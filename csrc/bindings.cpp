@@ -1106,7 +1106,126 @@ PYBIND11_MODULE(flash_vla_kernels, m) {
        py::arg("S_q"), py::arg("S_kv"), py::arg("NH"), py::arg("HD"),
        py::arg("attn_scale") = 1.0f, py::arg("stream") = 0);
 
+    // Causal MHA — N1.7 Qwen3-VL LLM (is_causal=True per HF). Same layout
+    // and cuBLAS path as attention_mha_fp16; differs only in the softmax
+    // step (strict upper-triangular mask via softmax_causal_fp16).
+    m.def("attention_mha_causal_fp16",
+          [](FvkContext& ctx, uintptr_t Q, uintptr_t K, uintptr_t V,
+             uintptr_t logits, uintptr_t out,
+             int S_q, int S_kv, int NH, int HD,
+             float attn_scale, uintptr_t stream) {
+        extern void attention_mha_causal_fp16(
+            cublasHandle_t, const __half*, const __half*, const __half*,
+            __half*, __half*, int, int, int, int, float, cudaStream_t);
+        attention_mha_causal_fp16(ctx.cublas_handle,
+                                   reinterpret_cast<const __half*>(Q),
+                                   reinterpret_cast<const __half*>(K),
+                                   reinterpret_cast<const __half*>(V),
+                                   reinterpret_cast<__half*>(logits),
+                                   reinterpret_cast<__half*>(out),
+                                   S_q, S_kv, NH, HD, attn_scale,
+                                   to_stream(stream));
+    }, py::arg("ctx"), py::arg("Q"), py::arg("K"), py::arg("V"),
+       py::arg("logits"), py::arg("out"),
+       py::arg("S_q"), py::arg("S_kv"), py::arg("NH"), py::arg("HD"),
+       py::arg("attn_scale") = 1.0f, py::arg("stream") = 0);
+
     // FA2 bindings (fvk.attention_fa2_fwd_fp16/bf16) moved to a separate
     // pybind module flash_vla_fa2.so — see csrc/fa2_bindings.cpp. This
     // keeps flash_vla_kernels.so small and fast to rebuild.
+
+    // ── DiT bf16 helpers (Phase 5a-2) ────────────────────────────────
+    m.def("layer_norm_no_affine_bf16",
+          [](uintptr_t x, uintptr_t out, int seq_len, int dim, float eps,
+             uintptr_t stream) {
+        extern void layer_norm_no_affine_bf16(
+            const __nv_bfloat16*, __nv_bfloat16*, int, int, float, cudaStream_t);
+        layer_norm_no_affine_bf16(
+            reinterpret_cast<const __nv_bfloat16*>(x),
+            reinterpret_cast<__nv_bfloat16*>(out),
+            seq_len, dim, eps, to_stream(stream));
+    }, py::arg("x"), py::arg("out"), py::arg("seq_len"), py::arg("dim"),
+       py::arg("eps") = 1e-5f, py::arg("stream") = 0);
+
+    m.def("ada_layer_norm_bf16",
+          [](uintptr_t x, uintptr_t scale, uintptr_t shift, uintptr_t out,
+             int seq_len, int dim, float eps, uintptr_t stream) {
+        extern void ada_layer_norm_bf16(
+            const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*,
+            __nv_bfloat16*, int, int, float, cudaStream_t);
+        ada_layer_norm_bf16(
+            reinterpret_cast<const __nv_bfloat16*>(x),
+            reinterpret_cast<const __nv_bfloat16*>(scale),
+            reinterpret_cast<const __nv_bfloat16*>(shift),
+            reinterpret_cast<__nv_bfloat16*>(out),
+            seq_len, dim, eps, to_stream(stream));
+    }, py::arg("x"), py::arg("scale"), py::arg("shift"), py::arg("out"),
+       py::arg("seq_len"), py::arg("dim"),
+       py::arg("eps") = 1e-5f, py::arg("stream") = 0);
+
+    m.def("add_bias_bf16",
+          [](uintptr_t x, uintptr_t b, int S, int D, uintptr_t stream) {
+        extern void add_bias_bf16(
+            __nv_bfloat16*, const __nv_bfloat16*, int, int, cudaStream_t);
+        add_bias_bf16(reinterpret_cast<__nv_bfloat16*>(x),
+                       reinterpret_cast<const __nv_bfloat16*>(b),
+                       S, D, to_stream(stream));
+    }, py::arg("x"), py::arg("b"), py::arg("S"), py::arg("D"),
+       py::arg("stream") = 0);
+
+    m.def("cast_fp16_to_bf16",
+          [](uintptr_t in, uintptr_t out, int n, uintptr_t stream) {
+        extern void cast_fp16_to_bf16(
+            const __half*, __nv_bfloat16*, int, cudaStream_t);
+        cast_fp16_to_bf16(reinterpret_cast<const __half*>(in),
+                           reinterpret_cast<__nv_bfloat16*>(out),
+                           n, to_stream(stream));
+    }, py::arg("in"), py::arg("out"), py::arg("n"), py::arg("stream") = 0);
+
+    m.def("cast_bf16_to_fp16",
+          [](uintptr_t in, uintptr_t out, int n, uintptr_t stream) {
+        extern void cast_bf16_to_fp16(
+            const __nv_bfloat16*, __half*, int, cudaStream_t);
+        cast_bf16_to_fp16(reinterpret_cast<const __nv_bfloat16*>(in),
+                           reinterpret_cast<__half*>(out),
+                           n, to_stream(stream));
+    }, py::arg("in"), py::arg("out"), py::arg("n"), py::arg("stream") = 0);
+
+    // ── DiT bf16 attention path (Phase 5a-2) ─────────────────────────
+    m.def("softmax_bf16", [](uintptr_t data, int rows, int cols,
+                              uintptr_t stream) {
+        extern void softmax_bf16(__nv_bfloat16*, int, int, cudaStream_t);
+        softmax_bf16(reinterpret_cast<__nv_bfloat16*>(data),
+                      rows, cols, to_stream(stream));
+    }, py::arg("data"), py::arg("rows"), py::arg("cols"),
+       py::arg("stream") = 0);
+
+    m.def("gpu_fill_neginf_bf16", [](uintptr_t x, int n, uintptr_t stream) {
+        extern void gpu_fill_neginf_bf16(__nv_bfloat16*, int, cudaStream_t);
+        gpu_fill_neginf_bf16(reinterpret_cast<__nv_bfloat16*>(x),
+                              n, to_stream(stream));
+    }, py::arg("x"), py::arg("n"), py::arg("stream") = 0);
+
+    m.def("attention_mha_bf16",
+          [](FvkContext& ctx, uintptr_t Q, uintptr_t K, uintptr_t V,
+             uintptr_t logits, uintptr_t out,
+             int S_q, int S_kv, int NH, int HD,
+             float attn_scale, int logits_kv_stride, uintptr_t stream) {
+        extern void attention_mha_bf16(
+            cublasHandle_t, const __nv_bfloat16*, const __nv_bfloat16*,
+            const __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*,
+            int, int, int, int, float, int, cudaStream_t);
+        attention_mha_bf16(ctx.cublas_handle,
+                            reinterpret_cast<const __nv_bfloat16*>(Q),
+                            reinterpret_cast<const __nv_bfloat16*>(K),
+                            reinterpret_cast<const __nv_bfloat16*>(V),
+                            reinterpret_cast<__nv_bfloat16*>(logits),
+                            reinterpret_cast<__nv_bfloat16*>(out),
+                            S_q, S_kv, NH, HD, attn_scale,
+                            logits_kv_stride, to_stream(stream));
+    }, py::arg("ctx"), py::arg("Q"), py::arg("K"), py::arg("V"),
+       py::arg("logits"), py::arg("out"),
+       py::arg("S_q"), py::arg("S_kv"), py::arg("NH"), py::arg("HD"),
+       py::arg("attn_scale") = 1.0f, py::arg("logits_kv_stride") = 0,
+       py::arg("stream") = 0);
 }

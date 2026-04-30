@@ -95,15 +95,19 @@ def convert_pi05_safetensors(safetensors_path: Union[str, pathlib.Path]) -> dict
       - 10-step sinusoidal time embeddings.
     """
     from safetensors import safe_open
+    from flash_vla.executors.torch_weights import _autodetect_strip_prefix
 
     logger.info("Loading Pi0.5 safetensors: %s", safetensors_path)
     f = safe_open(str(safetensors_path), framework="pt")
+    # Auto-strip the lerobot HF policy ``model.`` wrap so the openpi
+    # bare-key lookups below resolve transparently on either layout.
+    _strip = _autodetect_strip_prefix(set(f.keys()))
 
     def g(key: str) -> torch.Tensor:
-        return f.get_tensor(key).to(bf16)
+        return f.get_tensor((_strip + key) if _strip else key).to(bf16)
 
     def g_raw(key: str) -> torch.Tensor:
-        return f.get_tensor(key)
+        return f.get_tensor((_strip + key) if _strip else key)
 
     ckpt: dict = {}
 
@@ -498,21 +502,23 @@ class Pi05TorchFrontendRtx:
     # -----------------------------------------------------------------
 
     def _load_norm_stats(self, checkpoint_dir: pathlib.Path) -> None:
+        from flash_vla.core.utils.norm_stats import (
+            load_norm_stats, lerobot_candidates,
+        )
         candidates = [
             checkpoint_dir / "assets" / "physical-intelligence" / "libero" / "norm_stats.json",
             checkpoint_dir.parent / "pi05_libero" / "assets" / "physical-intelligence" / "libero" / "norm_stats.json",
             checkpoint_dir / "norm_stats.json",
             pathlib.Path("/root/.cache/openpi/openpi-assets/checkpoints/pi05_libero/"
                          "assets/physical-intelligence/libero/norm_stats.json"),
+            *lerobot_candidates(checkpoint_dir),
         ]
-        for p in candidates:
-            if p.exists():
-                with open(p) as f:
-                    data = json.load(f)
-                self.norm_stats = data.get("norm_stats", data)
-                logger.info("Loaded norm stats from %s", p)
-                return
-        raise FileNotFoundError("norm_stats.json not found near checkpoint")
+        try:
+            self.norm_stats = load_norm_stats(
+                candidates, checkpoint_dir=checkpoint_dir)
+        except FileNotFoundError as e:
+            raise FileNotFoundError(
+                f"norm_stats not found near checkpoint: {e}") from e
 
     def _quantize_all_fp8(self) -> None:
         """Pre-quantize all large GEMM weights to FP8 E4M3."""

@@ -1,0 +1,53 @@
+name: groot_n17
+display_name: "NVIDIA GR00T-N1.7-3B"
+
+backbone:
+  family: qwen3_vl
+  hf_model: nvidia/Cosmos-Reason2-2B
+  embedding_dim: 2048
+  llm_layers: 16        # truncated from 28; persisted in shipped ckpt
+  llm_num_q_heads: 16
+  llm_num_kv_heads: 8
+  llm_head_dim: 128
+  llm_intermediate_size: 6144
+  llm_rope_theta: 5000000
+  llm_rope_mrope_section: [24, 20, 20]
+  llm_rope_mrope_interleaved: true
+  vit_blocks: 24
+  vit_hidden: 1024
+  vit_out_hidden: 2048
+  vit_heads: 16
+  vit_intermediate: 4096
+  vit_patch_size: 16
+  vit_temporal_patch: 2
+  vit_spatial_merge: 2
+  deepstack_visual_indexes: [5, 11, 17]
+
+action_head:
+  hidden_size: 1024
+  input_embedding_dim: 1536
+  use_vlln: true
+  use_vl_self_attention: true
+  vl_self_attention_layers: 4
+  vl_self_attention_heads: 32
+  vl_self_attention_head_dim: 64
+  dit_layers: 32
+  dit_heads: 32
+  dit_head_dim: 48
+  dit_norm_type: ada_norm
+  dit_interleave_self_attention: true
+  attend_text_every_n_blocks: 2
+
+action:
+  max_action_dim: 132
+  max_state_dim: 132
+  action_horizon: 40
+  num_inference_timesteps: 4
+  max_seq_len: 1024
+  max_num_embodiments: 32
+  use_percentiles: true   # q01/q99 from statistics.json (NEW vs N1.6 mean/std)
+
+image:
+  crop_size: [230, 230]
+  target_size: [256, 256]
+  shortest_edge: 256

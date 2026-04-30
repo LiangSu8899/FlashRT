@@ -92,15 +92,19 @@ def convert_pi0_safetensors(safetensors_path: Union[str, pathlib.Path]) -> dict:
         :func:`_precompute_time_proj_all` and discarded.
     """
     from safetensors import safe_open
+    from flash_vla.executors.torch_weights import _autodetect_strip_prefix
 
     logger.info("Loading Pi0 safetensors: %s", safetensors_path)
     f = safe_open(str(safetensors_path), framework="pt")
+    # Auto-strip the lerobot HF policy ``model.`` wrap so the openpi
+    # bare-key lookups below resolve on either layout.
+    _strip = _autodetect_strip_prefix(set(f.keys()))
 
     def g(key: str) -> torch.Tensor:
-        return f.get_tensor(key).to(fp16)
+        return f.get_tensor((_strip + key) if _strip else key).to(fp16)
 
     def g_raw(key: str) -> torch.Tensor:
-        return f.get_tensor(key)
+        return f.get_tensor((_strip + key) if _strip else key)
 
     ckpt: dict = {}
 
@@ -414,22 +418,24 @@ class Pi0TorchFrontendRtx:
                     self.num_views, self.chunk_size)
 
     def _load_norm_stats(self, checkpoint_dir: pathlib.Path) -> None:
+        from flash_vla.core.utils.norm_stats import (
+            load_norm_stats, lerobot_candidates,
+        )
         candidates = [
             checkpoint_dir / "assets" / "physical-intelligence" / "libero"
             / "norm_stats.json",
             checkpoint_dir.parent / "pi0_base" / "assets"
             / "physical-intelligence" / "libero" / "norm_stats.json",
             checkpoint_dir / "norm_stats.json",
+            *lerobot_candidates(checkpoint_dir),
         ]
-        for p in candidates:
-            if p.exists():
-                with open(p) as f:
-                    data = json.load(f)
-                self.norm_stats = data.get("norm_stats", data)
-                logger.info("Loaded norm stats from %s", p)
-                return
-        raise FileNotFoundError(
-            f"norm_stats.json not found near Pi0 checkpoint {checkpoint_dir}")
+        try:
+            self.norm_stats = load_norm_stats(
+                candidates, checkpoint_dir=checkpoint_dir)
+        except FileNotFoundError as e:
+            raise FileNotFoundError(
+                f"norm_stats not found near Pi0 checkpoint {checkpoint_dir}: "
+                f"{e}") from e
 
     def _quantize_all_fp8(self) -> None:
         W = self._ckpt_fp16

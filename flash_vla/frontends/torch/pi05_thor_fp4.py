@@ -293,9 +293,11 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
         self._awq_inv_s_gu = {} if self.use_awq else None
         self._awq_inv_s_dn = {} if self.use_awq else None
 
+        from flash_vla.executors.torch_weights import _autodetect_strip_prefix
         with safe_open(self._checkpoint_path, framework='pt', device='cuda') as sf:
+            _strip = _autodetect_strip_prefix(set(sf.keys()))
             def get(k):
-                return sf.get_tensor(k)
+                return sf.get_tensor((_strip + k) if _strip else k)
 
             for l in self._fp4_layers:
                 p = f"{model_root}.{l}"
@@ -366,10 +368,12 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
         This keeps the captured CUDA Graph valid — no recapture needed.
         """
         from safetensors import safe_open
+        from flash_vla.executors.torch_weights import _autodetect_strip_prefix
         De = self.De; He = self.He
         model_root = "paligemma_with_expert.paligemma.model.language_model.layers"
         with safe_open(self._checkpoint_path, framework='pt', device='cuda') as sf:
-            def get(k): return sf.get_tensor(k)
+            _strip = _autodetect_strip_prefix(set(sf.keys()))
+            def get(k): return sf.get_tensor((_strip + k) if _strip else k)
             for l in self._fp4_layers:
                 p = f"{model_root}.{l}"
                 ff = 1.0 + get(f"{p}.post_attention_layernorm.weight").float()

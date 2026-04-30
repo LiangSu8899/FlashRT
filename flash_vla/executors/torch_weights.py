@@ -23,7 +23,7 @@ Design constraints (from docs/v2/stage7_weight_loader.md §2.3):
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 
 import torch
 
@@ -49,6 +49,46 @@ _FP32 = torch.float32
 #  Sources
 # ════════════════════════════════════════════════════════════════════
 
+_LEROBOT_AUTO_STRIP_PREFIX = "model."
+
+# Top-level weight-namespace fingerprints we know from each model
+# family's openpi-converted layout. The autodetect heuristic flags a
+# checkpoint as lerobot-wrapped when every occurrence of one of these
+# sentinels in the file is preceded by ``model.`` and none of them
+# appear bare. Adding a new family is one line.
+_PALIGEMMA_FAMILY_SENTINELS = (
+    "paligemma_with_expert.",  # Pi0 / Pi0.5
+    "paligemma.model.",        # Pi0-FAST (no action-expert wrap)
+)
+
+
+def _autodetect_strip_prefix(raw_keys) -> str:
+    """Detect a uniform leading prefix that should be stripped before
+    schema lookups.
+
+    The lerobot HF policy releases (e.g. ``lerobot/pi05_libero_finetuned
+    _v044``) wrap the entire model under an extra ``model.`` namespace
+    relative to the openpi-converted layout the spec was written for.
+    Every published lerobot policy ckpt follows this rule; our
+    spec-side keys are openpi-style (no ``model.`` prefix). Detect by
+    walking each known family sentinel and checking whether the
+    on-disk file uses bare or ``model.``-wrapped form.
+
+    Returns the prefix to strip (e.g. ``"model."``) or ``""`` if no
+    auto-strip applies.
+    """
+    if not raw_keys:
+        return ""
+    for sentinel in _PALIGEMMA_FAMILY_SENTINELS:
+        has_bare = any(k.startswith(sentinel) for k in raw_keys)
+        has_prefixed = any(
+            k.startswith(_LEROBOT_AUTO_STRIP_PREFIX + sentinel)
+            for k in raw_keys)
+        if has_prefixed and not has_bare:
+            return _LEROBOT_AUTO_STRIP_PREFIX
+    return ""
+
+
 class SafetensorsSource:
     """WeightSource backed by a ``safetensors.safe_open`` handle.
 
@@ -56,20 +96,104 @@ class SafetensorsSource:
     tensor on CUDA (the handle is opened with ``device='cuda'``). No
     caching — each ``get`` returns a fresh view; use transforms to
     shape/quantize.
+
+    Args:
+        path: safetensors file path.
+        device: torch device the safetensors handle opens on.
+        strip_prefix: optional leading prefix to strip from on-disk
+            keys before serving them to the spec. If ``None`` (default)
+            the source auto-detects the lerobot HF wrapping convention
+            (``model.<openpi-key>``) and strips ``model.`` when present.
+            Pass an empty string to disable auto-detection without
+            stripping anything.
     """
 
-    def __init__(self, path: str, *, device: str = "cuda"):
+    def __init__(
+        self, path: str, *,
+        device: str = "cuda",
+        strip_prefix: Optional[str] = None,
+    ):
         from safetensors import safe_open  # deferred: host python may lack torch+safetensors
         self._sf = safe_open(str(path), framework="pt", device=device)
         self._path = str(path)
-        # safetensors' safe_open exposes ``keys()`` — cache once for ``has``.
-        self._keys = set(self._sf.keys())
+        raw_keys = set(self._sf.keys())
+        if strip_prefix is None:
+            strip_prefix = _autodetect_strip_prefix(raw_keys)
+        self._strip = strip_prefix
+        if self._strip:
+            # Build the spec-side key set by stripping the prefix.
+            self._keys = {
+                (k[len(self._strip):] if k.startswith(self._strip) else k)
+                for k in raw_keys}
+        else:
+            self._keys = raw_keys
 
     def get(self, key: str):
+        # Spec-side key may map to a prefixed on-disk key.
+        if self._strip and (self._strip + key) in self._sf.keys():
+            return self._sf.get_tensor(self._strip + key)
         return self._sf.get_tensor(key)
 
     def has(self, key: str) -> bool:
         return key in self._keys
+
+
+class MultiSafetensorsSource:
+    """WeightSource that aggregates multiple safetensors shards behind a
+    single ``get/has`` interface — needed for checkpoints sharded across
+    multiple files (e.g. ``model-00001-of-00002.safetensors`` etc.).
+
+    On construction, opens every shard once and builds a key→handle index
+    so subsequent ``get`` calls dispatch to the right shard without rescan.
+
+    Args:
+        paths: ordered list of shard paths. Order doesn't affect lookup
+            (the index is keyed by tensor name) but we preserve it for
+            deterministic error messages.
+        device: torch device the safetensors handles open on.
+
+    Raises:
+        ValueError: if a tensor key appears in multiple shards (corrupt
+            checkpoint — safetensors index files guarantee uniqueness).
+    """
+
+    def __init__(
+        self, paths, *,
+        device: str = "cuda",
+        strip_prefix: Optional[str] = None,
+    ):
+        from safetensors import safe_open
+        self._handles = []
+        # Map spec-side key -> (handle, raw_key). Allows the same source
+        # to serve both prefixed and bare key namespaces transparently.
+        self._key_to_handle: dict[str, tuple] = {}
+        all_raw: set[str] = set()
+        raw_handle_pairs: list = []
+        for p in paths:
+            h = safe_open(str(p), framework="pt", device=device)
+            self._handles.append(h)
+            for k in h.keys():
+                if k in all_raw:
+                    raise ValueError(
+                        f"key {k!r} appears in multiple shards (corrupt index?)")
+                all_raw.add(k)
+                raw_handle_pairs.append((h, k))
+        if strip_prefix is None:
+            strip_prefix = _autodetect_strip_prefix(all_raw)
+        self._strip = strip_prefix
+        for h, k in raw_handle_pairs:
+            spec_k = (k[len(self._strip):]
+                      if self._strip and k.startswith(self._strip)
+                      else k)
+            self._key_to_handle[spec_k] = (h, k)
+        self._paths = [str(p) for p in paths]
+
+    def get(self, key: str):
+        h, raw_key = self._key_to_handle[key]
+        return h.get_tensor(raw_key)
+
+    def has(self, key: str) -> bool:
+        return key in self._key_to_handle
 
 
 class DictSource:

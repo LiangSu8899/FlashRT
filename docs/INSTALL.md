@@ -100,6 +100,27 @@ Per-arch produced shared libraries:
 | RTX 5090 (SM120) | ✅ | ✅ | ✅ (in-SO FA2) | — |
 | RTX 4090 (SM89) | ✅ | — | ✅ (in-SO FA2) | — |
 
+### 6.1 Building on CUDA < 12.8
+
+The default vendor build of Flash-Attention 2 emits a ``compute_120``
+PTX fallback alongside the per-arch SASS so a single ``.so`` covers
+all listed gencodes — including Blackwell (SM120) targets that need
+CUDA 12.8+. On older toolchains (e.g. an L40S running a CUDA-12.4
+image) ``nvcc`` rejects the ``compute_120`` PTX target with a
+``Value 'compute_120' is not defined`` error and the build aborts.
+
+If you only need a binary for the GPU detected on the build host
+(typical for cloud / self-hosted users that aren't shipping the
+``.so`` to a different arch), set ``FA2_ARCH_NATIVE_ONLY=ON`` to
+skip the cross-arch SASS + PTX fallback. The build emits SASS for
+the current arch only, runs ~66 % faster, and works on any CUDA
+toolchain that supports that arch:
+
+```bash
+cmake -B build -S . -DFA2_ARCH_NATIVE_ONLY=ON
+cmake --build build -j$(nproc)
+```
+
 ## 7. Verify
 
 ```bash

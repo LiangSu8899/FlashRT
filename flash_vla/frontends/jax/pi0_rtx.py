@@ -455,11 +455,14 @@ class Pi0JaxFrontendRtx(Pi0TorchFrontendRtx):
 
     def _load_norm_stats_jax(self, checkpoint_dir: pathlib.Path) -> None:
         """Like the torch frontend's ``_load_norm_stats`` but also looks
-        at the sibling ``<name>_pytorch`` directory, which is where
-        openpi ships the LIBERO ``physical-intelligence/libero/norm_stats.json``
-        when the Orbax checkpoint itself only ships per-embodiment assets.
+        at the sibling ``<name>_pytorch`` directory (where openpi ships
+        the LIBERO assets when the Orbax checkpoint itself only carries
+        per-embodiment assets) and tolerates the lerobot HF release's
+        ``meta/stats.json`` schema.
         """
-        import json
+        from flash_vla.core.utils.norm_stats import (
+            load_norm_stats, lerobot_candidates,
+        )
         name = checkpoint_dir.name
         candidates = [
             checkpoint_dir / "assets" / "physical-intelligence" / "libero"
@@ -469,14 +472,12 @@ class Pi0JaxFrontendRtx(Pi0TorchFrontendRtx):
             checkpoint_dir.parent / "pi0_base_pytorch" / "assets"
             / "physical-intelligence" / "libero" / "norm_stats.json",
             checkpoint_dir / "norm_stats.json",
+            *lerobot_candidates(checkpoint_dir),
         ]
-        for p in candidates:
-            if p.exists():
-                with open(p) as f:
-                    data = json.load(f)
-                self.norm_stats = data.get("norm_stats", data)
-                logger.info("Loaded norm stats from %s", p)
-                return
-        raise FileNotFoundError(
-            f"norm_stats.json not found near Pi0 Orbax checkpoint "
-            f"{checkpoint_dir}. Looked in: {[str(p) for p in candidates]}")
+        try:
+            self.norm_stats = load_norm_stats(
+                candidates, checkpoint_dir=checkpoint_dir)
+        except FileNotFoundError as e:
+            raise FileNotFoundError(
+                f"norm_stats not found near Pi0 Orbax checkpoint "
+                f"{checkpoint_dir}: {e}") from e

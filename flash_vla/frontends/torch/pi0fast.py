@@ -135,20 +135,21 @@ class Pi0FastTorchFrontend:
                      num_views, max_decode_steps, self._has_sm100)
 
     def _load_norm_stats(self, checkpoint_dir):
+        from flash_vla.core.utils.norm_stats import (
+            load_norm_stats, lerobot_candidates,
+        )
         candidates = [
             checkpoint_dir / "assets" / "franka" / "norm_stats.json",
             checkpoint_dir / "assets" / "physical-intelligence" / "libero" / "norm_stats.json",
             checkpoint_dir / "norm_stats.json",
+            *lerobot_candidates(checkpoint_dir),
         ]
-        for p in candidates:
-            if p.exists():
-                with open(p) as f:
-                    data = json.load(f)
-                self.norm_stats = data.get("norm_stats", data)
-                logger.info("Loaded norm stats from %s", p)
-                return
-        logger.warning("norm_stats.json not found — using dummy stats")
-        self.norm_stats = None
+        # Pi0-FAST has historically tolerated missing stats (decoder-only
+        # path can run without them), so keep ``strict=False`` here.
+        self.norm_stats = load_norm_stats(
+            candidates, checkpoint_dir=checkpoint_dir, strict=False)
+        if self.norm_stats is None:
+            logger.warning("norm_stats not found — using dummy stats")
 
     def _load_tokenizer(self):
         sp_paths = [
@@ -193,9 +194,13 @@ class Pi0FastTorchFrontend:
     def _load_weights(self, safetensors_path):
         """Load weights from safetensors (converted from Orbax via convert_pi0fast_orbax_to_safetensors.py)."""
         from safetensors import safe_open
+        from flash_vla.executors.torch_weights import _autodetect_strip_prefix
 
         sf = safe_open(str(safetensors_path), framework='pt', device='cuda')
-        def g_raw(k): return sf.get_tensor(k)
+        # Auto-strip the lerobot HF policy ``model.`` namespace wrap if
+        # present (no-op on existing openpi-converted ckpts).
+        _strip = _autodetect_strip_prefix(set(sf.keys()))
+        def g_raw(k): return sf.get_tensor((_strip + k) if _strip else k)
         def g(k): return g_raw(k).to(fp16)
 
         nv = self.num_views

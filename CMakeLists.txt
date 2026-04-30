@@ -399,8 +399,11 @@ pybind11_add_module(flash_vla_kernels
   csrc/kernels/softmax.cu
   csrc/kernels/attention_cublas.cu
   csrc/kernels/attention_mha.cu
+  csrc/kernels/attention_mha_causal.cu
   csrc/kernels/rope_qwen3.cu
   csrc/kernels/decoder_fused.cu
+  csrc/kernels/dit_bf16.cu
+  csrc/kernels/attention_dit_bf16.cu
   csrc/attention/fmha_dispatch.cu
   csrc/bindings.cpp
 )

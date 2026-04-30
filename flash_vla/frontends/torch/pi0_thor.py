@@ -132,21 +132,19 @@ class Pi0TorchFrontendThor:
     # -----------------------------------------------------------------------
 
     def _load_norm_stats(self, checkpoint_dir):
+        from flash_vla.core.utils.norm_stats import (
+            load_norm_stats, lerobot_candidates,
+        )
         candidates = [
             checkpoint_dir / "assets" / "physical-intelligence" / "libero" / "norm_stats.json",
             checkpoint_dir.parent / "pi0_base" / "assets" / "physical-intelligence" / "libero" / "norm_stats.json",
             checkpoint_dir / "norm_stats.json",
             pathlib.Path("/root/.cache/openpi/openpi-assets/checkpoints/pi0_base/"
                          "assets/physical-intelligence/libero/norm_stats.json"),
+            *lerobot_candidates(checkpoint_dir),
         ]
-        for p in candidates:
-            if p.exists():
-                with open(p) as f:
-                    data = json.load(f)
-                self.norm_stats = data.get("norm_stats", data)
-                logger.info("Loaded norm stats from %s", p)
-                return
-        raise FileNotFoundError("norm_stats.json not found")
+        self.norm_stats = load_norm_stats(
+            candidates, checkpoint_dir=checkpoint_dir)
 
     # -----------------------------------------------------------------------
     # Weight loading
@@ -156,12 +154,16 @@ class Pi0TorchFrontendThor:
         from safetensors import safe_open
 
         from flash_vla.executors.torch_weights import (
-            SafetensorsSource, WeightLoader,
+            SafetensorsSource, WeightLoader, _autodetect_strip_prefix,
         )
         from flash_vla.frontends.torch._pi0_thor_spec import build_spec
 
         sf = safe_open(str(safetensors_path), framework='pt', device='cuda')
-        def g_raw(k): return sf.get_tensor(k)
+        # Auto-strip the lerobot HF policy ``model.`` namespace wrap so
+        # this loader can stay written against openpi-converted bare
+        # keys. Returns ``""`` (no-op) for already-openpi checkpoints.
+        _strip = _autodetect_strip_prefix(set(sf.keys()))
+        def g_raw(k): return sf.get_tensor((_strip + k) if _strip else k)
         def g(k): return g_raw(k).to(fp16)
 
         # Declarative weight-loader pass (stage 7.4). Populates:

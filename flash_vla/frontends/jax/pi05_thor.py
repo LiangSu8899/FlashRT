@@ -79,15 +79,17 @@ class Pi05JaxFrontendThor:
 
         checkpoint_dir = pathlib.Path(checkpoint_dir)
 
-        # ── Load norm stats ──
-        self.norm_stats = None
-        for p in [checkpoint_dir / "assets" / "physical-intelligence" / "libero" / "norm_stats.json",
-                  checkpoint_dir / "norm_stats.json"]:
-            if p.exists():
-                with open(p) as f:
-                    data = json.load(f)
-                self.norm_stats = data.get("norm_stats", data)
-                break
+        # ── Load norm stats (openpi or lerobot HF release) ──
+        from flash_vla.core.utils.norm_stats import (
+            load_norm_stats, lerobot_candidates,
+        )
+        self.norm_stats = load_norm_stats(
+            [checkpoint_dir / "assets" / "physical-intelligence" / "libero" / "norm_stats.json",
+             checkpoint_dir / "norm_stats.json",
+             *lerobot_candidates(checkpoint_dir)],
+            checkpoint_dir=checkpoint_dir,
+            strict=False,
+        )
 
         # ── FvkContext + GemmRunner + FMHA ──
         from flash_vla import flash_vla_kernels as _fvk
