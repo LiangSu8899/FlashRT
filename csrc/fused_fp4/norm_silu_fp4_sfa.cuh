@@ -13,7 +13,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
-namespace flash_vla {
+namespace flash_rt {
 namespace fused_fp4 {
 
 // F2: rms_norm → fp4 packed + SFA tile-interleaved.
@@ -64,4 +64,4 @@ void gate_silu_mul_mul_fp4_sfa_v2_fp16(
     int seq_len, int half_dim, cudaStream_t stream);
 
 }  // namespace fused_fp4
-}  // namespace flash_vla
+}  // namespace flash_rt

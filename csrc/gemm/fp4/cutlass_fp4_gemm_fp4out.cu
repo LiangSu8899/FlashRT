@@ -22,7 +22,7 @@
 #include "cutlass/detail/sm100_blockscaled_layout.hpp"
 #include "cute/tensor.hpp"
 
-namespace flash_vla {
+namespace flash_rt {
 namespace fp4 {
 namespace fp4out {
 
@@ -163,4 +163,4 @@ int cutlass_fp4_gemm_fp4out(
 }
 
 }  // namespace fp4
-}  // namespace flash_vla
+}  // namespace flash_rt

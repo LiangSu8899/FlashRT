@@ -24,7 +24,7 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
-namespace flash_vla {
+namespace flash_rt {
 namespace fp4 {
 
 // Run NVFP4 GEMM with fused silu_mul aux epilogue.
@@ -49,4 +49,4 @@ int cutlass_fp4_gemm_silu_aux_fp4(
     cudaStream_t stream);
 
 }  // namespace fp4
-}  // namespace flash_vla
+}  // namespace flash_rt

@@ -28,7 +28,7 @@
 #  define FV_HAVE_CUTLASS 0
 #endif
 
-namespace flash_vla {
+namespace flash_rt {
 namespace fused_fp4 {
 
 #if FV_HAVE_CUTLASS
@@ -136,4 +136,4 @@ void gate_silu_mul_mul_fp4_sfa_v2_fp16(
 }
 
 }  // namespace fused_fp4
-}  // namespace flash_vla
+}  // namespace flash_rt

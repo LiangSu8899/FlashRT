@@ -49,17 +49,17 @@ int main() {
     uint8_t *X_p, *X_sfa, *W_p, *W_sfb;
     CHECK(cudaMalloc(&X_p,   M*K/2));
     CHECK(cudaMalloc(&W_p,   N*K/2));
-    int x_sfa_sz = flash_vla::fp4::sfa_size_bytes(M, K, false);
-    int w_sfb_sz = flash_vla::fp4::sfa_size_bytes(N, K, true);
+    int x_sfa_sz = flash_rt::fp4::sfa_size_bytes(M, K, false);
+    int w_sfb_sz = flash_rt::fp4::sfa_size_bytes(N, K, true);
     CHECK(cudaMalloc(&X_sfa, x_sfa_sz));
     CHECK(cudaMalloc(&W_sfb, w_sfb_sz));
-    flash_vla::fp4::quantize_fp4_dynamic_sfa_fp16(d_X, X_p, X_sfa, M, K, false, 0);
-    flash_vla::fp4::quantize_fp4_dynamic_sfa_fp16(d_W, W_p, W_sfb, N, K, true,  0);
+    flash_rt::fp4::quantize_fp4_dynamic_sfa_fp16(d_X, X_p, X_sfa, M, K, false, 0);
+    flash_rt::fp4::quantize_fp4_dynamic_sfa_fp16(d_W, W_p, W_sfb, N, K, true,  0);
     cudaDeviceSynchronize();
 
     // ─ Path A: new fp4out GEMM ─
     uint8_t *D_p, *D_sfd;
-    int d_sfd_sz = flash_vla::fp4::sfa_size_bytes(M, N, false);
+    int d_sfd_sz = flash_rt::fp4::sfa_size_bytes(M, N, false);
     CHECK(cudaMalloc(&D_p,   M*N/2));
     CHECK(cudaMalloc(&D_sfd, d_sfd_sz));
     CHECK(cudaMemset(D_p,   0, M*N/2));
@@ -69,7 +69,7 @@ int main() {
     CHECK(cudaMalloc(&d_norm, sizeof(float)));
     float h_norm = 1.0f;
     CHECK(cudaMemcpy(d_norm, &h_norm, sizeof(float), cudaMemcpyHostToDevice));
-    int rc = flash_vla::fp4::cutlass_fp4_gemm_fp4out(
+    int rc = flash_rt::fp4::cutlass_fp4_gemm_fp4out(
         X_p, X_sfa, W_p, W_sfb, D_p, D_sfd, M, N, K, 0);
     CHECK(cudaDeviceSynchronize());
     if (rc) { fprintf(stderr, "cutlass_fp4_gemm_fp4out failed rc=0x%x\n", rc); return 1; }
@@ -81,10 +81,10 @@ int main() {
     CHECK(cudaMalloc(&D_fp16, M*N*sizeof(__half)));
     CHECK(cudaMalloc(&D_p_ref, M*N/2));
     CHECK(cudaMalloc(&D_sfa_ref, d_sfd_sz));
-    rc = flash_vla::fp4::cutlass_fp4_sq_fp16(X_p, X_sfa, W_p, W_sfb, D_fp16, M, N, K, 1.0f, 0.0f, 0);
+    rc = flash_rt::fp4::cutlass_fp4_sq_fp16(X_p, X_sfa, W_p, W_sfb, D_fp16, M, N, K, 1.0f, 0.0f, 0);
     CHECK(cudaDeviceSynchronize());
     if (rc) { fprintf(stderr, "fp16 ref GEMM failed rc=0x%x\n", rc); return 1; }
-    rc = flash_vla::fp4::quantize_fp4_dynamic_sfa_fp16(D_fp16, D_p_ref, D_sfa_ref, M, N, false, 0);
+    rc = flash_rt::fp4::quantize_fp4_dynamic_sfa_fp16(D_fp16, D_p_ref, D_sfa_ref, M, N, false, 0);
     CHECK(cudaDeviceSynchronize());
     if (rc) { fprintf(stderr, "ref quantize_fp4 failed rc=%d\n", rc); return 1; }
     printf("[B] reference fp16 GEMM + fp4 quant: rc=0\n");
@@ -122,26 +122,26 @@ int main() {
     const int iters = 200, warmup = 20;
 
     for (int i = 0; i < warmup; ++i) {
-        flash_vla::fp4::cutlass_fp4_gemm_fp4out(X_p, X_sfa, W_p, W_sfb, D_p, D_sfd, M, N, K, 0);
+        flash_rt::fp4::cutlass_fp4_gemm_fp4out(X_p, X_sfa, W_p, W_sfb, D_p, D_sfd, M, N, K, 0);
     }
     cudaDeviceSynchronize();
     cudaEventRecord(e1);
     for (int i = 0; i < iters; ++i) {
-        flash_vla::fp4::cutlass_fp4_gemm_fp4out(X_p, X_sfa, W_p, W_sfb, D_p, D_sfd, M, N, K, 0);
+        flash_rt::fp4::cutlass_fp4_gemm_fp4out(X_p, X_sfa, W_p, W_sfb, D_p, D_sfd, M, N, K, 0);
     }
     cudaEventRecord(e2); cudaEventSynchronize(e2);
     float ms_a = 0; cudaEventElapsedTime(&ms_a, e1, e2);
     float us_a = ms_a * 1000 / iters;
 
     for (int i = 0; i < warmup; ++i) {
-        flash_vla::fp4::cutlass_fp4_sq_fp16(X_p, X_sfa, W_p, W_sfb, D_fp16, M, N, K, 1.0f, 0.0f, 0);
-        flash_vla::fp4::quantize_fp4_dynamic_sfa_fp16(D_fp16, D_p_ref, D_sfa_ref, M, N, false, 0);
+        flash_rt::fp4::cutlass_fp4_sq_fp16(X_p, X_sfa, W_p, W_sfb, D_fp16, M, N, K, 1.0f, 0.0f, 0);
+        flash_rt::fp4::quantize_fp4_dynamic_sfa_fp16(D_fp16, D_p_ref, D_sfa_ref, M, N, false, 0);
     }
     cudaDeviceSynchronize();
     cudaEventRecord(e1);
     for (int i = 0; i < iters; ++i) {
-        flash_vla::fp4::cutlass_fp4_sq_fp16(X_p, X_sfa, W_p, W_sfb, D_fp16, M, N, K, 1.0f, 0.0f, 0);
-        flash_vla::fp4::quantize_fp4_dynamic_sfa_fp16(D_fp16, D_p_ref, D_sfa_ref, M, N, false, 0);
+        flash_rt::fp4::cutlass_fp4_sq_fp16(X_p, X_sfa, W_p, W_sfb, D_fp16, M, N, K, 1.0f, 0.0f, 0);
+        flash_rt::fp4::quantize_fp4_dynamic_sfa_fp16(D_fp16, D_p_ref, D_sfa_ref, M, N, false, 0);
     }
     cudaEventRecord(e2); cudaEventSynchronize(e2);
     float ms_b = 0; cudaEventElapsedTime(&ms_b, e1, e2);

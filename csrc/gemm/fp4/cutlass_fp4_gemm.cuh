@@ -14,7 +14,7 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 
-namespace flash_vla {
+namespace flash_rt {
 namespace fp4 {
 
 // Invariants (enforced at call sites and / or static_assert'd):
@@ -54,4 +54,4 @@ const char* cutlass_fp4_gemm_variant_name(int idx);
 int cutlass_fp4_gemm_num_variants();
 
 } // namespace fp4
-} // namespace flash_vla
+} // namespace flash_rt

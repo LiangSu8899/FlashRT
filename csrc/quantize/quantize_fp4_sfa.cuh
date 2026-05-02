@@ -13,7 +13,7 @@
 #pragma once
 #include <cuda_runtime.h>
 
-namespace flash_vla {
+namespace flash_rt {
 namespace fp4 {
 
 // fp16 [N, D] → packed [N, D/2] (e2m1) + SFA/SFB tile-interleaved UE4M3 scales.
@@ -28,4 +28,4 @@ int quantize_fp4_dynamic_sfa_fp16(
     cudaStream_t stream);
 
 }  // namespace fp4
-}  // namespace flash_vla
+}  // namespace flash_rt

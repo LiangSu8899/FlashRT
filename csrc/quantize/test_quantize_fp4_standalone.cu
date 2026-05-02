@@ -110,10 +110,10 @@ static int run_case(ShapeCase sc) {
   cudaMemcpy(d_src, h_src.data(), n_elems * sizeof(__half), cudaMemcpyHostToDevice);
 
   cudaStream_t stream; cudaStreamCreate(&stream);
-  int rc = flash_vla::fp4::quantize_fp4_dynamic_fp16(
+  int rc = flash_rt::fp4::quantize_fp4_dynamic_fp16(
       d_src, d_packed, d_scales, sc.N, sc.D, stream);
   if (rc) { fprintf(stderr, "quant rc=%d\n", rc); return 1; }
-  rc = flash_vla::fp4::dequantize_fp4_to_fp16(
+  rc = flash_rt::fp4::dequantize_fp4_to_fp16(
       d_packed, d_scales, d_dst, sc.N, sc.D, stream);
   if (rc) { fprintf(stderr, "dequant rc=%d\n", rc); return 1; }
   cudaStreamSynchronize(stream);
@@ -153,11 +153,11 @@ static int run_case(ShapeCase sc) {
   cudaEvent_t e0, e1;
   cudaEventCreate(&e0); cudaEventCreate(&e1);
   for (int i = 0; i < 10; ++i)
-    flash_vla::fp4::quantize_fp4_dynamic_fp16(d_src, d_packed, d_scales, sc.N, sc.D, stream);
+    flash_rt::fp4::quantize_fp4_dynamic_fp16(d_src, d_packed, d_scales, sc.N, sc.D, stream);
   cudaStreamSynchronize(stream);
   cudaEventRecord(e0, stream);
   for (int i = 0; i < iters; ++i)
-    flash_vla::fp4::quantize_fp4_dynamic_fp16(d_src, d_packed, d_scales, sc.N, sc.D, stream);
+    flash_rt::fp4::quantize_fp4_dynamic_fp16(d_src, d_packed, d_scales, sc.N, sc.D, stream);
   cudaEventRecord(e1, stream);
   cudaEventSynchronize(e1);
   float ms = 0; cudaEventElapsedTime(&ms, e0, e1);

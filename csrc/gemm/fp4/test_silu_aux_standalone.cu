@@ -151,18 +151,18 @@ int main() {
     // X: act, SFA layout (is_sfb=false)
     uint8_t *d_X_packed, *d_X_sfa;
     CHECK(cudaMalloc(&d_X_packed, M * K / 2));
-    int x_sfa_sz = flash_vla::fp4::sfa_size_bytes(M, K, /*is_sfb=*/false);
+    int x_sfa_sz = flash_rt::fp4::sfa_size_bytes(M, K, /*is_sfb=*/false);
     CHECK(cudaMalloc(&d_X_sfa, x_sfa_sz));
-    int rc = flash_vla::fp4::quantize_fp4_dynamic_sfa_fp16(
+    int rc = flash_rt::fp4::quantize_fp4_dynamic_sfa_fp16(
         d_X, d_X_packed, d_X_sfa, M, K, false, 0);
     if (rc) { fprintf(stderr, "quantize X failed rc=%d\n", rc); return 1; }
 
     // Wu: weight, SFB layout (is_sfb=true)
     uint8_t *d_Wu_packed, *d_Wu_sfb;
     CHECK(cudaMalloc(&d_Wu_packed, N * K / 2));
-    int wu_sfb_sz = flash_vla::fp4::sfa_size_bytes(N, K, /*is_sfb=*/true);
+    int wu_sfb_sz = flash_rt::fp4::sfa_size_bytes(N, K, /*is_sfb=*/true);
     CHECK(cudaMalloc(&d_Wu_sfb, wu_sfb_sz));
-    rc = flash_vla::fp4::quantize_fp4_dynamic_sfa_fp16(
+    rc = flash_rt::fp4::quantize_fp4_dynamic_sfa_fp16(
         d_Wu, d_Wu_packed, d_Wu_sfb, N, K, true, 0);
     if (rc) { fprintf(stderr, "quantize Wu failed rc=%d\n", rc); return 1; }
 
@@ -171,13 +171,13 @@ int main() {
     // ─── Allocate output for the FUSED kernel (silu_aux) ─────────────────
     uint8_t *d_D_packed, *d_D_sfa;
     CHECK(cudaMalloc(&d_D_packed, M * N / 2));
-    int d_sfa_sz = flash_vla::fp4::sfa_size_bytes(M, N, /*is_sfb=*/false);
+    int d_sfa_sz = flash_rt::fp4::sfa_size_bytes(M, N, /*is_sfb=*/false);
     CHECK(cudaMalloc(&d_D_sfa, d_sfa_sz));
     CHECK(cudaMemset(d_D_packed, 0, M * N / 2));
     CHECK(cudaMemset(d_D_sfa, 0, d_sfa_sz));
 
     // ─── Run the fused P1 kernel ─────────────────────────────────────────
-    rc = flash_vla::fp4::cutlass_fp4_gemm_silu_aux_fp4(
+    rc = flash_rt::fp4::cutlass_fp4_gemm_silu_aux_fp4(
         d_X_packed, d_X_sfa,
         d_Wu_packed, d_Wu_sfb,
         d_gate,
@@ -264,14 +264,14 @@ int main() {
     cudaEventCreate(&e1); cudaEventCreate(&e2);
     const int iters = 200, warmup = 20;
     for (int i = 0; i < warmup; ++i) {
-      flash_vla::fp4::cutlass_fp4_gemm_silu_aux_fp4(
+      flash_rt::fp4::cutlass_fp4_gemm_silu_aux_fp4(
           d_X_packed, d_X_sfa, d_Wu_packed, d_Wu_sfb, d_gate,
           d_D_packed, d_D_sfa, M, N, K, 0);
     }
     cudaDeviceSynchronize();
     cudaEventRecord(e1);
     for (int i = 0; i < iters; ++i) {
-      flash_vla::fp4::cutlass_fp4_gemm_silu_aux_fp4(
+      flash_rt::fp4::cutlass_fp4_gemm_silu_aux_fp4(
           d_X_packed, d_X_sfa, d_Wu_packed, d_Wu_sfb, d_gate,
           d_D_packed, d_D_sfa, M, N, K, 0);
     }
