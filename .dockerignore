@@ -1,0 +1,25 @@
+# Don't ship local artefacts into the build context — they get rebuilt
+# inside the image, and shipping them bloats `docker build`'s tarball
+# from ~28 MB to ~320 MB on a developer machine.
+build/
+build*/
+third_party/
+**/__pycache__/
+*.pyc
+.git/
+.gitignore
+.pytest_cache/
+.venv/
+*.so
+*.pyd
+*.dylib
+*.dll
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store
+
+# CI / scratch
+.github/
+node_modules/

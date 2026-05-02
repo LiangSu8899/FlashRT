@@ -4,7 +4,7 @@
 
 A general kernel library composed into static graphs — no ONNX export, no engine compilation, no per-driver rebuild. Hand-written kernels (norm / activation / fusion / RoPE / FP8 / NVFP4 GEMM / attention) cover standard transformer, DiT, and SigLIP primitives. The composition pattern itself is hardware-agnostic; today the codebase ships with NVIDIA implementations spanning edge to server (Jetson AGX Thor through A100 / RTX 4090 / 5090).
 
-The flagship integration is **FlashRT** — production VLA control for Pi0, Pi0.5, GROOT N1.6, and Pi0-FAST, validated on LIBERO. The same kernel set also powers the BAGEL world-model image-generation pipeline (research preview) and audio / video generation (4× over PyTorch). The pattern is workload-shaped (small-batch realtime), not model-class-shaped.
+The flagship integration is production VLA control for Pi0, Pi0.5, GROOT N1.6, and Pi0-FAST, validated on LIBERO. The same kernel set also powers the BAGEL world-model image-generation pipeline (research preview) and audio / video generation (4× over PyTorch). The pattern is workload-shaped (small-batch realtime), not model-class-shaped.
 
 Existing inference tooling is shaped for different workloads — TensorRT for tactic-search compile to frozen engines, vLLM / SGLang for high-batch LLM serving. FlashRT targets the small-batch realtime cell with hand-tuned kernels and no compile step.
 
@@ -491,60 +491,49 @@ directly, so you never hit the `flash-attn` wheel's
 `FVK_RTX_FA2=0` is still supported as a fall-back to `pip flash-attn`
 for debugging, but the default path has zero pip-wheel dependency.
 
-### Option A — Docker (recommended for exact reproduction)
+### Option A — Prebuilt Docker image (fastest, recommended)
 
-FlashRT is tested against NVIDIA's NGC PyTorch container. Build
-inside the container so the CUDA/torch/nvcc toolchain is already
-pinned and known-good:
+The published image already has CUDA 13.0, PyTorch 2.9, the
+FlashRT kernels prebuilt, and CUTLASS vendored — pull and run, no
+local compile, no `flash-attn` wheel hunting:
 
 ```bash
-# Host: launch container with GPU + repo mount
-docker run -d --gpus all --ipc=host --network=host --name flashrt-dev \
-  -v $(pwd):/workspace/FlashRT \
-  nvcr.io/nvidia/pytorch:25.10-py3 sleep infinity
-
-# Inside the container
-docker exec -it flashrt-dev bash
-cd /workspace/FlashRT
-
-# CUTLASS 4.x (for the main FP4/FP8 kernels — this is *separate* from
-# the CUTLASS 3.x vendored for FA2 under csrc/attention/flash_attn_2_src/)
-git clone --depth 1 --branch v4.4.2 \
-    https://github.com/NVIDIA/cutlass.git third_party/cutlass
-
-# Python deps — torch + jax are already in the NGC image; add ours
-pip install -e ".[torch]"          # or "[jax]" / "[all]"
-# NOTE: editable mode (-e) is required. The cmake build below drops
-# compiled .so files into flash_rt/ in the source tree; editable
-# install makes that directory importable directly. A non-editable
-# `pip install .` would install a copy BEFORE the .so files exist and
-# `import flash_rt` would fail at runtime with a missing-module error.
-
-# Build — CMake auto-detects GPU arch via nvidia-smi.
-# On RTX (SM80/86/89/120) this produces BOTH flash_rt_kernels.so and
-# flash_rt_fa2.so; on Thor (SM110) it produces only the former.
-# CMake writes .so files directly into flash_rt/ at build time —
-# no separate `cp`, `make install`, or `ninja install` step needed.
-cmake -B build -S .
-cmake --build build -j$(nproc)
-
-# Verify
-python -c "import flash_rt; from flash_rt import flash_rt_kernels, flash_rt_fa2; \
-           print('kernels:', flash_rt_kernels.has_cutlass_sm100()); \
-           print('fa2.fwd_fp16:', callable(flash_rt_fa2.fwd_fp16)); \
-           print('fa2.fwd_bf16:', callable(flash_rt_fa2.fwd_bf16))"
-# kernels: True/False  (True on Thor, False on RTX — expected)
-# fa2.fwd_fp16: True
-# fa2.fwd_bf16: True
+docker pull ghcr.io/liangsu8899/flashrt:latest
+docker run --rm --gpus all -it ghcr.io/liangsu8899/flashrt:latest
+# Drops you in a Python REPL with `flash_rt` already imported.
 ```
 
-The `nvcr.io/nvidia/pytorch:25.10-py3` image includes CUDA 13.0,
-cuBLASLt, PyTorch 2.9 (with SM120 support), and nvcc 13.0.88 — all
-pinned versions that match this repo's CI. For 4090 you use the same
-image; see [`docs/deployment_rtx4090.md`](docs/deployment_rtx4090.md)
-for a step-by-step.
+For Modal / RunPod / Vast and other cloud runners, point the image
+config at the same registry — Modal cold-start drops from a 10-minute
+kernel compile to a ~30-second pull:
 
-### Option B — Native Linux (no Docker)
+```python
+image = modal.Image.from_registry("ghcr.io/liangsu8899/flashrt:0.2.0")
+```
+
+Tags + advanced usage (build args, slim variants, mounting checkpoints):
+see [`docker/README.md`](docker/README.md).
+
+> **Thor (SM110)** is not covered by this image — Jetson is ARM64 and
+> uses a different NVIDIA base. Thor users follow Option C below.
+
+### Option B — Build the Docker image yourself
+
+If you need a different GPU arch, want to pin a specific commit, or
+prefer to vet the image source:
+
+```bash
+git clone https://github.com/LiangSu8899/FlashRT.git
+cd FlashRT
+docker build -t flashrt:dev -f docker/Dockerfile .
+docker run --rm --gpus all -it flashrt:dev
+```
+
+Build args (`GPU_ARCH`, `FA2_HDIMS`, `BASE_IMAGE`, `CUTLASS_REF`)
+documented in [`docker/README.md`](docker/README.md). Cold build on a
+fresh host is ~25 min (NGC pull + FA2 codegen); warm rebuild ~12 min.
+
+### Option C — Native Linux (no Docker)
 
 System requirements:
 
