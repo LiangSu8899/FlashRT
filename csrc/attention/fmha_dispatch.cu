@@ -6,9 +6,31 @@
 // ================================================================
 
 #include "fmha_dispatch.h"
-#include <dlfcn.h>
 #include <cstdio>
 #include <cublasLt.h>
+
+// ── Cross-platform dynamic library loading ──
+// Linux: dlopen/dlsym/dlclose (POSIX).
+// Windows: LoadLibraryA/GetProcAddress/FreeLibrary (Win32).
+// The wrapper keeps the rest of the file dlopen-style and lets the
+// SM100/SM110 CUTLASS FMHA path stay available on Windows builds —
+// callers just have to pass a .dll path instead of a .so.
+#ifdef _WIN32
+  #define WIN32_LEAN_AND_MEAN
+  #include <windows.h>
+  using DynLibHandle = HMODULE;
+  static DynLibHandle dyn_open(const char* path)                  { return LoadLibraryA(path); }
+  static void*        dyn_sym(DynLibHandle h, const char* name)   { return reinterpret_cast<void*>(GetProcAddress(h, name)); }
+  static void         dyn_close(DynLibHandle h)                   { if (h) FreeLibrary(h); }
+  static const char*  dyn_error()                                 { return "LoadLibrary/GetProcAddress failed (Win32 GetLastError available via system error code)"; }
+#else
+  #include <dlfcn.h>
+  using DynLibHandle = void*;
+  static DynLibHandle dyn_open(const char* path)                  { return dlopen(path, RTLD_LAZY); }
+  static void*        dyn_sym(DynLibHandle h, const char* name)   { return dlsym(h, name); }
+  static void         dyn_close(DynLibHandle h)                   { if (h) dlclose(h); }
+  static const char*  dyn_error()                                 { return dlerror(); }
+#endif
 
 // ── Function pointer types for dlopen'd FMHA ──
 typedef int (*fmha_fn_t)(
@@ -23,8 +45,8 @@ typedef int (*fmha_strided_fn_t)(
     int, int, int, int, int, int, int, int, void*);
 
 // ── Global state ──
-static void* g_fmha_lib = nullptr;
-static void* g_fmha_strided_lib = nullptr;
+static DynLibHandle g_fmha_lib = nullptr;
+static DynLibHandle g_fmha_strided_lib = nullptr;
 static fmha_fn_t g_fmha_fn = nullptr;
 static fmha_strided_fn_t g_fmha_strided_fn = nullptr;
 static FMHABackend g_active_backend = FMHABackend::AUTO;
@@ -32,13 +54,13 @@ static FMHABackend g_active_backend = FMHABackend::AUTO;
 // ── Library loading ──
 
 int load_fmha_library(const char* path) {
-    g_fmha_lib = dlopen(path, RTLD_LAZY);
+    g_fmha_lib = dyn_open(path);
     if (!g_fmha_lib) {
         fprintf(stderr, "[FlashVLA] Failed to load FMHA library: %s\n  %s\n",
-                path, dlerror());
+                path, dyn_error());
         return -1;
     }
-    g_fmha_fn = (fmha_fn_t)dlsym(g_fmha_lib, "fmha_fp16_attn");
+    g_fmha_fn = (fmha_fn_t)dyn_sym(g_fmha_lib, "fmha_fp16_attn");
     if (!g_fmha_fn) {
         fprintf(stderr, "[FlashVLA] Symbol 'fmha_fp16_attn' not found in %s\n", path);
         return -1;
@@ -48,13 +70,13 @@ int load_fmha_library(const char* path) {
 }
 
 int load_fmha_strided_library(const char* path) {
-    g_fmha_strided_lib = dlopen(path, RTLD_LAZY);
+    g_fmha_strided_lib = dyn_open(path);
     if (!g_fmha_strided_lib) {
         fprintf(stderr, "[FlashVLA] Failed to load strided FMHA library: %s\n  %s\n",
-                path, dlerror());
+                path, dyn_error());
         return -1;
     }
-    g_fmha_strided_fn = (fmha_strided_fn_t)dlsym(g_fmha_strided_lib, "fmha_fp16_strided");
+    g_fmha_strided_fn = (fmha_strided_fn_t)dyn_sym(g_fmha_strided_lib, "fmha_fp16_strided");
     if (!g_fmha_strided_fn) {
         fprintf(stderr, "[FlashVLA] Symbol 'fmha_fp16_strided' not found in %s\n", path);
         return -1;

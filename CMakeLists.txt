@@ -109,6 +109,31 @@ set(FA2_HDIMS "96;128;256" CACHE STRING
 set(FA2_DTYPES "fp16;bf16" CACHE STRING
     "Semicolon-separated FA2 dtype instantiations to build. Pi0 uses fp16; pi0.5/groot use bf16.")
 
+# ── MSVC / Windows host-compiler flags ──
+# Linux is the primary platform; this block only activates under MSVC.
+#   /bigobj  — FA2 + CUTLASS template instantiations blow past the
+#              default 65k-section limit. Required for the FA2 object lib.
+#   /utf-8   — sources contain non-ASCII comments (e.g. "→"). Without
+#              this, MSVC interprets them as the system code page and
+#              warns/errors depending on locale.
+#   /Zc:__cplusplus — make __cplusplus report the real value so feature
+#              detection (in CUTLASS, pybind11) doesn't see C++98.
+#   /EHsc    — standard C++ exception model (pybind11 expects it).
+# We push these globally for both CXX and the nvcc host pass via
+# -Xcompiler. nvcc-only flags stay where they are.
+if(MSVC)
+  add_compile_options(
+    $<$<COMPILE_LANGUAGE:CXX>:/bigobj>
+    $<$<COMPILE_LANGUAGE:CXX>:/utf-8>
+    $<$<COMPILE_LANGUAGE:CXX>:/Zc:__cplusplus>
+    $<$<COMPILE_LANGUAGE:CXX>:/EHsc>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/bigobj>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:__cplusplus>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc>
+  )
+endif()
+
 # ── Paths ──
 set(CUTLASS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cutlass)
 set(CUTLASS_INCLUDE ${CUTLASS_DIR}/include)
@@ -303,7 +328,9 @@ if(ENABLE_FA2)
       # arg (seen with make VERBOSE=1: the dangling -Xcompiler would
       # grab the first -gencode and forward it to gcc, which then
       # misreads it as a -g<level> debug flag).
-      "SHELL:-Xcompiler -Wno-deprecated-declarations"
+      # MSVC equivalent of -Wno-deprecated-declarations is /wd4996.
+      $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:SHELL:-Xcompiler -Wno-deprecated-declarations>
+      $<$<CXX_COMPILER_ID:MSVC>:SHELL:-Xcompiler /wd4996>
       # nvcc's per-file internal parallelism (CUDA 11.2+). Pipes the
       # several codegen stages (front-end, PTXAS, fatbin-pack) through
       # up to 4 threads, cutting single-file compile time ~20% on

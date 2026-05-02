@@ -22,9 +22,8 @@ __global__ void gate_silu_mul_kernel(const T* __restrict__ gate,
     }
 }
 
-template __global__ void gate_silu_mul_kernel<__half>(const __half*, const __half*, __half*, int);
-template __global__ void gate_silu_mul_kernel<__nv_bfloat16>(const __nv_bfloat16*, const __nv_bfloat16*, __nv_bfloat16*, int);
-
+FVK_KERNEL_INSTANTIATE(__global__ void gate_silu_mul_kernel<__half>(const __half*, const __half*, __half*, int))
+FVK_KERNEL_INSTANTIATE(__global__ void gate_silu_mul_kernel<__nv_bfloat16>(const __nv_bfloat16*, const __nv_bfloat16*, __nv_bfloat16*, int))
 void gate_silu_mul(const __nv_bfloat16* gate, const __nv_bfloat16* up,
                    __nv_bfloat16* out, int n, cudaStream_t stream) {
     gate_silu_mul_kernel<__nv_bfloat16><<<(n + 255) / 256, 256, 0, stream>>>(gate, up, out, n);
@@ -52,9 +51,8 @@ __global__ void gelu_kernel(T* __restrict__ x, int n) {
     }
 }
 
-template __global__ void gelu_kernel<__half>(__half*, int);
-template __global__ void gelu_kernel<__nv_bfloat16>(__nv_bfloat16*, int);
-
+FVK_KERNEL_INSTANTIATE(__global__ void gelu_kernel<__half>(__half*, int))
+FVK_KERNEL_INSTANTIATE(__global__ void gelu_kernel<__nv_bfloat16>(__nv_bfloat16*, int))
 void gelu_inplace(__nv_bfloat16* x, int n, cudaStream_t stream) {
     int n2 = n >> 1;
     gelu_kernel<__nv_bfloat16><<<(n2 + 255) / 256, 256, 0, stream>>>(x, n);
@@ -83,9 +81,8 @@ __global__ void gate_silu_mul_merged_kernel(const T* __restrict__ merged,
     }
 }
 
-template __global__ void gate_silu_mul_merged_kernel<__half>(const __half*, __half*, int, int);
-template __global__ void gate_silu_mul_merged_kernel<__nv_bfloat16>(const __nv_bfloat16*, __nv_bfloat16*, int, int);
-
+FVK_KERNEL_INSTANTIATE(__global__ void gate_silu_mul_merged_kernel<__half>(const __half*, __half*, int, int))
+FVK_KERNEL_INSTANTIATE(__global__ void gate_silu_mul_merged_kernel<__nv_bfloat16>(const __nv_bfloat16*, __nv_bfloat16*, int, int))
 void gate_silu_mul_merged(const __nv_bfloat16* merged, __nv_bfloat16* out,
                            int seq, int half_dim, cudaStream_t stream) {
     int total = seq * half_dim;
@@ -152,9 +149,8 @@ __global__ void gate_silu_mul_merged_fp8_kernel(const T* __restrict__ merged,
     }
 }
 
-template __global__ void gate_silu_mul_merged_fp8_kernel<__half>(const __half*, __nv_fp8_e4m3*, int, int, const float*);
-template __global__ void gate_silu_mul_merged_fp8_kernel<__nv_bfloat16>(const __nv_bfloat16*, __nv_fp8_e4m3*, int, int, const float*);
-
+FVK_KERNEL_INSTANTIATE(__global__ void gate_silu_mul_merged_fp8_kernel<__half>(const __half*, __nv_fp8_e4m3*, int, int, const float*))
+FVK_KERNEL_INSTANTIATE(__global__ void gate_silu_mul_merged_fp8_kernel<__nv_bfloat16>(const __nv_bfloat16*, __nv_fp8_e4m3*, int, int, const float*))
 void gate_silu_mul_merged_fp8(const __nv_bfloat16* merged, __nv_fp8_e4m3* out,
                                int seq, int half_dim,
                                const float* d_scale, cudaStream_t stream) {
@@ -190,9 +186,8 @@ __global__ void silu_mul_split_fp8_kernel(const T* __restrict__ gate,
     out[idx] = __nv_fp8_e4m3(fminf(fmaxf(val, -448.0f), 448.0f));
 }
 
-template __global__ void silu_mul_split_fp8_kernel<__half>(const __half*, const __half*, __nv_fp8_e4m3*, int, const float*);
-template __global__ void silu_mul_split_fp8_kernel<__nv_bfloat16>(const __nv_bfloat16*, const __nv_bfloat16*, __nv_fp8_e4m3*, int, const float*);
-
+FVK_KERNEL_INSTANTIATE(__global__ void silu_mul_split_fp8_kernel<__half>(const __half*, const __half*, __nv_fp8_e4m3*, int, const float*))
+FVK_KERNEL_INSTANTIATE(__global__ void silu_mul_split_fp8_kernel<__nv_bfloat16>(const __nv_bfloat16*, const __nv_bfloat16*, __nv_fp8_e4m3*, int, const float*))
 void silu_mul_split_fp8_fp16(const __half* gate, const __half* up,
                               __nv_fp8_e4m3* out, int n,
                               const float* d_scale, cudaStream_t stream) {
@@ -216,8 +211,7 @@ __global__ void silu_inplace_kernel(T* __restrict__ x, int n) {
     }
 }
 
-template __global__ void silu_inplace_kernel<__half>(__half*, int);
-
+FVK_KERNEL_INSTANTIATE(__global__ void silu_inplace_kernel<__half>(__half*, int))
 void silu_inplace_fp16(__half* x, int n, cudaStream_t stream) {
     int n2 = n >> 1;
     silu_inplace_kernel<__half><<<(n2 + 255) / 256, 256, 0, stream>>>(x, n);
@@ -242,9 +236,8 @@ __global__ void fused_add_silu_kernel(T* __restrict__ a,
     }
 }
 
-template __global__ void fused_add_silu_kernel<__half>(__half*, const __half*, int);
-template __global__ void fused_add_silu_kernel<__nv_bfloat16>(__nv_bfloat16*, const __nv_bfloat16*, int);
-
+FVK_KERNEL_INSTANTIATE(__global__ void fused_add_silu_kernel<__half>(__half*, const __half*, int))
+FVK_KERNEL_INSTANTIATE(__global__ void fused_add_silu_kernel<__nv_bfloat16>(__nv_bfloat16*, const __nv_bfloat16*, int))
 void fused_add_silu_fp16(__half* a, const __half* b, int n, cudaStream_t stream) {
     int n2 = n >> 1;
     fused_add_silu_kernel<__half><<<(n2 + 255) / 256, 256, 0, stream>>>(a, b, n);
@@ -270,8 +263,7 @@ __global__ void relu_inplace_kernel(T* __restrict__ x, int n) {
     }
 }
 
-template __global__ void relu_inplace_kernel<__half>(__half*, int);
-
+FVK_KERNEL_INSTANTIATE(__global__ void relu_inplace_kernel<__half>(__half*, int))
 void relu_inplace_fp16(__half* x, int n, cudaStream_t stream) {
     int n2 = n >> 1;
     relu_inplace_kernel<__half><<<(n2 + 255) / 256, 256, 0, stream>>>(x, n);

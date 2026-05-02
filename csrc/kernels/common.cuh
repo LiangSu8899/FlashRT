@@ -13,6 +13,19 @@
 #include <cuda_fp8.h>
 #include <cstdint>
 
+// ── Explicit-instantiation guard for MSVC ──
+// MSVC 19.50 (Visual Studio 2022/2026) refuses explicit __global__
+// template instantiations whose signatures contain const-qualified
+// pointers + typedef aliases like __half (matched by GCC/Clang).
+// Linux keeps the explicit instantiations (cross-TU safe, earlier
+// link errors); MSVC relies on implicit instantiation triggered by
+// the host wrapper kernel-launches living in the same .cu file.
+#ifdef _MSC_VER
+  #define FVK_KERNEL_INSTANTIATE(decl) /* implicit on MSVC */
+#else
+  #define FVK_KERNEL_INSTANTIATE(decl) template decl;
+#endif
+
 // ── Generic dtype conversion (template) ──
 // Every kernel uses these instead of hardcoded bf16_to_f32 / f32_to_bf16.
 
