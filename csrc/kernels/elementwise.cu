@@ -26,9 +26,8 @@ __global__ void gate_mul_res_kernel(T* __restrict__ residual,
     }
 }
 
-template __global__ void gate_mul_res_kernel<__half>(__half*, const __half*, const __half*, int);
-template __global__ void gate_mul_res_kernel<__nv_bfloat16>(__nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, int);
-
+FVK_KERNEL_INSTANTIATE(__global__ void gate_mul_res_kernel<__half>(__half*, const __half*, const __half*, int))
+FVK_KERNEL_INSTANTIATE(__global__ void gate_mul_res_kernel<__nv_bfloat16>(__nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, int))
 void gate_mul_residual(__nv_bfloat16* residual, const __nv_bfloat16* x,
                        const __nv_bfloat16* gate, int n, cudaStream_t stream) {
     int n2 = n >> 1;
@@ -60,9 +59,8 @@ __global__ void bias_res_kernel(T* __restrict__ residual,
     }
 }
 
-template __global__ void bias_res_kernel<__half>(__half*, const __half*, const __half*, int);
-template __global__ void bias_res_kernel<__nv_bfloat16>(__nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, int);
-
+FVK_KERNEL_INSTANTIATE(__global__ void bias_res_kernel<__half>(__half*, const __half*, const __half*, int))
+FVK_KERNEL_INSTANTIATE(__global__ void bias_res_kernel<__nv_bfloat16>(__nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, int))
 void bias_residual(__nv_bfloat16* residual, const __nv_bfloat16* x,
                    const __nv_bfloat16* bias, int seq_len, int dim,
                    cudaStream_t stream) {
@@ -91,9 +89,8 @@ __global__ void res_add_kernel(T* __restrict__ residual,
     }
 }
 
-template __global__ void res_add_kernel<__half>(__half*, const __half*, int);
-template __global__ void res_add_kernel<__nv_bfloat16>(__nv_bfloat16*, const __nv_bfloat16*, int);
-
+FVK_KERNEL_INSTANTIATE(__global__ void res_add_kernel<__half>(__half*, const __half*, int))
+FVK_KERNEL_INSTANTIATE(__global__ void res_add_kernel<__nv_bfloat16>(__nv_bfloat16*, const __nv_bfloat16*, int))
 void residual_add(__nv_bfloat16* residual, const __nv_bfloat16* x, int n,
                   cudaStream_t stream) {
     int n2 = n >> 1;
@@ -131,11 +128,10 @@ __global__ void cfg_combine_kernel(T* __restrict__ residual,
     }
 }
 
-template __global__ void cfg_combine_kernel<__half>(
-    __half*, const __half*, const __half*, float, int);
-template __global__ void cfg_combine_kernel<__nv_bfloat16>(
-    __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, float, int);
-
+FVK_KERNEL_INSTANTIATE(__global__ void cfg_combine_kernel<__half>(
+    __half*, const __half*, const __half*, float, int))
+FVK_KERNEL_INSTANTIATE(__global__ void cfg_combine_kernel<__nv_bfloat16>(
+    __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, float, int))
 void cfg_combine_into_residual(__nv_bfloat16* residual,
                                const __nv_bfloat16* v_cond,
                                const __nv_bfloat16* v_uncond,

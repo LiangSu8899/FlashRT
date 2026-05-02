@@ -38,9 +38,8 @@ __global__ void rms_norm_kernel(const T* __restrict__ x,
 }
 
 // Explicit instantiation
-template __global__ void rms_norm_kernel<__half>(const __half*, const __half*, __half*, int, float);
-template __global__ void rms_norm_kernel<__nv_bfloat16>(const __nv_bfloat16*, const __nv_bfloat16*, __nv_bfloat16*, int, float);
-
+FVK_KERNEL_INSTANTIATE(__global__ void rms_norm_kernel<__half>(const __half*, const __half*, __half*, int, float))
+FVK_KERNEL_INSTANTIATE(__global__ void rms_norm_kernel<__nv_bfloat16>(const __nv_bfloat16*, const __nv_bfloat16*, __nv_bfloat16*, int, float))
 void rms_norm(const __nv_bfloat16* x, const __nv_bfloat16* weight,
               __nv_bfloat16* out, int seq_len, int dim, float eps,
               cudaStream_t stream) {
@@ -97,9 +96,8 @@ __global__ void layer_norm_kernel(const T* __restrict__ x,
     }
 }
 
-template __global__ void layer_norm_kernel<__half>(const __half*, const __half*, const __half*, __half*, int, float);
-template __global__ void layer_norm_kernel<__nv_bfloat16>(const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, __nv_bfloat16*, int, float);
-
+FVK_KERNEL_INSTANTIATE(__global__ void layer_norm_kernel<__half>(const __half*, const __half*, const __half*, __half*, int, float))
+FVK_KERNEL_INSTANTIATE(__global__ void layer_norm_kernel<__nv_bfloat16>(const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, __nv_bfloat16*, int, float))
 void layer_norm(const __nv_bfloat16* x, const __nv_bfloat16* weight,
                 const __nv_bfloat16* bias, __nv_bfloat16* out,
                 int seq_len, int dim, float eps, cudaStream_t stream) {
@@ -169,8 +167,7 @@ __global__ void layer_norm_fp8_kernel(const T* __restrict__ x,
     }
 }
 
-template __global__ void layer_norm_fp8_kernel<__nv_bfloat16>(const __nv_bfloat16*, __nv_fp8_e4m3*, const __nv_bfloat16*, const __nv_bfloat16*, int, float);
-
+FVK_KERNEL_INSTANTIATE(__global__ void layer_norm_fp8_kernel<__nv_bfloat16>(const __nv_bfloat16*, __nv_fp8_e4m3*, const __nv_bfloat16*, const __nv_bfloat16*, int, float))
 void layer_norm_fp8(const __half* x, __nv_fp8_e4m3* out,
                      const __half* gamma, const __half* beta,
                      int seq_len, int dim, float eps, cudaStream_t stream) {
@@ -222,9 +219,8 @@ __global__ void ada_rms_norm_style_kernel(
     }
 }
 
-template __global__ void ada_rms_norm_style_kernel<__half>(const __half*, const __half*, const __half*, __half*, __half*, int, float);
-template __global__ void ada_rms_norm_style_kernel<__nv_bfloat16>(const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, int, float);
-
+FVK_KERNEL_INSTANTIATE(__global__ void ada_rms_norm_style_kernel<__half>(const __half*, const __half*, const __half*, __half*, __half*, int, float))
+FVK_KERNEL_INSTANTIATE(__global__ void ada_rms_norm_style_kernel<__nv_bfloat16>(const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, int, float))
 void ada_rms_norm_style(const __nv_bfloat16* x, const __nv_bfloat16* weight,
                         const __nv_bfloat16* style,
                         __nv_bfloat16* out, __nv_bfloat16* gate_out,
@@ -266,9 +262,8 @@ __global__ void rms_norm_fp8_kernel(const T* __restrict__ x,
     }
 }
 
-template __global__ void rms_norm_fp8_kernel<__half>(const __half*, const __half*, __nv_fp8_e4m3*, int, float, const float*);
-template __global__ void rms_norm_fp8_kernel<__nv_bfloat16>(const __nv_bfloat16*, const __nv_bfloat16*, __nv_fp8_e4m3*, int, float, const float*);
-
+FVK_KERNEL_INSTANTIATE(__global__ void rms_norm_fp8_kernel<__half>(const __half*, const __half*, __nv_fp8_e4m3*, int, float, const float*))
+FVK_KERNEL_INSTANTIATE(__global__ void rms_norm_fp8_kernel<__nv_bfloat16>(const __nv_bfloat16*, const __nv_bfloat16*, __nv_fp8_e4m3*, int, float, const float*))
 void rms_norm_fp8(const __nv_bfloat16* x, const __nv_bfloat16* weight,
                    __nv_fp8_e4m3* out, int seq_len, int dim, float eps,
                    const float* d_scale, cudaStream_t stream) {
@@ -321,9 +316,8 @@ __global__ void ada_rms_norm_style_fp8_kernel(
     }
 }
 
-template __global__ void ada_rms_norm_style_fp8_kernel<__half>(const __half*, const __half*, const __half*, __nv_fp8_e4m3*, __half*, int, float, const float*);
-template __global__ void ada_rms_norm_style_fp8_kernel<__nv_bfloat16>(const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, __nv_fp8_e4m3*, __nv_bfloat16*, int, float, const float*);
-
+FVK_KERNEL_INSTANTIATE(__global__ void ada_rms_norm_style_fp8_kernel<__half>(const __half*, const __half*, const __half*, __nv_fp8_e4m3*, __half*, int, float, const float*))
+FVK_KERNEL_INSTANTIATE(__global__ void ada_rms_norm_style_fp8_kernel<__nv_bfloat16>(const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, __nv_fp8_e4m3*, __nv_bfloat16*, int, float, const float*))
 void ada_rms_norm_style_fp8(const __nv_bfloat16* x, const __nv_bfloat16* weight,
                              const __nv_bfloat16* style,
                              __nv_fp8_e4m3* out, __nv_bfloat16* gate_out,
@@ -368,9 +362,8 @@ __global__ void residual_add_rms_norm_fp8_kernel(
     }
 }
 
-template __global__ void residual_add_rms_norm_fp8_kernel<__half>(__half*, const __half*, const __half*, __nv_fp8_e4m3*, int, float, const float*);
-template __global__ void residual_add_rms_norm_fp8_kernel<__nv_bfloat16>(__nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, __nv_fp8_e4m3*, int, float, const float*);
-
+FVK_KERNEL_INSTANTIATE(__global__ void residual_add_rms_norm_fp8_kernel<__half>(__half*, const __half*, const __half*, __nv_fp8_e4m3*, int, float, const float*))
+FVK_KERNEL_INSTANTIATE(__global__ void residual_add_rms_norm_fp8_kernel<__nv_bfloat16>(__nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, __nv_fp8_e4m3*, int, float, const float*))
 void residual_add_rms_norm_fp8(__nv_bfloat16* residual, const __nv_bfloat16* x,
                                 const __nv_bfloat16* weight, __nv_fp8_e4m3* out,
                                 int seq_len, int dim, float eps,
@@ -419,9 +412,8 @@ __global__ void residual_add_rms_norm_kernel(
     }
 }
 
-template __global__ void residual_add_rms_norm_kernel<__half>(__half*, const __half*, const __half*, __half*, int, float);
-template __global__ void residual_add_rms_norm_kernel<__nv_bfloat16>(__nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, __nv_bfloat16*, int, float);
-
+FVK_KERNEL_INSTANTIATE(__global__ void residual_add_rms_norm_kernel<__half>(__half*, const __half*, const __half*, __half*, int, float))
+FVK_KERNEL_INSTANTIATE(__global__ void residual_add_rms_norm_kernel<__nv_bfloat16>(__nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, __nv_bfloat16*, int, float))
 void residual_add_rms_norm(__nv_bfloat16* residual, const __nv_bfloat16* x,
                             const __nv_bfloat16* weight, __nv_bfloat16* out,
                             int seq_len, int dim, float eps,

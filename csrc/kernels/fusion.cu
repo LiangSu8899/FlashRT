@@ -64,13 +64,12 @@ __global__ void gate_residual_ada_norm_fp8_kernel(
     }
 }
 
-template __global__ void gate_residual_ada_norm_fp8_kernel<__half>(
+FVK_KERNEL_INSTANTIATE(__global__ void gate_residual_ada_norm_fp8_kernel<__half>(
     __half*, const __half*, const __half*, const __half*, const __half*,
-    __nv_fp8_e4m3*, __half*, int, float, const float*);
-template __global__ void gate_residual_ada_norm_fp8_kernel<__nv_bfloat16>(
+    __nv_fp8_e4m3*, __half*, int, float, const float*))
+FVK_KERNEL_INSTANTIATE(__global__ void gate_residual_ada_norm_fp8_kernel<__nv_bfloat16>(
     __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*,
-    __nv_fp8_e4m3*, __nv_bfloat16*, int, float, const float*);
-
+    __nv_fp8_e4m3*, __nv_bfloat16*, int, float, const float*))
 void gate_residual_ada_norm_fp8(__nv_bfloat16* residual, const __nv_bfloat16* x,
                                  const __nv_bfloat16* gate, const __nv_bfloat16* weight,
                                  const __nv_bfloat16* style,

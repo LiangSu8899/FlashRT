@@ -34,9 +34,8 @@ __global__ void absmax_kernel(const T* __restrict__ x, float* max_val, int n) {
     if (threadIdx.x == 0) atomicMax((int*)max_val, __float_as_int(local_max));
 }
 
-template __global__ void absmax_kernel<__half>(const __half*, float*, int);
-template __global__ void absmax_kernel<__nv_bfloat16>(const __nv_bfloat16*, float*, int);
-
+FVK_KERNEL_INSTANTIATE(__global__ void absmax_kernel<__half>(const __half*, float*, int))
+FVK_KERNEL_INSTANTIATE(__global__ void absmax_kernel<__nv_bfloat16>(const __nv_bfloat16*, float*, int))
 // Verbatim production quant_fp8_static_k: 4 elem/thread, packed uint32 store
 __global__ void quantize_fp8_kernel(const __half* in, __nv_fp8_e4m3* out, const float* descale_ptr, int n) {
     int i = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
@@ -72,9 +71,8 @@ __global__ void quantize_fp8_kernel_generic(const T* __restrict__ input,
     }
 }
 
-template __global__ void quantize_fp8_kernel_generic<__half>(const __half*, __nv_fp8_e4m3*, const float*, int);
-template __global__ void quantize_fp8_kernel_generic<__nv_bfloat16>(const __nv_bfloat16*, __nv_fp8_e4m3*, const float*, int);
-
+FVK_KERNEL_INSTANTIATE(__global__ void quantize_fp8_kernel_generic<__half>(const __half*, __nv_fp8_e4m3*, const float*, int))
+FVK_KERNEL_INSTANTIATE(__global__ void quantize_fp8_kernel_generic<__nv_bfloat16>(const __nv_bfloat16*, __nv_fp8_e4m3*, const float*, int))
 float quantize_fp8(const __nv_bfloat16* input, __nv_fp8_e4m3* output,
                    float* d_scale, int n, cudaStream_t stream) {
     float* d_max;

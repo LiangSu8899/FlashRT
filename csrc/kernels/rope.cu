@@ -82,12 +82,11 @@ __global__ void qkv_split_kernel_t(const T* __restrict__ qkv,
     }
 }
 
-template __global__ void qkv_split_kernel_t<__half>(
-    const __half*, __half*, __half*, __half*, int, int, int, int);
-template __global__ void qkv_split_kernel_t<__nv_bfloat16>(
+FVK_KERNEL_INSTANTIATE(__global__ void qkv_split_kernel_t<__half>(
+    const __half*, __half*, __half*, __half*, int, int, int, int))
+FVK_KERNEL_INSTANTIATE(__global__ void qkv_split_kernel_t<__nv_bfloat16>(
     const __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*,
-    int, int, int, int);
-
+    int, int, int, int))
 // Legacy BF16 kernel name — kept as thin alias for ABI compatibility.
 __global__ void qkv_split_kernel(const __nv_bfloat16* __restrict__ qkv,
                                   __nv_bfloat16* __restrict__ Q,
