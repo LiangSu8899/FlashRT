@@ -1,10 +1,10 @@
 """
 CKernelBagel — Pure C-kernel 28-layer full-MoT forward for BAGEL.
 
-All operations via flash_vla_kernels (BF16 native) and flash_wm_kernels (BF16 ports).
+All operations via flash_rt_kernels (BF16 native) and flash_wm_kernels (BF16 ports).
 Zero PyTorch tensor creation / arithmetic in forward(). CUDA Graph safe.
 
-Modeled after CKernelQwen3 (flash_vla/models/groot/pipeline_thor.py).
+Modeled after CKernelQwen3 (flash_rt/models/groot/pipeline_thor.py).
 
 Architecture: Qwen2.5-7B MoT
   D=3584, H=28(Q)/4(KV), HD=128, FFN=18944, L=28
@@ -23,9 +23,9 @@ _VLA_DIR = os.path.dirname(_WM_DIR)
 sys.path.insert(0, _VLA_DIR)
 sys.path.insert(0, _WM_DIR)
 
-import flash_vla.flash_vla_kernels as fvk
+import flash_rt.flash_rt_kernels as fvk
 import flash_wm_kernels as fwk
-from flash_vla.core.thor_frontend_utils import quant_fp8
+from flash_rt.core.thor_frontend_utils import quant_fp8
 from flash_attn import flash_attn_func  # native GQA, ~6x faster than cuBLAS
 
 bf16 = torch.bfloat16
@@ -474,7 +474,7 @@ class CKernelBagel:
             # flash_attn_func: Q [1,Sq,NHQ,HD] × K,V [1,total_kv,NHKV,HD] → out [1,Sq,NHQ,HD]
             # Measured 6.2x faster than cuBLAS on Thor (Sq=786, total_kv=808, bf16).
             # The output tensor is allocated by flash_attn; PyTorch caching allocator
-            # pins its pointer across graph replays (see flash_vla TorchFlashAttnBackend).
+            # pins its pointer across graph replays (see flash_rt TorchFlashAttnBackend).
             q_view = self.b_q.view(1, Sq, NHQ, HD)
             k_view = self.b_k_merged[i][:total_kv].view(1, total_kv, NHKV, HD)
             v_view = self.b_v_merged[i][:total_kv].view(1, total_kv, NHKV, HD)

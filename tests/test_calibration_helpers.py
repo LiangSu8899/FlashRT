@@ -1,4 +1,4 @@
-"""Unit tests for flash_vla.core.calibration.
+"""Unit tests for flash_rt.core.calibration.
 
 CPU-only.
 """
@@ -6,7 +6,7 @@ CPU-only.
 import numpy as np
 import pytest
 
-from flash_vla.core.calibration import (
+from flash_rt.core.calibration import (
     accumulate_amax,
     format_summary,
     summarize_amax_dispersion,
@@ -84,7 +84,7 @@ def test_outlier_cutback_detected_in_summary():
 # check_scale_ceiling
 # ---------------------------------------------------------------------------
 
-from flash_vla.core.calibration import check_scale_ceiling, FP8_SCALE_RATIO_WARN
+from flash_rt.core.calibration import check_scale_ceiling, FP8_SCALE_RATIO_WARN
 
 
 def test_check_scale_ceiling_no_offenders_quiet(caplog):
@@ -99,7 +99,7 @@ def test_check_scale_ceiling_no_offenders_quiet(caplog):
 def test_check_scale_ceiling_warns_on_outlier(caplog):
     """One layer at 50× median → must warn."""
     import logging as _log
-    caplog.set_level(_log.WARNING, logger="flash_vla.core.calibration")
+    caplog.set_level(_log.WARNING, logger="flash_rt.core.calibration")
     # median = 0.1, ratio 20 → threshold 2.0
     scales = {"l0": 0.1, "l1": 0.1, "l2": 0.1, "outlier": 5.0}
     offenders = check_scale_ceiling(scales, ratio=20.0, label="pytest_case")
@@ -155,7 +155,7 @@ def _make_dummy_meta():
 
 
 def test_stratified_sample_indices_n8_task8():
-    from flash_vla.core.calibration import stratified_sample_indices
+    from flash_rt.core.calibration import stratified_sample_indices
     df = _make_dummy_meta()
     picks = stratified_sample_indices(df, n=8, task_filter=8)
     assert len(picks) == 8
@@ -169,7 +169,7 @@ def test_stratified_sample_indices_n8_task8():
 
 
 def test_stratified_sample_indices_excludes():
-    from flash_vla.core.calibration import stratified_sample_indices
+    from flash_rt.core.calibration import stratified_sample_indices
     df = _make_dummy_meta()
     exclude = {0, 100, 200}  # first frame of each task-8 episode
     picks = stratified_sample_indices(df, n=8, task_filter=8, exclude=exclude)
@@ -177,7 +177,7 @@ def test_stratified_sample_indices_excludes():
 
 
 def test_stratified_sample_indices_missing_column():
-    from flash_vla.core.calibration import stratified_sample_indices
+    from flash_rt.core.calibration import stratified_sample_indices
     import pandas as pd
     df = pd.DataFrame({"wrong": [1, 2, 3]})
     with pytest.raises(ValueError, match="missing columns"):
@@ -185,21 +185,21 @@ def test_stratified_sample_indices_missing_column():
 
 
 def test_stratified_sample_indices_empty_after_filter():
-    from flash_vla.core.calibration import stratified_sample_indices
+    from flash_rt.core.calibration import stratified_sample_indices
     df = _make_dummy_meta()
     with pytest.raises(ValueError, match="no rows"):
         stratified_sample_indices(df, n=4, task_filter=99)
 
 
 def test_stratified_sample_indices_bad_n():
-    from flash_vla.core.calibration import stratified_sample_indices
+    from flash_rt.core.calibration import stratified_sample_indices
     df = _make_dummy_meta()
     with pytest.raises(ValueError, match="n must be"):
         stratified_sample_indices(df, n=0, task_filter=8)
 
 
 def test_stratified_sample_applies_load_fn():
-    from flash_vla.core.calibration import stratified_sample
+    from flash_rt.core.calibration import stratified_sample
     df = _make_dummy_meta()
     load_fn = lambda idx: {"fake_frame_id": idx}
     obs = stratified_sample(df, load_fn, n=4, task_filter=8)

@@ -40,7 +40,7 @@ import numpy as np
 import torch
 
 # Force a fresh calibration pass — wipe any cached scales for this ckpt.
-cdir = pathlib.Path.home() / ".flash_vla" / "calibration"
+cdir = pathlib.Path.home() / ".flash_rt" / "calibration"
 if cdir.exists():
     for f in cdir.glob("*.json"):
         f.unlink()
@@ -66,7 +66,7 @@ else:
             "wrist_image": data[f"wrist_{i}"],
         })
 
-from flash_vla.frontends.torch.groot_thor import GrootTorchFrontendThor
+from flash_rt.frontends.torch.groot_thor import GrootTorchFrontendThor
 pipe = GrootTorchFrontendThor("CKPT", num_views=2, autotune=3)
 pipe.set_prompt(prompt)
 

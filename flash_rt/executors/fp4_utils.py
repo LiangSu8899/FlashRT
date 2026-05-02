@@ -1,11 +1,11 @@
 """NVFP4 utilities for Pi0.5 FP4 frontend (Phase 4.3, additive).
 
-Thin Python wrapper over flash_vla.flash_vla_fp4 kernels that handles:
+Thin Python wrapper over flash_rt.flash_rt_fp4 kernels that handles:
   1. Offline weight quantization (fp16 → packed int4 + tile-interleaved SFB)
   2. Runtime activation quantization scratch allocation
   3. FP4 GEMM invocation with per-shape variant selection
 
-Does NOT modify any existing module. Requires flash_vla_fp4.so built with SM100
+Does NOT modify any existing module. Requires flash_rt_fp4.so built with SM100
 CUTLASS support (see docs/v2/fp4_kernel_impl_progress.md §3.5-3.6).
 
 Usage:
@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import torch
 
-import flash_vla.flash_vla_fp4 as fvk_fp4
+import flash_rt.flash_rt_fp4 as fvk_fp4
 
 
 # ────────────────────────────────────────────────────────────────────

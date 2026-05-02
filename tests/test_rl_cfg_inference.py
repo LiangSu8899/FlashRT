@@ -45,9 +45,9 @@ def _make_dummy_obs():
                     reason=f"pi05 ckpt missing at {CKPT_PI05}")
 def test_default_path_unchanged_no_rl_mode():
     """Without ``set_rl_mode``, the pipeline class is the standard one."""
-    from flash_vla.frontends.torch.pi05_rtx import Pi05TorchFrontendRtx
-    from flash_vla.models.pi05.pipeline_rtx import Pi05Pipeline
-    from flash_vla.models.pi05.pipeline_rtx_cfg import Pi05CFGPipeline
+    from flash_rt.frontends.torch.pi05_rtx import Pi05TorchFrontendRtx
+    from flash_rt.models.pi05.pipeline_rtx import Pi05Pipeline
+    from flash_rt.models.pi05.pipeline_rtx_cfg import Pi05CFGPipeline
 
     rt = Pi05TorchFrontendRtx(CKPT_PI05, num_views=2)
     rt.set_prompt("pick up the cup")
@@ -61,8 +61,8 @@ def test_default_path_unchanged_no_rl_mode():
                     reason=f"pi05 ckpt missing at {CKPT_PI05}")
 def test_set_rl_mode_builds_cfg_pipeline():
     """``set_rl_mode`` triggers Pi05CFGPipeline on next ``set_prompt``."""
-    from flash_vla.frontends.torch.pi05_rtx import Pi05TorchFrontendRtx
-    from flash_vla.models.pi05.pipeline_rtx_cfg import Pi05CFGPipeline
+    from flash_rt.frontends.torch.pi05_rtx import Pi05TorchFrontendRtx
+    from flash_rt.models.pi05.pipeline_rtx_cfg import Pi05CFGPipeline
 
     rt = Pi05TorchFrontendRtx(CKPT_PI05, num_views=2)
     rt.set_rl_mode(cfg_enable=True, cfg_beta=1.5, advantage_positive=True)
@@ -79,9 +79,9 @@ def test_set_rl_mode_builds_cfg_pipeline():
                     reason=f"pi05 ckpt missing at {CKPT_PI05}")
 def test_disable_rl_mode_reverts_pipeline_class():
     """Calling ``set_rl_mode(cfg_enable=False)`` reverts to standard pipeline."""
-    from flash_vla.frontends.torch.pi05_rtx import Pi05TorchFrontendRtx
-    from flash_vla.models.pi05.pipeline_rtx import Pi05Pipeline
-    from flash_vla.models.pi05.pipeline_rtx_cfg import Pi05CFGPipeline
+    from flash_rt.frontends.torch.pi05_rtx import Pi05TorchFrontendRtx
+    from flash_rt.models.pi05.pipeline_rtx import Pi05Pipeline
+    from flash_rt.models.pi05.pipeline_rtx_cfg import Pi05CFGPipeline
 
     rt = Pi05TorchFrontendRtx(CKPT_PI05, num_views=2)
     rt.set_rl_mode(cfg_enable=True, cfg_beta=1.5)
@@ -99,7 +99,7 @@ def test_disable_rl_mode_reverts_pipeline_class():
                     reason=f"pi05 ckpt missing at {CKPT_PI05}")
 def test_rl_mode_invalid_beta_raises():
     """``cfg_beta < 1.0`` is rejected at the frontend boundary."""
-    from flash_vla.frontends.torch.pi05_rtx import Pi05TorchFrontendRtx
+    from flash_rt.frontends.torch.pi05_rtx import Pi05TorchFrontendRtx
 
     rt = Pi05TorchFrontendRtx(CKPT_PI05, num_views=2)
     with pytest.raises(ValueError, match="cfg_beta must be"):
@@ -127,8 +127,8 @@ def test_cfg_beta_one_matches_standard_cond_only():
     churn that tends to segfault on consecutive pipeline rebuilds in
     the same process.
     """
-    from flash_vla.core.rl import build_acp_tagged_task
-    from flash_vla.frontends.torch.pi05_rtx import Pi05TorchFrontendRtx
+    from flash_rt.core.rl import build_acp_tagged_task
+    from flash_rt.frontends.torch.pi05_rtx import Pi05TorchFrontendRtx
 
     base_prompt = "pick up the red cup"
     cond_prompt = build_acp_tagged_task(base_prompt, is_positive=True)
@@ -174,7 +174,7 @@ def test_cfg_inference_produces_finite_actions():
     Pi05CFGPipeline; ``calibrate`` populates FP8 scales and ``infer``
     falls back to ``run_pipeline`` (CFG flow) on each call.
     """
-    from flash_vla.frontends.torch.pi05_rtx import Pi05TorchFrontendRtx
+    from flash_rt.frontends.torch.pi05_rtx import Pi05TorchFrontendRtx
 
     rt = Pi05TorchFrontendRtx(CKPT_PI05, num_views=2)
     rt.set_rl_mode(cfg_enable=True, cfg_beta=1.5)

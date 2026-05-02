@@ -15,7 +15,7 @@ import math
 import ctypes
 import numpy as np
 
-from flash_vla.hardware.thor.shared_primitives import (
+from flash_rt.hardware.thor.shared_primitives import (
     _gpu_copy, _gpu_zero, _gpu_sync,
     _d2h_float, _d2h_floats,
     _measure_scale_gpu,
@@ -37,7 +37,7 @@ def decoder_forward_pi0(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None):
 
     Args:
         ctx: FvkContext (C++ object with cuBLAS handle)
-        fvk: flash_vla_kernels module
+        fvk: flash_rt_kernels module
         bufs: dict of GPU buffer pointers (uintptr_t)
             noise, x, xn, temp, action_buf, gate, qkv, logits,
             attn_out, hid, fg, xn_fp8, hid_fp8, ctx_fp8, state_token
@@ -223,7 +223,7 @@ def decoder_forward_calibrate_pi0(ctx, fvk_mod, bufs, weights, dims,
 
     Args:
         ctx: FvkContext (C++ object with cuBLAS handle)
-        fvk_mod: flash_vla_kernels module
+        fvk_mod: flash_rt_kernels module
         bufs: dict of GPU buffer pointers (uintptr_t)
             noise, x, xn, temp, action_buf, gate, qkv, logits, attn_out,
             hid, fg, xn_fp8, hid_fp8, ctx_fp8, state_token,

@@ -3,8 +3,8 @@ FlashVLA — High-performance VLA inference engine.
 
 Public exports (stable API — see ``docs/stable_api.md``):
 
-    flash_vla.load_model(...)   → VLAModel
-    flash_vla.VLAModel          — unified inference wrapper
+    flash_rt.load_model(...)   → VLAModel
+    flash_rt.VLAModel          — unified inference wrapper
 
 Supported models: Pi0.5, Pi0, Pi0-FAST, GROOT N1.6.
 Supported hardware: Jetson Thor (SM110), RTX 5090 (SM120), RTX 4090 (SM89).
@@ -13,9 +13,9 @@ Extending with new models: see ``docs/plugin_model_template.md``.
 
 Usage::
 
-    import flash_vla
+    import flash_rt
 
-    model = flash_vla.load_model(
+    model = flash_rt.load_model(
         checkpoint="/path/to/checkpoint",
         framework="torch",
         autotune=3,
@@ -31,7 +31,7 @@ __version__ = "0.1.0"
 # Python 3.8+ on Windows ignores PATH for C-extension dependencies
 # (security hardening). The compiled .pyd needs cudart64_*.dll,
 # cublas64_*.dll, cublasLt, cudnn — we add their canonical install
-# directories to the secure DLL loader so `import flash_vla` works
+# directories to the secure DLL loader so `import flash_rt` works
 # without the user pre-loading them. Linux is unaffected: this whole
 # block is skipped via the sys.platform guard.
 import os as _os
@@ -63,6 +63,6 @@ if _sys.platform == 'win32':
     del _root, _sub, _p, _seen, _cuda_roots
 del _os, _sys
 
-from flash_vla.api import load_model, VLAModel  # noqa: E402
+from flash_rt.api import load_model, VLAModel  # noqa: E402
 
 __all__ = ["load_model", "VLAModel"]

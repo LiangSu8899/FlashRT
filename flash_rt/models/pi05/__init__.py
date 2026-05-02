@@ -2,7 +2,7 @@
 
 The RTX pipeline class and its dimension constants are re-exported
 here so that frontends and tests can
-``from flash_vla.models.pi05 import ...`` without knowing the
+``from flash_rt.models.pi05 import ...`` without knowing the
 internal file layout.
 
 Per the unified pipeline_<hw>.py contract:
@@ -10,7 +10,7 @@ Per the unified pipeline_<hw>.py contract:
     pipeline_rtx.py   - RTX SM120/SM89 Pi05Pipeline class
 """
 
-from flash_vla.models.pi05.pipeline_rtx import (
+from flash_rt.models.pi05.pipeline_rtx import (
     Pi05Pipeline,
     VIS_L, VIS_D, VIS_H, VIS_NH, VIS_HD, VIS_SEQ_PER_VIEW, VIS_PATCH_FLAT,
     ENC_L, ENC_D, ENC_H, ENC_NH, ENC_NKV, ENC_HD,

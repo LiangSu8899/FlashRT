@@ -17,7 +17,7 @@ def test_eager_infer_latency():
     matches = sorted(glob.glob(_CKPT_GLOB))
     if not matches or not _FIXTURE.exists() or not _AUX.exists():
         pytest.skip("ckpt/fixtures missing")
-    from flash_vla.frontends.torch.groot_n17_thor import GrootN17TorchFrontendThor
+    from flash_rt.frontends.torch.groot_n17_thor import GrootN17TorchFrontendThor
 
     fe = GrootN17TorchFrontendThor(
         matches[0], num_views=2,

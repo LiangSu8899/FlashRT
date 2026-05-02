@@ -12,12 +12,12 @@ pytorch_to_onnx.py:485-501):
 
 DOES NOT MODIFY:
     - shared_primitives.encoder_forward  (unchanged)
-    - flash_vla_kernels.so               (unchanged)
+    - flash_rt_kernels.so               (unchanged)
     - any existing kernel source         (unchanged)
 
 Uses:
-    - fvk (flash_vla_kernels)  for all FP8 kernels + gate_geglu_merged_fp16
-    - fvk_fp4 (flash_vla_fp4)  for NVFP4 GEMM + norm_fp16 + quant/reshape
+    - fvk (flash_rt_kernels)  for all FP8 kernels + gate_geglu_merged_fp16
+    - fvk_fp4 (flash_rt_fp4)  for NVFP4 GEMM + norm_fp16 + quant/reshape
 """
 
 import math

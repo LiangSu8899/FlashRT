@@ -32,7 +32,7 @@ _CKPT_AVAILABLE = os.path.isdir(CKPT_PI05)
 
 _CHILD = r"""
 import os, sys, numpy as np, torch
-from flash_vla.frontends.torch.pi05_rtx import Pi05TorchFrontendRtx
+from flash_rt.frontends.torch.pi05_rtx import Pi05TorchFrontendRtx
 mode, ckpt, out_path, seed = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
 obs = {"image": np.zeros((224,224,3), dtype=np.uint8),
        "wrist_image": np.zeros((224,224,3), dtype=np.uint8),

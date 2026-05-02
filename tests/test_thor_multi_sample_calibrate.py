@@ -3,7 +3,7 @@
 
 Exercises :meth:`Pi05TorchFrontendThor.calibrate` with N>=2 real
 observations sampled from a LeRobot-v2 LIBERO dataset (via
-:mod:`flash_vla.datasets.libero`). Verifies:
+:mod:`flash_rt.datasets.libero`). Verifies:
 
 * No exception from the newly-implemented multi-frame path.
 * After ``calibrate(obs_list)``, the subsequent ``infer`` runs and
@@ -74,7 +74,7 @@ def main() -> int:
     # ------------------------------------------------------------------
     # Sample N real observations from LIBERO.
     # ------------------------------------------------------------------
-    from flash_vla.datasets.libero import load_calibration_obs
+    from flash_rt.datasets.libero import load_calibration_obs
     t0 = time.perf_counter()
     obs_list = load_calibration_obs(
         args.libero_root, n=args.n, task_filter=args.task_filter, verbose=True)
@@ -84,7 +84,7 @@ def main() -> int:
     # ------------------------------------------------------------------
     # Build Pi0.5 Thor frontend and run N>=2 calibration path.
     # ------------------------------------------------------------------
-    from flash_vla.frontends.torch.pi05_thor import Pi05TorchFrontendThor
+    from flash_rt.frontends.torch.pi05_thor import Pi05TorchFrontendThor
 
     pipe = Pi05TorchFrontendThor(args.pi05_ckpt, num_views=2, autotune=0)
     pipe.set_prompt(PROMPT)

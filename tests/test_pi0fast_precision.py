@@ -63,9 +63,9 @@ os.environ["TRANSFORMERS_OFFLINE"] = "1"
 sys.path.insert(0, "ROOTDIR")
 import logging; logging.basicConfig(level=logging.WARNING)
 
-import flash_vla.flash_vla_kernels as fvk
-from flash_vla.frontends.PIPELINE_MODULE import PIPELINE_CLASS
-from flash_vla.models.pi0fast.pipeline import (
+import flash_rt.flash_rt_kernels as fvk
+from flash_rt.frontends.PIPELINE_MODULE import PIPELINE_CLASS
+from flash_rt.models.pi0fast.pipeline import (
     prefill_forward_pi0fast, decode_step_pi0fast_bf16,
 )
 

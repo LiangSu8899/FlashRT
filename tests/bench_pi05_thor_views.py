@@ -57,7 +57,7 @@ sys.path.insert(0, "ROOTDIR")
 
 # Clear calibration cache so the reported calibrate_ms is a real
 # forward-pass cost, not a disk read.
-cdir = pathlib.Path.home() / ".flash_vla" / "calibration"
+cdir = pathlib.Path.home() / ".flash_rt" / "calibration"
 if cdir.exists():
     for f in cdir.glob("*.json"): f.unlink()
 
@@ -72,13 +72,13 @@ for i in range(int(d["n"])):
 
 # Build frontend
 if USE_FP4:
-    from flash_vla.frontends.torch.pi05_thor_fp4 import Pi05TorchFrontendThorFP4
+    from flash_rt.frontends.torch.pi05_thor_fp4 import Pi05TorchFrontendThorFP4
     pipe = Pi05TorchFrontendThorFP4(
         CKPT, num_views=NV, autotune=3,
         use_fp4_encoder_ffn=True, fp4_layers=tuple(range(18)),
         use_awq=True, use_p1_split_gu=True)
 else:
-    from flash_vla.frontends.torch.pi05_thor import Pi05TorchFrontendThor
+    from flash_rt.frontends.torch.pi05_thor import Pi05TorchFrontendThor
     pipe = Pi05TorchFrontendThor(CKPT, num_views=NV, autotune=3)
 
 # 3v uses pytorch_reference.npz tokens + noise to allow cos vs FP32 ref.
@@ -166,7 +166,7 @@ sys.path.insert(0, "ROOTDIR")
 
 # JAX Pi0.5: FP8 (N=1 implicit) or FP4 (N=8 LIBERO multi-frame).
 # Clear cache so calibrate_ms reflects a real forward-pass cost.
-cdir = pathlib.Path.home() / ".flash_vla" / "calibration"
+cdir = pathlib.Path.home() / ".flash_rt" / "calibration"
 if cdir.exists():
     for f in cdir.glob("*.json"): f.unlink()
 
@@ -184,13 +184,13 @@ for i in range(int(d["n"])):
 deploy_obs = dict(obs_list[0])
 
 if USE_FP4:
-    from flash_vla.frontends.jax.pi05_thor_fp4 import Pi05JaxFrontendThorFP4
+    from flash_rt.frontends.jax.pi05_thor_fp4 import Pi05JaxFrontendThorFP4
     pipe = Pi05JaxFrontendThorFP4(
         JAX_CKPT, num_views=NV, autotune=3, weight_cache=True,
         use_fp4_encoder_ffn=True, fp4_layers=tuple(range(18)),
         use_awq=True, use_p1_split_gu=True)
 else:
-    from flash_vla.frontends.jax.pi05_thor import Pi05JaxFrontendThor
+    from flash_rt.frontends.jax.pi05_thor import Pi05JaxFrontendThor
     pipe = Pi05JaxFrontendThor(JAX_CKPT, num_views=NV, autotune=3)
 
 # 3v matches pytorch_reference.npz so we can report cos.

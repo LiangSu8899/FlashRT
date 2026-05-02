@@ -7,7 +7,7 @@ belong in ``models/<m>/pipeline_thor.py``.
 
 This file holds the **B=1 hot path** (the production single-sample
 inference). The B>=1 batched companions live in
-:mod:`flash_vla.hardware.thor.shared_primitives_batched`
+:mod:`flash_rt.hardware.thor.shared_primitives_batched`
 (``encoder_forward_b2``) so the B=1 file stays small and easy to
 reason about — single-sample inference is the main-line product;
 batched is opt-in.
@@ -57,7 +57,7 @@ def siglip_forward(gemm, fvk, bufs, weights, dims, stream=0, *, attn=None):
 
     Args:
         gemm: GemmRunner instance
-        fvk: flash_vla_kernels module
+        fvk: flash_rt_kernels module
         bufs: dict of GPU buffer pointers
             x (S,D), x_fp8 (S,D), qkv (S,3D), attn_out (S,D),
             hidden (S,H), hid_fp8 (S,H), scratch (S, max(D,H))
@@ -210,7 +210,7 @@ def encoder_forward(gemm, fvk, bufs, weights, dims, stream=0, *, attn=None):
 
     Args:
         gemm: GemmRunner
-        fvk: flash_vla_kernels module
+        fvk: flash_rt_kernels module
         bufs: dict — x, x_fp8, qkv, logits, attn_out, o_fp8, gate, hidden, hid_fp8, fg, ctx
         weights: dict — qkv_w[L], o_w[L], gate_w[L], down_w[L], rope, Kc, Vc,
                         act_scales (device float ptr), alpha_host (host list[L*4])

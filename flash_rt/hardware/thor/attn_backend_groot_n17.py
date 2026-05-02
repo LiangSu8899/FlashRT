@@ -30,7 +30,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from flash_vla.hardware.backend import AttentionBackendBase, AttentionSpec
+from flash_rt.hardware.backend import AttentionBackendBase, AttentionSpec
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -148,7 +148,7 @@ class ThorGrootN17AttnBackend(AttentionBackendBase):
 
     def _fvk_mod(self):
         if self._fvk is None:
-            import flash_vla.flash_vla_kernels as fvk
+            import flash_rt.flash_rt_kernels as fvk
             self._fvk = fvk
         return self._fvk
 

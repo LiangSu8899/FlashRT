@@ -10,10 +10,10 @@ pipeline_<hw>.py contract in docs/adding_new_model.md §0.
 
 This file holds the **B=1 main-line single-sample inference path**.
 The B>=1 batched companion lives in
-:mod:`flash_vla.models.pi05.pipeline_thor_batched` (mirrors the RTX
+:mod:`flash_rt.models.pi05.pipeline_thor_batched` (mirrors the RTX
 ``pipeline_rtx`` / ``pipeline_rtx_batched`` split). The CFG variants
-live in :mod:`flash_vla.models.pi05.pipeline_thor_cfg` (serial) and
-:mod:`flash_vla.models.pi05.pipeline_thor_cfg_batched` (B=2 fused).
+live in :mod:`flash_rt.models.pi05.pipeline_thor_cfg` (serial) and
+:mod:`flash_rt.models.pi05.pipeline_thor_cfg_batched` (B=2 fused).
 
 Functions:
     decoder_forward            — Pi0.5 decoder inference (static FP8)
@@ -25,7 +25,7 @@ Classes:
 
 import math
 
-from flash_vla.hardware.thor.shared_primitives import (
+from flash_rt.hardware.thor.shared_primitives import (
     _measure_scale_gpu,
     _gpu_copy,
     _gpu_sync,
@@ -42,7 +42,7 @@ def decoder_forward(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None):
 
     Args:
         ctx: FvkContext (C++ object with cuBLAS handle)
-        fvk: flash_vla_kernels module
+        fvk: flash_rt_kernels module
         bufs: dict of GPU buffer pointers (uintptr_t)
             noise, x, xn, gate, qkv, logits, attn_out, hid, fg,
             xn_fp8, hid_fp8, ctx_fp8
@@ -348,7 +348,7 @@ class Pi05ThorPipeline:
           pipeline only orchestrates ``replay``.
         * **Backend-agnostic**: the torch frontend uses
           ``torch.cuda.CUDAGraph`` and the JAX frontend uses
-          ``flash_vla.engine.cuda_graph.CUDAGraph``; both are wrapped
+          ``flash_rt.engine.cuda_graph.CUDAGraph``; both are wrapped
           by the ``replay_siglip`` / ``replay_enc_ae`` callbacks the
           frontend hands in. Each callback is responsible for any
           stream-sync the backend needs after replay.

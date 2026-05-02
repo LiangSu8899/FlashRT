@@ -10,7 +10,7 @@ Covers ALL weight categories:
   - Action: in/out proj, time MLP
 
 Usage:
-    python -m flash_vla.weights.verify --checkpoint /path/to/ckpt
+    python -m flash_rt.weights.verify --checkpoint /path/to/ckpt
 """
 
 import logging
@@ -38,12 +38,12 @@ def verify_against_production(checkpoint_dir: str, verbose=False):
     import torch
 
     # Production ground truth (archived backend, for verification only)
-    from flash_vla._archive.backends.thor_torch import ThorTorch
+    from flash_rt._archive.backends.thor_torch import ThorTorch
     prod = ThorTorch(checkpoint_dir=checkpoint_dir, use_cuda_graph=False)
 
     # New pipeline
-    from flash_vla.core.weights.loader import load_weights
-    from flash_vla.core.weights.transformer import transform_safetensors_weights
+    from flash_rt.core.weights.loader import load_weights
+    from flash_rt.core.weights.transformer import transform_safetensors_weights
 
     raw = load_weights(checkpoint_dir)
     engine_w = transform_safetensors_weights(raw)

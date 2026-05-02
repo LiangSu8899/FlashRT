@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import pytest
 
-from flash_vla.hardware.thor.attn_backend_groot_n17 import (
+from flash_rt.hardware.thor.attn_backend_groot_n17 import (
     ThorGrootN17AttnBackend,
     make_groot_n17_attention_spec,
 )

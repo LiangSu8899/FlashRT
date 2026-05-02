@@ -53,17 +53,17 @@ sys.path.insert(0, "ROOTDIR")
 ROLE = os.environ["ROLE"]
 BACKEND = os.environ["BACKEND"]   # "torch" | "jax"
 
-cdir = pathlib.Path.home() / ".flash_vla" / "calibration"
+cdir = pathlib.Path.home() / ".flash_rt" / "calibration"
 if cdir.exists():
     for f in cdir.glob("*.json"):
         f.unlink()
 
 if BACKEND == "torch":
-    from flash_vla.frontends.torch.pi05_thor import Pi05TorchFrontendThor as Frontend
+    from flash_rt.frontends.torch.pi05_thor import Pi05TorchFrontendThor as Frontend
     CKPT = "TORCH_CKPT"
     NUM_VIEWS = 2
 elif BACKEND == "jax":
-    from flash_vla.frontends.jax.pi05_thor import Pi05JaxFrontendThor as Frontend
+    from flash_rt.frontends.jax.pi05_thor import Pi05JaxFrontendThor as Frontend
     CKPT = "JAX_CKPT"
     NUM_VIEWS = 2
 else:
@@ -99,7 +99,7 @@ elif ROLE == "cfg_b15":
     pipe.set_rl_mode(cfg_enable=True, cfg_beta=1.5, advantage_positive=True)
     pipe.set_prompt(prompt)
 elif ROLE == "cond_only":
-    from flash_vla.core.rl import build_acp_tagged_task
+    from flash_rt.core.rl import build_acp_tagged_task
     cond_text = build_acp_tagged_task(prompt, is_positive=True)
     pipe.set_prompt(cond_text)
 else:

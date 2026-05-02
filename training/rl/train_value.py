@@ -33,17 +33,17 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from flash_vla.core.rl.advantage import (
+from flash_rt.core.rl.advantage import (
     binarize_advantages,
     compute_nstep_advantages,
     compute_per_task_thresholds,
 )
-from flash_vla.core.rl.reward import (
+from flash_rt.core.rl.reward import (
     compute_dense_rewards_from_targets,
     compute_episode_value_targets,
     compute_soft_value_loss,
 )
-from flash_vla.core.rl.value_function import StandaloneValueFunction
+from flash_rt.core.rl.value_function import StandaloneValueFunction
 
 
 @dataclass

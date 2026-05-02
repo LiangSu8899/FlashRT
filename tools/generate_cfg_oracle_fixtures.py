@@ -53,7 +53,7 @@ BETAS = [1.0, 1.5, 2.0, 2.5]
 
 CHILD_REF = r"""
 import sys, numpy as np, torch
-from flash_vla.refs.pi05_cfg_reference import Pi05CFGReference
+from flash_rt.refs.pi05_cfg_reference import Pi05CFGReference
 beta, out_path, ckpt = float(sys.argv[1]), sys.argv[2], sys.argv[3]
 obs = {"observation/image": np.zeros((224,224,3), dtype=np.uint8),
        "observation/wrist_image": np.zeros((224,224,3), dtype=np.uint8),
@@ -69,7 +69,7 @@ np.savez(out_path,
 
 CHILD_FVLA = r"""
 import sys, ctypes, numpy as np, torch
-from flash_vla.frontends.torch.pi05_rtx import Pi05TorchFrontendRtx
+from flash_rt.frontends.torch.pi05_rtx import Pi05TorchFrontendRtx
 mode, beta, out_path, ckpt = sys.argv[1], float(sys.argv[2]), sys.argv[3], sys.argv[4]
 obs = {"image": np.zeros((224,224,3), dtype=np.uint8),
        "wrist_image": np.zeros((224,224,3), dtype=np.uint8),

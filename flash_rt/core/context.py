@@ -1,10 +1,10 @@
 """FlashVLA — FvkContext: per-instance runtime resources.
 
-Wraps the C++ FvkContext (cuBLAS handle) from flash_vla_kernels.so.
+Wraps the C++ FvkContext (cuBLAS handle) from flash_rt_kernels.so.
 Created by frontend, passed to all kernel calls via hardware pipeline.
 
 Usage:
-    from flash_vla.core.context import FvkContext
+    from flash_rt.core.context import FvkContext
     ctx = FvkContext()
     fvk.attention_qkv_fp16(ctx.cpp, Q, K, V, ...)
     fvk.gmm_fp16(ctx.cpp, A, B, C, ...)
@@ -26,7 +26,7 @@ class FvkContext:
     """
 
     def __init__(self):
-        from flash_vla import flash_vla_kernels as fvk
+        from flash_rt import flash_rt_kernels as fvk
         self._cpp = fvk.FvkContext()
         self._gemm = fvk.GemmRunner()
         logger.debug("FvkContext created (cuBLAS handle + GemmRunner)")

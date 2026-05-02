@@ -10,8 +10,8 @@ loader; see ``docs/v2/stage7_weight_loader.md`` §7.
 
 from __future__ import annotations
 
-from flash_vla.executors.weight_loader import Item, LayerBlock, ModelWeightSpec
-from flash_vla.executors.torch_weights import (
+from flash_rt.executors.weight_loader import Item, LayerBlock, ModelWeightSpec
+from flash_rt.executors.torch_weights import (
     FlatCat,
     FusedGateUp,
     FusedQKV,
@@ -20,7 +20,7 @@ from flash_vla.executors.torch_weights import (
     ToFp16,
     tT,
 )
-from flash_vla.frontends.torch._thor_spec_common import (
+from flash_rt.frontends.torch._thor_spec_common import (
     paligemma_encoder_block,
     paligemma_siglip_block,
 )

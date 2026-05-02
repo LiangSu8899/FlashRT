@@ -3,7 +3,7 @@
 Loads Pi0 Orbax checkpoints (the JAX-native format shipped by openpi) and
 drives the same framework-agnostic ``Pi0Pipeline`` as the torch frontend.
 
-Design mirrors :mod:`flash_vla.frontends.jax.pi05_rtx` — a **thin shim**
+Design mirrors :mod:`flash_rt.frontends.jax.pi05_rtx` — a **thin shim**
 over :class:`Pi0TorchFrontendRtx`. The JAX-specific work is the weight
 loader (Orbax -> FP16 torch tensors with the same dict schema as
 ``convert_pi0_safetensors``). Once weights match, every downstream step
@@ -26,7 +26,7 @@ Pi0 vs Pi0.5 Orbax schema differences
 
 Usage::
 
-    from flash_vla.frontends.jax.pi0_rtx import Pi0JaxFrontendRtx
+    from flash_rt.frontends.jax.pi0_rtx import Pi0JaxFrontendRtx
     pipe = Pi0JaxFrontendRtx("/path/to/pi0_base", num_views=2)
     pipe.set_prompt("pick up the red block")
     pipe.calibrate_with_real_data([obs])
@@ -44,7 +44,7 @@ import ml_dtypes
 import numpy as np
 import torch
 
-from flash_vla.models.pi0.pipeline_rtx import (
+from flash_rt.models.pi0.pipeline_rtx import (
     ACTION_DIM,
     DEC_D,
     DEC_L,
@@ -52,7 +52,7 @@ from flash_vla.models.pi0.pipeline_rtx import (
     NUM_STEPS_DEFAULT,
     VIS_L,
 )
-from flash_vla.frontends.torch.pi0_rtx import (
+from flash_rt.frontends.torch.pi0_rtx import (
     CHUNK_SIZE_DEFAULT,
     MAX_PROMPT_LEN_DEFAULT,
     Pi0TorchFrontendRtx,
@@ -104,7 +104,7 @@ def convert_pi0_orbax(
     tensors keyed by rtx names) so the same downstream FP8 quant,
     time_proj precompute, and pipeline build apply to both frontends.
     """
-    from flash_vla.core.weights.loader import _load_orbax
+    from flash_rt.core.weights.loader import _load_orbax
 
     checkpoint_dir = pathlib.Path(checkpoint_dir)
     logger.info("Loading Pi0 Orbax checkpoint: %s", checkpoint_dir)
@@ -365,9 +365,9 @@ class Pi0JaxFrontendRtx(Pi0TorchFrontendRtx):
         # Don't chain to Pi0TorchFrontendRtx.__init__ — it expects a
         # safetensors file. We replicate the body and swap the loader.
         import ctypes
-        from flash_vla.hardware.rtx.attn_backend import RtxFlashAttnBackend
-        from flash_vla import flash_vla_kernels as fvk
-        from flash_vla.frontends.torch.pi0_rtx import _precompute_time_proj_all
+        from flash_rt.hardware.rtx.attn_backend import RtxFlashAttnBackend
+        from flash_rt import flash_rt_kernels as fvk
+        from flash_rt.frontends.torch.pi0_rtx import _precompute_time_proj_all
 
         checkpoint_dir = pathlib.Path(checkpoint_dir)
         self.num_views = int(num_views)
@@ -460,7 +460,7 @@ class Pi0JaxFrontendRtx(Pi0TorchFrontendRtx):
         per-embodiment assets) and tolerates the lerobot HF release's
         ``meta/stats.json`` schema.
         """
-        from flash_vla.core.utils.norm_stats import (
+        from flash_rt.core.utils.norm_stats import (
             load_norm_stats, lerobot_candidates,
         )
         name = checkpoint_dir.name

@@ -10,8 +10,8 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-import flash_vla.flash_vla_fp4 as fvk_fp4
-import flash_vla.flash_vla_kernels as fvk
+import flash_rt.flash_rt_fp4 as fvk_fp4
+import flash_rt.flash_rt_kernels as fvk
 
 
 def bench_graph(make_fn, iters=1000, warmup=50):
@@ -63,7 +63,7 @@ def main():
     fg_out = torch.empty(Se, De, dtype=torch.float16, device=device)
 
     # FP4 weights (fake) - using quant_weight utility
-    from flash_vla.executors.fp4_utils import quant_weight_nvfp4, FP4ActScratch
+    from flash_rt.executors.fp4_utils import quant_weight_nvfp4, FP4ActScratch
     gu_fp4 = quant_weight_nvfp4(torch.randn(2 * He, De, dtype=torch.float16, device=device).contiguous())
     dw_fp4 = quant_weight_nvfp4(torch.randn(De, He, dtype=torch.float16, device=device).contiguous())
     sc_gu = FP4ActScratch(Se, De, device)

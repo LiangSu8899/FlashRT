@@ -25,8 +25,8 @@ sys.path.insert(0, FLASH_VLA_ROOT)
 sys.path.insert(0, _FLASH_WM)  # for flash_wm_kernels.so
 sys.path.insert(0, os.path.join(_FLASH_WM, "csrc"))  # for ckernel_bagel.py
 
-import flash_vla.flash_vla_kernels as fvk
-from flash_vla.core.thor_frontend_utils import quant_fp8
+import flash_rt.flash_rt_kernels as fvk
+from flash_rt.core.thor_frontend_utils import quant_fp8
 
 # ── Model constants ──────────────────────────────────────────────────────────
 D = 3584; H = 28; KV_H = 4; HD = 128; FFN = 18944; N_LAYERS = 28; K_DIM = KV_H * HD

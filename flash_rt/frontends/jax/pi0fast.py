@@ -25,11 +25,11 @@ import pathlib
 import time
 from typing import Optional, Union
 
-from flash_vla.hardware.thor.shared_primitives import (
+from flash_rt.hardware.thor.shared_primitives import (
     siglip_forward,
     postln_project,
 )
-from flash_vla.models.pi0fast.pipeline import (
+from flash_rt.models.pi0fast.pipeline import (
     prefill_forward_pi0fast,
     decode_step_pi0fast,
     decode_step_pi0fast_bf16,
@@ -41,9 +41,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-import flash_vla.flash_vla_kernels as fvk
-from flash_vla.core.cuda_buffer import CudaBuffer
-from flash_vla.core.quant.calibrator import load_calibration, save_calibration
+import flash_rt.flash_rt_kernels as fvk
+from flash_rt.core.cuda_buffer import CudaBuffer
+from flash_rt.core.quant.calibrator import load_calibration, save_calibration
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +61,7 @@ FAST_SKIP_TOKENS = 128
 _TEXT_PHASE_TOKENS = [4022, 235292, 235248]  # "Action", ":", " "
 
 
-from flash_vla.core.thor_frontend_utils import quant_fp8  # noqa: E402
+from flash_rt.core.thor_frontend_utils import quant_fp8  # noqa: E402
 
 
 def _interleave_qk(w, num_heads):
@@ -183,7 +183,7 @@ class Pi0FastJaxFrontend:
 
     def _load_weights(self, checkpoint_dir):
         # Load raw weights from Orbax
-        from flash_vla.core.weights.loader import load_weights, detect_format
+        from flash_rt.core.weights.loader import load_weights, detect_format
         fmt = detect_format(str(checkpoint_dir))
         if fmt == "orbax":
             raw = load_weights(str(checkpoint_dir), format="orbax")
@@ -193,7 +193,7 @@ class Pi0FastJaxFrontend:
             raise ValueError(f"Unknown checkpoint format at {checkpoint_dir}")
 
         # Transform to engine format
-        from flash_vla.core.weights.transformer import transform_jax_weights_pi0fast
+        from flash_rt.core.weights.transformer import transform_jax_weights_pi0fast
         weights = transform_jax_weights_pi0fast(raw)
         del raw
 
@@ -955,7 +955,7 @@ class Pi0FastJaxFrontend:
                 f"percentile must be in [0, 100], got {percentile}")
 
         if n == 1:
-            from flash_vla.core.calibration_api import implicit_calibrate
+            from flash_rt.core.calibration_api import implicit_calibrate
             implicit_calibrate(
                 self, obs_list,
                 percentile=percentile, max_samples=None, verbose=verbose,
@@ -977,13 +977,13 @@ class Pi0FastJaxFrontend:
         decode graphs recaptured once (rule C7).
         """
         import torch
-        from flash_vla.core.calibration import (
+        from flash_rt.core.calibration import (
             accumulate_amax,
             check_scale_ceiling,
             format_summary,
             summarize_amax_dispersion,
         )
-        import flash_vla.flash_vla_kernels as fvk
+        import flash_rt.flash_rt_kernels as fvk
 
         n = len(obs_list)
         logger.info(

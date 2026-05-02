@@ -2,11 +2,11 @@
 
 Loads HuggingFace GR00T-N1.6-3B safetensors checkpoints and drives the
 framework-agnostic ``GrootSigLIP2`` / ``GrootQwen3`` / ``GrootDiT`` classes
-in :mod:`flash_vla.models.groot.pipeline_rtx`.
+in :mod:`flash_rt.models.groot.pipeline_rtx`.
 
 Usage::
 
-    from flash_vla.hardware.rtx import GrootTorchFrontendRtx
+    from flash_rt.hardware.rtx import GrootTorchFrontendRtx
     pipe = GrootTorchFrontendRtx(
         "/path/to/GR00T-N1.6-3B",
         num_views=2,
@@ -39,8 +39,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from flash_vla.hardware.rtx.attn_backend_groot import RtxFlashAttnBackendGroot
-from flash_vla.models.groot.pipeline_rtx import (
+from flash_rt.hardware.rtx.attn_backend_groot import RtxFlashAttnBackendGroot
+from flash_rt.models.groot.pipeline_rtx import (
     GrootDiT,
     GrootQwen3,
     GrootSigLIP2,
@@ -85,8 +85,8 @@ DIT_PREFIX = "action_head.model"
 AH_PREFIX = "action_head"
 
 # ── Embodiment id mapping (shared between Thor and rtx, see
-#    flash_vla/hardware/groot_embodiments.py) ──
-from flash_vla.models.groot.embodiments import (
+#    flash_rt/hardware/groot_embodiments.py) ──
+from flash_rt.models.groot.embodiments import (
     EMBODIMENT_TAG_TO_INDEX,
     PUBLIC_TRAINED_TAGS,
     is_embodiment_trained,
@@ -114,7 +114,7 @@ def _cal_scale(amax: float) -> float:
 
 def _load_groot_calibration(checkpoint_path, Se: int) -> Optional[dict]:
     """Return cached GROOT calibration for (checkpoint, Se) or None."""
-    from flash_vla.core.quant.calibrator import _checkpoint_hash, _cache_path
+    from flash_rt.core.quant.calibrator import _checkpoint_hash, _cache_path
     try:
         ckpt_hash = _checkpoint_hash(str(checkpoint_path))
     except FileNotFoundError:
@@ -136,7 +136,7 @@ def _load_groot_calibration(checkpoint_path, Se: int) -> Optional[dict]:
 def _save_groot_calibration(checkpoint_path, Se: int,
                             qwen3_scales=None, dit_scales=None) -> None:
     """Merge the given scales into the GROOT calibration cache file."""
-    from flash_vla.core.quant.calibrator import _checkpoint_hash, _cache_path
+    from flash_rt.core.quant.calibrator import _checkpoint_hash, _cache_path
     ckpt_hash = _checkpoint_hash(str(checkpoint_path))
     cache_file = _cache_path(ckpt_hash, Se)
     cache_file.parent.mkdir(parents=True, exist_ok=True)
@@ -288,7 +288,7 @@ def _calibrate_qwen3_per_sample(sd, gemm, fvk, qwen3, ie_fp16_list, stream=0):
     """Run Qwen3 amax collection N times.
 
     Returns an ``[N, 3*L]`` float32 numpy array of raw amax values, ready
-    for ``flash_vla.core.calibration.accumulate_amax`` percentile reduction.
+    for ``flash_rt.core.calibration.accumulate_amax`` percentile reduction.
     """
     if not ie_fp16_list:
         raise ValueError("ie_fp16_list must be non-empty")
@@ -540,7 +540,7 @@ class GrootTorchFrontendRtx:
         self._graphs_built = False
 
         # ── Init kernels ──
-        from flash_vla import flash_vla_kernels as fvk
+        from flash_rt import flash_rt_kernels as fvk
         self._fvk = fvk
         self._gemm = fvk.GemmRunner()
         self._cudart = ctypes.CDLL("libcudart.so")
@@ -1621,7 +1621,7 @@ class GrootTorchFrontendRtx:
         buffers (no graph re-capture needed; the captured kernels read
         scales from the buffers at replay time).
         """
-        from flash_vla.core.calibration import (
+        from flash_rt.core.calibration import (
             accumulate_amax,
             format_summary,
             summarize_amax_dispersion,
@@ -1756,7 +1756,7 @@ class GrootTorchFrontendRtx:
 
     def _warn_if_scale_ceiling_exceeded(self, label: str = "groot_rtx") -> None:
         """Diagnostic warning if any FP8 scale is far above the median."""
-        from flash_vla.core.calibration import check_scale_ceiling
+        from flash_rt.core.calibration import check_scale_ceiling
         scales: dict = {}
         for i, s in enumerate(self._read_qwen3_scales().tolist()):
             scales[f"qwen3_{i}"] = float(s)
@@ -1771,7 +1771,7 @@ class GrootTorchFrontendRtx:
     def _snapshot_precision_spec(self, *, method: str, n: int,
                                  percentile: Optional[float]):
         """Build a :class:`ModelPrecisionSpec` from current FP8 scales."""
-        from flash_vla.core.precision_spec import (
+        from flash_rt.core.precision_spec import (
             ModelPrecisionSpec,
             PrecisionSpec,
         )

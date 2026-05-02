@@ -12,7 +12,7 @@ import pathlib
 
 import pytest
 
-from flash_vla.core.utils.norm_stats import (
+from flash_rt.core.utils.norm_stats import (
     load_norm_stats,
     lerobot_candidates,
     _is_lerobot_stats,

@@ -21,7 +21,7 @@ Each parquet row is one frame with (at least) these columns::
 This module provides:
 
 * :class:`LiberoDataset` — builds the metadata DataFrame (episode × frame)
-  that :func:`flash_vla.core.calibration.stratified_sample_indices` expects,
+  that :func:`flash_rt.core.calibration.stratified_sample_indices` expects,
   and can ``load_frame(global_index)`` → obs dict for the frontend.
 * :func:`load_calibration_obs` — convenience that combines stratified
   sampling + per-frame loading into one call. Returns a list ready to
@@ -86,7 +86,7 @@ class LiberoDataset:
     builds an in-memory DataFrame with columns
     ``(task_index, episode_index, frame_index, index)`` — the exact
     shape required by
-    :func:`flash_vla.core.calibration.stratified_sample_indices`.
+    :func:`flash_rt.core.calibration.stratified_sample_indices`.
 
     Per-frame image bytes are **not** loaded until
     :meth:`load_frame` is called — so building the DataFrame is fast
@@ -278,7 +278,7 @@ def load_calibration_obs(
     """Stratified-sample N observations from a LIBERO dataset.
 
     Thin wrapper combining :class:`LiberoDataset` +
-    :func:`flash_vla.core.calibration.stratified_sample_indices`. The
+    :func:`flash_rt.core.calibration.stratified_sample_indices`. The
     returned list can go straight into
     ``frontend.calibrate(obs_list, percentile=99.9)``.
 
@@ -291,7 +291,7 @@ def load_calibration_obs(
         image_size: resize target for both main + wrist images.
         verbose: log chosen indices and episode layout.
     """
-    from flash_vla.core.calibration import stratified_sample_indices
+    from flash_rt.core.calibration import stratified_sample_indices
 
     ds = LiberoDataset(root, image_size=image_size)
     picks = stratified_sample_indices(

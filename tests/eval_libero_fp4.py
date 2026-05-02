@@ -18,7 +18,7 @@ os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("MUJOCO_EGL_DEVICE_ID", "0")
 os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 
-import flash_vla
+import flash_rt
 from examples.thor import eval_libero
 
 _LAT = []
@@ -38,7 +38,7 @@ def _hook(m):
 def run(args):
     eval_libero._patch_egl_cleanup()
     fp4_layers = tuple(int(x) for x in args.fp4_layers.split(","))
-    model = flash_vla.load_model(
+    model = flash_rt.load_model(
         checkpoint=args.checkpoint, framework="torch",
         num_views=2, autotune=args.autotune, config="pi05", hardware="auto",
         use_fp4=True, fp4_layers=fp4_layers,

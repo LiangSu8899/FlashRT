@@ -1,7 +1,7 @@
-"""Locate ``flash_vla_jax_ffi.so`` and register its handlers with JAX.
+"""Locate ``flash_rt_jax_ffi.so`` and register its handlers with JAX.
 
 The ``.so`` is installed by the CMake build into the package root
-(``flash_vla/flash_vla_jax_ffi.so``). Two XLA FFI handlers are
+(``flash_rt/flash_rt_jax_ffi.so``). Two XLA FFI handlers are
 exposed from C++ (see ``csrc/training/jax_ffi/``):
 
 * ``flashvla_fp8_gemm_bf16_out``    — bf16 = fp8 @ fp8 (cuBLASLt FP8 GEMM)
@@ -33,14 +33,14 @@ def _jax_ffi():
 
 
 def _candidate_so_paths() -> list[Path]:
-    """Return possible install locations of ``flash_vla_jax_ffi.so``."""
+    """Return possible install locations of ``flash_rt_jax_ffi.so``."""
     here = Path(__file__).resolve()
     candidates: list[Path] = []
-    # 1. Adjacent to the FlashVLA package: <repo>/flash_vla/flash_vla_jax_ffi.so
+    # 1. Adjacent to the FlashVLA package: <repo>/flash_rt/flash_rt_jax_ffi.so
     repo_root = here.parents[3]                       # training/jax/fp8 → repo
-    candidates.append(repo_root / "flash_vla" / "flash_vla_jax_ffi.so")
-    # 2. CMake build dir during dev: <repo>/build/flash_vla_jax_ffi.so
-    candidates.append(repo_root / "build" / "flash_vla_jax_ffi.so")
+    candidates.append(repo_root / "flash_rt" / "flash_rt_jax_ffi.so")
+    # 2. CMake build dir during dev: <repo>/build/flash_rt_jax_ffi.so
+    candidates.append(repo_root / "build" / "flash_rt_jax_ffi.so")
     # 3. Optional override
     override = os.environ.get("FLASHVLA_JAX_FFI_SO")
     if override:
@@ -63,15 +63,15 @@ _HANDLERS = {
 
 
 def get_so_path() -> Path:
-    """Return the resolved path to ``flash_vla_jax_ffi.so`` or raise."""
+    """Return the resolved path to ``flash_rt_jax_ffi.so`` or raise."""
     for p in _candidate_so_paths():
         if p.is_file():
             return p
     raise FileNotFoundError(
-        "flash_vla_jax_ffi.so not found. Candidates checked: "
+        "flash_rt_jax_ffi.so not found. Candidates checked: "
         + ", ".join(str(p) for p in _candidate_so_paths())
         + ". Build the JAX FFI target via `cmake --build build "
-          "--target flash_vla_jax_ffi`, or set FLASHVLA_JAX_FFI_SO."
+          "--target flash_rt_jax_ffi`, or set FLASHVLA_JAX_FFI_SO."
     )
 
 

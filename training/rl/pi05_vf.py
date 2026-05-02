@@ -28,13 +28,13 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from flash_vla.core.rl.reward import (
+from flash_rt.core.rl.reward import (
     DEFAULT_BIN_MAX,
     DEFAULT_BIN_MIN,
     DEFAULT_NUM_BINS,
     expected_value_from_logits,
 )
-from flash_vla.core.rl.value_function import ValueFunctionHead
+from flash_rt.core.rl.value_function import ValueFunctionHead
 
 
 def pool_masked_mean(

@@ -33,7 +33,7 @@ from typing import Any
 
 import numpy as np
 
-from flash_vla.executors.weight_loader import LoaderContext, ModelWeightSpec
+from flash_rt.executors.weight_loader import LoaderContext, ModelWeightSpec
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -183,7 +183,7 @@ class CudaBufferAttr:
     def store(self, tensor, *, scale=None):
         if self._stored:
             raise RuntimeError(f"CudaBufferAttr sink '{self.name}' stored twice")
-        from flash_vla.core.cuda_buffer import CudaBuffer
+        from flash_rt.core.cuda_buffer import CudaBuffer
         arr = np.ascontiguousarray(tensor)
         buf = CudaBuffer.from_numpy(arr)
         setattr(self._bound_target, self.name, buf)
@@ -222,7 +222,7 @@ class CudaBufferFlat:
         import jax
         import jax.numpy as jnp
 
-        from flash_vla.core.cuda_buffer import CudaBuffer
+        from flash_rt.core.cuda_buffer import CudaBuffer
 
         parts = self._parts
         # Normalise each part to a JAX array so ``jnp.concatenate`` works
@@ -246,7 +246,7 @@ def quant_flat_item(*, name: str, key: str, sink_attr: str,
     Covers the 95% case in the jax encoder/decoder blocks:
     ``q8, qs = qfp8(engine_w[f"{pfx}.qkv.weight"]); dec_qkv.append(q8)``.
     """
-    from flash_vla.executors.weight_loader import Item
+    from flash_rt.executors.weight_loader import Item
     return Item(
         name=name,
         key=key,

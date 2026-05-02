@@ -16,7 +16,7 @@ same outputs as torch checkpoints through the rtx pipeline.
 
 Usage::
 
-    from flash_vla.frontends.jax.pi05_rtx import Pi05JaxFrontendRtx
+    from flash_rt.frontends.jax.pi05_rtx import Pi05JaxFrontendRtx
     pipe = Pi05JaxFrontendRtx("/path/to/pi05_libero", num_views=2)
     pipe.set_prompt("pick up the red block")
     pipe.calibrate_with_real_data([obs])
@@ -35,14 +35,14 @@ import ml_dtypes
 import numpy as np
 import torch
 
-from flash_vla.models.pi05.pipeline_rtx import (
+from flash_rt.models.pi05.pipeline_rtx import (
     ACTION_DIM,
     DEC_L,
     ENC_L,
     NUM_STEPS_DEFAULT,
     VIS_L,
 )
-from flash_vla.frontends.torch.pi05_rtx import (
+from flash_rt.frontends.torch.pi05_rtx import (
     CHUNK_SIZE,
     MAX_PROMPT_LEN_DEFAULT,
     Pi05TorchFrontendRtx,
@@ -103,10 +103,10 @@ def convert_pi05_orbax(
     bf16 cuda tensors with rtx key names) so the same downstream FP8
     quantize + style precompute + pipeline build code applies to both
     frontends. See
-    ``flash_vla.frontends.torch.pi05_rtx.convert_pi05_safetensors`` for
+    ``flash_rt.frontends.torch.pi05_rtx.convert_pi05_safetensors`` for
     the full schema.
     """
-    from flash_vla.core.weights.loader import _load_orbax
+    from flash_rt.core.weights.loader import _load_orbax
 
     checkpoint_dir = pathlib.Path(checkpoint_dir)
     logger.info("Loading Pi0.5 Orbax checkpoint: %s", checkpoint_dir)
@@ -495,14 +495,14 @@ class Pi05JaxFrontendRtx(Pi05TorchFrontendRtx):
         self._quantize_all_fp8()
 
         # ── Pre-compute decoder styles (shared helper) ──
-        from flash_vla.frontends.torch.pi05_rtx import _precompute_decoder_styles
+        from flash_rt.frontends.torch.pi05_rtx import _precompute_decoder_styles
         self._precomputed_styles = _precompute_decoder_styles(
             self._ckpt_bf16, self.chunk_size, num_steps=num_steps
         )
 
         # ── Attention backend, fvk, GemmRunner, reusable buffers ──
-        from flash_vla.hardware.rtx.attn_backend import RtxFlashAttnBackend
-        from flash_vla import flash_vla_kernels as fvk
+        from flash_rt.hardware.rtx.attn_backend import RtxFlashAttnBackend
+        from flash_rt import flash_rt_kernels as fvk
         import ctypes
 
         enc_seq_max = self.num_views * 256 + self.max_prompt_len

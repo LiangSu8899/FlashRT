@@ -2,10 +2,10 @@
 
 Backend-agnostic per-chunk CFG class for the Pi0.5 Thor frontend
 (torch + JAX), mirroring the RTX file structure
-(``flash_vla/models/pi05/pipeline_rtx_cfg.py``).
+(``flash_rt/models/pi05/pipeline_rtx_cfg.py``).
 
 The B=2 fused-CFG companion lives in
-:mod:`flash_vla.models.pi05.pipeline_thor_cfg_batched`
+:mod:`flash_rt.models.pi05.pipeline_thor_cfg_batched`
 (``Pi05ThorCFGBatchedPipeline``) and mirrors RTX's
 ``pipeline_rtx_cfg_batched.py`` split.
 
@@ -22,7 +22,7 @@ Architectural notes
 
   * **No new kernels.** The combine uses the already-shipped
     ``fvk.cfg_combine_into_residual_fp16`` (Thor SM110's
-    ``flash_vla_kernels.so``). All elementwise / GEMM primitives Thor
+    ``flash_rt_kernels.so``). All elementwise / GEMM primitives Thor
     already exposes are reused.
 """
 from __future__ import annotations
@@ -39,7 +39,7 @@ class Pi05ThorCFGPipeline(Pi05ThorPipeline):
     """Per-chunk classifier-free guidance pipeline for Pi0.5 Thor SM110.
 
     Args:
-        fvk: ``flash_vla.flash_vla_kernels`` module — the Thor kernel
+        fvk: ``flash_rt.flash_rt_kernels`` module — the Thor kernel
             library. Must export ``cfg_combine_into_residual_fp16``.
         cfg_beta: Guidance strength. Must be ``>= 1.0``. ``1.0`` collapses
             to the cond-only output (after the zero-residual prep below).
@@ -161,7 +161,7 @@ class Pi05ThorCFGPipeline(Pi05ThorPipeline):
         type the frontend chose for the embeddings (a torch.Tensor
         on the torch side, a numpy array on the JAX side) is fine.
 
-        Mirrors :meth:`flash_vla.models.pi05.pipeline_rtx_cfg.Pi05CFGPipeline
+        Mirrors :meth:`flash_rt.models.pi05.pipeline_rtx_cfg.Pi05CFGPipeline
         .set_language_embeds_pair` (pipeline_rtx_cfg.py:159).
         """
         self._lang_emb_cond = cond_embeds

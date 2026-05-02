@@ -10,8 +10,8 @@ the frontend for now.
 
 from __future__ import annotations
 
-from flash_vla.executors.weight_loader import ModelWeightSpec
-from flash_vla.frontends.jax._thor_spec_common import (
+from flash_rt.executors.weight_loader import ModelWeightSpec
+from flash_rt.frontends.jax._thor_spec_common import (
     gemma_decoder_block,
     paligemma_encoder_block,
     vision_siglip_block,

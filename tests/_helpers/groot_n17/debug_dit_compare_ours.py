@@ -46,7 +46,7 @@ def main() -> None:
     aux = torch.load(AUX, weights_only=False)
     ref = torch.load(REF, weights_only=False)
 
-    from flash_vla.frontends.torch.groot_n17_thor import GrootN17TorchFrontendThor
+    from flash_rt.frontends.torch.groot_n17_thor import GrootN17TorchFrontendThor
     fe = GrootN17TorchFrontendThor(
         snap, num_views=2,
         embodiment_tag="oxe_droid_relative_eef_relative_joint")
@@ -98,7 +98,7 @@ def main() -> None:
         "ff_proj_out": bufs["dit_ff_proj_out"].data_ptr(),
     }
 
-    from flash_vla.models.groot_n17 import pipeline_thor
+    from flash_rt.models.groot_n17 import pipeline_thor
 
     print("\n  Pass A: per-layer equivalence (re-inject HF output_{li-1})")
     print("  layer  type    cos(ours, HF)")

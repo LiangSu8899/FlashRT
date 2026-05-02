@@ -1,6 +1,6 @@
-"""FlashVLA -- Pi05TorchFrontendThor: complete inference using ONLY flash_vla_kernels.so.
+"""FlashVLA -- Pi05TorchFrontendThor: complete inference using ONLY flash_rt_kernels.so.
 
-All computation goes through flash_vla_kernels (pybind11 + CUTLASS + cuBLASLt).
+All computation goes through flash_rt_kernels (pybind11 + CUTLASS + cuBLASLt).
 
 Usage:
     pipe = Pi05TorchFrontendThor("/path/to/checkpoint", num_views=2)
@@ -17,17 +17,17 @@ import pathlib
 import time
 from typing import Optional, Union
 
-from flash_vla.hardware.thor.shared_primitives import (
+from flash_rt.hardware.thor.shared_primitives import (
     siglip_forward,
     postln_project,
     encoder_forward,
     encoder_forward_calibrate,
 )
-from flash_vla.models.pi05.pipeline_thor import (
+from flash_rt.models.pi05.pipeline_thor import (
     decoder_forward,
     decoder_forward_calibrate,
 )
-from flash_vla.hardware.thor.attn_backend import (
+from flash_rt.hardware.thor.attn_backend import (
     ThorFlashAttnBackend,
     make_pi05_attention_spec,
 )
@@ -36,10 +36,10 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-import flash_vla.flash_vla_kernels as fvk
-from flash_vla.core.cuda_buffer import CudaBuffer
-from flash_vla.core.utils.actions import unnormalize_actions, LIBERO_ACTION_DIM
-from flash_vla.core.quant.calibrator import load_calibration, save_calibration
+import flash_rt.flash_rt_kernels as fvk
+from flash_rt.core.cuda_buffer import CudaBuffer
+from flash_rt.core.utils.actions import unnormalize_actions, LIBERO_ACTION_DIM
+from flash_rt.core.quant.calibrator import load_calibration, save_calibration
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +53,7 @@ _cudart = ctypes.CDLL("libcudart.so")
 # Helpers
 # ---------------------------------------------------------------------------
 
-from flash_vla.core.thor_frontend_utils import embed_prompt_torch as embed_prompt  # noqa: E402
+from flash_rt.core.thor_frontend_utils import embed_prompt_torch as embed_prompt  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -65,7 +65,7 @@ from flash_vla.core.thor_frontend_utils import embed_prompt_torch as embed_promp
 # ===========================================================================
 
 class Pi05TorchFrontendThor:
-    """Complete Pi0.5 inference pipeline using only flash_vla_kernels.so.
+    """Complete Pi0.5 inference pipeline using only flash_rt_kernels.so.
 
     Interface compatible with FlashVLAModel.predict():
         set_prompt(prompt_text)
@@ -118,7 +118,7 @@ class Pi05TorchFrontendThor:
 
         # ---- Load CUTLASS FMHA (compiled from csrc/attention/) ----
         # Search order: next to the checkpoint, then the installed
-        # ``flash_vla/`` package dir (pip + editable installs land here via
+        # ``flash_rt/`` package dir (pip + editable installs land here via
         # the ``package-data = ["*.so"]`` glob in pyproject.toml), then the
         # uncopied ``build/`` output of a fresh cmake run, then the docker
         # container convention ``/workspace/``.
@@ -157,7 +157,7 @@ class Pi05TorchFrontendThor:
     # -----------------------------------------------------------------------
 
     def _load_norm_stats(self, checkpoint_dir):
-        from flash_vla.core.utils.norm_stats import (
+        from flash_rt.core.utils.norm_stats import (
             load_norm_stats, lerobot_candidates,
         )
         candidates = [
@@ -178,12 +178,12 @@ class Pi05TorchFrontendThor:
     def _load_weights(self, safetensors_path):
         from safetensors import safe_open
 
-        from flash_vla.executors.torch_weights import (
+        from flash_rt.executors.torch_weights import (
             SafetensorsSource, WeightLoader,
         )
-        from flash_vla.frontends.torch._pi05_thor_spec import build_spec
+        from flash_rt.frontends.torch._pi05_thor_spec import build_spec
 
-        from flash_vla.executors.torch_weights import _autodetect_strip_prefix
+        from flash_rt.executors.torch_weights import _autodetect_strip_prefix
         sf = safe_open(str(safetensors_path), framework='pt', device='cuda')
         # The lerobot HF policy releases (e.g. lerobot/pi05_libero
         # _finetuned_v044) wrap every weight key under an extra
@@ -596,7 +596,7 @@ class Pi05TorchFrontendThor:
             raise ValueError(
                 "set_rl_mode requires a text prompt (the ACP tag is "
                 "appended at the string level); pass a str, not token IDs")
-        from flash_vla.core.rl import build_acp_tagged_task
+        from flash_rt.core.rl import build_acp_tagged_task
 
         cfg = self._rl_config
         cond_text = build_acp_tagged_task(
@@ -645,7 +645,7 @@ class Pi05TorchFrontendThor:
 
     def _build_cfg_serial_pipeline(self, cfg_beta: float) -> None:
         """Build the Stage 0 serial CFG pipeline (per-chunk, B=1 graphs)."""
-        from flash_vla.models.pi05.pipeline_thor_cfg import (
+        from flash_rt.models.pi05.pipeline_thor_cfg import (
             Pi05ThorCFGPipeline)
         self._cfg_pipeline = Pi05ThorCFGPipeline(
             fvk,
@@ -687,7 +687,7 @@ class Pi05TorchFrontendThor:
         Changing ``cfg_beta`` requires rebuilding the pipeline (the
         beta is baked into the captured cfg_combine kernel calls).
         """
-        from flash_vla.models.pi05.pipeline_thor_cfg_batched import (
+        from flash_rt.models.pi05.pipeline_thor_cfg_batched import (
             Pi05ThorCFGBatchedPipeline)
         # Mark this beta on the inner enc_ae_b2 graph for backward
         # compatibility with any callers that still trigger the eager
@@ -1361,8 +1361,8 @@ class Pi05TorchFrontendThor:
         wires up the ``_b2``-suffixed buffers, the per-sample KV-cache
         slabs, and the B-tiled style buffers, then drives a warmup +
         capture using
-        :func:`flash_vla.hardware.thor.shared_primitives_batched.encoder_forward_b2`
-        and :func:`flash_vla.models.pi05.pipeline_thor_batched.decoder_forward_b2`.
+        :func:`flash_rt.hardware.thor.shared_primitives_batched.encoder_forward_b2`
+        and :func:`flash_rt.models.pi05.pipeline_thor_batched.decoder_forward_b2`.
 
         Preconditions:
           * ``self._batched`` is True and ``self._alloc_b2_buffers``
@@ -1375,9 +1375,9 @@ class Pi05TorchFrontendThor:
             "B=1 calibration transfers to B=N". Stage 3 CFG-batched
             will override with a joint cond+uncond pass.
         """
-        from flash_vla.hardware.thor.shared_primitives_batched import (
+        from flash_rt.hardware.thor.shared_primitives_batched import (
             encoder_forward_b2)
-        from flash_vla.models.pi05.pipeline_thor_batched import (
+        from flash_rt.models.pi05.pipeline_thor_batched import (
             decoder_forward_b2)
 
         B = self.B
@@ -1522,9 +1522,9 @@ class Pi05TorchFrontendThor:
         Requires ``self._lang_emb_cond`` / ``_lang_emb_uncond`` to be
         device tensors (set up by ``_set_prompt_rl``).
         """
-        from flash_vla.hardware.thor.shared_primitives_batched import (
+        from flash_rt.hardware.thor.shared_primitives_batched import (
             encoder_forward_b2)
-        from flash_vla.models.pi05.pipeline_thor_batched import (
+        from flash_rt.models.pi05.pipeline_thor_batched import (
             decoder_forward_b2)
 
         B = self.B
@@ -1736,7 +1736,7 @@ class Pi05TorchFrontendThor:
             batch_size: Number of fused samples. Stage 2 supports
                 ``batch_size=2``; future stages may extend.
 
-        Mirrors :meth:`flash_vla.frontends.torch.pi05_rtx.Pi05TorchFrontendRtx.set_batched_mode`
+        Mirrors :meth:`flash_rt.frontends.torch.pi05_rtx.Pi05TorchFrontendRtx.set_batched_mode`
         (line 1140) at the API level.
         """
         if not enable:
@@ -2030,7 +2030,7 @@ class Pi05TorchFrontendThor:
         if n == 1:
             # Legacy implicit-calibrate path: one infer() flips
             # _real_data_calibrated via the lazy branch in infer().
-            from flash_vla.core.calibration_api import implicit_calibrate
+            from flash_rt.core.calibration_api import implicit_calibrate
             implicit_calibrate(
                 self, obs_list,
                 percentile=percentile, max_samples=None, verbose=verbose,
@@ -2194,7 +2194,7 @@ class Pi05TorchFrontendThor:
         buffers differ (Thor exposes single device tensors per stage
         rather than a per-tensor dict).
         """
-        from flash_vla.core.calibration import (
+        from flash_rt.core.calibration import (
             accumulate_amax,
             check_scale_ceiling,
             format_summary,

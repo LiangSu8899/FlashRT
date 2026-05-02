@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from flash_vla.executors.weight_loader import Item, LayerBlock
-from flash_vla.executors.jax_weights import (
+from flash_rt.executors.weight_loader import Item, LayerBlock
+from flash_rt.executors.jax_weights import (
     Astype,
     CudaBufferFlat,
     JaxQuant,

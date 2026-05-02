@@ -1,16 +1,16 @@
 """FlashVLA — Pi0.5 Thor SM110 fused B=2 classifier-free-guidance pipeline.
 
 Single-inheritance subclass of
-:class:`flash_vla.models.pi05.pipeline_thor_batched.Pi05ThorBatchedPipeline`
+:class:`flash_rt.models.pi05.pipeline_thor_batched.Pi05ThorBatchedPipeline`
 that runs the conditioned + unconditioned CFG branches as the two
 slots of a single B=2 fused forward, mirroring the RTX layout
-(``flash_vla/models/pi05/pipeline_rtx_cfg_batched.py``).
+(``flash_rt/models/pi05/pipeline_rtx_cfg_batched.py``).
 
 Slot 0 carries the conditioned prompt; slot 1 carries the
 unconditioned prompt. Both contexts ride the same B=2 ``enc_ae_b2``
 graph replay; the **per-step** CFG combine + noise mirror happen
 inside that captured graph (see
-:func:`flash_vla.models.pi05.pipeline_thor_batched.decoder_forward_b2` with
+:func:`flash_rt.models.pi05.pipeline_thor_batched.decoder_forward_b2` with
 ``cfg_beta`` set), matching RTX
 :meth:`Pi05CFGBatchedPipeline.transformer_decoder_batched` and
 arXiv:2511.14759 Appendix E:
@@ -40,12 +40,12 @@ class Pi05ThorCFGBatchedPipeline(Pi05ThorBatchedPipeline):
     """B=2 fused classifier-free guidance pipeline for Pi0.5 Thor SM110.
 
     Mirrors RTX
-    :class:`flash_vla.models.pi05.pipeline_rtx_cfg_batched.Pi05CFGBatchedPipeline`:
+    :class:`flash_rt.models.pi05.pipeline_rtx_cfg_batched.Pi05CFGBatchedPipeline`:
     slot 0 carries the conditioned prompt, slot 1 carries the
     unconditioned prompt, both ride a single ``enc_ae_b2`` graph
     replay, and the per-step CFG combine + noise mirror live INSIDE
     that captured graph (driven by ``cfg_beta`` plumbed through to
-    :func:`flash_vla.models.pi05.pipeline_thor_batched.decoder_forward_b2`).
+    :func:`flash_rt.models.pi05.pipeline_thor_batched.decoder_forward_b2`).
 
     The frontend's
     :meth:`_capture_enc_ae_graph_b2` recaptures the graph with

@@ -1,6 +1,6 @@
 """FlashVLA new-model template — pipeline (model-specific compute).
 
-Copy this file to `flash_vla/models/<mymodel>/pipeline_<hw>.py`
+Copy this file to `flash_rt/models/<mymodel>/pipeline_<hw>.py`
 (`<hw>` = `thor` or `rtx`). This is **the bulk of your hand-written
 work** — it's where you translate your model's `forward()` into a
 sequence of `fvk.*` kernel calls.
@@ -88,7 +88,7 @@ def encoder_forward(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None):
 
     Args:
         ctx: FvkContext (C++ object holding cuBLAS handle)
-        fvk: flash_vla_kernels module (pybind layer)
+        fvk: flash_rt_kernels module (pybind layer)
         bufs: dict of GPU buffer pointers (uintptr_t).
               Allocated once in the frontend, reused across calls.
               Required keys: x, x_norm, qkv, attn_out, ffn_hid, residual
@@ -225,10 +225,10 @@ def encoder_forward_calibrate(ctx, fvk, bufs, weights, dims, act_scales, stream=
 
     After this runs once per real-data sample, the frontend's
     calibration code applies a percentile reduction over samples
-    (see flash_vla.core.calibration.accumulate_amax) and writes the
+    (see flash_rt.core.calibration.accumulate_amax) and writes the
     final scales into the production weights dict.
     """
-    from flash_vla.hardware.thor.shared_primitives import _measure_scale_gpu  # rtx version is identical
+    from flash_rt.hardware.thor.shared_primitives import _measure_scale_gpu  # rtx version is identical
     # TODO: implement following the same control flow as encoder_forward.
     # At every fvk.quantize_fp8_static call site in encoder_forward,
     # replace with:

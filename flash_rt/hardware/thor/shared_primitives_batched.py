@@ -1,6 +1,6 @@
 """FlashVLA — Thor SM110 model-agnostic primitives, B>=1 batched variants.
 
-Companion to :mod:`flash_vla.hardware.thor.shared_primitives` which
+Companion to :mod:`flash_rt.hardware.thor.shared_primitives` which
 holds the B=1 hot path (the production single-sample inference).
 This module isolates the B>=1 batched kernel orchestrations so the
 B=1 file stays small and easy to reason about — the non-batched
@@ -9,8 +9,8 @@ is opt-in (used by the fused-CFG B=2 pipeline and future RL-rollout
 B>2 paths).
 
 Mirrors the model-layer split between
-:mod:`flash_vla.models.pi05.pipeline_thor` (B=1) and
-:mod:`flash_vla.models.pi05.pipeline_thor_batched` (B>=1), and the
+:mod:`flash_rt.models.pi05.pipeline_thor` (B=1) and
+:mod:`flash_rt.models.pi05.pipeline_thor_batched` (B>=1), and the
 RTX layout's cfg / cfg_batched split.
 
 Functions:
@@ -49,7 +49,7 @@ def encoder_forward_b2(gemm, fvk, bufs, weights, dims, stream=0, *,
     Buffer contract (``B`` is the leading axis or fold):
 
       bufs: same key set as
-        :func:`flash_vla.hardware.thor.shared_primitives.encoder_forward`;
+        :func:`flash_rt.hardware.thor.shared_primitives.encoder_forward`;
         shapes are flat ``B*Se`` along the row dim. The frontend
         allocates a fresh set of ``_b2``-suffixed buffers and hands
         them in here.
@@ -63,7 +63,7 @@ def encoder_forward_b2(gemm, fvk, bufs, weights, dims, stream=0, *,
         sequence length (NOT B*Se).
 
     Args:
-        attn: Optional :class:`flash_vla.hardware.thor.attn_backend.ThorFlashAttnBackend`.
+        attn: Optional :class:`flash_rt.hardware.thor.attn_backend.ThorFlashAttnBackend`.
             **Not used in Stage 2** — the backend's encoder slot is
             single-batch; Stage 2 calls ``fvk.attention_qkv_fp16``
             directly per-sample. A future Stage extends the backend

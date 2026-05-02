@@ -2,7 +2,7 @@
 
 These tests anchor FlashVLA's serial / batched FP8 CFG implementations
 against an independent FP32 PyTorch reference (R_fp32, see
-``flash_vla/refs/pi05_cfg_reference.py``) and against the fused
+``flash_rt/refs/pi05_cfg_reference.py``) and against the fused
 combine kernel's mathematical contract. The full test hierarchy is
 documented in ``docs/precision_spec.md``; below is a summary.
 
@@ -113,7 +113,7 @@ def _cos(a: np.ndarray, b: np.ndarray) -> float:
 @pytest.mark.skipif(
     "FLASHVLA_GPU_TESTS" not in os.environ
     or not os.environ.get("FLASHVLA_GPU_TESTS"),
-    reason="C1 needs CUDA + flash_vla_kernels extension")
+    reason="C1 needs CUDA + flash_rt_kernels extension")
 def test_c1_cfg_combine_kernel_matches_fp32():
     """C1: residual += v_uncond + β·(v_cond - v_uncond), in BF16, vs FP32 ref.
 
@@ -128,7 +128,7 @@ def test_c1_cfg_combine_kernel_matches_fp32():
     """
     import torch
 
-    from flash_vla import flash_vla_kernels as fvk
+    from flash_rt import flash_rt_kernels as fvk
 
     n = 320
     rng = np.random.default_rng(0)

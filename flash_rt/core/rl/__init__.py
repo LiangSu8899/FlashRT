@@ -4,7 +4,7 @@ Framework-agnostic: no torch / jax / hardware assumptions in the
 prompt-builder side; the value-function and reward modules are
 PyTorch-only because the VF model is a torch ``nn.Module``. Used by:
 
-* the inference path (``flash_vla.frontends.*``) — ACP tag builder,
+* the inference path (``flash_rt.frontends.*``) — ACP tag builder,
   CFG sampler;
 * the training path (``training/rl/``) — value targets, dense
   rewards, soft-bin loss, N-step advantage, per-task threshold,

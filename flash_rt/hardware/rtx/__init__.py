@@ -1,8 +1,8 @@
 """FlashVLA — RTX consumer discrete GPU attention backends.
 
 Hardware-specific attention backends for RTX GPUs (SM80/86/89/120).
-Model pipelines live in ``flash_vla.models.*``; frontends live in
-``flash_vla.frontends.*``.
+Model pipelines live in ``flash_rt.models.*``; frontends live in
+``flash_rt.frontends.*``.
 
 Remaining here:
     attn_backend.py       — Pi0 / Pi0.5 attention backend
@@ -11,7 +11,7 @@ Remaining here:
                              (:class:`RtxFlashAttnBackendGroot`)
 
 Both backends wrap the vendored Flash-Attention 2 kernels
-(:mod:`flash_vla.flash_vla_fa2`) and are framework-neutral — used
+(:mod:`flash_rt.flash_rt_fa2`) and are framework-neutral — used
 by both the torch and jax frontends. The ``Torch``-prefixed names
 ``TorchFlashAttnBackend`` / ``TorchFlashAttnBackendGroot`` are kept
 as deprecated aliases and will be removed in a future major version.

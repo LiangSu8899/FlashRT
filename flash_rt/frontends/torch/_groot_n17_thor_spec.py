@@ -33,8 +33,8 @@ Per-layer scale-list layout (so the pipeline can index correctly):
 
 from __future__ import annotations
 
-from flash_vla.executors.weight_loader import Item, LayerBlock, ModelWeightSpec
-from flash_vla.executors.torch_weights import (
+from flash_rt.executors.weight_loader import Item, LayerBlock, ModelWeightSpec
+from flash_rt.executors.torch_weights import (
     Attr,
     Cat,
     Quant,
@@ -375,8 +375,8 @@ def build_spec() -> ModelWeightSpec:
 
     Run via::
 
-        from flash_vla.executors.weight_loader import WeightLoader
-        from flash_vla.executors.torch_weights import SafetensorsSource
+        from flash_rt.executors.weight_loader import WeightLoader
+        from flash_rt.executors.torch_weights import SafetensorsSource
         WeightLoader(
             source=SafetensorsSource(<list-of-shard-paths>),
             target=self,
@@ -386,7 +386,7 @@ def build_spec() -> ModelWeightSpec:
     After ``.run()`` returns, every ``Attr`` and ``TensorList`` named above
     is materialised onto the frontend instance, and the scale lists are
     populated in spec-iteration order (matching the FP8 GEMM call order in
-    ``flash_vla.models.groot_n17.pipeline_thor``).
+    ``flash_rt.models.groot_n17.pipeline_thor``).
     """
     return ModelWeightSpec(
         framework="torch",

@@ -1,9 +1,9 @@
 """FlashVLA — AttentionBackend protocol.
 
-Anchors the upstream refactor: every model pipeline in ``flash_vla.models.*``
+Anchors the upstream refactor: every model pipeline in ``flash_rt.models.*``
 that has more than one hardware implementation (Pi0.5, Pi0, GROOT, Pi0.6)
 calls attention through this protocol, so the hardware-specific code lives
-in exactly one place (``flash_vla.hardware.{thor,rtx}.attention_*``).
+in exactly one place (``flash_rt.hardware.{thor,rtx}.attention_*``).
 
 Scope
 -----

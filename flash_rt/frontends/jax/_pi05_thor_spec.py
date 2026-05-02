@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import numpy as np
 
-from flash_vla.executors.weight_loader import Item, LayerBlock, ModelWeightSpec
-from flash_vla.executors.jax_weights import Astype, NumpyList
-from flash_vla.frontends.jax._thor_spec_common import (
+from flash_rt.executors.weight_loader import Item, LayerBlock, ModelWeightSpec
+from flash_rt.executors.jax_weights import Astype, NumpyList
+from flash_rt.frontends.jax._thor_spec_common import (
     gemma_decoder_block,
     paligemma_encoder_block,
     vision_siglip_block,

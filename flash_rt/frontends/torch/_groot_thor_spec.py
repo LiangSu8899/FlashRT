@@ -25,8 +25,8 @@ Op order inside each Item is byte-for-byte equivalent to
 
 from __future__ import annotations
 
-from flash_vla.executors.weight_loader import Item, LayerBlock, ModelWeightSpec
-from flash_vla.executors.torch_weights import (
+from flash_rt.executors.weight_loader import Item, LayerBlock, ModelWeightSpec
+from flash_rt.executors.torch_weights import (
     Cat,
     Quant,
     T,

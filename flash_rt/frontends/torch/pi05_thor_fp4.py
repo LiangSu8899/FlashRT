@@ -21,17 +21,17 @@ from typing import Iterable
 
 import torch
 
-import flash_vla.flash_vla_kernels as fvk
-from flash_vla.frontends.torch.pi05_thor import Pi05TorchFrontendThor
-from flash_vla.hardware.thor.shared_primitives import encoder_forward
-from flash_vla.models.pi05.pipeline_thor import decoder_forward
-from flash_vla.hardware.thor.shared_primitives_fp4 import encoder_forward_with_fp4_subset
-from flash_vla.executors.fp4_utils import (
+import flash_rt.flash_rt_kernels as fvk
+from flash_rt.frontends.torch.pi05_thor import Pi05TorchFrontendThor
+from flash_rt.hardware.thor.shared_primitives import encoder_forward
+from flash_rt.models.pi05.pipeline_thor import decoder_forward
+from flash_rt.hardware.thor.shared_primitives_fp4 import encoder_forward_with_fp4_subset
+from flash_rt.executors.fp4_utils import (
     FP4ActScratch, pick_variant, quant_weight_nvfp4, quant_weight_nvfp4_inplace,
 )
 
 try:
-    import flash_vla.flash_vla_fp4 as fvk_fp4
+    import flash_rt.flash_rt_fp4 as fvk_fp4
     _HAS_FP4 = fvk_fp4.has_nvfp4()
 except Exception as _e:  # pragma: no cover
     fvk_fp4 = None
@@ -68,8 +68,8 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
         if self._fp4_layers:
             if not _HAS_FP4:
                 raise RuntimeError(
-                    "use_fp4_encoder_ffn=True but flash_vla_fp4 not available. "
-                    "Ensure flash_vla_fp4.so is built with NVFP4 support.")
+                    "use_fp4_encoder_ffn=True but flash_rt_fp4 not available. "
+                    "Ensure flash_rt_fp4.so is built with NVFP4 support.")
             self._prepare_fp4_encoder()
             logger.info("Pi05 FP4 enabled on encoder layers: %s  (AWQ=%s)",
                         sorted(self._fp4_layers), self.use_awq)
@@ -129,7 +129,7 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                 obs_list, percentile=percentile, verbose=verbose)
 
         import numpy as np
-        from flash_vla.core.calibration import (
+        from flash_rt.core.calibration import (
             accumulate_amax,
             check_scale_ceiling,
             format_summary,
@@ -293,7 +293,7 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
         self._awq_inv_s_gu = {} if self.use_awq else None
         self._awq_inv_s_dn = {} if self.use_awq else None
 
-        from flash_vla.executors.torch_weights import _autodetect_strip_prefix
+        from flash_rt.executors.torch_weights import _autodetect_strip_prefix
         with safe_open(self._checkpoint_path, framework='pt', device='cuda') as sf:
             _strip = _autodetect_strip_prefix(set(sf.keys()))
             def get(k):
@@ -368,7 +368,7 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
         This keeps the captured CUDA Graph valid — no recapture needed.
         """
         from safetensors import safe_open
-        from flash_vla.executors.torch_weights import _autodetect_strip_prefix
+        from flash_rt.executors.torch_weights import _autodetect_strip_prefix
         De = self.De; He = self.He
         model_root = "paligemma_with_expert.paligemma.model.language_model.layers"
         with safe_open(self._checkpoint_path, framework='pt', device='cuda') as sf:
@@ -536,7 +536,7 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
         # P1: split-GU intermediate FP4 buffers (gate / up between fp4out GEMMs
         # and geglu_two combiner). Each is [Se, He/2] packed + SFA.
         if self.use_p1_split_gu:
-            from flash_vla.executors.fp4_utils import FP4Buffer
+            from flash_rt.executors.fp4_utils import FP4Buffer
             self._fp4_p1_gate = FP4Buffer(Se, He, device='cuda')
             self._fp4_p1_up   = FP4Buffer(Se, He, device='cuda')
         self._fp4_scratch_dict = {

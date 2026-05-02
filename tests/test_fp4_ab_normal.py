@@ -18,8 +18,8 @@ def main():
     obs = {"image": img, "wrist_image": wrist}
     CKPT = "<your_pi05_torch_ckpt>"
 
-    from flash_vla.frontends.torch.pi05_thor import Pi05TorchFrontendThor
-    from flash_vla.frontends.torch.pi05_thor_fp4 import Pi05TorchFrontendThorFP4
+    from flash_rt.frontends.torch.pi05_thor import Pi05TorchFrontendThor
+    from flash_rt.frontends.torch.pi05_thor_fp4 import Pi05TorchFrontendThorFP4
 
     for trial in range(3):
         print(f"\n── Trial {trial+1}/3 ──")

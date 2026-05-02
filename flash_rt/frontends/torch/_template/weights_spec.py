@@ -1,6 +1,6 @@
 """FlashVLA new-model template — weight specification.
 
-Copy this file to `flash_vla/frontends/torch/_<mymodel>_<hw>_spec.py`
+Copy this file to `flash_rt/frontends/torch/_<mymodel>_<hw>_spec.py`
 and fill in the `WEIGHT_SPEC` table. This is the **declarative** part
 of model integration; getting this right is mostly mechanical
 (translate state_dict keys to slots) and accounts for ~30% of the
@@ -51,7 +51,7 @@ state_dict["lm_head.weight"]             ("output", None, "lm_head_w"):
 import numpy as np
 from safetensors import safe_open
 
-from flash_vla.executors.fp8_utils import quant_weight_fp8
+from flash_rt.executors.fp8_utils import quant_weight_fp8
 
 
 # ──────────────────────────────────────────────────────────────────

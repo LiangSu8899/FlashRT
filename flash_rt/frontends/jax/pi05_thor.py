@@ -1,7 +1,7 @@
 """FlashVLA — Thor JAX frontend (SM110).
 
 Loads JAX Orbax checkpoints → FP8 quantize (ml_dtypes) → CudaBuffer (cudaMalloc)
-→ pipeline.py (flash_vla_kernels.so) on Jetson AGX Thor.
+→ pipeline.py (flash_rt_kernels.so) on Jetson AGX Thor.
 
 No PyTorch dependency.
 CudaBuffer (cudaMalloc) bridges JAX weight loading ↔ kernel execution.
@@ -22,17 +22,17 @@ import time as _time
 
 import numpy as np
 
-from flash_vla.hardware.thor.shared_primitives import (
+from flash_rt.hardware.thor.shared_primitives import (
     siglip_forward,
     postln_project,
     encoder_forward,
     encoder_forward_calibrate,
 )
-from flash_vla.models.pi05.pipeline_thor import (
+from flash_rt.models.pi05.pipeline_thor import (
     decoder_forward,
     decoder_forward_calibrate,
 )
-from flash_vla.hardware.thor.attn_backend import (
+from flash_rt.hardware.thor.attn_backend import (
     ThorFlashAttnBackend,
     make_pi05_attention_spec,
 )
@@ -54,11 +54,11 @@ import jax
 import jax.numpy as jnp
 
 
-from flash_vla.core.thor_frontend_utils import embed_prompt_numpy as _embed_prompt  # noqa: E402
+from flash_rt.core.thor_frontend_utils import embed_prompt_numpy as _embed_prompt  # noqa: E402
 
 
 class Pi05JaxFrontendThor:
-    """Thor SM110 — JAX (Orbax) frontend. CudaBuffer bridge to flash_vla_kernels."""
+    """Thor SM110 — JAX (Orbax) frontend. CudaBuffer bridge to flash_rt_kernels."""
 
     def __init__(self, checkpoint_dir, engine_path=None, fmha_path=None,
                  use_cuda_graph=True, num_views=2, autotune=3,
@@ -72,15 +72,15 @@ class Pi05JaxFrontendThor:
                 Only affects JAX (Orbax is slow to load; safetensors is already fast).
                 Set False to force re-quantize (e.g., after fine-tuning).
         """
-        from flash_vla.engine.cuda_buffer import CudaBuffer, sync
-        from flash_vla.weights.transformer import quantize_fp8_e4m3, compute_time_embeddings
+        from flash_rt.engine.cuda_buffer import CudaBuffer, sync
+        from flash_rt.weights.transformer import quantize_fp8_e4m3, compute_time_embeddings
         self._CudaBuffer = CudaBuffer
         self._sync = sync
 
         checkpoint_dir = pathlib.Path(checkpoint_dir)
 
         # ── Load norm stats (openpi or lerobot HF release) ──
-        from flash_vla.core.utils.norm_stats import (
+        from flash_rt.core.utils.norm_stats import (
             load_norm_stats, lerobot_candidates,
         )
         self.norm_stats = load_norm_stats(
@@ -92,14 +92,14 @@ class Pi05JaxFrontendThor:
         )
 
         # ── FvkContext + GemmRunner + FMHA ──
-        from flash_vla import flash_vla_kernels as _fvk
+        from flash_rt import flash_rt_kernels as _fvk
         self._fvk = _fvk
         self._ctx = _fvk.FvkContext()
         self._gemm = _fvk.GemmRunner()
 
         if fmha_path is None:
             # Search order matches the torch Thor frontends: ckpt-adjacent,
-            # ``flash_vla/`` package dir (pip / editable install target),
+            # ``flash_rt/`` package dir (pip / editable install target),
             # fresh cmake ``build/`` output, docker ``/workspace/``.
             _here = pathlib.Path(__file__)
             for c in [str(checkpoint_dir.parent / 'libfmha_fp16_strided.so'),
@@ -119,15 +119,15 @@ class Pi05JaxFrontendThor:
         cache_hit = False
 
         if weight_cache:
-            from flash_vla.core.weights.weight_cache import load_weight_cache
+            from flash_rt.core.weights.weight_cache import load_weight_cache
             cached = load_weight_cache(str(checkpoint_dir), num_views)
             if cached is not None:
                 self._load_from_cache(cached)
                 cache_hit = True
 
         if not cache_hit:
-            from flash_vla.weights.loader import load_weights, detect_format
-            from flash_vla.weights.transformer import transform_jax_weights
+            from flash_rt.weights.loader import load_weights, detect_format
+            from flash_rt.weights.transformer import transform_jax_weights
 
             fmt = detect_format(str(checkpoint_dir))
             raw = load_weights(str(checkpoint_dir), format=fmt)
@@ -235,9 +235,9 @@ class Pi05JaxFrontendThor:
         # Also mutates self._cache_blobs with the per-slot cache keys.
         self._cache_blobs = {}
 
-        from flash_vla.executors.jax_weights import OrbaxDictSource
-        from flash_vla.executors.weight_loader import WeightLoader
-        from flash_vla.frontends.jax._pi05_thor_spec import build_spec
+        from flash_rt.executors.jax_weights import OrbaxDictSource
+        from flash_rt.executors.weight_loader import WeightLoader
+        from flash_rt.frontends.jax._pi05_thor_spec import build_spec
         WeightLoader(source=OrbaxDictSource(engine_w),
                      target=self, spec=build_spec()).run()
 
@@ -279,7 +279,7 @@ class Pi05JaxFrontendThor:
         self.img_buf = CB.device_empty(nv * 224 * 224 * 3, fp16)
         self.patches_buf = CB.device_empty(S * 588, fp16)
         # GemmRunner for FP16 patch_embed GEMM
-        from flash_vla import flash_vla_kernels as _fvk
+        from flash_rt import flash_rt_kernels as _fvk
         self._fvk = _fvk
         self._gemm = _fvk.GemmRunner()
 
@@ -459,7 +459,7 @@ class Pi05JaxFrontendThor:
         Uses _cache_blobs collected during _upload_weights (avoids GPU→CPU download
         which segfaults in XLA context).
         """
-        from flash_vla.core.weights.weight_cache import save_weight_cache
+        from flash_rt.core.weights.weight_cache import save_weight_cache
 
         entries = []
         blobs = []
@@ -858,7 +858,7 @@ class Pi05JaxFrontendThor:
         Checks calibration cache first. On miss, runs dynamic calibration
         and saves to cache for next startup.
         """
-        from flash_vla.core.quant.calibrator import load_calibration, save_calibration
+        from flash_rt.core.quant.calibrator import load_calibration, save_calibration
 
         CB = self._CudaBuffer
         Se = self.Se; total_keys = self.total_keys
@@ -1056,7 +1056,7 @@ class Pi05JaxFrontendThor:
 
     def _capture_siglip_graph(self):
         """Capture patch_embed + SigLIP + PostLN as CUDA graph."""
-        from flash_vla.engine.cuda_graph import CUDAGraph
+        from flash_rt.engine.cuda_graph import CUDAGraph
         S, D, H, NH, HD, L = self.sig_dims
 
         _cudart = ctypes.CDLL("libcudart.so")
@@ -1138,7 +1138,7 @@ class Pi05JaxFrontendThor:
 
     def _capture_enc_ae_graph(self):
         """Capture Encoder+AE as CUDA graph via pipeline.py."""
-        from flash_vla.engine.cuda_graph import CUDAGraph
+        from flash_rt.engine.cuda_graph import CUDAGraph
         stream = self._stream; _cudart = self._cudart
         stream_int = stream.value or 0
 
@@ -1279,16 +1279,16 @@ class Pi05JaxFrontendThor:
         """Capture the B=N JAX encoder + decoder graph.
 
         Mirrors :meth:`Pi05TorchFrontendThor._capture_enc_ae_graph_b2`
-        but uses :class:`flash_vla.engine.cuda_graph.CUDAGraph` and
+        but uses :class:`flash_rt.engine.cuda_graph.CUDAGraph` and
         explicit-stream replay (no ``torch.cuda.Stream`` here). Drives
         a 3x warmup followed by a single capture against
-        :func:`flash_vla.hardware.thor.shared_primitives_batched.encoder_forward_b2`
-        + :func:`flash_vla.models.pi05.pipeline_thor_batched.decoder_forward_b2`.
+        :func:`flash_rt.hardware.thor.shared_primitives_batched.encoder_forward_b2`
+        + :func:`flash_rt.models.pi05.pipeline_thor_batched.decoder_forward_b2`.
         """
-        from flash_vla.engine.cuda_graph import CUDAGraph
-        from flash_vla.hardware.thor.shared_primitives_batched import (
+        from flash_rt.engine.cuda_graph import CUDAGraph
+        from flash_rt.hardware.thor.shared_primitives_batched import (
             encoder_forward_b2)
-        from flash_vla.models.pi05.pipeline_thor_batched import (
+        from flash_rt.models.pi05.pipeline_thor_batched import (
             decoder_forward_b2)
 
         if self._sa_all_b2 is None:
@@ -1436,10 +1436,10 @@ class Pi05JaxFrontendThor:
         Per-call frontend work shrinks to: image upload + noise R upload
         + ONE ``outer_graph.replay()`` + final sync.
         """
-        from flash_vla.engine.cuda_graph import CUDAGraph
-        from flash_vla.hardware.thor.shared_primitives_batched import (
+        from flash_rt.engine.cuda_graph import CUDAGraph
+        from flash_rt.hardware.thor.shared_primitives_batched import (
             encoder_forward_b2)
-        from flash_vla.models.pi05.pipeline_thor_batched import (
+        from flash_rt.models.pi05.pipeline_thor_batched import (
             decoder_forward_b2)
         cudart = self._cudart
         stream = self._stream
@@ -1660,7 +1660,7 @@ class Pi05JaxFrontendThor:
         appropriate slot of ``_enc_x_b2``, replays the B=N graph,
         unpacks per-slot actions.
         """
-        from flash_vla.core.utils.actions import (
+        from flash_rt.core.utils.actions import (
             unnormalize_actions, LIBERO_ACTION_DIM)
         if not self._batched:
             raise RuntimeError(
@@ -1829,7 +1829,7 @@ class Pi05JaxFrontendThor:
             raise ValueError(
                 "set_rl_mode requires a text prompt (the ACP tag is "
                 "appended at the string level); pass a str, not token IDs")
-        from flash_vla.core.rl import build_acp_tagged_task
+        from flash_rt.core.rl import build_acp_tagged_task
 
         cfg = self._rl_config
         cond_text = build_acp_tagged_task(
@@ -1887,7 +1887,7 @@ class Pi05JaxFrontendThor:
 
     def _build_cfg_serial_pipeline_jax(self, cfg_beta: float) -> None:
         """JAX serial CFG pipeline (Stage 0 — per-chunk, B=1 graphs)."""
-        from flash_vla.models.pi05.pipeline_thor_cfg import (
+        from flash_rt.models.pi05.pipeline_thor_cfg import (
             Pi05ThorCFGPipeline)
         stream = self._stream
         stream_int = stream.value or 0
@@ -1931,7 +1931,7 @@ class Pi05JaxFrontendThor:
         def _sync_jax():
             self._cudart.cudaStreamSynchronize(stream)
 
-        from flash_vla import flash_vla_kernels as _fvk
+        from flash_rt import flash_rt_kernels as _fvk
         self._cfg_pipeline = Pi05ThorCFGPipeline(
             _fvk,
             cfg_beta=cfg_beta,
@@ -1967,7 +1967,7 @@ class Pi05JaxFrontendThor:
         Changing ``cfg_beta`` requires rebuilding the pipeline (the
         beta is baked into the captured cfg_combine kernel calls).
         """
-        from flash_vla.models.pi05.pipeline_thor_cfg_batched import (
+        from flash_rt.models.pi05.pipeline_thor_cfg_batched import (
             Pi05ThorCFGBatchedPipeline)
         # Recapture against the new cfg_beta. Any previous B=2 graph
         # was either non-CFG or captured against a stale beta.
@@ -2041,7 +2041,7 @@ class Pi05JaxFrontendThor:
         def _sync_jax():
             self._cudart.cudaStreamSynchronize(stream)
 
-        from flash_vla import flash_vla_kernels as _fvk
+        from flash_rt import flash_rt_kernels as _fvk
         self._cfg_pipeline = Pi05ThorCFGBatchedPipeline(
             _fvk,
             cfg_beta=cfg_beta,
@@ -2069,7 +2069,7 @@ class Pi05JaxFrontendThor:
             so the same numpy array can be re-uploaded for the uncond
             branch.
         """
-        from flash_vla.core.utils.actions import (
+        from flash_rt.core.utils.actions import (
             unnormalize_actions, LIBERO_ACTION_DIM)
         nv = self.num_views
         stream = self._stream
@@ -2173,7 +2173,7 @@ class Pi05JaxFrontendThor:
         forwards through encoder + decoder, percentile-reduces per-tensor
         amax along the sample axis, uploads the reduced FP8 scales, and
         recaptures the enc/ae graph with the new scales baked in
-        (mirrors ``flash_vla/frontends/torch/pi05_thor.py``).
+        (mirrors ``flash_rt/frontends/torch/pi05_thor.py``).
         """
         if isinstance(observations, dict):
             obs_list = [observations]
@@ -2191,7 +2191,7 @@ class Pi05JaxFrontendThor:
                 f"percentile must be in [0, 100], got {percentile}")
 
         if n == 1:
-            from flash_vla.core.calibration_api import implicit_calibrate
+            from flash_rt.core.calibration_api import implicit_calibrate
             implicit_calibrate(
                 self, obs_list,
                 percentile=percentile, max_samples=None, verbose=verbose,
@@ -2207,20 +2207,20 @@ class Pi05JaxFrontendThor:
 
         Drives encoder + decoder shadow forwards over each obs in
         ``obs_list``, downloads per-tensor amax, percentile-reduces along
-        the sample axis via ``flash_vla.core.calibration.accumulate_amax``
+        the sample axis via ``flash_rt.core.calibration.accumulate_amax``
         (framework rule C5), uploads the reduced scales, recomputes the
         enc-side alpha = act_scale * weight_scale in float32 (rule C6),
         and recaptures the enc+ae CUDA Graph (rule C7) so the new scales
         are baked into the captured kernels.
 
         Mirrors:
-          * Pi0.5 torch Thor — ``flash_vla/frontends/torch/pi05_thor.py``
+          * Pi0.5 torch Thor — ``flash_rt/frontends/torch/pi05_thor.py``
             ``_calibrate_multi_frame``
-          * Pi0.5 JAX Thor FP4 — ``flash_vla/frontends/jax/pi05_thor_fp4.py``
+          * Pi0.5 JAX Thor FP4 — ``flash_rt/frontends/jax/pi05_thor_fp4.py``
             ``_calibrate_multi_frame`` (Phase 1 only; FP4 also runs an
             AWQ refit in Phase 2 which is FP4-specific).
         """
-        from flash_vla.core.calibration import accumulate_amax
+        from flash_rt.core.calibration import accumulate_amax
 
         n = len(obs_list)
         logger.info(
@@ -2546,7 +2546,7 @@ class Pi05JaxFrontendThor:
         raw_actions = self.g_noise.download_new((self.Sa, 32), np.float16).astype(np.float32)
 
         if self.norm_stats:
-            from flash_vla.core.utils.actions import unnormalize_actions, LIBERO_ACTION_DIM
+            from flash_rt.core.utils.actions import unnormalize_actions, LIBERO_ACTION_DIM
             unnorm = unnormalize_actions(raw_actions, self.norm_stats)
             robot_actions = unnorm[:, :LIBERO_ACTION_DIM]
         else:

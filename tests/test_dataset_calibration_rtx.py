@@ -101,7 +101,7 @@ def _run_rtx_pi0(rtx, observation, noise_tensor):
 
 def _build_rt(prompt, sample_obs):
     """Build a fresh Pi0TorchFrontendRtx pinned to the task prompt."""
-    from flash_vla.frontends.torch.pi0_rtx import Pi0TorchFrontendRtx
+    from flash_rt.frontends.torch.pi0_rtx import Pi0TorchFrontendRtx
     rt = Pi0TorchFrontendRtx(CKPT_TORCH, num_views=2)
     rt.set_prompt(prompt)
     return rt

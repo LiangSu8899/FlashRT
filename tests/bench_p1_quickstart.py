@@ -48,7 +48,7 @@ def cool(s):
 
 
 def main():
-    from flash_vla.frontends.torch.pi05_thor_fp4 import Pi05TorchFrontendThorFP4
+    from flash_rt.frontends.torch.pi05_thor_fp4 import Pi05TorchFrontendThorFP4
     CKPT = "<your_pi05_torch_ckpt>"
     LAYERS = tuple(range(18))
 

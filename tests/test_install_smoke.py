@@ -4,19 +4,19 @@ Both failure modes used to silently affect every Linux user who didn't
 follow the exact sequence in INSTALL.md / README.md. They are now
 prevented at build / import time, so this file is the regression net:
 
-1. ``test_kernels_so_lives_in_flash_vla`` —
-   CMake must drop ``flash_vla_kernels*.so`` into ``flash_vla/`` at
+1. ``test_kernels_so_lives_in_flash_rt`` —
+   CMake must drop ``flash_rt_kernels*.so`` into ``flash_rt/`` at
    build time (via ``LIBRARY_OUTPUT_DIRECTORY``), so a plain
    ``cmake --build`` is self-sufficient. If this regresses, the user
    has to remember a manual ``cp`` or ``ninja install`` step that the
    docs don't make obvious.
 
 2. ``test_import_without_flash_attn`` —
-   ``import flash_vla`` and the default RTX Pi0 / Pi0.5 backend
+   ``import flash_rt`` and the default RTX Pi0 / Pi0.5 backend
    instantiation must succeed even when the upstream ``flash-attn``
    pip wheel is missing (Modal has no prebuilt wheel for
    torch 2.5.1 / CUDA 12.5 / Py3.12 → 30–60 min sdist compile per
-   cold image). The vendored ``flash_vla_fa2.so`` is enough for the
+   cold image). The vendored ``flash_rt_fa2.so`` is enough for the
    default path; ``flash-attn`` is only needed for legacy bisection
    sites and the GROOT backend.
 
@@ -33,26 +33,26 @@ import sys
 import pytest
 
 
-def test_kernels_so_lives_in_flash_vla():
-    """The compiled .so must land inside the ``flash_vla/`` package
+def test_kernels_so_lives_in_flash_rt():
+    """The compiled .so must land inside the ``flash_rt/`` package
     at build time. ``cmake --build`` alone should be sufficient — no
     follow-up ``cp`` / ``ninja install`` step.
     """
-    import flash_vla
-    pkg_dir = pathlib.Path(flash_vla.__file__).parent
-    matches = list(pkg_dir.glob("flash_vla_kernels*.so")) \
-        + list(pkg_dir.glob("flash_vla_kernels*.pyd"))
+    import flash_rt
+    pkg_dir = pathlib.Path(flash_rt.__file__).parent
+    matches = list(pkg_dir.glob("flash_rt_kernels*.so")) \
+        + list(pkg_dir.glob("flash_rt_kernels*.pyd"))
     assert matches, (
-        f"flash_vla_kernels*.so not found in {pkg_dir}. "
+        f"flash_rt_kernels*.so not found in {pkg_dir}. "
         "Did `cmake --build` leave it under build/ instead? "
         "CMakeLists.txt must set LIBRARY_OUTPUT_DIRECTORY on the "
-        "flash_vla_kernels target."
+        "flash_rt_kernels target."
     )
 
 
 def test_import_without_flash_attn(monkeypatch):
-    """``import flash_vla`` must not require the upstream flash-attn
-    pip package. The default RTX path uses ``flash_vla_fa2.so``; the
+    """``import flash_rt`` must not require the upstream flash-attn
+    pip package. The default RTX path uses ``flash_rt_fa2.so``; the
     upstream wheel is only needed for legacy / GROOT paths.
     """
     # Block flash_attn from importing — sys.modules[name] = None makes
@@ -60,21 +60,21 @@ def test_import_without_flash_attn(monkeypatch):
     # site-packages copy (if any).
     monkeypatch.setitem(sys.modules, "flash_attn", None)
 
-    # Purge any cached flash_vla submodules so the import re-runs end
+    # Purge any cached flash_rt submodules so the import re-runs end
     # to end. Only top-level + hardware/rtx submodules need clearing —
     # those are where the offending import used to live.
-    to_purge = [k for k in sys.modules if k.startswith("flash_vla")]
+    to_purge = [k for k in sys.modules if k.startswith("flash_rt")]
     for k in to_purge:
         sys.modules.pop(k, None)
 
     # Top-level import must succeed.
-    flash_vla = importlib.import_module("flash_vla")
-    assert flash_vla.__version__
+    flash_rt = importlib.import_module("flash_rt")
+    assert flash_rt.__version__
 
     # The RTX attention backend module must also import without
     # touching upstream flash_attn. Backend instantiation is GPU-bound
     # and is exercised separately in tests/test_pi05_*.py.
-    importlib.import_module("flash_vla.hardware.rtx.attn_backend")
+    importlib.import_module("flash_rt.hardware.rtx.attn_backend")
 
 
 def test_legacy_path_raises_clear_error_without_flash_attn(monkeypatch):
@@ -85,11 +85,11 @@ def test_legacy_path_raises_clear_error_without_flash_attn(monkeypatch):
     backend init.
     """
     monkeypatch.setitem(sys.modules, "flash_attn", None)
-    to_purge = [k for k in sys.modules if k.startswith("flash_vla")]
+    to_purge = [k for k in sys.modules if k.startswith("flash_rt")]
     for k in to_purge:
         sys.modules.pop(k, None)
 
-    from flash_vla.hardware.rtx.attn_backend import _make_flash_attn_proxy
+    from flash_rt.hardware.rtx.attn_backend import _make_flash_attn_proxy
 
     with pytest.raises(ImportError) as excinfo:
         _make_flash_attn_proxy(need_legacy=True)

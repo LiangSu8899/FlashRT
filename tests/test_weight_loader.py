@@ -19,7 +19,7 @@ from __future__ import annotations
 import sys
 import traceback
 
-from flash_vla.executors.weight_loader import (
+from flash_rt.executors.weight_loader import (
     BufferSpec,
     Item,
     LayerBlock,
@@ -178,7 +178,7 @@ def test_torch_dict_source_and_sinks():
         print("    (skipped — no torch/CUDA)")
         return
     import torch
-    from flash_vla.executors.torch_weights import (
+    from flash_rt.executors.torch_weights import (
         Attr, DictSource, FlatCat, TensorList, ToFp16, WeightLoader,
     )
 
@@ -216,7 +216,7 @@ def test_torch_cat_composite_source():
         print("    (skipped — no torch/CUDA)")
         return
     import torch
-    from flash_vla.executors.torch_weights import (
+    from flash_rt.executors.torch_weights import (
         Attr, Cat, DictSource, ToFp16, WeightLoader,
     )
 
@@ -245,8 +245,8 @@ def test_torch_fused_qkv_with_norm_and_interleave():
         print("    (skipped — no torch/CUDA)")
         return
     import torch
-    from flash_vla.core.thor_frontend_utils import interleave_qk as core_iqk
-    from flash_vla.executors.torch_weights import (
+    from flash_rt.core.thor_frontend_utils import interleave_qk as core_iqk
+    from flash_rt.executors.torch_weights import (
         Attr, DictSource, FusedQKV, WeightLoader,
     )
 
@@ -287,7 +287,7 @@ def test_torch_fused_gate_up_with_norm():
         print("    (skipped — no torch/CUDA)")
         return
     import torch
-    from flash_vla.executors.torch_weights import (
+    from flash_rt.executors.torch_weights import (
         Attr, DictSource, FusedGateUp, WeightLoader,
     )
 
@@ -318,8 +318,8 @@ def test_torch_quant_and_scale_publication():
         print("    (skipped — no torch/CUDA)")
         return
     import torch
-    from flash_vla.core.thor_frontend_utils import quant_fp8
-    from flash_vla.executors.torch_weights import (
+    from flash_rt.core.thor_frontend_utils import quant_fp8
+    from flash_rt.executors.torch_weights import (
         DictSource, Quant, T, TensorList, ToFp16, WeightLoader,
     )
 
@@ -367,7 +367,7 @@ def test_torch_run_idempotent():
         print("    (skipped — no torch/CUDA)")
         return
     import torch
-    from flash_vla.executors.torch_weights import (
+    from flash_rt.executors.torch_weights import (
         DictSource, TensorList, ToFp16, WeightLoader,
     )
 
@@ -407,7 +407,7 @@ TESTS += [
 def _jax_available():
     try:
         import jax  # noqa
-        from flash_vla.core.cuda_buffer import CudaBuffer  # noqa
+        from flash_rt.core.cuda_buffer import CudaBuffer  # noqa
         return True
     except Exception:
         return False
@@ -418,8 +418,8 @@ def test_jax_orbax_dict_source_and_numpy_sinks():
         print("    (skipped — no jax)")
         return
     import numpy as np
-    from flash_vla.executors.weight_loader import WeightLoader
-    from flash_vla.executors.jax_weights import (
+    from flash_rt.executors.weight_loader import WeightLoader
+    from flash_rt.executors.jax_weights import (
         Astype, NumpyAttr, NumpyList, OrbaxDictSource,
     )
 
@@ -451,8 +451,8 @@ def test_jax_quant_and_cuda_buffer_flat():
         return
     import jax.numpy as jnp
     import numpy as np
-    from flash_vla.executors.weight_loader import WeightLoader
-    from flash_vla.executors.jax_weights import (
+    from flash_rt.executors.weight_loader import WeightLoader
+    from flash_rt.executors.jax_weights import (
         CudaBufferFlat, JaxQuant, OrbaxDictSource,
     )
 
@@ -493,8 +493,8 @@ def test_jax_cuda_buffer_attr_single():
         print("    (skipped — no jax)")
         return
     import numpy as np
-    from flash_vla.executors.weight_loader import WeightLoader
-    from flash_vla.executors.jax_weights import (
+    from flash_rt.executors.weight_loader import WeightLoader
+    from flash_rt.executors.jax_weights import (
         Astype, CudaBufferAttr, OrbaxDictSource, Transpose,
     )
 

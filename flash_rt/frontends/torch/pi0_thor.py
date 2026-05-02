@@ -1,4 +1,4 @@
-"""FlashVLA -- Pi0TorchFrontendThor: Pi0 inference using ONLY flash_vla_kernels.so.
+"""FlashVLA -- Pi0TorchFrontendThor: Pi0 inference using ONLY flash_rt_kernels.so.
 
 Adapted from ThorPipelineTorch (Pi0.5). Key differences:
   - Standard RMSNorm (not AdaRMSNorm) → fuse norm weight into QKV/GateUp
@@ -21,17 +21,17 @@ import pathlib
 import time
 from typing import Optional, Union
 
-from flash_vla.hardware.thor.shared_primitives import (
+from flash_rt.hardware.thor.shared_primitives import (
     siglip_forward,
     postln_project,
     encoder_forward,
     encoder_forward_calibrate,
 )
-from flash_vla.hardware.thor.attn_backend import (
+from flash_rt.hardware.thor.attn_backend import (
     ThorFlashAttnBackend,
     make_pi0_attention_spec,
 )
-from flash_vla.models.pi0.pipeline_thor import (
+from flash_rt.models.pi0.pipeline_thor import (
     decoder_forward_pi0,
     decoder_forward_calibrate_pi0,
 )
@@ -40,10 +40,10 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-import flash_vla.flash_vla_kernels as fvk
-from flash_vla.core.cuda_buffer import CudaBuffer
-from flash_vla.core.utils.actions import unnormalize_actions, LIBERO_ACTION_DIM
-from flash_vla.core.quant.calibrator import load_calibration, save_calibration
+import flash_rt.flash_rt_kernels as fvk
+from flash_rt.core.cuda_buffer import CudaBuffer
+from flash_rt.core.utils.actions import unnormalize_actions, LIBERO_ACTION_DIM
+from flash_rt.core.quant.calibrator import load_calibration, save_calibration
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +57,7 @@ _cudart = ctypes.CDLL("libcudart.so")
 # Helpers (shared with Pi0.5)
 # ---------------------------------------------------------------------------
 
-from flash_vla.core.thor_frontend_utils import embed_prompt_torch as embed_prompt  # noqa: E402
+from flash_rt.core.thor_frontend_utils import embed_prompt_torch as embed_prompt  # noqa: E402
 
 
 # ===========================================================================
@@ -65,7 +65,7 @@ from flash_vla.core.thor_frontend_utils import embed_prompt_torch as embed_promp
 # ===========================================================================
 
 class Pi0TorchFrontendThor:
-    """Complete Pi0 inference pipeline using only flash_vla_kernels.so.
+    """Complete Pi0 inference pipeline using only flash_rt_kernels.so.
 
     Interface compatible with FlashVLAModel.predict():
         set_prompt(prompt_text)
@@ -94,7 +94,7 @@ class Pi0TorchFrontendThor:
         self._gemm = fvk.GemmRunner()
 
         # ---- Load CUTLASS FMHA ----
-        # Search order: ckpt-adjacent, ``flash_vla/`` package dir (pip
+        # Search order: ckpt-adjacent, ``flash_rt/`` package dir (pip
         # install lands here), fresh cmake ``build/`` output, docker
         # ``/workspace/`` convention.
         fmha_paths = [
@@ -132,7 +132,7 @@ class Pi0TorchFrontendThor:
     # -----------------------------------------------------------------------
 
     def _load_norm_stats(self, checkpoint_dir):
-        from flash_vla.core.utils.norm_stats import (
+        from flash_rt.core.utils.norm_stats import (
             load_norm_stats, lerobot_candidates,
         )
         candidates = [
@@ -153,10 +153,10 @@ class Pi0TorchFrontendThor:
     def _load_weights(self, safetensors_path):
         from safetensors import safe_open
 
-        from flash_vla.executors.torch_weights import (
+        from flash_rt.executors.torch_weights import (
             SafetensorsSource, WeightLoader, _autodetect_strip_prefix,
         )
-        from flash_vla.frontends.torch._pi0_thor_spec import build_spec
+        from flash_rt.frontends.torch._pi0_thor_spec import build_spec
 
         sf = safe_open(str(safetensors_path), framework='pt', device='cuda')
         # Auto-strip the lerobot HF policy ``model.`` namespace wrap so
@@ -994,7 +994,7 @@ class Pi0TorchFrontendThor:
             raise ValueError(f"percentile must be in [0, 100], got {percentile}")
 
         if n == 1:
-            from flash_vla.core.calibration_api import implicit_calibrate
+            from flash_rt.core.calibration_api import implicit_calibrate
             implicit_calibrate(
                 self, obs_list,
                 percentile=percentile, max_samples=None, verbose=verbose,
@@ -1013,7 +1013,7 @@ class Pi0TorchFrontendThor:
         kernel) and re-projects ``obs['state']`` per sample before the
         decoder pass.
         """
-        from flash_vla.core.calibration import (
+        from flash_rt.core.calibration import (
             accumulate_amax,
             check_scale_ceiling,
             format_summary,

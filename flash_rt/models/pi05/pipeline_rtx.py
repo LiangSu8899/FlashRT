@@ -1,7 +1,7 @@
 """FlashVLA — RTX (consumer discrete GPU) Pi0.5 inference pipeline.
 
 Framework-agnostic pipeline for Pi0.5 on consumer RTX GPUs (Blackwell SM120
-/ Ada SM89, 5090 / 4090). Mirrors the ``flash_vla/hardware/thor/pipeline_pi05.py``
+/ Ada SM89, 5090 / 4090). Mirrors the ``flash_rt/hardware/thor/pipeline_pi05.py``
 design philosophy: the pipeline owns kernel composition, frontends own
 weights/framework choice.
 
@@ -20,14 +20,14 @@ Architecture::
                 ├── allocates internal working buffers as CudaBuffer (no torch)
                 ├── runs fvk kernels via pointers for all GEMM / norm / fused ops
                 ├── delegates attention to attn_backend (pluggable)
-                └── captures a CUDA graph via flash_vla.core.cuda_graph
+                └── captures a CUDA graph via flash_rt.core.cuda_graph
 
 The attention kernel itself is vendored Flash-Attention 2 (see
 ``csrc/attention/flash_attn_2_src/``) shipped as
-``flash_vla.flash_vla_fa2``. ``RtxFlashAttnBackend`` uses
+``flash_rt.flash_rt_fa2``. ``RtxFlashAttnBackend`` uses
 ``torch.empty`` for the Q/K/V/O scratch tensors only — the attention
 call is framework-neutral. A future pass will swap the allocator for
-:class:`flash_vla.core.cuda_buffer.CudaBuffer` to remove that
+:class:`flash_rt.core.cuda_buffer.CudaBuffer` to remove that
 transitive torch dependency entirely.
 
 All activations are BF16. FP8 E4M3 quantization on weights + activations for
@@ -44,8 +44,8 @@ import math
 import numpy as np
 import ml_dtypes
 
-from flash_vla.core.cuda_buffer import CudaBuffer
-from flash_vla.core.cuda_graph import CUDAGraph
+from flash_rt.core.cuda_buffer import CudaBuffer
+from flash_rt.core.cuda_graph import CUDAGraph
 
 logger = logging.getLogger(__name__)
 
@@ -95,15 +95,15 @@ FP32 = np.float32
 class Pi05Pipeline:
     """Pi0.5 inference pipeline for RTX (Blackwell / Ada) consumer GPUs.
 
-    The pipeline composes ``flash_vla_kernels`` kernels + ``GemmRunner``
-    cuBLASLt calls + an injected :class:`~flash_vla.hardware.rtx.attn_backend.AttnBackend`
+    The pipeline composes ``flash_rt_kernels`` kernels + ``GemmRunner``
+    cuBLASLt calls + an injected :class:`~flash_rt.hardware.rtx.attn_backend.AttnBackend`
     into the full SigLIP → Gemma encoder → Gemma decoder flow.
 
     Args:
         gemm:         ``fvk.GemmRunner()`` — cuBLASLt BF16/FP8 GEMM driver.
-        fvk:          The ``flash_vla_kernels`` module (raw pointer kernels).
+        fvk:          The ``flash_rt_kernels`` module (raw pointer kernels).
         attn_backend: Attention backend implementing the
-                      :class:`~flash_vla.hardware.rtx.attn_backend.AttnBackend`
+                      :class:`~flash_rt.hardware.rtx.attn_backend.AttnBackend`
                       protocol (owns Q/K/V/O tensors, runs attention).
         weights:      Dict of weight pointers — see class docstring for schema.
         num_views:    Number of observation camera views (1/2/3).

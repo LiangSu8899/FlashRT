@@ -4,7 +4,7 @@ STRICTLY ADDITIVE. Subclasses :class:`Pi05JaxFrontendThor` and overlays an
 optional NVFP4 path on a configurable subset of encoder FFN layers. With the
 FP4 flag off, behaves bit-identically to the base FP8 JAX frontend.
 
-Mirrors :class:`flash_vla.frontends.torch.pi05_thor_fp4.Pi05TorchFrontendThorFP4`
+Mirrors :class:`flash_rt.frontends.torch.pi05_thor_fp4.Pi05TorchFrontendThorFP4`
 in its public surface and calibration discipline, but keeps the runtime
 torch-free: all FP4 weights / activation scratch / AWQ inv_s buffers live in
 :class:`CudaBuffer`, and this module pulls *zero* torch symbols at import or
@@ -35,8 +35,8 @@ from typing import Iterable
 
 import numpy as np
 
-from flash_vla.frontends.jax.pi05_thor import Pi05JaxFrontendThor
-from flash_vla.executors.fp4_utils_cb import (
+from flash_rt.frontends.jax.pi05_thor import Pi05JaxFrontendThor
+from flash_rt.executors.fp4_utils_cb import (
     FP4ActScratchCB,
     FP4BufferCB,
     _PtrShim,
@@ -47,7 +47,7 @@ from flash_vla.executors.fp4_utils_cb import (
 )
 
 try:
-    import flash_vla.flash_vla_fp4 as fvk_fp4
+    import flash_rt.flash_rt_fp4 as fvk_fp4
     _HAS_FP4 = fvk_fp4.has_nvfp4()
 except Exception:  # pragma: no cover
     fvk_fp4 = None
@@ -124,7 +124,7 @@ class Pi05JaxFrontendThorFP4(Pi05JaxFrontendThor):
         if self._fp4_layers:
             if not _HAS_FP4:
                 raise RuntimeError(
-                    "use_fp4_encoder_ffn=True but flash_vla_fp4 is not "
+                    "use_fp4_encoder_ffn=True but flash_rt_fp4 is not "
                     "available (SM100+ required). Build with NVFP4 support "
                     "or set use_fp4_encoder_ffn=False.")
             self._prepare_fp4_encoder_jax()
@@ -175,7 +175,7 @@ class Pi05JaxFrontendThorFP4(Pi05JaxFrontendThor):
         [Chunk 2 — construction-time NVFP4 derivation, per-layer + P1.
          Chunk 3 — builds _fp4_scratch and wires the graph.]
         """
-        from flash_vla.engine.cuda_buffer import CudaBuffer
+        from flash_rt.engine.cuda_buffer import CudaBuffer
 
         De = int(self.De)
         He = int(self.He)
@@ -190,8 +190,8 @@ class Pi05JaxFrontendThorFP4(Pi05JaxFrontendThor):
             logger.info(
                 "FP4 prep: FP8 weight cache hit so engine_w was not stashed — "
                 "reloading Orbax for FP4 layer weights (one-time).")
-            from flash_vla.weights.loader import load_weights, detect_format
-            from flash_vla.weights.transformer import transform_jax_weights
+            from flash_rt.weights.loader import load_weights, detect_format
+            from flash_rt.weights.transformer import transform_jax_weights
             fmt = detect_format(self._checkpoint_path)
             raw = load_weights(self._checkpoint_path, format=fmt)
             engine_w = transform_jax_weights(raw)
@@ -320,7 +320,7 @@ class Pi05JaxFrontendThorFP4(Pi05JaxFrontendThor):
     # (in-place AWQ refit relies on this).
     # ------------------------------------------------------------------
     def _build_fp4_scratch(self) -> None:
-        from flash_vla.engine.cuda_buffer import CudaBuffer
+        from flash_rt.engine.cuda_buffer import CudaBuffer
 
         Se_max = int(self.Se_max)
         De = int(self.De)
@@ -382,11 +382,11 @@ class Pi05JaxFrontendThorFP4(Pi05JaxFrontendThor):
         if not self._fp4_layers:
             return super()._capture_enc_ae_graph()
 
-        from flash_vla.engine.cuda_graph import CUDAGraph
-        from flash_vla.hardware.thor.shared_primitives_fp4 import (
+        from flash_rt.engine.cuda_graph import CUDAGraph
+        from flash_rt.hardware.thor.shared_primitives_fp4 import (
             encoder_forward_with_fp4_subset,
         )
-        from flash_vla.models.pi05.pipeline_thor import decoder_forward
+        from flash_rt.models.pi05.pipeline_thor import decoder_forward
 
         stream = self._stream
         _cudart = self._cudart
@@ -446,7 +446,7 @@ class Pi05JaxFrontendThorFP4(Pi05JaxFrontendThor):
         but without torch.
         """
         import math
-        from flash_vla.engine.cuda_buffer import CudaBuffer
+        from flash_rt.engine.cuda_buffer import CudaBuffer
 
         Se = int(self.Se); De = int(self.De); He = int(self.He)
         NHe = int(self.NHe); HDe = int(self.HDe); Le = int(self.Le)
@@ -568,7 +568,7 @@ class Pi05JaxFrontendThorFP4(Pi05JaxFrontendThor):
 
         Parallel of :meth:`Pi05TorchFrontendThorFP4._requant_fp4_weights_with_awq`.
         """
-        from flash_vla.engine.cuda_buffer import CudaBuffer
+        from flash_rt.engine.cuda_buffer import CudaBuffer
 
         De = int(self.De); He = int(self.He)
 
@@ -576,8 +576,8 @@ class Pi05JaxFrontendThorFP4(Pi05JaxFrontendThor):
         # stash-or-reload logic, but we need them again since the stash
         # is cleared after construction.
         if not hasattr(self, "_awq_refit_src") or self._awq_refit_src is None:
-            from flash_vla.weights.loader import load_weights, detect_format
-            from flash_vla.weights.transformer import transform_jax_weights
+            from flash_rt.weights.loader import load_weights, detect_format
+            from flash_rt.weights.transformer import transform_jax_weights
             fmt = detect_format(self._checkpoint_path)
             raw = load_weights(self._checkpoint_path, format=fmt)
             engine_w = transform_jax_weights(raw); del raw
@@ -661,15 +661,15 @@ class Pi05JaxFrontendThorFP4(Pi05JaxFrontendThor):
 
         Parallel of :meth:`Pi05TorchFrontendThorFP4._calibrate_multi_frame`.
         """
-        from flash_vla.engine.cuda_buffer import CudaBuffer
-        from flash_vla.core.calibration import accumulate_amax, check_scale_ceiling
-        from flash_vla.hardware.thor.shared_primitives import encoder_forward_calibrate
-        from flash_vla.models.pi05.pipeline_thor import decoder_forward_calibrate
+        from flash_rt.engine.cuda_buffer import CudaBuffer
+        from flash_rt.core.calibration import accumulate_amax, check_scale_ceiling
+        from flash_rt.hardware.thor.shared_primitives import encoder_forward_calibrate
+        from flash_rt.models.pi05.pipeline_thor import decoder_forward_calibrate
 
         if not self._fp4_layers:
             # Pure-FP8 JAX multi-frame is out of Task A scope — surface the
             # same message the shim would.
-            from flash_vla.core.calibration_api import implicit_calibrate
+            from flash_rt.core.calibration_api import implicit_calibrate
             return implicit_calibrate(self, obs_list, percentile=percentile,
                                        verbose=verbose)
 

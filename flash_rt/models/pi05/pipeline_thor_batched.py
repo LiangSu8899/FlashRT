@@ -1,6 +1,6 @@
 """FlashVLA — Pi0.5 Thor SM110 batched (B>=1) inference pipeline.
 
-Companion to :mod:`flash_vla.models.pi05.pipeline_thor` which holds
+Companion to :mod:`flash_rt.models.pi05.pipeline_thor` which holds
 the B=1 main-line single-sample inference path. This module isolates
 the B>=1 batched orchestration so the B=1 file stays small and easy
 to reason about — single-sample inference is the production hot
@@ -8,10 +8,10 @@ path; batched is opt-in (used by the fused-CFG B=2 pipeline and the
 generic infer_batch entry point).
 
 Mirrors the RTX layout split between
-:mod:`flash_vla.models.pi05.pipeline_rtx` and
-:mod:`flash_vla.models.pi05.pipeline_rtx_batched`, and the existing
-:mod:`flash_vla.models.pi05.pipeline_thor_cfg` /
-:mod:`flash_vla.models.pi05.pipeline_thor_cfg_batched` cfg / cfg-
+:mod:`flash_rt.models.pi05.pipeline_rtx` and
+:mod:`flash_rt.models.pi05.pipeline_rtx_batched`, and the existing
+:mod:`flash_rt.models.pi05.pipeline_thor_cfg` /
+:mod:`flash_rt.models.pi05.pipeline_thor_cfg_batched` cfg / cfg-
 batched split.
 
 Class hierarchy::
@@ -44,7 +44,7 @@ def decoder_forward_b2(ctx, fvk, bufs, weights, dims, stream=0, *,
     """Batched action-expert decoder forward for ``B`` independent samples.
 
     Stage 2 of the Thor batched-CFG port. Same kernel-class split as
-    :func:`flash_vla.hardware.thor.shared_primitives_batched.encoder_forward_b2`:
+    :func:`flash_rt.hardware.thor.shared_primitives_batched.encoder_forward_b2`:
 
       * Flat-elementwise + GEMM kernels scale via ``M = B*S``.
       * ``qkv_split_rope_kvcache_fp16`` and ``attention_qkv_fp16`` go
@@ -56,14 +56,14 @@ def decoder_forward_b2(ctx, fvk, bufs, weights, dims, stream=0, *,
         buffers MUST be **B-tiled** (each (step, layer) slice
         replicated B times along the row dim) before this function
         is called — same trick as RTX
-        :class:`flash_vla.models.pi05.pipeline_rtx_batched.Pi05BatchedPipeline`
+        :class:`flash_rt.models.pi05.pipeline_rtx_batched.Pi05BatchedPipeline`
         Bug 6 fix at pipeline_rtx_batched.py:195–220. With B-tiled
         styles each kernel call uses the B*S row count and naturally
         walks both samples' style data.
 
     Args:
         bufs: same key set as
-            :func:`flash_vla.models.pi05.pipeline_thor.decoder_forward`;
+            :func:`flash_rt.models.pi05.pipeline_thor.decoder_forward`;
             row dims are B*S (flat). If ``cfg_beta`` is set, must
             additionally include ``v_b2`` — a fresh velocity output
             buffer of size ``B*S*32*2`` bytes used to hold per-step
@@ -305,7 +305,7 @@ class Pi05ThorBatchedPipeline(Pi05ThorPipeline):
 
     Args:
         batch_size: Must be ``>= 1``. Stage 3's
-            :class:`flash_vla.models.pi05.pipeline_thor_cfg_batched.Pi05ThorCFGBatchedPipeline`
+            :class:`flash_rt.models.pi05.pipeline_thor_cfg_batched.Pi05ThorCFGBatchedPipeline`
             sets ``batch_size = 2`` and assigns slot 0 = cond,
             slot 1 = uncond for fused CFG.
 
@@ -313,7 +313,7 @@ class Pi05ThorBatchedPipeline(Pi05ThorPipeline):
         * No buffer ownership; the frontend allocates ``_b2``-suffixed
           buffers and captures the B*Seq graph.
         * No new Thor kernels — see
-          :func:`flash_vla.hardware.thor.shared_primitives_batched.encoder_forward_b2`
+          :func:`flash_rt.hardware.thor.shared_primitives_batched.encoder_forward_b2`
           and :func:`decoder_forward_b2` (this file)
           for the inline-loop strategy.
     """

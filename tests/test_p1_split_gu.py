@@ -66,7 +66,7 @@ def cool(secs=60):
 
 
 def main():
-    from flash_vla.frontends.torch.pi05_thor_fp4 import Pi05TorchFrontendThorFP4
+    from flash_rt.frontends.torch.pi05_thor_fp4 import Pi05TorchFrontendThorFP4
     CKPT = "<your_pi05_torch_ckpt>"
     prod = np.load("/tmp/v_prod.npy")
     v_torch = np.load("/tmp/v_torch.npy")

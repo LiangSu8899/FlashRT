@@ -1,7 +1,7 @@
 """FlashVLA — RTX (consumer discrete GPU) Pi0 inference pipeline.
 
 Framework-agnostic pipeline for Pi0 on consumer RTX GPUs (Blackwell SM120
-/ Ada SM89, 5090 / 4090). Mirrors ``flash_vla/models/pi05/pipeline_rtx.py``
+/ Ada SM89, 5090 / 4090). Mirrors ``flash_rt/models/pi05/pipeline_rtx.py``
 — shared vision/encoder paths; decoder is swapped for Pi0's variant:
 
   * Standard RMSNorm (no AdaRMSNorm / style modulation)
@@ -26,8 +26,8 @@ import logging
 
 import numpy as np
 
-from flash_vla.core.cuda_buffer import CudaBuffer
-from flash_vla.core.cuda_graph import CUDAGraph
+from flash_rt.core.cuda_buffer import CudaBuffer
+from flash_rt.core.cuda_graph import CUDAGraph
 
 logger = logging.getLogger(__name__)
 
@@ -78,12 +78,12 @@ class Pi0Pipeline:
 
     Args:
         gemm:         ``fvk.GemmRunner()`` cuBLASLt driver.
-        fvk:          The ``flash_vla_kernels`` module.
+        fvk:          The ``flash_rt_kernels`` module.
         attn_backend: Attention backend (must support ``state_nk`` kwarg
                       on ``run("decoder", ...)`` — the torch flash_attn
                       backend implements this natively).
         weights:      Pointer dict — see ``_build_pipeline_weights`` in
-                      ``flash_vla.frontends.torch.pi0_rtx``.
+                      ``flash_rt.frontends.torch.pi0_rtx``.
         num_views:    Number of observation camera views.
         max_prompt_len: Max tokenised prompt length.
         chunk_size:   Action chunk length Sa (default 10).

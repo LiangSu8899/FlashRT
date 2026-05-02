@@ -1,7 +1,7 @@
 """FP8 GEMM as a ``torch.autograd.Function`` over a frozen base weight.
 
 The forward path routes through FlashVLA's existing FP8 kernel
-(``flash_vla.flash_vla_kernels.GemmRunner.fp8_nn_dev``) and the runtime
+(``flash_rt.flash_rt_kernels.GemmRunner.fp8_nn_dev``) and the runtime
 activation quantizer (``quantize_fp8_static``). Both are the same
 kernels used by the inference pipeline — the training stack is
 expected to "eat" the FP8 speedup, not just reuse a fp8 dtype tag in
@@ -16,7 +16,7 @@ overhead at one layer's worth of BF16 weight (≤ ~33 MB for pi0.5 FFN
 lives in ``Fp8MatmulFunction.backward`` (``ctx.bwd_strategy``).
 
 Numerics conventions match the inference path
-(``flash_vla/core/weights/transformer.py:quantize_fp8_e4m3``):
+(``flash_rt/core/weights/transformer.py:quantize_fp8_e4m3``):
 
 * FP8 storage: ``torch.float8_e4m3fn`` viewed as ``torch.uint8`` bytes.
 * Per-tensor scale ``s = amax / 448`` lives on-device as a 1-element
@@ -39,7 +39,7 @@ def _get_runner():
     """Lazily build the process-wide ``GemmRunner`` + kernel module handle."""
     global _RUNNER, _KERNELS
     if _RUNNER is None:
-        from flash_vla import flash_vla_kernels as kern
+        from flash_rt import flash_rt_kernels as kern
         _KERNELS = kern
         _RUNNER = kern.GemmRunner()
     return _RUNNER, _KERNELS
@@ -77,7 +77,7 @@ def dequant_fp8_to_bf16(w_uint8: torch.Tensor, scale: float) -> torch.Tensor:
 
 # ── torch.library custom_ops for the FP8 forward GEMM ──────────────
 #
-# The vendored kernels (``flash_vla.flash_vla_kernels``) drive cuBLASLt
+# The vendored kernels (``flash_rt.flash_rt_kernels``) drive cuBLASLt
 # FP8 directly via raw device pointers (``x.data_ptr()``). Plain Python
 # wrappers around these calls are opaque to Dynamo / Inductor — when
 # called from inside a ``torch.compile``'d region or a captured
