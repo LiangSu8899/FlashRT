@@ -1,7 +1,7 @@
 """FlashVLA — Pi0.5 RTX CFG inference fused into a single B=2 batched forward.
 
 Single-inheritance subclass of
-:class:`flash_vla.models.pi05.pipeline_rtx_batched.Pi05BatchedPipeline`
+:class:`flash_rt.models.pi05.pipeline_rtx_batched.Pi05BatchedPipeline`
 that reuses the sample-batched vision / encoder / decoder infrastructure
 to run classifier-free guidance's conditioned + unconditioned branches
 as the two slots of a single B=2 forward. Each denoising step fuses
@@ -28,7 +28,7 @@ from typing import Optional
 
 import numpy as np
 
-from flash_vla.core.cuda_buffer import CudaBuffer
+from flash_rt.core.cuda_buffer import CudaBuffer
 
 from .pipeline_rtx import ACTION_DIM, BF16, DEC_D, DEC_L, ENC_D, Pi05Pipeline
 from .pipeline_rtx_batched import Pi05BatchedPipeline

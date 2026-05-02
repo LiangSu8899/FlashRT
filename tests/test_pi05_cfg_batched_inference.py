@@ -44,9 +44,9 @@ def _make_dummy_obs():
                     reason=f"pi05 ckpt missing at {CKPT_PI05}")
 def test_rl_only_uses_serial_cfg_pipeline():
     """RL mode without batched mode uses the serial Pi05CFGPipeline."""
-    from flash_vla.frontends.torch.pi05_rtx import Pi05TorchFrontendRtx
-    from flash_vla.models.pi05.pipeline_rtx_cfg import Pi05CFGPipeline
-    from flash_vla.models.pi05.pipeline_rtx_cfg_batched import (
+    from flash_rt.frontends.torch.pi05_rtx import Pi05TorchFrontendRtx
+    from flash_rt.models.pi05.pipeline_rtx_cfg import Pi05CFGPipeline
+    from flash_rt.models.pi05.pipeline_rtx_cfg_batched import (
         Pi05CFGBatchedPipeline,
     )
 
@@ -62,8 +62,8 @@ def test_rl_only_uses_serial_cfg_pipeline():
                     reason=f"pi05 ckpt missing at {CKPT_PI05}")
 def test_rl_and_batched_builds_cfg_batched_pipeline():
     """RL + batched together builds Pi05CFGBatchedPipeline."""
-    from flash_vla.frontends.torch.pi05_rtx import Pi05TorchFrontendRtx
-    from flash_vla.models.pi05.pipeline_rtx_cfg_batched import (
+    from flash_rt.frontends.torch.pi05_rtx import Pi05TorchFrontendRtx
+    from flash_rt.models.pi05.pipeline_rtx_cfg_batched import (
         Pi05CFGBatchedPipeline,
     )
 
@@ -81,7 +81,7 @@ def test_rl_and_batched_builds_cfg_batched_pipeline():
                     reason=f"pi05 ckpt missing at {CKPT_PI05}")
 def test_batched_cfg_inference_returns_finite_actions():
     """End-to-end batched CFG: calibrate + infer produces finite actions."""
-    from flash_vla.frontends.torch.pi05_rtx import Pi05TorchFrontendRtx
+    from flash_rt.frontends.torch.pi05_rtx import Pi05TorchFrontendRtx
 
     rt = Pi05TorchFrontendRtx(CKPT_PI05, num_views=2)
     rt.set_batched_mode(enable=True)
@@ -113,7 +113,7 @@ def test_batched_cfg_inference_returns_finite_actions():
 
 _PRECISION_CHILD = r"""
 import os, sys, numpy as np, torch
-from flash_vla.frontends.torch.pi05_rtx import Pi05TorchFrontendRtx
+from flash_rt.frontends.torch.pi05_rtx import Pi05TorchFrontendRtx
 mode, ckpt, out_path, seed, beta = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), float(sys.argv[5])
 obs = {"image": np.zeros((224,224,3), dtype=np.uint8),
        "wrist_image": np.zeros((224,224,3), dtype=np.uint8),
@@ -266,7 +266,7 @@ def test_batched_cfg_beta_sweep_trend():
 
 _ASYM_CHILD = r"""
 import sys, ctypes, numpy as np, torch
-from flash_vla.frontends.torch.pi05_rtx import (
+from flash_rt.frontends.torch.pi05_rtx import (
     Pi05TorchFrontendRtx, PI05_BATCH_SIZE,
     unnormalize_actions, LIBERO_ACTION_DIM,
 )

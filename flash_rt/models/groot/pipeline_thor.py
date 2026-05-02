@@ -1,6 +1,6 @@
 """FlashVLA — GROOT N1.6 Pipeline for Thor SM110.
 
-Composes flash_vla_kernels into full GROOT inference pipeline.
+Composes flash_rt_kernels into full GROOT inference pipeline.
 Architecture: Eagle3-VL (SigLIP2 + Qwen3-1.7B) + AlternateVLDiT
 
 Functions:
@@ -37,7 +37,7 @@ def siglip2_forward(gemm, fvk, bufs, weights, dims, stream=0):
 
     Args:
         gemm: GemmRunner
-        fvk: flash_vla_kernels module
+        fvk: flash_rt_kernels module
         bufs: dict — x, x_fp8, qkv, attn_out, hidden, hid_fp8, scratch
         weights: dict — ln_attn_w/b[L], qkv_w/b[L], o_w/b[L], ln_ffn_w/b[L],
                         up_w/b[L], down_w/b[L], alpha[L*4]
@@ -453,7 +453,7 @@ def embodiment_decode_action(gemm, bufs, weights, dims, stream=0):
 
 import torch
 import torch.nn.functional as F
-import flash_vla.flash_vla_kernels as fvk
+import flash_rt.flash_rt_kernels as fvk
 
 fp16 = torch.float16
 fp8 = torch.float8_e4m3fn
@@ -467,7 +467,7 @@ def _quant_fp8(w):
 class CKernelQwen3:
     """Qwen3 16L all-C-kernel forward — CUDA Graph compatible.
 
-    All operations use flash_vla_kernels: rms_norm, FP8 GEMM, RoPE,
+    All operations use flash_rt_kernels: rms_norm, FP8 GEMM, RoPE,
     attention_mha (cuBLAS), residual_add. Internal FP32 precision.
     """
 

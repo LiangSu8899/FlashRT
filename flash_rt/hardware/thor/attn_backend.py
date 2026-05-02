@@ -1,6 +1,6 @@
 """FlashVLA — Thor attention backend.
 
-Implements the AttentionBackend protocol (``flash_vla/hardware/backend.py``)
+Implements the AttentionBackend protocol (``flash_rt/hardware/backend.py``)
 on Thor SM110 using the fvk attention primitives. Pipeline-owned memory
 model: the pipeline allocates all Q/K/V/O/logits buffers (and the layered
 KV cache in weights) and passes pointers at construction. The backend is a
@@ -29,7 +29,7 @@ from __future__ import annotations
 import math
 from typing import Optional
 
-from flash_vla.hardware.backend import AttentionBackendBase, AttentionSpec
+from flash_rt.hardware.backend import AttentionBackendBase, AttentionSpec
 
 
 class ThorFlashAttnBackend(AttentionBackendBase):
@@ -55,7 +55,7 @@ class ThorFlashAttnBackend(AttentionBackendBase):
             ctx:  the object passed as the first argument to
                 ``fvk.attention_qkv_fp16``. Accepted forms:
                   * raw ``fvk.FvkContext`` (Pi0.5 frontends)
-                  * ``flash_vla.core.context.FvkContext`` Python wrapper
+                  * ``flash_rt.core.context.FvkContext`` Python wrapper
                     (newer call sites)
                 Backend passes it through unchanged; it auto-detects the
                 wrapper form via a ``.cpp`` attribute at call time.
@@ -144,7 +144,7 @@ class ThorFlashAttnBackend(AttentionBackendBase):
 
     def _fvk_mod(self):
         if self._fvk is None:
-            import flash_vla.flash_vla_kernels as fvk
+            import flash_rt.flash_rt_kernels as fvk
             self._fvk = fvk
         return self._fvk
 

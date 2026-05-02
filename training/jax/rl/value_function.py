@@ -1,6 +1,6 @@
 """Distributional value-function modules for RECAP — JAX nnx port.
 
-Mirror of :mod:`flash_vla.core.rl.value_function` (PyTorch). Same
+Mirror of :mod:`flash_rt.core.rl.value_function` (PyTorch). Same
 architecture (state-encoder MLP + value-head MLP), same defaults
 (``num_bins=201``, support ``[-1, 0]``), same forward semantics. The
 weight-transfer helpers in :mod:`training.jax.tests` exist to assert
@@ -15,7 +15,7 @@ Three classes mirror the PyTorch surface 1-for-1:
 * :class:`Pi05ValueFunction` — frozen pi0.5 backbone reference + a
   trainable :class:`ValueFunctionHead`.
 
-Wiring matches ``flash_vla.core.rl.value_function`` and
+Wiring matches ``flash_rt.core.rl.value_function`` and
 ``training.rl.pi05_vf`` byte-for-byte at the architecture level.
 """
 
@@ -188,7 +188,7 @@ def pool_masked_mean(
 class ValueFunctionHead(nnx.Module):
     """Distributional VF head over a pooled VLA prefix embedding.
 
-    Architecture mirrors :class:`flash_vla.core.rl.value_function.ValueFunctionHead`
+    Architecture mirrors :class:`flash_rt.core.rl.value_function.ValueFunctionHead`
     1-for-1::
 
         mlp = (Linear → LayerNorm → GELU → Dropout) × (num_layers - 1)

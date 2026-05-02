@@ -43,7 +43,7 @@ class RtxFlashAttnBackendGroot:
     bottom of this file for external plugins pinned to the old name.
 
     **Protocol compatibility**: implements
-    :class:`flash_vla.hardware.backend.AttentionBackend` via
+    :class:`flash_rt.hardware.backend.AttentionBackend` via
     :meth:`sites` / :meth:`get_slot_ptrs` / :meth:`run`. Legacy
     methods (:meth:`vision_attn` / :meth:`qwen3_attn` /
     :meth:`dit_self_attn` / :meth:`dit_cross_attn` / :meth:`get_ptrs`)
@@ -139,7 +139,7 @@ class RtxFlashAttnBackendGroot:
         # GROOT currently routes attention through the upstream
         # ``flash-attn`` pip wheel as its primary path; defer the import
         # to backend instantiation (not module import) so users without
-        # the wheel can still ``import flash_vla`` and run Pi0 / Pi0.5.
+        # the wheel can still ``import flash_rt`` and run Pi0 / Pi0.5.
         try:
             from flash_attn import flash_attn_func
         except ImportError as e:

@@ -10,7 +10,7 @@ Design:
     tensors (``torch.empty(...)``) for both torch and jax frontends
     — the torch dependency is for allocation only, the attention
     kernel itself doesn't see torch. A future pass will swap the
-    allocator for :class:`flash_vla.core.cuda_buffer.CudaBuffer` to
+    allocator for :class:`flash_rt.core.cuda_buffer.CudaBuffer` to
     remove the torch dep entirely.
   - The pipeline asks the backend for raw device pointers via
     :meth:`AttnBackend.get_ptrs` and writes Q/K/V via ``fvk`` kernels
@@ -20,7 +20,7 @@ Design:
     with layer + shape info; the backend uses its own tensor views.
 
 Ships :class:`RtxFlashAttnBackend` which dispatches to the vendored
-Flash-Attention 2 in :mod:`flash_vla.flash_vla_fa2` (fp16 and bf16).
+Flash-Attention 2 in :mod:`flash_rt.flash_rt_fa2` (fp16 and bf16).
 The legacy name ``TorchFlashAttnBackend`` is kept as a deprecated
 alias for external plugins; see the class docstring.
 """
@@ -42,7 +42,7 @@ def _make_flash_attn_proxy(need_legacy: bool):
     is actually called — which it never is on the default fast path.
 
     On environments without a prebuilt flash-attn wheel (Modal cloud,
-    older CUDA images) this lets ``import flash_vla`` and the default
+    older CUDA images) this lets ``import flash_rt`` and the default
     RTX inference path succeed without paying the 30–60 min sdist
     compile or hitting an ImportError at module load.
     """
@@ -55,7 +55,7 @@ def _make_flash_attn_proxy(need_legacy: bool):
                 "selected the legacy upstream flash-attn path, but the "
                 "`flash-attn` pip package is not installed. Either:\n"
                 "  - unset FVK_RTX_FA2 / FVK_RTX_FA2_SITES to use the "
-                "vendored flash_vla_fa2 (default), or\n"
+                "vendored flash_rt_fa2 (default), or\n"
                 "  - install flash-attn (prebuilt wheels at "
                 "https://github.com/Dao-AILab/flash-attention/releases)."
             ) from e
@@ -146,7 +146,7 @@ class RtxFlashAttnBackend:
     """Pi0 / Pi0.5 attention backend for the RTX family (SM80/86/89/120).
 
     Framework-agnostic at the attention-call layer: the actual kernel is
-    the vendored Flash-Attention 2 in ``flash_vla.flash_vla_fa2`` (fp16
+    the vendored Flash-Attention 2 in ``flash_rt.flash_rt_fa2`` (fp16
     and bf16 entries, picked per-dtype at ``__init__`` time). Pi0 on
     5090 / 4090, Pi0.5 on either, and the GROOT vision path all go
     through the same ``run(site, layer_idx, ...)`` call regardless of
@@ -156,7 +156,7 @@ class RtxFlashAttnBackend:
     tensors because the pipeline reads their ``.data_ptr()`` into fvk
     kernel calls. That's a torch dependency for allocation only — the
     attention kernel itself does not see torch. A future pass will
-    swap the allocator for :class:`flash_vla.core.cuda_buffer.CudaBuffer`
+    swap the allocator for :class:`flash_rt.core.cuda_buffer.CudaBuffer`
     to remove the torch dep entirely (not urgent — torch is already a
     RTX-path transitive dep via the frontend-level image preprocessor).
 
@@ -175,7 +175,7 @@ class RtxFlashAttnBackend:
     FA2 / legacy dispatch
     ---------------------
     Controlled by env var ``FVK_RTX_FA2`` (default ``"1"``):
-      * ``"1"`` — attention call goes to ``flash_vla_fa2.fwd_{fp16,bf16}``.
+      * ``"1"`` — attention call goes to ``flash_rt_fa2.fwd_{fp16,bf16}``.
       * ``"0"`` — attention call goes to pip ``flash_attn.flash_attn_func``
         (only as a safety-net fallback; the pip wheel is not a runtime
         dependency any more, you'd need to install it separately).
@@ -183,11 +183,11 @@ class RtxFlashAttnBackend:
         toggles for bisecting integration bugs.
 
     **Protocol compatibility**: this class implements the
-    :class:`flash_vla.hardware.backend.AttentionBackend` protocol via
+    :class:`flash_rt.hardware.backend.AttentionBackend` protocol via
     :meth:`get_slot_ptrs` and :meth:`run`. The legacy methods
     (:meth:`vision_attn` / :meth:`encoder_attn` / :meth:`decoder_attn`
     / :meth:`get_ptrs`) remain live for the current pipelines in
-    ``flash_vla.models.pi05.pipeline_rtx`` and will be retired once
+    ``flash_rt.models.pi05.pipeline_rtx`` and will be retired once
     those pipelines migrate to the protocol methods. Both surfaces
     wrap the same underlying torch tensors and ``flash_attn_func``
     calls — adding the new methods did not change any runtime
@@ -226,7 +226,7 @@ class RtxFlashAttnBackend:
 
         # Select attention implementation:
         #   FVK_RTX_FA2 env var: "1" (default) = use vendored FA2 from
-        #   flash_vla_fa2.so (drops pip flash-attn wheel dep), "0" =
+        #   flash_rt_fa2.so (drops pip flash-attn wheel dep), "0" =
         #   keep legacy pip flash_attn_func path.
         # The vendored module ships both fp16 and bf16 instantiations
         # (hdim 96/128/256 × regular + splitkv), so every RTX frontend
@@ -294,15 +294,15 @@ class RtxFlashAttnBackend:
         # 24 columns and slice the first 72 of the output back).
         if self._use_fvk_fa2:
             try:
-                from flash_vla import flash_vla_fa2 as _fa2
+                from flash_rt import flash_rt_fa2 as _fa2
             except ImportError as e:
                 raise RuntimeError(
-                    "FVK_RTX_FA2=1 but flash_vla_fa2 module is not built. "
+                    "FVK_RTX_FA2=1 but flash_rt_fa2 module is not built. "
                     "Rebuild with ENABLE_FA2 (SM80/86/89/120). Set "
                     f"FVK_RTX_FA2=0 to use pip flash_attn. Import error: {e}")
             self._fa2 = _fa2
             # Pick fp16 or bf16 entry based on the backend's dtype;
-            # both live in the same flash_vla_fa2 module.
+            # both live in the same flash_rt_fa2 module.
             self._fa2_fwd = _fa2.fwd_fp16 if self._is_fp16 else _fa2.fwd_bf16
             # SM count used by the splitkv heuristic — matches upstream's
             # get_num_sm(current_device) behaviour in flash_api.cpp.
@@ -393,7 +393,7 @@ class RtxFlashAttnBackend:
         #   - ``FVK_RTX_FA2=0`` (legacy backend), or
         #   - ``FVK_RTX_FA2_SITES`` excludes some sites during bisection.
         # The default (``_use_fvk_fa2=True`` + all three sites enabled) goes
-        # entirely through the vendored ``flash_vla_fa2.so``, so we make the
+        # entirely through the vendored ``flash_rt_fa2.so``, so we make the
         # import lazy: environments without a prebuilt flash-attn wheel
         # (Modal / older CUDA images) can still use FlashRT for the
         # default RTX path. ``_flash_attn_call`` raises a clear error if
@@ -704,7 +704,7 @@ class RtxFlashAttnBackend:
 
 # ─────────────────────────────────────────────────────────────────────────
 # Backwards-compatible alias — old name before the Torch-prefix drop.
-# External plugins pinned to ``from flash_vla.hardware.rtx.attn_backend
+# External plugins pinned to ``from flash_rt.hardware.rtx.attn_backend
 # import TorchFlashAttnBackend`` continue to work; the name was
 # misleading because the backend is used by the jax frontend too (JAX
 # has no dependency on torch in the attention call path — it only

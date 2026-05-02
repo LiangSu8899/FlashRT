@@ -19,9 +19,9 @@ import os
 
 import pytest
 
-from flash_vla.executors.weight_loader import Item, LayerBlock
-from flash_vla.executors.torch_weights import Cat
-from flash_vla.frontends.torch._groot_n17_thor_spec import build_spec
+from flash_rt.executors.weight_loader import Item, LayerBlock
+from flash_rt.executors.torch_weights import Cat
+from flash_rt.frontends.torch._groot_n17_thor_spec import build_spec
 
 
 N17_CACHE_GLOB = (

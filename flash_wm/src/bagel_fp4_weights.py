@@ -1,7 +1,7 @@
 """Offline NVFP4 weight preparation for BAGEL gen expert (world-model path).
 
 Loads original fp16 weights directly from ema.safetensors and quantizes to
-NVFP4 packed + CUTLASS tile-interleaved SFB via flash_vla.flash_vla_fp4.
+NVFP4 packed + CUTLASS tile-interleaved SFB via flash_rt.flash_rt_fp4.
 This avoids the FP8→fp16 dequant path (double-lossy) that BagelFP8Engine uses.
 
 Scope: gen expert only (q/k/v/o/gate/up/down × 28 layers).
@@ -20,7 +20,7 @@ from safetensors import safe_open
 _THIS = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(_THIS)))   # repo root
 
-from flash_vla.executors.fp4_utils import quant_weight_nvfp4
+from flash_rt.executors.fp4_utils import quant_weight_nvfp4
 
 fp16 = torch.float16
 
@@ -62,7 +62,7 @@ def prepare_gen_fp4_weights(weights_root: str,
 
     Returns:
         dict[layer_idx] = dict[gname] = {'packed', 'sfb', 'N', 'K'}
-        (as returned by flash_vla.executors.fp4_utils.quant_weight_nvfp4).
+        (as returned by flash_rt.executors.fp4_utils.quant_weight_nvfp4).
     """
     layers = range(N_LAYERS) if layers is None else list(layers)
     gnames = list(GEN_WEIGHT_KEYS.keys()) if gnames is None else list(gnames)

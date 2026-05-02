@@ -91,7 +91,7 @@ PI05_SCRIPT = r"""
 import sys, json, time, pathlib, numpy as np, torch
 sys.path.insert(0, "ROOTDIR")
 
-cdir = pathlib.Path.home() / ".flash_vla" / "calibration"
+cdir = pathlib.Path.home() / ".flash_rt" / "calibration"
 if cdir.exists():
     for f in cdir.glob("*.json"): f.unlink()
 
@@ -105,7 +105,7 @@ ref_noise    = ref["arg9_noise"][0].astype(np.float16)           # (10, 32)
 tok_mask     = ref["arg8_tokenized_prompt_mask"][0]
 ref_tokens   = ref["arg7_tokenized_prompt"][0][:int(tok_mask.sum())].astype(np.int64)
 
-from flash_vla.frontends.torch.pi05_thor import Pi05TorchFrontendThor as PIPE_CLS
+from flash_rt.frontends.torch.pi05_thor import Pi05TorchFrontendThor as PIPE_CLS
 pipe = PIPE_CLS(CKPT, num_views=3, autotune=3)
 pipe.set_prompt(ref_tokens.tolist())
 
@@ -125,7 +125,7 @@ if N > 1:
              "state": d[f"state_{i}"]} for i in range(int(d["n"]))
         ]
     else:
-        from flash_vla.datasets.libero import load_calibration_obs
+        from flash_rt.datasets.libero import load_calibration_obs
         base = load_calibration_obs(LIBERO_ROOT, n=N, verbose=False)
         obs_list = [{"image": o["image"], "wrist_image": o["wrist_image"],
                      "wrist_image_right": o["wrist_image"],
@@ -180,7 +180,7 @@ PI05_FP4_SCRIPT = r"""
 import sys, json, time, pathlib, numpy as np, torch
 sys.path.insert(0, "ROOTDIR")
 
-cdir = pathlib.Path.home() / ".flash_vla" / "calibration"
+cdir = pathlib.Path.home() / ".flash_rt" / "calibration"
 if cdir.exists():
     for f in cdir.glob("*.json"): f.unlink()
 
@@ -193,7 +193,7 @@ ref_noise   = ref["arg9_noise"][0].astype(np.float16)
 tok_mask    = ref["arg8_tokenized_prompt_mask"][0]
 ref_tokens  = ref["arg7_tokenized_prompt"][0][:int(tok_mask.sum())].astype(np.int64)
 
-from flash_vla.frontends.torch.pi05_thor_fp4 import Pi05TorchFrontendThorFP4
+from flash_rt.frontends.torch.pi05_thor_fp4 import Pi05TorchFrontendThorFP4
 pipe = Pi05TorchFrontendThorFP4(
     CKPT, num_views=3, autotune=3,
     use_fp4_encoder_ffn=True, fp4_layers=tuple(range(18)),
@@ -214,7 +214,7 @@ if N > 1:
              "state": d[f"state_{i}"]} for i in range(int(d["n"]))
         ]
     else:
-        from flash_vla.datasets.libero import load_calibration_obs
+        from flash_rt.datasets.libero import load_calibration_obs
         base = load_calibration_obs(LIBERO_ROOT, n=N, verbose=False)
         obs_list = [{"image": o["image"], "wrist_image": o["wrist_image"],
                      "wrist_image_right": o["wrist_image"],
@@ -268,7 +268,7 @@ PI0_SCRIPT = r"""
 import sys, json, time, pathlib, numpy as np, torch
 sys.path.insert(0, "ROOTDIR")
 
-cdir = pathlib.Path.home() / ".flash_vla" / "calibration"
+cdir = pathlib.Path.home() / ".flash_rt" / "calibration"
 if cdir.exists():
     for f in cdir.glob("*.json"): f.unlink()
 
@@ -281,7 +281,7 @@ toks = ref["arg5_tokenized_prompt"][0]
 tok_mask = ref["arg6_tokenized_prompt_mask"][0]
 prompt_len = int(tok_mask.sum())
 
-from flash_vla.frontends.torch.pi0_thor import Pi0TorchFrontendThor
+from flash_rt.frontends.torch.pi0_thor import Pi0TorchFrontendThor
 pipe = Pi0TorchFrontendThor(CKPT, num_views=2, autotune=3)
 pipe.set_prompt(toks[:prompt_len].tolist())
 
@@ -299,7 +299,7 @@ if N > 1:
         d = np.load(obs_npz)
         obs_list = [{"image": d[f"img_{i}"], "wrist_image": d[f"wrist_{i}"], "state": d[f"state_{i}"]} for i in range(int(d["n"]))]
     else:
-        from flash_vla.datasets.libero import load_calibration_obs
+        from flash_rt.datasets.libero import load_calibration_obs
         obs_list = load_calibration_obs(LIBERO_ROOT, n=N, verbose=False)
     t0 = time.perf_counter(); pipe.calibrate(obs_list, percentile=99.9)
     cal_ms = (time.perf_counter() - t0) * 1000
@@ -356,7 +356,7 @@ PI0_JAX_SCRIPT = r"""
 import sys, json, time, pathlib, numpy as np
 sys.path.insert(0, "ROOTDIR")
 
-cdir = pathlib.Path.home() / ".flash_vla" / "calibration"
+cdir = pathlib.Path.home() / ".flash_rt" / "calibration"
 if cdir.exists():
     for f in cdir.glob("*.json"): f.unlink()
 
@@ -369,7 +369,7 @@ toks = ref["arg5_tokenized_prompt"][0]
 tok_mask = ref["arg6_tokenized_prompt_mask"][0]
 prompt_len = int(tok_mask.sum())
 
-from flash_vla.frontends.jax.pi0_thor import Pi0JaxFrontendThor
+from flash_rt.frontends.jax.pi0_thor import Pi0JaxFrontendThor
 pipe = Pi0JaxFrontendThor(CKPT, num_views=2, autotune=3)
 pipe.set_prompt(toks[:prompt_len].tolist())
 
@@ -388,7 +388,7 @@ if N > 1:
             for i in range(int(d["n"]))
         ]
     else:
-        from flash_vla.datasets.libero import load_calibration_obs
+        from flash_rt.datasets.libero import load_calibration_obs
         obs_list = load_calibration_obs(LIBERO_ROOT, n=N, verbose=False)
     t0 = time.perf_counter(); pipe.calibrate(obs_list, percentile=99.9)
     cal_ms = (time.perf_counter() - t0) * 1000
@@ -441,13 +441,13 @@ os.environ["TRANSFORMERS_OFFLINE"] = "1"
 sys.path.insert(0, "ROOTDIR")
 import logging; logging.basicConfig(level=logging.WARNING)
 
-cdir = pathlib.Path.home() / ".flash_vla" / "calibration"
+cdir = pathlib.Path.home() / ".flash_rt" / "calibration"
 if cdir.exists():
     for f in cdir.glob("*.json"): f.unlink()
 
-import flash_vla.flash_vla_kernels as fvk
-from flash_vla.frontends.torch.pi0fast import Pi0FastTorchFrontend
-from flash_vla.models.pi0fast.pipeline import (
+import flash_rt.flash_rt_kernels as fvk
+from flash_rt.frontends.torch.pi0fast import Pi0FastTorchFrontend
+from flash_rt.models.pi0fast.pipeline import (
     prefill_forward_pi0fast, decode_step_pi0fast_bf16,
 )
 
@@ -462,7 +462,7 @@ if N > 1:
         d = np.load(obs_npz)
         obs_list = [{"image": d[f"img_{i}"], "wrist_image": d[f"wrist_{i}"], "state": d[f"state_{i}"]} for i in range(int(d["n"]))]
     else:
-        from flash_vla.datasets.libero import load_calibration_obs
+        from flash_rt.datasets.libero import load_calibration_obs
         obs_list = load_calibration_obs(LIBERO_ROOT, n=N, verbose=False)
     t0 = time.perf_counter(); pipe.calibrate(obs_list, percentile=99.9)
     cal_ms = (time.perf_counter() - t0) * 1000
@@ -592,13 +592,13 @@ import sys, json, time, pathlib, numpy as np, torch, os
 os.environ["HF_HUB_OFFLINE"] = "1"
 sys.path.insert(0, "ROOTDIR")
 
-cdir = pathlib.Path.home() / ".flash_vla" / "calibration"
+cdir = pathlib.Path.home() / ".flash_rt" / "calibration"
 if cdir.exists():
     for f in cdir.glob("*.json"): f.unlink()
 
-import flash_vla.flash_vla_kernels as fvk
-from flash_vla.frontends.jax.pi0fast import Pi0FastJaxFrontend
-from flash_vla.models.pi0fast.pipeline import (
+import flash_rt.flash_rt_kernels as fvk
+from flash_rt.frontends.jax.pi0fast import Pi0FastJaxFrontend
+from flash_rt.models.pi0fast.pipeline import (
     prefill_forward_pi0fast, decode_step_pi0fast_bf16,
 )
 
@@ -617,7 +617,7 @@ if N > 1:
             for i in range(int(d["n"]))
         ]
     else:
-        from flash_vla.datasets.libero import load_calibration_obs
+        from flash_rt.datasets.libero import load_calibration_obs
         obs_list = load_calibration_obs(LIBERO_ROOT, n=N, verbose=False)
     t0 = time.perf_counter(); pipe.calibrate(obs_list, percentile=99.9)
     cal_ms = (time.perf_counter() - t0) * 1000
@@ -699,7 +699,7 @@ PI05_JAX_SCRIPT = r"""
 import sys, json, time, pathlib, numpy as np
 sys.path.insert(0, "ROOTDIR")
 
-cdir = pathlib.Path.home() / ".flash_vla" / "calibration"
+cdir = pathlib.Path.home() / ".flash_rt" / "calibration"
 if cdir.exists():
     for f in cdir.glob("*.json"): f.unlink()
 
@@ -712,7 +712,7 @@ ref_noise  = ref["arg9_noise"][0].astype(np.float16)
 tok_mask   = ref["arg8_tokenized_prompt_mask"][0]
 ref_tokens = ref["arg7_tokenized_prompt"][0][:int(tok_mask.sum())].astype(np.int64)
 
-from flash_vla.frontends.jax.pi05_thor import Pi05JaxFrontendThor
+from flash_rt.frontends.jax.pi05_thor import Pi05JaxFrontendThor
 pipe = Pi05JaxFrontendThor(CKPT, num_views=3, autotune=3)
 pipe.set_prompt(ref_tokens.tolist())
 
@@ -732,7 +732,7 @@ if N > 1:
              "state": d[f"state_{i}"]} for i in range(int(d["n"]))
         ]
     else:
-        from flash_vla.datasets.libero import load_calibration_obs
+        from flash_rt.datasets.libero import load_calibration_obs
         base = load_calibration_obs(LIBERO_ROOT, n=N, verbose=False)
         obs_list = [{"image": o["image"], "wrist_image": o["wrist_image"],
                      "wrist_image_right": o["wrist_image"],
@@ -791,7 +791,7 @@ PI05_JAX_FP4_SCRIPT = r"""
 import sys, json, time, pathlib, numpy as np
 sys.path.insert(0, "ROOTDIR")
 
-cdir = pathlib.Path.home() / ".flash_vla" / "calibration"
+cdir = pathlib.Path.home() / ".flash_rt" / "calibration"
 if cdir.exists():
     for f in cdir.glob("*.json"): f.unlink()
 
@@ -804,7 +804,7 @@ ref_noise  = ref["arg9_noise"][0].astype(np.float16)
 tok_mask   = ref["arg8_tokenized_prompt_mask"][0]
 ref_tokens = ref["arg7_tokenized_prompt"][0][:int(tok_mask.sum())].astype(np.int64)
 
-from flash_vla.frontends.jax.pi05_thor_fp4 import Pi05JaxFrontendThorFP4
+from flash_rt.frontends.jax.pi05_thor_fp4 import Pi05JaxFrontendThorFP4
 pipe = Pi05JaxFrontendThorFP4(
     CKPT, num_views=3, autotune=3, weight_cache=True,
     use_fp4_encoder_ffn=True, fp4_layers=tuple(range(18)),
@@ -827,7 +827,7 @@ if N > 1:
              "state": d[f"state_{i}"]} for i in range(int(d["n"]))
         ]
     else:
-        from flash_vla.datasets.libero import load_calibration_obs
+        from flash_rt.datasets.libero import load_calibration_obs
         base = load_calibration_obs(LIBERO_ROOT, n=N, verbose=False)
         obs_list = [{"image": o["image"], "wrist_image": o["wrist_image"],
                      "wrist_image_right": o["wrist_image"],

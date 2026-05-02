@@ -19,9 +19,9 @@ from __future__ import annotations
 import time
 import torch
 
-import flash_vla.flash_vla_fp4 as fvk_fp4
-import flash_vla.flash_vla_kernels as fvk
-from flash_vla.executors.fp4_utils import (
+import flash_rt.flash_rt_fp4 as fvk_fp4
+import flash_rt.flash_rt_kernels as fvk
+from flash_rt.executors.fp4_utils import (
     FP4ActScratch, fp4_gemm, pick_variant,
     quant_act_nvfp4, quant_weight_nvfp4,
 )

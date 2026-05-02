@@ -52,7 +52,7 @@ def _fake_slots():
 
 
 def _build(spec_override=None, **slot_overrides):
-    from flash_vla.hardware.thor.attn_backend_groot import (
+    from flash_rt.hardware.thor.attn_backend_groot import (
         ThorGrootAttnBackend, make_groot_attention_spec,
     )
     spec = spec_override or make_groot_attention_spec(
@@ -75,7 +75,7 @@ def test_construct_ok():
 
 def test_groot_spec_mha_kernels():
     """qwen3, dit_self, dit_cross all carry extra={'kernel': 'mha'}."""
-    from flash_vla.hardware.thor.attn_backend_groot import make_groot_attention_spec
+    from flash_rt.hardware.thor.attn_backend_groot import make_groot_attention_spec
     spec = make_groot_attention_spec(num_views=2, qwen3_seq_max=1024, sa=17, s_kv=600)
     for name in ("qwen3", "dit_self", "dit_cross"):
         assert spec.site(name).extra.get("kernel") == "mha", name
@@ -175,8 +175,8 @@ def test_reject_wrong_kv_layers_len():
 
 
 def test_reject_extra_site():
-    from flash_vla.hardware.thor.attn_backend_groot import ThorGrootAttnBackend
-    from flash_vla.hardware.backend import AttentionSpec
+    from flash_rt.hardware.thor.attn_backend_groot import ThorGrootAttnBackend
+    from flash_rt.hardware.backend import AttentionSpec
     spec = AttentionSpec()
     for name in ("siglip", "qwen3", "dit_self", "dit_cross", "rogue"):
         spec.add_site(name, num_layers=1, num_q_heads=1, num_kv_heads=1,

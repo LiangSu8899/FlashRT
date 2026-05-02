@@ -11,8 +11,8 @@ so spec modules don't alias mutable state across frontends.
 
 from __future__ import annotations
 
-from flash_vla.executors.weight_loader import Item, LayerBlock
-from flash_vla.executors.torch_weights import (
+from flash_rt.executors.weight_loader import Item, LayerBlock
+from flash_rt.executors.torch_weights import (
     Cat,
     FusedGateUp,
     FusedQKV,

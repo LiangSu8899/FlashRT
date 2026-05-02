@@ -36,7 +36,7 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 import numpy as np
-import flash_vla
+import flash_rt
 
 
 def main():
@@ -82,7 +82,7 @@ def main():
     # ══════════════════════════════════════════
     #  3 lines
     # ══════════════════════════════════════════
-    model = flash_vla.load_model(
+    model = flash_rt.load_model(
         checkpoint=args.checkpoint,
         framework=args.framework,
         num_views=args.num_views,

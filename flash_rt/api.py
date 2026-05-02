@@ -3,9 +3,9 @@ FlashVLA — Public API.
 
 3 lines of code to run VLA inference:
 
-    import flash_vla
+    import flash_rt
 
-    model = flash_vla.load_model(
+    model = flash_rt.load_model(
         checkpoint="/path/to/checkpoint",
         framework="torch",
         autotune=3,
@@ -149,10 +149,10 @@ class VLAModel:
         Use after fine-tuning or switching deployment domains.
         Clears calibration cache (and weight cache for JAX).
         """
-        from flash_vla.core.quant.calibrator import clear_calibration
+        from flash_rt.core.quant.calibrator import clear_calibration
         clear_calibration(self._pipe._checkpoint_path)
         if self._framework == "jax":
-            from flash_vla.core.weights.weight_cache import clear_weight_cache
+            from flash_rt.core.weights.weight_cache import clear_weight_cache
             clear_weight_cache(self._pipe._checkpoint_path)
         self._pipe.calibrated = False
         self._pipe._real_data_calibrated = False
@@ -206,13 +206,13 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         hardware: GPU backend selection. ``"auto"`` (default) detects the
             current CUDA device via compute capability and picks the
             best-matching backend:
-              SM110 (Jetson Thor)  → ``flash_vla.hardware.thor.*``
-              SM120 (RTX 5090)     → ``flash_vla.hardware.rtx.*``
+              SM110 (Jetson Thor)  → ``flash_rt.hardware.thor.*``
+              SM120 (RTX 5090)     → ``flash_rt.hardware.rtx.*``
                                      (falls back to Thor classes for models
                                       without an rtx-specific implementation —
                                       those classes have SM120 runtime forks
                                       where needed, e.g. Pi0-FAST.)
-              SM89  (RTX 4090)     → ``flash_vla.hardware.rtx.*``
+              SM89  (RTX 4090)     → ``flash_rt.hardware.rtx.*``
             Pass ``"thor"`` / ``"rtx_sm120"`` / ``"rtx_sm89"`` explicitly to
             force a specific backend (useful for cross-hardware debugging).
         embodiment_tag: GROOT only. Per-embodiment MLP slot to load. Passing
@@ -227,7 +227,7 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             smaller value (e.g. 16 for LIBERO) to reduce DiT compute.
         use_fp4: Pi0.5 torch only. If True, enable NVFP4 quantization on the
             selected encoder FFN layers (Gate+Up + Down GEMMs). Requires
-            SM100+ GPU (Thor SM110) and the flash_vla_fp4 extension. Falls
+            SM100+ GPU (Thor SM110) and the flash_rt_fp4 extension. Falls
             back to FP8 with a warning if the extension is unavailable.
             Default False (production FP8 baseline).
             Validated on LIBERO Spatial: 491/500 = 98.2% (matches baseline).
@@ -263,17 +263,17 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         if use_p1_split_gu is None:
             use_p1_split_gu = False
 
-    from flash_vla.hardware import detect_arch, resolve_pipeline_class
+    from flash_rt.hardware import detect_arch, resolve_pipeline_class
     arch = detect_arch() if hardware == "auto" else hardware
 
     if recalibrate:
-        from flash_vla.core.quant.calibrator import clear_calibration
+        from flash_rt.core.quant.calibrator import clear_calibration
         try:
             clear_calibration(checkpoint)
         except FileNotFoundError:
             pass
         if framework == "jax":
-            from flash_vla.core.weights.weight_cache import clear_weight_cache
+            from flash_rt.core.weights.weight_cache import clear_weight_cache
             try:
                 clear_weight_cache(checkpoint)
             except FileNotFoundError:
@@ -298,25 +298,25 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             use_fp4 = False
         else:
             try:
-                import flash_vla.flash_vla_fp4 as _fvk_fp4
+                import flash_rt.flash_rt_fp4 as _fvk_fp4
                 if not _fvk_fp4.has_nvfp4():
                     logger.warning(
-                        "flash_vla_fp4 loaded but has_nvfp4()=False (SM100+ required). "
+                        "flash_rt_fp4 loaded but has_nvfp4()=False (SM100+ required). "
                         "Falling back to FP8.")
                     use_fp4 = False
             except ImportError:
                 logger.warning(
-                    "flash_vla_fp4 extension not available. Falling back to FP8.")
+                    "flash_rt_fp4 extension not available. Falling back to FP8.")
                 use_fp4 = False
 
             if use_fp4:
                 if framework == "torch":
-                    from flash_vla.frontends.torch.pi05_thor_fp4 import (
+                    from flash_rt.frontends.torch.pi05_thor_fp4 import (
                         Pi05TorchFrontendThorFP4,
                     )
                     pipe_cls = Pi05TorchFrontendThorFP4
                 else:  # framework == "jax"
-                    from flash_vla.frontends.jax.pi05_thor_fp4 import (
+                    from flash_rt.frontends.jax.pi05_thor_fp4 import (
                         Pi05JaxFrontendThorFP4,
                     )
                     pipe_cls = Pi05JaxFrontendThorFP4

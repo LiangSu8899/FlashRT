@@ -50,7 +50,7 @@ def main() -> None:
     aux = torch.load(AUX, weights_only=False)
 
     # ── Compute "our" backbone first (a one-shot set_prompt) and stash. ──
-    from flash_vla.frontends.torch.groot_n17_thor import GrootN17TorchFrontendThor
+    from flash_rt.frontends.torch.groot_n17_thor import GrootN17TorchFrontendThor
     fe = GrootN17TorchFrontendThor(
         snap, num_views=2,
         embodiment_tag="oxe_droid_relative_eef_relative_joint")

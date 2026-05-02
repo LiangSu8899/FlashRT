@@ -1,4 +1,4 @@
-"""FlashVLA — GrootTorchFrontendThor: GROOT N1.6 inference via flash_vla_kernels.so.
+"""FlashVLA — GrootTorchFrontendThor: GROOT N1.6 inference via flash_rt_kernels.so.
 
 Architecture: Eagle3-VL (SigLIP2 + Qwen3-1.7B) + AlternateVLDiT (32L, 4 flow-matching steps)
 
@@ -21,12 +21,12 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from flash_vla.hardware.thor.shared_primitives import siglip_forward  # SigLIP2 == Pi0.5 SigLIP
-from flash_vla.hardware.thor.attn_backend_groot import (
+from flash_rt.hardware.thor.shared_primitives import siglip_forward  # SigLIP2 == Pi0.5 SigLIP
+from flash_rt.hardware.thor.attn_backend_groot import (
     ThorGrootAttnBackend,
     make_groot_attention_spec,
 )
-from flash_vla.models.groot.pipeline_thor import (
+from flash_rt.models.groot.pipeline_thor import (
     siglip2_forward,
     eagle_project,
     qwen3_forward,
@@ -36,8 +36,8 @@ from flash_vla.models.groot.pipeline_thor import (
     embodiment_decode_action,
 )
 
-import flash_vla.flash_vla_kernels as fvk
-from flash_vla.core.quant.calibrator import load_calibration, save_calibration
+import flash_rt.flash_rt_kernels as fvk
+from flash_rt.core.quant.calibrator import load_calibration, save_calibration
 
 logger = logging.getLogger(__name__)
 
@@ -56,10 +56,10 @@ fp8 = torch.float8_e4m3fn
 COMPUTE_DTYPE = fp16
 
 # Embodiment tag → projector index. Shared with rtx — see
-# flash_vla/hardware/groot_embodiments.py. Same 32-slot per-embodiment
+# flash_rt/hardware/groot_embodiments.py. Same 32-slot per-embodiment
 # MLP layout; only a subset of slots have trained weights in the
 # GR00T-N1.6-3B base checkpoint (see TRAINED_EMBODIMENT_IDS).
-from flash_vla.models.groot.embodiments import (
+from flash_rt.models.groot.embodiments import (
     EMBODIMENT_TAG_TO_INDEX,
     PUBLIC_TRAINED_TAGS,
     is_embodiment_trained,
@@ -73,7 +73,7 @@ DIT_PREFIX = "action_head.model"
 AH_PREFIX  = "action_head"
 
 
-from flash_vla.core.thor_frontend_utils import quant_fp8  # noqa: E402
+from flash_rt.core.thor_frontend_utils import quant_fp8  # noqa: E402
 
 
 class GrootTorchFrontendThor:
@@ -213,8 +213,8 @@ class GrootTorchFrontendThor:
         #   self._sig_{ln_attn,ln_ffn,qkv,o,up,down}_{w,b}  (27-layer lists)
         #   self._sig_alpha                                  (108 fp32 scales)
         # Qwen3 / DiT / embodiment remain inline — see _groot_thor_spec.py docstring.
-        from flash_vla.executors.torch_weights import DictSource, WeightLoader
-        from flash_vla.frontends.torch._groot_thor_spec import build_siglip2_spec
+        from flash_rt.executors.torch_weights import DictSource, WeightLoader
+        from flash_rt.frontends.torch._groot_thor_spec import build_siglip2_spec
         WeightLoader(source=DictSource(sd), target=self,
                      spec=build_siglip2_spec()).run()
 
@@ -1556,7 +1556,7 @@ class GrootTorchFrontendThor:
                 enc_scales=[], enc_alpha=[], ae_scales=[],
                 enc_w_scales=[],
             )
-            from flash_vla.core.quant.calibrator import _checkpoint_hash, _cache_path
+            from flash_rt.core.quant.calibrator import _checkpoint_hash, _cache_path
             import json
             ckpt_hash = _checkpoint_hash(self._checkpoint_path)
             cache_file = _cache_path(ckpt_hash, Se)
@@ -1702,7 +1702,7 @@ class GrootTorchFrontendThor:
         logger.info("DiT calibrated: %d act scales", len(scales))
 
         try:
-            from flash_vla.core.quant.calibrator import _checkpoint_hash, _cache_path
+            from flash_rt.core.quant.calibrator import _checkpoint_hash, _cache_path
             import json
             ckpt_hash = _checkpoint_hash(str(self._checkpoint_path))
             cache_file = _cache_path(ckpt_hash, Se)
@@ -1748,7 +1748,7 @@ class GrootTorchFrontendThor:
         re-capture needed; the captured kernels read scales from the
         buffers at replay time).
         """
-        from flash_vla.core.calibration import (
+        from flash_rt.core.calibration import (
             accumulate_amax,
             format_summary,
             summarize_amax_dispersion,
@@ -1893,7 +1893,7 @@ class GrootTorchFrontendThor:
 
     def _warn_if_scale_ceiling_exceeded(self, label: str = "groot_thor") -> None:
         """Diagnostic warning if any FP8 scale is far above the median."""
-        from flash_vla.core.calibration import check_scale_ceiling
+        from flash_rt.core.calibration import check_scale_ceiling
         scales: dict = {}
         for i, s in enumerate(self._read_qwen3_scales().tolist()):
             scales[f"qwen3_{i}"] = float(s)
@@ -1906,7 +1906,7 @@ class GrootTorchFrontendThor:
     def _snapshot_precision_spec(self, *, method: str, n: int,
                                  percentile: Optional[float]):
         """Build a :class:`ModelPrecisionSpec` from current FP8 scales."""
-        from flash_vla.core.precision_spec import (
+        from flash_rt.core.precision_spec import (
             ModelPrecisionSpec,
             PrecisionSpec,
         )
@@ -1986,7 +1986,7 @@ class GrootTorchFrontendThor:
                 with additional samples (the FP16 shadow forward requires
                 the raw state dict to be alive).
         """
-        from flash_vla.models.groot.pipeline_thor import CKernelQwen3, CKernelDiTHead
+        from flash_rt.models.groot.pipeline_thor import CKernelQwen3, CKernelDiTHead
         logger.info("Capturing CUDA Graphs for E2E pipeline...")
 
         Se = self._Se

@@ -18,7 +18,7 @@ import math
 import ctypes
 import numpy as np
 
-from flash_vla.hardware.thor.shared_primitives import (
+from flash_rt.hardware.thor.shared_primitives import (
     _gpu_copy, _gpu_zero, _gpu_sync,
     _d2h_float, _d2h_floats,
     _measure_scale_gpu,
@@ -67,7 +67,7 @@ def prefill_forward_pi0fast(gemm, fvk, bufs, weights, dims, stream=0):
 
     Args:
         gemm: GemmRunner
-        fvk: flash_vla_kernels module
+        fvk: flash_rt_kernels module
         bufs: dict — x (BF16!), x_fp8, qkv (FP16), logits, attn_out (FP16),
                      o_fp8, gate (FP16), hid_fp8, fg (BF16!), xn (BF16!), ctx
         weights: dict — always required:
@@ -205,7 +205,7 @@ def decode_step_pi0fast(ctx, fvk, bufs, weights, dims, step, stream=0):
 
     Args:
         ctx: FvkContext
-        fvk: flash_vla_kernels module
+        fvk: flash_rt_kernels module
         bufs: dict — x, x_fp8, qkv, logits, attn_out, o_fp8, gate, hid_fp8, fg, xn
         weights: dict — qkv_w[L], o_w[L], gate_w[L], down_w[L], rope_base,
                         Kc, Vc, final_norm_w, act_scales, w_scales
@@ -726,7 +726,7 @@ def siglip_forward_sm120(gemm, fvk, bufs, weights, dims, stream=0):
     Args:
         gemm: GemmRunner (unused on SM120 path — kept for interface
               parity with siglip_forward).
-        fvk: flash_vla_kernels module.
+        fvk: flash_rt_kernels module.
         bufs: dict — x, x_fp8, qkv, attn_out, hidden, hid_fp8 (FP16
               raw pointers, same contract as pipeline_pi05.siglip_forward);
               plus SM120-only keys ``qkv_t`` (torch.Tensor view of qkv

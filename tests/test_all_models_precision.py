@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """FlashVLA — Full precision test: all models, all backends.
 
-Tests current flash_vla_kernels.so against saved reference outputs.
+Tests current flash_rt_kernels.so against saved reference outputs.
 Each model runs in separate subprocess. Uses monkey-patch noise injection
 for deterministic comparison (same pattern as _vf_*.py production tests).
 
@@ -32,7 +32,7 @@ def cosine(a, b):
 PI05_SCRIPT = '''
 import sys, os, time, json, torch, numpy as np
 sys.path.insert(0, "ROOTDIR")
-from flash_vla.frontends.torch.pi05_thor import Pi05TorchFrontendThor as ThorPipelineTorch
+from flash_rt.frontends.torch.pi05_thor import Pi05TorchFrontendThor as ThorPipelineTorch
 
 np.random.seed(42)
 img = np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8)
@@ -94,14 +94,14 @@ print(json.dumps({
 PI05_FP4_SCRIPT = '''
 import sys, os, time, json, torch, numpy as np
 sys.path.insert(0, "ROOTDIR")
-import flash_vla
+import flash_rt
 
 np.random.seed(42)
 img = np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8)
 wrist = np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8)
 obs = {"image": img, "wrist_image": wrist}
 
-m = flash_vla.load_model("<your_pi05_torch_ckpt>",
+m = flash_rt.load_model("<your_pi05_torch_ckpt>",
                          framework="torch", config="pi05",
                          num_views=2, autotune=3, use_fp4=True)
 pipe = m._pipe
@@ -158,7 +158,7 @@ PI0_SCRIPT = '''
 import sys, os, time, json, pathlib, torch, numpy as np
 sys.path.insert(0, "ROOTDIR")
 
-for f in (pathlib.Path.home()/".flash_vla"/"calibration").glob("70bdf6f4*"):
+for f in (pathlib.Path.home()/".flash_rt"/"calibration").glob("70bdf6f4*"):
     f.unlink()
 
 ref = np.load("/tmp/pi0_ref_2view.npz", allow_pickle=True)
@@ -170,7 +170,7 @@ toks = ref["arg5_tokenized_prompt"][0]
 tok_mask = ref["arg6_tokenized_prompt_mask"][0]
 prompt_len = int(tok_mask.sum())
 
-from flash_vla.frontends.torch.pi0_thor import Pi0TorchFrontendThor as ThorPipelineTorchPi0
+from flash_rt.frontends.torch.pi0_thor import Pi0TorchFrontendThor as ThorPipelineTorchPi0
 pipe = ThorPipelineTorchPi0("<your_pi0_torch_ckpt>", num_views=2, autotune=3)
 pipe.set_prompt(toks[:prompt_len].tolist())
 
@@ -232,7 +232,7 @@ img_np = ref["img_np"]
 prompt = ref["prompt"]
 T_ref = ref_actions.shape[0]
 
-from flash_vla.frontends.torch.groot_thor import GrootTorchFrontendThor as ThorPipelineTorchGroot
+from flash_rt.frontends.torch.groot_thor import GrootTorchFrontendThor as ThorPipelineTorchGroot
 pipe = ThorPipelineTorchGroot("<your_groot_ckpt>", num_views=2, autotune=3)
 pipe.set_prompt(prompt)
 
@@ -275,7 +275,7 @@ toks = ref["arg5_tokenized_prompt"][0]
 tok_mask = ref["arg6_tokenized_prompt_mask"][0]
 prompt_len = int(tok_mask.sum())
 
-from flash_vla.frontends.jax.pi0_thor import Pi0JaxFrontendThor as ThorPipelineJaxPi0
+from flash_rt.frontends.jax.pi0_thor import Pi0JaxFrontendThor as ThorPipelineJaxPi0
 pipe = ThorPipelineJaxPi0("<your_jax_ckpts>/pi0_base", num_views=2, autotune=3)
 pipe.set_prompt(toks[:prompt_len].tolist())
 
@@ -332,7 +332,7 @@ print(json.dumps(results))
 PI05_JAX_SCRIPT = '''
 import sys, os, time, json, numpy as np
 sys.path.insert(0, "ROOTDIR")
-from flash_vla.frontends.jax.pi05_thor import Pi05JaxFrontendThor as ThorPipelineJaxPi05
+from flash_rt.frontends.jax.pi05_thor import Pi05JaxFrontendThor as ThorPipelineJaxPi05
 
 pipe = ThorPipelineJaxPi05("<your_pi05_jax_ckpt>", num_views=2, autotune=3)
 pipe.set_prompt("pick up the red block and place it in the tray")

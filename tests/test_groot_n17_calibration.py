@@ -1,6 +1,6 @@
 """Phase 3c.b1 — smoke test for the calibration module.
 
-Verifies that ``flash_vla.models.groot_n17.calibration`` runs end-to-end
+Verifies that ``flash_rt.models.groot_n17.calibration`` runs end-to-end
 on a real ckpt + Phase 1 fixture inputs without crashing, returns
 sensible amax values, and the per-stage hidden-state shapes line up.
 
@@ -33,7 +33,7 @@ def frontend():
     matches = sorted(glob.glob(_CKPT_GLOB))
     if not matches:
         pytest.skip("N1.7 ckpt not in HF cache")
-    from flash_vla.frontends.torch.groot_n17_thor import GrootN17TorchFrontendThor
+    from flash_rt.frontends.torch.groot_n17_thor import GrootN17TorchFrontendThor
     return GrootN17TorchFrontendThor(
         matches[0], num_views=2,
         embodiment_tag="oxe_droid_relative_eef_relative_joint",
@@ -55,7 +55,7 @@ def _all_finite_positive(values, name):
 
 
 def test_calibrate_vit(frontend, fixtures):
-    from flash_vla.models.groot_n17 import calibration as cal
+    from flash_rt.models.groot_n17 import calibration as cal
     import sys; sys.path.insert(0, str(_FIXTURE.parent.parent))
     from _groot_n17_runner import build_vit_rope_tables
 
@@ -76,7 +76,7 @@ def test_calibrate_vit(frontend, fixtures):
 
 
 def test_calibrate_deepstack(frontend, fixtures):
-    from flash_vla.models.groot_n17 import calibration as cal
+    from flash_rt.models.groot_n17 import calibration as cal
     fx, _ = fixtures
     taps = {tap: fx["activations"][f"vit_block_{tap}"].to("cuda").float()
             for tap in (5, 11, 17)}
@@ -90,7 +90,7 @@ def test_calibrate_deepstack(frontend, fixtures):
 
 
 def test_calibrate_llm(frontend, fixtures):
-    from flash_vla.models.groot_n17 import calibration as cal
+    from flash_rt.models.groot_n17 import calibration as cal
     fx, aux = fixtures
     llm_in = fx["activations"]["llm_layer_0"].to("cuda").float()
     if llm_in.dim() == 2:
@@ -110,7 +110,7 @@ def test_calibrate_llm(frontend, fixtures):
 
 
 def test_calibrate_vlsa(frontend, fixtures):
-    from flash_vla.models.groot_n17 import calibration as cal
+    from flash_rt.models.groot_n17 import calibration as cal
     fx, _ = fixtures
     # Use llm_layer_15 directly (post-layer 15, pre-vlln) as a stand-in
     # llm_final to exercise the vlsa shadow.
@@ -174,7 +174,7 @@ def test_frontend_set_prompt(frontend, fixtures):
 
 
 def test_amax_helpers():
-    from flash_vla.models.groot_n17 import calibration as cal
+    from flash_rt.models.groot_n17 import calibration as cal
     s = cal.amax_to_dev_scale(44.8)
     assert s.dtype == torch.float32
     assert s.numel() == 1

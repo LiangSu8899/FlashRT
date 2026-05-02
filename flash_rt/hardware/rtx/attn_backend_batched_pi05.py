@@ -1,8 +1,8 @@
 """Batched (B=2) Pi0.5 RTX attention backend.
 
-Subclass of :class:`flash_vla.hardware.rtx.attn_backend.RtxFlashAttnBackend`
+Subclass of :class:`flash_rt.hardware.rtx.attn_backend.RtxFlashAttnBackend`
 that adds B=2 sample-batched Q/K/V/output buffers for use by
-:class:`flash_vla.models.pi05.pipeline_rtx_batched.Pi05BatchedPipeline`.
+:class:`flash_rt.models.pi05.pipeline_rtx_batched.Pi05BatchedPipeline`.
 
 The parent backend's B=1 buffers and methods are left untouched: all
 existing pipelines (``Pi05Pipeline``, ``Pi05CFGPipeline``) continue to

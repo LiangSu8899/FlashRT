@@ -62,7 +62,7 @@ def frontend_with_prompt():
     matches = sorted(glob.glob(_CKPT_GLOB))
     if not matches or not _FIXTURE.exists() or not _AUX.exists():
         pytest.skip("ckpt or fixtures missing")
-    from flash_vla.frontends.torch.groot_n17_thor import GrootN17TorchFrontendThor
+    from flash_rt.frontends.torch.groot_n17_thor import GrootN17TorchFrontendThor
     fe = GrootN17TorchFrontendThor(
         matches[0], num_views=2,
         embodiment_tag="oxe_droid_relative_eef_relative_joint",

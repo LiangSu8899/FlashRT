@@ -155,8 +155,8 @@ def eval_single_task(args, task_id):
     logger.info(f"Task {task_id}: {task_description}")
 
     # Load model via unified API
-    import flash_vla
-    model = flash_vla.load_model(
+    import flash_rt
+    model = flash_rt.load_model(
         checkpoint=args.checkpoint,
         framework=args.framework,
         num_views=2,

@@ -1,7 +1,7 @@
 """FlashVLA new-model template — frontend (entry point).
 
-Copy this file to `flash_vla/frontends/torch/<mymodel>_<hw>.py`. This
-is the class that `flash_vla.load_model()` instantiates. It owns:
+Copy this file to `flash_rt/frontends/torch/<mymodel>_<hw>.py`. This
+is the class that `flash_rt.load_model()` instantiates. It owns:
 
 1. Weight loading (delegates to weights_spec.py)
 2. CUDA buffer allocation (one-time, all forward buffers)
@@ -57,17 +57,17 @@ import pathlib
 import numpy as np
 import torch
 
-import flash_vla.flash_vla_kernels as fvk
-from flash_vla.core.cuda_buffer import CudaBuffer
-from flash_vla.core.quant.calibrator import load_calibration, save_calibration
+import flash_rt.flash_rt_kernels as fvk
+from flash_rt.core.cuda_buffer import CudaBuffer
+from flash_rt.core.quant.calibrator import load_calibration, save_calibration
 
 # Local imports — replace with your model's modules after copying.
-# from flash_vla.frontends.torch._mymodel_thor_spec import load_weights, NUM_ENCODER_LAYERS, ...
-# from flash_vla.models.mymodel.pipeline_thor import (
+# from flash_rt.frontends.torch._mymodel_thor_spec import load_weights, NUM_ENCODER_LAYERS, ...
+# from flash_rt.models.mymodel.pipeline_thor import (
 #     encoder_forward, encoder_forward_calibrate,
 #     decoder_forward, decoder_forward_calibrate,
 # )
-# from flash_vla.hardware.thor.attn_backend import (
+# from flash_rt.hardware.thor.attn_backend import (
 #     ThorFlashAttnBackend, make_mymodel_attention_spec,
 # )
 
@@ -105,7 +105,7 @@ class TemplateTorchFrontendThor:
 
         # STEP 1a: Load weights (calls into weights_spec.py)
         # Returns dict {"fp8": {...}, "plain": {...}, "scales": {...}}
-        # TODO: from flash_vla.frontends.torch._mymodel_thor_spec import load_weights
+        # TODO: from flash_rt.frontends.torch._mymodel_thor_spec import load_weights
         # self.weights = load_weights(str(self.checkpoint_dir / "model.safetensors"))
         self.weights = {}       # placeholder
 
@@ -120,7 +120,7 @@ class TemplateTorchFrontendThor:
         # STEP 1d: Create the attention backend.
         # The backend pre-allocates Q/K/V tensors per attention site
         # using the spec from attention.py.
-        # TODO: from flash_vla.hardware.thor.attn_backend import (
+        # TODO: from flash_rt.hardware.thor.attn_backend import (
         #     ThorFlashAttnBackend, make_mymodel_attention_spec,
         # )
         # self._attn_spec = make_mymodel_attention_spec()
@@ -191,7 +191,7 @@ class TemplateTorchFrontendThor:
         # STEP 4a: Tokenize and embed the prompt.
         # TODO: use whatever tokenizer your model expects. Most VLAs use
         # PaliGemma's SentencePiece tokenizer; FlashVLA ships a helper:
-        # from flash_vla.core.thor_frontend_utils import embed_prompt_torch
+        # from flash_rt.core.thor_frontend_utils import embed_prompt_torch
         # prompt_emb_np = embed_prompt_torch(prompt_text, ...)
         prompt_emb_np = np.zeros((128, self.D), dtype=np.float16)  # placeholder
         prompt_len = prompt_emb_np.shape[0]
@@ -255,7 +255,7 @@ class TemplateTorchFrontendThor:
         with torch.cuda.stream(s):
             # Warm-up the kernels first (not in graph) so cuBLAS picks
             # tactics. Otherwise the graph captures cuBLAS handshake too.
-            from flash_vla.models.mymodel.pipeline_thor import encoder_forward, decoder_forward
+            from flash_rt.models.mymodel.pipeline_thor import encoder_forward, decoder_forward
             encoder_forward(self._ctx, fvk, self._bufs_ptr, self._weights_ptr,
                             self._dims, stream=s.cuda_stream, attn=self._attn)
             decoder_forward(self._ctx, fvk, self._bufs_ptr, self._weights_ptr,
@@ -309,7 +309,7 @@ class TemplateTorchFrontendThor:
         actions_np = self._bufs["actions_out"].to_numpy().reshape(self.action_horizon, self.action_dim)
 
         # STEP 6e (optional): unnormalize actions (LIBERO/your-dataset specific)
-        # from flash_vla.core.utils.actions import unnormalize_actions
+        # from flash_rt.core.utils.actions import unnormalize_actions
         # actions_np = unnormalize_actions(actions_np, ...)
 
         return {"actions": actions_np}
@@ -323,7 +323,7 @@ class TemplateTorchFrontendThor:
 #       (no fresh allocations in infer() that break the captured graph).
 # - [ ] set_prompt() returns ~immediately on cache hit (verify with timing).
 # - [ ] First infer() after set_prompt() completes without recapture.
-# - [ ] Calibration cache file appears under ~/.flash_vla/calibration/
+# - [ ] Calibration cache file appears under ~/.flash_rt/calibration/
 #       after the first successful set_prompt().
 # - [ ] cosine vs your reference PyTorch FP32 output is >= 0.998 on a
 #       representative observation (use /tmp/pytorch_reference.npz pattern

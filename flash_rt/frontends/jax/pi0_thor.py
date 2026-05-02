@@ -1,7 +1,7 @@
 """FlashVLA — Thor JAX frontend for Pi0 (SM110).
 
 Loads JAX Orbax checkpoints → FP8 quantize (ml_dtypes) → CudaBuffer (cudaMalloc)
-→ pipeline_pi0.py (flash_vla_kernels.so) on Jetson AGX Thor.
+→ pipeline_pi0.py (flash_rt_kernels.so) on Jetson AGX Thor.
 
 Adapted from thor_jax_pi05.py with Pi0-specific changes:
   - Standard RMSNorm (fused into QKV/GateUp) instead of AdaRMSNorm
@@ -27,17 +27,17 @@ import time as _time
 
 import numpy as np
 
-from flash_vla.hardware.thor.shared_primitives import (
+from flash_rt.hardware.thor.shared_primitives import (
     siglip_forward,
     postln_project,
     encoder_forward,
     encoder_forward_calibrate,
 )
-from flash_vla.models.pi0.pipeline_thor import (
+from flash_rt.models.pi0.pipeline_thor import (
     decoder_forward_pi0,
     decoder_forward_calibrate_pi0,
 )
-from flash_vla.hardware.thor.attn_backend import (
+from flash_rt.hardware.thor.attn_backend import (
     ThorFlashAttnBackend,
     make_pi0_attention_spec,
 )
@@ -58,17 +58,17 @@ import jax
 import jax.numpy as jnp
 
 
-from flash_vla.core.thor_frontend_utils import embed_prompt_numpy as _embed_prompt  # noqa: E402
+from flash_rt.core.thor_frontend_utils import embed_prompt_numpy as _embed_prompt  # noqa: E402
 
 
 class Pi0JaxFrontendThor:
-    """Thor SM110 — JAX (Orbax) frontend for Pi0. CudaBuffer bridge to flash_vla_kernels."""
+    """Thor SM110 — JAX (Orbax) frontend for Pi0. CudaBuffer bridge to flash_rt_kernels."""
 
     def __init__(self, checkpoint_dir, engine_path=None, fmha_path=None,
                  use_cuda_graph=True, num_views=2, autotune=3,
                  weight_cache=True, **kwargs):
-        from flash_vla.engine.cuda_buffer import CudaBuffer, sync
-        from flash_vla.core.weights.transformer import quantize_fp8_e4m3, compute_time_embeddings
+        from flash_rt.engine.cuda_buffer import CudaBuffer, sync
+        from flash_rt.core.weights.transformer import quantize_fp8_e4m3, compute_time_embeddings
         self._CudaBuffer = CudaBuffer
         self._sync = sync
 
@@ -85,14 +85,14 @@ class Pi0JaxFrontendThor:
                 break
 
         # ── FvkContext + GemmRunner + FMHA ──
-        from flash_vla import flash_vla_kernels as _fvk
+        from flash_rt import flash_rt_kernels as _fvk
         self._fvk = _fvk
         self._ctx = _fvk.FvkContext()
         self._gemm = _fvk.GemmRunner()
 
         if fmha_path is None:
             # Search order matches the torch Thor frontends: ckpt-adjacent,
-            # ``flash_vla/`` package dir (pip / editable install target),
+            # ``flash_rt/`` package dir (pip / editable install target),
             # fresh cmake ``build/`` output, docker ``/workspace/``.
             _here = pathlib.Path(__file__)
             for c in [str(checkpoint_dir.parent / 'libfmha_fp16_strided.so'),
@@ -112,15 +112,15 @@ class Pi0JaxFrontendThor:
         cache_hit = False
 
         if weight_cache:
-            from flash_vla.core.weights.weight_cache import load_weight_cache
+            from flash_rt.core.weights.weight_cache import load_weight_cache
             cached = load_weight_cache(str(checkpoint_dir), num_views)
             if cached is not None:
                 self._load_from_cache(cached)
                 cache_hit = True
 
         if not cache_hit:
-            from flash_vla.core.weights.loader import load_weights, detect_format
-            from flash_vla.core.weights.transformer import transform_jax_weights_pi0
+            from flash_rt.core.weights.loader import load_weights, detect_format
+            from flash_rt.core.weights.transformer import transform_jax_weights_pi0
 
             fmt = detect_format(str(checkpoint_dir))
             raw = load_weights(str(checkpoint_dir), format=fmt)
@@ -175,9 +175,9 @@ class Pi0JaxFrontendThor:
         # self._cache_blobs with the per-slot cache keys.
         self._cache_blobs = {}
 
-        from flash_vla.executors.jax_weights import OrbaxDictSource
-        from flash_vla.executors.weight_loader import WeightLoader
-        from flash_vla.frontends.jax._pi0_thor_spec import build_spec
+        from flash_rt.executors.jax_weights import OrbaxDictSource
+        from flash_rt.executors.weight_loader import WeightLoader
+        from flash_rt.frontends.jax._pi0_thor_spec import build_spec
         WeightLoader(source=OrbaxDictSource(engine_w),
                      target=self, spec=build_spec()).run()
 
@@ -399,7 +399,7 @@ class Pi0JaxFrontendThor:
     ]
 
     def _save_to_cache(self, checkpoint_path):
-        from flash_vla.core.weights.weight_cache import save_weight_cache
+        from flash_rt.core.weights.weight_cache import save_weight_cache
 
         entries = []
         blobs = []
@@ -749,7 +749,7 @@ class Pi0JaxFrontendThor:
     # -----------------------------------------------------------------------
 
     def _calibrate(self):
-        from flash_vla.core.quant.calibrator import load_calibration, save_calibration
+        from flash_rt.core.quant.calibrator import load_calibration, save_calibration
 
         CB = self._CudaBuffer
         Se = self.Se; total_keys = self.total_keys
@@ -887,7 +887,7 @@ class Pi0JaxFrontendThor:
                                   self.pos_emb_buf.ptr.value, S, D, 256, stream_int)
 
     def _capture_siglip_graph(self):
-        from flash_vla.engine.cuda_graph import CUDAGraph
+        from flash_rt.engine.cuda_graph import CUDAGraph
         S, D, H, NH, HD, L = self.sig_dims
 
         _cudart = ctypes.CDLL("libcudart.so")
@@ -955,7 +955,7 @@ class Pi0JaxFrontendThor:
     # -----------------------------------------------------------------------
 
     def _capture_enc_ae_graph(self):
-        from flash_vla.engine.cuda_graph import CUDAGraph
+        from flash_rt.engine.cuda_graph import CUDAGraph
         stream = self._stream; _cudart = self._cudart
         stream_int = stream.value or 0
 
@@ -1028,7 +1028,7 @@ class Pi0JaxFrontendThor:
                 f"percentile must be in [0, 100], got {percentile}")
 
         if n == 1:
-            from flash_vla.core.calibration_api import implicit_calibrate
+            from flash_rt.core.calibration_api import implicit_calibrate
             implicit_calibrate(
                 self, obs_list,
                 percentile=percentile, max_samples=None, verbose=verbose,
@@ -1044,10 +1044,10 @@ class Pi0JaxFrontendThor:
 
         Runs encoder + Pi0 decoder shadow forwards for each obs in
         ``obs_list``, downloads per-sample amax, percentile-reduces along
-        the sample axis via :func:`flash_vla.core.calibration.accumulate_amax`,
+        the sample axis via :func:`flash_rt.core.calibration.accumulate_amax`,
         and recaptures the enc+ae CUDA Graph.
         """
-        from flash_vla.core.calibration import accumulate_amax
+        from flash_rt.core.calibration import accumulate_amax
 
         n = len(obs_list)
         logger.info(
@@ -1411,7 +1411,7 @@ class Pi0JaxFrontendThor:
         raw_actions = self.g_noise.download_new((self.Sa, 32), np.float16).astype(np.float32)
 
         if self.norm_stats:
-            from flash_vla.core.utils.actions import unnormalize_actions, LIBERO_ACTION_DIM
+            from flash_rt.core.utils.actions import unnormalize_actions, LIBERO_ACTION_DIM
             unnorm = unnormalize_actions(raw_actions, self.norm_stats)
             robot_actions = unnorm[:, :LIBERO_ACTION_DIM]
         else:

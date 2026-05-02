@@ -2,7 +2,7 @@
 
 Current contents:
 
-* :mod:`flash_vla.datasets.libero` — LeRobot-v2 LIBERO layout
+* :mod:`flash_rt.datasets.libero` — LeRobot-v2 LIBERO layout
   (``meta/info.json`` + ``data/chunk-000/episode_XXXXXX.parquet``).
 
 These modules are framework-agnostic: they return plain ``dict`` obs

@@ -1,4 +1,4 @@
-"""CPU-only unit tests for ``flash_vla.core.rl`` primitives.
+"""CPU-only unit tests for ``flash_rt.core.rl`` primitives.
 
 Covers the ACP tag builder and the CFGSampler combine math. No CUDA or
 model loading required.
@@ -7,7 +7,7 @@ model loading required.
 import numpy as np
 import pytest
 
-from flash_vla.core.rl import (
+from flash_rt.core.rl import (
     ACP_NEGATIVE_TAG,
     ACP_POSITIVE_TAG,
     CFGSampler,

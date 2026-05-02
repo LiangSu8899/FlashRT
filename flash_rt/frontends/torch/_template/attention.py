@@ -1,7 +1,7 @@
 """FlashVLA new-model template — attention specification.
 
 Copy the body of `make_template_attention_spec()` into
-`flash_vla/hardware/<hw>/attn_backend.py` (Thor or RTX). The
+`flash_rt/hardware/<hw>/attn_backend.py` (Thor or RTX). The
 attention backend itself (the class that holds Q/K/V buffers and
 dispatches to FA2 / cuBLAS / FMHA) does NOT need to be subclassed —
 the existing `ThorFlashAttnBackend` / `TorchFlashAttnBackend` work
@@ -46,14 +46,14 @@ the captured CUDA Graph. Also, profiling and debugging per-site
 plugin_model_template.md §"Site-level bisect via env var".
 """
 
-from flash_vla.hardware.backend import AttentionSpec
+from flash_rt.hardware.backend import AttentionSpec
 
 
 def make_template_attention_spec() -> AttentionSpec:
     """STEP 1: declare every attention site your model uses.
 
     TODO: rename to `make_<mymodel>_attention_spec` and move into
-    `flash_vla/hardware/<hw>/attn_backend.py` next to the existing
+    `flash_rt/hardware/<hw>/attn_backend.py` next to the existing
     `make_pi05_attention_spec` for reference.
     """
     spec = AttentionSpec()

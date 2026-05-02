@@ -1,6 +1,6 @@
 """Minimal per-stage runner for Phase 3b.2 cosine tests.
 
-Each forward in ``flash_vla.models.groot_n17.pipeline_thor`` is validated
+Each forward in ``flash_rt.models.groot_n17.pipeline_thor`` is validated
 against a fixture activation by:
 
     1. Loading only the ckpt tensors that stage needs (lazy, lru-cached).
@@ -72,7 +72,7 @@ def fvk():
     warning. Production frontends (e.g. ``pi05_thor.py:126``) auto-load
     from a path list. Mirror that here for tests.
     """
-    import flash_vla.flash_vla_kernels as _fvk
+    import flash_rt.flash_rt_kernels as _fvk
     candidates = [
         "/workspace/libfmha_fp16_strided.so",
         "/work/libfmha_fp16_strided.so",
@@ -234,4 +234,4 @@ class Fp8Calibrator:
 
 
 # Re-export from production module — single source of truth.
-from flash_vla.models.groot_n17.calibration import build_vit_rope_tables  # noqa: F401
+from flash_rt.models.groot_n17.calibration import build_vit_rope_tables  # noqa: F401

@@ -48,7 +48,7 @@ class GrootN17TorchFrontendThor:
         device: str = "cuda:0",
         load_strided_fmha: bool = True,
     ):
-        from flash_vla.models.groot_n17.embodiments import (
+        from flash_rt.models.groot_n17.embodiments import (
             EMBODIMENT_TAG_TO_INDEX, EMBODIMENT_NUM_VIEWS,
         )
 
@@ -75,7 +75,7 @@ class GrootN17TorchFrontendThor:
     # ────────────────────────────────────────────────────────────────
 
     def _load_fmha_strided(self) -> None:
-        import flash_vla.flash_vla_kernels as fvk
+        import flash_rt.flash_rt_kernels as fvk
         candidates = [
             "/workspace/libfmha_fp16_strided.so",
             str(pathlib.Path(self.checkpoint_path).parent / "libfmha_fp16_strided.so"),
@@ -96,9 +96,9 @@ class GrootN17TorchFrontendThor:
     def _load_weights(self) -> None:
         """Run WEIGHT_SPEC against all ckpt shards; slice per-embodiment dense
         matrices on the host side post-load."""
-        from flash_vla.executors.torch_weights import MultiSafetensorsSource
-        from flash_vla.executors.weight_loader import WeightLoader
-        from flash_vla.frontends.torch._groot_n17_thor_spec import WEIGHT_SPEC
+        from flash_rt.executors.torch_weights import MultiSafetensorsSource
+        from flash_rt.executors.weight_loader import WeightLoader
+        from flash_rt.frontends.torch._groot_n17_thor_spec import WEIGHT_SPEC
 
         shards = sorted(
             glob.glob(os.path.join(self.checkpoint_path, "model-*.safetensors")))
@@ -261,8 +261,8 @@ class GrootN17TorchFrontendThor:
           * ``self._visual_pos_masks``           — bool device (S,)
           * ``self.Se``                          — int = S
         """
-        from flash_vla.models.groot_n17 import calibration as cal
-        from flash_vla.models.groot_n17.calibration import build_vit_rope_tables
+        from flash_rt.models.groot_n17 import calibration as cal
+        from flash_rt.models.groot_n17.calibration import build_vit_rope_tables
 
         self._prompt = prompt
         self.Se = int(aux["llm_input_embeds"].shape[1])
@@ -390,7 +390,7 @@ class GrootN17TorchFrontendThor:
           * cuBLAS workspace state must be primed first — we run 3
             eager dit_forward iterations on the same buffer set.
         """
-        from flash_vla.models.groot_n17 import pipeline_thor
+        from flash_rt.models.groot_n17 import pipeline_thor
 
         Sa = action_horizon + 1
         if not hasattr(self, "_infer_bufs"):
@@ -401,7 +401,7 @@ class GrootN17TorchFrontendThor:
             self._precompute_diffusion_modulators(
                 num_inference_timesteps=num_inference_timesteps)
         if not hasattr(self, "_gemm"):
-            import flash_vla.flash_vla_kernels as _fvk
+            import flash_rt.flash_rt_kernels as _fvk
             self._fvk = _fvk
             self._gemm = _fvk.GemmRunner()
 
@@ -470,7 +470,7 @@ class GrootN17TorchFrontendThor:
         """Convert per-stage amax dicts to per-layer device d_act_scale tensors
         and host alphas. After this, the production forwards have everything
         they need in ``self.<stage>_*`` attrs."""
-        from flash_vla.models.groot_n17 import calibration as cal
+        from flash_rt.models.groot_n17 import calibration as cal
         device = self.device
 
         def to_devs(amaxes):
@@ -521,10 +521,10 @@ class GrootN17TorchFrontendThor:
         """JSON cache so subsequent set_prompt calls skip the shadow forward.
 
         Schema is N1.7-specific (Pi05 ``save_calibration`` layout doesn't fit
-        — different stages). Stored at ``~/.cache/flash_vla/<ckpt_hash>_n17_Se<n>.json``.
+        — different stages). Stored at ``~/.cache/flash_rt/<ckpt_hash>_n17_Se<n>.json``.
         """
         import json
-        from flash_vla.core.quant.calibrator import _checkpoint_hash, CACHE_DIR
+        from flash_rt.core.quant.calibrator import _checkpoint_hash, CACHE_DIR
 
         try:
             ckpt_hash = _checkpoint_hash(self.checkpoint_path)
@@ -603,10 +603,10 @@ class GrootN17TorchFrontendThor:
             verbose: log per-stage amax dispersion summaries after
                 reduction.
         """
-        from flash_vla.core.calibration import (
+        from flash_rt.core.calibration import (
             accumulate_amax, format_summary, summarize_amax_dispersion,
         )
-        from flash_vla.models.groot_n17 import calibration as cal
+        from flash_rt.models.groot_n17 import calibration as cal
         import logging
         import numpy as np
 
@@ -721,7 +721,7 @@ class GrootN17TorchFrontendThor:
         bf16 native, so ``decoder_layer_specs`` is left empty.
         """
         import numpy as np
-        from flash_vla.core.precision_spec import (
+        from flash_rt.core.precision_spec import (
             ModelPrecisionSpec, PrecisionSpec,
         )
 
@@ -1080,7 +1080,7 @@ class GrootN17TorchFrontendThor:
 
         Wires per-layer AdaLN shift/scale device ptrs and per-layer cross-KV
         slots into the production attn backend (lazily constructed)."""
-        from flash_vla.models.groot_n17 import pipeline_thor
+        from flash_rt.models.groot_n17 import pipeline_thor
 
         if not hasattr(self, "_dit_attn"):
             self._build_dit_attn(Sa)
@@ -1122,7 +1122,7 @@ class GrootN17TorchFrontendThor:
 
         # cuBLAS GemmRunner — fresh per call (cheap construct).
         if not hasattr(self, "_gemm"):
-            import flash_vla.flash_vla_kernels as _fvk
+            import flash_rt.flash_rt_kernels as _fvk
             self._fvk = _fvk
             self._gemm = _fvk.GemmRunner()
 
@@ -1153,10 +1153,10 @@ class GrootN17TorchFrontendThor:
     def _build_dit_attn(self, Sa: int) -> None:
         """Construct ThorGrootN17AttnBackend with DiT slots wired to current
         cross-KV. self_attn slots get fresh per-step buffers."""
-        from flash_vla.hardware.thor.attn_backend_groot_n17 import (
+        from flash_rt.hardware.thor.attn_backend_groot_n17 import (
             ThorGrootN17AttnBackend, make_groot_n17_attention_spec,
         )
-        import flash_vla.flash_vla_kernels as fvk
+        import flash_rt.flash_rt_kernels as fvk
 
         D = 1536; NH = 32; HD = 48
         Skv_text = int(self._dit_cross_K[0].shape[0])

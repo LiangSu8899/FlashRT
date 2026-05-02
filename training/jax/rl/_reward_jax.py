@@ -1,6 +1,6 @@
-"""JAX equivalents of the torch-tensor-using helpers in ``flash_vla.core.rl.reward``.
+"""JAX equivalents of the torch-tensor-using helpers in ``flash_rt.core.rl.reward``.
 
-The PyTorch reference is ``flash_vla/core/rl/reward.py``:
+The PyTorch reference is ``flash_rt/core/rl/reward.py``:
 
 * :func:`build_bin_centers` — :func:`torch.linspace` → :func:`jnp.linspace`.
 * :func:`project_values_to_bins` — bilinear soft-target projection,
@@ -97,7 +97,7 @@ def compute_soft_value_loss(
     """Distributional VF loss with soft targets (π\\*0.6 Eq. 1).
 
     ``L = - Σ soft_target * log_softmax(logits)`` averaged over the
-    batch. Mirrors :func:`flash_vla.core.rl.reward.compute_soft_value_loss`.
+    batch. Mirrors :func:`flash_rt.core.rl.reward.compute_soft_value_loss`.
     """
     soft_target = project_values_to_bins(target_values, bin_centers)
     log_probs = jax_log_softmax(predicted_logits, axis=-1)

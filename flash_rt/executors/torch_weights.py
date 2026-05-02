@@ -27,12 +27,12 @@ from typing import Any, Optional
 
 import torch
 
-from flash_vla.core.thor_frontend_utils import (
+from flash_rt.core.thor_frontend_utils import (
     interleave_qk as _interleave_qk_core,
     quant_fp8 as _quant_fp8_core,
 )
 
-from flash_vla.executors.weight_loader import (
+from flash_rt.executors.weight_loader import (
     Item,
     LayerBlock,
     LoaderContext,

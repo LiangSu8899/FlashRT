@@ -78,8 +78,8 @@ import math
 
 import numpy as np
 
-from flash_vla.core.cuda_buffer import CudaBuffer
-from flash_vla.core.cuda_graph import CUDAGraph
+from flash_rt.core.cuda_buffer import CudaBuffer
+from flash_rt.core.cuda_graph import CUDAGraph
 
 logger = logging.getLogger(__name__)
 

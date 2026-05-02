@@ -5,7 +5,7 @@ that point). Stored as a device tensor and reused as input to the existing
 Qwen3 RoPE kernel during every replay.
 
 This module is pure-PyTorch (CPU/GPU agnostic). It does NOT call any
-flash_vla_kernels symbol — the kernel consumes the tensors produced here
+flash_rt_kernels symbol — the kernel consumes the tensors produced here
 unchanged.
 
 Math source: ``transformers.models.qwen3_vl.modeling_qwen3_vl``

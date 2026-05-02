@@ -45,7 +45,7 @@ def main():
 
     print("Library usage example:")
     print("```python")
-    print("from flash_vla.backends.x86_sm120 import Pi05FastInference")
+    print("from flash_rt.backends.x86_sm120 import Pi05FastInference")
     print()
     print("model = Pi05FastInference(")
     print("    checkpoint=checkpoint_dict,")

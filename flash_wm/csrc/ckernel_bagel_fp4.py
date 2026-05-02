@@ -29,11 +29,11 @@ _VLA = os.path.dirname(_WM)
 sys.path.insert(0, _VLA)
 sys.path.insert(0, _WM)
 
-import flash_vla.flash_vla_kernels as fvk
-import flash_vla.flash_vla_fp4 as fvk_fp4
+import flash_rt.flash_rt_kernels as fvk
+import flash_rt.flash_rt_fp4 as fvk_fp4
 import flash_wm_kernels as fwk
 from flash_attn import flash_attn_func
-from flash_vla.executors.fp4_utils import FP4ActScratch
+from flash_rt.executors.fp4_utils import FP4ActScratch
 
 from ckernel_bagel import CKernelBagel, D, NHQ, NHKV, HD, K_DIM, FFN, L, bf16, FP8
 

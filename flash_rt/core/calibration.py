@@ -208,7 +208,7 @@ def stratified_sample_indices(
     Example::
 
         import pandas as pd
-        from flash_vla.core.calibration import stratified_sample_indices
+        from flash_rt.core.calibration import stratified_sample_indices
         df = pd.read_parquet("rollouts/meta.parquet")
         picks = stratified_sample_indices(df, n=8, task_filter=8)
         obs_list = [my_load_one_frame(i) for i in picks]

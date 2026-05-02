@@ -1,15 +1,15 @@
 """FlashVLA -- RTX Pi0.5 torch frontend.
 
 Loads HuggingFace PyTorch safetensors checkpoints + drives the
-framework-agnostic :class:`~flash_vla.models.pi05.pipeline_rtx.Pi05Pipeline`.
+framework-agnostic :class:`~flash_rt.models.pi05.pipeline_rtx.Pi05Pipeline`.
 
 This is the "reference" RTX frontend. The RTX JAX frontend
-(:mod:`flash_vla.frontends.jax.pi05_rtx`) mirrors this API but loads
+(:mod:`flash_rt.frontends.jax.pi05_rtx`) mirrors this API but loads
 from Orbax and uses JAX for weight quantization.
 
 Usage::
 
-    from flash_vla.frontends.torch.pi05_rtx import Pi05TorchFrontendRtxRtx
+    from flash_rt.frontends.torch.pi05_rtx import Pi05TorchFrontendRtxRtx
     pipe = Pi05TorchFrontendRtxRtx("/path/to/pi05_libero_pytorch", num_views=2)
     pipe.set_prompt("pick up the red block")
     pipe.calibrate_with_real_data([obs_dict])   # once, ~1 s
@@ -32,19 +32,19 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from flash_vla.core.utils.actions import unnormalize_actions, LIBERO_ACTION_DIM
-from flash_vla.hardware.rtx.attn_backend import RtxFlashAttnBackend
-from flash_vla.models.pi05.pipeline_rtx import (
+from flash_rt.core.utils.actions import unnormalize_actions, LIBERO_ACTION_DIM
+from flash_rt.hardware.rtx.attn_backend import RtxFlashAttnBackend
+from flash_rt.models.pi05.pipeline_rtx import (
     Pi05Pipeline,
     VIS_L, VIS_D, VIS_H, VIS_PATCH_FLAT,
     ENC_L, ENC_D, ENC_H,
     DEC_L, DEC_D, DEC_H, DEC_HD,
     ACTION_DIM, NUM_STEPS_DEFAULT,
 )
-from flash_vla.models.pi05.pipeline_rtx_cfg import Pi05CFGPipeline
-from flash_vla.models.pi05.pipeline_rtx_batched import Pi05BatchedPipeline
-from flash_vla.models.pi05.pipeline_rtx_cfg_batched import Pi05CFGBatchedPipeline
-from flash_vla.hardware.rtx.attn_backend_batched_pi05 import (
+from flash_rt.models.pi05.pipeline_rtx_cfg import Pi05CFGPipeline
+from flash_rt.models.pi05.pipeline_rtx_batched import Pi05BatchedPipeline
+from flash_rt.models.pi05.pipeline_rtx_cfg_batched import Pi05CFGBatchedPipeline
+from flash_rt.hardware.rtx.attn_backend_batched_pi05 import (
     PI05_BATCH_SIZE,
     RtxFlashAttnBatchedBackendPi05,
 )
@@ -95,7 +95,7 @@ def convert_pi05_safetensors(safetensors_path: Union[str, pathlib.Path]) -> dict
       - 10-step sinusoidal time embeddings.
     """
     from safetensors import safe_open
-    from flash_vla.executors.torch_weights import _autodetect_strip_prefix
+    from flash_rt.executors.torch_weights import _autodetect_strip_prefix
 
     logger.info("Loading Pi0.5 safetensors: %s", safetensors_path)
     f = safe_open(str(safetensors_path), framework="pt")
@@ -481,7 +481,7 @@ class Pi05TorchFrontendRtx:
             num_encoder_layers=ENC_L)
 
         # ── fvk module + GemmRunner ──
-        from flash_vla import flash_vla_kernels as fvk
+        from flash_rt import flash_rt_kernels as fvk
         self.fvk = fvk
         self.gemm = fvk.GemmRunner()
 
@@ -502,7 +502,7 @@ class Pi05TorchFrontendRtx:
     # -----------------------------------------------------------------
 
     def _load_norm_stats(self, checkpoint_dir: pathlib.Path) -> None:
-        from flash_vla.core.utils.norm_stats import (
+        from flash_rt.core.utils.norm_stats import (
             load_norm_stats, lerobot_candidates,
         )
         candidates = [
@@ -731,7 +731,7 @@ class Pi05TorchFrontendRtx:
         the two slots of a B=2 fused forward. Otherwise the serial
         :class:`Pi05CFGPipeline` runs them sequentially (Phase 1+2).
         """
-        from flash_vla.core.rl import build_acp_tagged_task
+        from flash_rt.core.rl import build_acp_tagged_task
 
         cfg = self._rl_config
         if cfg is None:
@@ -914,7 +914,7 @@ class Pi05TorchFrontendRtx:
     def _calibrate_multi_frame(
         self, obs_list, *, percentile: float, verbose: bool,
     ) -> None:
-        from flash_vla.core.calibration import (
+        from flash_rt.core.calibration import (
             accumulate_amax,
             format_summary,
             summarize_amax_dispersion,
@@ -985,7 +985,7 @@ class Pi05TorchFrontendRtx:
 
     def _warn_if_scale_ceiling_exceeded(self, label: str = "pi05_rtx") -> None:
         """Diagnostic warning if any FP8 scale exceeds the sanity ceiling."""
-        from flash_vla.core.calibration import check_scale_ceiling
+        from flash_rt.core.calibration import check_scale_ceiling
         scales = {
             name: float(buf.download_new((1,), np.float32)[0])
             for name, buf in self.pipeline.fp8_act_scales.items()
@@ -994,7 +994,7 @@ class Pi05TorchFrontendRtx:
 
     def _snapshot_precision_spec(self, *, method: str, n: int,
                                   percentile: Optional[float]):
-        from flash_vla.core.precision_spec import (
+        from flash_rt.core.precision_spec import (
             ModelPrecisionSpec,
             PrecisionSpec,
         )

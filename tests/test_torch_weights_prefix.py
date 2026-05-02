@@ -17,7 +17,7 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
-from flash_vla.executors.torch_weights import (
+from flash_rt.executors.torch_weights import (
     MultiSafetensorsSource,
     SafetensorsSource,
     _autodetect_strip_prefix,

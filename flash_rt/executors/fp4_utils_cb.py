@@ -1,8 +1,8 @@
 """NVFP4 utilities over CudaBuffer (torch-free variant of fp4_utils.py).
 
 Mirror of the torch-based helpers in ``fp4_utils.py``, but every allocation
-and pointer is expressed through :class:`flash_vla.engine.cuda_buffer.CudaBuffer`
-so the JAX Pi0.5 FP4 frontend can consume the same ``flash_vla_fp4`` kernels
+and pointer is expressed through :class:`flash_rt.engine.cuda_buffer.CudaBuffer`
+so the JAX Pi0.5 FP4 frontend can consume the same ``flash_rt_fp4`` kernels
 without pulling torch into the runtime path.
 
 Symmetry with the torch side:
@@ -22,8 +22,8 @@ from __future__ import annotations
 
 import numpy as np
 
-import flash_vla.flash_vla_fp4 as fvk_fp4
-from flash_vla.engine.cuda_buffer import CudaBuffer, sync
+import flash_rt.flash_rt_fp4 as fvk_fp4
+from flash_rt.engine.cuda_buffer import CudaBuffer, sync
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -39,7 +39,7 @@ VARIANT_V8_WIDE_NK   = 8
 
 def pick_variant(N: int, K: int) -> int:
     """Shape-based NVFP4 GEMM variant. Bit-identical to
-    ``flash_vla.executors.fp4_utils.pick_variant``.
+    ``flash_rt.executors.fp4_utils.pick_variant``.
     """
     if N >= 16384:
         return VARIANT_V8_WIDE_NK

@@ -2,9 +2,9 @@
 
 Detects the current GPU's compute capability and maps
 ``(config, framework, arch)`` triples to concrete frontend classes in
-``flash_vla.frontends.*``.
+``flash_rt.frontends.*``.
 
-``flash_vla.api.load_model`` calls ``resolve_pipeline_class`` so user
+``flash_rt.api.load_model`` calls ``resolve_pipeline_class`` so user
 code doesn't need to know whether it's running on Jetson Thor (SM110),
 an RTX 5090 (SM120), or an RTX 4090 (SM89).
 
@@ -13,7 +13,7 @@ Adding a new model
 External packages can register new models by mutating ``_PIPELINE_MAP``
 at import time::
 
-    from flash_vla.hardware import _PIPELINE_MAP
+    from flash_rt.hardware import _PIPELINE_MAP
     _PIPELINE_MAP[("mymodel", "torch", "rtx_sm120")] = (
         "mymodel_plugin.frontend", "MyModelTorchFrontend"
     )
@@ -65,60 +65,60 @@ def detect_arch() -> str:
 
 
 # Dispatch table: (config, framework, arch) → (module_path, class_name).
-# Resolved lazily at load_model time so importing ``flash_vla`` does not
+# Resolved lazily at load_model time so importing ``flash_rt`` does not
 # drag in every backend. External plugins may add entries to this dict
 # to register new models — see ``docs/plugin_model_template.md``.
 _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
     # ── Pi0.5 ──
     ("pi05", "torch", "thor"):
-        ("flash_vla.frontends.torch.pi05_thor", "Pi05TorchFrontendThor"),
+        ("flash_rt.frontends.torch.pi05_thor", "Pi05TorchFrontendThor"),
     ("pi05", "torch", "rtx_sm120"):
-        ("flash_vla.frontends.torch.pi05_rtx", "Pi05TorchFrontendRtx"),
+        ("flash_rt.frontends.torch.pi05_rtx", "Pi05TorchFrontendRtx"),
     ("pi05", "torch", "rtx_sm89"):
-        ("flash_vla.frontends.torch.pi05_rtx", "Pi05TorchFrontendRtx"),
+        ("flash_rt.frontends.torch.pi05_rtx", "Pi05TorchFrontendRtx"),
     ("pi05", "jax", "thor"):
-        ("flash_vla.frontends.jax.pi05_thor", "Pi05JaxFrontendThor"),
+        ("flash_rt.frontends.jax.pi05_thor", "Pi05JaxFrontendThor"),
     ("pi05", "jax", "rtx_sm120"):
-        ("flash_vla.frontends.jax.pi05_rtx", "Pi05JaxFrontendRtx"),
+        ("flash_rt.frontends.jax.pi05_rtx", "Pi05JaxFrontendRtx"),
     ("pi05", "jax", "rtx_sm89"):
-        ("flash_vla.frontends.jax.pi05_rtx", "Pi05JaxFrontendRtx"),
+        ("flash_rt.frontends.jax.pi05_rtx", "Pi05JaxFrontendRtx"),
 
     # ── Pi0 ── (Thor native + RTX consumer via pipeline_rtx.py.)
     ("pi0", "torch", "thor"):
-        ("flash_vla.frontends.torch.pi0_thor", "Pi0TorchFrontendThor"),
+        ("flash_rt.frontends.torch.pi0_thor", "Pi0TorchFrontendThor"),
     ("pi0", "torch", "rtx_sm120"):
-        ("flash_vla.frontends.torch.pi0_rtx", "Pi0TorchFrontendRtx"),
+        ("flash_rt.frontends.torch.pi0_rtx", "Pi0TorchFrontendRtx"),
     ("pi0", "torch", "rtx_sm89"):
-        ("flash_vla.frontends.torch.pi0_rtx", "Pi0TorchFrontendRtx"),
+        ("flash_rt.frontends.torch.pi0_rtx", "Pi0TorchFrontendRtx"),
     ("pi0", "jax", "thor"):
-        ("flash_vla.frontends.jax.pi0_thor", "Pi0JaxFrontendThor"),
+        ("flash_rt.frontends.jax.pi0_thor", "Pi0JaxFrontendThor"),
     ("pi0", "jax", "rtx_sm120"):
-        ("flash_vla.frontends.jax.pi0_rtx", "Pi0JaxFrontendRtx"),
+        ("flash_rt.frontends.jax.pi0_rtx", "Pi0JaxFrontendRtx"),
     ("pi0", "jax", "rtx_sm89"):
-        ("flash_vla.frontends.jax.pi0_rtx", "Pi0JaxFrontendRtx"),
+        ("flash_rt.frontends.jax.pi0_rtx", "Pi0JaxFrontendRtx"),
 
     # ── GROOT N1.6 ──
     ("groot", "torch", "thor"):
-        ("flash_vla.frontends.torch.groot_thor", "GrootTorchFrontendThor"),
+        ("flash_rt.frontends.torch.groot_thor", "GrootTorchFrontendThor"),
     ("groot", "torch", "rtx_sm120"):
-        ("flash_vla.frontends.torch.groot_rtx", "GrootTorchFrontendRtx"),
+        ("flash_rt.frontends.torch.groot_rtx", "GrootTorchFrontendRtx"),
 
     # ── Pi0-FAST ── (SM120 runtime fork inside pipeline, no AttentionBackend protocol.)
     ("pi0fast", "torch", "thor"):
-        ("flash_vla.frontends.torch.pi0fast", "Pi0FastTorchFrontend"),
+        ("flash_rt.frontends.torch.pi0fast", "Pi0FastTorchFrontend"),
     ("pi0fast", "torch", "rtx_sm120"):
-        ("flash_vla.frontends.torch.pi0fast", "Pi0FastTorchFrontend"),
+        ("flash_rt.frontends.torch.pi0fast", "Pi0FastTorchFrontend"),
     ("pi0fast", "jax", "thor"):
-        ("flash_vla.frontends.jax.pi0fast", "Pi0FastJaxFrontend"),
+        ("flash_rt.frontends.jax.pi0fast", "Pi0FastJaxFrontend"),
     ("pi0fast", "jax", "rtx_sm120"):
-        ("flash_vla.frontends.jax.pi0fast", "Pi0FastJaxFrontend"),
+        ("flash_rt.frontends.jax.pi0fast", "Pi0FastJaxFrontend"),
 }
 
 
 def resolve_pipeline_class(config: str, framework: str, arch: str):
     """Resolve (config, framework, arch) to a pipeline class object.
 
-    Lazily imports the backend module — touching ``flash_vla.hardware``
+    Lazily imports the backend module — touching ``flash_rt.hardware``
     does not pull in torch/jax/rtx code until a load happens.
     """
     key = (config, framework, arch)

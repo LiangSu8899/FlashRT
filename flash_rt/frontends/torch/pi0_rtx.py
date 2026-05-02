@@ -1,6 +1,6 @@
 """FlashVLA -- RTX Pi0 torch frontend.
 
-Mirrors :mod:`flash_vla.frontends.torch.pi05_rtx` but targets Pi0 (not
+Mirrors :mod:`flash_rt.frontends.torch.pi05_rtx` but targets Pi0 (not
 Pi0.5): standard RMSNorm decoder, ``state_proj`` + ``action_time_mlp``
 pre-block, ``S_dec = Sa + 1`` sequence, and a state-masked cross-attention
 via the attention backend's ``run("decoder", ..., state_nk=...)`` kwarg.
@@ -11,7 +11,7 @@ Orbax checkpoint) plus ``assets/physical-intelligence/<task>/norm_stats.json``.
 
 Usage::
 
-    from flash_vla.frontends.torch.pi0_rtx import Pi0TorchFrontendRtx
+    from flash_rt.frontends.torch.pi0_rtx import Pi0TorchFrontendRtx
     pipe = Pi0TorchFrontendRtx("/path/to/pi0_libero_pytorch", num_views=2)
     pipe.set_prompt("pick up the red block")
     pipe.calibrate_with_real_data([obs])
@@ -34,9 +34,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from flash_vla.core.utils.actions import unnormalize_actions, LIBERO_ACTION_DIM
-from flash_vla.hardware.rtx.attn_backend import RtxFlashAttnBackend
-from flash_vla.models.pi0.pipeline_rtx import (
+from flash_rt.core.utils.actions import unnormalize_actions, LIBERO_ACTION_DIM
+from flash_rt.hardware.rtx.attn_backend import RtxFlashAttnBackend
+from flash_rt.models.pi0.pipeline_rtx import (
     Pi0Pipeline,
     VIS_L, VIS_D, VIS_H, VIS_PATCH_FLAT,
     ENC_L, ENC_D, ENC_H,
@@ -92,7 +92,7 @@ def convert_pi0_safetensors(safetensors_path: Union[str, pathlib.Path]) -> dict:
         :func:`_precompute_time_proj_all` and discarded.
     """
     from safetensors import safe_open
-    from flash_vla.executors.torch_weights import _autodetect_strip_prefix
+    from flash_rt.executors.torch_weights import _autodetect_strip_prefix
 
     logger.info("Loading Pi0 safetensors: %s", safetensors_path)
     f = safe_open(str(safetensors_path), framework="pt")
@@ -400,7 +400,7 @@ class Pi0TorchFrontendRtx:
             num_encoder_layers=ENC_L,
             dtype=fp16)
 
-        from flash_vla import flash_vla_kernels as fvk
+        from flash_rt import flash_rt_kernels as fvk
         self.fvk = fvk
         self.gemm = fvk.GemmRunner()
 
@@ -418,7 +418,7 @@ class Pi0TorchFrontendRtx:
                     self.num_views, self.chunk_size)
 
     def _load_norm_stats(self, checkpoint_dir: pathlib.Path) -> None:
-        from flash_vla.core.utils.norm_stats import (
+        from flash_rt.core.utils.norm_stats import (
             load_norm_stats, lerobot_candidates,
         )
         candidates = [
@@ -673,7 +673,7 @@ class Pi0TorchFrontendRtx:
     def _calibrate_multi_frame(
         self, obs_list, *, percentile: float, verbose: bool,
     ) -> None:
-        from flash_vla.core.calibration import (
+        from flash_rt.core.calibration import (
             accumulate_amax,
             format_summary,
             summarize_amax_dispersion,
@@ -753,7 +753,7 @@ class Pi0TorchFrontendRtx:
 
     def _warn_if_scale_ceiling_exceeded(self, label: str = "pi0_rtx") -> None:
         """Diagnostic warning if any FP8 scale exceeds the sanity ceiling."""
-        from flash_vla.core.calibration import check_scale_ceiling
+        from flash_rt.core.calibration import check_scale_ceiling
         scales = {
             name: float(buf.download_new((1,), np.float32)[0])
             for name, buf in self.pipeline.fp8_act_scales.items()
@@ -763,7 +763,7 @@ class Pi0TorchFrontendRtx:
     def _snapshot_precision_spec(self, *, method: str, n: int,
                                   percentile: Optional[float]):
         """Build a :class:`ModelPrecisionSpec` from current pipeline scales."""
-        from flash_vla.core.precision_spec import (
+        from flash_rt.core.precision_spec import (
             ModelPrecisionSpec,
             PrecisionSpec,
         )

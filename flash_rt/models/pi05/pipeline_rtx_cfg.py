@@ -1,6 +1,6 @@
 """FlashVLA — Pi0.5 RTX pipeline with classifier-free guidance (CFG).
 
-Subclass of :class:`flash_vla.models.pi05.pipeline_rtx.Pi05Pipeline` that
+Subclass of :class:`flash_rt.models.pi05.pipeline_rtx.Pi05Pipeline` that
 adds per-step CFG inference for advantage-conditioned policies trained
 with the RECAP recipe (arXiv:2511.14759, Appendix E).
 
@@ -38,7 +38,7 @@ from typing import Optional
 
 import numpy as np
 
-from flash_vla.core.cuda_buffer import CudaBuffer
+from flash_rt.core.cuda_buffer import CudaBuffer
 
 # Raw-byte dtype for the encoder K/V cache snapshots — the snapshot is
 # a verbatim copy of attn.enc_K bytes, no element-wise math runs on it.

@@ -10,7 +10,7 @@ Cache key design:
     - Same model, different Se → different buffer shapes → potentially different scales
     - Same Se, different finetune → completely different activation distributions
 
-Cache location: ~/.flash_vla/calibration/{ckpt_hash}_{Se}.json
+Cache location: ~/.flash_rt/calibration/{ckpt_hash}_{Se}.json
 """
 
 import hashlib
@@ -22,7 +22,7 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-CACHE_DIR = Path.home() / ".flash_vla" / "calibration"
+CACHE_DIR = Path.home() / ".flash_rt" / "calibration"
 
 
 def _checkpoint_hash(checkpoint_path: str, read_bytes: int = 65536) -> str:

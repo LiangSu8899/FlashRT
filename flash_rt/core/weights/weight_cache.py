@@ -4,7 +4,7 @@ Caches FP8-quantized engine weights to disk after first load.
 Subsequent loads skip Orbax read + transform + FP8 quantize (~42s → ~5s).
 
 Cache format: JSON header (length-prefixed) + contiguous raw binary blobs.
-Cache location: ~/.flash_vla/weights/{ckpt_hash}_nv{num_views}.bin
+Cache location: ~/.flash_rt/weights/{ckpt_hash}_nv{num_views}.bin
 
 Designed for JAX (Orbax) frontend where loading is expensive.
 Torch (safetensors) loads in ~3s and doesn't need this.
@@ -20,7 +20,7 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-WEIGHT_CACHE_DIR = Path.home() / ".flash_vla" / "weights"
+WEIGHT_CACHE_DIR = Path.home() / ".flash_rt" / "weights"
 CACHE_VERSION = 1
 MAGIC = b"FVW1"  # FlashVLA Weights v1
 
@@ -39,7 +39,7 @@ def save_weight_cache(checkpoint_path: str, num_views: int,
         entries: list of {"name": str, "nbytes": int, "dtype": str, "shape": list}
         blobs: list of raw bytes, one per entry
     """
-    from flash_vla.core.quant.calibrator import _checkpoint_hash
+    from flash_rt.core.quant.calibrator import _checkpoint_hash
 
     ckpt_hash = _checkpoint_hash(checkpoint_path)
     WEIGHT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -80,7 +80,7 @@ def load_weight_cache(checkpoint_path: str, num_views: int
 
     Returns (header_dict, body_bytes) or None on miss.
     """
-    from flash_vla.core.quant.calibrator import _checkpoint_hash
+    from flash_rt.core.quant.calibrator import _checkpoint_hash
 
     try:
         ckpt_hash = _checkpoint_hash(checkpoint_path)
@@ -134,7 +134,7 @@ def clear_weight_cache(checkpoint_path: str = None):
         if count:
             logger.info("Cleared %d weight cache files", count)
     else:
-        from flash_vla.core.quant.calibrator import _checkpoint_hash
+        from flash_rt.core.quant.calibrator import _checkpoint_hash
         try:
             ckpt_hash = _checkpoint_hash(checkpoint_path)
         except FileNotFoundError:

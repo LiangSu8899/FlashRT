@@ -31,7 +31,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-import flash_vla.flash_vla_kernels as fvk
+import flash_rt.flash_rt_kernels as fvk
 
 from bagel_fp8_engine import (
     rms_norm_bf16, apply_rotary_pos_emb,
@@ -125,10 +125,10 @@ def recalibrate_act_scales_mixed(engine, fp4_layers, fp4_ffn, x_input):
     Mutates engine state in place. Caller must re-run
     ``ck.set_act_scales_from_engine(engine)`` afterwards.
     """
-    import flash_vla.flash_vla_kernels as fvk
-    import flash_vla.flash_vla_fp4 as fvk_fp4
+    import flash_rt.flash_rt_kernels as fvk
+    import flash_rt.flash_rt_fp4 as fvk_fp4
     import flash_wm_kernels as fwk
-    from flash_vla.executors.fp4_utils import FP4ActScratch
+    from flash_rt.executors.fp4_utils import FP4ActScratch
     from bagel_fp8_engine import (
         rms_norm_bf16, apply_rotary_pos_emb,
         N_LAYERS, D, H, KV_H, HD, K_DIM, FFN, FP8, GEMM_NAMES,

@@ -23,7 +23,7 @@ tests and offline fixture generation, never by production code.
 Usage
 -----
 
-    from flash_vla.refs.pi05_cfg_reference import Pi05CFGReference
+    from flash_rt.refs.pi05_cfg_reference import Pi05CFGReference
 
     ref = Pi05CFGReference(
         config_name="pi05_libero",
@@ -55,8 +55,8 @@ import torch
 logger = logging.getLogger(__name__)
 
 
-# ACP prompt format — matches flash_vla.core.rl.acp_tags. Duplicated
-# here so the reference has zero dependency on flash_vla internals.
+# ACP prompt format — matches flash_rt.core.rl.acp_tags. Duplicated
+# here so the reference has zero dependency on flash_rt internals.
 _ACP_POSITIVE_TAG = "Advantage: positive"
 
 

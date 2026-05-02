@@ -25,11 +25,11 @@ import pathlib
 import time
 from typing import Optional, Union
 
-from flash_vla.hardware.thor.shared_primitives import (
+from flash_rt.hardware.thor.shared_primitives import (
     siglip_forward,
     postln_project,
 )
-from flash_vla.models.pi0fast.pipeline import (
+from flash_rt.models.pi0fast.pipeline import (
     prefill_forward_pi0fast,
     decode_step_pi0fast,
     decode_step_pi0fast_bf16,
@@ -41,9 +41,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-import flash_vla.flash_vla_kernels as fvk
-from flash_vla.core.cuda_buffer import CudaBuffer
-from flash_vla.core.quant.calibrator import load_calibration, save_calibration
+import flash_rt.flash_rt_kernels as fvk
+from flash_rt.core.cuda_buffer import CudaBuffer
+from flash_rt.core.quant.calibrator import load_calibration, save_calibration
 
 logger = logging.getLogger(__name__)
 
@@ -61,10 +61,10 @@ FAST_SKIP_TOKENS = 128
 _TEXT_PHASE_TOKENS = [4022, 235292, 235248]  # "Action", ":", " "
 
 
-from flash_vla.core.thor_frontend_utils import quant_fp8  # noqa: E402
+from flash_rt.core.thor_frontend_utils import quant_fp8  # noqa: E402
 
 
-from flash_vla.core.thor_frontend_utils import (  # noqa: E402
+from flash_rt.core.thor_frontend_utils import (  # noqa: E402
     interleave_qk as _interleave_qk,
 )
 
@@ -135,7 +135,7 @@ class Pi0FastTorchFrontend:
                      num_views, max_decode_steps, self._has_sm100)
 
     def _load_norm_stats(self, checkpoint_dir):
-        from flash_vla.core.utils.norm_stats import (
+        from flash_rt.core.utils.norm_stats import (
             load_norm_stats, lerobot_candidates,
         )
         candidates = [
@@ -194,7 +194,7 @@ class Pi0FastTorchFrontend:
     def _load_weights(self, safetensors_path):
         """Load weights from safetensors (converted from Orbax via convert_pi0fast_orbax_to_safetensors.py)."""
         from safetensors import safe_open
-        from flash_vla.executors.torch_weights import _autodetect_strip_prefix
+        from flash_rt.executors.torch_weights import _autodetect_strip_prefix
 
         sf = safe_open(str(safetensors_path), framework='pt', device='cuda')
         # Auto-strip the lerobot HF policy ``model.`` namespace wrap if
@@ -1002,7 +1002,7 @@ class Pi0FastTorchFrontend:
             raise ValueError(f"percentile must be in [0, 100], got {percentile}")
 
         if n == 1:
-            from flash_vla.core.calibration_api import implicit_calibrate
+            from flash_rt.core.calibration_api import implicit_calibrate
             implicit_calibrate(
                 self, obs_list,
                 percentile=percentile, max_samples=None, verbose=verbose,
@@ -1022,7 +1022,7 @@ class Pi0FastTorchFrontend:
         percentile-reduced, uploaded back, alpha_host is recomputed,
         and prefill + decode graphs are recaptured once.
         """
-        from flash_vla.core.calibration import (
+        from flash_rt.core.calibration import (
             accumulate_amax,
             check_scale_ceiling,
             format_summary,
