@@ -1,4 +1,4 @@
-"""FlashVLA — Pi0.5 RTX CFG inference fused into a single B=2 batched forward.
+"""FlashRT — Pi0.5 RTX CFG inference fused into a single B=2 batched forward.
 
 Single-inheritance subclass of
 :class:`flash_rt.models.pi05.pipeline_rtx_batched.Pi05BatchedPipeline`

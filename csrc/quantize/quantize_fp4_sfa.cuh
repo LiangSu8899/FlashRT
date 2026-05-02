@@ -1,5 +1,5 @@
 // ============================================================================
-//  FlashVLA — fused (FP4 quantize + CUTLASS SFA/SFB tile-interleave) kernel.
+//  FlashRT — fused (FP4 quantize + CUTLASS SFA/SFB tile-interleave) kernel.
 //
 //  Equivalent to:
 //      quantize_fp4_dynamic_fp16(src, packed, linear_scales, N, D)

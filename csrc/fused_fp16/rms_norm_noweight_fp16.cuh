@@ -1,5 +1,5 @@
 // ============================================================================
-//  FlashVLA — fp16-output RMSNorm kernels (additive, for FP4 frontend path).
+//  FlashRT — fp16-output RMSNorm kernels (additive, for FP4 frontend path).
 //
 //  Design intent:
 //    The existing fp8-output RMSNorm kernels (norm.cu) fuse RMSNorm with

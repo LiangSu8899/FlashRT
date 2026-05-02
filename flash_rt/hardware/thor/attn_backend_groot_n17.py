@@ -1,4 +1,4 @@
-"""FlashVLA — Thor attention backend for GROOT N1.7.
+"""FlashRT — Thor attention backend for GROOT N1.7.
 
 Mirrors the N1.6 ``ThorGrootAttnBackend`` shape (no Q/O aliasing, separate
 QKV buffers, per-layer K/V only for cross-attention) but with N1.7-specific

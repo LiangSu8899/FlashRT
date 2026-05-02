@@ -1,4 +1,4 @@
-# FlashVLA — Pi0 model configuration
+# FlashRT — Pi0 model configuration
 name: pi0
 vision_type: siglip
 vlm_hidden: 2048

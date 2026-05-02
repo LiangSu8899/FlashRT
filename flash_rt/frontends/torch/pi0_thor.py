@@ -1,4 +1,4 @@
-"""FlashVLA -- Pi0TorchFrontendThor: Pi0 inference using ONLY flash_rt_kernels.so.
+"""FlashRT -- Pi0TorchFrontendThor: Pi0 inference using ONLY flash_rt_kernels.so.
 
 Adapted from ThorPipelineTorch (Pi0.5). Key differences:
   - Standard RMSNorm (not AdaRMSNorm) → fuse norm weight into QKV/GateUp
@@ -67,7 +67,7 @@ from flash_rt.core.thor_frontend_utils import embed_prompt_torch as embed_prompt
 class Pi0TorchFrontendThor:
     """Complete Pi0 inference pipeline using only flash_rt_kernels.so.
 
-    Interface compatible with FlashVLAModel.predict():
+    Interface compatible with FlashRTModel.predict():
         set_prompt(prompt_text)
         infer(observation) -> {"actions": np.ndarray}
     """

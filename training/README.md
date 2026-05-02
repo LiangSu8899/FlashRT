@@ -1,7 +1,7 @@
-# FlashVLA Training (BETA)
+# FlashRT Training (BETA)
 
 Status: **v0.1.0 BETA — API not stable**. Maintained alongside the
-inference framework `flash_vla/`; will be released as a separate package
+inference framework `flash_rt/`; will be released as a separate package
 once the API stabilises.
 
 This subtree is the **FP8 + LoRA + RECAP training infrastructure**
@@ -30,20 +30,20 @@ The PyTorch and JAX lines are **independent end-to-end paths** —
 JAX trains/serves JAX, PyTorch trains/serves PyTorch; they share
 algorithm primitives (ACP tag strings, advantage thresholds,
 reward-target math) under
-[`flash_vla/core/rl/`](../flash_vla/core/rl/) and the same FP8
+[`flash_rt/core/rl/`](../flash_rt/core/rl/) and the same FP8
 cuBLASLt kernel under [`csrc/gemm/`](../csrc/gemm/), but the
 checkpoints don't cross over and you don't need to think about
 the other framework while you use one.
 
 ## Why this exists
 
-FlashVLA's training stack is one of several PyTorch options the
+FlashRT's training stack is one of several PyTorch options the
 community has for fine-tuning pi0.5; it sits alongside the upstream
 [openpi](https://github.com/Physical-Intelligence/openpi) JAX path
 (the canonical reference) and the [lerobot](https://github.com/huggingface/lerobot)
 PyTorch port (which provides a PEFT-based BF16 LoRA training loop
 out of the box). What this stack adds is a **FP8-forward training
-path on Ada/Blackwell consumer GPUs**: the same kernels FlashVLA's
+path on Ada/Blackwell consumer GPUs**: the same kernels FlashRT's
 inference path uses for FP8 GEMM, fused RMSNorm, and SwiGLU are
 reused for the training forward pass, while backward stays in BF16
 through small LoRA adapters. The aim is to let users who already
@@ -54,7 +54,7 @@ memory / step-time curve than the BF16 path:
   speed-priority (peak 14.65 GB, 16.14 samples/s at B=4) or
   memory-priority (peak 10.05 GB, 15.80 samples/s at B=4) — pick the
   one that fits your card and iteration budget.
-- Trained LoRA checkpoints load directly into the FlashVLA inference
+- Trained LoRA checkpoints load directly into the FlashRT inference
   engine via `merge_lora_into_base`.
 
 Public reference numbers from the upstream projects, for context:
@@ -78,7 +78,7 @@ training/
 │   └── inject.py                #   target-module walker + calibration
 ├── rl/                          # RECAP-style RL pipeline
 │   ├── acp_hook.py              #   prompt injection (30 % dropout)
-│   ├── advantage.py / reward.py / value_function.py — see flash_vla/core/rl/
+│   ├── advantage.py / reward.py / value_function.py — see flash_rt/core/rl/
 │   ├── checkpoint.py            #   pi0.5 base loader + LoRA save/load
 │   ├── dataset_stats.py         #   ACP indicator audit (vendored from Evo-RL)
 │   ├── jax_baseline_compare.py  #   head-to-head with openpi JAX script
@@ -98,7 +98,7 @@ training/
 ```
 
 Algorithm primitives shared with the inference path live under
-[`flash_vla/core/rl/`](../flash_vla/core/rl/) (`acp_tags.py`,
+[`flash_rt/core/rl/`](../flash_rt/core/rl/) (`acp_tags.py`,
 `cfg_sampler.py`, `reward.py`, `advantage.py`, `value_function.py`).
 
 ## Quick start
@@ -420,7 +420,7 @@ file under [`training/rl/`](rl/):
 
 The shared inference-side primitives (advantage tag string format,
 CFG sampler, value-function reward shaping) live under
-[`flash_vla/core/rl/`](../flash_vla/core/rl/) so train and serve
+[`flash_rt/core/rl/`](../flash_rt/core/rl/) so train and serve
 agree byte-for-byte on what `Advantage: positive/negative` means.
 
 If you only want a vanilla supervised LoRA fine-tune, set
@@ -448,7 +448,7 @@ merge_lora_into_base(
 The merged directory mirrors the base layout (`config.json`,
 `policy_postprocessor.json`, `policy_preprocessor.json`, `assets/`,
 `model.safetensors`) so any pi0.5 PyTorch consumer — including
-FlashVLA's `Pi05TorchFrontendRtx` — can load it directly.
+FlashRT's `Pi05TorchFrontendRtx` — can load it directly.
 
 For **classifier-free-guidance inference** on the merged LoRA
 checkpoint (the RECAP / ACP test-time recipe — runs the model
@@ -469,7 +469,7 @@ two files. Concretely:
 | Component | pi0.5-specific? | Reusable across VLAs |
 |---|---|---|
 | FP8 cuBLASLt GEMM kernel ([`csrc/gemm/`](../csrc/gemm/)) | no | ✅ any model with M ≥ 64 LoRA-bearing GEMMs benefits |
-| RECAP / ACP algorithm primitives ([`flash_vla/core/rl/`](../flash_vla/core/rl/)) | no | ✅ pure paper-aligned algorithm — tag strings, advantage, soft-bin loss, CFG combine |
+| RECAP / ACP algorithm primitives ([`flash_rt/core/rl/`](../flash_rt/core/rl/)) | no | ✅ pure paper-aligned algorithm — tag strings, advantage, soft-bin loss, CFG combine |
 | Dataset Protocol ([`rl/dataset_protocol.py`](rl/dataset_protocol.py)) | no | ✅ 5-method contract; no model assumptions |
 | Optimizer + LR + grad-clip + LoRA injection ([`train_recap.py`](rl/train_recap.py), [`lora/inject.py`](lora/inject.py)) | no | ✅ `InjectionConfig.target_modules` defaults to HF naming (`q_proj`/`k_proj`/`v_proj`/`o_proj`/`gate_proj`/`up_proj`/`down_proj`); pass your own list if your model uses different names |
 | RECAP iter / VF training ([`recap_iter.py`](rl/recap_iter.py), [`train_value.py`](rl/train_value.py), [`pi05_vf.py`](rl/pi05_vf.py)) | mostly no | ✅ `StandaloneValueFunction` is state-only; `Pi05ValueFunction` swaps the backbone for any VLA exposing pooled prefix embeddings |
@@ -569,35 +569,35 @@ action expert, matching openpi `gemma_2b_lora` / `gemma_300m_lora`),
 the same trainable parameter count (~26.5M ≈ 0.7% of the 3.6B base),
 and the same `gradient_checkpointing=True`. The lerobot row uses
 `peft.LoraConfig` on `lerobot/pi05` with that target regex at
-rank 16; the FlashVLA rows use `Pi05Trainer.compile(InjectionConfig(
+rank 16; the FlashRT rows use `Pi05Trainer.compile(InjectionConfig(
 encoder_rank=16, decoder_rank=16))`. Everything ran on the same
 RTX 5090 SM120 / 32 GB card.
 
 | Stack | `cache_bf16_weight` | `compile_mode` | step/s | samples/s | peak GPU |
 |---|---|---|---:|---:|---:|
 | lerobot pi05 BF16+LoRA (PyTorch, PEFT, openpi-aligned target) | n/a (BF16 base) | n/a | 1.83 | 7.33 | 9.08 GB |
-| FlashVLA FP8+LoRA, sync data, eager | True | None | 1.46 | 5.84 | 13.88 GB |
+| FlashRT FP8+LoRA, sync data, eager | True | None | 1.46 | 5.84 | 13.88 GB |
 | + `dataloader_workers=2` | True | None | 2.68 | 10.72 | 13.88 GB |
 | + `compile_mode="default"` (Inductor fusion) | True | default | 3.89 | 15.56 | 14.46 GB |
 | **+ `compile_mode="reduce-overhead"`** (speed-priority recipe) | **True** | **reduce-overhead** | **4.04** | **16.14** | **14.65 GB** |
 | **`cache_bf16_weight=False`** (memory-priority recipe) | **False** | **reduce-overhead** | **3.95** | **15.80** | **10.05 GB** |
 
-The two FlashVLA bottom rows are the recommended starting points,
+The two FlashRT bottom rows are the recommended starting points,
 sitting at different points of the same memory ↔ step-time curve.
 Pick the one that matches your card and iteration budget.
 
 **30k-step wall-clock at B=4** (the same step count as the
-`training/_runs/` archive), measured directly for the FlashVLA
+`training/_runs/` archive), measured directly for the FlashRT
 recipes and extrapolated from the steady step/s above for the
 lerobot row:
 
 | Stack | wall (30k steps) |
 |---|---:|
 | lerobot pi05 BF16+LoRA (PyTorch, openpi-aligned LoRA target) | ~273 min (~4 h 33 min, extrapolated from 1.83 step/s) |
-| FlashVLA, speed-priority recipe | **~124 min** (≈2 h 4 min, measured) |
-| FlashVLA, memory-priority recipe | **~127 min** (≈2 h 7 min, extrapolated) |
+| FlashRT, speed-priority recipe | **~124 min** (≈2 h 4 min, measured) |
+| FlashRT, memory-priority recipe | **~127 min** (≈2 h 7 min, extrapolated) |
 
-The FlashVLA speed-priority number is from a real 30k-step LIBERO
+The FlashRT speed-priority number is from a real 30k-step LIBERO
 RECAP run (`B=4`, `dataloader_workers=2`, `compile_mode="reduce-overhead"`,
 `cache_bf16_weight=True`, `seed=42`): plain LoRA wall 126.6 min,
 RL+LoRA wall 128.7 min, loss mean dropped 0.042 → 0.012 / 0.044 →
@@ -619,7 +619,7 @@ dequant kernel launches. With CUDA-Graph capture
 (`compile_mode="reduce-overhead"`) this trade-off shrinks to
 ~2 % step-time (the per-layer dequant kernels are amortised inside
 the captured graph), so users on tighter cards can flip to
-`cache_bf16_weight=False` and get effectively the same FlashVLA
+`cache_bf16_weight=False` and get effectively the same FlashRT
 step-time at a peak memory close to the lerobot BF16+LoRA path.
 
 The eager equivalent of the same ablation costs more

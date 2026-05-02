@@ -1,5 +1,5 @@
 """
-FlashVLA — Public API.
+FlashRT — Public API.
 
 3 lines of code to run VLA inference:
 
@@ -125,7 +125,7 @@ class VLAModel:
         if not hasattr(self._pipe, "calibrate"):
             raise NotImplementedError(
                 "This frontend does not expose a public calibrate() API. "
-                "Upgrade to a recent version of FlashVLA that includes "
+                "Upgrade to a recent version of FlashRT that includes "
                 "the unified calibration interface.")
         self._pipe.calibrate(
             observations,
@@ -180,7 +180,7 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                use_awq=None,
                awq_alpha=0.5,
                use_p1_split_gu=None):
-    """Load a FlashVLA model.
+    """Load a FlashRT model.
 
     Args:
         checkpoint: path to checkpoint directory.

@@ -1,4 +1,4 @@
-"""FlashVLA -- RTX Pi0.5 JAX frontend.
+"""FlashRT -- RTX Pi0.5 JAX frontend.
 
 Loads Pi0.5 Orbax checkpoints (the JAX-native format used by openpi) and
 drives the same framework-agnostic ``Pi05Pipeline`` as the torch frontend.

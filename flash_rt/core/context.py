@@ -1,4 +1,4 @@
-"""FlashVLA — FvkContext: per-instance runtime resources.
+"""FlashRT — FvkContext: per-instance runtime resources.
 
 Wraps the C++ FvkContext (cuBLAS handle) from flash_rt_kernels.so.
 Created by frontend, passed to all kernel calls via hardware pipeline.
@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 
 class FvkContext:
-    """Per-instance runtime resources for FlashVLA kernels.
+    """Per-instance runtime resources for FlashRT kernels.
 
     Owns:
         - cuBLAS handle (via C++ FvkContext)

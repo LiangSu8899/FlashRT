@@ -1,5 +1,5 @@
 // ============================================================================
-//  FlashVLA — pybind module for vendored Flash-Attention 2.
+//  FlashRT — pybind module for vendored Flash-Attention 2.
 //
 //  Built as a SEPARATE .so from flash_rt_kernels.so to keep the main kernel
 //  binary small (~3.6 MB) and to avoid FA2's heavy CUTLASS 3.x template
@@ -105,7 +105,7 @@ static auto make_fwd(Fn fn) {
 
 
 PYBIND11_MODULE(flash_rt_fa2, m) {
-    m.doc() = "FlashVLA — vendored Flash-Attention 2 forward (fp16 + bf16).";
+    m.doc() = "FlashRT — vendored Flash-Attention 2 forward (fp16 + bf16).";
 
     m.def("fwd_fp16", make_fwd(&fvk_attention_fa2_fwd_fp16),
         py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("O"), py::arg("softmax_lse"),

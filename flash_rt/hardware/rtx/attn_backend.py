@@ -1,4 +1,4 @@
-"""FlashVLA — RTX attention backend protocol + implementation.
+"""FlashRT — RTX attention backend protocol + implementation.
 
 The rtx Pi0 / Pi0.5 pipeline is framework-agnostic except for the
 scratch tensor allocator. This module provides the attention backend

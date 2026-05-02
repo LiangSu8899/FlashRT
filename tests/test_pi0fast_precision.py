@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""FlashVLA Pi0-FAST precision test (autoregressive variant).
+"""FlashRT Pi0-FAST precision test (autoregressive variant).
 
 Counterpart to test_all_models_precision.py, specialized for the
 autoregressive Pi0-FAST architecture.
@@ -378,7 +378,7 @@ def main():
     targets = [args.backend] if args.backend else list(BACKENDS.keys())
 
     print("=" * 72)
-    print("FlashVLA — Pi0-FAST Precision Test (autoregressive)")
+    print("FlashRT — Pi0-FAST Precision Test (autoregressive)")
     print("=" * 72)
     print("Each backend runs prefill + decode step 0 with identical dummy input.")
     print("Per-segment cosine vs JAX bf16 reference (gemma_fast.Module.apply).")

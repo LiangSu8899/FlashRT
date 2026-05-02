@@ -1,4 +1,4 @@
-"""FlashVLA -- RTX Pi0.5 torch frontend.
+"""FlashRT -- RTX Pi0.5 torch frontend.
 
 Loads HuggingFace PyTorch safetensors checkpoints + drives the
 framework-agnostic :class:`~flash_rt.models.pi05.pipeline_rtx.Pi05Pipeline`.

@@ -2,16 +2,16 @@
 
 > **Target audience**: anyone who wants to understand calibration as a **framework component** — its cache contract, its lifecycle, what a frontend must implement to use it. For the FP8 numerical mechanics (E4M3 dynamic range, why per-tensor scale, alpha = act_scale × weight_scale, debugging precision regressions) read [`../calibration.md`](../calibration.md) — this doc does not duplicate it.
 >
-> **Source**: [`flash_vla/core/quant/calibrator.py`](../../flash_vla/core/quant/calibrator.py) — cache implementation. Per-frontend `_calibrate(...)` methods follow the same protocol.
+> **Source**: [`flash_rt/core/quant/calibrator.py`](../../flash_rt/core/quant/calibrator.py) — cache implementation. Per-frontend `_calibrate(...)` methods follow the same protocol.
 
 ---
 
 ## 1. What the calibration framework owns
 
-Calibration is the most cross-cutting piece of FlashVLA's quantization story. It is the only component that:
+Calibration is the most cross-cutting piece of FlashRT's quantization story. It is the only component that:
 
 - runs per-checkpoint AND per-sequence-length
-- has a disk side-effect (`~/.flash_vla/calibration/`)
+- has a disk side-effect (`~/.flash_rt/calibration/`)
 - has a 2.5–4 second cost on first run that must not repeat
 
 The framework owns the cross-cutting parts so each frontend doesn't reinvent them:
@@ -42,10 +42,10 @@ The framework caches per `(checkpoint, sequence_length)`. Concretely:
 Cache file:
 
 ```
-~/.flash_vla/calibration/{ckpt_hash}_Se{N}.json
+~/.flash_rt/calibration/{ckpt_hash}_Se{N}.json
 ```
 
-`save_calibration` and `load_calibration` in [`calibrator.py`](../../flash_vla/core/quant/calibrator.py) are the only public read / write entry points.
+`save_calibration` and `load_calibration` in [`calibrator.py`](../../flash_rt/core/quant/calibrator.py) are the only public read / write entry points.
 
 ### 2.2 What is cached
 
@@ -77,7 +77,7 @@ Cache **does not** invalidate on:
 - code changes in the kernel library (you have to delete the cache file by hand)
 - changes in calibration sample data (deliberate — the cache is a snapshot of a measurement at one point in time)
 
-To force recalibration: `rm ~/.flash_vla/calibration/{ckpt_hash}_Se*.json`. There is no environment flag to disable the cache; if you want fresh calibration every run, delete the file in your boot script.
+To force recalibration: `rm ~/.flash_rt/calibration/{ckpt_hash}_Se*.json`. There is no environment flag to disable the cache; if you want fresh calibration every run, delete the file in your boot script.
 
 ---
 
@@ -126,7 +126,7 @@ Adding a new layout is one elif in `_checkpoint_hash`. The candidate file list i
 A frontend's `_calibrate` typically wraps the framework like this:
 
 ```python
-from flash_vla.core.quant.calibrator import (
+from flash_rt.core.quant.calibrator import (
     _checkpoint_hash, _cache_path,
     save_calibration, load_calibration,
 )
@@ -190,7 +190,7 @@ This is why the framework hashes content + size, not the path.
 
 ## 8. Where this differs from a "compile-time" calibration
 
-In TensorRT, calibration is a build-time concern — the calibrator runs during `trtexec`, the result is baked into a `.engine` file, and you cannot recalibrate without rebuilding. FlashVLA's calibration:
+In TensorRT, calibration is a build-time concern — the calibrator runs during `trtexec`, the result is baked into a `.engine` file, and you cannot recalibrate without rebuilding. FlashRT's calibration:
 
 - runs at **first inference**, not at build
 - writes a portable JSON (not a binary engine)
@@ -205,12 +205,12 @@ This is the same property that makes "no compile, no export" possible: calibrati
 
 | What | File |
 |---|---|
-| Cache key + save / load + path constants | [`flash_vla/core/quant/calibrator.py`](../../flash_vla/core/quant/calibrator.py) |
+| Cache key + save / load + path constants | [`flash_rt/core/quant/calibrator.py`](../../flash_rt/core/quant/calibrator.py) |
 | Mechanics doc (FP8 dynamic range, scales, alpha math) | [`../calibration.md`](../calibration.md) |
-| Pi0.5 frontend `_calibrate` | `flash_vla/frontends/torch/pi05_thor.py` |
-| GROOT frontend `_calibrate` | `flash_vla/frontends/torch/groot_thor.py` |
+| Pi0.5 frontend `_calibrate` | `flash_rt/frontends/torch/pi05_thor.py` |
+| GROOT frontend `_calibrate` | `flash_rt/frontends/torch/groot_thor.py` |
 | Multi-sample helper | `tests/test_thor_multi_sample_calibrate.py` |
-| AWQ refit utility | `flash_vla/core/quant/awq.py` (when present) |
+| AWQ refit utility | `flash_rt/core/quant/awq.py` (when present) |
 
 ---
 
@@ -218,7 +218,7 @@ This is the same property that makes "no compile, no export" possible: calibrati
 
 The following are guaranteed across v0.x releases:
 
-1. Cache directory `~/.flash_vla/calibration/`.
+1. Cache directory `~/.flash_rt/calibration/`.
 2. Cache filename pattern `{ckpt_hash}_Se{N}.json`.
 3. `_checkpoint_hash(path)` is stable: the same file always produces the same hash.
 4. JSON top-level keys: `ckpt_hash`, `Se`, `enc_scales`, `enc_alpha`, `ae_scales`, `enc_w_scales`, `extra`. New keys may appear; existing keys do not change name or semantic.

@@ -20,13 +20,13 @@ Thor, and the numerical contract the implementation meets.
 |---|---|---|
 | Model | Pi0.5 | Pi0.5 |
 | Hardware | RTX 5090 / 4090 (SM89, SM120) | Jetson AGX Thor (SM110, aarch64) |
-| Frontends | [`Pi05TorchFrontendRtx`](../flash_vla/frontends/torch/pi05_rtx.py) (safetensors) / [`Pi05JaxFrontendRtx`](../flash_vla/frontends/jax/pi05_rtx.py) (Orbax) | [`Pi05TorchFrontendThor`](../flash_vla/frontends/torch/pi05_thor.py) (safetensors) / [`Pi05JaxFrontendThor`](../flash_vla/frontends/jax/pi05_thor.py) (Orbax) |
+| Frontends | [`Pi05TorchFrontendRtx`](../flash_rt/frontends/torch/pi05_rtx.py) (safetensors) / [`Pi05JaxFrontendRtx`](../flash_rt/frontends/jax/pi05_rtx.py) (Orbax) | [`Pi05TorchFrontendThor`](../flash_rt/frontends/torch/pi05_thor.py) (safetensors) / [`Pi05JaxFrontendThor`](../flash_rt/frontends/jax/pi05_thor.py) (Orbax) |
 | Serial CFG | ✅ 37 ms (β=1.5) | ✅ 88 ms (torch) / 96 ms (JAX) |
 | Fused CFG (B=2, paper-correct per-step) | ✅ **25.9 ms** (β=1.5) | ✅ **~67 ms** (torch / JAX, with `autotune≥3`) |
 | Generic B>2 batched (RL rollout) | not yet | not yet |
 
 Conditioned-prompt strings are byte-equal across the four frontends
-(shared builder in [`flash_vla/core/rl/`](../flash_vla/core/rl/)),
+(shared builder in [`flash_rt/core/rl/`](../flash_rt/core/rl/)),
 so the same merged LoRA checkpoint serves all four backends.
 
 ## API
@@ -35,7 +35,7 @@ CFG is opt-in. The default (no `set_rl_mode` call) inference path is
 bit-for-bit unchanged.
 
 ```python
-from flash_vla.frontends.torch.pi05_thor import Pi05TorchFrontendThor
+from flash_rt.frontends.torch.pi05_thor import Pi05TorchFrontendThor
 
 # Construct. autotune>0 enables the B=2 outer-graph autotuner —
 # recommended for production, see "Performance" below.
@@ -288,13 +288,13 @@ does this).
 - π\*0.6 paper — [arXiv:2511.14759](https://arxiv.org/abs/2511.14759),
   Appendix E for the CFG derivation from the flow-matching likelihood
   gradient.
-- [`flash_vla/core/rl/`](../flash_vla/core/rl/) — framework-agnostic
+- [`flash_rt/core/rl/`](../flash_rt/core/rl/) — framework-agnostic
   combine math, ACP-tag prompt builder.
 - [`csrc/kernels/elementwise.cu`](../csrc/kernels/elementwise.cu) —
   `cfg_combine_into_residual` kernel (packed-2 vectorised, FP32
   internally for numerical stability at β > 1).
 - Pipeline classes:
-  - RTX: [`pipeline_rtx_cfg.py`](../flash_vla/models/pi05/pipeline_rtx_cfg.py),
-    [`pipeline_rtx_cfg_batched.py`](../flash_vla/models/pi05/pipeline_rtx_cfg_batched.py)
-  - Thor: [`pipeline_thor_cfg.py`](../flash_vla/models/pi05/pipeline_thor_cfg.py),
-    [`pipeline_thor_cfg_batched.py`](../flash_vla/models/pi05/pipeline_thor_cfg_batched.py)
+  - RTX: [`pipeline_rtx_cfg.py`](../flash_rt/models/pi05/pipeline_rtx_cfg.py),
+    [`pipeline_rtx_cfg_batched.py`](../flash_rt/models/pi05/pipeline_rtx_cfg_batched.py)
+  - Thor: [`pipeline_thor_cfg.py`](../flash_rt/models/pi05/pipeline_thor_cfg.py),
+    [`pipeline_thor_cfg_batched.py`](../flash_rt/models/pi05/pipeline_thor_cfg_batched.py)

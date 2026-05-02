@@ -1,5 +1,5 @@
 // ================================================================
-// FlashVLA — Causal MHA batched cuBLAS attention (for Qwen3-VL LLM
+// FlashRT — Causal MHA batched cuBLAS attention (for Qwen3-VL LLM
 //                                                   in GROOT N1.7)
 //
 // Same layout & GEMM strategy as ``attention_mha_fp16`` but applies a

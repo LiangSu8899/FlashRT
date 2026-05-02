@@ -1,4 +1,4 @@
-"""FlashVLA — Pi0.5 Thor SM110 decoder pipeline (B=1, main-line path).
+"""FlashRT — Pi0.5 Thor SM110 decoder pipeline (B=1, main-line path).
 
 Pi0.5-specific Thor compute (AdaRMSNorm action expert decoder + the
 calibration twin). SigLIP / encoder live in

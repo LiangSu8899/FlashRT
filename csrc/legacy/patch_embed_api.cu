@@ -1,4 +1,4 @@
-// FlashVLA — Patch Embedding GEMM API (standalone .so)
+// FlashRT — Patch Embedding GEMM API (standalone .so)
 //
 // Compile:
 //   nvcc -O3 -std=c++17 -arch=sm_110a --use_fast_math \

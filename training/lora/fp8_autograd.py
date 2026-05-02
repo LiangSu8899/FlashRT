@@ -1,6 +1,6 @@
 """FP8 GEMM as a ``torch.autograd.Function`` over a frozen base weight.
 
-The forward path routes through FlashVLA's existing FP8 kernel
+The forward path routes through FlashRT's existing FP8 kernel
 (``flash_rt.flash_rt_kernels.GemmRunner.fp8_nn_dev``) and the runtime
 activation quantizer (``quantize_fp8_static``). Both are the same
 kernels used by the inference pipeline — the training stack is

@@ -1,4 +1,4 @@
-"""FlashVLA — CudaBuffer: cudaMalloc/managed wrapper for engine-facing GPU buffers."""
+"""FlashRT — CudaBuffer: cudaMalloc/managed wrapper for engine-facing GPU buffers."""
 
 import ctypes
 import logging

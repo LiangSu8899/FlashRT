@@ -1,4 +1,4 @@
-# FlashVLA Usage Guide
+# FlashRT Usage Guide
 
 Complete reference for installation, API parameters, mechanisms, and usage patterns.
 
@@ -18,32 +18,32 @@ git clone --depth 1 --branch v4.4.2 \
 
 pip install -e ".[torch]"     # or "[jax]" / "[all]"
 
-# Build — produces flash_vla_kernels.so AND (on RTX) flash_vla_fa2.so.
+# Build — produces flash_rt_kernels.so AND (on RTX) flash_rt_fa2.so.
 # Thor builds produce only the former (FA2 skipped, Thor uses fvk
 # cuBLAS-decomposed attention).
 mkdir build && cd build
 cmake ..                       # auto-detects GPU arch from nvidia-smi
 make -j$(nproc)
-cp flash_vla_kernels*.so flash_vla_fa2*.so ../flash_vla/ 2>/dev/null || \
-   cp flash_vla_kernels*.so ../flash_vla/     # Thor path
+cp flash_rt_kernels*.so flash_rt_fa2*.so ../flash_rt/ 2>/dev/null || \
+   cp flash_rt_kernels*.so ../flash_rt/     # Thor path
 cd ..
 ```
 
-**Crucially — no `pip install flash-attn` required.** FlashVLA
+**Crucially — no `pip install flash-attn` required.** FlashRT
 vendors FA2 v2.7.4.post1 (fp16 + bf16) at source level and builds
-it into `flash_vla/flash_vla_fa2.so`. Zero pip `flash-attn` wheel
+it into `flash_rt/flash_rt_fa2.so`. Zero pip `flash-attn` wheel
 dependency at runtime.
 
-After installation, `import flash_vla` works from any directory.
+After installation, `import flash_rt` works from any directory.
 
 ---
 
 ## Quick Start
 
 ```python
-import flash_vla
+import flash_rt
 
-model = flash_vla.load_model(
+model = flash_rt.load_model(
     checkpoint="/path/to/checkpoint",
     framework="torch",
 )
@@ -59,10 +59,10 @@ actions = model.predict(
 
 ## API Reference
 
-### `flash_vla.load_model()`
+### `flash_rt.load_model()`
 
 ```python
-model = flash_vla.load_model(
+model = flash_rt.load_model(
     checkpoint,                # str: path to checkpoint directory
     framework="torch",         # "torch" or "jax"
     num_views=2,               # number of camera views (2 or 3)
@@ -137,7 +137,7 @@ FAST tokens (Gemma 2B, 18 layers), not via diffusion. Total latency =
 
 ```python
 # Default: good for interactive / multi-prompt scenarios
-model = flash_vla.load_model(
+model = flash_rt.load_model(
     checkpoint="/path/to/pi0_fast_base",
     config="pi0fast",
 )
@@ -148,7 +148,7 @@ actions = model.predict(
 )
 
 # Max-performance: best for fixed-prompt 24h continuous control
-model = flash_vla.load_model(
+model = flash_rt.load_model(
     checkpoint="/path/to/pi0_fast_base",
     config="pi0fast",
     decode_cuda_graph=True,       # capture decode loop as CUDA Graph
@@ -184,7 +184,7 @@ zero host-device synchronization per step.
 
 The 2.4s calibration is the largest cold-start cost. It runs 16 forward
 passes with noise perturbations to find robust FP8 activation scales, then
-saves to `~/.flash_vla/calibration/`. On subsequent runs with the same
+saves to `~/.flash_rt/calibration/`. On subsequent runs with the same
 checkpoint and sequence length, calibration loads from cache instantly.
 
 ### Calibration Cache
@@ -204,7 +204,7 @@ No need to force recalibration — the system handles it automatically.
 
 **Force recalibration**:
 ```bash
-rm -rf ~/.flash_vla/calibration/   # clear all cached scales
+rm -rf ~/.flash_rt/calibration/   # clear all cached scales
 ```
 
 ### Checkpoint Conversion
@@ -258,7 +258,7 @@ FP8 inference requires calibrated activation scales — per-layer maximum values
 ### How it works
 
 **Phase 1: Initial calibration** (during `set_prompt()`):
-1. Check disk cache: `~/.flash_vla/calibration/{ckpt_hash}_Se{N}.json`
+1. Check disk cache: `~/.flash_rt/calibration/{ckpt_hash}_Se{N}.json`
 2. **Cache hit**: Load scales from JSON (instant)
 3. **Cache miss**: Run `encoder_forward_calibrate()` + `decoder_forward_calibrate()` with warmup data (~3-4s), save to cache
 
@@ -272,7 +272,7 @@ FP8 inference requires calibrated activation scales — per-layer maximum values
 
 | Property | Value |
 |----------|-------|
-| Location | `~/.flash_vla/calibration/` |
+| Location | `~/.flash_rt/calibration/` |
 | Key | `SHA256(checkpoint_first_64KB + file_size)[:16]` + `_Se{sequence_length}` |
 | Format | JSON with `enc_scales`, `ae_scales`, `enc_alpha`, `enc_w_scales` |
 | Invalidation | Automatic per-checkpoint hash. Different checkpoints or finetunes get different caches. |
@@ -290,7 +290,7 @@ Three ways to force fresh calibration:
 
 ```python
 # Method 1: At load time
-model = flash_vla.load_model(checkpoint, recalibrate=True)
+model = flash_rt.load_model(checkpoint, recalibrate=True)
 
 # Method 2: At runtime
 model.recalibrate()
@@ -302,7 +302,7 @@ python examples/quickstart.py --checkpoint /path/to/ckpt --recalibrate
 
 Or manually delete the cache:
 ```bash
-rm -rf ~/.flash_vla/calibration/
+rm -rf ~/.flash_rt/calibration/
 ```
 
 ### Explicit multi-sample calibration — `model.calibrate()`
@@ -329,7 +329,7 @@ The common case: you have a robot-rollout dataset, and you want to
 calibrate on N representative frames before deployment. Three lines:
 
 ```python
-from flash_vla.datasets.libero import load_calibration_obs
+from flash_rt.datasets.libero import load_calibration_obs
 
 # Pick 8 stratified frames (episode × frame-position) from a LIBERO-
 # format dataset. Returns list[dict] — each dict has 'image',
@@ -359,7 +359,7 @@ model.calibrate(obs_list)
    the lower-level helper:
 
 ```python
-from flash_vla.core.calibration import stratified_sample
+from flash_rt.core.calibration import stratified_sample
 
 obs_list = stratified_sample(my_dataframe, my_load_fn, n=8)
 model.calibrate(obs_list)
@@ -368,7 +368,7 @@ model.calibrate(obs_list)
 #### N = 1 — the default, keeps using the disk cache
 
 If you pass a single observation (or skip `calibrate()` entirely — the
-first `predict()` call triggers the same path), FlashVLA uses the
+first `predict()` call triggers the same path), FlashRT uses the
 legacy calibration pipeline:
 
 ```python
@@ -378,7 +378,7 @@ model.predict(obs)            # first call auto-calibrates
 ```
 
 The first run computes scales from one forward pass and writes them
-to `~/.flash_vla/calibration/{ckpt_hash}_Se{N}.json`. Every subsequent
+to `~/.flash_rt/calibration/{ckpt_hash}_Se{N}.json`. Every subsequent
 process with the same checkpoint reads the cache — no forward pass
 required.
 
@@ -465,7 +465,7 @@ If your dataset cannot go through `load_calibration_obs`, the
 lower-level helper takes a pandas DataFrame + a per-index loader:
 
 ```python
-flash_vla.core.calibration.stratified_sample(
+flash_rt.core.calibration.stratified_sample(
     metadata,        # pandas.DataFrame with {index, task_index,
                      #   episode_index, frame_index} columns
     load_fn,         # callable: index -> obs dict
@@ -482,9 +482,9 @@ frames) and applies `load_fn` to each.
 
 #### Diagnostic: outlier-scale warning
 
-After calibration, FlashVLA scans the produced per-layer FP8 scales
+After calibration, FlashRT scans the produced per-layer FP8 scales
 and logs a `WARNING` via
-`flash_vla.core.calibration.check_scale_ceiling` if any scale is more
+`flash_rt.core.calibration.check_scale_ceiling` if any scale is more
 than **20 ×** the median of the same calibration. This catches the
 case where a single outlier frame in the calibration set stretched the
 FP8 scale on one layer far beyond its peers — the typical sign that
@@ -494,10 +494,10 @@ the dataset contains a glitched / overexposed / occluded sample.
 ## Full Parameter Examples
 
 ```python
-import flash_vla
+import flash_rt
 
 # === Production deployment (recommended) ===
-model = flash_vla.load_model(
+model = flash_rt.load_model(
     checkpoint="/path/to/pi05_libero_pytorch",
     framework="torch",
     autotune=3,          # stable 44ms
@@ -506,7 +506,7 @@ actions = model.predict(images=[img, wrist], prompt="pick up the red block")
 
 
 # === JAX with Orbax checkpoint ===
-model = flash_vla.load_model(
+model = flash_rt.load_model(
     checkpoint="/path/to/orbax_checkpoint",
     framework="jax",
     autotune=5,          # JAX may need more trials
@@ -514,7 +514,7 @@ model = flash_vla.load_model(
 
 
 # === After fine-tuning: force recalibration ===
-model = flash_vla.load_model(
+model = flash_rt.load_model(
     checkpoint="/path/to/finetuned_checkpoint",
     framework="torch",
     recalibrate=True,    # ignore old cache
@@ -522,7 +522,7 @@ model = flash_vla.load_model(
 
 
 # === Fast iteration during development ===
-model = flash_vla.load_model(
+model = flash_rt.load_model(
     checkpoint="/path/to/checkpoint",
     framework="torch",
     autotune=0,          # skip autotune for fastest startup
@@ -530,7 +530,7 @@ model = flash_vla.load_model(
 
 
 # === 3-camera setup ===
-model = flash_vla.load_model(
+model = flash_rt.load_model(
     checkpoint="/path/to/checkpoint",
     framework="torch",
     num_views=3,
@@ -542,7 +542,7 @@ actions = model.predict(
 
 
 # === Runtime recalibration (domain shift) ===
-model = flash_vla.load_model(checkpoint="/path/to/checkpoint")
+model = flash_rt.load_model(checkpoint="/path/to/checkpoint")
 actions = model.predict(images=[img1, img2], prompt="task A")
 
 # ... deployment domain changed ...
@@ -567,20 +567,20 @@ Torch uses safetensors which is essentially a flat binary mmap — there's nothi
 
 ### How it works
 
-1. **First load**: Orbax → transform → FP8 quantize → upload to GPU → **save binary cache** (`~/.flash_vla/weights/{hash}_nv{N}.bin`, ~4 GB)
+1. **First load**: Orbax → transform → FP8 quantize → upload to GPU → **save binary cache** (`~/.flash_rt/weights/{hash}_nv{N}.bin`, ~4 GB)
 2. **Subsequent loads**: Read binary cache → upload to GPU directly (~6s)
 
 ### Parameters
 
 ```python
 # Default: cache enabled (recommended)
-model = flash_vla.load_model(checkpoint, framework="jax")
+model = flash_rt.load_model(checkpoint, framework="jax")
 
 # Disable cache (always re-quantize from Orbax)
-model = flash_vla.load_model(checkpoint, framework="jax", weight_cache=False)
+model = flash_rt.load_model(checkpoint, framework="jax", weight_cache=False)
 
 # Force re-quantize (clears both weight cache and calibration cache)
-model = flash_vla.load_model(checkpoint, framework="jax", recalibrate=True)
+model = flash_rt.load_model(checkpoint, framework="jax", recalibrate=True)
 ```
 
 ### When to disable or clear weight cache
@@ -601,7 +601,7 @@ Each cache file is keyed by `SHA256(checkpoint_manifest)[:16] + num_views`. Diff
 
 ## HTTP Server
 
-FlashVLA includes a FastAPI server for production deployment. The model loads once at startup; all subsequent requests are pure graph replay (~44ms).
+FlashRT includes a FastAPI server for production deployment. The model loads once at startup; all subsequent requests are pure graph replay (~44ms).
 
 ### Quick start
 
@@ -754,7 +754,7 @@ only supported on Pi0.5 torch.** The gate applies in two directions:
 
 ```python
 # Production-recommended — single flag, best-known config:
-model = flash_vla.load_model(
+model = flash_rt.load_model(
     checkpoint,
     config="pi05",
     use_fp4=True,
@@ -765,7 +765,7 @@ model = flash_vla.load_model(
 #   use_p1_split_gu=True           # production P1 path
 
 # Advanced: override sub-flags for A/B or debug:
-model = flash_vla.load_model(
+model = flash_rt.load_model(
     checkpoint, config="pi05",
     use_fp4=True,
     fp4_layers=(7, 8, 9),       # conservative subset
@@ -820,7 +820,7 @@ round-trip. A fp8-dequant fallback path exists if direct fp16 load fails.
 
 - SM100+ GPU with Blackwell Tensor Cores (validated on Thor SM110).
   Hardware without NVFP4 support silently falls back to FP8.
-- `flash_vla_fp4.so` extension built alongside `flash_vla_kernels.so`
+- `flash_rt_fp4.so` extension built alongside `flash_rt_kernels.so`
   (automatic in standard install).
 
 ### Validation

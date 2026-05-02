@@ -1,5 +1,5 @@
 // ================================================================
-// FlashVLA — Elementwise kernel declarations
+// FlashRT — Elementwise kernel declarations
 // Residual add, gate multiply, bias residual
 // Supports: __half (FP16), __nv_bfloat16 (BF16)
 // ================================================================

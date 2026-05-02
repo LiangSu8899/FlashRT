@@ -1,8 +1,8 @@
-# FlashVLA Architecture
+# FlashRT Architecture
 
-> **Target audience**: anyone trying to understand what FlashVLA *is* as a system — not how to add a model (see [`adding_new_model.md`](adding_new_model.md)) or how a specific kernel works (see [`kernel_catalog.md`](kernel_catalog.md)). This doc names the eight infrastructure components that make up FlashVLA, says where each one lives in the repo, and explains how they compose into a working inference engine.
+> **Target audience**: anyone trying to understand what FlashRT *is* as a system — not how to add a model (see [`adding_new_model.md`](adding_new_model.md)) or how a specific kernel works (see [`kernel_catalog.md`](kernel_catalog.md)). This doc names the eight infrastructure components that make up FlashRT, says where each one lives in the repo, and explains how they compose into a working inference engine.
 >
-> **TL;DR**: FlashVLA is **not** a compiler, a graph rewriter, or a serving runtime. It is a **kernel library plus six infrastructure components** wired together by a thin per-model pipeline. Every component has a single responsibility, a stable API, and a clear file in the tree. Adding a new model touches at most one file per component.
+> **TL;DR**: FlashRT is **not** a compiler, a graph rewriter, or a serving runtime. It is a **kernel library plus six infrastructure components** wired together by a thin per-model pipeline. Every component has a single responsibility, a stable API, and a clear file in the tree. Adding a new model touches at most one file per component.
 
 ---
 
@@ -11,20 +11,20 @@
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │  1. Public API                                               │
-│     flash_vla/api.py — load_model() + VLAModel.predict()     │
+│     flash_rt/api.py — load_model() + VLAModel.predict()     │
 └──────────────────────────────────────────────────────────────┘
         │ resolves (config, framework, arch) → frontend class
         ↓
 ┌──────────────────────────────────────────────────────────────┐
 │  2. Hardware Dispatch Map                                    │
-│     flash_vla/hardware/__init__.py::_PIPELINE_MAP            │
+│     flash_rt/hardware/__init__.py::_PIPELINE_MAP            │
 │     (config, framework, arch) → (module, class)              │
 └──────────────────────────────────────────────────────────────┘
         │ instantiates per-(framework × hardware) frontend
         ↓
 ┌──────────────────────────────────────────────────────────────┐
 │  3. Frontend (per (model, framework, hardware) triple)       │
-│     flash_vla/frontends/{torch,jax}/<model>_<arch>.py        │
+│     flash_rt/frontends/{torch,jax}/<model>_<arch>.py        │
 │     - Loads weights via WEIGHT_SPEC                          │
 │     - Builds AttentionSpec, gets AttentionBackend            │
 │     - Drives Calibration                                     │
@@ -33,32 +33,32 @@
         │ uses
         ├─→ ┌────────────────────────────────────────────────┐
         │   │  4. Weight Loading (declarative)               │
-        │   │     flash_vla/executors/weight_loader.py       │
+        │   │     flash_rt/executors/weight_loader.py       │
         │   │     ModelWeightSpec → WeightLoader.run()       │
         │   └────────────────────────────────────────────────┘
         ├─→ ┌────────────────────────────────────────────────┐
         │   │  5. Attention Backend (protocol)               │
-        │   │     flash_vla/hardware/backend.py              │
+        │   │     flash_rt/hardware/backend.py              │
         │   │     AttentionSpec → AttentionBackend impl      │
         │   └────────────────────────────────────────────────┘
         ├─→ ┌────────────────────────────────────────────────┐
         │   │  6. Calibration Framework                      │
-        │   │     flash_vla/core/quant/calibrator.py         │
-        │   │     ckpt_hash + Se → ~/.flash_vla/calibration  │
+        │   │     flash_rt/core/quant/calibrator.py         │
+        │   │     ckpt_hash + Se → ~/.flash_rt/calibration  │
         │   └────────────────────────────────────────────────┘
         └─→ ┌────────────────────────────────────────────────┐
             │  7. CUDA Graph Capture                         │
-            │     flash_vla/core/cuda_graph.py               │
+            │     flash_rt/core/cuda_graph.py               │
             │     forward(int_ptrs) → captured graph         │
             └────────────────────────────────────────────────┘
                             │ calls
                             ↓
 ┌──────────────────────────────────────────────────────────────┐
 │  8. Kernel Library (the .so files)                           │
-│     flash_vla/flash_vla_kernels.so   (~98 entries)           │
-│     flash_vla/flash_vla_fp4.so       (~23 entries, SM120)    │
-│     flash_vla/flash_vla_fa2.so       (vendored FA2, RTX)     │
-│     flash_vla/libfmha_fp16_strided.so (Thor / SM100+)        │
+│     flash_rt/flash_rt_kernels.so   (~98 entries)           │
+│     flash_rt/flash_rt_fp4.so       (~23 entries, SM120)    │
+│     flash_rt/flash_rt_fa2.so       (vendored FA2, RTX)     │
+│     flash_rt/libfmha_fp16_strided.so (Thor / SM100+)        │
 │     csrc/ — source                                           │
 └──────────────────────────────────────────────────────────────┘
 ```
@@ -69,12 +69,12 @@ The frontend is the only file you write per model. Everything below it is shared
 
 ## 2. Component-by-component
 
-### 2.1 Public API (`flash_vla/api.py`)
+### 2.1 Public API (`flash_rt/api.py`)
 
 The single entry point. Two functions:
 
 ```python
-model = flash_vla.load_model(checkpoint, config="pi05", framework="torch")
+model = flash_rt.load_model(checkpoint, config="pi05", framework="torch")
 actions = model.predict(images=..., prompt=...)
 ```
 
@@ -87,16 +87,16 @@ The API is stable and deliberately small. It does *not* expose attention backend
 
 See [`stable_api.md`](stable_api.md) for the full surface.
 
-### 2.2 Hardware Dispatch Map (`flash_vla/hardware/__init__.py`)
+### 2.2 Hardware Dispatch Map (`flash_rt/hardware/__init__.py`)
 
 A single dict — the **only** place in the codebase that knows which frontend handles which hardware:
 
 ```python
 _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
-    ("pi05",   "torch", "thor"):       ("flash_vla.frontends.torch.pi05_thor",       "Pi05TorchFrontendThor"),
-    ("pi05",   "torch", "rtx_sm120"):  ("flash_vla.frontends.torch.pi05",            "Pi05TorchFrontendRtx"),
-    ("pi05",   "jax",   "thor"):       ("flash_vla.frontends.jax.pi05_thor",         "Pi05JaxFrontendThor"),
-    ("groot",  "torch", "thor"):       ("flash_vla.frontends.torch.groot_thor",      "GrootTorchFrontendThor"),
+    ("pi05",   "torch", "thor"):       ("flash_rt.frontends.torch.pi05_thor",       "Pi05TorchFrontendThor"),
+    ("pi05",   "torch", "rtx_sm120"):  ("flash_rt.frontends.torch.pi05",            "Pi05TorchFrontendRtx"),
+    ("pi05",   "jax",   "thor"):       ("flash_rt.frontends.jax.pi05_thor",         "Pi05JaxFrontendThor"),
+    ("groot",  "torch", "thor"):       ("flash_rt.frontends.torch.groot_thor",      "GrootTorchFrontendThor"),
     # … one row per (model, framework, arch) triple
 }
 ```
@@ -105,7 +105,7 @@ External plugins extend the map at import time without forking the repo. See [`p
 
 This is the simplest possible dispatcher. There is no plugin manifest, no entry-points scanning, no manifest YAML. The map is python and explicit.
 
-### 2.3 Frontend (`flash_vla/frontends/{torch,jax}/<model>_<arch>.py`)
+### 2.3 Frontend (`flash_rt/frontends/{torch,jax}/<model>_<arch>.py`)
 
 The frontend is the per-model file. It is the *only* piece a new model adds.
 
@@ -123,7 +123,7 @@ A frontend is typically 800–1500 LOC, all linear. There is no inheritance hier
 
 The four shipped models each have between two and four frontends (one per `(framework, arch)` combination). They do not share code in the forward path; they share code through components 4–8.
 
-### 2.4 Weight Loading (`flash_vla/executors/weight_loader.py`)
+### 2.4 Weight Loading (`flash_rt/executors/weight_loader.py`)
 
 A declarative description of how every weight tensor in a checkpoint maps to module attributes, including transforms (transpose, fuse-norm, FP8 quant) and quantization scales.
 
@@ -147,7 +147,7 @@ The runner is framework-agnostic. Concrete `WeightSource` implementations exist 
 
 Full doc: [`extension/weight_spec.md`](extension/weight_spec.md).
 
-### 2.5 Attention Backend (`flash_vla/hardware/backend.py`)
+### 2.5 Attention Backend (`flash_rt/hardware/backend.py`)
 
 A protocol with two key methods:
 
@@ -161,12 +161,12 @@ A *site* is a distinct attention shape (e.g. SigLIP vision, PaliGemma encoder, P
 
 Full doc: [`extension/attention_backend.md`](extension/attention_backend.md).
 
-### 2.6 Calibration Framework (`flash_vla/core/quant/calibrator.py`)
+### 2.6 Calibration Framework (`flash_rt/core/quant/calibrator.py`)
 
 FP8 calibration is a *framework*, not a per-model script. It owns:
 
 - Cache key derivation (`{ckpt_hash}_Se{N}.json`) — survives checkpoint swaps and seq-length changes.
-- Cache location (`~/.flash_vla/calibration/`) — same path across models, configs, frameworks.
+- Cache location (`~/.flash_rt/calibration/`) — same path across models, configs, frameworks.
 - Save / load JSON shape per model — known fields plus a free-form `extra` map for model-specific scales.
 - A two-phase flow: (a) measurement pass that records amax per FP8 GEMM input, (b) refit pass that compounds `alpha = act_scale × weight_scale` and bakes them as host scalars into the captured graph.
 
@@ -174,26 +174,26 @@ A frontend writes `_calibrate(self, sample_obs)` that follows the protocol; ever
 
 Full doc: [`extension/calibration.md`](extension/calibration.md). Mechanics doc: [`calibration.md`](calibration.md).
 
-### 2.7 CUDA Graph Capture (`flash_vla/core/cuda_graph.py`)
+### 2.7 CUDA Graph Capture (`flash_rt/core/cuda_graph.py`)
 
-A small helper that wraps `torch.cuda.CUDAGraph` (and a JAX equivalent) with two FlashVLA-specific extensions:
+A small helper that wraps `torch.cuda.CUDAGraph` (and a JAX equivalent) with two FlashRT-specific extensions:
 
 - **Pointer-only forward**: the captured forward must take only `int` device pointers. No torch tensors, no JAX arrays. This is enforced at capture time and prevents accidental allocations during replay.
 - **Tactic-stable autotune**: optionally re-captures up to N times and keeps the fastest schedule. Works around Myelin / cuBLASLt tactic non-determinism on Thor (~2ms variance per capture).
 
 The captured graph is stored as `self._enc_ae_graph` on the frontend. Replay is `graph.replay()` plus a sync. No `.engine` file. No serialization. The graph lives in memory for the process lifetime; restart = re-capture (~50–500 ms on warm cache).
 
-### 2.8 Kernel Library (`flash_vla/*.so`, source under `csrc/`)
+### 2.8 Kernel Library (`flash_rt/*.so`, source under `csrc/`)
 
 The bottom of the stack. Hand-written CUDA kernels for the memory-bound ops (norm, activation, residual + norm + quant fusions, qkv split + RoPE, patch embed, etc.) plus thin wrappers around cuBLASLt FP8 GEMM, CUTLASS SM100 FP8 GEMM, vendored FlashAttention-2, and Thor's CUTLASS FMHA.
 
-Three modules, all loaded by `import flash_vla`:
+Three modules, all loaded by `import flash_rt`:
 
 | Module | Always built | Contents |
 |---|---|---|
-| `flash_vla_kernels.so` | yes | ~98 pybind entries: norm / activation / fusion / quant / GEMM / attention / RoPE / utils |
-| `flash_vla_fp4.so` | SM100+ only | ~23 entries: NVFP4 weight prep + SM120 block-scaled GEMM |
-| `flash_vla_fa2.so` | RTX only | 2 entries: FA2 fp16 / bf16 forward |
+| `flash_rt_kernels.so` | yes | ~98 pybind entries: norm / activation / fusion / quant / GEMM / attention / RoPE / utils |
+| `flash_rt_fp4.so` | SM100+ only | ~23 entries: NVFP4 weight prep + SM120 block-scaled GEMM |
+| `flash_rt_fa2.so` | RTX only | 2 entries: FA2 fp16 / bf16 forward |
 
 Full inventory: [`kernel_catalog.md`](kernel_catalog.md). Fusion patterns and naming conventions: [`kernel_fusion.md`](kernel_fusion.md).
 
@@ -235,7 +235,7 @@ The current architecture is shaped by the small-batch realtime workload:
 
 1. **Direct kernel composition** — the runtime executes the kernel sequence the frontend wrote, in the order written. The author of the frontend is the optimizer; there is no graph compiler / tactic search in the runtime today. Adding compiler-driven optimization passes is a possible direction; the current shape works because the target shape space is small enough for hand-tuned choices to be competitive.
 2. **Static KV cache layout** — KV caches are per-layer device buffers, sized at construction. Pi0-FAST does decode-time KV writes into these pre-sized slots. Paging / eviction / cross-request sharing is not what the current design does, but the pointer-stable backend protocol leaves room for richer KV management when a workload needs it.
-3. **Batching captured into the graph** — small batches (CFG, multi-policy, multi-frame) are supported within a captured graph. Cross-request continuous batching across users is the workload vLLM / SGLang are shaped for; FlashVLA can be deployed as one process per captured graph today, and a serving layer that fans out to FlashVLA workers is an explicit extension path. See [`inference_engine_differences.md`](inference_engine_differences.md) for the workload framing.
+3. **Batching captured into the graph** — small batches (CFG, multi-policy, multi-frame) are supported within a captured graph. Cross-request continuous batching across users is the workload vLLM / SGLang are shaped for; FlashRT can be deployed as one process per captured graph today, and a serving layer that fans out to FlashRT workers is an explicit extension path. See [`inference_engine_differences.md`](inference_engine_differences.md) for the workload framing.
 
 ---
 
@@ -243,17 +243,17 @@ The current architecture is shaped by the small-batch realtime workload:
 
 | Component | Source | Line count (approx) |
 |---|---|---|
-| Public API | `flash_vla/api.py` | 200 |
-| Hardware dispatch | `flash_vla/hardware/__init__.py` | 100 |
-| Frontends | `flash_vla/frontends/{torch,jax}/*.py` | 800–1500 each |
-| Weight Loader | `flash_vla/executors/weight_loader.py` | 330 |
-| Weight sources | `flash_vla/executors/{torch,jax}_weights.py` | 400 each |
-| Attention protocol | `flash_vla/hardware/backend.py` | 405 |
-| Attention backends | `flash_vla/hardware/{thor,rtx}/attn_backend*.py` | 300–600 each |
-| Calibration cache | `flash_vla/core/quant/calibrator.py` | 167 |
+| Public API | `flash_rt/api.py` | 200 |
+| Hardware dispatch | `flash_rt/hardware/__init__.py` | 100 |
+| Frontends | `flash_rt/frontends/{torch,jax}/*.py` | 800–1500 each |
+| Weight Loader | `flash_rt/executors/weight_loader.py` | 330 |
+| Weight sources | `flash_rt/executors/{torch,jax}_weights.py` | 400 each |
+| Attention protocol | `flash_rt/hardware/backend.py` | 405 |
+| Attention backends | `flash_rt/hardware/{thor,rtx}/attn_backend*.py` | 300–600 each |
+| Calibration cache | `flash_rt/core/quant/calibrator.py` | 167 |
 | Calibration runner | per-frontend `_calibrate()` | 100–200 |
-| CUDA Graph helper | `flash_vla/core/cuda_graph.py` | 150 |
-| Kernel library | `csrc/`, built into `flash_vla/*.so` | (see catalog) |
+| CUDA Graph helper | `flash_rt/core/cuda_graph.py` | 150 |
+| Kernel library | `csrc/`, built into `flash_rt/*.so` | (see catalog) |
 
 The whole infrastructure side (excluding kernels and frontends) is **~3000 lines**. Eight files. Adding a new model is a frontend; everything else is reused unchanged.
 

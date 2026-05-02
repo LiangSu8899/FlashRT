@@ -1,4 +1,4 @@
-"""FlashVLA -- RTX GROOT N1.6 torch frontend.
+"""FlashRT -- RTX GROOT N1.6 torch frontend.
 
 Loads HuggingFace GR00T-N1.6-3B safetensors checkpoints and drives the
 framework-agnostic ``GrootSigLIP2`` / ``GrootQwen3`` / ``GrootDiT`` classes

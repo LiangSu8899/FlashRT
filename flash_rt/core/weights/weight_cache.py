@@ -1,4 +1,4 @@
-"""FlashVLA — FP8 Weight Cache.
+"""FlashRT — FP8 Weight Cache.
 
 Caches FP8-quantized engine weights to disk after first load.
 Subsequent loads skip Orbax read + transform + FP8 quantize (~42s → ~5s).
@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 WEIGHT_CACHE_DIR = Path.home() / ".flash_rt" / "weights"
 CACHE_VERSION = 1
-MAGIC = b"FVW1"  # FlashVLA Weights v1
+MAGIC = b"FVW1"  # FlashRT Weights v1
 
 
 def _cache_path(ckpt_hash: str, num_views: int) -> Path:

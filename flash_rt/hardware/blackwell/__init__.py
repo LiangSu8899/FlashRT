@@ -1,4 +1,4 @@
-"""FlashVLA — Blackwell (SM120+) hardware-specific backend.
+"""FlashRT — Blackwell (SM120+) hardware-specific backend.
 
 Reserved for future Blackwell-only code paths (e.g. NVFP4/W4A8 block-scaled
 GEMMs, DSMEM, SM120a-specific CUTLASS templates).

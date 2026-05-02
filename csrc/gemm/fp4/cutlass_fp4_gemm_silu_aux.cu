@@ -1,5 +1,5 @@
 // ============================================================================
-//  FlashVLA P1 — NVFP4 GEMM with fused silu(aux_gate) * acc → fp4 + SFA out.
+//  FlashRT P1 — NVFP4 GEMM with fused silu(aux_gate) * acc → fp4 + SFA out.
 //
 //  STATUS (2026-04-15, Day 1 of P1): COMPILES, RUNTIME FAILS.
 //    Custom FusionOp `LinCombSiLuAuxMulBlockScaleFactor` + FusionCallbacks

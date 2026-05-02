@@ -1,4 +1,4 @@
-"""FlashVLA — Pi0.5 RTX inference pipeline with hardcoded B=2 batched forward.
+"""FlashRT — Pi0.5 RTX inference pipeline with hardcoded B=2 batched forward.
 
 Subclass of :class:`flash_rt.models.pi05.pipeline_rtx.Pi05Pipeline` that
 runs vision + Gemma-2B encoder + Gemma-300M decoder for two independent

@@ -1,4 +1,4 @@
-# FlashVLA — GROOT N1.6 model configuration
+# FlashRT — GROOT N1.6 model configuration
 # Eagle3-VL backbone (SigLIP2 + Qwen3-1.7B) + AlternateVLDiT action head
 name: groot
 

@@ -1,4 +1,4 @@
-"""FlashVLA -- RTX Pi0 torch frontend.
+"""FlashRT -- RTX Pi0 torch frontend.
 
 Mirrors :mod:`flash_rt.frontends.torch.pi05_rtx` but targets Pi0 (not
 Pi0.5): standard RMSNorm decoder, ``state_proj`` + ``action_time_mlp``

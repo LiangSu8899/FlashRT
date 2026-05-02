@@ -1,5 +1,5 @@
 // ============================================================================
-//  FlashVLA — NVFP4 (e2m1 + UE4M3 block-scale, block=16) GEMM for Thor SM110.
+//  FlashRT — NVFP4 (e2m1 + UE4M3 block-scale, block=16) GEMM for Thor SM110.
 //
 //  Minimal C-style entry points used by the pybind layer. Kernel bodies live
 //  in cutlass_fp4_gemm.cu and are based on CUTLASS example 72a

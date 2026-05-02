@@ -1,4 +1,4 @@
-"""FlashVLA — Weight Loader.
+"""FlashRT — Weight Loader.
 
 Loads model checkpoints from multiple formats into a unified
 dict[str, numpy.ndarray] with engine key names.

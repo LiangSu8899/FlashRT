@@ -23,7 +23,7 @@ Two openpi naming patterns are handled by the same code path
 * FeedForward (``parent/X_lora_a``)       — base at ``parent/X``
 
 There is **no PyTorch in the merge path** — the JAX line stays
-JAX-native end to end. Users running the FlashVLA torch frontend
+JAX-native end to end. Users running the FlashRT torch frontend
 have a separate, parallel torch path
 (``training.rl.merge_lora``); the two never need to meet.
 """

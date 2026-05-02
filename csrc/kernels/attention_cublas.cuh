@@ -1,5 +1,5 @@
 // ================================================================
-// FlashVLA — cuBLAS decomposed attention (GQA-compatible)
+// FlashRT — cuBLAS decomposed attention (GQA-compatible)
 // QK^T + softmax + PV, matching pi05 engine exactly.
 // Stateless: receives cuBLAS handle from caller (FvkContext).
 // ================================================================

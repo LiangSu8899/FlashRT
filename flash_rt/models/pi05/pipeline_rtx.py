@@ -1,4 +1,4 @@
-"""FlashVLA — RTX (consumer discrete GPU) Pi0.5 inference pipeline.
+"""FlashRT — RTX (consumer discrete GPU) Pi0.5 inference pipeline.
 
 Framework-agnostic pipeline for Pi0.5 on consumer RTX GPUs (Blackwell SM120
 / Ada SM89, 5090 / 4090). Mirrors the ``flash_rt/hardware/thor/pipeline_pi05.py``

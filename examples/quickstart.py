@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FlashVLA — Quickstart.
+FlashRT — Quickstart.
 
 Usage:
     # PyTorch:
@@ -40,7 +40,7 @@ import flash_rt
 
 
 def main():
-    parser = argparse.ArgumentParser(description="FlashVLA quickstart")
+    parser = argparse.ArgumentParser(description="FlashRT quickstart")
     parser.add_argument('--checkpoint', required=True)
     parser.add_argument('--framework', default='torch', choices=['torch', 'jax'])
     parser.add_argument('--num_views', type=int, default=2)

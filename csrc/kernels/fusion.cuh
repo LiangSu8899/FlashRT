@@ -1,5 +1,5 @@
 // ================================================================
-// FlashVLA — Cross-layer fusion kernel declarations
+// FlashRT — Cross-layer fusion kernel declarations
 // Fused gate*residual + AdaRMSNorm -> FP8
 // Supports: __half (FP16), __nv_bfloat16 (BF16)
 // ================================================================

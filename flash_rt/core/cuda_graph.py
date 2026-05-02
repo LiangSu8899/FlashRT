@@ -1,4 +1,4 @@
-"""FlashVLA — Framework-agnostic CUDA Graph capture/replay.
+"""FlashRT — Framework-agnostic CUDA Graph capture/replay.
 
 Uses CUDA Runtime API directly via ctypes. Works with any framework
 (PyTorch, JAX, or raw CUDA) because it operates at the stream level.

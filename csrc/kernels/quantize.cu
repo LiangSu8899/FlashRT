@@ -1,5 +1,5 @@
 // ================================================================
-// FlashVLA — Quantization kernels (dtype-generic FP8, BF16-only NVFP4)
+// FlashRT — Quantization kernels (dtype-generic FP8, BF16-only NVFP4)
 // FP8 dynamic/static, device-only, L2 prefetch, NVFP4 (SM120+)
 // FP8 kernels support: __half (FP16), __nv_bfloat16 (BF16) input
 // ================================================================

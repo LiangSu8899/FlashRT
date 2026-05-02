@@ -1,4 +1,4 @@
-"""FlashVLA — RTX GROOT N1.6 attention backend.
+"""FlashRT — RTX GROOT N1.6 attention backend.
 
 GROOT has four distinct attention shapes:
 

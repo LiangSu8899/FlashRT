@@ -1,5 +1,5 @@
 // ================================================================
-// FlashVLA — Cross-layer fusion kernels (dtype-generic)
+// FlashRT — Cross-layer fusion kernels (dtype-generic)
 // Fused gate*residual + AdaRMSNorm -> FP8 (decoder optimization)
 // Supports: __half (FP16), __nv_bfloat16 (BF16) via templates
 // ================================================================

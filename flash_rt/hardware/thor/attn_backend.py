@@ -1,4 +1,4 @@
-"""FlashVLA — Thor attention backend.
+"""FlashRT — Thor attention backend.
 
 Implements the AttentionBackend protocol (``flash_rt/hardware/backend.py``)
 on Thor SM110 using the fvk attention primitives. Pipeline-owned memory

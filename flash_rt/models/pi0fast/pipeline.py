@@ -1,4 +1,4 @@
-"""FlashVLA -- Thor SM110 + RTX 5090 SM120 Pipeline for Pi0-FAST.
+"""FlashRT -- Thor SM110 + RTX 5090 SM120 Pipeline for Pi0-FAST.
 
 Autoregressive token generation (NOT diffusion).
 Single Gemma 2B model (no separate action expert).

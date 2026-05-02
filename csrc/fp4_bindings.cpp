@@ -1,5 +1,5 @@
 // ============================================================================
-//  FlashVLA — pybind module for NVFP4 kernels.
+//  FlashRT — pybind module for NVFP4 kernels.
 //
 //  Built as a SEPARATE .so from flash_rt_kernels.so (which stays untouched).
 //  Python-side usage:
@@ -29,7 +29,7 @@ extern "C" int flash_rt_per_channel_mul_fp16(
 namespace py = pybind11;
 
 PYBIND11_MODULE(flash_rt_fp4, m) {
-  m.doc() = "FlashVLA — NVFP4 (Thor SM110) add-on kernels";
+  m.doc() = "FlashRT — NVFP4 (Thor SM110) add-on kernels";
 
   // ── GEMM ──
   m.def("cutlass_fp4_sq_fp16",

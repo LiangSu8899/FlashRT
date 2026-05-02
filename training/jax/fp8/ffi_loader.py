@@ -36,7 +36,7 @@ def _candidate_so_paths() -> list[Path]:
     """Return possible install locations of ``flash_rt_jax_ffi.so``."""
     here = Path(__file__).resolve()
     candidates: list[Path] = []
-    # 1. Adjacent to the FlashVLA package: <repo>/flash_rt/flash_rt_jax_ffi.so
+    # 1. Adjacent to the FlashRT package: <repo>/flash_rt/flash_rt_jax_ffi.so
     repo_root = here.parents[3]                       # training/jax/fp8 → repo
     candidates.append(repo_root / "flash_rt" / "flash_rt_jax_ffi.so")
     # 2. CMake build dir during dev: <repo>/build/flash_rt_jax_ffi.so

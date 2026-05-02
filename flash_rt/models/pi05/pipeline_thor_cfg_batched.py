@@ -1,4 +1,4 @@
-"""FlashVLA — Pi0.5 Thor SM110 fused B=2 classifier-free-guidance pipeline.
+"""FlashRT — Pi0.5 Thor SM110 fused B=2 classifier-free-guidance pipeline.
 
 Single-inheritance subclass of
 :class:`flash_rt.models.pi05.pipeline_thor_batched.Pi05ThorBatchedPipeline`

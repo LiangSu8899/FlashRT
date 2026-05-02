@@ -1,6 +1,6 @@
-# FlashVLA New-Model Template
+# FlashRT New-Model Template
 
-Skeleton package for adding a new VLA model to FlashVLA. Targets the
+Skeleton package for adding a new VLA model to FlashRT. Targets the
 **most common shape**: vision encoder (SigLIP-style) + LLM backbone
 (Gemma/LLaMA-style transformer with KV cache) + diffusion-style
 action decoder. If your model is autoregressive (Pi0-FAST-like) or
@@ -8,7 +8,7 @@ multi-stage (GROOT-like), copy this template anyway and read
 `pi0fast.py` / `groot_thor.py` for the structural delta.
 
 **Audience**: ML-infra engineers who already have the source model
-running in PyTorch and want to deploy it on FlashVLA-supported
+running in PyTorch and want to deploy it on FlashRT-supported
 hardware (Thor / RTX). You should already understand FP8
 quantization, KV cache layouts, and CUDA Graph capture. We do not
 re-explain those here.
@@ -29,7 +29,7 @@ _template/
 For your new model `mymodel`, the final layout will be:
 
 ```
-flash_vla/
+flash_rt/
 ├── frontends/torch/mymodel_thor.py     ← copy of frontend.py
 ├── frontends/torch/_mymodel_thor_spec.py ← copy of weights_spec.py
 ├── models/mymodel/pipeline_thor.py     ← copy of pipeline.py
@@ -46,7 +46,7 @@ file per `(model, hardware)`. See `docs/adding_new_model.md` §0.)
 1. **README.md** (this file) — understand the file split and what
    each file is responsible for
 2. `weights_spec.py` — start here. Mapping your checkpoint's tensor
-   names to the FlashVLA weight slots is the most concrete first step.
+   names to the FlashRT weight slots is the most concrete first step.
 3. `attention.py` — only ~60 lines, declares your model's attention
    sites (encoder / decoder / vision)
 4. `pipeline.py` — translate your model's forward pass into a sequence
@@ -61,9 +61,9 @@ this step correspond to in my model".
 
 ---
 
-## Model-code → FlashVLA mapping (the high-level mental model)
+## Model-code → FlashRT mapping (the high-level mental model)
 
-| Your model code | FlashVLA equivalent | Where it lives in template |
+| Your model code | FlashRT equivalent | Where it lives in template |
 |---|---|---|
 | `MyModel.from_pretrained(ckpt)` (loads safetensors) | `_load_weights()` (loads safetensors + does FP8 quant) | `frontend.py` STEP 1 + `weights_spec.py` |
 | `state_dict["encoder.layers.5.self_attn.q_proj.weight"]` | `WEIGHT_SPEC` entry: `("encoder", 5, "qkv")` → `Quant("fp8")` | `weights_spec.py` |
@@ -78,7 +78,7 @@ this step correspond to in my model".
 | First `model(...)` call (warm-up) | `_recalibrate_with_real_data()` + `_capture_enc_ae_graph()` | `frontend.py` STEP 5 |
 | Subsequent `model(...)` calls | `infer(obs)` → `cudaGraphLaunch(self._enc_ae_graph)` | `frontend.py` STEP 6 |
 
-**Key insight**: FlashVLA replaces your model's `forward()` with a
+**Key insight**: FlashRT replaces your model's `forward()` with a
 fully captured CUDA Graph. The "code" you write in `pipeline.py` is
 NOT executed at inference time — it runs once during graph capture,
 and from then on the graph is replayed. This is why all kernel
@@ -114,9 +114,9 @@ debug session.
    marker from your copies of these files
 2. Move the files to their final paths (see "Files in this template"
    above)
-3. Add 4 lines to `flash_vla/hardware/__init__.py::_PIPELINE_MAP` to
+3. Add 4 lines to `flash_rt/hardware/__init__.py::_PIPELINE_MAP` to
    register your frontend
-4. Write a config YAML at `flash_vla/configs/mymodel.yaml` (see any
+4. Write a config YAML at `flash_rt/configs/mymodel.yaml` (see any
    existing config for the shape)
 5. Add one segment to `tests/test_all_models_precision.py`
 6. Run the full validation protocol in `docs/adding_new_model.md` §3

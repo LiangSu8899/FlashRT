@@ -1,5 +1,5 @@
 // ================================================================
-// FlashVLA — RoPE kernels
+// FlashRT — RoPE kernels
 // Standard RoPE, QKV split, fused QKV split + RoPE
 // ================================================================
 

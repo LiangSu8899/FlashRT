@@ -1,4 +1,4 @@
-"""FlashVLA -- Pi0 model pipelines.
+"""FlashRT -- Pi0 model pipelines.
 
 Per the unified pipeline_<hw>.py contract:
     pipeline_thor.py  - Thor SM110 decoder forward fns (Pi0 standard

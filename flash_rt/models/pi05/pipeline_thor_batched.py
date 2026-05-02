@@ -1,4 +1,4 @@
-"""FlashVLA — Pi0.5 Thor SM110 batched (B>=1) inference pipeline.
+"""FlashRT — Pi0.5 Thor SM110 batched (B>=1) inference pipeline.
 
 Companion to :mod:`flash_rt.models.pi05.pipeline_thor` which holds
 the B=1 main-line single-sample inference path. This module isolates

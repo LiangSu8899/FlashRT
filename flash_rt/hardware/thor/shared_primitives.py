@@ -1,4 +1,4 @@
-"""FlashVLA -- Thor SM110 model-agnostic primitives, B=1 main-line path.
+"""FlashRT -- Thor SM110 model-agnostic primitives, B=1 main-line path.
 
 Closed set of Thor SM110 helpers + forward functions reused across
 all models. Per the unified pipeline contract (docs/adding_new_model

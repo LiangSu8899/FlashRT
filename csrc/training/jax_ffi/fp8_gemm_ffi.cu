@@ -1,5 +1,5 @@
 // ================================================================
-// FlashVLA training/jax_ffi: XLA FFI handler for FP8 GEMM.
+// FlashRT training/jax_ffi: XLA FFI handler for FP8 GEMM.
 //
 // Delegates to GemmRunner::fp8_nn_dev (csrc/gemm/gemm_runner.cu),
 // the same kernel the PyTorch training path drives via pybind. The

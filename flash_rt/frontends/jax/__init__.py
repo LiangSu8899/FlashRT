@@ -1,1 +1,1 @@
-"""FlashVLA — JAX frontends (Orbax checkpoint loaders)."""
+"""FlashRT — JAX frontends (Orbax checkpoint loaders)."""

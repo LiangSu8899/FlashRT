@@ -1,4 +1,4 @@
-"""FlashVLA — GROOT N1.6 Pipeline for Thor SM110.
+"""FlashRT — GROOT N1.6 Pipeline for Thor SM110.
 
 Composes flash_rt_kernels into full GROOT inference pipeline.
 Architecture: Eagle3-VL (SigLIP2 + Qwen3-1.7B) + AlternateVLDiT

@@ -1,8 +1,8 @@
-# FlashVLA Optimization Details
+# FlashRT Optimization Details
 
 > Pi0.5 on Jetson AGX Thor (SM110, 20 SMs, 225 GB/s DRAM, 32 MB L2)
 > Baseline: mlir-tensorrt + Myelin compiler engine v1.6-L2 = **70.2 ms**
-> FlashVLA: Hand-written C++/CUDA pipeline = **44 ms (CUDA Graph)**
+> FlashRT: Hand-written C++/CUDA pipeline = **44 ms (CUDA Graph)**
 > Improvement: **-26.2 ms (37.3% faster)**
 
 ---
@@ -11,7 +11,7 @@
 
 ### 1.1 Kernel Fusion (Memory-Bound Op Elimination)
 
-FlashVLA fuses memory-bound ops that the compiler treats as separate kernels. On Thor, all non-GEMM ops are bandwidth-bound (D=2048 or 1024, 20 SMs). Each standalone kernel incurs DRAM read + write + launch overhead.
+FlashRT fuses memory-bound ops that the compiler treats as separate kernels. On Thor, all non-GEMM ops are bandwidth-bound (D=2048 or 1024, 20 SMs). Each standalone kernel incurs DRAM read + write + launch overhead.
 
 | Fused Kernel | Replaces (Compiler) | Passes Saved | Where |
 |---|---|---|---|
@@ -22,7 +22,7 @@ FlashVLA fuses memory-bound ops that the compiler treats as separate kernels. On
 | `gate_geglu_merged_fp8` | gelu_approx + gate_mul + memset + amax + quant + descale | 5→1 | Encoder (18L), Decoder (18L×10) |
 | `siglip_layernorm_1read` | 3-pass layernorm (mean, var, normalize) | 3→1 | SigLIP (27L) |
 
-**Total kernel launches eliminated**: Compiler engine has **~5,300 layers / ~21,000 kernel launches** per inference. FlashVLA has ~13 kernels/decoder-layer × 180 blocks + ~500 encoder+siglip = **~2,840 kernel launches**. Reduction: **~18,000 launches eliminated (85%)**.
+**Total kernel launches eliminated**: Compiler engine has **~5,300 layers / ~21,000 kernel launches** per inference. FlashRT has ~13 kernels/decoder-layer × 180 blocks + ~500 encoder+siglip = **~2,840 kernel launches**. Reduction: **~18,000 launches eliminated (85%)**.
 
 ### 1.2 FP8 Static Quantization (Dynamic→Static Conversion)
 
@@ -33,7 +33,7 @@ Compiler (per GEMM):
   activation → amax_reduce → compute_scale → quantize_fp8 → GEMM → dequantize
   = 4 extra kernels + 1 device-sync (amax) per GEMM
 
-FlashVLA (per GEMM):
+FlashRT (per GEMM):
   activation (already FP8 from fused preceding kernel) → GEMM(descale=precomputed)
   = 0 extra kernels, scale is a compile-time constant
 ```
@@ -46,7 +46,7 @@ FlashVLA (per GEMM):
 
 Standard RMSNorm: `y = x / rms(x) * (1 + weight)`. The `(1 + weight)` is constant per layer.
 
-**FlashVLA**: Fuse `(1 + weight)` into the **following GEMM weight** at load time:
+**FlashRT**: Fuse `(1 + weight)` into the **following GEMM weight** at load time:
 
 ```python
 # At weight load (once):
@@ -67,9 +67,9 @@ Pi0.5 decoder uses AdaRMSNorm with learned modulation: `y = adarms(x, style)` wh
 
 **Compiler (v1.0-v1.4)**: 370 Dense GEMMs computed **inside the engine** every inference.
 
-**FlashVLA + Compiler v1.6-L2**: Precompute all `style` vectors on CPU at prompt-set time. Inject as constants → 370 Dense GEMMs removed from GPU graph.
+**FlashRT + Compiler v1.6-L2**: Precompute all `style` vectors on CPU at prompt-set time. Inject as constants → 370 Dense GEMMs removed from GPU graph.
 
-**Impact**: -5.5 ms (compiler v1.4→v1.6-L2), replicated in FlashVLA as Python precompute in `set_prompt()`.
+**Impact**: -5.5 ms (compiler v1.4→v1.6-L2), replicated in FlashRT as Python precompute in `set_prompt()`.
 
 ### 1.5 Vectorized Memory Access
 
@@ -86,9 +86,9 @@ The entire pipeline (SigLIP + PostLN + Encoder + Decoder) is captured as CUDA Gr
 
 **Compiler engine**: Already uses CUDA Graph internally (TRT engine execution). However, the graph contains **21,000+ nodes** with Myelin's fine-grained kernel scheduling.
 
-**FlashVLA**: Graph contains **~2,840 nodes** (7.4x fewer). Fewer nodes = faster graph instantiation + less scheduling overhead.
+**FlashRT**: Graph contains **~2,840 nodes** (7.4x fewer). Fewer nodes = faster graph instantiation + less scheduling overhead.
 
-**Graph autotune**: CUDA Graph instantiation on Thor is non-deterministic (±2ms variance). FlashVLA recaptures until a fast schedule is found. Typical: 0-1 retries needed.
+**Graph autotune**: CUDA Graph instantiation on Thor is non-deterministic (±2ms variance). FlashRT recaptures until a fast schedule is found. Typical: 0-1 retries needed.
 
 ---
 
@@ -96,7 +96,7 @@ The entire pipeline (SigLIP + PostLN + Encoder + Decoder) is captured as CUDA Gr
 
 ### 2.1 Component Comparison
 
-| Component | Compiler v1.6-L2 | FlashVLA | Delta | Notes |
+| Component | Compiler v1.6-L2 | FlashRT | Delta | Notes |
 |---|---|---|---|---|
 | **SigLIP** (27L vision) | 1.0 ms | 6.3 ms | +5.3 ms | See §2.2 |
 | **Encoder** (18L VLM) | 36.9 ms | 19.8 ms | **-17.1 ms** | See §2.3 |
@@ -105,7 +105,7 @@ The entire pipeline (SigLIP + PostLN + Encoder + Decoder) is captured as CUDA Gr
 | **Python/Host** | ~0 ms | 2.1 ms | +2.1 ms | Image preprocessing + output |
 | **Total** | **~74 ms** (nsys) / **70.2 ms** (CUDA events) | **44 ms** | **-26 ms** | |
 
-> Note: Compiler's "74 ms nsys" vs "70.2 ms CUDA events" gap is due to nsys profiling overhead. FlashVLA's 44 ms is CUDA events measurement (wall-clock `perf_counter` with `cudaStreamSynchronize`).
+> Note: Compiler's "74 ms nsys" vs "70.2 ms CUDA events" gap is due to nsys profiling overhead. FlashRT's 44 ms is CUDA events measurement (wall-clock `perf_counter` with `cudaStreamSynchronize`).
 
 ### 2.2 SigLIP: Why Compiler is Faster (1.0 ms vs 6.3 ms)
 
@@ -114,15 +114,15 @@ The compiler engine benefits from **Myelin's global fusion** across SigLIP's 27 
 - LayerNorm + GELU + bias fused as GEMM epilogues
 - Entire 27-layer stack shares L2 cache optimally (Myelin schedules for L2 residency)
 
-FlashVLA uses **cuBLASLt FP8 GEMM** + separate custom kernels for norm/activation:
+FlashRT uses **cuBLASLt FP8 GEMM** + separate custom kernels for norm/activation:
 - 27 layers × ~6 kernels/layer = ~162 kernel launches (vs compiler's ~138 with deeper fusion)
 - FP8 weight reduces DRAM traffic (15 MB/layer < 32 MB L2), partially compensating
 
 **This is the one area where the compiler approach wins.** SigLIP's large batch (S=512) and simple attention (no RoPE, no cross-attention) is ideal for Myelin's fusion.
 
-### 2.3 Encoder: FlashVLA 17.1 ms Faster
+### 2.3 Encoder: FlashRT 17.1 ms Faster
 
-| Sub-component | Compiler v1.6-L2 | FlashVLA | Delta | Root Cause |
+| Sub-component | Compiler v1.6-L2 | FlashRT | Delta | Root Cause |
 |---|---|---|---|---|
 | FFN GEMMs (gate_up + down) | 15.8 ms | 9.2 ms | **-6.6 ms** | cuBLASLt tactic vs Myelin CUTLASS |
 | Attention (QKV + softmax + attn@V) | 7.1 ms | 4.3 ms | **-2.8 ms** | cuBLAS attention vs Myelin kgen+GEMM |
@@ -133,13 +133,13 @@ FlashVLA uses **cuBLASLt FP8 GEMM** + separate custom kernels for norm/activatio
 | **Total** | **36.9 ms** | **19.8 ms** | **-17.1 ms** | |
 
 **Key wins**:
-1. **No data movement**: Compiler inserts MoveConcat/Transpose for layout conversion between ops. FlashVLA uses consistent row-major layout throughout — zero explicit transposes.
-2. **Fused norm+FP8**: Compiler has separate RMSNorm → QDQ → Quantize → GEMM. FlashVLA: `rms_norm_fp8_static` produces FP8 output directly.
+1. **No data movement**: Compiler inserts MoveConcat/Transpose for layout conversion between ops. FlashRT uses consistent row-major layout throughout — zero explicit transposes.
+2. **Fused norm+FP8**: Compiler has separate RMSNorm → QDQ → Quantize → GEMM. FlashRT: `rms_norm_fp8_static` produces FP8 output directly.
 3. **cuBLASLt vs Myelin tactic**: For Se=522 (encoder sequence), cuBLASLt selects better CUTLASS configurations than Myelin's tactic search for some shapes.
 
-### 2.4 Decoder (AE): FlashVLA 11.6 ms Faster
+### 2.4 Decoder (AE): FlashRT 11.6 ms Faster
 
-| Sub-component | Compiler v1.6-L2 | FlashVLA | Delta | Root Cause |
+| Sub-component | Compiler v1.6-L2 | FlashRT | Delta | Root Cause |
 |---|---|---|---|---|
 | FP8 GEMMs (QKV+O+GateUp+Down) | 24.2 ms | 15.8 ms | **-8.4 ms** | cuBLASLt + static descale vs Myelin FP8 |
 | Norm + activation + fusion kgen | 11.9 ms | 1.8 ms | **-10.1 ms** | All fused into 3 custom kernels/layer |
@@ -147,7 +147,7 @@ FlashVLA uses **cuBLASLt FP8 GEMM** + separate custom kernels for norm/activatio
 | **Total** | **36.1 ms** | **24.5 ms** | **-11.6 ms** | |
 
 **Key wins**:
-1. **10.1 ms from fusion**: Compiler's ~9,700 kgen launches (norm, GELU, softmax, QDQ) across 180 blocks. FlashVLA replaces with 3 fused kernels per layer: `fused_adarms_fp8_static` + `gate_res_adarms_fp8_static` + `gate_geglu_merged_fp8_fp16`. Despite GPU overlap making kgen "free" in the compiler, FlashVLA's fused approach reduces total graph nodes and improves scheduling.
+1. **10.1 ms from fusion**: Compiler's ~9,700 kgen launches (norm, GELU, softmax, QDQ) across 180 blocks. FlashRT replaces with 3 fused kernels per layer: `fused_adarms_fp8_static` + `gate_res_adarms_fp8_static` + `gate_geglu_merged_fp8_fp16`. Despite GPU overlap making kgen "free" in the compiler, FlashRT's fused approach reduces total graph nodes and improves scheduling.
 2. **8.4 ms from GEMM**: At S=10 (decoder batch), cuBLASLt FP8 with pre-baked descale outperforms Myelin's CUTLASS FP8 + separate descale. Myelin's per-GEMM tactic search advantage diminishes at very small batch sizes where launch overhead dominates.
 
 ---
@@ -181,7 +181,7 @@ FlashVLA uses **cuBLASLt FP8 GEMM** + separate custom kernels for norm/activatio
      ×180 layers                      ~25 ms    (+ GPU overlap → 36ms wall)
 ```
 
-### FlashVLA (per decoder layer, ×180 total)
+### FlashRT (per decoder layer, ×180 total)
 
 ```
 #   Kernel                              Time     Type
@@ -205,7 +205,7 @@ FlashVLA uses **cuBLASLt FP8 GEMM** + separate custom kernels for norm/activatio
 
 ### Key Differences
 
-| Metric | Compiler | FlashVLA | Ratio |
+| Metric | Compiler | FlashRT | Ratio |
 |---|---|---|---|
 | Kernels per layer | 22 | 13 | 0.59x |
 | Compute time per layer | ~139 μs | ~102 μs | 0.73x |
@@ -226,7 +226,7 @@ FlashVLA uses **cuBLASLt FP8 GEMM** + separate custom kernels for norm/activatio
 | v1.4-Wab (gate+up merge) | 75.7 ms | -2.8 ms | 2 GEMM → 1 wide GEMM, halve input QDQ |
 | **v1.6-L2** (Dense precompute) | **70.2 ms** | **-5.5 ms** | 370 Dense removed, graph simplification → better Myelin tactic |
 
-### FlashVLA Path (C++/CUDA hand-written)
+### FlashRT Path (C++/CUDA hand-written)
 
 | Phase | Latency | Delta | Method |
 |---|---|---|---|
@@ -241,7 +241,7 @@ FlashVLA uses **cuBLASLt FP8 GEMM** + separate custom kernels for norm/activatio
 
 ## 5. Where the 26 ms Comes From
 
-Summary of FlashVLA's advantage over compiler v1.6-L2 (70→44 ms):
+Summary of FlashRT's advantage over compiler v1.6-L2 (70→44 ms):
 
 | Category | Savings | Mechanism |
 |---|---|---|
@@ -258,7 +258,7 @@ Summary of FlashVLA's advantage over compiler v1.6-L2 (70→44 ms):
 
 ---
 
-## 6. Why the Compiler Cannot Match FlashVLA
+## 6. Why the Compiler Cannot Match FlashRT
 
 ### Structural Limitation: Opaque Boundary
 
@@ -273,7 +273,7 @@ The decoder operates at S=10 (10 action tokens). At this batch size:
 - All GEMMs are **launch-bound**, not compute-bound
 - Kernel fusion savings (memory traffic) are negligible (< 1 KB intermediate data)
 - **Dispatch overhead dominates**: compiler's 16,480 launches × ~2μs = ~33 ms dispatch cost
-- FlashVLA's 2,340 launches × ~3μs = ~7 ms dispatch cost
+- FlashRT's 2,340 launches × ~3μs = ~7 ms dispatch cost
 - **Dispatch savings alone: ~26 ms** (matches the total improvement)
 
 ### Myelin Tactic Search vs cuBLASLt
@@ -287,9 +287,9 @@ For large shapes (encoder Se=522), cuBLASLt consistently selects better CUTLASS 
 
 ```
 Compiler (Myelin):  Global fusion view → fewer kernels → but limited to Myelin's patterns
-FlashVLA:           No global fusion   → more kernels → but each kernel is purpose-built
+FlashRT:           No global fusion   → more kernels → but each kernel is purpose-built
 
 At large batch (SigLIP S=512):  Myelin's global fusion wins (1 ms vs 6 ms)
-At small batch (Decoder S=10):  FlashVLA's fewer launches wins (24 ms vs 36 ms)
-At medium batch (Encoder S=522): FlashVLA's cuBLASLt + fusion wins (20 ms vs 37 ms)
+At small batch (Decoder S=10):  FlashRT's fewer launches wins (24 ms vs 36 ms)
+At medium batch (Encoder S=522): FlashRT's cuBLASLt + fusion wins (20 ms vs 37 ms)
 ```

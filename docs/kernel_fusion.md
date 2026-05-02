@@ -3,7 +3,7 @@
 > **Target audience**: engineers who need to pick kernels while writing a new model's `pipeline.py` forward, optimize an existing forward path, or evaluate whether a proposed fusion is viable.
 >
 > **TL;DR**:
-> - The library ships **~120 pybind entries across three modules** — `flash_vla_kernels` (98 memory-bound / fp8 / cuBLAS-wrapper / FMHA entries), `flash_vla_fp4` (23 NVFP4 entries), and `flash_vla_fa2` (2 FA2 forward entries). Counts can drift ±a handful between releases; treat the number as "about 100", not exact. `flash_vla_kernels` is organized into 10 groups by purpose (see §2 below).
+> - The library ships **~120 pybind entries across three modules** — `flash_rt_kernels` (98 memory-bound / fp8 / cuBLAS-wrapper / FMHA entries), `flash_rt_fp4` (23 NVFP4 entries), and `flash_rt_fa2` (2 FA2 forward entries). Counts can drift ±a handful between releases; treat the number as "about 100", not exact. `flash_rt_kernels` is organized into 10 groups by purpose (see §2 below).
 > - Fusion is not free: **any rewrite that changes the kernel launch sequence carries Myelin tactic risk**. All 4 historical regressions (see §5) were caused by this.
 > - Current production fusion shape: see [`optimization-details.md`](../optimization-details.md) §1.1; this doc complements it with **how to choose / whether a new model can reuse** the existing kernels.
 > - Adding a brand-new fused kernel requires editing `csrc/` and rebuilding the `.so` (out of scope for this round; separate CUDA dev workflow).
@@ -16,10 +16,10 @@
 
 ### 1.0 Two naming layers: C++ math-primitive vs Python semantic-role
 
-FlashVLA uses **two distinct naming conventions** for the same kernel depending on layer:
+FlashRT uses **two distinct naming conventions** for the same kernel depending on layer:
 
-- **C++ layer** (`csrc/`, symbol names, file names): named after the **math primitive** the kernel implements, e.g. `flash_vla::fused_fp4::silu_mul_two_fp4_to_fp4` — "apply `silu(a) * b` to two fp4 streams, output fp4". The kernel does not know (or care) what a caller uses it for.
-- **Python layer** (`flash_vla_kernels` / `flash_vla_fp4` pybind modules, docs, user-facing API): named after the **semantic role** in the model architecture, e.g. `gate_geglu_merged_fp4`. Different architectures can bind the same C++ primitive under different Python names when the semantics differ.
+- **C++ layer** (`csrc/`, symbol names, file names): named after the **math primitive** the kernel implements, e.g. `flash_rt::fused_fp4::silu_mul_two_fp4_to_fp4` — "apply `silu(a) * b` to two fp4 streams, output fp4". The kernel does not know (or care) what a caller uses it for.
+- **Python layer** (`flash_rt_kernels` / `flash_rt_fp4` pybind modules, docs, user-facing API): named after the **semantic role** in the model architecture, e.g. `gate_geglu_merged_fp4`. Different architectures can bind the same C++ primitive under different Python names when the semantics differ.
 
 Concrete example: Pi0.5 / Pi0 use **GEGLU** (tanh-approx GELU gate) in the encoder FFN. The historical C++ name `silu_mul_two_*` reflects the shared math skeleton (`activation(a) * b`), and the Python binding is exposed as `gate_geglu_*` to reflect the actual activation the model expects. For a true-SiLU architecture (Qwen3, BAGEL) the Python binding is `silu_mul_split_fp8_fp16` — a different Python entry, sometimes the same C++ primitive.
 
@@ -163,7 +163,7 @@ geglu_fp8_static_fp16                      # DiT GELU-variant FFN fusion
 | `attention_qkv_fp16_state_masked` | Pi0 decoder where the first token is a state (masked) | `decoder` kernel=`"state_masked"` |
 | `attention_mha_fp16` | full MHA (GROOT Qwen3 + DiT) | kernel=`"mha"` |
 
-**New-model forwards do not call these directly** — they go through the [`AttentionBackend` protocol](../flash_vla/hardware/backend.py) via `attn.run(site=..., layer_idx=..., ...)`. See [`adding_new_model.md §2.1`](adding_new_model.md).
+**New-model forwards do not call these directly** — they go through the [`AttentionBackend` protocol](../flash_rt/hardware/backend.py) via `attn.run(site=..., layer_idx=..., ...)`. See [`adding_new_model.md §2.1`](adding_new_model.md).
 
 ### 2.5 QKV split / RoPE family
 
@@ -197,7 +197,7 @@ The production path only ever uses `_static_fp16` (after calibration the `d_scal
 
 The same `quantize_fp8_static` kernel is also re-exported on the
 JAX side via the XLA FFI handler `flashvla::quantize_fp8_static`
-in `flash_vla_jax_ffi.so` — the binding is in
+in `flash_rt_jax_ffi.so` — the binding is in
 [`csrc/training/jax_ffi/activation_quantize_ffi.cu`](../csrc/training/jax_ffi/activation_quantize_ffi.cu)
 and contains zero new compute logic (it just forwards the
 caller's CUDA stream + buffer pointers to the same kernel
@@ -230,7 +230,7 @@ load_fmha_library    # load libfmha_fp16.so (legacy)
 load_fmha_strided_library  # load libfmha_fp16_strided.so (required by SigLIP)
 ```
 
-**Pi0-FAST dispatches on hardware via `hasattr(fvk, 'cutlass_fp8_sq')`** (see [`frontends/torch/pi0fast.py`](../flash_vla/frontends/torch/pi0fast.py)). If your new model needs to run on both Thor and RTX, follow the runtime-fork pattern used by Pi0-FAST.
+**Pi0-FAST dispatches on hardware via `hasattr(fvk, 'cutlass_fp8_sq')`** (see [`frontends/torch/pi0fast.py`](../flash_rt/frontends/torch/pi0fast.py)). If your new model needs to run on both Thor and RTX, follow the runtime-fork pattern used by Pi0-FAST.
 
 ---
 
@@ -251,7 +251,7 @@ One Pi0.5 encoder layer is currently **9 kernel launches**, in this order (a tri
 10. cutlass_fp8_wide                             # Down GEMM
 ```
 
-Compared against the Myelin-compiled version (70.2ms) which implements the same logic in **~20 kernels**, FlashVLA has folded 3+3 elementwise + quant ops into the fused RMSNorm (steps 1 and 7) and another 3 into `gate_geglu` (step 9).
+Compared against the Myelin-compiled version (70.2ms) which implements the same logic in **~20 kernels**, FlashRT has folded 3+3 elementwise + quant ops into the fused RMSNorm (steps 1 and 7) and another 3 into `gate_geglu` (step 9).
 
 **Default template for a new model**: if the architecture is a Paligemma / Gemma variant, fork the Pi0.5 or Pi0 encoder forward. Swapping the dim constants is usually enough to get it running. **Do not** redesign the kernel sequence from scratch.
 

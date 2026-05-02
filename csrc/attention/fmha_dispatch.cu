@@ -1,5 +1,5 @@
 // ================================================================
-// FlashVLA — Attention dispatch implementation
+// FlashRT — Attention dispatch implementation
 //
 // Manages FMHA backends (FlashAttention / CUTLASS FMHA / cuBLAS)
 // with dynamic library loading for CUTLASS FMHA on SM100/110.
@@ -56,13 +56,13 @@ static FMHABackend g_active_backend = FMHABackend::AUTO;
 int load_fmha_library(const char* path) {
     g_fmha_lib = dyn_open(path);
     if (!g_fmha_lib) {
-        fprintf(stderr, "[FlashVLA] Failed to load FMHA library: %s\n  %s\n",
+        fprintf(stderr, "[FlashRT] Failed to load FMHA library: %s\n  %s\n",
                 path, dyn_error());
         return -1;
     }
     g_fmha_fn = (fmha_fn_t)dyn_sym(g_fmha_lib, "fmha_fp16_attn");
     if (!g_fmha_fn) {
-        fprintf(stderr, "[FlashVLA] Symbol 'fmha_fp16_attn' not found in %s\n", path);
+        fprintf(stderr, "[FlashRT] Symbol 'fmha_fp16_attn' not found in %s\n", path);
         return -1;
     }
     g_active_backend = FMHABackend::CUTLASS_FMHA;
@@ -72,13 +72,13 @@ int load_fmha_library(const char* path) {
 int load_fmha_strided_library(const char* path) {
     g_fmha_strided_lib = dyn_open(path);
     if (!g_fmha_strided_lib) {
-        fprintf(stderr, "[FlashVLA] Failed to load strided FMHA library: %s\n  %s\n",
+        fprintf(stderr, "[FlashRT] Failed to load strided FMHA library: %s\n  %s\n",
                 path, dyn_error());
         return -1;
     }
     g_fmha_strided_fn = (fmha_strided_fn_t)dyn_sym(g_fmha_strided_lib, "fmha_fp16_strided");
     if (!g_fmha_strided_fn) {
-        fprintf(stderr, "[FlashVLA] Symbol 'fmha_fp16_strided' not found in %s\n", path);
+        fprintf(stderr, "[FlashRT] Symbol 'fmha_fp16_strided' not found in %s\n", path);
         return -1;
     }
     return 0;
@@ -104,7 +104,7 @@ int fmha_forward(
 
     // FlashAttention path: must be called from Python side
     // (flash_attn_func is a Python function, not C-callable)
-    fprintf(stderr, "[FlashVLA] No FMHA backend loaded. "
+    fprintf(stderr, "[FlashRT] No FMHA backend loaded. "
                     "Call load_fmha_library() or use Python FlashAttention.\n");
     return -1;
 }
@@ -128,7 +128,7 @@ int fmha_strided_forward(
                                   1, seq, seq, num_heads, num_heads, head_dim,
                                   D3, D3, (void*)stream);
     }
-    fprintf(stderr, "[FlashVLA] Strided FMHA not loaded.\n");
+    fprintf(stderr, "[FlashRT] Strided FMHA not loaded.\n");
     return -1;
 }
 
@@ -145,7 +145,7 @@ int fmha_strided_full(
                                   batch, seq_q, seq_kv, nheads_q, nheads_kv, head_dim,
                                   stride_q, stride_kv, (void*)stream);
     }
-    fprintf(stderr, "[FlashVLA] Strided FMHA not loaded.\n");
+    fprintf(stderr, "[FlashRT] Strided FMHA not loaded.\n");
     return -1;
 }
 

@@ -3,7 +3,7 @@
 Closes the train→serve loop: after :func:`save_lora_state` writes
 ``lora.safetensors`` + ``lora_metadata.json``, this tool produces a
 *standalone* pi0.5 ``model.safetensors`` that any downstream
-inference consumer can load — including FlashVLA's
+inference consumer can load — including FlashRT's
 ``Pi05TorchFrontendRtx`` (which expects a directory mirroring the
 upstream ``pi05_libero_pytorch`` layout).
 

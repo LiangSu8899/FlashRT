@@ -1,4 +1,4 @@
-"""FlashVLA -- Thor SM110 Pipeline for Pi0.
+"""FlashRT -- Thor SM110 Pipeline for Pi0.
 
 Pi0 decoder forward pass and calibration.
 Adapted from Pi0.5 decoder (pipeline_pi05.py) with key differences:

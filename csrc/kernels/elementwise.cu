@@ -1,5 +1,5 @@
 // ================================================================
-// FlashVLA — Elementwise kernels (dtype-generic)
+// FlashRT — Elementwise kernels (dtype-generic)
 // Residual add, gate multiply, bias residual
 // Supports: __half (FP16), __nv_bfloat16 (BF16) via templates
 // ================================================================

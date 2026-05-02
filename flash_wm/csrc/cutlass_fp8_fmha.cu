@@ -1,13 +1,13 @@
 // ============================================================================
 //  flash_wm — CUTLASS Blackwell FMHA forward, FP8 E4M3 in / BF16 out.
 //
-//  Reuses flash_vla's mainloop collective (which has kPRescale precision
+//  Reuses flash_rt's mainloop collective (which has kPRescale precision
 //  protection for FP8 softmax denorm) + CUTLASS example 77 kernel/epilogue.
 //  Only new instantiation: Element=float_e4m3_t, ElementOut=bfloat16_t.
 //
 //  Scope: additive. Lives entirely under flash_wm/csrc/. Pulls headers from:
 //    - CUTLASS examples/77_blackwell_fmha (device/, kernel/, most of collective/)
-//    - flash_vla/csrc/attention/collective/ (mainloop_tma_warpspecialized.hpp
+//    - flash_rt/csrc/attention/collective/ (mainloop_tma_warpspecialized.hpp
 //        — has FP8 kPRescale) via CMake include path
 //
 //  Target shape for BAGEL Pi0.7 denoise:
@@ -51,13 +51,13 @@
   #define CUTLASS_ARCH_MMA_SM100F_ENABLED 1
 #endif
 
-// CMake include order: flash_vla/csrc/attention/ FIRST, then CUTLASS
-// example77. This guarantees flash_vla's modified mainloop (kPRescale FP8
+// CMake include order: flash_rt/csrc/attention/ FIRST, then CUTLASS
+// example77. This guarantees flash_rt's modified mainloop (kPRescale FP8
 // softmax denorm protection) wins over example77's stock mainloop for
 // "collective/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp".
 #include "device/fmha.hpp"
 #include "kernel/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp"
-#include "collective/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp"   // flash_vla version
+#include "collective/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp"   // flash_rt version
 #include "collective/sm100_fmha_fwd_epilogue_tma_warpspecialized.hpp"
 #include "collective/sm100_fmha_load_tma_warpspecialized.hpp"
 #include "collective/fmha_fusion.hpp"

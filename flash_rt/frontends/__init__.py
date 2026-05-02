@@ -1,4 +1,4 @@
-"""FlashVLA — framework-specific frontends.
+"""FlashRT — framework-specific frontends.
 
 Each frontend loads a checkpoint in its native format, builds the weight
 pointer dict, constructs a model pipeline from ``flash_rt.models.*``,

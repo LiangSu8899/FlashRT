@@ -1,5 +1,5 @@
 """
-FlashVLA — High-performance VLA inference engine.
+FlashRT — High-performance VLA inference engine.
 
 Public exports (stable API — see ``docs/stable_api.md``):
 

@@ -7,7 +7,7 @@
 > - **Weight scales** are precomputed once during `_load_weights` (via `quant_fp8`) and stored alongside the weight tensors.
 > - **Activation scales** are computed during `set_prompt` by running one forward pass and measuring the amax at each GEMM input, then cached to disk.
 > - `alpha = act_scale * weight_scale` is the CUTLASS FP8 GEMM descale multiplier and **must be multiplied in f32** — not f64.
-> - Calibration cache location: `~/.flash_vla/calibration/{ckpt_hash}_Se{N}.json`.
+> - Calibration cache location: `~/.flash_rt/calibration/{ckpt_hash}_Se{N}.json`.
 
 ---
 
@@ -26,13 +26,13 @@ fp8_value = clip(fp32_value / scale, -448, 448)
 fp32_restored = fp8_value * scale
 ```
 
-FlashVLA's policy:
+FlashRT's policy:
 - **Weights** — static per-tensor scale, computed once at load time and never updated.
 - **Activations** — static per-GEMM-input scale, computed once during calibration and held constant at runtime.
 
 The activation scale can only be obtained by running a full forward pass and recording the amax at each GEMM input. That is exactly what `_calibrate` does.
 
-**How this compares to vLLM and similar frameworks**: vLLM defaults to eager BF16 with no FP8 quantization. When AWQ or GPTQ is enabled, the quantization is **weight-only** (activations stay in FP16). FlashVLA runs **W8A8**, which requires calibrating both sides.
+**How this compares to vLLM and similar frameworks**: vLLM defaults to eager BF16 with no FP8 quantization. When AWQ or GPTQ is enabled, the quantization is **weight-only** (activations stay in FP16). FlashRT runs **W8A8**, which requires calibrating both sides.
 
 ---
 
@@ -40,10 +40,10 @@ The activation scale can only be obtained by running a full forward pass and rec
 
 ### 2.1 Weight scales (`*_w_scales`)
 
-Computed when loading the checkpoint, inside [`_load_weights`](../flash_vla/frontends/torch/pi05_thor.py) via the `Quant()` transform in WEIGHT_SPEC:
+Computed when loading the checkpoint, inside [`_load_weights`](../flash_rt/frontends/torch/pi05_thor.py) via the `Quant()` transform in WEIGHT_SPEC:
 
 ```python
-# flash_vla/core/thor_frontend_utils.py
+# flash_rt/core/thor_frontend_utils.py
 def quant_fp8(w):
     w = w.contiguous()
     a = w.float().abs().max().item()
@@ -79,7 +79,7 @@ _measure_scale_gpu(fvk, norm_scratch, Se * D, d_scale, fp8_scratch, stream)
 fvk.rms_norm_fp8_noweight_fp16(x, x_fp8, Se, D, d_scale, stream)
 ```
 
-Reference implementations: [`shared_primitives.py::encoder_forward_calibrate`](../flash_vla/hardware/thor/shared_primitives.py) (lines 491-610) and [`decoder_forward_calibrate`](../flash_vla/hardware/thor/shared_primitives.py) (from line 610 on).
+Reference implementations: [`shared_primitives.py::encoder_forward_calibrate`](../flash_rt/hardware/thor/shared_primitives.py) (lines 491-610) and [`decoder_forward_calibrate`](../flash_rt/hardware/thor/shared_primitives.py) (from line 610 on).
 
 Each Pi0.5 / Pi0 encoder layer has 4 FP8 GEMMs (QKV / O / Gate+Up / Down), so `enc_calib_scales.shape == (L * 4,) == (72,)`. The decoder is identical: `(La * 4,) == (72,)`.
 
@@ -111,8 +111,8 @@ Always use **`np.float32(a) * np.float32(b)`** — never plain `a * b`.
 
 ### 3.1 Cache key
 
-`~/.flash_vla/calibration/{ckpt_hash}_Se{N}.json`, where:
-- `ckpt_hash` = SHA256(first 64 KB + file_size), first 16 hex chars (see [`calibrator.py::_checkpoint_hash`](../flash_vla/core/quant/calibrator.py)).
+`~/.flash_rt/calibration/{ckpt_hash}_Se{N}.json`, where:
+- `ckpt_hash` = SHA256(first 64 KB + file_size), first 16 hex chars (see [`calibrator.py::_checkpoint_hash`](../flash_rt/core/quant/calibrator.py)).
 - `Se` = encoder input sequence length (a function of num_views and prompt length).
 
 **Why both parts are needed**:
@@ -139,16 +139,16 @@ Always use **`np.float32(a) * np.float32(b)`** — never plain `a * b`.
 
 ### 3.3 Invalidation
 
-Automatic invalidation conditions in [`load_calibration`](../flash_vla/core/quant/calibrator.py):
+Automatic invalidation conditions in [`load_calibration`](../flash_rt/core/quant/calibrator.py):
 - `version` mismatch → recalibrate.
 - `ckpt_hash` mismatch (user swapped the checkpoint) → recalibrate.
 - `Se` mismatch (prompt length changed) → recalibrate.
 
 Manual invalidation:
 ```bash
-rm ~/.flash_vla/calibration/{ckpt_hash}_Se{N}.json
+rm ~/.flash_rt/calibration/{ckpt_hash}_Se{N}.json
 # or wipe everything:
-rm -rf ~/.flash_vla/calibration/
+rm -rf ~/.flash_rt/calibration/
 ```
 
 `load_model(..., recalibrate=True)` also forces a rerun.
@@ -258,12 +258,12 @@ You need both. Do not pack alpha into a device tensor — the kernel expects a h
 
 | Content | File |
 |------|------|
-| `quant_fp8` weight quantization function | [`flash_vla/core/thor_frontend_utils.py`](../flash_vla/core/thor_frontend_utils.py) |
-| Calibration-cache read/write | [`flash_vla/core/quant/calibrator.py`](../flash_vla/core/quant/calibrator.py) |
-| `encoder_forward_calibrate` / `decoder_forward_calibrate` | [`flash_vla/hardware/thor/shared_primitives.py`](../flash_vla/hardware/thor/shared_primitives.py) |
-| Pi0.5 `_calibrate` example | [`flash_vla/frontends/torch/pi05_thor.py`](../flash_vla/frontends/torch/pi05_thor.py) (L499-649) |
-| `_recalibrate_with_real_data` | [`flash_vla/frontends/torch/pi05_thor.py`](../flash_vla/frontends/torch/pi05_thor.py) (L954) |
-| GROOT split calibrate (Qwen3 + DiT separate) | [`flash_vla/frontends/torch/groot_thor.py`](../flash_vla/frontends/torch/groot_thor.py), [`flash_vla/frontends/torch/groot_rtx.py`](../flash_vla/frontends/torch/groot_rtx.py) |
+| `quant_fp8` weight quantization function | [`flash_rt/core/thor_frontend_utils.py`](../flash_rt/core/thor_frontend_utils.py) |
+| Calibration-cache read/write | [`flash_rt/core/quant/calibrator.py`](../flash_rt/core/quant/calibrator.py) |
+| `encoder_forward_calibrate` / `decoder_forward_calibrate` | [`flash_rt/hardware/thor/shared_primitives.py`](../flash_rt/hardware/thor/shared_primitives.py) |
+| Pi0.5 `_calibrate` example | [`flash_rt/frontends/torch/pi05_thor.py`](../flash_rt/frontends/torch/pi05_thor.py) (L499-649) |
+| `_recalibrate_with_real_data` | [`flash_rt/frontends/torch/pi05_thor.py`](../flash_rt/frontends/torch/pi05_thor.py) (L954) |
+| GROOT split calibrate (Qwen3 + DiT separate) | [`flash_rt/frontends/torch/groot_thor.py`](../flash_rt/frontends/torch/groot_thor.py), [`flash_rt/frontends/torch/groot_rtx.py`](../flash_rt/frontends/torch/groot_rtx.py) |
 
 ---
 
@@ -316,7 +316,7 @@ You need both. Do not pack alpha into a device tensor — the kernel expects a h
 The sections above describe single-frame calibration, which is what the
 framework does by default. For real hardware deployment — where the
 runtime distribution of activations spans lighting, occlusion, and
-pose variation that a single frame does not cover — FlashVLA also
+pose variation that a single frame does not cover — FlashRT also
 supports **multi-frame dataset calibration with percentile clipping**.
 
 ### Motivation
@@ -412,7 +412,7 @@ Pi0.5 3-view on Thor SM110 against the Pi0.5 PyTorch FP32 reference
 container). Measured by
 [`tests/bench_thor_calibration_vs_ref.py`](../tests/bench_thor_calibration_vs_ref.py),
 stratified samples drawn from LIBERO-10 (379 episodes / 101 k frames)
-via [`flash_vla.datasets.libero`](../flash_vla/datasets/libero.py):
+via [`flash_rt.datasets.libero`](../flash_rt/datasets/libero.py):
 
 | Strategy | cos vs **FP32 ref** | maxdiff vs ref | calibrate time |
 |---|---|---|---|
@@ -448,7 +448,7 @@ path.
 
 The previous measurement (before FP32 reference was wired up) reported
 "cos > 0.9999 across all N" — that was measuring **the distance between
-two FP8 outputs** (different calibrations of the same FlashVLA pipeline)
+two FP8 outputs** (different calibrations of the same FlashRT pipeline)
 which is a calibration-drift signal. It cannot identify which strategy
 is *closer to the true model*, only how much strategies differ from
 each other. The dual-cosine table above is the calibration-choice
@@ -596,10 +596,10 @@ threshold.
 
 Thor `Pi05TorchFrontendThor.calibrate(obs_list, percentile=99.9)`
 supports N ≥ 2 today (same shape as the RTX API — see
-[`flash_vla/frontends/torch/pi05_thor.py`](../flash_vla/frontends/torch/pi05_thor.py)
+[`flash_rt/frontends/torch/pi05_thor.py`](../flash_rt/frontends/torch/pi05_thor.py)
 `_calibrate_multi_frame`). On RTX the same multi-sample API is also
 available for `groot_rtx` (see
-[`flash_vla/frontends/torch/groot_rtx.py`](../flash_vla/frontends/torch/groot_rtx.py)
+[`flash_rt/frontends/torch/groot_rtx.py`](../flash_rt/frontends/torch/groot_rtx.py)
 `_calibrate_multi_frame`), which percentile-reduces both the Qwen3 and
 the DiT activation scales after running per-sample shadow forwards
 through both stages. The remaining Thor frontends (`pi0_thor`,

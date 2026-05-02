@@ -1,4 +1,4 @@
-"""FlashVLA -- Pi0FastJaxFrontend: Pi0-FAST inference from JAX/Orbax checkpoint.
+"""FlashRT -- Pi0FastJaxFrontend: Pi0-FAST inference from JAX/Orbax checkpoint.
 
 Loads weights directly from Orbax (JAX format) via transform_jax_weights_pi0fast.
 For PyTorch safetensors checkpoint, use thor_torch_pi0fast.py instead.

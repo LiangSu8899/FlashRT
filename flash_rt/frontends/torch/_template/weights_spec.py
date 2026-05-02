@@ -1,4 +1,4 @@
-"""FlashVLA new-model template — weight specification.
+"""FlashRT new-model template — weight specification.
 
 Copy this file to `flash_rt/frontends/torch/_<mymodel>_<hw>_spec.py`
 and fill in the `WEIGHT_SPEC` table. This is the **declarative** part
@@ -9,7 +9,7 @@ total work.
 # WHAT YOU TRANSLATE
 =====================
 
-Your source model:                       FlashVLA WEIGHT_SPEC entry:
+Your source model:                       FlashRT WEIGHT_SPEC entry:
 ---------------------                    -------------------------------
 state_dict["encoder.layers.0.            ("encoder", 0, "qkv_proj_w"):
    self_attn.q_proj.weight"]                  (Stack(qw, kw, vw), Quant("fp8"))

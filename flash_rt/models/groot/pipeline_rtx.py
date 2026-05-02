@@ -1,4 +1,4 @@
-"""FlashVLA — RTX (consumer discrete GPU) GROOT N1.6 inference pipeline.
+"""FlashRT — RTX (consumer discrete GPU) GROOT N1.6 inference pipeline.
 
 Framework-agnostic pipeline for GROOT N1.6 on consumer RTX GPUs (Blackwell
 SM120 / Ada SM89). Mirrors the rtx Pi0.5 design (pipeline_pi05.py): the

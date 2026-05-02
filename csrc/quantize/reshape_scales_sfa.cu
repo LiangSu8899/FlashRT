@@ -1,5 +1,5 @@
 // ============================================================================
-//  FlashVLA — linear scales [rows, D/16] → CUTLASS SFA/SFB tile-interleaved.
+//  FlashRT — linear scales [rows, D/16] → CUTLASS SFA/SFB tile-interleaved.
 //
 //  Uses CUTLASS's `Sm1xxBlockScaledConfig<16>::tile_atom_to_shape_SF{A,B}` to
 //  derive the target layout at compile time, then a trivial CUDA kernel that

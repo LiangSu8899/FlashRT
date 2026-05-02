@@ -62,7 +62,7 @@ git log v2.7.4.post1..HEAD -- csrc/flash_attn/src/
 
 # For each relevant commit, generate a patch and apply here
 git format-patch -1 <SHA> --stdout > /tmp/fa-fix.patch
-cd <FlashVLA>
+cd <FlashRT>
 cd csrc/attention/flash_attn_2_src/flash_attn
 patch -p4 < /tmp/fa-fix.patch   # strip leading csrc/flash_attn/src/
 # verify: rebuild + cos test

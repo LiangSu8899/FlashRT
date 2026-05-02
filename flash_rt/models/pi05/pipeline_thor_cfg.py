@@ -1,4 +1,4 @@
-"""FlashVLA — Pi0.5 Thor SM110 classifier-free-guidance inference pipeline.
+"""FlashRT — Pi0.5 Thor SM110 classifier-free-guidance inference pipeline.
 
 Backend-agnostic per-chunk CFG class for the Pi0.5 Thor frontend
 (torch + JAX), mirroring the RTX file structure

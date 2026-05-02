@@ -1,5 +1,5 @@
 // ============================================================================
-//  FlashVLA — NVFP4 GEMM impl. Based on CUTLASS 4.x example 72a
+//  FlashRT — NVFP4 GEMM impl. Based on CUTLASS 4.x example 72a
 //  (Blackwell NVFP4 × NVFP4 → bfloat16), modified for fp16 output and to
 //  expose a C-style entry point consumable from pybind/bindings.cpp.
 //

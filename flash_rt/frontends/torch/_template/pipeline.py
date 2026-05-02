@@ -1,4 +1,4 @@
-"""FlashVLA new-model template — pipeline (model-specific compute).
+"""FlashRT new-model template — pipeline (model-specific compute).
 
 Copy this file to `flash_rt/models/<mymodel>/pipeline_<hw>.py`
 (`<hw>` = `thor` or `rtx`). This is **the bulk of your hand-written
@@ -25,7 +25,7 @@ Your reference PyTorch (one encoder layer):
     ffn_out = F.linear(F.silu(gate) * up, down_weight)
     x = x + ffn_out
 
-Equivalent FlashVLA kernel sequence:
+Equivalent FlashRT kernel sequence:
     fvk.rms_norm_fp16(x, norm_w, x_norm, S, D, eps, stream)        # ← norm
     fvk.quantize_fp8_static(x_norm, x_norm_fp8, ...)               # ← quantize before fp8 GEMM
     fvk.gemm_fp8_fp16(x_norm_fp8, qkv_w_fp8, qkv,                  # ← QKV proj

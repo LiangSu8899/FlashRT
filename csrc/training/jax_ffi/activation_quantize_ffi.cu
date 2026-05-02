@@ -1,5 +1,5 @@
 // ================================================================
-// FlashVLA training/jax_ffi: XLA FFI handler for FP8 static quantize.
+// FlashRT training/jax_ffi: XLA FFI handler for FP8 static quantize.
 //
 // Delegates to quantize_fp8_static (csrc/kernels/quantize.cu), the
 // same kernel the PyTorch training path drives via pybind. The

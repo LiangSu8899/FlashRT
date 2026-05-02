@@ -1,4 +1,4 @@
-"""FlashVLA — FP8 calibration cache.
+"""FlashRT — FP8 calibration cache.
 
 Calibration scales are checkpoint-specific and sequence-length-specific.
 Caching avoids re-running the dynamic calibration pass (~3-4s) on every startup.

@@ -1,4 +1,4 @@
-// FlashVLA — FP8 E4M3 Quantize API (standalone .so)
+// FlashRT — FP8 E4M3 Quantize API (standalone .so)
 //
 // Compile:
 //   nvcc -O3 -std=c++17 -arch=sm_110a --use_fast_math \
