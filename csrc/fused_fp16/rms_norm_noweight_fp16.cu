@@ -8,7 +8,7 @@
 
 #include <cuda_fp16.h>
 
-namespace flash_vla {
+namespace flash_rt {
 namespace fused_fp16 {
 
 // Matches RMS_NW_* in norm.cu — keeps SASS shape identical for the shared
@@ -133,4 +133,4 @@ void residual_add_rms_norm_noweight_fp16(__half* residual, const __half* x,
 }
 
 }  // namespace fused_fp16
-}  // namespace flash_vla
+}  // namespace flash_rt

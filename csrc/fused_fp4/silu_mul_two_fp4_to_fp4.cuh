@@ -10,7 +10,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
-namespace flash_vla {
+namespace flash_rt {
 namespace fused_fp4 {
 
 // silu(gate) * up — per-block FP4 quant — for [seq_len, H] hidden buffers.
@@ -35,4 +35,4 @@ void silu_mul_two_mul_fp4_to_fp4(
     int seq_len, int H, cudaStream_t stream);
 
 }  // namespace fused_fp4
-}  // namespace flash_vla
+}  // namespace flash_rt

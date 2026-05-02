@@ -13,7 +13,7 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
-namespace flash_vla {
+namespace flash_rt {
 namespace fp4 {
 
 // FP4-out NVFP4 GEMM:  D = quant_block(X @ W^T)  (alpha=1, beta=0)
@@ -32,4 +32,4 @@ int cutlass_fp4_gemm_fp4out(
     cudaStream_t stream);
 
 }  // namespace fp4
-}  // namespace flash_vla
+}  // namespace flash_rt

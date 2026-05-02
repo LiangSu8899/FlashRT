@@ -20,7 +20,7 @@
 #  define FV_HAVE_CUTLASS 0
 #endif
 
-namespace flash_vla {
+namespace flash_rt {
 namespace fp4 {
 
 #if FV_HAVE_CUTLASS
@@ -146,4 +146,4 @@ int quantize_fp4_dynamic_sfa_fp16(
 }
 
 }  // namespace fp4
-}  // namespace flash_vla
+}  // namespace flash_rt

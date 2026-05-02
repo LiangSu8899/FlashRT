@@ -13,13 +13,13 @@
 //    to fp8 with the same descale factor, results must be bit-exact with the
 //    existing fp8-out kernels (verified in test Phase 4.3 Step B).
 //
-//  Lives in a separate .so (flash_vla_fp4). Does NOT touch norm.cu.
+//  Lives in a separate .so (flash_rt_fp4). Does NOT touch norm.cu.
 // ============================================================================
 #pragma once
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
-namespace flash_vla {
+namespace flash_rt {
 namespace fused_fp16 {
 
 // fp16 [R,C] → fp16 [R,C], output = x * rsqrt(mean(x^2) + eps).
@@ -38,4 +38,4 @@ void residual_add_rms_norm_noweight_fp16(__half* residual, const __half* x,
                                           cudaStream_t stream);
 
 }  // namespace fused_fp16
-}  // namespace flash_vla
+}  // namespace flash_rt

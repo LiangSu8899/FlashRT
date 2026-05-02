@@ -16,7 +16,7 @@
 #include <cuda_fp16.h>
 #include <cstdint>
 
-namespace flash_vla {
+namespace flash_rt {
 namespace fused_fp4 {
 
 __global__ void kernel_per_channel_mul_fp16(
@@ -42,11 +42,11 @@ void per_channel_mul_fp16(
 }
 
 }  // namespace fused_fp4
-}  // namespace flash_vla
+}  // namespace flash_rt
 
-extern "C" int flash_vla_per_channel_mul_fp16(
+extern "C" int flash_rt_per_channel_mul_fp16(
     uintptr_t x, uintptr_t inv_s, int S, int D, uintptr_t stream) {
-  flash_vla::fused_fp4::per_channel_mul_fp16(
+  flash_rt::fused_fp4::per_channel_mul_fp16(
       reinterpret_cast<void*>(x),
       reinterpret_cast<const void*>(inv_s),
       S, D, reinterpret_cast<cudaStream_t>(stream));

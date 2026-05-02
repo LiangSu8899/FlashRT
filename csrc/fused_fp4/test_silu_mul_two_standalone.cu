@@ -89,25 +89,25 @@ int main() {
 
     // ─ Quantize inputs to NVFP4 ─
     uint8_t *X_p, *X_sfa, *Wg_p, *Wg_sfb, *Wu_p, *Wu_sfb;
-    int x_sfa_sz  = flash_vla::fp4::sfa_size_bytes(S, D, false);
-    int wg_sfb_sz = flash_vla::fp4::sfa_size_bytes(H, D, true);
+    int x_sfa_sz  = flash_rt::fp4::sfa_size_bytes(S, D, false);
+    int wg_sfb_sz = flash_rt::fp4::sfa_size_bytes(H, D, true);
     int wu_sfb_sz = wg_sfb_sz;
     CHECK(cudaMalloc(&X_p,    S*D/2));        CHECK(cudaMalloc(&X_sfa, x_sfa_sz));
     CHECK(cudaMalloc(&Wg_p,   H*D/2));        CHECK(cudaMalloc(&Wg_sfb, wg_sfb_sz));
     CHECK(cudaMalloc(&Wu_p,   H*D/2));        CHECK(cudaMalloc(&Wu_sfb, wu_sfb_sz));
-    flash_vla::fp4::quantize_fp4_dynamic_sfa_fp16(d_X,  X_p,  X_sfa,  S, D, false, 0);
-    flash_vla::fp4::quantize_fp4_dynamic_sfa_fp16(d_Wg, Wg_p, Wg_sfb, H, D, true,  0);
-    flash_vla::fp4::quantize_fp4_dynamic_sfa_fp16(d_Wu, Wu_p, Wu_sfb, H, D, true,  0);
+    flash_rt::fp4::quantize_fp4_dynamic_sfa_fp16(d_X,  X_p,  X_sfa,  S, D, false, 0);
+    flash_rt::fp4::quantize_fp4_dynamic_sfa_fp16(d_Wg, Wg_p, Wg_sfb, H, D, true,  0);
+    flash_rt::fp4::quantize_fp4_dynamic_sfa_fp16(d_Wu, Wu_p, Wu_sfb, H, D, true,  0);
     CHECK(cudaDeviceSynchronize());
 
     // ─ Run gate_proj fp4out + up_proj fp4out ─
     uint8_t *gate_p, *gate_sfa, *up_p, *up_sfa;
-    int gu_sfa_sz = flash_vla::fp4::sfa_size_bytes(S, H, false);
+    int gu_sfa_sz = flash_rt::fp4::sfa_size_bytes(S, H, false);
     CHECK(cudaMalloc(&gate_p,   S*H/2));   CHECK(cudaMalloc(&gate_sfa, gu_sfa_sz));
     CHECK(cudaMalloc(&up_p,     S*H/2));   CHECK(cudaMalloc(&up_sfa,   gu_sfa_sz));
-    int rc1 = flash_vla::fp4::cutlass_fp4_gemm_fp4out(
+    int rc1 = flash_rt::fp4::cutlass_fp4_gemm_fp4out(
         X_p, X_sfa, Wg_p, Wg_sfb, gate_p, gate_sfa, S, H, D, 0);
-    int rc2 = flash_vla::fp4::cutlass_fp4_gemm_fp4out(
+    int rc2 = flash_rt::fp4::cutlass_fp4_gemm_fp4out(
         X_p, X_sfa, Wu_p, Wu_sfb, up_p,   up_sfa,   S, H, D, 0);
     CHECK(cudaDeviceSynchronize());
     if (rc1 || rc2) { fprintf(stderr, "fp4out GEMM failed rc=%d/%d\n", rc1, rc2); return 1; }
@@ -118,7 +118,7 @@ int main() {
     CHECK(cudaMalloc(&out_p,   S*H/2));    CHECK(cudaMalloc(&out_sfa, gu_sfa_sz));
     CHECK(cudaMemset(out_p,   0, S*H/2));
     CHECK(cudaMemset(out_sfa, 0, gu_sfa_sz));
-    flash_vla::fused_fp4::silu_mul_two_fp4_to_fp4(
+    flash_rt::fused_fp4::silu_mul_two_fp4_to_fp4(
         gate_p, gate_sfa, up_p, up_sfa, out_p, out_sfa, S, H, 0);
     CHECK(cudaDeviceSynchronize());
     printf("[mul kernel] OK\n");
@@ -225,13 +225,13 @@ int main() {
     cudaEventCreate(&e1); cudaEventCreate(&e2);
     const int iters = 500, warmup = 50;
     for (int i = 0; i < warmup; ++i) {
-      flash_vla::fused_fp4::silu_mul_two_fp4_to_fp4(
+      flash_rt::fused_fp4::silu_mul_two_fp4_to_fp4(
           gate_p, gate_sfa, up_p, up_sfa, out_p, out_sfa, S, H, 0);
     }
     cudaDeviceSynchronize();
     cudaEventRecord(e1);
     for (int i = 0; i < iters; ++i) {
-      flash_vla::fused_fp4::silu_mul_two_fp4_to_fp4(
+      flash_rt::fused_fp4::silu_mul_two_fp4_to_fp4(
           gate_p, gate_sfa, up_p, up_sfa, out_p, out_sfa, S, H, 0);
     }
     cudaEventRecord(e2); cudaEventSynchronize(e2);
@@ -241,16 +241,16 @@ int main() {
 
     // ─ Latency: full P1 path (2× fp4out GEMM + silu_mul_two_fp4) ─
     for (int i = 0; i < warmup; ++i) {
-      flash_vla::fp4::cutlass_fp4_gemm_fp4out(X_p, X_sfa, Wg_p, Wg_sfb, gate_p, gate_sfa, S, H, D, 0);
-      flash_vla::fp4::cutlass_fp4_gemm_fp4out(X_p, X_sfa, Wu_p, Wu_sfb, up_p,   up_sfa,   S, H, D, 0);
-      flash_vla::fused_fp4::silu_mul_two_fp4_to_fp4(gate_p, gate_sfa, up_p, up_sfa, out_p, out_sfa, S, H, 0);
+      flash_rt::fp4::cutlass_fp4_gemm_fp4out(X_p, X_sfa, Wg_p, Wg_sfb, gate_p, gate_sfa, S, H, D, 0);
+      flash_rt::fp4::cutlass_fp4_gemm_fp4out(X_p, X_sfa, Wu_p, Wu_sfb, up_p,   up_sfa,   S, H, D, 0);
+      flash_rt::fused_fp4::silu_mul_two_fp4_to_fp4(gate_p, gate_sfa, up_p, up_sfa, out_p, out_sfa, S, H, 0);
     }
     cudaDeviceSynchronize();
     cudaEventRecord(e1);
     for (int i = 0; i < iters; ++i) {
-      flash_vla::fp4::cutlass_fp4_gemm_fp4out(X_p, X_sfa, Wg_p, Wg_sfb, gate_p, gate_sfa, S, H, D, 0);
-      flash_vla::fp4::cutlass_fp4_gemm_fp4out(X_p, X_sfa, Wu_p, Wu_sfb, up_p,   up_sfa,   S, H, D, 0);
-      flash_vla::fused_fp4::silu_mul_two_fp4_to_fp4(gate_p, gate_sfa, up_p, up_sfa, out_p, out_sfa, S, H, 0);
+      flash_rt::fp4::cutlass_fp4_gemm_fp4out(X_p, X_sfa, Wg_p, Wg_sfb, gate_p, gate_sfa, S, H, D, 0);
+      flash_rt::fp4::cutlass_fp4_gemm_fp4out(X_p, X_sfa, Wu_p, Wu_sfb, up_p,   up_sfa,   S, H, D, 0);
+      flash_rt::fused_fp4::silu_mul_two_fp4_to_fp4(gate_p, gate_sfa, up_p, up_sfa, out_p, out_sfa, S, H, 0);
     }
     cudaEventRecord(e2); cudaEventSynchronize(e2);
     float ms2 = 0; cudaEventElapsedTime(&ms2, e1, e2);

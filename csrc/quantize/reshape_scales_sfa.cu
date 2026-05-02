@@ -16,7 +16,7 @@
 #  define FV_HAVE_CUTLASS 0
 #endif
 
-namespace flash_vla {
+namespace flash_rt {
 namespace fp4 {
 
 #if FV_HAVE_CUTLASS
@@ -110,4 +110,4 @@ int reshape_linear_scales_to_sfa(
 }
 
 }  // namespace fp4
-}  // namespace flash_vla
+}  // namespace flash_rt

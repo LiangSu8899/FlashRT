@@ -27,7 +27,7 @@
 #  define FV_FP4_HAVE_CUTLASS 0
 #endif
 
-namespace flash_vla {
+namespace flash_rt {
 namespace fp4 {
 
 bool has_nvfp4_sm110() {
@@ -193,4 +193,4 @@ int cutlass_fp4_sq_fp16(
 }
 
 } // namespace fp4
-} // namespace flash_vla
+} // namespace flash_rt
