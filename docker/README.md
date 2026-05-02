@@ -123,14 +123,3 @@ docker run --rm --gpus all flashrt:dev \
     pip install flash-attn  # or grab a prebuilt wheel from the releases page
 ```
 
----
-
-## 5. Why no Thor (SM110) image?
-
-Jetson Thor is ARM64 + JetPack/L4T, so it needs a different NVIDIA
-base image (`nvcr.io/nvidia/l4t-jetpack:r36.x.x`). Thor users
-typically run on bare-metal JetPack rather than Docker, and the L4T
-toolchain pulls in extra runtime dependencies the x86_64 image
-doesn't need. If demand surfaces we'll add `Dockerfile.thor`; until
-then, see [`docs/INSTALL.md`](../docs/INSTALL.md) for the native
-Jetson path.
