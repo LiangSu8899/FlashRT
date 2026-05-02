@@ -1,4 +1,4 @@
-"""FlashVLA — AttentionBackend protocol.
+"""FlashRT — AttentionBackend protocol.
 
 Anchors the upstream refactor: every model pipeline in ``flash_rt.models.*``
 that has more than one hardware implementation (Pi0.5, Pi0, GROOT, Pi0.6)

@@ -5,13 +5,13 @@
 > **What this doc is for**: the contract — `SiteSpec`, `AttentionSpec`, the `AttentionBackend` protocol, the slot / pointer model, and the lifecycle.
 > **What this doc is not**: the kernel inventory. For that see [`../kernel_catalog.md`](../kernel_catalog.md).
 >
-> **Source**: [`flash_vla/hardware/backend.py`](../../flash_vla/hardware/backend.py) — protocol + base class + `SiteSpec` / `AttentionSpec`. Concrete backends live in `flash_vla/hardware/{thor,rtx}/attn_backend*.py`.
+> **Source**: [`flash_rt/hardware/backend.py`](../../flash_rt/hardware/backend.py) — protocol + base class + `SiteSpec` / `AttentionSpec`. Concrete backends live in `flash_rt/hardware/{thor,rtx}/attn_backend*.py`.
 
 ---
 
 ## 1. The problem this solves
 
-Every model in FlashVLA has 1–4 distinct attention shapes (for example, GROOT has SigLIP vision, Qwen3 backbone, DiT self-attention, DiT cross-attention). Each shape has its own preferred kernel, and each hardware target has its own preferred kernel for the same shape:
+Every model in FlashRT has 1–4 distinct attention shapes (for example, GROOT has SigLIP vision, Qwen3 backbone, DiT self-attention, DiT cross-attention). Each shape has its own preferred kernel, and each hardware target has its own preferred kernel for the same shape:
 
 | Shape | Thor SM110 | RTX SM120 / SM89 |
 |---|---|---|
@@ -65,7 +65,7 @@ The frontend builds the spec in a `make_attention_spec(...)` static method on th
 The frontend then asks the hardware module for a backend instance:
 
 ```python
-from flash_vla.hardware import make_attention_backend
+from flash_rt.hardware import make_attention_backend
 
 backend = make_attention_backend(arch="thor", spec=spec)  # → ThorFlashAttnBackend
 # or
@@ -195,11 +195,11 @@ Three concerns sit outside this protocol — handled at other layers today, avai
 
 | What | File |
 |---|---|
-| Protocol, `SiteSpec`, `AttentionSpec`, base class | [`flash_vla/hardware/backend.py`](../../flash_vla/hardware/backend.py) |
-| Thor Pi0/Pi0.5 backend | `flash_vla/hardware/thor/attn_backend.py` |
-| Thor GROOT backend | `flash_vla/hardware/thor/attn_backend_groot.py` |
-| RTX Pi0/Pi0.5 backend | `flash_vla/hardware/rtx/attn_backend.py` |
-| RTX GROOT backend | `flash_vla/hardware/rtx/attn_backend_groot.py` |
-| Pipeline call site (Pi0.5, all hardware) | `flash_vla/models/pi05/pipeline.py` |
-| `make_attention_backend` resolver | `flash_vla/hardware/__init__.py` |
+| Protocol, `SiteSpec`, `AttentionSpec`, base class | [`flash_rt/hardware/backend.py`](../../flash_rt/hardware/backend.py) |
+| Thor Pi0/Pi0.5 backend | `flash_rt/hardware/thor/attn_backend.py` |
+| Thor GROOT backend | `flash_rt/hardware/thor/attn_backend_groot.py` |
+| RTX Pi0/Pi0.5 backend | `flash_rt/hardware/rtx/attn_backend.py` |
+| RTX GROOT backend | `flash_rt/hardware/rtx/attn_backend_groot.py` |
+| Pipeline call site (Pi0.5, all hardware) | `flash_rt/models/pi05/pipeline.py` |
+| `make_attention_backend` resolver | `flash_rt/hardware/__init__.py` |
 | Conformance tests | `tests/test_thor_attn_backend.py`, `tests/test_thor_groot_attn_backend.py` |

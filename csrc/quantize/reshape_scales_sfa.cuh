@@ -1,5 +1,5 @@
 // ============================================================================
-//  FlashVLA — Linear scale layout → CUTLASS Sm1xxBlockScaledConfig SFA/SFB.
+//  FlashRT — Linear scale layout → CUTLASS Sm1xxBlockScaledConfig SFA/SFB.
 //
 //  Our dynamic quantize kernel produces scales in linear [N, D/16] row-major
 //  layout. CUTLASS SM100 block-scaled GEMM wants scales in a tile-interleaved

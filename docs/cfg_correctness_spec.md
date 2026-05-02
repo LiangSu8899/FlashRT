@@ -1,6 +1,6 @@
 # Pi0.5 CFG correctness specification
 
-This document is the **release contract** for FlashVLA's classifier-free
+This document is the **release contract** for FlashRT's classifier-free
 guidance (CFG) inference paths on Pi0.5 / RECAP. It defines:
 
 * the math each implementation must reproduce (Section 2),
@@ -15,9 +15,9 @@ guidance (CFG) inference paths on Pi0.5 / RECAP. It defines:
 
 | Implementation | Class | Path |
 |---|---|---|
-| **Reference** ($\mathcal{R}_\text{fp32}$) | `Pi05CFGReference` | `flash_vla/refs/pi05_cfg_reference.py` |
-| Serial CFG (FP8) | `Pi05CFGPipeline` | `flash_vla/models/pi05/pipeline_rtx_cfg.py` |
-| Batched CFG (FP8, B=2) | `Pi05CFGBatchedPipeline` | `flash_vla/models/pi05/pipeline_rtx_cfg_batched.py` |
+| **Reference** ($\mathcal{R}_\text{fp32}$) | `Pi05CFGReference` | `flash_rt/refs/pi05_cfg_reference.py` |
+| Serial CFG (FP8) | `Pi05CFGPipeline` | `flash_rt/models/pi05/pipeline_rtx_cfg.py` |
+| Batched CFG (FP8, B=2) | `Pi05CFGBatchedPipeline` | `flash_rt/models/pi05/pipeline_rtx_cfg_batched.py` |
 
 The reference implementation wraps the upstream `openpi`
 `PI0Pytorch` model in a manual CFG denoising loop. It runs in BF16 /
@@ -86,7 +86,7 @@ $$
 $$
 
 Why noise (and not $v_\text{cond}, v_\text{uncond}$ directly):
-FlashVLA's `decoder_action_buf` is the raw action-projection output
+FlashRT's `decoder_action_buf` is the raw action-projection output
 **after** absorbing the schedule's $-\Delta t$ scale into the output
 weight (see `pipeline_rtx.py`'s `out_proj` pre-scale). The reference
 returns the unscaled $v_t$ from `denoise_step`. So per-step `v` differs

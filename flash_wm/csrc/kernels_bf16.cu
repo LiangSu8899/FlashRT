@@ -1,7 +1,7 @@
 // ================================================================
 // flash_wm_kernels — BF16 kernel variants for BAGEL world model
 //
-// These are BF16 ports of FlashVLA's FP16 kernels.
+// These are BF16 ports of FlashRT's FP16 kernels.
 // BAGEL requires BF16 because its residual stream exceeds FP16 range
 // (absmax ~480K >> FP16 max 65504).
 //

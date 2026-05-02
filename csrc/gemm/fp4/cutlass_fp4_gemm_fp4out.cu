@@ -1,5 +1,5 @@
 // ============================================================================
-//  FlashVLA — NVFP4 GEMM with FP4 (e2m1) packed output + SFA tile-interleaved.
+//  FlashRT — NVFP4 GEMM with FP4 (e2m1) packed output + SFA tile-interleaved.
 //
 //  Strict copy of CUTLASS example 72b's NVFP4→NVFP4 GEMM, adapted to our
 //  variant style. Used for both gate_proj and up_proj in the P1 split-GU

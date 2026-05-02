@@ -1,4 +1,4 @@
-"""FlashVLA — Pi0.5 RTX pipeline with classifier-free guidance (CFG).
+"""FlashRT — Pi0.5 RTX pipeline with classifier-free guidance (CFG).
 
 Subclass of :class:`flash_rt.models.pi05.pipeline_rtx.Pi05Pipeline` that
 adds per-step CFG inference for advantage-conditioned policies trained

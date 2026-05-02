@@ -11,7 +11,7 @@
 
 namespace py = pybind11;
 
-// ── FvkContext: import from FlashVLA for cuBLAS handle ──
+// ── FvkContext: import from FlashRT for cuBLAS handle ──
 // Minimal reproduction — only need cublas_handle for CUDA Graph compatibility
 struct WmContext {
     cublasHandle_t cublas_handle;

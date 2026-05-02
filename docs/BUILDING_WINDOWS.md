@@ -1,4 +1,4 @@
-# Building FlashVLA on Windows
+# Building FlashRT on Windows
 
 Linux remains the primary, fully tested platform (see [INSTALL.md](INSTALL.md)).
 This document captures the Windows-specific build path for users who need
@@ -19,7 +19,7 @@ must not affect Linux builds.
 | Visual Studio | 2022 (MSVC 19.40+) or 2026 (MSVC 19.50+) | Install the "Desktop development with C++" workload |
 | CMake | 3.24+ | |
 | Ninja | latest | `pip install ninja` or VS-bundled |
-| Python | 3.10 / 3.11 / 3.12 | Same Python must run cmake AND `import flash_vla` |
+| Python | 3.10 / 3.11 / 3.12 | Same Python must run cmake AND `import flash_rt` |
 | pybind11 | latest | `pip install pybind11` |
 | CUTLASS | 4.4.2 | Manual clone — see step 3 |
 
@@ -68,7 +68,7 @@ ninja -j16
 via `nvidia-smi` works on Windows too if you omit the flag.
 
 When the build reaches `[Linking CXX shared module
-flash_vla_kernels.cp311-win_amd64.pyd]`, you're done.
+flash_rt_kernels.cp311-win_amd64.pyd]`, you're done.
 
 For an editable install (recommended, mirrors Linux):
 
@@ -77,7 +77,7 @@ cd ..
 pip install -e ".[torch]"
 ```
 
-The `.pyd` files are dropped into `flash_vla\` automatically.
+The `.pyd` files are dropped into `flash_rt\` automatically.
 
 ---
 
@@ -97,7 +97,7 @@ POSIX calls everywhere else. Behavior on Linux is unchanged byte-for-byte.
 
 If you ship a `.dll` build of the SM100/SM110 CUTLASS FMHA kernel,
 pass its full path to `load_fmha_library("...\\fmha_fp16_strided.dll")`.
-The default `flash_vla_kernels` build does not produce this DLL on
+The default `flash_rt_kernels` build does not produce this DLL on
 SM120 (FA2 in-process is faster on Blackwell), so most Windows users
 never load it.
 
@@ -133,17 +133,17 @@ will need a different remedy at that point.
 ### 5.3 Windows DLL search-path injection
 Python 3.8+ on Windows ignores `PATH` when resolving DLL dependencies
 of C extensions (a deliberate security hardening). Without
-intervention, `import flash_vla` fails with
-`ImportError: DLL load failed while importing flash_vla_kernels`,
+intervention, `import flash_rt` fails with
+`ImportError: DLL load failed while importing flash_rt_kernels`,
 because `cudart64_*.dll`, `cublas64_*.dll`, etc. live in the CUDA
 toolkit `bin\` directory which the secure loader does not consult.
 
-`flash_vla/__init__.py` calls `os.add_dll_directory()` for every
+`flash_rt/__init__.py` calls `os.add_dll_directory()` for every
 plausible CUDA install (the active `CUDA_PATH`, the default v13.0 /
 v12.9 / v12.8 install paths, and `CUDNN_PATH` if set), gated on
 `sys.platform == 'win32'` so Linux is untouched. If your CUDA install
 is somewhere else, set `CUDA_PATH` in the environment before
-importing `flash_vla`.
+importing `flash_rt`.
 
 ### 5.4 MSVC compile flags in `CMakeLists.txt`
 The top of `CMakeLists.txt` adds an `if(MSVC) ... endif()` block that
@@ -159,8 +159,8 @@ target's `-Xcompiler -Wno-deprecated-declarations` is mapped to
 ## 6. Smoke test
 
 ```bat
-python -c "import flash_vla; print(flash_vla.__version__)"
-python -c "from flash_vla import flash_vla_kernels; print('kernels OK')"
+python -c "import flash_rt; print(flash_rt.__version__)"
+python -c "from flash_rt import flash_rt_kernels; print('kernels OK')"
 ```
 
 Both commands should print without error. If the second one fails
@@ -178,7 +178,7 @@ location.
   come from. SM100/SM110 users who want the CUTLASS FMHA backend on
   Windows will need to add a Windows-side build target — open an
   issue if you need this.
-- **JAX FFI module** (`flash_vla_jax_ffi`) is detected only when
+- **JAX FFI module** (`flash_rt_jax_ffi`) is detected only when
   `jax.ffi.include_dir()` resolves; JAX on Windows is not officially
   supported by upstream JAX, so this module is normally skipped.
 - **Editable install + Ninja** is the tested combination. Other

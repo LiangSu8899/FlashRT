@@ -1,4 +1,4 @@
-"""FlashVLA -- Pi0FastTorchFrontend: Autoregressive Pi0-FAST inference.
+"""FlashRT -- Pi0FastTorchFrontend: Autoregressive Pi0-FAST inference.
 
 Unlike Pi0/Pi0.5 (diffusion), Pi0-FAST generates actions as discrete tokens
 via autoregressive decoding through a single Gemma 2B model.

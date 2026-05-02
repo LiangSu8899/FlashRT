@@ -1,4 +1,4 @@
-"""FlashVLA -- GROOT N1.6 model pipelines and embodiment mapping.
+"""FlashRT -- GROOT N1.6 model pipelines and embodiment mapping.
 
 Per the unified pipeline_<hw>.py contract:
     pipeline_thor.py  - Thor SM110 GrootSigLIP2 / GrootQwen3 / GrootDiT

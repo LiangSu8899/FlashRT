@@ -2,7 +2,7 @@
 
 The driver is dataset-agnostic (it's the upstream
 ``train_jax_lora_recap.py`` from openpi-compiler invoked via the
-FlashVLA FP8 wrapper); the LIBERO-only filename was a misnomer.
+FlashRT FP8 wrapper); the LIBERO-only filename was a misnomer.
 This shim re-exports everything for any caller still importing
 the old path. New code should import from
 :mod:`training.jax.rl.train_recap` directly.

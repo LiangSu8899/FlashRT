@@ -1,16 +1,16 @@
-# FlashVLA Training — JAX path (BETA)
+# FlashRT Training — JAX path (BETA)
 
 Status: **v0.1.0 BETA — API not stable**. JAX companion to the
 PyTorch FP8+LoRA training stack at [`training/`](../). Both paths
 share the same algorithm primitives in
-[`flash_vla/core/rl/`](../../flash_vla/core/rl/) (ACP tags, advantage,
+[`flash_rt/core/rl/`](../../flash_rt/core/rl/) (ACP tags, advantage,
 soft VF loss) and the same FP8 cuBLASLt kernel in
 [`csrc/gemm/gemm_runner.cu`](../../csrc/gemm/gemm_runner.cu); only
 the framework wiring differs.
 
 ## Why this exists
 
-FlashVLA's PyTorch path is one of several ways to fine-tune pi0.5
+FlashRT's PyTorch path is one of several ways to fine-tune pi0.5
 ([openpi](https://github.com/Physical-Intelligence/openpi) is the
 canonical JAX reference, [lerobot](https://github.com/huggingface/lerobot)
 is the PEFT-based PyTorch port). The JAX path here is for users
@@ -19,14 +19,14 @@ acceleration without leaving the JAX ecosystem. Concretely:
 
 * The trained checkpoint is **Orbax**, not PyTorch safetensors.
 * Inference loads the merged Orbax via
-  [`flash_vla.frontends.jax.pi05_rtx`](../../flash_vla/frontends/jax/pi05_rtx.py)
+  [`flash_rt.frontends.jax.pi05_rtx`](../../flash_rt/frontends/jax/pi05_rtx.py)
   — JAX-native end to end, no torch in the train→serve loop.
 * The PyTorch path at [`training/`](../) is a parallel, independent
   lane — they never need to meet.
 
 The work the JAX path adds on top of openpi:
 
-1. An **XLA FFI handler** that exposes FlashVLA's cuBLASLt FP8 GEMM
+1. An **XLA FFI handler** that exposes FlashRT's cuBLASLt FP8 GEMM
    to JAX ([`csrc/training/jax_ffi/`](../../csrc/training/jax_ffi/)).
 2. A **monkey-patch** that routes openpi's
    `lora.Einsum` + `lora.FeedForward` matmuls through the FFI when
@@ -61,7 +61,7 @@ training/jax/
 
 The shared inference primitives (`acp_tags`, `cfg_sampler`,
 `advantage`, numpy parts of `reward`) are imported directly from
-[`flash_vla/core/rl/`](../../flash_vla/core/rl/); the JAX path only
+[`flash_rt/core/rl/`](../../flash_rt/core/rl/); the JAX path only
 reimplements the bits that touched torch tensors.
 
 ## Quick start
@@ -76,7 +76,7 @@ Same env-var convention as the PyTorch README. Add one JAX-only entry:
 | Pi0.5 LIBERO ckpt (norm_stats source) | `FLASHVLA_PI05_LIBERO` | inference round-trip |
 
 The trained driver is the upstream
-`openpi-compiler/RL/scripts/train_jax_lora_recap.py`. FlashVLA
+`openpi-compiler/RL/scripts/train_jax_lora_recap.py`. FlashRT
 contributes a wrapper that enables the FP8 patch before the
 upstream's argparse runs:
 
@@ -122,7 +122,7 @@ The merged directory is a drop-in replacement for `pi05_base/params`
 plus the LIBERO finetune. Load via:
 
 ```python
-from flash_vla.frontends.jax.pi05_rtx import Pi05JaxFrontendRtx
+from flash_rt.frontends.jax.pi05_rtx import Pi05JaxFrontendRtx
 
 pipe = Pi05JaxFrontendRtx("<your-merged-dir>", num_views=2)
 pipe.set_prompt("pick up the red block")
@@ -131,7 +131,7 @@ out = pipe.infer(obs)             # {"actions": (chunk_size, 7) np.ndarray}
 ```
 
 Note that the inference frontend's
-[`flash_vla/frontends/jax/pi05_rtx.py`](../../flash_vla/frontends/jax/pi05_rtx.py)
+[`flash_rt/frontends/jax/pi05_rtx.py`](../../flash_rt/frontends/jax/pi05_rtx.py)
 loader expects norm_stats next to the merged checkpoint at
 `<dir>/assets/physical-intelligence/libero/norm_stats.json`. The
 upstream pi05_libero ckpt already ships this file — symlink its
@@ -157,7 +157,7 @@ on RTX 5090, β=1.5 — same path as the PyTorch frontend).
 Same recipe as the PyTorch README's
 ["What is the RECAP / ACP pipeline?"](../README.md#what-is-the-recap--acp-pipeline)
 section. The shared algorithm primitives live under
-[`flash_vla/core/rl/`](../../flash_vla/core/rl/); both stacks import
+[`flash_rt/core/rl/`](../../flash_rt/core/rl/); both stacks import
 the same `build_acp_tagged_task` from `acp_tags.py`, the same
 N-step advantage from `advantage.py`, and the same numpy reward
 helpers from `reward.py`. The byte-equality test in
@@ -169,7 +169,7 @@ the JAX hook produces identical tag strings given the same
 pi0.5 prefix embedding) is implemented in
 [`training/jax/rl/value_function.py`](rl/value_function.py) as a
 `flax.nnx.Module` mirroring the PyTorch reference at
-[`flash_vla/core/rl/value_function.py`](../../flash_vla/core/rl/value_function.py).
+[`flash_rt/core/rl/value_function.py`](../../flash_rt/core/rl/value_function.py).
 Forward parity at cosine = 1.000000 under transferred weights —
 see Status table below.
 
@@ -255,7 +255,7 @@ FP8 kernel itself.
 Last-half median loss is 0.0135. The shape matches the PyTorch
 RECAP curve 1-for-1 in direction; absolute values differ by a few
 tenths of a milli-loss because the JAX path runs on the openpi
-optimizer + dataset pipeline rather than the FlashVLA PyTorch one.
+optimizer + dataset pipeline rather than the FlashRT PyTorch one.
 
 ## Memory and throughput notes
 
@@ -331,6 +331,6 @@ env vars first.
 
 `JAX_PLATFORMS=cuda` is required when the JAX install ships an
 experimental `mlir_tensorrt` plugin that grabs the CUDA platform
-on import — the plugin's clustering pass rejects FlashVLA's XLA
+on import — the plugin's clustering pass rejects FlashRT's XLA
 FFI custom calls, so an explicit platform pin keeps the run on
 the canonical CUDA backend.

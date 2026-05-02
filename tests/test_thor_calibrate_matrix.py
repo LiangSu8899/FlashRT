@@ -86,7 +86,7 @@ PI05_SCRIPT = r"""
 # Gold reference: /tmp/pytorch_reference.npz::pytorch_raw_output — this
 # is the PyTorch FP16 / FP32 original-model output, the only valid
 # accuracy baseline. /tmp/v_prod.npy and /tmp/v_torch.npy are FP8
-# outputs (same precision tier as FlashVLA Thor) and are cross-checks,
+# outputs (same precision tier as FlashRT Thor) and are cross-checks,
 # not gold. We report cos_vs_pytorch_ref as the primary metric.
 import sys, json, time, pathlib, numpy as np, torch
 sys.path.insert(0, "ROOTDIR")

@@ -1,4 +1,4 @@
-"""FlashVLA new-model template — frontend (entry point).
+"""FlashRT new-model template — frontend (entry point).
 
 Copy this file to `flash_rt/frontends/torch/<mymodel>_<hw>.py`. This
 is the class that `flash_rt.load_model()` instantiates. It owns:
@@ -12,7 +12,7 @@ is the class that `flash_rt.load_model()` instantiates. It owns:
 # WHAT YOU TRANSLATE
 =====================
 
-Your reference inference code:                 FlashVLA frontend mapping:
+Your reference inference code:                 FlashRT frontend mapping:
 ------------------------------                 -------------------------
 model = MyModel.from_pretrained(ckpt)          frontend = MyModelFrontend(ckpt)
                                                   └─→ STEP 1: _load_weights()
@@ -190,7 +190,7 @@ class TemplateTorchFrontendThor:
 
         # STEP 4a: Tokenize and embed the prompt.
         # TODO: use whatever tokenizer your model expects. Most VLAs use
-        # PaliGemma's SentencePiece tokenizer; FlashVLA ships a helper:
+        # PaliGemma's SentencePiece tokenizer; FlashRT ships a helper:
         # from flash_rt.core.thor_frontend_utils import embed_prompt_torch
         # prompt_emb_np = embed_prompt_torch(prompt_text, ...)
         prompt_emb_np = np.zeros((128, self.D), dtype=np.float16)  # placeholder

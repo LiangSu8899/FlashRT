@@ -1,4 +1,4 @@
-"""FlashVLA — GrootTorchFrontendThor: GROOT N1.6 inference via flash_rt_kernels.so.
+"""FlashRT — GrootTorchFrontendThor: GROOT N1.6 inference via flash_rt_kernels.so.
 
 Architecture: Eagle3-VL (SigLIP2 + Qwen3-1.7B) + AlternateVLDiT (32L, 4 flow-matching steps)
 

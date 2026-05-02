@@ -1,4 +1,4 @@
-"""FlashVLA — Hardware detection utilities."""
+"""FlashRT — Hardware detection utilities."""
 
 import subprocess
 

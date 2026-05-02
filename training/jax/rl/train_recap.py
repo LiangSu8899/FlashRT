@@ -23,7 +23,7 @@ The driver implements the recipe Phase 3d calls for:
   ``:301-306``.
 
 Re-implementing this entire driver in ``training/jax/rl/`` would
-just duplicate openpi-compiler. Instead, FlashVLA contributes:
+just duplicate openpi-compiler. Instead, FlashRT contributes:
 
 * The FP8 LoRA patch (`training.jax.fp8.lora_patch`) — installed
   via ``training.jax.scripts.run_baseline_with_fp8_patch`` so the

@@ -1,4 +1,4 @@
-# FlashVLA — Pi0.5 model configuration
+# FlashRT — Pi0.5 model configuration
 name: pi05
 vision_type: siglip
 vlm_hidden: 2048

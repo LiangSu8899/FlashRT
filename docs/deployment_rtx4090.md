@@ -8,7 +8,7 @@
 >
 > **Attention kernel is vendored.** Flash-Attention 2 v2.7.4.post1
 > source is shipped under `csrc/attention/flash_attn_2_src/` and
-> built into `flash_vla/flash_vla_fa2.so` during `cmake && make`.
+> built into `flash_rt/flash_rt_fa2.so` during `cmake && make`.
 > No `pip install flash-attn` needed — on 4090 the kernel uses
 > `arch=compute_80,code=sm_80` AOT SASS (Ampere ISA is a strict
 > subset of Ada), so the compiled `.so` runs natively without
@@ -21,7 +21,7 @@
 1. [Hardware + OS prerequisites](#1-hardware--os-prerequisites)
 2. [Docker image + container setup](#2-docker-image--container-setup)
 3. [Transfer the repo folder + datasets](#3-transfer-the-repo-folder--datasets)
-4. [Build `flash_vla_kernels.so` (for SM89)](#4-build-flash_vla_kernelsso-for-sm89)
+4. [Build `flash_rt_kernels.so` (for SM89)](#4-build-flash_rt_kernelsso-for-sm89)
 5. [Sanity checks](#5-sanity-checks)
 6. [Cosine regression tests](#6-cosine-regression-tests)
 7. [Latency benchmarks](#7-latency-benchmarks)
@@ -107,8 +107,8 @@ RUN pip install --no-cache-dir \
 # NOTE: `pip install flash-attn` is NOT required any more. FlashRT
 # vendors the FA2 fp16 + bf16 fwd kernels at source level under
 # csrc/attention/flash_attn_2_src/ and builds them into
-# flash_vla/flash_vla_fa2.so during `cmake && make`. The runtime
-# imports `from flash_vla import flash_vla_fa2` directly, so there is
+# flash_rt/flash_rt_fa2.so during `cmake && make`. The runtime
+# imports `from flash_rt import flash_rt_fa2` directly, so there is
 # no dependency on the pip `flash-attn` wheel and no need to match
 # the wheel's torch × CUDA × driver × glibc compatibility matrix.
 #
@@ -210,7 +210,7 @@ export PYTHONPATH=/workspace/openpi/src:$PYTHONPATH
 
 ---
 
-## 4. Build `flash_vla_kernels.so` (for SM89)
+## 4. Build `flash_rt_kernels.so` (for SM89)
 
 CMake auto-detects the local GPU's compute capability via
 `nvidia-smi`, so on a 4090 it will default to `GPU_ARCH=89`. No flag
@@ -232,7 +232,7 @@ Expected CMake output on 4090:
 -- NVFP4/W4A8 support: DISABLED (requires sm_120a)  ← expected, 4090 is Ada not Blackwell
 -- FA2 in-SO attention: ENABLED (sm_89)             ← expected, vendored FA2 built for SM80-family
 -- FA2 vendor object library: building for sm_80 + sm_120 + PTX fallback
--- FA2 pybind module: flash_vla_fa2 (separate .so)
+-- FA2 pybind module: flash_rt_fa2 (separate .so)
 ```
 
 Build time on 4090 (CUDA 13 NGC container): ~10–12 min total
@@ -243,7 +243,7 @@ take ~2 min because FA2 is a separate CMake target.
 The SM89 build uses:
 - `fp8_gemm_descale_fp16` → cuBLASLt (works on SM89+)
 - FP16/BF16 templated kernels (norm, activation, residual) — all support SM80+
-- **In-SO Flash-Attention 2** (fp16 + bf16) via `flash_vla_fa2.so`.
+- **In-SO Flash-Attention 2** (fp16 + bf16) via `flash_rt_fa2.so`.
   Runs `arch=compute_80,code=sm_80` SASS natively on SM89 (Ampere
   ISA is a strict subset of Ada) — no PTX JIT, no pip `flash-attn`
   wheel required.
@@ -253,17 +253,17 @@ The SM89 build uses:
 Install both `.so` files next to the Python package:
 
 ```bash
-cp build/flash_vla_kernels.cpython-312-x86_64-linux-gnu.so \
-   flash_vla/flash_vla_kernels.cpython-312-x86_64-linux-gnu.so
-cp build/flash_vla_fa2.cpython-312-x86_64-linux-gnu.so \
-   flash_vla/flash_vla_fa2.cpython-312-x86_64-linux-gnu.so
+cp build/flash_rt_kernels.cpython-312-x86_64-linux-gnu.so \
+   flash_rt/flash_rt_kernels.cpython-312-x86_64-linux-gnu.so
+cp build/flash_rt_fa2.cpython-312-x86_64-linux-gnu.so \
+   flash_rt/flash_rt_fa2.cpython-312-x86_64-linux-gnu.so
 ```
 
 Verify the bindings are loadable:
 
 ```bash
-python -c "from flash_vla import flash_vla_kernels as fvk; \
-           from flash_vla import flash_vla_fa2     as fa2; \
+python -c "from flash_rt import flash_rt_kernels as fvk; \
+           from flash_rt import flash_rt_fa2     as fa2; \
            print('gate_geglu_fp16:',   hasattr(fvk, 'gate_geglu_fp16')); \
            print('qkv_split_fp16:',       hasattr(fvk, 'qkv_split_fp16')); \
            print('fp8_gemm_descale_fp16:', hasattr(fvk, 'fp8_gemm_descale_fp16')); \
@@ -290,7 +290,7 @@ fa2.fwd_bf16: True
 
 ```bash
 python -c "
-from flash_vla.hardware import detect_arch, _PIPELINE_MAP
+from flash_rt.hardware import detect_arch, _PIPELINE_MAP
 arch = detect_arch()
 print('detected arch:', arch)
 print('pi0 torch dispatch:', _PIPELINE_MAP[('pi0', 'torch', arch)])
@@ -301,8 +301,8 @@ print('pi0 jax dispatch:  ', _PIPELINE_MAP[('pi0', 'jax',   arch)])
 Expected:
 ```
 detected arch: rtx_sm89
-pi0 torch dispatch: ('flash_vla.frontends.torch.pi0_rtx', 'Pi0TorchFrontendRtx')
-pi0 jax dispatch:   ('flash_vla.frontends.jax.pi0_rtx',   'Pi0JaxFrontendRtx')
+pi0 torch dispatch: ('flash_rt.frontends.torch.pi0_rtx', 'Pi0TorchFrontendRtx')
+pi0 jax dispatch:   ('flash_rt.frontends.jax.pi0_rtx',   'Pi0JaxFrontendRtx')
 ```
 
 If this prints `rtx_sm89` and resolves to the same classes as 5090,
@@ -312,11 +312,11 @@ the whole codepath is good.
 
 ```bash
 python -c "
-from flash_vla.frontends.torch.pi0_rtx   import Pi0TorchFrontendRtx
-from flash_vla.frontends.jax.pi0_rtx     import Pi0JaxFrontendRtx
-from flash_vla.frontends.torch.pi05_rtx  import Pi05TorchFrontendRtx
-from flash_vla.frontends.jax.pi05_rtx    import Pi05JaxFrontendRtx
-from flash_vla.frontends.torch.groot_rtx import GrootTorchFrontendRtx
+from flash_rt.frontends.torch.pi0_rtx   import Pi0TorchFrontendRtx
+from flash_rt.frontends.jax.pi0_rtx     import Pi0JaxFrontendRtx
+from flash_rt.frontends.torch.pi05_rtx  import Pi05TorchFrontendRtx
+from flash_rt.frontends.jax.pi05_rtx    import Pi05JaxFrontendRtx
+from flash_rt.frontends.torch.groot_rtx import GrootTorchFrontendRtx
 print('all imports OK')
 "
 ```
@@ -332,7 +332,7 @@ real frames). Expected cos targets are the same as 5090 since the FP8
 kernels are algorithmically identical.
 
 For each of the four RTX paths below, the validation pattern is the
-same: load the model via `flash_vla.load_model(...)`, run `predict()`
+same: load the model via `flash_rt.load_model(...)`, run `predict()`
 with a matched-noise observation, and compare the output against your
 PyTorch FP32 reference run on the same inputs.
 
@@ -353,7 +353,7 @@ Typical: jax_vs_fp32 = 0.9984, jax_vs_torch = 0.9990.
 
 ### 6d. GROOT torch RTX
 Targets: pass per-embodiment cosine thresholds (see
-`flash_vla.models.groot.embodiments`). Requires the HuggingFace
+`flash_rt.models.groot.embodiments`). Requires the HuggingFace
 Isaac-GR00T checkpoint locally available.
 
 If `transformers` complains about `VideoInput`, pin a compatible
@@ -433,14 +433,14 @@ Host driver < 545 can't run CUDA 13 containers. Either upgrade the
 driver or rebuild the image against `nvcr.io/nvidia/pytorch:24.07-py3`
 (CUDA 12.6, compatible with driver 535+).
 
-### `ImportError: cannot import name 'flash_vla_fa2' from 'flash_vla'`
+### `ImportError: cannot import name 'flash_rt_fa2' from 'flash_rt'`
 You skipped the FA2 `.so` install step. The main kernel build
 produces TWO `.so` files on RTX targets — copy both:
 ```bash
-cp build/flash_vla_kernels*.so flash_vla/
-cp build/flash_vla_fa2*.so     flash_vla/
+cp build/flash_rt_kernels*.so flash_rt/
+cp build/flash_rt_fa2*.so     flash_rt/
 ```
-If `build/flash_vla_fa2*.so` does not exist, check that CMake
+If `build/flash_rt_fa2*.so` does not exist, check that CMake
 printed `FA2 in-SO attention: ENABLED (sm_89)` during `cmake ..`
 — if it said DISABLED, the detected GPU arch is wrong (`cmake ..
 -DGPU_ARCH=89` forces SM89).
@@ -481,10 +481,10 @@ for the full flag table and measured savings.
 You almost certainly have `*.so` from the 5090 build (sm_120) loaded
 on the 4090. Remove, rebuild, re-install:
 ```bash
-rm -f flash_vla/flash_vla_kernels*.so flash_vla/flash_vla_fa2*.so \
-      build/flash_vla_kernels*.so     build/flash_vla_fa2*.so
+rm -f flash_rt/flash_rt_kernels*.so flash_rt/flash_rt_fa2*.so \
+      build/flash_rt_kernels*.so     build/flash_rt_fa2*.so
 cd build && rm CMakeCache.txt && cmake .. && make -j && cd ..
-cp build/flash_vla_kernels.*.so build/flash_vla_fa2.*.so flash_vla/
+cp build/flash_rt_kernels.*.so build/flash_rt_fa2.*.so flash_rt/
 ```
 
 ### Cosine is 0.91, per-action gradient 0.72 → 0.95
@@ -517,14 +517,14 @@ docker exec -it pi0-4090 bash
 cd <repo_root>
 export PYTHONPATH=/workspace/openpi/src:$PYTHONPATH
 
-# 1. Build (produces flash_vla_kernels.so + flash_vla_fa2.so on RTX)
+# 1. Build (produces flash_rt_kernels.so + flash_rt_fa2.so on RTX)
 cd build && cmake .. && make -j$(nproc) && cd ..
-cp build/flash_vla_kernels.cpython-312-*.so flash_vla/
-cp build/flash_vla_fa2.cpython-312-*.so     flash_vla/
+cp build/flash_rt_kernels.cpython-312-*.so flash_rt/
+cp build/flash_rt_fa2.cpython-312-*.so     flash_rt/
 
 # 2. Verify bindings
-python -c "from flash_vla import flash_vla_kernels as fvk; \
-           from flash_vla import flash_vla_fa2     as fa2; \
+python -c "from flash_rt import flash_rt_kernels as fvk; \
+           from flash_rt import flash_rt_fa2     as fa2; \
   print('gate_geglu_fp16:', hasattr(fvk, 'gate_geglu_fp16')); \
   print('has_cutlass_sm100:',  fvk.has_cutlass_sm100()); \
   print('fa2.fwd_fp16/bf16:',  callable(fa2.fwd_fp16) and callable(fa2.fwd_bf16))"

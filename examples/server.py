@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FlashVLA — HTTP inference server.
+FlashRT — HTTP inference server.
 
 Loads model once at startup, serves predictions via REST API.
 
@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="FlashVLA inference server")
+    parser = argparse.ArgumentParser(description="FlashRT inference server")
     parser.add_argument('--checkpoint', required=True)
     parser.add_argument('--framework', default='torch', choices=['torch', 'jax'])
     parser.add_argument('--num_views', type=int, default=2)
@@ -72,7 +72,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional
 
-app = FastAPI(title="FlashVLA", version=flash_rt.__version__)
+app = FastAPI(title="FlashRT", version=flash_rt.__version__)
 
 # Single-GPU lock — only one inference at a time
 _lock = asyncio.Lock()

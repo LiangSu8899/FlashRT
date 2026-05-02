@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FlashVLA Blackwell — LIBERO benchmark.
+FlashRT Blackwell — LIBERO benchmark.
 
 Uses Pi05FastInference backend (pybind11 + FlashAttention) on RTX 5090.
 
@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 
 
 def main():
-    parser = argparse.ArgumentParser(description="FlashVLA Blackwell LIBERO benchmark")
+    parser = argparse.ArgumentParser(description="FlashRT Blackwell LIBERO benchmark")
     parser.add_argument('--checkpoint', required=True)
     parser.add_argument('--task_suite', default='libero_spatial',
                         choices=['libero_spatial', 'libero_object', 'libero_goal',
@@ -31,7 +31,7 @@ def main():
     args = parser.parse_args()
 
     print("=" * 60)
-    print(f"FlashVLA Blackwell — LIBERO {args.task_suite}")
+    print(f"FlashRT Blackwell — LIBERO {args.task_suite}")
     print("=" * 60)
 
     print(f"\nFor full LIBERO evaluation, use the production script:")

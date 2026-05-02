@@ -1,7 +1,7 @@
 // ============================================================================
 //  flash_wm — NVFP4 GEMM with BF16 output (Thor SM100/SM110).
 //
-//  Direct mirror of the upstream flash_vla FP4 GEMM variant template, with
+//  Direct mirror of the upstream flash_rt FP4 GEMM variant template, with
 //  ElementC/ElementD swapped from cutlass::half_t to cutlass::bfloat16_t.
 //  Needed because BAGEL's residual stream is BF16 and the FP4 Down GEMM's
 //  fp16 output accumulator overflows 65504 at some layers/timesteps (L5 @

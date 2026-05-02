@@ -1,5 +1,5 @@
 // ================================================================
-// FlashVLA — Normalization kernels (dtype-generic)
+// FlashRT — Normalization kernels (dtype-generic)
 // RMSNorm, LayerNorm, AdaRMSNorm
 // Supports: __half (FP16), __nv_bfloat16 (BF16) via templates
 // ================================================================

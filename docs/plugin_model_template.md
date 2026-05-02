@@ -1,7 +1,7 @@
-# FlashVLA — Plugin Model Template
+# FlashRT — Plugin Model Template
 
 This document shows how an **external package** integrates a new VLA model
-into FlashVLA without modifying the open-source repo. This is the intended
+into FlashRT without modifying the open-source repo. This is the intended
 path for closed-source or partner-specific models (e.g. Pi0.6, Pi0.7).
 
 No actual plugin code lives in this repo — this is purely documentation.
@@ -10,8 +10,8 @@ No actual plugin code lives in this repo — this is purely documentation.
 
 ## Overview
 
-FlashVLA's dispatch is driven by `_PIPELINE_MAP` in
-`flash_vla.hardware.__init__`. A plugin registers itself by:
+FlashRT's dispatch is driven by `_PIPELINE_MAP` in
+`flash_rt.hardware.__init__`. A plugin registers itself by:
 
 1. Implementing `AttentionBackend` for the new model's attention shape.
 2. Writing a pipeline class (model logic, framework-agnostic).
@@ -19,7 +19,7 @@ FlashVLA's dispatch is driven by `_PIPELINE_MAP` in
 4. Monkey-patching `_PIPELINE_MAP` to route `(config, framework, arch)`
    to the plugin's frontend.
 
-After registration, `flash_vla.load_model(config="mymodel")` works
+After registration, `flash_rt.load_model(config="mymodel")` works
 exactly like the built-in models.
 
 ---
@@ -29,7 +29,7 @@ exactly like the built-in models.
 ```python
 # mymodel_plugin/attention.py
 
-from flash_vla.hardware.backend import AttentionBackendBase, AttentionSpec
+from flash_rt.hardware.backend import AttentionBackendBase, AttentionSpec
 
 class MyModelAttentionBackend(AttentionBackendBase):
     """Attention backend for MyModel on RTX (flash_attn)."""
@@ -37,7 +37,7 @@ class MyModelAttentionBackend(AttentionBackendBase):
     def __init__(self, spec: AttentionSpec):
         super().__init__(spec)
         # Allocate Q/K/V torch tensors for each (site, layer) ...
-        # See flash_vla.hardware.rtx.attn_backend.TorchFlashAttnBackend
+        # See flash_rt.hardware.rtx.attn_backend.TorchFlashAttnBackend
         # for a working example.
 
     def get_slot_ptrs(self, site: str, layer_idx: int) -> dict[str, int]:
@@ -52,7 +52,7 @@ class MyModelAttentionBackend(AttentionBackendBase):
 If the model's attention shape is similar to an existing model, consider
 reusing `TorchFlashAttnBackend` (Pi0.5 pattern) or
 `TorchFlashAttnBackendGroot` (multi-site pattern) directly. These are
-importable from `flash_vla.hardware.rtx.attn_backend[_groot]`.
+importable from `flash_rt.hardware.rtx.attn_backend[_groot]`.
 
 ---
 
@@ -61,7 +61,7 @@ importable from `flash_vla.hardware.rtx.attn_backend[_groot]`.
 ```python
 # mymodel_plugin/pipeline.py
 
-from flash_vla.core.cuda_buffer import CudaBuffer
+from flash_rt.core.cuda_buffer import CudaBuffer
 
 class MyModelPipeline:
     """Framework-agnostic pipeline. Operates on raw device pointers."""
@@ -95,7 +95,7 @@ The pipeline should:
 import torch
 from mymodel_plugin.pipeline import MyModelPipeline
 from mymodel_plugin.attention import MyModelAttentionBackend
-from flash_vla.hardware.backend import AttentionSpec
+from flash_rt.hardware.backend import AttentionSpec
 
 class MyModelTorchFrontend:
     """Load safetensors checkpoint → build pipeline → infer."""
@@ -134,7 +134,7 @@ methods that `VLAModel.predict()` calls.
 ```python
 # mymodel_plugin/__init__.py
 
-from flash_vla.hardware import _PIPELINE_MAP
+from flash_rt.hardware import _PIPELINE_MAP
 
 # Register for RTX 5090
 _PIPELINE_MAP[("mymodel", "torch", "rtx_sm120")] = (
@@ -147,7 +147,7 @@ _PIPELINE_MAP[("mymodel", "torch", "thor")] = (
 )
 ```
 
-After this import, `flash_vla.load_model(config="mymodel")` will find
+After this import, `flash_rt.load_model(config="mymodel")` will find
 and instantiate `MyModelTorchFrontend`.
 
 **Import order matters**: the plugin's `__init__.py` must run before
@@ -156,15 +156,15 @@ and instantiate `MyModelTorchFrontend`.
 ```python
 # Option A: explicit import in user code
 import mymodel_plugin  # registers _PIPELINE_MAP entries
-import flash_vla
-model = flash_vla.load_model(config="mymodel", checkpoint="...")
+import flash_rt
+model = flash_rt.load_model(config="mymodel", checkpoint="...")
 
 # Option B: entry_points (setuptools)
 # In mymodel_plugin's setup.cfg:
 #   [options.entry_points]
-#   flash_vla.plugins =
+#   flash_rt.plugins =
 #       mymodel = mymodel_plugin
-# FlashVLA does NOT auto-discover entry_points today, but a future
+# FlashRT does NOT auto-discover entry_points today, but a future
 # version may. For now, use Option A.
 ```
 
@@ -177,16 +177,16 @@ in [stable_api.md](stable_api.md):
 
 | Import | Purpose |
 |---|---|
-| `flash_vla.hardware.backend.AttentionBackend` | Protocol to implement |
-| `flash_vla.hardware.backend.AttentionSpec` | Build attention site specs |
-| `flash_vla.hardware.backend.SiteSpec` | Attention site descriptor |
-| `flash_vla.hardware._PIPELINE_MAP` | Registration point |
-| `flash_vla.core.cuda_buffer.CudaBuffer` | GPU buffer allocation |
-| `flash_vla.core.cuda_graph.CUDAGraph` | CUDA graph capture/replay |
-| `flash_vla.core.quant.calibrator.*` | FP8 calibration cache |
+| `flash_rt.hardware.backend.AttentionBackend` | Protocol to implement |
+| `flash_rt.hardware.backend.AttentionSpec` | Build attention site specs |
+| `flash_rt.hardware.backend.SiteSpec` | Attention site descriptor |
+| `flash_rt.hardware._PIPELINE_MAP` | Registration point |
+| `flash_rt.core.cuda_buffer.CudaBuffer` | GPU buffer allocation |
+| `flash_rt.core.cuda_graph.CUDAGraph` | CUDA graph capture/replay |
+| `flash_rt.core.quant.calibrator.*` | FP8 calibration cache |
 
-Everything else (`flash_vla.models.*`, `flash_vla.frontends.*`,
-`flash_vla.hardware.rtx.*` internals) is internal and may change.
+Everything else (`flash_rt.models.*`, `flash_rt.frontends.*`,
+`flash_rt.hardware.rtx.*` internals) is internal and may change.
 
 ---
 
@@ -195,9 +195,9 @@ Everything else (`flash_vla.models.*`, `flash_vla.frontends.*`,
 ```python
 # Smoke test
 import mymodel_plugin
-import flash_vla
+import flash_rt
 
-model = flash_vla.load_model(
+model = flash_rt.load_model(
     config="mymodel",
     checkpoint="/path/to/ckpt",
     framework="torch",
@@ -205,7 +205,7 @@ model = flash_vla.load_model(
 model.predict(images=[img1, img2], prompt="test prompt")
 
 # Verify dispatch
-from flash_vla.hardware import resolve_pipeline_class, detect_arch
+from flash_rt.hardware import resolve_pipeline_class, detect_arch
 cls = resolve_pipeline_class("mymodel", "torch", detect_arch())
 assert cls.__name__ == "MyModelTorchFrontend"
 ```

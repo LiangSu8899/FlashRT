@@ -1,4 +1,4 @@
-"""FlashVLA — Thor attention backend for GROOT.
+"""FlashRT — Thor attention backend for GROOT.
 
 GROOT's internal buffer layout is sufficiently different from Pi0.5/Pi0
 that it warrants its own backend class (see

@@ -1,4 +1,4 @@
-"""FlashVLA -- Pi0.5 model pipelines.
+"""FlashRT -- Pi0.5 model pipelines.
 
 The RTX pipeline class and its dimension constants are re-exported
 here so that frontends and tests can

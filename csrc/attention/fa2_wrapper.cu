@@ -1,5 +1,5 @@
 // ================================================================
-// FlashVLA — Raw-pointer entries for vendored Flash-Attention 2
+// FlashRT — Raw-pointer entries for vendored Flash-Attention 2
 //
 // Replaces flash_api.cpp (torch-typed) with two C-linkage entries:
 //   fvk_attention_fa2_fwd_fp16   — elem_type = cutlass::half_t

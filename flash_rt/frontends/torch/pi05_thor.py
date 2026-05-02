@@ -1,4 +1,4 @@
-"""FlashVLA -- Pi05TorchFrontendThor: complete inference using ONLY flash_rt_kernels.so.
+"""FlashRT -- Pi05TorchFrontendThor: complete inference using ONLY flash_rt_kernels.so.
 
 All computation goes through flash_rt_kernels (pybind11 + CUTLASS + cuBLASLt).
 
@@ -67,7 +67,7 @@ from flash_rt.core.thor_frontend_utils import embed_prompt_torch as embed_prompt
 class Pi05TorchFrontendThor:
     """Complete Pi0.5 inference pipeline using only flash_rt_kernels.so.
 
-    Interface compatible with FlashVLAModel.predict():
+    Interface compatible with FlashRTModel.predict():
         set_prompt(prompt_text)
         infer(observation) -> {"actions": np.ndarray}
     """

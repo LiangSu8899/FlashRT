@@ -1,12 +1,12 @@
 # Adding a New Model: The Complete Guide
 
-> **Target audience**: Engineers who need to integrate a new VLA model into FlashVLA (e.g. Pi0.6, a fresh open-source VLA).
+> **Target audience**: Engineers who need to integrate a new VLA model into FlashRT (e.g. Pi0.6, a fresh open-source VLA).
 >
 > **Time estimate**: A single `(framework, hardware)` combination runs around 800-1200 lines of code, or 1-2 weeks of work, assuming the model's structure is close to Pi0.5 / Pi0. All four combinations (torch/jax × thor/rtx) take roughly 3-4 weeks.
 >
 > **Read in this order** (don't skip ahead — each doc assumes the previous):
 > 1. **This doc §0–§1** (you are here) — the repository contract and which files you'll touch
-> 2. [`flash_vla/frontends/torch/_template/README.md`](../flash_vla/frontends/torch/_template/) — the **starter package**. Open in a separate window before reading further; the rest of this doc references it. The template has 4 stub files (frontend / pipeline / weights_spec / attention) you copy and fill in.
+> 2. [`flash_rt/frontends/torch/_template/README.md`](../flash_rt/frontends/torch/_template/) — the **starter package**. Open in a separate window before reading further; the rest of this doc references it. The template has 4 stub files (frontend / pipeline / weights_spec / attention) you copy and fill in.
 > 3. [`docs/stable_api.md`](stable_api.md) — public API surface and naming conventions you must respect
 > 4. [`docs/calibration.md`](calibration.md) — how FP8 calibration works (read **§2 + §10** before writing your `_calibrate` twin)
 > 5. [`docs/kernel_fusion.md`](kernel_fusion.md) — kernel naming + decision tree for which `fvk.*` to call where (skim §1 + §2; reference the rest as you write `pipeline.py`)
@@ -52,7 +52,7 @@ Mandatory rules:
      file. They go into models/<m>/pipeline_<hw>.py.
 
 4. _PIPELINE_MAP is strictly one-to-one:
-     ("model", "framework", "hw") -> ("flash_vla.frontends.<fw>.<m>_<hw>",
+     ("model", "framework", "hw") -> ("flash_rt.frontends.<fw>.<m>_<hw>",
                                       "ClassName")
    Each tuple points to exactly one file and one class. Multiple tuples
    sharing a class (i.e. runtime forking) is forbidden.
@@ -70,7 +70,7 @@ Known historical exception (do NOT copy this pattern):
 Walking through a hypothetical `pi06` model (Paligemma backbone) that needs to support both Thor and RTX, under both torch and jax:
 
 ```
-flash_vla/
+flash_rt/
 ├── hardware/__init__.py                  # 4 new lines in _PIPELINE_MAP
 ├── hardware/thor/attn_backend.py         # add make_pi06_attention_spec (if shapes change)
 ├── hardware/rtx/attn_backend.py          # (RTX) same
@@ -107,23 +107,23 @@ Before reading §2, **copy the starter template**:
 
 ```bash
 # For a new model called "mymodel" on Thor:
-cp -r flash_vla/frontends/torch/_template /tmp/mymodel_thor_work
+cp -r flash_rt/frontends/torch/_template /tmp/mymodel_thor_work
 cd /tmp/mymodel_thor_work
 $EDITOR README.md   # 5-min read; explains the file split
 ```
 
 Then work file-by-file in this order (each file's docstring tells you exactly what to translate from your source model):
 
-1. **`weights_spec.py`** → `flash_vla/frontends/torch/_<mymodel>_thor_spec.py`
+1. **`weights_spec.py`** → `flash_rt/frontends/torch/_<mymodel>_thor_spec.py`
    The declarative weight loader. Map each `state_dict[...]` key from your reference checkpoint to a `WEIGHT_SPEC` row. Pure mechanical work; ~60-120 lines for a Pi0.5-shape model.
 
-2. **`attention.py`** → append `make_<mymodel>_attention_spec()` to `flash_vla/hardware/thor/attn_backend.py`
+2. **`attention.py`** → append `make_<mymodel>_attention_spec()` to `flash_rt/hardware/thor/attn_backend.py`
    ~60 lines. Declares one `add_site()` call per distinct attention shape in your model (vision, encoder, decoder, etc.).
 
-3. **`pipeline.py`** → `flash_vla/models/<mymodel>/pipeline_thor.py`
+3. **`pipeline.py`** → `flash_rt/models/<mymodel>/pipeline_thor.py`
    **The hard part.** Translate your reference model's `forward()` into a sequence of `fvk.*` kernel calls. The template's `# WHAT YOU TRANSLATE` block at the top shows the line-by-line mapping pattern. You'll write two functions per stage: a production forward (FP8, captured into CUDA Graph) and a calibration twin (BF16 + measures activation amax). 200-400 lines per hardware target.
 
-4. **`frontend.py`** → `flash_vla/frontends/torch/<mymodel>_thor.py`
+4. **`frontend.py`** → `flash_rt/frontends/torch/<mymodel>_thor.py`
    Wires it all together. Owns weight upload, buffer allocation, calibration cache, and CUDA Graph capture. Class name must be `<Model>TorchFrontendThor` per §0 rule 2. ~400-700 lines.
 
 After all four files compile and your first `infer()` produces non-NaN output, run cosine vs your PyTorch FP32 reference. Use the **first-light cosine routing table** in [`plugin_model_template.md`](plugin_model_template.md) to narrow down where to look — that table maps the cos number you see directly to the most likely root cause.
@@ -138,9 +138,9 @@ For RTX, repeat with `pipeline_rtx.py` / `<mymodel>_rtx.py`. For JAX, the templa
 
 ### (1) AttentionSpec — 15-35 lines
 
-File: [`flash_vla/hardware/thor/attn_backend.py`](../flash_vla/hardware/thor/attn_backend.py) (Thor) or [`flash_vla/hardware/rtx/attn_backend.py`](../flash_vla/hardware/rtx/attn_backend.py) (RTX).
+File: [`flash_rt/hardware/thor/attn_backend.py`](../flash_rt/hardware/thor/attn_backend.py) (Thor) or [`flash_rt/hardware/rtx/attn_backend.py`](../flash_rt/hardware/rtx/attn_backend.py) (RTX).
 
-Copy [`make_pi05_attention_spec`](../flash_vla/hardware/thor/attn_backend.py) and adjust:
+Copy [`make_pi05_attention_spec`](../flash_rt/hardware/thor/attn_backend.py) and adjust:
 
 ```python
 def make_pi06_attention_spec(num_views: int, *,
@@ -174,7 +174,7 @@ def make_pi06_attention_spec(num_views: int, *,
     )
 ```
 
-**Allowed values for `extra["kernel"]`** (see [`backend.py:AttentionBackend`](../flash_vla/hardware/backend.py) for the full table):
+**Allowed values for `extra["kernel"]`** (see [`backend.py:AttentionBackend`](../flash_rt/hardware/backend.py) for the full table):
 
 | kernel value | underlying fvk primitive | used for |
 |----------|--------------|------|
@@ -183,30 +183,30 @@ def make_pi06_attention_spec(num_views: int, *,
 | `"state_masked"` | `attention_qkv_fp16_state_masked` | Pi0 decoder (the first token is state) |
 | `"mha"` | `attention_mha_fp16` | GROOT Qwen3 full-MHA plus DiT self/cross |
 
-Do not invent new kernel values. If you need a new variant, extend the dispatch branches in [`hardware/thor/attn_backend.py:ThorFlashAttnBackend.run`](../flash_vla/hardware/thor/attn_backend.py).
+Do not invent new kernel values. If you need a new variant, extend the dispatch branches in [`hardware/thor/attn_backend.py:ThorFlashAttnBackend.run`](../flash_rt/hardware/thor/attn_backend.py).
 
 ---
 
 ### (2) Pipeline forward — 200-400 lines per hardware; **the bulk of the hand-written code**
 
 Files:
-- `flash_vla/models/pi06/pipeline_thor.py` (Thor path)
-- `flash_vla/models/pi06/pipeline_rtx.py` (RTX path)
+- `flash_rt/models/pi06/pipeline_thor.py` (Thor path)
+- `flash_rt/models/pi06/pipeline_rtx.py` (RTX path)
 
 **Each hardware gets its own file, even if the two paths end up looking similar.** Genuinely shared code lives in `hardware/<hw>/shared_primitives.py` (reserved for truly model-agnostic helpers) or is imported between sibling functions.
 
 Recent references to copy from:
-- Thor: [`models/pi0/pipeline_thor.py`](../flash_vla/models/pi0/pipeline_thor.py) — Pi0 decoder forward
-- Thor: [`models/pi05/pipeline_thor.py`](../flash_vla/models/pi05/pipeline_thor.py) — Pi0.5 `postln_project` / `decoder_forward` / `decoder_forward_calibrate`
-- RTX: [`models/pi05/pipeline_rtx.py`](../flash_vla/models/pi05/pipeline_rtx.py) — the `Pi05Pipeline` class (framework-agnostic, takes AttnBackend via injection)
-- RTX: [`models/groot/pipeline_rtx.py`](../flash_vla/models/groot/pipeline_rtx.py) — GROOT's three-graph flow
+- Thor: [`models/pi0/pipeline_thor.py`](../flash_rt/models/pi0/pipeline_thor.py) — Pi0 decoder forward
+- Thor: [`models/pi05/pipeline_thor.py`](../flash_rt/models/pi05/pipeline_thor.py) — Pi0.5 `postln_project` / `decoder_forward` / `decoder_forward_calibrate`
+- RTX: [`models/pi05/pipeline_rtx.py`](../flash_rt/models/pi05/pipeline_rtx.py) — the `Pi05Pipeline` class (framework-agnostic, takes AttnBackend via injection)
+- RTX: [`models/groot/pipeline_rtx.py`](../flash_rt/models/groot/pipeline_rtx.py) — GROOT's three-graph flow
 
 Every forward function must obey the **pointer-interface contract**:
 
 ```python
 def decoder_forward_pi06(
     gemm: fvk.GemmRunner,
-    fvk_module,                    # flash_vla_kernels
+    fvk_module,                    # flash_rt_kernels
     bufs: dict,                    # {'x': ptr, 'xn': ptr, ...}
     weights: dict,                 # {'qw': ptr, 'ow': ptr, 'gu': ptr, 'd': ptr, ...}
     dims: dict,                    # {'S': 10, 'Da': 1024, 'Ha': 4096, 'La': 24, ...}
@@ -236,19 +236,19 @@ def decoder_forward_pi06(
 ### (3) Torch WEIGHT_SPEC — 60-120 lines per `(framework, hardware)` combo, **declarative**
 
 Files:
-- `flash_vla/frontends/torch/_pi06_thor_spec.py`
-- `flash_vla/frontends/torch/_pi06_rtx_spec.py` (only if dims or weight interface differ)
+- `flash_rt/frontends/torch/_pi06_thor_spec.py`
+- `flash_rt/frontends/torch/_pi06_rtx_spec.py` (only if dims or weight interface differ)
 
 When the two hardwares share the exact same weight interface (common — both sides read the same safetensors checkpoint), a single spec file can back both frontends via `from ._pi06_thor_spec import build_spec`. **The default is still one spec file per hardware**, to avoid a future dim change on one side accidentally regressing the other.
 
 If the backbone is in the Paligemma / Gemma family (very likely):
 
 ```python
-from flash_vla.executors.weight_loader import Item, LayerBlock, ModelWeightSpec
-from flash_vla.executors.torch_weights import (
+from flash_rt.executors.weight_loader import Item, LayerBlock, ModelWeightSpec
+from flash_rt.executors.torch_weights import (
     FlatCat, FusedGateUp, FusedQKV, Quant, TensorList, ToFp16, tT,
 )
-from flash_vla.frontends.torch._thor_spec_common import (
+from flash_rt.frontends.torch._thor_spec_common import (
     paligemma_encoder_block, paligemma_siglip_block,
 )
 
@@ -283,9 +283,9 @@ def build_spec() -> ModelWeightSpec:
     )
 ```
 
-If the backbone is a **novel architecture** (Qwen3, etc.): look at [`frontends/torch/groot_thor.py::_load_qwen3_weights`](../flash_vla/frontends/torch/groot_thor.py), which is still a hand-written loop rather than a declarative spec. You will likely need to either:
+If the backbone is a **novel architecture** (Qwen3, etc.): look at [`frontends/torch/groot_thor.py::_load_qwen3_weights`](../flash_rt/frontends/torch/groot_thor.py), which is still a hand-written loop rather than a declarative spec. You will likely need to either:
 - add a new shared block builder to `_thor_spec_common.py`, or
-- define a new composite source (something like `FusedQKV`) — see `flash_vla/executors/torch_weights.py`.
+- define a new composite source (something like `FusedQKV`) — see `flash_rt/executors/torch_weights.py`.
 
 **Op order must be byte-identical**: compare your spec, op by op, against the legacy hand-written loader — `.T.contiguous()` vs `.t().contiguous()`, `ToFp16` before or after `Quant`, exactly when `norm_fuse` is applied. A single character wrong causes precision regressions.
 
@@ -294,10 +294,10 @@ If the backbone is a **novel architecture** (Qwen3, etc.): look at [`frontends/t
 ### (4) Frontend — 700-1000 lines per frontend; ~2800-4000 lines across all four
 
 Files:
-- `flash_vla/frontends/torch/pi06_thor.py`  (class: `Pi06TorchFrontendThor`)
-- `flash_vla/frontends/torch/pi06_rtx.py`   (class: `Pi06TorchFrontendRtx`)
-- `flash_vla/frontends/jax/pi06_thor.py`    (class: `Pi06JaxFrontendThor`)
-- `flash_vla/frontends/jax/pi06_rtx.py`     (class: `Pi06JaxFrontendRtx`)
+- `flash_rt/frontends/torch/pi06_thor.py`  (class: `Pi06TorchFrontendThor`)
+- `flash_rt/frontends/torch/pi06_rtx.py`   (class: `Pi06TorchFrontendRtx`)
+- `flash_rt/frontends/jax/pi06_thor.py`    (class: `Pi06JaxFrontendThor`)
+- `flash_rt/frontends/jax/pi06_rtx.py`     (class: `Pi06JaxFrontendRtx`)
 
 **Class-name rule**: `<Model><Framework>Frontend<HW>` in CamelCase — e.g. `Pi05TorchFrontendThor`, `Pi05TorchFrontendRtx`, `GrootJaxFrontendThor`.
 
@@ -326,45 +326,45 @@ Skeleton: copy the nearest sibling (same framework, same hardware) and edit:
 ### (5) JAX-side differences worth calling out
 
 **Where the JAX side diverges from torch**:
-- The source is `OrbaxDictSource(engine_w)`, where `engine_w` is the `dict[str, ndarray]` exported by openpi. The key names are **not** HF safetensors paths; they follow openpi's internal schema (e.g. `vision.layer.{i}.qkv.weight`). See [`_thor_spec_common.py`](../flash_vla/frontends/jax/_thor_spec_common.py).
+- The source is `OrbaxDictSource(engine_w)`, where `engine_w` is the `dict[str, ndarray]` exported by openpi. The key names are **not** HF safetensors paths; they follow openpi's internal schema (e.g. `vision.layer.{i}.qkv.weight`). See [`_thor_spec_common.py`](../flash_rt/frontends/jax/_thor_spec_common.py).
 - `engine_w` typically has QKV and gate_up **already fused** (openpi does this during export). So the spec does not need `FusedQKV` / `FusedGateUp` — plain `JaxQuant()` is enough.
 - The sink is `CudaBufferFlat` / `CudaBufferAttr` plus an explicit `cache=...` argument (weight caching relies on it).
 - The frontend must set `self._cache_blobs = {}` before calling `WeightLoader.run(...)`.
 
-**Weight cache behavior**: the default is `weight_cache=True`. The first load takes ~30-40s; results are cached to `~/.flash_vla/weights/<hash>_nv<N>.bin`, and subsequent loads take ~5s. When modifying a spec you **must preserve the cache key schema** (`sig_wt_fp8.{0..11}`, etc.); otherwise the cache format changes and users have to wipe it manually.
+**Weight cache behavior**: the default is `weight_cache=True`. The first load takes ~30-40s; results are cached to `~/.flash_rt/weights/<hash>_nv<N>.bin`, and subsequent loads take ~5s. When modifying a spec you **must preserve the cache key schema** (`sig_wt_fp8.{0..11}`, etc.); otherwise the cache format changes and users have to wipe it manually.
 
 ---
 
 ### (6) `_PIPELINE_MAP` registration — 4 lines (per hardware × per framework)
 
-File: [`flash_vla/hardware/__init__.py`](../flash_vla/hardware/__init__.py)
+File: [`flash_rt/hardware/__init__.py`](../flash_rt/hardware/__init__.py)
 
 ```python
 _PIPELINE_MAP: dict[...] = {
     ...  # existing entries
     # ── Pi0.6 ──
     ("pi06", "torch", "thor"):
-        ("flash_vla.frontends.torch.pi06_thor", "Pi06TorchFrontendThor"),
+        ("flash_rt.frontends.torch.pi06_thor", "Pi06TorchFrontendThor"),
     ("pi06", "torch", "rtx_sm120"):
-        ("flash_vla.frontends.torch.pi06_rtx",  "Pi06TorchFrontendRtx"),
+        ("flash_rt.frontends.torch.pi06_rtx",  "Pi06TorchFrontendRtx"),
     ("pi06", "jax", "thor"):
-        ("flash_vla.frontends.jax.pi06_thor",   "Pi06JaxFrontendThor"),
+        ("flash_rt.frontends.jax.pi06_thor",   "Pi06JaxFrontendThor"),
     ("pi06", "jax", "rtx_sm120"):
-        ("flash_vla.frontends.jax.pi06_rtx",    "Pi06JaxFrontendRtx"),
+        ("flash_rt.frontends.jax.pi06_rtx",    "Pi06JaxFrontendRtx"),
 }
 ```
 
 One entry, one class. Two entries pointing at the same class is the pi0fast anti-pattern.
 
-Then confirm that `config="pi06"` is accepted in [`api.py::load_model`](../flash_vla/api.py) — the function validates configs near the top.
+Then confirm that `config="pi06"` is accepted in [`api.py::load_model`](../flash_rt/api.py) — the function validates configs near the top.
 
 ---
 
 ### (7) Config YAML — 30 lines
 
-File: `flash_vla/configs/pi06.yaml`
+File: `flash_rt/configs/pi06.yaml`
 
-Copy [`pi05.yaml`](../flash_vla/configs/pi05.yaml) as a starting point. Fields: `num_layers`, `hidden_dim`, `num_heads`, `head_dim`, `ffn_hidden_dim`, `num_views`, `action_horizon`, `vocab_size`, and so on.
+Copy [`pi05.yaml`](../flash_rt/configs/pi05.yaml) as a starting point. Fields: `num_layers`, `hidden_dim`, `num_heads`, `head_dim`, `ffn_hidden_dim`, `num_views`, `action_horizon`, `vocab_size`, and so on.
 
 This YAML is used only for logging and metadata. Runtime dimensions still come from the constants hard-coded inside the frontend.
 
@@ -436,7 +436,7 @@ Thor has 122Gi of unified memory. Loading two models concurrently will OOM. Test
 
 ### 4.3 Don't rebuild the kernel .so
 
-`flash_vla/flash_vla_kernels.cpython-312-aarch64-linux-gnu.so` (3.6MB) is a production binary. Adding a new model should not trigger a kernel rebuild — every fvk function you need is already in this .so. If you genuinely need a new kernel, that's a separate CUDA development flow, with explicit version backups.
+`flash_rt/flash_rt_kernels.cpython-312-aarch64-linux-gnu.so` (3.6MB) is a production binary. Adding a new model should not trigger a kernel rebuild — every fvk function you need is already in this .so. If you genuinely need a new kernel, that's a separate CUDA development flow, with explicit version backups.
 
 ---
 
@@ -496,7 +496,7 @@ A: Likely causes: wrong QKV interleave (bad GQA head count), mixing `.T.contiguo
 A: Your forward contains a dynamic allocation or a conditional branch that causes capture to take a different kernel path. Details in [`kernel_fusion.md §6`](kernel_fusion.md#cuda-graph-rules).
 
 **Q: JAX loading takes ~40s — too slow?**
-A: That's the expected first-load cost. Keep `weight_cache=True` (the default); subsequent loads are ~5s. If you changed the WEIGHT_SPEC's cache key, you need `rm -rf ~/.flash_vla/weights/` so the cache can be rebuilt.
+A: That's the expected first-load cost. Keep `weight_cache=True` (the default); subsequent loads are ~5s. If you changed the WEIGHT_SPEC's cache key, you need `rm -rf ~/.flash_rt/weights/` so the cache can be rebuilt.
 
 **Q: New model OOMs on Thor?**
 A: Thor has 122Gi of unified memory. Check: (1) `free -h` shows free memory greater than model size × 1.5; (2) no other pipeline is running concurrently; (3) the previous `weight_cache` version has been cleaned up.

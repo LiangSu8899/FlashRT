@@ -1,4 +1,4 @@
-"""FlashVLA — Weight transform verification.
+"""FlashRT — Weight transform verification.
 
 Numerically compares engine weights from the new unified transform pipeline
 against the production ThorTorch (ground truth).

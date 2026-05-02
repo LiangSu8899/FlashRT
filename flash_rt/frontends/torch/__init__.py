@@ -1,1 +1,1 @@
-"""FlashVLA — PyTorch frontends (safetensors checkpoint loaders)."""
+"""FlashRT — PyTorch frontends (safetensors checkpoint loaders)."""

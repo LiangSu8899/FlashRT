@@ -58,7 +58,7 @@ message(STATUS "CUTLASS include: ${CUTLASS_INCLUDE}")
 
 # ── CUTLASS Blackwell FMHA (example 77) headers ──
 # flash_wm's cutlass_fp8_fmha.cu pulls {kernel, device, most of collective}
-# from examples/77, but uses flash_vla's LOCAL modified mainloop which has
+# from examples/77, but uses flash_rt's LOCAL modified mainloop which has
 # kPRescale softmax denorm protection. So include both dirs.
 set(CUTLASS_FMHA77_INC "${CUTLASS_INCLUDE}/../examples/77_blackwell_fmha")
 set(FLASHVLA_ATTN_INC "${CMAKE_CURRENT_SOURCE_DIR}/../../csrc/attention")
@@ -81,7 +81,7 @@ target_include_directories(flash_wm_kernels PRIVATE
   ${CUDAToolkit_INCLUDE_DIRS}
   ${CUTLASS_INCLUDE}
   ${CUTLASS_INCLUDE}/../tools/util/include
-  ${FLASHVLA_ATTN_INC}    # flash_vla's modified mainloop (kPRescale FP8 fix)
+  ${FLASHVLA_ATTN_INC}    # flash_rt's modified mainloop (kPRescale FP8 fix)
   ${CUTLASS_FMHA77_INC}   # CUTLASS example 77 headers (kernel/, device/, rest of collective/)
 )
 

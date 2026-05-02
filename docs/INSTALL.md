@@ -1,4 +1,4 @@
-# Installing FlashVLA
+# Installing FlashRT
 
 One-page install guide. Picks up where the README leaves off and
 covers the details the README keeps short to stay readable.
@@ -16,9 +16,9 @@ enables which kernels), read the "Build" section of the top-level
 | **Docker** | You want a known-good CUDA/PyTorch toolchain and don't care about host Python | [README §Option A](../README.md) |
 | **Native Linux** | You already run CUDA workloads on the host and want the library in your existing venv | [README §Option B](../README.md) |
 
-Both paths end at the same verification step — `import flash_vla;
-flash_vla.__version__` returns the installed version, and
-`flash_vla.flash_vla_kernels` is importable.
+Both paths end at the same verification step — `import flash_rt;
+flash_rt.__version__` returns the installed version, and
+`flash_rt.flash_rt_kernels` is importable.
 
 ---
 
@@ -29,7 +29,7 @@ flash_vla.__version__` returns the installed version, and
 | GPU | SM80+ | A100 / RTX 30-series / 40-series / Thor / 5090. Pre-SM80 (V100, 20-series) is unsupported — FA2 vendored code requires Ampere. |
 | NVIDIA driver | 525+ (CUDA 12.4) / 545+ (CUDA 13) | 5090 needs 550+ |
 | CUDA Toolkit | 12.4+ on Thor/Ada/Hopper, 12.8+ on Blackwell | CUDA 13 is the NGC-image default |
-| Python | 3.10 / 3.11 / 3.12 | One venv; the interpreter that runs `cmake` MUST match the interpreter that later imports `flash_vla` |
+| Python | 3.10 / 3.11 / 3.12 | One venv; the interpreter that runs `cmake` MUST match the interpreter that later imports `flash_rt` |
 | GCC / G++ | 11+ (C++17) | |
 | CMake | 3.24+ | |
 
@@ -48,7 +48,7 @@ source .venv/bin/activate
 
 ## 4. CUTLASS dependency
 
-FlashVLA's main FP8/FP4 GEMM path is built against **CUTLASS 4.x**, not
+FlashRT's main FP8/FP4 GEMM path is built against **CUTLASS 4.x**, not
 bundled in the repo to keep clone size small. Clone it before
 running `cmake`:
 
@@ -71,11 +71,11 @@ pip install -e ".[torch]"       # or "[jax]" / "[all]"
 ```
 
 `-e` is not optional. The CMake build drops compiled `.so` files into
-the `flash_vla/` source tree; only editable install makes that
+the `flash_rt/` source tree; only editable install makes that
 directory importable without an extra copy step. A plain
-`pip install .` would snapshot `flash_vla/` BEFORE the kernels are
-built, and `import flash_vla` later would fail with a missing
-`flash_vla_kernels` error.
+`pip install .` would snapshot `flash_rt/` BEFORE the kernels are
+built, and `import flash_rt` later would fail with a missing
+`flash_rt_kernels` error.
 
 ## 6. Build
 
@@ -86,7 +86,7 @@ cmake --build build -j$(nproc)       # equivalent to: ninja -C build, or make -C
 ```
 
 That's it — no separate `cp`, `make install`, or `ninja install`
-step. CMake writes every `.so` directly into `flash_vla/` at build
+step. CMake writes every `.so` directly into `flash_rt/` at build
 time via `LIBRARY_OUTPUT_DIRECTORY`, so a single `cmake --build`
 leaves the package importable. (The legacy `install(TARGETS …)`
 rule is still present for wheel-packaging users who run
@@ -94,7 +94,7 @@ rule is still present for wheel-packaging users who run
 
 Per-arch produced shared libraries:
 
-| Target  | `flash_vla_kernels.so` | `flash_vla_fp4.so` | `flash_vla_fa2.so` | `libfmha_fp16_strided.so` |
+| Target  | `flash_rt_kernels.so` | `flash_rt_fp4.so` | `flash_rt_fa2.so` | `libfmha_fp16_strided.so` |
 |---------|:----------------------:|:------------------:|:------------------:|:-------------------------:|
 | Thor (SM110) | ✅ | ✅ | — | ✅ (SigLIP fast path) |
 | Hopper (SM100) | ✅ | ✅ | — | ✅ |
@@ -126,24 +126,24 @@ cmake --build build -j$(nproc)
 
 ```bash
 python -c "
-import flash_vla, torch, numpy
-print('flash_vla:', flash_vla.__version__)
+import flash_rt, torch, numpy
+print('flash_rt:', flash_rt.__version__)
 print('torch    :', torch.__version__, torch.cuda.get_device_capability())
 print('numpy    :', numpy.__version__)
-from flash_vla import flash_vla_kernels
-print('kernels CUTLASS SM100:', flash_vla_kernels.has_cutlass_sm100())
+from flash_rt import flash_rt_kernels
+print('kernels CUTLASS SM100:', flash_rt_kernels.has_cutlass_sm100())
 "
 ```
 
 Expected (Thor example):
 ```
-flash_vla: 0.1.0
+flash_rt: 0.1.0
 torch    : 2.9.0+cu124 (11, 0)
 numpy    : 1.26.x
 kernels CUTLASS SM100: True
 ```
 
-If `import flash_vla` fails with "no module named flash_vla_kernels",
+If `import flash_rt` fails with "no module named flash_rt_kernels",
 either (a) `cmake --build` didn't produce the `.so` (re-run with
 `-v` and check the link step succeeded), or (b) you installed
 non-editable (`pip install .` instead of `pip install -e .`) and
@@ -152,7 +152,7 @@ the import is hitting a stale site-packages copy. Check in order.
 ## 7.1 `flash-attn` (optional)
 
 The default RTX Pi0 / Pi0.5 path routes attention through the
-vendored `flash_vla_fa2.so` (built from `csrc/attention/flash_attn_2_src/`)
+vendored `flash_rt_fa2.so` (built from `csrc/attention/flash_attn_2_src/`)
 and does **not** require the upstream `flash-attn` pip package.
 You only need to install `flash-attn` if:
 
@@ -183,7 +183,7 @@ Upgrade path (tracked, not yet done):
   rename expected but verify); check the PJRT plugin registers
   cleanly with `python -c "import jax; jax.devices()"`.
 - Orbax 0.6+ changed the default metadata layout for `StandardRestore`;
-  our `load_from_cache` path in `flash_vla/frontends/jax/` expects
+  our `load_from_cache` path in `flash_rt/frontends/jax/` expects
   the 0.5.x layout.
 
 ## 9. `transformers` version constraint
@@ -195,7 +195,7 @@ is to upgrade the pin once we port the tokenizer call-site.
 
 ## 10. Checkpoints
 
-FlashVLA does not bundle model weights. Bring your own Pi0 / Pi0.5 /
+FlashRT does not bundle model weights. Bring your own Pi0 / Pi0.5 /
 GROOT checkpoint in whichever format your trainer produced:
 
 - `safetensors` (HuggingFace / PyTorch format) — used by the torch
@@ -210,7 +210,7 @@ See [USAGE.md](../USAGE.md) §Loading a model for the per-frontend
 | Symptom | Likely cause |
 |---|---|
 | `CMake Error ... CUTLASS headers not found` | Step 4 skipped |
-| `No module named 'flash_vla_kernels'` | Step 6's `cp *.so` step skipped, OR non-editable install |
+| `No module named 'flash_rt_kernels'` | Step 6's `cp *.so` step skipped, OR non-editable install |
 | `PJRT plugin ... not found` at JAX import | JAX / jax-cuda12-plugin version mismatch (Step 8) |
 | `cuBLAS error code=13` when loading second model | Ran two model loads in one process; subprocess-isolate per model |
 | cos regression right after calibrate | `act_scale * weight_scale` alpha computed in f64 somewhere; see `docs/calibration.md` §2.3 |

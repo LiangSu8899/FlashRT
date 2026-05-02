@@ -1,5 +1,5 @@
 // ================================================================
-// FlashVLA — CUTLASS FP8 GEMM implementations for SM100/SM110
+// FlashRT — CUTLASS FP8 GEMM implementations for SM100/SM110
 //
 // Tile configurations tuned for the Pi0.5 / Pi0 / GROOT shape mix:
 //   - SqGemm (256×256×128): QKV, O projection

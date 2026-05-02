@@ -1,4 +1,4 @@
-# FlashVLA Examples
+# FlashRT Examples
 
 ## Quick Start (Hardware-Agnostic)
 
@@ -59,5 +59,5 @@ python examples/blackwell/eval_libero.py \
 2. Copy an existing example and adjust engine/FMHA paths
 3. The library auto-detects SM version; you may also force backend:
    ```python
-   model = flash_vla.load_model("pi05", ckpt, backend="thor")
+   model = flash_rt.load_model("pi05", ckpt, backend="thor")
    ```

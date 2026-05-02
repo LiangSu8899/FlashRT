@@ -1,5 +1,5 @@
 // ================================================================
-// FlashVLA — pybind11 bindings
+// FlashRT — pybind11 bindings
 // Exposes GemmRunner + all CUDA kernels to Python
 // ================================================================
 
@@ -41,7 +41,7 @@ extern "C" int cutlass_fp8_t1_bf16out(void*, void*, void*, int, int, int, float,
 #endif
 
 PYBIND11_MODULE(flash_rt_kernels, m) {
-    m.doc() = "FlashVLA C++/CUDA inference kernels";
+    m.doc() = "FlashRT C++/CUDA inference kernels";
 
     // ── FvkContext: per-instance cuBLAS handle ──
     py::class_<FvkContext>(m, "FvkContext")

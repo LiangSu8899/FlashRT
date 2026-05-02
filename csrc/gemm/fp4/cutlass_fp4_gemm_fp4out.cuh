@@ -1,5 +1,5 @@
 // ============================================================================
-//  FlashVLA — NVFP4 GEMM with FP4 (e2m1) packed output + SFA tile-interleaved.
+//  FlashRT — NVFP4 GEMM with FP4 (e2m1) packed output + SFA tile-interleaved.
 //  Used by the P1 split-GU FFN path: gate_proj and up_proj both produce FP4
 //  buffers that the next-step silu_mul kernel consumes directly.
 //

@@ -1,5 +1,5 @@
 // ============================================================================
-//  FlashVLA — silu_mul_two_fp4_to_fp4: P1 split-GU FFN combiner.
+//  FlashRT — silu_mul_two_fp4_to_fp4: P1 split-GU FFN combiner.
 //
 //  Reads two FP4 inputs (gate, up — each packed [S, H/2] + SFA) produced
 //  by separate NVFP4 GEMMs, dequantizes each, computes silu(gate) * up in

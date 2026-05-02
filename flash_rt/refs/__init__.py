@@ -1,7 +1,7 @@
 """Reference (oracle) implementations.
 
 These modules host independent, framework-faithful reference
-implementations used as ground-truth oracles for FlashVLA's optimised
+implementations used as ground-truth oracles for FlashRT's optimised
 inference paths. Reference code is **not** part of the production
 runtime — it is only loaded by tests and offline fixture generators.
 A reference implementation must:

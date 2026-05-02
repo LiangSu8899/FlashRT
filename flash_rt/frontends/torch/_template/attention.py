@@ -1,4 +1,4 @@
-"""FlashVLA new-model template — attention specification.
+"""FlashRT new-model template — attention specification.
 
 Copy the body of `make_template_attention_spec()` into
 `flash_rt/hardware/<hw>/attn_backend.py` (Thor or RTX). The
@@ -14,7 +14,7 @@ for any model whose attention sites you can describe with
 Your model has N attention "sites" — distinct attention operations
 with different shapes / KV layouts. For a Pi0.5-shape model:
 
-Your model code:                              FlashVLA AttentionSpec call:
+Your model code:                              FlashRT AttentionSpec call:
 -----------------                             ---------------------------
 SiglipVisionTransformer (16 layers, 16        spec.add_site("vision",
    heads, full self-attn, fixed Sq=256/view)      num_layers=16, num_q_heads=16,

@@ -84,7 +84,7 @@ else()
 endif()
 
 # ── FA2 build slimming flags (opt-in; defaults keep today's behaviour) ──
-# FA2's vendored CUTLASS 3.x templates dominate FlashVLA's build cost
+# FA2's vendored CUTLASS 3.x templates dominate FlashRT's build cost
 # (~8–10 min on a warm container for the default matrix of 3 hdims ×
 # 2 dtypes × 2 paths × 3 gencode arches = 36 codegens). These flags let
 # developers trade binary coverage for iteration speed without touching

@@ -1,17 +1,17 @@
-# FlashVLA Kernel Catalog
+# FlashRT Kernel Catalog
 
-> **Audience**: you are evaluating whether FlashVLA can accelerate
+> **Audience**: you are evaluating whether FlashRT can accelerate
 > *your* model (not necessarily a VLA). This doc lists every CUDA
-> kernel shipped by FlashVLA and the fusion patterns they enable,
+> kernel shipped by FlashRT and the fusion patterns they enable,
 > so you can judge re-use against your model's compute graph
 > before adopting the framework.
 >
-> **TL;DR**: FlashVLA exports pybind entries across three modules:
-> **`flash_vla_kernels`** (~98 entries; memory-bound ops, fp8
+> **TL;DR**: FlashRT exports pybind entries across three modules:
+> **`flash_rt_kernels`** (~98 entries; memory-bound ops, fp8
 > quant/dequant, cuBLASLt wrappers, Thor FMHA — always built),
-> **`flash_vla_fp4`** (~23 entries; NVFP4 weight prep and SM120
+> **`flash_rt_fp4`** (~23 entries; NVFP4 weight prep and SM120
 > block-scaled GEMM wrappers — built on SM100+/SM120),
-> and **`flash_vla_fa2`** (2 entries; vendored Flash-Attention 2
+> and **`flash_rt_fa2`** (2 entries; vendored Flash-Attention 2
 > fwd for fp16 + bf16 — RTX/SM80-family only, skipped on Thor).
 > Counts are approximate and can shift by a handful between
 > releases; this doc lists them by group, not by individual entry.
@@ -52,17 +52,17 @@ implementation.
 ## Module layout
 
 ```python
-from flash_vla import flash_vla_kernels as fvk       # 87 kernels, always built (pybind, PyTorch)
-from flash_vla import flash_vla_fa2     as fa2       # 2 entries, RTX only (SM80/86/89/120)
+from flash_rt import flash_rt_kernels as fvk       # 87 kernels, always built (pybind, PyTorch)
+from flash_rt import flash_rt_fa2     as fa2       # 2 entries, RTX only (SM80/86/89/120)
 # JAX side (training + inference): consumed via ctypes + jax.ffi
-#   <repo>/flash_vla/flash_vla_jax_ffi.so             # 2 XLA FFI handlers, optional
+#   <repo>/flash_rt/flash_rt_jax_ffi.so             # 2 XLA FFI handlers, optional
 ```
 
-`flash_vla_fa2` is skipped on Thor SM110 (Thor uses `fvk.attention_qkv_fp16`
+`flash_rt_fa2` is skipped on Thor SM110 (Thor uses `fvk.attention_qkv_fp16`
 cuBLAS-decomposed attention — hand-tuned for Thor's unified LPDDR).
-`flash_vla_jax_ffi.so` is built only when JAX + the XLA FFI header are
+`flash_rt_jax_ffi.so` is built only when JAX + the XLA FFI header are
 importable at configure time; it carries **zero new compute kernels**
-— each handler delegates to an existing entry in `flash_vla_kernels`
+— each handler delegates to an existing entry in `flash_rt_kernels`
 (see § 11).
 
 ---
@@ -100,7 +100,7 @@ modulation.
 
 ## 3. Fusion — composite (17 kernels)
 
-This is where most of FlashVLA's latency wins come from. Each kernel
+This is where most of FlashRT's latency wins come from. Each kernel
 collapses 2–4 PyTorch ops into a single launch, removing memory
 round-trips.
 
@@ -142,11 +142,11 @@ round-trips.
 | `fp8_gemm_descale_fp16` / `_bf16out` / `_f32out` | cuBLASLt FP8 GEMM with per-tensor `alpha` descale | Main workhorse for all FP8 projections |
 
 Add-on NVFP4 / block-scaled GEMM lives in the separate
-`flash_vla_fp4.so` module (SM120 only).
+`flash_rt_fp4.so` module (SM120 only).
 
 ## 6. Attention (10 entries, fvk + fa2 combined)
 
-### Thor / decomposed path (`flash_vla_kernels`)
+### Thor / decomposed path (`flash_rt_kernels`)
 
 | Kernel | Shape it serves | Notes |
 |---|---|---|
@@ -159,7 +159,7 @@ Add-on NVFP4 / block-scaled GEMM lives in the separate
 | `load_fmha_library` / `_strided_library` | Dynamic .so load for Thor's FMHA lib | |
 | `softmax_fp16` | Standalone softmax | Useful as a building block |
 
-### RTX / Flash-Attention 2 path (`flash_vla_fa2`)
+### RTX / Flash-Attention 2 path (`flash_rt_fa2`)
 
 | Kernel | Notes |
 |---|---|
@@ -212,9 +212,9 @@ traversal per layer.
 | `get_sm_version()` | Returns `(major, minor)` of the current device |
 | `has_cutlass_fmha()` | Thor / SM100+ FMHA template availability |
 | `has_cutlass_sm100()` | SM100-family CUTLASS FP8 GEMMs built in |
-| `has_nvfp4()` | SM120 NVFP4 quant + block-scaled GEMM available (separate `flash_vla_fp4.so`) |
+| `has_nvfp4()` | SM120 NVFP4 quant + block-scaled GEMM available (separate `flash_rt_fp4.so`) |
 
-## 11. JAX FFI bindings (2 entries, optional `flash_vla_jax_ffi.so`)
+## 11. JAX FFI bindings (2 entries, optional `flash_rt_jax_ffi.so`)
 
 XLA Foreign Function Interface handlers that expose the existing
 FP8 GEMM + activation-quantize entries to JAX, used by the
@@ -247,7 +247,7 @@ for measured numbers on RTX 5090 SM120.
 
 ## Re-use decision tree
 
-When evaluating FlashVLA for a new model, walk this checklist:
+When evaluating FlashRT for a new model, walk this checklist:
 
 1. **Does your model use RMSNorm + SwiGLU/GeGLU + GQA?**
    → `residual_add_rms_norm_fp8_noweight_fp16` + `qkv_split_rope_kvcache_fp16`
@@ -258,7 +258,7 @@ When evaluating FlashVLA for a new model, walk this checklist:
    on Thor. Batch=1, arbitrary seqlen, HD ≤ 256.
 3. **Do you need FP8 anywhere?**
    → `fp8_gemm_descale_*` (cuBLASLt) for the matmul + the full
-   calibrate-once-use-forever machinery in `flash_vla.core.quant`.
+   calibrate-once-use-forever machinery in `flash_rt.core.quant`.
 4. **Is your decoder a flow-matching / diffusion loop?**
    → `gpu_euler_step` + CUDA Graph capture of a single denoise step
    replayed N times. Pi0 / Pi0.5 / GROOT DiT all work this way; your
@@ -268,16 +268,16 @@ When evaluating FlashVLA for a new model, walk this checklist:
    supports causal + `attn_mask` via the pybind args.
 6. **Are you on JAX (training or inference)?**
    → Same FP8 GEMM + activation-quantize, exposed as XLA FFI
-   handlers in `flash_vla_jax_ffi.so` (§ 11). The training path
+   handlers in `flash_rt_jax_ffi.so` (§ 11). The training path
    (FP8 + LoRA + RECAP) is documented in
    [`training/jax/README.md`](../training/jax/README.md); the
    inference path uses
-   [`flash_vla.frontends.jax.pi05_rtx`](../flash_vla/frontends/jax/pi05_rtx.py),
+   [`flash_rt.frontends.jax.pi05_rtx`](../flash_rt/frontends/jax/pi05_rtx.py),
    which inherits the CFG pipeline machinery from the PyTorch
    frontend so RL inference works on JAX-loaded checkpoints
    without extra wiring.
 
-If the answer to ≥2 of these is yes, FlashVLA saves you the 3-6
+If the answer to ≥2 of these is yes, FlashRT saves you the 3-6
 months of hand-written CUDA + cuBLASLt wrangling it took to build
 this. See [`adding_new_model.md`](adding_new_model.md) for the
 step-by-step model integration guide and
@@ -288,7 +288,7 @@ out-of-tree plugin example.
 
 ## Not yet supported
 
-Shape features that currently have no fused kernels in FlashVLA:
+Shape features that currently have no fused kernels in FlashRT:
 
 - **MLA (DeepSeek-style)**. No GQA alternative that splits
   latent K/V differently. Would need a dedicated `attention_mla_*`
@@ -297,7 +297,7 @@ Shape features that currently have no fused kernels in FlashVLA:
   feature flag disabled; enabling it is ~50 LoC but the path has
   not been exercised end-to-end.
 - **Tree-attention / speculative decoding**. Out of scope —
-  FlashVLA targets batch=1, not batch-N speculation.
+  FlashRT targets batch=1, not batch-N speculation.
 - **RWKV / Mamba / state-space models**. Different primitive set
   entirely; no overlap with the kernel library here.
 - **8-bit weight + 8-bit activation in pure INT8** (BitsAndBytes

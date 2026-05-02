@@ -1,5 +1,5 @@
 // ================================================================
-// FlashVLA — Patch embedding kernel declarations
+// FlashRT — Patch embedding kernel declarations
 // GPU im2col + fused bias + positional embedding
 // ================================================================
 #pragma once

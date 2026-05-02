@@ -1,5 +1,5 @@
 // ============================================================================
-//  FlashVLA — P1 NVFP4 GEMM with fused silu(aux) * acc → fp4 + SFA epilogue.
+//  FlashRT — P1 NVFP4 GEMM with fused silu(aux) * acc → fp4 + SFA epilogue.
 //
 //  Kernel signature for the second leg of the split-GU FFN path:
 //

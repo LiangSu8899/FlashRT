@@ -1,4 +1,4 @@
-"""FlashVLA — model-specific pipeline and calibration code.
+"""FlashRT — model-specific pipeline and calibration code.
 
 Each subdirectory (pi05/, groot/, pi0/, pi0fast/) holds the pipeline
 logic for one model family.  Hardware-specific attention backends live

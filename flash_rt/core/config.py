@@ -1,4 +1,4 @@
-"""FlashVLA — Model and quantization configuration."""
+"""FlashRT — Model and quantization configuration."""
 
 from dataclasses import dataclass, field
 from pathlib import Path

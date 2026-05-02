@@ -25,7 +25,7 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 # Multiplicative outlier threshold for the scale-ceiling diagnostic.
-# Different FlashVLA backends store the "FP8 act scale" buffer with
+# Different FlashRT backends store the "FP8 act scale" buffer with
 # slightly different semantics (some hold amax, some hold amax/448,
 # depending on the kernel). Rather than pick an absolute threshold
 # that would mis-fire on one backend or another, we flag scales that
@@ -123,7 +123,7 @@ def check_scale_ceiling(
     is pulled 20× higher than peers — the signature of a true outlier
     sample in the calibration set.
 
-    This is a **diagnostic warning only** — FlashVLA captures a single
+    This is a **diagnostic warning only** — FlashRT captures a single
     CUDA Graph per calibration, so there is no runtime fallback to
     FP16 for an offending layer. If this fires, re-run calibration
     with a lower ``percentile`` or a different sample set.

@@ -1,4 +1,4 @@
-"""FlashVLA — Thor JAX frontend (SM110).
+"""FlashRT — Thor JAX frontend (SM110).
 
 Loads JAX Orbax checkpoints → FP8 quantize (ml_dtypes) → CudaBuffer (cudaMalloc)
 → pipeline.py (flash_rt_kernels.so) on Jetson AGX Thor.

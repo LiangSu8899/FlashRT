@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""FlashVLA — Full precision test: all models, all backends.
+"""FlashRT — Full precision test: all models, all backends.
 
 Tests current flash_rt_kernels.so against saved reference outputs.
 Each model runs in separate subprocess. Uses monkey-patch noise injection
 for deterministic comparison (same pattern as _vf_*.py production tests).
 
 Compares:
-  Pi0.5: Production vs FlashVLA Torch vs FlashVLA JAX (saved outputs in /tmp/v_*.npy)
-  Pi0:   FlashVLA Torch vs PI0Pytorch reference (/tmp/pi0_ref_2view.npz)
-  Pi0 JAX: FlashVLA JAX vs FlashVLA Torch (raw decoder output, same noise)
-  GROOT: FlashVLA Torch vs PyTorch reference (groot_ref/groot_ref_e2e_full.pt)
+  Pi0.5: Production vs FlashRT Torch vs FlashRT JAX (saved outputs in /tmp/v_*.npy)
+  Pi0:   FlashRT Torch vs PI0Pytorch reference (/tmp/pi0_ref_2view.npz)
+  Pi0 JAX: FlashRT JAX vs FlashRT Torch (raw decoder output, same noise)
+  GROOT: FlashRT Torch vs PyTorch reference (groot_ref/groot_ref_e2e_full.pt)
 
 Usage:
     python3 tests/test_all_models_precision.py
@@ -27,7 +27,7 @@ def cosine(a, b):
 
 # ══════════════════════════════════════════════════════════════
 # Pi0.5: monkey-patch noise, full infer path
-# Re-run FlashVLA Torch with matched_noise, compare vs saved prod/jax
+# Re-run FlashRT Torch with matched_noise, compare vs saved prod/jax
 # ══════════════════════════════════════════════════════════════
 PI05_SCRIPT = '''
 import sys, os, time, json, torch, numpy as np
@@ -410,7 +410,7 @@ def main():
     targets = [args.model] if args.model else list(MODELS.keys())
 
     print("=" * 60)
-    print("FlashVLA — Full Precision & Latency Test")
+    print("FlashRT — Full Precision & Latency Test")
     print("=" * 60)
 
     # FP4 is lossy vs FP8 prod — loosen cos thresholds accordingly

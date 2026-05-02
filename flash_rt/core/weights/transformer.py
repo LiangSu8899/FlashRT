@@ -1,4 +1,4 @@
-"""FlashVLA — Weight Transformer.
+"""FlashRT — Weight Transformer.
 
 Transforms raw checkpoint weights into engine-ready format.
 All operations are pure numpy — no framework dependency.

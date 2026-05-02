@@ -1,4 +1,4 @@
-"""FP8 forward GEMM op for JAX, backed by FlashVLA's cuBLASLt FP8 kernel."""
+"""FP8 forward GEMM op for JAX, backed by FlashRT's cuBLASLt FP8 kernel."""
 
 from .fp8_jax import (
     FP8_E4M3_MAX,

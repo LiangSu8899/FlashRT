@@ -1,5 +1,5 @@
 // ================================================================
-// FlashVLA — RoPE kernel declarations
+// FlashRT — RoPE kernel declarations
 // Standard RoPE, QKV split, fused QKV split + RoPE
 // ================================================================
 #pragma once

@@ -1,5 +1,5 @@
 // ================================================================
-// FlashVLA — Decoder fused kernels (FP16)
+// FlashRT — Decoder fused kernels (FP16)
 // Direct port of pi05 engine ae_forward_static kernels.
 // ================================================================
 

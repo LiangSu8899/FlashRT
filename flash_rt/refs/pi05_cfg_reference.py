@@ -14,7 +14,7 @@ into a single guided velocity:
 with ``a^0 ~ N(0, I)`` and ``dt = -1 / num_steps``. Boundary
 condition matches openpi's :meth:`PI0Pytorch.sample_actions`.
 
-This module's outputs are the ground-truth FlashVLA verifies its
+This module's outputs are the ground-truth FlashRT verifies its
 optimised serial / batched FP8 pipelines against (correctness
 contract C2/C3/C5 in ``docs/precision_spec.md``). The reference is
 intentionally slow and dependency-heavy; it is **only** imported by
@@ -74,7 +74,7 @@ class Pi05CFGReference:
 
     Wraps the upstream ``openpi`` ``PI0Pytorch`` model with a manual
     classifier-free-guidance denoising loop. Per-step velocity tensors
-    are exposed for fine-grained correctness checks against FlashVLA's
+    are exposed for fine-grained correctness checks against FlashRT's
     serial and batched paths.
     """
 
@@ -235,7 +235,7 @@ class Pi05CFGReference:
         state = state_cond
         bsize = state.shape[0]
 
-        # Initial noise. To compare apples-to-apples with FlashVLA, the
+        # Initial noise. To compare apples-to-apples with FlashRT, the
         # reference samples noise via the *same* RNG path that
         # ``Pi05TorchFrontendRtx`` uses internally — a CUDA BF16
         # ``.normal_()`` — and casts to FP32 only for the denoising
@@ -289,7 +289,7 @@ class Pi05CFGReference:
         actions_raw = x_t[0].detach().cpu().numpy().astype(np.float32)
 
         # Apply the policy's output transforms (unnormalize + slice to
-        # robot DOF) so the returned ``actions`` match what FlashVLA's
+        # robot DOF) so the returned ``actions`` match what FlashRT's
         # ``infer()`` produces. Per-step velocities and noise are kept
         # in the model's native (normalized, full-action_dim) space —
         # that is where C2/C3 oracle comparisons happen.

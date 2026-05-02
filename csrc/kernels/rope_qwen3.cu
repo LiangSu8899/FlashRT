@@ -1,5 +1,5 @@
 // ================================================================
-// FlashVLA — Qwen3 RoPE kernel (rotate_half style)
+// FlashRT — Qwen3 RoPE kernel (rotate_half style)
 // Applies rotary position embedding in Qwen3/LLaMA format:
 //   out[..., :HD/2] = x[..., :HD/2] * cos - x[..., HD/2:] * sin
 //   out[..., HD/2:] = x[..., HD/2:] * cos + x[..., :HD/2] * sin

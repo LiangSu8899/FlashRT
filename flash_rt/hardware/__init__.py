@@ -1,4 +1,4 @@
-"""FlashVLA hardware-dispatch layer.
+"""FlashRT hardware-dispatch layer.
 
 Detects the current GPU's compute capability and maps
 ``(config, framework, arch)`` triples to concrete frontend classes in
@@ -45,10 +45,10 @@ def detect_arch() -> str:
         import torch
     except ImportError as e:
         raise RuntimeError(
-            "FlashVLA requires PyTorch for GPU detection") from e
+            "FlashRT requires PyTorch for GPU detection") from e
     if not torch.cuda.is_available():
         raise RuntimeError(
-            "FlashVLA requires a CUDA-capable GPU "
+            "FlashRT requires a CUDA-capable GPU "
             "(torch.cuda.is_available()==False)")
     major, minor = torch.cuda.get_device_capability()
     if (major, minor) == (11, 0):
@@ -58,7 +58,7 @@ def detect_arch() -> str:
     if (major, minor) == (8, 9):
         return "rtx_sm89"
     raise RuntimeError(
-        f"FlashVLA: unsupported GPU SM {major}.{minor}. "
+        f"FlashRT: unsupported GPU SM {major}.{minor}. "
         f"Supported architectures: SM110 (Thor), SM120 (RTX 5090), "
         f"SM89 (RTX 4090)."
     )
@@ -134,7 +134,7 @@ def resolve_pipeline_class(config: str, framework: str, arch: str):
             hint = (f"No backend for config={config!r} "
                     f"framework={framework!r} in any supported architecture.")
         raise RuntimeError(
-            f"FlashVLA: no pipeline for "
+            f"FlashRT: no pipeline for "
             f"config={config!r} framework={framework!r} arch={arch!r}. "
             f"{hint}"
         )

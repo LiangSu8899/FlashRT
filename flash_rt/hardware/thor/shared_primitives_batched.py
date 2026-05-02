@@ -1,4 +1,4 @@
-"""FlashVLA — Thor SM110 model-agnostic primitives, B>=1 batched variants.
+"""FlashRT — Thor SM110 model-agnostic primitives, B>=1 batched variants.
 
 Companion to :mod:`flash_rt.hardware.thor.shared_primitives` which
 holds the B=1 hot path (the production single-sample inference).

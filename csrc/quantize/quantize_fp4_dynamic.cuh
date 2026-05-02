@@ -1,5 +1,5 @@
 // ============================================================================
-//  FlashVLA — fp16 → NVFP4 (e2m1 + UE4M3 block scale) dynamic quantization.
+//  FlashRT — fp16 → NVFP4 (e2m1 + UE4M3 block scale) dynamic quantization.
 //
 //  Per-row, per-16-element-block. Used at runtime to quantize activation
 //  tensors before FP4 GEMM. Weights go through the offline `Quant4` transform

@@ -1,5 +1,5 @@
 // ============================================================================
-//  FlashVLA — parametric NVFP4 GEMM kernel variants for small-M tuning.
+//  FlashRT — parametric NVFP4 GEMM kernel variants for small-M tuning.
 //
 //  Allows instantiating multiple (MmaTileShape, ClusterShape) configs at
 //  compile time. Each variant exported as a separate extern "C"-style runner

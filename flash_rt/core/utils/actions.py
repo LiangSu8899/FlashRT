@@ -1,4 +1,4 @@
-"""FlashVLA — Action post-processing utilities."""
+"""FlashRT — Action post-processing utilities."""
 
 import numpy as np
 

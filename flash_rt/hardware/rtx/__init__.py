@@ -1,4 +1,4 @@
-"""FlashVLA — RTX consumer discrete GPU attention backends.
+"""FlashRT — RTX consumer discrete GPU attention backends.
 
 Hardware-specific attention backends for RTX GPUs (SM80/86/89/120).
 Model pipelines live in ``flash_rt.models.*``; frontends live in

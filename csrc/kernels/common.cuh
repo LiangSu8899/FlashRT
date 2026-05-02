@@ -1,5 +1,5 @@
 // ================================================================
-// FlashVLA — Common CUDA kernel utilities
+// FlashRT — Common CUDA kernel utilities
 // Shared helpers used across all kernel files.
 //
 // All elementwise kernels are dtype-generic via C++ templates.

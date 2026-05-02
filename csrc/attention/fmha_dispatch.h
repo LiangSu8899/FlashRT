@@ -1,5 +1,5 @@
 // ================================================================
-// FlashVLA — Attention dispatch layer
+// FlashRT — Attention dispatch layer
 //
 // Unified interface for attention backends:
 //   - FlashAttention-2/3 (SM89/SM120, pip install)

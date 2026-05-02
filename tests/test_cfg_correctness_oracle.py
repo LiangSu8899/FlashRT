@@ -1,6 +1,6 @@
 """C1-C5 oracle tests for Pi0.5 CFG correctness.
 
-These tests anchor FlashVLA's serial / batched FP8 CFG implementations
+These tests anchor FlashRT's serial / batched FP8 CFG implementations
 against an independent FP32 PyTorch reference (R_fp32, see
 ``flash_rt/refs/pi05_cfg_reference.py``) and against the fused
 combine kernel's mathematical contract. The full test hierarchy is
@@ -46,7 +46,7 @@ BETAS = [1.0, 1.5, 2.0, 2.5]
 TAU_C1_MAX_ABS_DIFF = 0.0          # bf16 round-to-nearest exact
 
 # C2 — per-step noise trajectory cosine vs R_fp32.
-# Why noise (and not v_cond / v_uncond)? FlashVLA's per-step
+# Why noise (and not v_cond / v_uncond)? FlashRT's per-step
 # ``decoder_action_buf`` carries the velocity AFTER the model's
 # output projection has folded the diffusion schedule's ``-dt``
 # scale (``out_proj`` weights pre-scaled by ``-1/num_steps``); the
@@ -178,7 +178,7 @@ def test_c2_per_step_noise_vs_ref(fixtures, beta, path):
     """C2: per-step noise trajectory cosine vs R_fp32.
 
     Compares each step's diffusion noise state ``a^k`` between
-    FlashVLA's FP8 path and the FP32 reference. Both implementations
+    FlashRT's FP8 path and the FP32 reference. Both implementations
     integrate ``a^{k+1} = a^k + dt · v_guided^{(k)}`` from the same
     initial noise; deviation grows monotonically with k as FP8 / FP8
     cuBLASLt rounding accumulates. ``cos(ref[0], impl[0])`` is always

@@ -251,7 +251,7 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
   }
 
   CUTLASS_DEVICE void operator()(const Params &params, char* smem) {
-// FlashVLA vendored patch: upstream v4.4.2 arch guard missed SM110.
+// FlashRT vendored patch: upstream v4.4.2 arch guard missed SM110.
 // SM110 (Jetson AGX Thor) is binary-compatible with SM100 TMA/UMMA and
 // CUTLASS arch/config.h does define CUTLASS_ARCH_MMA_SM110A/F_ENABLED for
 // -gencode=compute_110a, but this example kernel never honoured them.

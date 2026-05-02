@@ -1,5 +1,5 @@
 // ============================================================================
-//  FlashVLA — F2/F3/F4: fused pre-GEMM kernels that produce NVFP4 + SFA in one
+//  FlashRT — F2/F3/F4: fused pre-GEMM kernels that produce NVFP4 + SFA in one
 //  launch, matching FP8 path's single-kernel pre-GEMM pattern.
 //
 //  F2: rms_norm_noweight + fp4_quant + SFA            (layer-entry / no residual)

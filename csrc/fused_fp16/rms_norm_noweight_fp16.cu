@@ -1,5 +1,5 @@
 // ============================================================================
-//  FlashVLA — fp16-output RMSNorm kernels (additive).
+//  FlashRT — fp16-output RMSNorm kernels (additive).
 //  Copied from csrc/kernels/norm.cu {rms_norm_fp8_noweight_kernel,
 //  res_rms_fp8_noweight_kernel}, with the descale division and fp8 cast
 //  stripped. See .cuh for rationale.

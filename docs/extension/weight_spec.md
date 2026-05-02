@@ -5,7 +5,7 @@
 > **What this doc is for**: the contract — protocols, data classes, semantics of one `run()`.
 > **What this doc is not**: the per-model walkthrough. For that see [`../adding_new_model.md`](../adding_new_model.md).
 >
-> **Source**: [`flash_vla/executors/weight_loader.py`](../../flash_vla/executors/weight_loader.py) — protocols + runner. Concrete sources / sinks live in `executors/torch_weights.py` and `executors/jax_weights.py`.
+> **Source**: [`flash_rt/executors/weight_loader.py`](../../flash_rt/executors/weight_loader.py) — protocols + runner. Concrete sources / sinks live in `executors/torch_weights.py` and `executors/jax_weights.py`.
 
 ---
 
@@ -91,7 +91,7 @@ class ModelWeightSpec:
 `singletons` runs first; then each `LayerBlock`; then `buffers` (allocated, not loaded). One spec per `(model, framework)` pair lives at module scope of the corresponding frontend file:
 
 ```python
-# flash_vla/frontends/torch/_pi05_thor_spec.py
+# flash_rt/frontends/torch/_pi05_thor_spec.py
 WEIGHT_SPEC = ModelWeightSpec(framework="torch", blocks=[...], singletons=[...])
 ```
 
@@ -100,7 +100,7 @@ WEIGHT_SPEC = ModelWeightSpec(framework="torch", blocks=[...], singletons=[...])
 ## 4. Running the spec
 
 ```python
-from flash_vla.executors.weight_loader import WeightLoader
+from flash_rt.executors.weight_loader import WeightLoader
 
 WeightLoader(
     source=SafetensorsSource("/path/to/model.safetensors"),
@@ -200,7 +200,7 @@ Sinks are duck-typed (`@runtime_checkable Protocol`), so a custom sink class wor
 
 ## 7. Built-in transforms
 
-The transforms shipped under `flash_vla/executors/torch_weights.py`:
+The transforms shipped under `flash_rt/executors/torch_weights.py`:
 
 | Transform | What it does | When you need it |
 |---|---|---|
@@ -242,13 +242,13 @@ Not guaranteed (subject to refactor without notice):
 
 ## 9. Worked example: a 4-item LayerBlock
 
-Real fragment from `flash_vla/frontends/torch/_pi05_thor_spec.py`, simplified:
+Real fragment from `flash_rt/frontends/torch/_pi05_thor_spec.py`, simplified:
 
 ```python
-from flash_vla.executors.weight_loader import (
+from flash_rt.executors.weight_loader import (
     Item, LayerBlock, ModelWeightSpec,
 )
-from flash_vla.executors.torch_weights import (
+from flash_rt.executors.torch_weights import (
     Transpose, QuantFP8, FuseNorm,
     Cat, FusedQKV,
     Attr, TensorList,
@@ -339,12 +339,12 @@ The win is not "less code per loader" — it is **the same loader runs against a
 
 | What | File |
 |---|---|
-| Protocols + runner | [`executors/weight_loader.py`](../../flash_vla/executors/weight_loader.py) |
-| Torch sources / transforms / sinks | [`executors/torch_weights.py`](../../flash_vla/executors/torch_weights.py) |
-| JAX sources / transforms / sinks | [`executors/jax_weights.py`](../../flash_vla/executors/jax_weights.py) |
-| Pi0.5 spec example | `flash_vla/frontends/torch/_pi05_thor_spec.py` |
-| Pi0 spec example | `flash_vla/frontends/torch/_pi0_thor_spec.py` |
-| GROOT spec example | `flash_vla/frontends/torch/_groot_thor_spec.py` |
-| Pi0-FAST spec example | `flash_vla/frontends/torch/_pi0fast_thor_spec.py` |
+| Protocols + runner | [`executors/weight_loader.py`](../../flash_rt/executors/weight_loader.py) |
+| Torch sources / transforms / sinks | [`executors/torch_weights.py`](../../flash_rt/executors/torch_weights.py) |
+| JAX sources / transforms / sinks | [`executors/jax_weights.py`](../../flash_rt/executors/jax_weights.py) |
+| Pi0.5 spec example | `flash_rt/frontends/torch/_pi05_thor_spec.py` |
+| Pi0 spec example | `flash_rt/frontends/torch/_pi0_thor_spec.py` |
+| GROOT spec example | `flash_rt/frontends/torch/_groot_thor_spec.py` |
+| Pi0-FAST spec example | `flash_rt/frontends/torch/_pi0fast_thor_spec.py` |
 
 Read one of the four spec files when adding a new model — they are the canonical reference and are kept short on purpose.

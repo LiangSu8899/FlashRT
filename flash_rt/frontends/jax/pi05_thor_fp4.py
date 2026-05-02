@@ -1,4 +1,4 @@
-"""FlashVLA — Thor JAX Pi0.5 frontend with NVFP4 encoder-FFN subset.
+"""FlashRT — Thor JAX Pi0.5 frontend with NVFP4 encoder-FFN subset.
 
 STRICTLY ADDITIVE. Subclasses :class:`Pi05JaxFrontendThor` and overlays an
 optional NVFP4 path on a configurable subset of encoder FFN layers. With the

@@ -1,5 +1,5 @@
 // ================================================================
-// FlashVLA — CUTLASS FP8 GEMM Templates for SM100/SM110
+// FlashRT — CUTLASS FP8 GEMM Templates for SM100/SM110
 // (Jetson AGX Thor, Grace Hopper, etc.)
 //
 // These templates are compiled with -arch=sm_110a or sm_100a.
