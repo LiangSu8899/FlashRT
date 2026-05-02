@@ -201,6 +201,12 @@ endif()
 if(ENABLE_SM100_CUTLASS)
   add_library(fmha_fp16_strided SHARED csrc/attention/fmha_fp16_strided.cu)
   set_target_properties(fmha_fp16_strided PROPERTIES
+    # Drop the artefact directly into flash_vla/ at build time so a plain
+    # `cmake --build` / `ninja` is self-sufficient — no follow-up `cp` or
+    # `ninja install` step needed before `import flash_vla` works. The
+    # install(TARGETS ...) rule below stays for wheel-packaging users.
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_vla
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_vla
     CUDA_STANDARD 17
     POSITION_INDEPENDENT_CODE ON
     # CMake defaults CMAKE_CUDA_ARCHITECTURES to "75" on this toolchain;
@@ -404,6 +410,9 @@ if(ENABLE_FA2)
   #     from flash_vla import flash_vla_fa2 as fa2
   #     fa2.fwd_fp16(...)  /  fa2.fwd_bf16(...)
   pybind11_add_module(flash_vla_fa2 csrc/fa2_bindings.cpp)
+  set_target_properties(flash_vla_fa2 PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_vla
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_vla)
   target_sources(flash_vla_fa2 PRIVATE $<TARGET_OBJECTS:fa2_vendor_obj>)
   target_include_directories(flash_vla_fa2 PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc
@@ -434,6 +443,9 @@ pybind11_add_module(flash_vla_kernels
   csrc/attention/fmha_dispatch.cu
   csrc/bindings.cpp
 )
+set_target_properties(flash_vla_kernels PROPERTIES
+  LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_vla
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_vla)
 
 if(ENABLE_SM100_CUTLASS)
   target_sources(flash_vla_kernels PRIVATE $<TARGET_OBJECTS:cutlass_sm100_obj>)
@@ -522,6 +534,9 @@ if(ENABLE_SM100_CUTLASS)
   message(STATUS "NVFP4 add-on module (flash_vla_fp4): building for sm_${GPU_ARCH}a")
 
   pybind11_add_module(flash_vla_fp4 csrc/fp4_bindings.cpp)
+  set_target_properties(flash_vla_fp4 PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_vla
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_vla)
   target_sources(flash_vla_fp4 PRIVATE $<TARGET_OBJECTS:fp4_kernels_obj>)
   target_include_directories(flash_vla_fp4 PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc
@@ -564,6 +579,8 @@ if(JAX_FFI_DETECT_RESULT EQUAL 0
     csrc/kernels/quantize.cu
   )
   set_target_properties(flash_vla_jax_ffi PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_vla
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_vla
     CUDA_STANDARD 17
     POSITION_INDEPENDENT_CODE ON
     PREFIX ""                             # → flash_vla_jax_ffi.so (no "lib" prefix)

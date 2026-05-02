@@ -523,14 +523,10 @@ pip install -e ".[torch]"          # or "[jax]" / "[all]"
 # Build — CMake auto-detects GPU arch via nvidia-smi.
 # On RTX (SM80/86/89/120) this produces BOTH flash_vla_kernels.so and
 # flash_vla_fa2.so; on Thor (SM110) it produces only the former.
-mkdir build && cd build
-cmake ..
-make -j$(nproc)
-cp flash_vla*.so ../flash_vla/
-# libfmha_fp16_strided.so is built only on Thor / Hopper (SM100+);
-# on RTX this glob is empty and the cp below is a no-op.
-cp libfmha*.so ../flash_vla/ 2>/dev/null || true
-cd ..
+# CMake writes .so files directly into flash_vla/ at build time —
+# no separate `cp`, `make install`, or `ninja install` step needed.
+cmake -B build -S .
+cmake --build build -j$(nproc)
 
 # Verify
 python -c "import flash_vla; from flash_vla import flash_vla_kernels, flash_vla_fa2; \
@@ -614,13 +610,10 @@ pip install -e ".[torch]"          # or "[jax]" / "[all]"
 # `pip install .` would install a copy BEFORE the .so files exist and
 # `import flash_vla` would fail at runtime with a missing-module error.
 
-mkdir build && cd build
-cmake ..                # auto-detects GPU arch
-make -j$(nproc)
-cp flash_vla*.so ../flash_vla/
-# libfmha_fp16_strided.so is Thor / Hopper (SM100+) only; no-op on RTX.
-cp libfmha*.so ../flash_vla/ 2>/dev/null || true
-cd ..
+cmake -B build -S .                 # auto-detects GPU arch
+cmake --build build -j$(nproc)
+# CMake writes .so files directly into flash_vla/ — no `cp` /
+# `make install` / `ninja install` step needed.
 ```
 
 ### GPU arch override
@@ -629,11 +622,11 @@ CMake reads `nvidia-smi --query-gpu=compute_cap` to pick the target
 arch. Override for cross-compilation or when auto-detect fails:
 
 ```bash
-cmake .. -DGPU_ARCH=110   # Jetson AGX Thor   (FA2 skipped, CUTLASS SM100 path ON)
-cmake .. -DGPU_ARCH=120   # RTX 5090           (FA2 sm_80+sm_120 AOT, NVFP4 ON)
-cmake .. -DGPU_ARCH=89    # RTX 4090           (FA2 sm_80 AOT natively runs on Ada)
-cmake .. -DGPU_ARCH=86    # RTX 3090 / A10     (FA2 sm_80 AOT)
-cmake .. -DGPU_ARCH=80    # A100               (FA2 sm_80 AOT)
+cmake -B build -S . -DGPU_ARCH=110   # Jetson AGX Thor   (FA2 skipped, CUTLASS SM100 path ON)
+cmake -B build -S . -DGPU_ARCH=120   # RTX 5090           (FA2 sm_80+sm_120 AOT, NVFP4 ON)
+cmake -B build -S . -DGPU_ARCH=89    # RTX 4090           (FA2 sm_80 AOT natively runs on Ada)
+cmake -B build -S . -DGPU_ARCH=86    # RTX 3090 / A10     (FA2 sm_80 AOT)
+cmake -B build -S . -DGPU_ARCH=80    # A100               (FA2 sm_80 AOT)
 ```
 
 FA2 is enabled by CMake when `GPU_ARCH ∈ {80, 86, 89, 120}`. Other

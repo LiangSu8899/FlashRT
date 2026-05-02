@@ -136,7 +136,20 @@ class RtxFlashAttnBackendGroot:
         self._dit_self_out_ref = None
         self._dit_cross_out_ref = None
 
-        from flash_attn import flash_attn_func
+        # GROOT currently routes attention through the upstream
+        # ``flash-attn`` pip wheel as its primary path; defer the import
+        # to backend instantiation (not module import) so users without
+        # the wheel can still ``import flash_vla`` and run Pi0 / Pi0.5.
+        try:
+            from flash_attn import flash_attn_func
+        except ImportError as e:
+            raise ImportError(
+                "GROOT RTX backend requires the upstream `flash-attn` "
+                "pip package. Install a prebuilt wheel for your "
+                "torch/CUDA combo from "
+                "https://github.com/Dao-AILab/flash-attention/releases "
+                "(building the sdist takes 30+ minutes on cold images)."
+            ) from e
         self._flash_attn_func = flash_attn_func
 
     # ── Pointer interface (for pipeline's fvk kernel calls) ──

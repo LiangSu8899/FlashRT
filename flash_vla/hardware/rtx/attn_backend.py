@@ -27,7 +27,48 @@ alias for external plugins; see the class docstring.
 
 from __future__ import annotations
 
+import os
 from typing import Protocol
+
+
+def _make_flash_attn_proxy(need_legacy: bool):
+    """Return a callable that resolves to ``flash_attn.flash_attn_func``.
+
+    The upstream ``flash-attn`` pip wheel is *only* required when either
+    ``FVK_RTX_FA2=0`` is set (legacy backend) or ``FVK_RTX_FA2_SITES``
+    excludes one of the three FA2 call sites. When ``need_legacy`` is
+    ``False`` we still return a proxy so attribute capture in
+    ``__init__`` succeeds, but no import is attempted until the proxy
+    is actually called — which it never is on the default fast path.
+
+    On environments without a prebuilt flash-attn wheel (Modal cloud,
+    older CUDA images) this lets ``import flash_vla`` and the default
+    RTX inference path succeed without paying the 30–60 min sdist
+    compile or hitting an ImportError at module load.
+    """
+    if need_legacy:
+        try:
+            from flash_attn import flash_attn_func
+        except ImportError as e:
+            raise ImportError(
+                "FVK_RTX_FA2=0 (or FVK_RTX_FA2_SITES excludes a site) "
+                "selected the legacy upstream flash-attn path, but the "
+                "`flash-attn` pip package is not installed. Either:\n"
+                "  - unset FVK_RTX_FA2 / FVK_RTX_FA2_SITES to use the "
+                "vendored flash_vla_fa2 (default), or\n"
+                "  - install flash-attn (prebuilt wheels at "
+                "https://github.com/Dao-AILab/flash-attention/releases)."
+            ) from e
+        return flash_attn_func
+
+    def _missing_legacy(*_args, **_kw):
+        raise RuntimeError(
+            "Default RTX FA2 path was reconfigured at runtime to require "
+            "flash_attn.flash_attn_func, but the proxy was constructed "
+            "with need_legacy=False. This indicates the FVK_RTX_FA2 / "
+            "FVK_RTX_FA2_SITES env vars changed after backend init."
+        )
+    return _missing_legacy
 
 
 class AttnBackend(Protocol):
@@ -348,11 +389,17 @@ class RtxFlashAttnBackend:
                                                     dtype=torch.float32, device=d)
             self._dec_o_accum_rows1 = torch.empty(_dec_splits, 1, 8, _rows1_sq, 256,
                                                   dtype=torch.float32, device=d)
-        # Always import flash_attn: used either as the full legacy
-        # backend (when _use_fvk_fa2 is False) or as per-site fallback
-        # when FVK_RTX_FA2_SITES excludes some sites during bisection.
-        from flash_attn import flash_attn_func
-        self._flash_attn_func = flash_attn_func
+        # ``flash_attn`` (the upstream pip wheel) is needed only when:
+        #   - ``FVK_RTX_FA2=0`` (legacy backend), or
+        #   - ``FVK_RTX_FA2_SITES`` excludes some sites during bisection.
+        # The default (``_use_fvk_fa2=True`` + all three sites enabled) goes
+        # entirely through the vendored ``flash_vla_fa2.so``, so we make the
+        # import lazy: environments without a prebuilt flash-attn wheel
+        # (Modal / older CUDA images) can still use FlashRT for the
+        # default RTX path. ``_flash_attn_call`` raises a clear error if
+        # the legacy path is actually invoked without the package.
+        self._flash_attn_func = _make_flash_attn_proxy(
+            need_legacy=not self._use_fvk_fa2 or not all(self._fa2_sites.values()))
 
     # ── Pointer interface (for pipeline's fvk kernel calls) ──
 

@@ -19,6 +19,14 @@ torch = ["torch", "safetensors", "sentencepiece"]
 jax = ["jax", "jaxlib", "ml_dtypes", "orbax-checkpoint", "flax"]
 server = ["fastapi", "uvicorn"]
 eval = ["opencv-python", "tqdm"]
+# Optional. Required only for the legacy upstream attention path
+# (FVK_RTX_FA2=0 / FVK_RTX_FA2_SITES=...) and the GROOT N1.6/N1.7
+# backend. Default RTX Pi0 / Pi0.5 inference uses the vendored
+# flash_vla_fa2.so and does NOT need this. If pip cannot find a
+# prebuilt wheel for your torch+CUDA+Python combo, grab one from
+# https://github.com/Dao-AILab/flash-attention/releases — building
+# the sdist takes 30+ minutes on cold cloud images.
+flash-attn = ["flash-attn"]
 all = ["flash-vla[torch,jax,server,eval]"]
 
 [tool.setuptools.packages.find]

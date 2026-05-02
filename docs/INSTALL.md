@@ -80,16 +80,17 @@ built, and `import flash_vla` later would fail with a missing
 ## 6. Build
 
 ```bash
-mkdir build && cd build
-cmake ..                             # auto-detects GPU arch via nvidia-smi
-# Or override: cmake .. -DGPU_ARCH=110   (110=Thor, 120=5090, 89=4090, 80=A100)
-make -j$(nproc)
-cp flash_vla*.so ../flash_vla/
-# libfmha_fp16_strided.so is built only on Thor / Hopper (SM100+);
-# on RTX this glob is empty and the cp below is a no-op.
-cp libfmha*.so ../flash_vla/ 2>/dev/null || true
-cd ..
+cmake -B build -S .                  # auto-detects GPU arch via nvidia-smi
+# Or override: cmake -B build -S . -DGPU_ARCH=110   (110=Thor, 120=5090, 89=4090, 80=A100)
+cmake --build build -j$(nproc)       # equivalent to: ninja -C build, or make -C build
 ```
+
+That's it — no separate `cp`, `make install`, or `ninja install`
+step. CMake writes every `.so` directly into `flash_vla/` at build
+time via `LIBRARY_OUTPUT_DIRECTORY`, so a single `cmake --build`
+leaves the package importable. (The legacy `install(TARGETS …)`
+rule is still present for wheel-packaging users who run
+`cmake --install build`.)
 
 Per-arch produced shared libraries:
 
@@ -143,9 +144,29 @@ kernels CUTLASS SM100: True
 ```
 
 If `import flash_vla` fails with "no module named flash_vla_kernels",
-either (a) `make` didn't produce the `.so`, or (b) you forgot
-`cp *.so ../flash_vla/`, or (c) you installed non-editable and the
-import is hitting a stale site-packages copy. Check in order.
+either (a) `cmake --build` didn't produce the `.so` (re-run with
+`-v` and check the link step succeeded), or (b) you installed
+non-editable (`pip install .` instead of `pip install -e .`) and
+the import is hitting a stale site-packages copy. Check in order.
+
+## 7.1 `flash-attn` (optional)
+
+The default RTX Pi0 / Pi0.5 path routes attention through the
+vendored `flash_vla_fa2.so` (built from `csrc/attention/flash_attn_2_src/`)
+and does **not** require the upstream `flash-attn` pip package.
+You only need to install `flash-attn` if:
+
+- You set `FVK_RTX_FA2=0` to fall back to the legacy upstream path, or
+- You set `FVK_RTX_FA2_SITES=…` to bisect a subset of attention
+  sites against the upstream reference, or
+- You run the **GROOT N1.6 / N1.7** backend (its current attention
+  path is upstream `flash_attn_func`).
+
+When you do need it, prefer a prebuilt wheel matching your
+torch / CUDA / Python combo from
+[the flash-attention releases page](https://github.com/Dao-AILab/flash-attention/releases) —
+building the source distribution typically takes 30+ minutes on a
+cold cloud image (Modal, RunPod, etc.).
 
 ## 8. JAX frontend (optional)
 
