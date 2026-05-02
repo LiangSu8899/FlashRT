@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(flash_vla CUDA CXX)
+project(flash_rt CUDA CXX)
 
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CXX_STANDARD 17)
@@ -186,7 +186,7 @@ endif()
 # Built as a standalone shared library (not a pybind module) because
 # csrc/attention/fmha_dispatch.cu loads it at runtime via dlopen and
 # resolves the 'fmha_fp16_strided' symbol with dlsym. Keeping the FMHA
-# kernel in its own .so lets flash_vla_kernels.so stay small (~3.6 MB)
+# kernel in its own .so lets flash_rt_kernels.so stay small (~3.6 MB)
 # and avoids pulling CUTLASS SM100 FMHA templates into every rebuild.
 #
 # Include-path priority:
@@ -197,16 +197,16 @@ endif()
 #   3. Standard CUTLASS include + util.
 #
 # Only built on Thor / Hopper (SM100+); RTX (SM89/SM120) uses in-SO FA2
-# instead via flash_vla_fa2.so.
+# instead via flash_rt_fa2.so.
 if(ENABLE_SM100_CUTLASS)
   add_library(fmha_fp16_strided SHARED csrc/attention/fmha_fp16_strided.cu)
   set_target_properties(fmha_fp16_strided PROPERTIES
-    # Drop the artefact directly into flash_vla/ at build time so a plain
+    # Drop the artefact directly into flash_rt/ at build time so a plain
     # `cmake --build` / `ninja` is self-sufficient — no follow-up `cp` or
-    # `ninja install` step needed before `import flash_vla` works. The
+    # `ninja install` step needed before `import flash_rt` works. The
     # install(TARGETS ...) rule below stays for wheel-packaging users.
-    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_vla
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_vla
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt
     CUDA_STANDARD 17
     POSITION_INDEPENDENT_CODE ON
     # CMake defaults CMAKE_CUDA_ARCHITECTURES to "75" on this toolchain;
@@ -257,15 +257,15 @@ endif()
 
 # ── Flash-Attention 2 vendored kernels (fp16 + bf16 fwd SM80) ──
 # Built as an object library and linked into a SEPARATE pybind module
-# flash_vla_fa2.so — same isolation pattern as flash_vla_fp4.so. The
-# main flash_vla_kernels.so stays small (~3.6 MB) and its rebuild no
+# flash_rt_fa2.so — same isolation pattern as flash_rt_fp4.so. The
+# main flash_rt_kernels.so stays small (~3.6 MB) and its rebuild no
 # longer waits on FA2's heavy CUTLASS 3.x template codegen (~8 min).
 #
 # The hdim .cu files are template instantiations for the FA2 forward,
 # six per elem_type (three hdim × non-split + splitkv × fp16/bf16).
 # fa2_wrapper.cu provides the raw-pointer C entries
 # (fvk_attention_fa2_fwd_{fp16,bf16}); fa2_bindings.cpp pybind11-wraps
-# them into the flash_vla_fa2 module.
+# them into the flash_rt_fa2 module.
 if(ENABLE_FA2)
   # Dynamic source list: {hdim} x {dtype} x {split, no-split} .cu files,
   # driven by FA2_HDIMS / FA2_DTYPES cache vars. Default is the full
@@ -407,23 +407,23 @@ if(ENABLE_FA2)
   message(STATUS "FA2 vendor instantiations: hdim={${_FA2_H}} x dtype={${_FA2_D}} x {split,no-split} = ${_FA2_NKERN} kernel .cu files")
 
   # Independent pybind module. Caller side:
-  #     from flash_vla import flash_vla_fa2 as fa2
+  #     from flash_rt import flash_rt_fa2 as fa2
   #     fa2.fwd_fp16(...)  /  fa2.fwd_bf16(...)
-  pybind11_add_module(flash_vla_fa2 csrc/fa2_bindings.cpp)
-  set_target_properties(flash_vla_fa2 PROPERTIES
-    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_vla
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_vla)
-  target_sources(flash_vla_fa2 PRIVATE $<TARGET_OBJECTS:fa2_vendor_obj>)
-  target_include_directories(flash_vla_fa2 PRIVATE
+  pybind11_add_module(flash_rt_fa2 csrc/fa2_bindings.cpp)
+  set_target_properties(flash_rt_fa2 PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
+  target_sources(flash_rt_fa2 PRIVATE $<TARGET_OBJECTS:fa2_vendor_obj>)
+  target_include_directories(flash_rt_fa2 PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc
   )
-  target_link_libraries(flash_vla_fa2 PRIVATE CUDA::cudart)
-  install(TARGETS flash_vla_fa2 DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/flash_vla)
-  message(STATUS "FA2 pybind module: flash_vla_fa2 (separate .so)")
+  target_link_libraries(flash_rt_fa2 PRIVATE CUDA::cudart)
+  install(TARGETS flash_rt_fa2 DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
+  message(STATUS "FA2 pybind module: flash_rt_fa2 (separate .so)")
 endif()
 
 # ── Main module ──
-pybind11_add_module(flash_vla_kernels
+pybind11_add_module(flash_rt_kernels
   csrc/gemm/gemm_runner.cu
   csrc/kernels/norm.cu
   csrc/kernels/activation.cu
@@ -443,26 +443,26 @@ pybind11_add_module(flash_vla_kernels
   csrc/attention/fmha_dispatch.cu
   csrc/bindings.cpp
 )
-set_target_properties(flash_vla_kernels PROPERTIES
-  LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_vla
-  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_vla)
+set_target_properties(flash_rt_kernels PROPERTIES
+  LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
 
 if(ENABLE_SM100_CUTLASS)
-  target_sources(flash_vla_kernels PRIVATE $<TARGET_OBJECTS:cutlass_sm100_obj>)
-  target_compile_definitions(flash_vla_kernels PRIVATE ENABLE_SM100_CUTLASS=1)
+  target_sources(flash_rt_kernels PRIVATE $<TARGET_OBJECTS:cutlass_sm100_obj>)
+  target_compile_definitions(flash_rt_kernels PRIVATE ENABLE_SM100_CUTLASS=1)
 endif()
 
 if(ENABLE_NVFP4)
-  target_sources(flash_vla_kernels PRIVATE $<TARGET_OBJECTS:gemm_kernels_obj>)
-  target_compile_definitions(flash_vla_kernels PRIVATE ENABLE_NVFP4=1)
+  target_sources(flash_rt_kernels PRIVATE $<TARGET_OBJECTS:gemm_kernels_obj>)
+  target_compile_definitions(flash_rt_kernels PRIVATE ENABLE_NVFP4=1)
 endif()
 
-# (ENABLE_FA2 object-lib is linked into flash_vla_fa2.so only — see
-# the dedicated pybind11_add_module(flash_vla_fa2 ...) above. The main
-# flash_vla_kernels.so deliberately does NOT pull FA2 in, so rebuilds
+# (ENABLE_FA2 object-lib is linked into flash_rt_fa2.so only — see
+# the dedicated pybind11_add_module(flash_rt_fa2 ...) above. The main
+# flash_rt_kernels.so deliberately does NOT pull FA2 in, so rebuilds
 # of our hand-written kernels don't re-trigger the FA2 codegen tax.)
 
-target_include_directories(flash_vla_kernels PRIVATE
+target_include_directories(flash_rt_kernels PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/csrc
   ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm
   ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels
@@ -471,14 +471,14 @@ target_include_directories(flash_vla_kernels PRIVATE
   ${CUTLASS_DIR}/tools/util/include
 )
 
-target_link_libraries(flash_vla_kernels PRIVATE
+target_link_libraries(flash_rt_kernels PRIVATE
   CUDA::cublas
   CUDA::cublasLt
   CUDA::cudart
   ${CMAKE_DL_LIBS}    # dlopen/dlsym for FMHA .so loading
 )
 
-target_compile_options(flash_vla_kernels PRIVATE
+target_compile_options(flash_rt_kernels PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:
     --expt-relaxed-constexpr -O3
     --ftz=true --prec-div=false --prec-sqrt=false
@@ -486,11 +486,11 @@ target_compile_options(flash_vla_kernels PRIVATE
   >
 )
 
-install(TARGETS flash_vla_kernels DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/flash_vla)
+install(TARGETS flash_rt_kernels DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
 
 
 # ──────────────────────────────────────────────────────────────────────
-#  NVFP4 add-on module (separate .so, additive, does NOT touch flash_vla_kernels)
+#  NVFP4 add-on module (separate .so, additive, does NOT touch flash_rt_kernels)
 #  Built only when SM100-class GPU present. Thor SM110 via -arch=sm_110a.
 # ──────────────────────────────────────────────────────────────────────
 if(ENABLE_SM100_CUTLASS)
@@ -531,29 +531,29 @@ if(ENABLE_SM100_CUTLASS)
   # branch in cutlass_fp4_gemm.cu for BOTH device and host compilation
   # passes of nvcc.
   target_compile_definitions(fp4_kernels_obj PRIVATE CUTLASS_ARCH_MMA_SM100_SUPPORTED=1)
-  message(STATUS "NVFP4 add-on module (flash_vla_fp4): building for sm_${GPU_ARCH}a")
+  message(STATUS "NVFP4 add-on module (flash_rt_fp4): building for sm_${GPU_ARCH}a")
 
-  pybind11_add_module(flash_vla_fp4 csrc/fp4_bindings.cpp)
-  set_target_properties(flash_vla_fp4 PROPERTIES
-    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_vla
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_vla)
-  target_sources(flash_vla_fp4 PRIVATE $<TARGET_OBJECTS:fp4_kernels_obj>)
-  target_include_directories(flash_vla_fp4 PRIVATE
+  pybind11_add_module(flash_rt_fp4 csrc/fp4_bindings.cpp)
+  set_target_properties(flash_rt_fp4 PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
+  target_sources(flash_rt_fp4 PRIVATE $<TARGET_OBJECTS:fp4_kernels_obj>)
+  target_include_directories(flash_rt_fp4 PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc
   )
-  target_link_libraries(flash_vla_fp4 PRIVATE CUDA::cudart)
-  install(TARGETS flash_vla_fp4 DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/flash_vla)
+  target_link_libraries(flash_rt_fp4 PRIVATE CUDA::cudart)
+  install(TARGETS flash_rt_fp4 DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
 endif()
 
 
 # ──────────────────────────────────────────────────────────────────────
-#  JAX FFI add-on (separate .so, additive, does NOT touch flash_vla_kernels)
+#  JAX FFI add-on (separate .so, additive, does NOT touch flash_rt_kernels)
 #
 #  Built only when JAX is importable from the configure-time Python and
 #  exposes `xla/ffi/api/ffi.h` via `jax.ffi.include_dir()`. The
-#  resulting `flash_vla_jax_ffi.so` is consumed by `training/jax/` via
+#  resulting `flash_rt_jax_ffi.so` is consumed by `training/jax/` via
 #  ctypes + jax.ffi.register_ffi_target — independent of the PyTorch
-#  pybind path, so JAX-only deps never bleed into flash_vla_kernels.
+#  pybind path, so JAX-only deps never bleed into flash_rt_kernels.
 #
 #  The handlers delegate to GemmRunner::fp8_nn_dev /
 #  quantize_fp8_static (the same kernels the PyTorch path drives), so
@@ -572,21 +572,21 @@ if(JAX_FFI_DETECT_RESULT EQUAL 0
    AND EXISTS "${JAX_FFI_INCLUDE_DIR}/xla/ffi/api/ffi.h")
   message(STATUS "JAX FFI: ENABLED (include=${JAX_FFI_INCLUDE_DIR})")
 
-  add_library(flash_vla_jax_ffi SHARED
+  add_library(flash_rt_jax_ffi SHARED
     csrc/training/jax_ffi/fp8_gemm_ffi.cu
     csrc/training/jax_ffi/activation_quantize_ffi.cu
     csrc/gemm/gemm_runner.cu
     csrc/kernels/quantize.cu
   )
-  set_target_properties(flash_vla_jax_ffi PROPERTIES
-    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_vla
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_vla
+  set_target_properties(flash_rt_jax_ffi PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt
     CUDA_STANDARD 17
     POSITION_INDEPENDENT_CODE ON
-    PREFIX ""                             # → flash_vla_jax_ffi.so (no "lib" prefix)
-    OUTPUT_NAME "flash_vla_jax_ffi"
+    PREFIX ""                             # → flash_rt_jax_ffi.so (no "lib" prefix)
+    OUTPUT_NAME "flash_rt_jax_ffi"
   )
-  target_include_directories(flash_vla_jax_ffi PRIVATE
+  target_include_directories(flash_rt_jax_ffi PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels
@@ -595,19 +595,19 @@ if(JAX_FFI_DETECT_RESULT EQUAL 0
     ${CUTLASS_INCLUDE}
     ${CUTLASS_DIR}/tools/util/include
   )
-  target_link_libraries(flash_vla_jax_ffi PRIVATE
+  target_link_libraries(flash_rt_jax_ffi PRIVATE
     CUDA::cublas
     CUDA::cublasLt
     CUDA::cudart
   )
-  target_compile_options(flash_vla_jax_ffi PRIVATE
+  target_compile_options(flash_rt_jax_ffi PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:
       --expt-relaxed-constexpr -O3
       --ftz=true --prec-div=false --prec-sqrt=false
       ${GPU_GENCODE}
     >
   )
-  install(TARGETS flash_vla_jax_ffi DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/flash_vla)
+  install(TARGETS flash_rt_jax_ffi DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
 else()
   message(STATUS "JAX FFI: SKIPPED (jax.ffi not importable or ffi.h missing)")
 endif()
