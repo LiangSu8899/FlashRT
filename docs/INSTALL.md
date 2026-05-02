@@ -13,8 +13,10 @@ enables which kernels), read the "Build" section of the top-level
 
 | Path | When to use | Entry point |
 |---|---|---|
-| **Docker** | You want a known-good CUDA/PyTorch toolchain and don't care about host Python | [README §Option A](../README.md) |
-| **Native Linux** | You already run CUDA workloads on the host and want the library in your existing venv | [README §Option B](../README.md) |
+| **Prebuilt Docker image** | Fastest path. Cloud (Modal / RunPod / Vast) or local. CUDA + kernels already compiled. | [README §Option A](../README.md) + [`docker/README.md`](../docker/README.md) |
+| **Build Docker yourself** | Custom GPU arch / pinned commit / vetting the recipe | [README §Option B](../README.md) |
+| **Native Linux** | Existing venv on a CUDA host, no Docker | [README §Option C](../README.md) + this doc below |
+| **Native Jetson Thor** | SM110, ARM64, JetPack — Docker not recommended on Jetson | this doc below + [`docs/deployment_rtx4090.md`](deployment_rtx4090.md) for cross-ref |
 
 Both paths end at the same verification step — `import flash_rt;
 flash_rt.__version__` returns the installed version, and
