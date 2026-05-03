@@ -56,9 +56,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 DEFAULT_LIBERO = os.environ.get("LIBERO_ROOT", "/workspace/libero_10_image")
-DEFAULT_CKPT   = os.environ.get(
-    "PI05_CKPT",
-    "<your_pi05_torch_ckpt>")
+DEFAULT_CKPT   = os.environ.get("PI05_CKPT", "/workspace/pytorch_checkpoints/pi05_libero_converted")
 DEFAULT_REF    = os.environ.get("PI05_FP32_REF", "/tmp/pytorch_reference.npz")
 
 

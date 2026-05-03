@@ -21,6 +21,26 @@ import numpy as np
 
 FLASH_VLA_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+# Centralised env-var resolution for checkpoint paths. Per-model templates
+# below embed placeholder strings like "<your_pi05_torch_ckpt>" which
+# ``run_model`` substitutes from ``tests/_helpers/paths.resolve(...)``
+# before launching the subprocess. Public users export FLASH_RT_PI05_CKPT
+# etc. (see tests/_helpers/paths.py for the full key list and defaults).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _helpers.paths import resolve  # noqa: E402
+
+# Placeholder string -> resolver key. Only keys whose placeholder actually
+# appears in the chosen template get resolved, so a missing GROOT fixture
+# won't break a Pi0-only invocation.
+_PLACEHOLDER_TO_KEY = {
+    "<your_pi05_torch_ckpt>": "PI05_CKPT",
+    "<your_pi0_torch_ckpt>":  "PI0_CKPT",
+    "<your_pi05_jax_ckpt>":   "PI05_JAX_CKPT",
+    "<your_jax_ckpts>":       "JAX_CKPTS",
+    "<your_groot_ckpt>":      "GROOT_CKPT",
+    "<your_groot_ref>":       "GROOT_REF",
+}
+
 def cosine(a, b):
     a, b = a.flatten().astype(np.float64), b.flatten().astype(np.float64)
     return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-12))
@@ -395,6 +415,13 @@ MODELS = {
 def run_model(key):
     name, script = MODELS[key]
     script = script.replace('ROOTDIR', FLASH_VLA_ROOT)
+    # Resolve only the placeholders that actually appear in this template,
+    # so a missing key for an unselected model doesn't kill the run.
+    for placeholder, env_key in _PLACEHOLDER_TO_KEY.items():
+        if placeholder in script:
+            # JAX_CKPTS is a base prefix; downstream code joins with /pi0_base etc.
+            must_exist = env_key not in {"JAX_CKPTS", "TORCH_CKPTS"}
+            script = script.replace(placeholder, resolve(env_key, must_exist=must_exist))
     r = subprocess.run(['python3', '-c', script], capture_output=True, text=True, timeout=600)
     if r.returncode != 0:
         return {'error': '\n'.join(r.stderr.strip().split('\n')[-5:])}

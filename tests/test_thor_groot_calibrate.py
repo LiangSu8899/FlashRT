@@ -23,12 +23,10 @@ import argparse, json, os, subprocess, sys
 
 FLASH_VLA_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-GROOT_CKPT = os.environ.get(
-    "GROOT_THOR_CHECKPOINT",
-    "<your_groot_ckpt>")
+GROOT_CKPT = os.environ.get("GROOT_THOR_CHECKPOINT", "/workspace/openpi-main/openpi-main/groot_ckpt")
 GROOT_REF = os.environ.get(
     "GROOT_THOR_REFERENCE",
-    "<your_groot_ref>/groot_ref_e2e_full.pt")
+    "/workspace/openpi-main/openpi-main/groot_ref/groot_ref_e2e_full.pt")
 
 # Single subprocess script — parametrised by N. Calls calibrate(obs_list)
 # explicitly (not relying on infer-side implicit calibration), then runs

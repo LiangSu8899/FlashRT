@@ -1,7 +1,7 @@
 """NVFP4 utilities over CudaBuffer (torch-free variant of fp4_utils.py).
 
 Mirror of the torch-based helpers in ``fp4_utils.py``, but every allocation
-and pointer is expressed through :class:`flash_rt.engine.cuda_buffer.CudaBuffer`
+and pointer is expressed through :class:`flash_rt.core.cuda_buffer.CudaBuffer`
 so the JAX Pi0.5 FP4 frontend can consume the same ``flash_rt_fp4`` kernels
 without pulling torch into the runtime path.
 
@@ -23,7 +23,7 @@ from __future__ import annotations
 import numpy as np
 
 import flash_rt.flash_rt_fp4 as fvk_fp4
-from flash_rt.engine.cuda_buffer import CudaBuffer, sync
+from flash_rt.core.cuda_buffer import CudaBuffer, sync
 
 
 # ────────────────────────────────────────────────────────────────────

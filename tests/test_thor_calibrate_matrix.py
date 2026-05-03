@@ -54,18 +54,15 @@ logger = logging.getLogger("thor_cal_matrix")
 ROOT = Path(__file__).resolve().parents[1]
 
 LIBERO_ROOT = os.environ.get("LIBERO_ROOT", "/workspace/libero_10_image")
-PI05_CKPT = os.environ.get(
-    "PI05_CKPT", "<your_pi05_torch_ckpt>")
-PI05_JAX_CKPT = os.environ.get(
-    "PI05_JAX_CKPT", "<your_pi05_jax_ckpt>")
-PI0_CKPT = os.environ.get(
-    "PI0_CKPT", "<your_pi0_torch_ckpt>")
+PI05_CKPT = os.environ.get("PI05_CKPT", "/workspace/pytorch_checkpoints/pi05_libero_converted")
+PI05_JAX_CKPT = os.environ.get("PI05_JAX_CKPT", "/workspace/checkpoints/pi05_libero_jax")
+PI0_CKPT = os.environ.get("PI0_CKPT", "/workspace/pytorch_checkpoints/pi0_base_converted")
 PI0_JAX_CKPT = os.environ.get(
-    "PI0_JAX_CKPT", "<your_jax_ckpts>/pi0_base")
+    "PI0_JAX_CKPT", "/workspace/checkpoints/pi0_base")
 PI0FAST_CKPT = os.environ.get(
-    "PI0FAST_CKPT", "<your_torch_ckpts>/pi0_fast_base_converted")
+    "PI0FAST_CKPT", "/workspace/pytorch_checkpoints/pi0_fast_base_converted")
 PI0FAST_JAX_CKPT = os.environ.get(
-    "PI0FAST_JAX_CKPT", "<your_jax_ckpts>/pi0_fast_base")
+    "PI0FAST_JAX_CKPT", "/workspace/checkpoints/pi0_fast_base")
 
 
 # ------------------------------------------------------------------

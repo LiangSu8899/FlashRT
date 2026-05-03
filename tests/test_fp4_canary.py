@@ -31,7 +31,7 @@ def run_variant(cls, **kw):
     wrist = np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8)
     obs = {"image": img, "wrist_image": wrist}
 
-    pipe = cls("<your_pi05_torch_ckpt>",
+    pipe = cls(os.environ.get("FLASH_RT_PI05_CKPT", "/workspace/pytorch_checkpoints/pi05_libero_converted"),
                num_views=2, autotune=3, **kw)
     pipe.set_prompt("pick up the red block and place it in the tray")
     for _ in range(5):

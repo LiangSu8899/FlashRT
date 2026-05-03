@@ -45,10 +45,8 @@ logger = logging.getLogger("bench_pi05_views")
 
 ROOT = Path(__file__).resolve().parents[1]
 
-PI05_TORCH_CKPT = os.environ.get(
-    "PI05_CKPT", "<your_pi05_torch_ckpt>")
-PI05_JAX_CKPT = os.environ.get(
-    "PI05_JAX_CKPT", "<your_pi05_jax_ckpt>")
+PI05_TORCH_CKPT = os.environ.get("PI05_CKPT", "/workspace/pytorch_checkpoints/pi05_libero_converted")
+PI05_JAX_CKPT = os.environ.get("PI05_JAX_CKPT", "/workspace/checkpoints/pi05_libero_jax")
 
 
 TORCH_SCRIPT = r"""

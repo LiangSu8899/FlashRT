@@ -348,7 +348,7 @@ class Pi05ThorPipeline:
           pipeline only orchestrates ``replay``.
         * **Backend-agnostic**: the torch frontend uses
           ``torch.cuda.CUDAGraph`` and the JAX frontend uses
-          ``flash_rt.engine.cuda_graph.CUDAGraph``; both are wrapped
+          ``flash_rt.core.cuda_graph.CUDAGraph``; both are wrapped
           by the ``replay_siglip`` / ``replay_enc_ae`` callbacks the
           frontend hands in. Each callback is responsible for any
           stream-sync the backend needs after replay.

@@ -67,7 +67,7 @@ class Pi0JaxFrontendThor:
     def __init__(self, checkpoint_dir, engine_path=None, fmha_path=None,
                  use_cuda_graph=True, num_views=2, autotune=3,
                  weight_cache=True, **kwargs):
-        from flash_rt.engine.cuda_buffer import CudaBuffer, sync
+        from flash_rt.core.cuda_buffer import CudaBuffer, sync
         from flash_rt.core.weights.transformer import quantize_fp8_e4m3, compute_time_embeddings
         self._CudaBuffer = CudaBuffer
         self._sync = sync
@@ -887,7 +887,7 @@ class Pi0JaxFrontendThor:
                                   self.pos_emb_buf.ptr.value, S, D, 256, stream_int)
 
     def _capture_siglip_graph(self):
-        from flash_rt.engine.cuda_graph import CUDAGraph
+        from flash_rt.core.cuda_graph import CUDAGraph
         S, D, H, NH, HD, L = self.sig_dims
 
         _cudart = ctypes.CDLL("libcudart.so")
@@ -955,7 +955,7 @@ class Pi0JaxFrontendThor:
     # -----------------------------------------------------------------------
 
     def _capture_enc_ae_graph(self):
-        from flash_rt.engine.cuda_graph import CUDAGraph
+        from flash_rt.core.cuda_graph import CUDAGraph
         stream = self._stream; _cudart = self._cudart
         stream_int = stream.value or 0
 

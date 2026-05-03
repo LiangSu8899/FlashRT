@@ -6,7 +6,7 @@ standard eval flow runs.
 
 Usage:
     python tests/eval_libero_fp4.py \\
-        --checkpoint <your_pi05_torch_ckpt> \\
+        --checkpoint /workspace/pytorch_checkpoints/pi05_libero_converted \\
         --task_suite libero_spatial [--full]
 """
 from __future__ import annotations

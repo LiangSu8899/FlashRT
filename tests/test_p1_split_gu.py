@@ -67,7 +67,7 @@ def cool(secs=60):
 
 def main():
     from flash_rt.frontends.torch.pi05_thor_fp4 import Pi05TorchFrontendThorFP4
-    CKPT = "<your_pi05_torch_ckpt>"
+    CKPT = os.environ.get("FLASH_RT_PI05_CKPT", "/workspace/pytorch_checkpoints/pi05_libero_converted")
     prod = np.load("/tmp/v_prod.npy")
     v_torch = np.load("/tmp/v_torch.npy")
 

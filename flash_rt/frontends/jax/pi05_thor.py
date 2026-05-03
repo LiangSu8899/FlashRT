@@ -72,8 +72,8 @@ class Pi05JaxFrontendThor:
                 Only affects JAX (Orbax is slow to load; safetensors is already fast).
                 Set False to force re-quantize (e.g., after fine-tuning).
         """
-        from flash_rt.engine.cuda_buffer import CudaBuffer, sync
-        from flash_rt.weights.transformer import quantize_fp8_e4m3, compute_time_embeddings
+        from flash_rt.core.cuda_buffer import CudaBuffer, sync
+        from flash_rt.core.weights.transformer import quantize_fp8_e4m3, compute_time_embeddings
         self._CudaBuffer = CudaBuffer
         self._sync = sync
 
@@ -126,8 +126,8 @@ class Pi05JaxFrontendThor:
                 cache_hit = True
 
         if not cache_hit:
-            from flash_rt.weights.loader import load_weights, detect_format
-            from flash_rt.weights.transformer import transform_jax_weights
+            from flash_rt.core.weights.loader import load_weights, detect_format
+            from flash_rt.core.weights.transformer import transform_jax_weights
 
             fmt = detect_format(str(checkpoint_dir))
             raw = load_weights(str(checkpoint_dir), format=fmt)
@@ -1056,7 +1056,7 @@ class Pi05JaxFrontendThor:
 
     def _capture_siglip_graph(self):
         """Capture patch_embed + SigLIP + PostLN as CUDA graph."""
-        from flash_rt.engine.cuda_graph import CUDAGraph
+        from flash_rt.core.cuda_graph import CUDAGraph
         S, D, H, NH, HD, L = self.sig_dims
 
         _cudart = ctypes.CDLL("libcudart.so")
@@ -1138,7 +1138,7 @@ class Pi05JaxFrontendThor:
 
     def _capture_enc_ae_graph(self):
         """Capture Encoder+AE as CUDA graph via pipeline.py."""
-        from flash_rt.engine.cuda_graph import CUDAGraph
+        from flash_rt.core.cuda_graph import CUDAGraph
         stream = self._stream; _cudart = self._cudart
         stream_int = stream.value or 0
 
@@ -1279,13 +1279,13 @@ class Pi05JaxFrontendThor:
         """Capture the B=N JAX encoder + decoder graph.
 
         Mirrors :meth:`Pi05TorchFrontendThor._capture_enc_ae_graph_b2`
-        but uses :class:`flash_rt.engine.cuda_graph.CUDAGraph` and
+        but uses :class:`flash_rt.core.cuda_graph.CUDAGraph` and
         explicit-stream replay (no ``torch.cuda.Stream`` here). Drives
         a 3x warmup followed by a single capture against
         :func:`flash_rt.hardware.thor.shared_primitives_batched.encoder_forward_b2`
         + :func:`flash_rt.models.pi05.pipeline_thor_batched.decoder_forward_b2`.
         """
-        from flash_rt.engine.cuda_graph import CUDAGraph
+        from flash_rt.core.cuda_graph import CUDAGraph
         from flash_rt.hardware.thor.shared_primitives_batched import (
             encoder_forward_b2)
         from flash_rt.models.pi05.pipeline_thor_batched import (
@@ -1436,7 +1436,7 @@ class Pi05JaxFrontendThor:
         Per-call frontend work shrinks to: image upload + noise R upload
         + ONE ``outer_graph.replay()`` + final sync.
         """
-        from flash_rt.engine.cuda_graph import CUDAGraph
+        from flash_rt.core.cuda_graph import CUDAGraph
         from flash_rt.hardware.thor.shared_primitives_batched import (
             encoder_forward_b2)
         from flash_rt.models.pi05.pipeline_thor_batched import (

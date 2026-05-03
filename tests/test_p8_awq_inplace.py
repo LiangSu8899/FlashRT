@@ -35,7 +35,7 @@ def main():
 
     print("Building Pi0.5 AWQ full-18 (use_awq=True, P8 in-place requant)...")
     pipe = Pi05TorchFrontendThorFP4(
-        "<your_pi05_torch_ckpt>",
+        os.environ.get("FLASH_RT_PI05_CKPT", "/workspace/pytorch_checkpoints/pi05_libero_converted"),
         num_views=2, autotune=3,
         use_fp4_encoder_ffn=True,
         fp4_layers=tuple(range(18)),

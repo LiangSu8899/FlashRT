@@ -46,8 +46,8 @@ FLASH_VLA_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Random uint8 images + zero state. Pi0-FAST is multi-task, so the model can
 # accept any input shape; the goal is FVK ≡ JAX equivalence, not action quality.
 import os as _os
-_CKPT_BASE = _os.environ.get("PI0FAST_CKPT_BASE", "<your_jax_ckpts>")
-_PT_BASE   = _os.environ.get("PI0FAST_PT_BASE",   "<your_torch_ckpts>")
+_CKPT_BASE = _os.environ.get("PI0FAST_CKPT_BASE", "/workspace/checkpoints")
+_PT_BASE   = _os.environ.get("PI0FAST_PT_BASE", "/workspace/pytorch_checkpoints")
 TORCH_CHECKPOINT = f"{_PT_BASE}/pi0_fast_base_converted"
 JAX_CHECKPOINT = f"{_CKPT_BASE}/pi0_fast_base"
 
