@@ -1,12 +1,21 @@
 # FlashRT — Docker
 
-The fastest path to a working FlashRT install on a Linux x86_64 host
-(RTX 5090 / 4090 / 3090 / Ampere). One image, one command, no CUTLASS
-clone, no `flash-attn` wheel-hunting, no manual `cp *.so` step.
+The fastest path to a working FlashRT install. One image, one
+command, no CUTLASS clone, no `flash-attn` wheel-hunting, no manual
+`cp *.so` step.
 
-> **Thor (SM110)** is not covered by this image — Jetson is ARM64 and
-> uses a different NVIDIA base (`nvcr.io/nvidia/l4t-jetpack`). Thor
-> users follow the native install in [`docs/INSTALL.md`](../docs/INSTALL.md).
+Two Dockerfiles ship with the repo:
+
+| Hardware | Dockerfile | NGC base |
+|----------|------------|----------|
+| RTX 5090 / 4090 / 3090 / Ampere (x86_64)    | [`Dockerfile`](Dockerfile)         | `nvcr.io/nvidia/pytorch:25.10-py3` |
+| Jetson AGX Thor (SM110, aarch64)            | [`Dockerfile.thor`](Dockerfile.thor) | `nvcr.io/nvidia/pytorch:25.09-py3` (arm64 manifest) |
+
+Thor uses a hand-tuned cuBLAS-decomposed attention path
+(`csrc/attention/fmha_dispatch.cu`) instead of the vendored
+Flash-Attention 2, so its image deliberately does NOT produce
+`flash_rt_fa2.so`. Everything else builds the same way. Skip to
+[§5](#5-thor-jetson-agx-thor-sm110-aarch64) for the Thor flow.
 
 ---
 
@@ -122,4 +131,49 @@ GROOT, install it yourself:
 docker run --rm --gpus all flashrt:dev \
     pip install flash-attn  # or grab a prebuilt wheel from the releases page
 ```
+
+---
+
+## 5. Thor (Jetson AGX Thor, SM110, aarch64)
+
+The Thor image uses a separate Dockerfile, [`Dockerfile.thor`](Dockerfile.thor),
+because Thor pulls a different NGC manifest (`linux/arm64`) and skips
+the FA2 build (Thor has its own attention path). Build on a Thor
+host so `nvidia-smi` auto-detects `sm_110a`:
+
+```bash
+# On the Thor host
+docker build -t flashrt:thor -f docker/Dockerfile.thor .
+
+# Run (note --runtime nvidia for Jetson)
+docker run --rm --gpus all -it --runtime nvidia flashrt:thor
+```
+
+### What's different vs the x86 image
+
+- **Base**: `nvcr.io/nvidia/pytorch:25.09-py3` (one minor older than the
+  x86 image — 25.09 has the validated arm64 / Thor manifest, 25.10
+  arm64 has not been smoke-tested on SM110 yet).
+- **Build targets**: 4 `.so` files instead of 5
+  (`flash_rt_kernels`, `flash_rt_fp4`, `libfmha_fp16_strided`,
+  `flash_rt_jax_ffi`).
+- **No `flash_rt_fa2.so`**: Thor's `csrc/attention/fmha_dispatch.cu`
+  loads `libfmha_fp16_strided.so` at runtime via dlopen — no FA2
+  template instantiation, ~10 min faster cold build than x86.
+- **`flash_rt_fp4.so` on Thor**: built for sm_110a (NVFP4 instructions
+  are SM120-only at the SASS level, but the kernel object compiles
+  fine on Thor and the runtime dispatcher gates calls accordingly —
+  see `docs/kernel_catalog.md` § FP4 path).
+
+### Build args
+
+Same as the x86 image (`GPU_ARCH`, `CUTLASS_REF`), minus `FA2_HDIMS`
+which is a no-op on Thor.
+
+### Smoke check
+
+The image-build smoke deliberately asserts `libfmha_fp16_strided.so`
+is present and does NOT import `flash_rt_fa2`, so a future regression
+that reintroduces FA2 onto Thor by accident gets caught at build
+time.
 
