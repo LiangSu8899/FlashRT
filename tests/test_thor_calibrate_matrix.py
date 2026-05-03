@@ -135,15 +135,24 @@ else:
 
 for _ in range(3): pipe.infer(ref_obs)
 
-matched = torch.from_numpy(ref_noise).to(dtype=torch.float16, device="cuda")
-_o = torch.Tensor.normal_
-def _p(self, *a, **kw):
-    if self.data_ptr() == pipe._g_noise.data_ptr():
-        self.copy_(matched); return self
-    return _o(self, *a, **kw)
-torch.Tensor.normal_ = _p
+# Inject ref_noise via np.random.randn — current Pi0.5 Torch frontend
+# draws _g_noise via np.random.randn(Sa, 32) on the CPU and H2D-copies.
+# The legacy torch.Tensor.normal_ monkey-patch no longer fires; without
+# this update the test would diff against the wrong initial noise and
+# cos collapses to ~0.3. Mirrors test_all_models_precision.py PI05_SCRIPT.
+Sa = ref_noise.shape[0]
+_orig_randn = np.random.randn
+class _PatchedRNG:
+    on = False
+    def __call__(self, *a, **kw):
+        if self.on and a == (Sa, 32):
+            return ref_noise.astype(np.float64)
+        return _orig_randn(*a, **kw)
+_p = _PatchedRNG(); np.random.randn = _p
+_p.on = True
 pipe.infer(ref_obs)
-torch.Tensor.normal_ = _o
+_p.on = False
+np.random.randn = _orig_randn
 out = pipe._g_noise.float().cpu().numpy()
 
 def cos(a, b):
@@ -224,15 +233,24 @@ else:
 
 for _ in range(3): pipe.infer(ref_obs)
 
-matched = torch.from_numpy(ref_noise).to(dtype=torch.float16, device="cuda")
-_o = torch.Tensor.normal_
-def _p(self, *a, **kw):
-    if self.data_ptr() == pipe._g_noise.data_ptr():
-        self.copy_(matched); return self
-    return _o(self, *a, **kw)
-torch.Tensor.normal_ = _p
+# Inject ref_noise via np.random.randn — current Pi0.5 Torch frontend
+# draws _g_noise via np.random.randn(Sa, 32) on the CPU and H2D-copies.
+# The legacy torch.Tensor.normal_ monkey-patch no longer fires; without
+# this update the test would diff against the wrong initial noise and
+# cos collapses to ~0.3. Mirrors test_all_models_precision.py PI05_SCRIPT.
+Sa = ref_noise.shape[0]
+_orig_randn = np.random.randn
+class _PatchedRNG:
+    on = False
+    def __call__(self, *a, **kw):
+        if self.on and a == (Sa, 32):
+            return ref_noise.astype(np.float64)
+        return _orig_randn(*a, **kw)
+_p = _PatchedRNG(); np.random.randn = _p
+_p.on = True
 pipe.infer(ref_obs)
-torch.Tensor.normal_ = _o
+_p.on = False
+np.random.randn = _orig_randn
 out = pipe._g_noise.float().cpu().numpy()
 
 def cos(a, b):
