@@ -195,17 +195,17 @@ For Pi0.5 / GROOT you will also need:
 
 `rtx_pi0_cosine_vs_official.py` imports `openpi.models.pi0_config` +
 `openpi.models_pytorch.pi0_pytorch` to generate the PyTorch FP32
-reference. Make sure `/workspace/openpi/src` is in `PYTHONPATH`:
+reference. Make sure `<openpi_repo>/src` is in `PYTHONPATH`:
 
 ```bash
-# 5090 had: PYTHONPATH=/workspace/openpi/src:
-rsync -avz /workspace/openpi user@4090-host:/workspace/
+# 5090 had: PYTHONPATH=<openpi_repo>/src:
+rsync -avz <openpi_repo> user@4090-host:<remote_root>/
 ```
 
 If `PYTHONPATH` isn't set in the container, `export` it:
 
 ```bash
-export PYTHONPATH=/workspace/openpi/src:$PYTHONPATH
+export PYTHONPATH=<openpi_repo>/src:$PYTHONPATH
 ```
 
 ---
@@ -515,7 +515,7 @@ GPU clocks are boosting up/down. Lock them (§7b). Also check for:
 docker exec -it pi0-4090 bash
 
 cd <repo_root>
-export PYTHONPATH=/workspace/openpi/src:$PYTHONPATH
+export PYTHONPATH=<openpi_repo>/src:$PYTHONPATH
 
 # 1. Build (produces flash_rt_kernels.so + flash_rt_fa2.so on RTX)
 cd build && cmake .. && make -j$(nproc) && cd ..

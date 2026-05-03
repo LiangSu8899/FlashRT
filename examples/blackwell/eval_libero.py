@@ -1,27 +1,24 @@
 #!/usr/bin/env python3
 """
-FlashRT Blackwell — LIBERO benchmark.
+FlashRT Blackwell — LIBERO benchmark pointer.
 
-Uses Pi05FastInference backend (pybind11 + FlashAttention) on RTX 5090.
+The unified ``flash_rt.load_model(...)`` API is hardware-agnostic, so
+the Thor LIBERO evaluation script at ``examples/thor/eval_libero.py``
+runs unchanged on Blackwell (RTX 5090, SM120) once cmake auto-detects
+the right gencode flag. This stub prints the canonical command + a
+minimal library-usage snippet so users land on the right entry point.
 
 Usage:
     python examples/blackwell/eval_libero.py \
         --checkpoint /path/to/pi05_libero_pytorch \
         --task_suite libero_spatial
-
-For the full LIBERO evaluation with env integration, see:
-    test-5090/libero_eval.py
 """
 
 import argparse
-import sys
-import os
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 
 
 def main():
-    parser = argparse.ArgumentParser(description="FlashRT Blackwell LIBERO benchmark")
+    parser = argparse.ArgumentParser(description="FlashRT Blackwell LIBERO benchmark pointer")
     parser.add_argument('--checkpoint', required=True)
     parser.add_argument('--task_suite', default='libero_spatial',
                         choices=['libero_spatial', 'libero_object', 'libero_goal',
@@ -34,33 +31,35 @@ def main():
     print(f"FlashRT Blackwell — LIBERO {args.task_suite}")
     print("=" * 60)
 
-    print(f"\nFor full LIBERO evaluation, use the production script:")
-    print(f"  cd test-5090/")
-    print(f"  python libero_eval.py \\")
+    print("\nThe shared LIBERO eval script lives at examples/thor/eval_libero.py")
+    print("and runs unchanged on RTX 5090 (Blackwell, SM120):")
+    print()
+    print(f"  python examples/thor/eval_libero.py \\")
     print(f"    --checkpoint {args.checkpoint} \\")
-    print(f"    --task_suite {args.task_suite}")
+    print(f"    --task_suite {args.task_suite} \\")
+    print(f"    --framework torch \\")
+    print(f"    --num_views {args.num_views}", end="")
     if args.quick:
-        print(f"    --quick")
+        print(" \\\n    --quick")
+    else:
+        print()
     print()
 
-    print("Library usage example:")
+    print("Library-usage snippet (matches README quickstart):")
     print("```python")
-    print("from flash_rt.backends.x86_sm120 import Pi05FastInference")
+    print("import flash_rt")
     print()
-    print("model = Pi05FastInference(")
-    print("    checkpoint=checkpoint_dict,")
+    print("model = flash_rt.load_model(")
+    print(f"    checkpoint=\"{args.checkpoint}\",")
+    print("    framework=\"torch\",     # or \"jax\"")
+    print("    config=\"pi05\",")
     print(f"    num_views={args.num_views},")
-    print("    chunk_size=10,")
     print(")")
-    print("model.record_infer_graph()")
     print()
-    print("# Per-step inference in LIBERO loop:")
-    print("actions = model.forward(")
-    print("    observation_images_normalized=obs_images,")
-    print("    diffusion_noise=noise,")
-    print("    task_prompt='pick up the red block',")
-    print("    state_tokens=state,")
-    print(")")
+    print("# First call: ~3 s (calibration + CUDA Graph capture).")
+    print("# Subsequent calls: graph replay (~17 ms on RTX 5090, 2 views).")
+    print("actions = model.predict(images=[base_img, wrist_img],")
+    print("                        prompt=\"pick up the red block\")")
     print("```")
 
 
