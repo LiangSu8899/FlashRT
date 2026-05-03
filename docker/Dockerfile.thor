@@ -10,7 +10,7 @@
 #   docker build -t flashrt:thor -f docker/Dockerfile.thor .
 #
 # Run:
-#   docker run --rm --gpus all -it --runtime nvidia flashrt:thor
+#   docker run --rm --gpus all -it --runtime=nvidia flashrt:thor
 #
 # Note on FA2: Thor (SM110) uses the in-tree cuBLAS-decomposed attention
 # path (csrc/attention/fmha_dispatch.cu + libfmha_fp16_strided.so), not
@@ -103,5 +103,5 @@ assert os.path.exists(os.path.join(os.path.dirname(flash_rt.__file__), 'libfmha_
 print('Thor build OK — kernels + fmha_fp16_strided + fp4 + jax_ffi present')"
 
 # Default to a Python REPL with flash_rt pre-imported. Override with
-#   docker run --rm --gpus all -it --runtime nvidia flashrt:thor <cmd>
+#   docker run --rm --gpus all -it --runtime=nvidia flashrt:thor <cmd>
 CMD ["python3", "-c", "import flash_rt; print('flash_rt', flash_rt.__version__, '— Thor (SM110) build ready'); import code; code.interact(local={'flash_rt': flash_rt})"]

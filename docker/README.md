@@ -145,9 +145,35 @@ host so `nvidia-smi` auto-detects `sm_110a`:
 # On the Thor host
 docker build -t flashrt:thor -f docker/Dockerfile.thor .
 
-# Run (note --runtime nvidia for Jetson)
-docker run --rm --gpus all -it --runtime nvidia flashrt:thor
+# Run (note --runtime=nvidia for Jetson — see below for why)
+docker run --rm --gpus all -it --runtime=nvidia flashrt:thor
 ```
+
+### Why `--runtime=nvidia` on Jetson
+
+Unlike a discrete-GPU host (where `--gpus all` alone is enough — the
+libnvidia-container shim auto-discovers `/dev/nvidia*` and the
+matching driver libs), Jetson's iGPU stack is bound to host kernel
+drivers and is exposed to containers through a **CSV-driven
+mount mechanism** owned by `nvidia-container-runtime`:
+
+```
+/etc/nvidia-container-runtime/host-files-for-container.d/
+├── devices.csv     # /dev/nvgpu, /dev/nvhost-*, /dev/nvmap, …
+└── drivers.csv     # /usr/lib/aarch64-linux-gnu/tegra/libcuda.so.*, …
+```
+
+Passing `--runtime=nvidia` is what activates that runtime, which in
+turn parses the two CSV files at container start and bind-mounts
+every listed device node and driver library from the Tegra host
+into the container. Without the flag the standard runc starts the
+container without those mounts; the result is no `/dev/nvgpu`, no
+`libcuda.so`, and `torch.cuda.is_available()` returns `False` even
+though `nvidia-smi` works on the host.
+
+`--gpus all` is left in the example for parity with the x86 docs and
+because the libnvidia-container CLI hook ignores it gracefully on
+Jetson, but the load-bearing flag here is `--runtime=nvidia`.
 
 ### What's different vs the x86 image
 
