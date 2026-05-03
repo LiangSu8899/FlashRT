@@ -31,11 +31,11 @@ def main():
     wrist = np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8)
     obs = {"image": img, "wrist_image": wrist}
 
-    from flash_vla.frontends.torch.pi05_thor_fp4 import Pi05TorchFrontendThorFP4
+    from flash_rt.frontends.torch.pi05_thor_fp4 import Pi05TorchFrontendThorFP4
 
     print("Building Pi0.5 AWQ full-18 (use_awq=True, P8 in-place requant)...")
     pipe = Pi05TorchFrontendThorFP4(
-        "<your_pi05_torch_ckpt>",
+        os.environ.get("FLASH_RT_PI05_CKPT", "/workspace/pytorch_checkpoints/pi05_libero_converted"),
         num_views=2, autotune=3,
         use_fp4_encoder_ffn=True,
         fp4_layers=tuple(range(18)),

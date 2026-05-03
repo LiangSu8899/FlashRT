@@ -36,7 +36,7 @@ def _bootstrap_pipeline(rt):
 
 def _make_synthetic_ie(qwen3, seed):
     """Build a deterministic synthetic ``ie_fp16`` tensor of the right shape."""
-    from flash_vla.models.groot.pipeline_rtx import QWEN3_D
+    from flash_rt.models.groot.pipeline_rtx import QWEN3_D
     torch.manual_seed(seed)
     return torch.randn(qwen3.Se, QWEN3_D, device="cuda", dtype=torch.float16)
 
@@ -50,7 +50,7 @@ def test_qwen3_per_sample_n1_matches_legacy_impl():
     Guards the refactor that splits raw-amax collection from FP8 scale
     conversion: the single-sample legacy path must remain bit-identical.
     """
-    from flash_vla.frontends.torch.groot_rtx import (
+    from flash_rt.frontends.torch.groot_rtx import (
         GrootTorchFrontendRtx,
         _cal_scale,
         _calibrate_qwen3_impl,
@@ -80,11 +80,11 @@ def test_qwen3_per_sample_n1_matches_legacy_impl():
                     reason=f"GR00T-N1.6-3B ckpt missing at {CKPT_GROOT}")
 def test_qwen3_per_sample_shape_and_finiteness():
     """N>=2 must yield ``[N, 3*L]`` finite non-negative amax values."""
-    from flash_vla.frontends.torch.groot_rtx import (
+    from flash_rt.frontends.torch.groot_rtx import (
         GrootTorchFrontendRtx,
         _calibrate_qwen3_per_sample,
     )
-    from flash_vla.models.groot.pipeline_rtx import QWEN3_L
+    from flash_rt.models.groot.pipeline_rtx import QWEN3_L
 
     rt = GrootTorchFrontendRtx(CKPT_GROOT, num_views=2,
                                embodiment_tag="gr1")
@@ -103,7 +103,7 @@ def test_qwen3_per_sample_shape_and_finiteness():
 
 def test_qwen3_per_sample_empty_raises():
     """Empty input list raises ``ValueError`` without touching CUDA."""
-    from flash_vla.frontends.torch.groot_rtx import _calibrate_qwen3_per_sample
+    from flash_rt.frontends.torch.groot_rtx import _calibrate_qwen3_per_sample
 
     with pytest.raises(ValueError, match="non-empty"):
         _calibrate_qwen3_per_sample(None, None, None, None, [])
@@ -111,7 +111,7 @@ def test_qwen3_per_sample_empty_raises():
 
 def test_dit_per_sample_empty_raises():
     """Empty cal_tensors list raises ``ValueError`` without touching CUDA."""
-    from flash_vla.frontends.torch.groot_rtx import _calibrate_dit_per_sample
+    from flash_rt.frontends.torch.groot_rtx import _calibrate_dit_per_sample
 
     with pytest.raises(ValueError, match="non-empty"):
         _calibrate_dit_per_sample(None, None, None, None, [], [], [])
@@ -123,8 +123,8 @@ def test_dit_per_sample_empty_raises():
 def test_calibrate_multi_frame_end_to_end():
     """``calibrate([obs1, obs2, obs3])`` must populate scales + precision_spec
     and leave the model in a runnable state."""
-    from flash_vla.frontends.torch.groot_rtx import GrootTorchFrontendRtx
-    from flash_vla.models.groot.pipeline_rtx import DIT_L, QWEN3_L
+    from flash_rt.frontends.torch.groot_rtx import GrootTorchFrontendRtx
+    from flash_rt.models.groot.pipeline_rtx import DIT_L, QWEN3_L
 
     rt = GrootTorchFrontendRtx(CKPT_GROOT, num_views=2, embodiment_tag="gr1")
     rt.set_prompt("pick up the red block")
@@ -163,7 +163,7 @@ def test_calibrate_multi_frame_end_to_end():
 
 def test_dit_per_sample_length_mismatch_raises():
     """Mismatched per-sample list lengths raise ``ValueError``."""
-    from flash_vla.frontends.torch.groot_rtx import _calibrate_dit_per_sample
+    from flash_rt.frontends.torch.groot_rtx import _calibrate_dit_per_sample
 
     with pytest.raises(ValueError, match="length mismatch"):
         _calibrate_dit_per_sample(

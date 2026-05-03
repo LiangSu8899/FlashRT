@@ -10,13 +10,13 @@ each ``β ∈ {1.0, 1.5, 2.0, 2.5}``:
   * ``ref_noise_b{β}``          — FP32 reference per-step noise
                                    (num_steps + 1, action_horizon, action_dim)
 
-  * ``serial_actions_b{β}``     — FlashVLA serial CFG final actions (10, 7)
-  * ``serial_v_cond_b{β}``      — FlashVLA serial per-step v_cond traces
+  * ``serial_actions_b{β}``     — FlashRT serial CFG final actions (10, 7)
+  * ``serial_v_cond_b{β}``      — FlashRT serial per-step v_cond traces
                                    (num_steps, action_horizon, action_dim)
   * ``serial_v_uncond_b{β}``
   * ``serial_noise_b{β}``
 
-  * ``batched_actions_b{β}``    — FlashVLA batched CFG final actions
+  * ``batched_actions_b{β}``    — FlashRT batched CFG final actions
   * ``batched_v_cond_b{β}``
   * ``batched_v_uncond_b{β}``
   * ``batched_noise_b{β}``
@@ -30,7 +30,7 @@ Each subprocess uses a fixed seed; pipelines / refs each sample
 internally via CUDA BF16 ``.normal_()`` so subprocess isolation does
 not change the noise stream.
 
-Run from the FlashVLA repo root inside the pi0-stablehlo container::
+Run from the FlashRT repo root inside the pi0-stablehlo container::
 
     python tools/generate_cfg_oracle_fixtures.py
 """
@@ -53,7 +53,7 @@ BETAS = [1.0, 1.5, 2.0, 2.5]
 
 CHILD_REF = r"""
 import sys, numpy as np, torch
-from flash_vla.refs.pi05_cfg_reference import Pi05CFGReference
+from flash_rt.refs.pi05_cfg_reference import Pi05CFGReference
 beta, out_path, ckpt = float(sys.argv[1]), sys.argv[2], sys.argv[3]
 obs = {"observation/image": np.zeros((224,224,3), dtype=np.uint8),
        "observation/wrist_image": np.zeros((224,224,3), dtype=np.uint8),
@@ -69,7 +69,7 @@ np.savez(out_path,
 
 CHILD_FVLA = r"""
 import sys, ctypes, numpy as np, torch
-from flash_vla.frontends.torch.pi05_rtx import Pi05TorchFrontendRtx
+from flash_rt.frontends.torch.pi05_rtx import Pi05TorchFrontendRtx
 mode, beta, out_path, ckpt = sys.argv[1], float(sys.argv[2]), sys.argv[3], sys.argv[4]
 obs = {"image": np.zeros((224,224,3), dtype=np.uint8),
        "wrist_image": np.zeros((224,224,3), dtype=np.uint8),
@@ -160,9 +160,9 @@ def main() -> None:
             bundle[f"ref_noise_{beta_tag}"] = d["noise"]
             print(f"actions shape={d['actions'].shape}")
 
-            # FlashVLA serial
+            # FlashRT serial
             ser_npz = os.path.join(td, f"ser_{beta_tag}.npz")
-            print("  FlashVLA serial ... ", end=" ", flush=True)
+            print("  FlashRT serial ... ", end=" ", flush=True)
             _run_child(["serial", str(beta), ser_npz, CKPT], CHILD_FVLA)
             d = np.load(ser_npz)
             bundle[f"serial_actions_{beta_tag}"] = d["actions"]
@@ -171,9 +171,9 @@ def main() -> None:
             bundle[f"serial_noise_{beta_tag}"] = d["noise"]
             print(f"actions shape={d['actions'].shape}")
 
-            # FlashVLA batched
+            # FlashRT batched
             bat_npz = os.path.join(td, f"bat_{beta_tag}.npz")
-            print("  FlashVLA batched ...", end=" ", flush=True)
+            print("  FlashRT batched ...", end=" ", flush=True)
             _run_child(["batched", str(beta), bat_npz, CKPT], CHILD_FVLA)
             d = np.load(bat_npz)
             bundle[f"batched_actions_{beta_tag}"] = d["actions"]

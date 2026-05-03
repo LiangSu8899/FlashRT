@@ -2,7 +2,7 @@ r"""ACP prompt hook for advantage-conditioned policy training (JAX).
 
 Mirrors the PyTorch ``training.rl.acp_hook.ACPPromptHook`` 1-for-1
 on the prompt-mutation side. Both stacks consume the SAME shared
-primitive (:func:`flash_vla.core.rl.acp_tags.build_acp_tagged_task`)
+primitive (:func:`flash_rt.core.rl.acp_tags.build_acp_tagged_task`)
 so the resulting ``batch["task"]`` strings are byte-identical given
 the same ``(tasks, indicators, seed)`` triple.
 
@@ -22,7 +22,7 @@ from typing import Any
 
 import numpy as np
 
-from flash_vla.core.rl.acp_tags import build_acp_tagged_task
+from flash_rt.core.rl.acp_tags import build_acp_tagged_task
 
 
 def _extract_indicators(values: Any, batch_size: int) -> list[bool]:

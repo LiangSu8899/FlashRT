@@ -1,5 +1,5 @@
 // ============================================================================
-//  Standalone test for flash_vla::fp4::cutlass_fp4_sq_fp16.
+//  Standalone test for flash_rt::fp4::cutlass_fp4_sq_fp16.
 //
 //  Builds as its own executable (no pybind, no .so). Uses CUTLASS host
 //  reference (`cutlass::reference::host::Gemm3x` with block scaling) to
@@ -169,7 +169,7 @@ static int run_case(ShapeCase sc, int iters) {
   cudaStreamCreate(&stream);
 
   // ── Run kernel ──
-  int rc = flash_vla::fp4::cutlass_fp4_sq_fp16(
+  int rc = flash_rt::fp4::cutlass_fp4_sq_fp16(
       blkA.device_data(), blkSFA.device_data(),
       blkB.device_data(), blkSFB.device_data(),
       blkD.device_data(),
@@ -200,7 +200,7 @@ static int run_case(ShapeCase sc, int iters) {
   cudaEvent_t e0, e1;
   cudaEventCreate(&e0); cudaEventCreate(&e1);
   for (int i = 0; i < 5; ++i) {  // warmup
-    flash_vla::fp4::cutlass_fp4_sq_fp16(
+    flash_rt::fp4::cutlass_fp4_sq_fp16(
         blkA.device_data(), blkSFA.device_data(),
         blkB.device_data(), blkSFB.device_data(),
         blkD.device_data(), M, N, K, alpha, beta, stream);
@@ -208,7 +208,7 @@ static int run_case(ShapeCase sc, int iters) {
   cudaStreamSynchronize(stream);
   cudaEventRecord(e0, stream);
   for (int i = 0; i < iters; ++i) {
-    flash_vla::fp4::cutlass_fp4_sq_fp16(
+    flash_rt::fp4::cutlass_fp4_sq_fp16(
         blkA.device_data(), blkSFA.device_data(),
         blkB.device_data(), blkSFB.device_data(),
         blkD.device_data(), M, N, K, alpha, beta, stream);
@@ -228,7 +228,7 @@ static int run_case(ShapeCase sc, int iters) {
 }
 
 int main(int argc, char** argv) {
-  if (!flash_vla::fp4::has_nvfp4_sm110()) {
+  if (!flash_rt::fp4::has_nvfp4_sm110()) {
     fprintf(stderr, "FP4 kernel not compiled (missing CUTLASS SM100 support)\n");
     return 1;
   }

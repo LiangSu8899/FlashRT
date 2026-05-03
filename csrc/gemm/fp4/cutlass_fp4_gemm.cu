@@ -1,5 +1,5 @@
 // ============================================================================
-//  FlashVLA — NVFP4 GEMM impl. Based on CUTLASS 4.x example 72a
+//  FlashRT — NVFP4 GEMM impl. Based on CUTLASS 4.x example 72a
 //  (Blackwell NVFP4 × NVFP4 → bfloat16), modified for fp16 output and to
 //  expose a C-style entry point consumable from pybind/bindings.cpp.
 //
@@ -27,7 +27,7 @@
 #  define FV_FP4_HAVE_CUTLASS 0
 #endif
 
-namespace flash_vla {
+namespace flash_rt {
 namespace fp4 {
 
 bool has_nvfp4_sm110() {
@@ -193,4 +193,4 @@ int cutlass_fp4_sq_fp16(
 }
 
 } // namespace fp4
-} // namespace flash_vla
+} // namespace flash_rt

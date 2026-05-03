@@ -1,5 +1,5 @@
 // ============================================================================
-//  FlashVLA — fp16 → NVFP4 (e2m1 + UE4M3 block scale) dynamic quantization.
+//  FlashRT — fp16 → NVFP4 (e2m1 + UE4M3 block scale) dynamic quantization.
 //
 //  Per-row, per-16-element-block. Used at runtime to quantize activation
 //  tensors before FP4 GEMM. Weights go through the offline `Quant4` transform
@@ -22,7 +22,7 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 
-namespace flash_vla {
+namespace flash_rt {
 namespace fp4 {
 
 // Launch parameters automatic: one thread per 16-element block per row.
@@ -44,4 +44,4 @@ int dequantize_fp4_to_fp16(
     cudaStream_t stream);
 
 }  // namespace fp4
-}  // namespace flash_vla
+}  // namespace flash_rt

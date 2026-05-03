@@ -10,7 +10,7 @@
 //  where A: FP8 E4M3 RowMajor [M, K], B: FP8 E4M3 ColumnMajor [N, K],
 //  bias: BF16 [N] (per-col), D: BF16 RowMajor [M, N], alpha: FP32 scalar.
 //
-//  Additive only — upstream flash_vla/csrc/gemm/cutlass_sm100.cu is untouched.
+//  Additive only — upstream flash_rt/csrc/gemm/cutlass_sm100.cu is untouched.
 //  Self-contained kernel lives in flash_wm/csrc/, uses CUTLASS 3.x collective
 //  builder with LinCombPerColBias fusion.
 // ============================================================================

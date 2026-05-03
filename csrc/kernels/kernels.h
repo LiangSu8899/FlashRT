@@ -1,5 +1,5 @@
 // ================================================================
-// FlashVLA — Unified kernel header
+// FlashRT — Unified kernel header
 // Include this single file to access all kernel declarations.
 // ================================================================
 #pragma once

@@ -16,10 +16,10 @@ def main():
     img = np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8)
     wrist = np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8)
     obs = {"image": img, "wrist_image": wrist}
-    CKPT = "<your_pi05_torch_ckpt>"
+    CKPT = os.environ.get("FLASH_RT_PI05_CKPT", "/workspace/pytorch_checkpoints/pi05_libero_converted")
 
-    from flash_vla.frontends.torch.pi05_thor import Pi05TorchFrontendThor
-    from flash_vla.frontends.torch.pi05_thor_fp4 import Pi05TorchFrontendThorFP4
+    from flash_rt.frontends.torch.pi05_thor import Pi05TorchFrontendThor
+    from flash_rt.frontends.torch.pi05_thor_fp4 import Pi05TorchFrontendThorFP4
 
     for trial in range(3):
         print(f"\n── Trial {trial+1}/3 ──")

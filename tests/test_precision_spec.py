@@ -1,4 +1,4 @@
-"""Unit tests for flash_vla.core.precision_spec.
+"""Unit tests for flash_rt.core.precision_spec.
 
 CPU-only, no CUDA / torch. Covers:
   * validate() accepts the v1 canonical combo
@@ -14,7 +14,7 @@ import tempfile
 import numpy as np
 import pytest
 
-from flash_vla.core.precision_spec import ModelPrecisionSpec, PrecisionSpec
+from flash_rt.core.precision_spec import ModelPrecisionSpec, PrecisionSpec
 
 
 def test_default_is_canonical_supported():

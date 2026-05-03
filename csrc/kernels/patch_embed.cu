@@ -1,5 +1,5 @@
 // ================================================================
-// FlashVLA — Patch embedding kernels
+// FlashRT — Patch embedding kernels
 //
 // 1. im2col: (nv, 224, 224, 3) → (nv*256, 588) strided copy
 // 2. bias_pos: output[i,j] += bias[j] + pos_emb[i % S_per_view, j]

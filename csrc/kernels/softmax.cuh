@@ -1,5 +1,5 @@
 // ================================================================
-// FlashVLA — Softmax kernel (FP16)
+// FlashRT — Softmax kernel (FP16)
 // Port of pi05 softmax_bf16_kernel. In-place row-wise softmax.
 // ================================================================
 #pragma once

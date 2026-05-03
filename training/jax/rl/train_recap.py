@@ -23,14 +23,14 @@ The driver implements the recipe Phase 3d calls for:
   ``:301-306``.
 
 Re-implementing this entire driver in ``training/jax/rl/`` would
-just duplicate openpi-compiler. Instead, FlashVLA contributes:
+just duplicate openpi-compiler. Instead, FlashRT contributes:
 
 * The FP8 LoRA patch (`training.jax.fp8.lora_patch`) — installed
   via ``training.jax.scripts.run_baseline_with_fp8_patch`` so the
   upstream driver routes its base GEMMs through cuBLASLt FP8.
-* The cross-language primitives (``flash_vla.core.rl.acp_tags``,
-  ``flash_vla.core.rl.advantage``,
-  ``flash_vla.core.rl.reward``) — imported by both PyTorch and the
+* The cross-language primitives (``flash_rt.core.rl.acp_tags``,
+  ``flash_rt.core.rl.advantage``,
+  ``flash_rt.core.rl.reward``) — imported by both PyTorch and the
   upstream JAX driver.
 * Forward-parity / annotation helpers for users who want to
   annotate a brand-new dataset (`training.jax.rl.train_value`,

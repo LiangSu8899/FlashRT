@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""FlashVLA Pi0-FAST precision test (autoregressive variant).
+"""FlashRT Pi0-FAST precision test (autoregressive variant).
 
 Counterpart to test_all_models_precision.py, specialized for the
 autoregressive Pi0-FAST architecture.
@@ -46,8 +46,8 @@ FLASH_VLA_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Random uint8 images + zero state. Pi0-FAST is multi-task, so the model can
 # accept any input shape; the goal is FVK ≡ JAX equivalence, not action quality.
 import os as _os
-_CKPT_BASE = _os.environ.get("PI0FAST_CKPT_BASE", "<your_jax_ckpts>")
-_PT_BASE   = _os.environ.get("PI0FAST_PT_BASE",   "<your_torch_ckpts>")
+_CKPT_BASE = _os.environ.get("PI0FAST_CKPT_BASE", "/workspace/checkpoints")
+_PT_BASE   = _os.environ.get("PI0FAST_PT_BASE", "/workspace/pytorch_checkpoints")
 TORCH_CHECKPOINT = f"{_PT_BASE}/pi0_fast_base_converted"
 JAX_CHECKPOINT = f"{_CKPT_BASE}/pi0_fast_base"
 
@@ -63,9 +63,9 @@ os.environ["TRANSFORMERS_OFFLINE"] = "1"
 sys.path.insert(0, "ROOTDIR")
 import logging; logging.basicConfig(level=logging.WARNING)
 
-import flash_vla.flash_vla_kernels as fvk
-from flash_vla.frontends.PIPELINE_MODULE import PIPELINE_CLASS
-from flash_vla.models.pi0fast.pipeline import (
+import flash_rt.flash_rt_kernels as fvk
+from flash_rt.frontends.PIPELINE_MODULE import PIPELINE_CLASS
+from flash_rt.models.pi0fast.pipeline import (
     prefill_forward_pi0fast, decode_step_pi0fast_bf16,
 )
 
@@ -378,7 +378,7 @@ def main():
     targets = [args.backend] if args.backend else list(BACKENDS.keys())
 
     print("=" * 72)
-    print("FlashVLA — Pi0-FAST Precision Test (autoregressive)")
+    print("FlashRT — Pi0-FAST Precision Test (autoregressive)")
     print("=" * 72)
     print("Each backend runs prefill + decode step 0 with identical dummy input.")
     print("Per-segment cosine vs JAX bf16 reference (gemma_fast.Module.apply).")

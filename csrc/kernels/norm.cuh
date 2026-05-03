@@ -1,5 +1,5 @@
 // ================================================================
-// FlashVLA — Normalization kernel declarations
+// FlashRT — Normalization kernel declarations
 // RMSNorm, LayerNorm, AdaRMSNorm
 // Dual dtype: BF16 (__nv_bfloat16) + FP16 (__half)
 // ================================================================

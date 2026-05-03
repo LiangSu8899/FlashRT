@@ -2,7 +2,7 @@
 
 Pulls the policy preprocessor + postprocessor safetensors off Hugging
 Face for a published lerobot checkpoint, runs them through
-``flash_vla.core.utils.norm_stats.load_norm_stats``, and reports
+``flash_rt.core.utils.norm_stats.load_norm_stats``, and reports
 whether the resulting dict has finite, sane action / state quantiles.
 
 This is **not** a CI test — it talks to the public network and
@@ -112,7 +112,7 @@ def _check_stats(stats: dict) -> tuple[bool, list[str]]:
 
 
 def validate_repo(repo: str) -> bool:
-    from flash_vla.core.utils.norm_stats import load_norm_stats, lerobot_candidates
+    from flash_rt.core.utils.norm_stats import load_norm_stats, lerobot_candidates
 
     print(f"\n=== {repo} ===")
     with tempfile.TemporaryDirectory(prefix="lerobot_norm_") as td:

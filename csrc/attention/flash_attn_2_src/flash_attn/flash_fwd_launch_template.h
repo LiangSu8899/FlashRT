@@ -14,7 +14,7 @@
 #define C10_CUDA_CHECK(expr) do {                                          \
     auto _fa2_err = (expr);                                                \
     if (_fa2_err != cudaSuccess) {                                         \
-        fprintf(stderr, "FlashVLA FA2 CUDA error %s:%d: %s\n",             \
+        fprintf(stderr, "FlashRT FA2 CUDA error %s:%d: %s\n",             \
                 __FILE__, __LINE__, cudaGetErrorString(_fa2_err));         \
         std::abort();                                                      \
     }                                                                      \
@@ -24,7 +24,7 @@
 #define C10_CUDA_KERNEL_LAUNCH_CHECK() do {                                \
     auto _fa2_err = cudaGetLastError();                                    \
     if (_fa2_err != cudaSuccess) {                                         \
-        fprintf(stderr, "FlashVLA FA2 kernel launch error %s:%d: %s\n",    \
+        fprintf(stderr, "FlashRT FA2 kernel launch error %s:%d: %s\n",    \
                 __FILE__, __LINE__, cudaGetErrorString(_fa2_err));         \
         std::abort();                                                      \
     }                                                                      \

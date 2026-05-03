@@ -1,4 +1,4 @@
-"""Run the openpi JAX baseline with FlashVLA's FP8 LoRA patch enabled.
+"""Run the openpi JAX baseline with FlashRT's FP8 LoRA patch enabled.
 
 This is a thin wrapper around an existing
 ``RL/scripts/train_jax_lora_recap.py``-style baseline. It:

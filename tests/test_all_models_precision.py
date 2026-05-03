@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""FlashVLA — Full precision test: all models, all backends.
+"""FlashRT — Full precision test: all models, all backends.
 
-Tests current flash_vla_kernels.so against saved reference outputs.
+Tests current flash_rt_kernels.so against saved reference outputs.
 Each model runs in separate subprocess. Uses monkey-patch noise injection
 for deterministic comparison (same pattern as _vf_*.py production tests).
 
 Compares:
-  Pi0.5: Production vs FlashVLA Torch vs FlashVLA JAX (saved outputs in /tmp/v_*.npy)
-  Pi0:   FlashVLA Torch vs PI0Pytorch reference (/tmp/pi0_ref_2view.npz)
-  Pi0 JAX: FlashVLA JAX vs FlashVLA Torch (raw decoder output, same noise)
-  GROOT: FlashVLA Torch vs PyTorch reference (groot_ref/groot_ref_e2e_full.pt)
+  Pi0.5: Production vs FlashRT Torch vs FlashRT JAX (saved outputs in /tmp/v_*.npy)
+  Pi0:   FlashRT Torch vs PI0Pytorch reference (/tmp/pi0_ref_2view.npz)
+  Pi0 JAX: FlashRT JAX vs FlashRT Torch (raw decoder output, same noise)
+  GROOT: FlashRT Torch vs PyTorch reference (groot_ref/groot_ref_e2e_full.pt)
 
 Usage:
     python3 tests/test_all_models_precision.py
@@ -21,18 +21,38 @@ import numpy as np
 
 FLASH_VLA_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+# Centralised env-var resolution for checkpoint paths. Per-model templates
+# below embed placeholder strings like "<your_pi05_torch_ckpt>" which
+# ``run_model`` substitutes from ``tests/_helpers/paths.resolve(...)``
+# before launching the subprocess. Public users export FLASH_RT_PI05_CKPT
+# etc. (see tests/_helpers/paths.py for the full key list and defaults).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _helpers.paths import resolve  # noqa: E402
+
+# Placeholder string -> resolver key. Only keys whose placeholder actually
+# appears in the chosen template get resolved, so a missing GROOT fixture
+# won't break a Pi0-only invocation.
+_PLACEHOLDER_TO_KEY = {
+    "<your_pi05_torch_ckpt>": "PI05_CKPT",
+    "<your_pi0_torch_ckpt>":  "PI0_CKPT",
+    "<your_pi05_jax_ckpt>":   "PI05_JAX_CKPT",
+    "<your_jax_ckpts>":       "JAX_CKPTS",
+    "<your_groot_ckpt>":      "GROOT_CKPT",
+    "<your_groot_ref>":       "GROOT_REF",
+}
+
 def cosine(a, b):
     a, b = a.flatten().astype(np.float64), b.flatten().astype(np.float64)
     return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-12))
 
 # ══════════════════════════════════════════════════════════════
 # Pi0.5: monkey-patch noise, full infer path
-# Re-run FlashVLA Torch with matched_noise, compare vs saved prod/jax
+# Re-run FlashRT Torch with matched_noise, compare vs saved prod/jax
 # ══════════════════════════════════════════════════════════════
 PI05_SCRIPT = '''
 import sys, os, time, json, torch, numpy as np
 sys.path.insert(0, "ROOTDIR")
-from flash_vla.frontends.torch.pi05_thor import Pi05TorchFrontendThor as ThorPipelineTorch
+from flash_rt.frontends.torch.pi05_thor import Pi05TorchFrontendThor as ThorPipelineTorch
 
 np.random.seed(42)
 img = np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8)
@@ -94,14 +114,14 @@ print(json.dumps({
 PI05_FP4_SCRIPT = '''
 import sys, os, time, json, torch, numpy as np
 sys.path.insert(0, "ROOTDIR")
-import flash_vla
+import flash_rt
 
 np.random.seed(42)
 img = np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8)
 wrist = np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8)
 obs = {"image": img, "wrist_image": wrist}
 
-m = flash_vla.load_model("<your_pi05_torch_ckpt>",
+m = flash_rt.load_model("<your_pi05_torch_ckpt>",
                          framework="torch", config="pi05",
                          num_views=2, autotune=3, use_fp4=True)
 pipe = m._pipe
@@ -158,7 +178,7 @@ PI0_SCRIPT = '''
 import sys, os, time, json, pathlib, torch, numpy as np
 sys.path.insert(0, "ROOTDIR")
 
-for f in (pathlib.Path.home()/".flash_vla"/"calibration").glob("70bdf6f4*"):
+for f in (pathlib.Path.home()/".flash_rt"/"calibration").glob("70bdf6f4*"):
     f.unlink()
 
 ref = np.load("/tmp/pi0_ref_2view.npz", allow_pickle=True)
@@ -170,7 +190,7 @@ toks = ref["arg5_tokenized_prompt"][0]
 tok_mask = ref["arg6_tokenized_prompt_mask"][0]
 prompt_len = int(tok_mask.sum())
 
-from flash_vla.frontends.torch.pi0_thor import Pi0TorchFrontendThor as ThorPipelineTorchPi0
+from flash_rt.frontends.torch.pi0_thor import Pi0TorchFrontendThor as ThorPipelineTorchPi0
 pipe = ThorPipelineTorchPi0("<your_pi0_torch_ckpt>", num_views=2, autotune=3)
 pipe.set_prompt(toks[:prompt_len].tolist())
 
@@ -232,7 +252,7 @@ img_np = ref["img_np"]
 prompt = ref["prompt"]
 T_ref = ref_actions.shape[0]
 
-from flash_vla.frontends.torch.groot_thor import GrootTorchFrontendThor as ThorPipelineTorchGroot
+from flash_rt.frontends.torch.groot_thor import GrootTorchFrontendThor as ThorPipelineTorchGroot
 pipe = ThorPipelineTorchGroot("<your_groot_ckpt>", num_views=2, autotune=3)
 pipe.set_prompt(prompt)
 
@@ -275,7 +295,7 @@ toks = ref["arg5_tokenized_prompt"][0]
 tok_mask = ref["arg6_tokenized_prompt_mask"][0]
 prompt_len = int(tok_mask.sum())
 
-from flash_vla.frontends.jax.pi0_thor import Pi0JaxFrontendThor as ThorPipelineJaxPi0
+from flash_rt.frontends.jax.pi0_thor import Pi0JaxFrontendThor as ThorPipelineJaxPi0
 pipe = ThorPipelineJaxPi0("<your_jax_ckpts>/pi0_base", num_views=2, autotune=3)
 pipe.set_prompt(toks[:prompt_len].tolist())
 
@@ -332,7 +352,7 @@ print(json.dumps(results))
 PI05_JAX_SCRIPT = '''
 import sys, os, time, json, numpy as np
 sys.path.insert(0, "ROOTDIR")
-from flash_vla.frontends.jax.pi05_thor import Pi05JaxFrontendThor as ThorPipelineJaxPi05
+from flash_rt.frontends.jax.pi05_thor import Pi05JaxFrontendThor as ThorPipelineJaxPi05
 
 pipe = ThorPipelineJaxPi05("<your_pi05_jax_ckpt>", num_views=2, autotune=3)
 pipe.set_prompt("pick up the red block and place it in the tray")
@@ -395,6 +415,13 @@ MODELS = {
 def run_model(key):
     name, script = MODELS[key]
     script = script.replace('ROOTDIR', FLASH_VLA_ROOT)
+    # Resolve only the placeholders that actually appear in this template,
+    # so a missing key for an unselected model doesn't kill the run.
+    for placeholder, env_key in _PLACEHOLDER_TO_KEY.items():
+        if placeholder in script:
+            # JAX_CKPTS is a base prefix; downstream code joins with /pi0_base etc.
+            must_exist = env_key not in {"JAX_CKPTS", "TORCH_CKPTS"}
+            script = script.replace(placeholder, resolve(env_key, must_exist=must_exist))
     r = subprocess.run(['python3', '-c', script], capture_output=True, text=True, timeout=600)
     if r.returncode != 0:
         return {'error': '\n'.join(r.stderr.strip().split('\n')[-5:])}
@@ -410,7 +437,7 @@ def main():
     targets = [args.model] if args.model else list(MODELS.keys())
 
     print("=" * 60)
-    print("FlashVLA — Full Precision & Latency Test")
+    print("FlashRT — Full Precision & Latency Test")
     print("=" * 60)
 
     # FP4 is lossy vs FP8 prod — loosen cos thresholds accordingly

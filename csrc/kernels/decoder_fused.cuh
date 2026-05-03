@@ -1,5 +1,5 @@
 // ================================================================
-// FlashVLA — Decoder fused kernel declarations (FP16)
+// FlashRT — Decoder fused kernel declarations (FP16)
 // Port of pi05 ae_forward_static fused kernels.
 // ================================================================
 #pragma once

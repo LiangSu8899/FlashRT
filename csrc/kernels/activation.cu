@@ -1,5 +1,5 @@
 // ================================================================
-// FlashVLA — Activation kernels (dtype-generic)
+// FlashRT — Activation kernels (dtype-generic)
 // GeLU, SiLU, Gate*Act*Mul (BF16/FP16 and fused FP8 variants)
 // Supports: __half (FP16), __nv_bfloat16 (BF16) via templates
 // ================================================================

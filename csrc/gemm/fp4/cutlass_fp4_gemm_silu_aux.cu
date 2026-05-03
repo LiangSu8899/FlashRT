@@ -1,5 +1,5 @@
 // ============================================================================
-//  FlashVLA P1 — NVFP4 GEMM with fused silu(aux_gate) * acc → fp4 + SFA out.
+//  FlashRT P1 — NVFP4 GEMM with fused silu(aux_gate) * acc → fp4 + SFA out.
 //
 //  STATUS (2026-04-15, Day 1 of P1): COMPILES, RUNTIME FAILS.
 //    Custom FusionOp `LinCombSiLuAuxMulBlockScaleFactor` + FusionCallbacks
@@ -264,7 +264,7 @@ struct FusionCallbacks<
 // GEMM type definition
 //
 /////////////////////////////////////////////////////////////////////////////////////////////////
-namespace flash_vla {
+namespace flash_rt {
 namespace fp4 {
 namespace silu_aux {
 
@@ -414,4 +414,4 @@ int cutlass_fp4_gemm_silu_aux_fp4(
 }
 
 }  // namespace fp4
-}  // namespace flash_vla
+}  // namespace flash_rt

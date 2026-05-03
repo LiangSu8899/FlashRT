@@ -1,5 +1,5 @@
 // ================================================================
-// FlashVLA — Quantization kernel declarations
+// FlashRT — Quantization kernel declarations
 // FP8 dynamic/static quantize, NVFP4 block-scaled (SM120+)
 // FP8 functions support: __half (FP16), __nv_bfloat16 (BF16) input
 // ================================================================

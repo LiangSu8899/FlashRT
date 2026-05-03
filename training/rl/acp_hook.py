@@ -12,12 +12,12 @@ For each sample in a training batch:
 Default ``dropout = 0.30`` matches the openpi-compiler reference and
 the π\*0.6 paper recommendation. The hook reuses the same
 ``build_acp_tagged_task`` helper as the inference path
-(``flash_vla/core/rl/acp_tags.py``) so the prompt format is
+(``flash_rt/core/rl/acp_tags.py``) so the prompt format is
 byte-identical between train and serve.
 
 Source: ported from ``openpi-compiler/RL/recap/acp_hook.py``
 (2026-04-25, verbatim semantics; only the import path changes from
-``recap.acp_tags`` to ``flash_vla.core.rl.acp_tags``).
+``recap.acp_tags`` to ``flash_rt.core.rl.acp_tags``).
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ from typing import Any
 
 import torch
 
-from flash_vla.core.rl.acp_tags import build_acp_tagged_task
+from flash_rt.core.rl.acp_tags import build_acp_tagged_task
 
 
 def _extract_indicators(values: Any, batch_size: int) -> list[bool]:

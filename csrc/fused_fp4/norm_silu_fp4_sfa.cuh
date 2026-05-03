@@ -1,5 +1,5 @@
 // ============================================================================
-//  FlashVLA — F2/F3/F4: fused pre-GEMM kernels that produce NVFP4 + SFA in one
+//  FlashRT — F2/F3/F4: fused pre-GEMM kernels that produce NVFP4 + SFA in one
 //  launch, matching FP8 path's single-kernel pre-GEMM pattern.
 //
 //  F2: rms_norm_noweight + fp4_quant + SFA            (layer-entry / no residual)
@@ -13,7 +13,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
-namespace flash_vla {
+namespace flash_rt {
 namespace fused_fp4 {
 
 // F2: rms_norm → fp4 packed + SFA tile-interleaved.
@@ -64,4 +64,4 @@ void gate_silu_mul_mul_fp4_sfa_v2_fp16(
     int seq_len, int half_dim, cudaStream_t stream);
 
 }  // namespace fused_fp4
-}  // namespace flash_vla
+}  // namespace flash_rt

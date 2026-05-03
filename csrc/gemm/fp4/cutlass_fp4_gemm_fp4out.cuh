@@ -1,5 +1,5 @@
 // ============================================================================
-//  FlashVLA — NVFP4 GEMM with FP4 (e2m1) packed output + SFA tile-interleaved.
+//  FlashRT — NVFP4 GEMM with FP4 (e2m1) packed output + SFA tile-interleaved.
 //  Used by the P1 split-GU FFN path: gate_proj and up_proj both produce FP4
 //  buffers that the next-step silu_mul kernel consumes directly.
 //
@@ -13,7 +13,7 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
-namespace flash_vla {
+namespace flash_rt {
 namespace fp4 {
 
 // FP4-out NVFP4 GEMM:  D = quant_block(X @ W^T)  (alpha=1, beta=0)
@@ -32,4 +32,4 @@ int cutlass_fp4_gemm_fp4out(
     cudaStream_t stream);
 
 }  // namespace fp4
-}  // namespace flash_vla
+}  // namespace flash_rt

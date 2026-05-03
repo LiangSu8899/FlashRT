@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FlashVLA Thor — LIBERO benchmark.
+FlashRT Thor — LIBERO benchmark.
 
 Usage:
     # Quick test (3 tasks x 3 episodes):
@@ -155,8 +155,8 @@ def eval_single_task(args, task_id):
     logger.info(f"Task {task_id}: {task_description}")
 
     # Load model via unified API
-    import flash_vla
-    model = flash_vla.load_model(
+    import flash_rt
+    model = flash_rt.load_model(
         checkpoint=args.checkpoint,
         framework=args.framework,
         num_views=2,
@@ -193,7 +193,7 @@ def eval_single_task(args, task_id):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="FlashVLA LIBERO benchmark")
+    parser = argparse.ArgumentParser(description="FlashRT LIBERO benchmark")
     parser.add_argument("--checkpoint", required=True,
                         help="Checkpoint dir (safetensors for torch, Orbax for jax)")
     parser.add_argument("--task_suite", default="libero_spatial",
@@ -221,7 +221,7 @@ def main():
         args.output = f"libero_{args.task_suite}_{args.framework}_results.json"
 
     print("=" * 60)
-    print(f"FlashVLA LIBERO Benchmark")
+    print(f"FlashRT LIBERO Benchmark")
     print(f"  Suite:      {args.task_suite}")
     print(f"  Framework:  {args.framework}")
     print(f"  Tasks:      0..{task_end-1}")

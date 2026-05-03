@@ -1,5 +1,5 @@
 // ============================================================================
-//  FlashVLA — Linear scale layout → CUTLASS Sm1xxBlockScaledConfig SFA/SFB.
+//  FlashRT — Linear scale layout → CUTLASS Sm1xxBlockScaledConfig SFA/SFB.
 //
 //  Our dynamic quantize kernel produces scales in linear [N, D/16] row-major
 //  layout. CUTLASS SM100 block-scaled GEMM wants scales in a tile-interleaved
@@ -14,7 +14,7 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 
-namespace flash_vla {
+namespace flash_rt {
 namespace fp4 {
 
 // Reorder linear [rows, D/16] block-scales (fp8 e4m3) into CUTLASS SFA layout
@@ -34,4 +34,4 @@ int reshape_linear_scales_to_sfa(
 int64_t sfa_size_bytes(int rows, int D, bool is_sfb);
 
 }  // namespace fp4
-}  // namespace flash_vla
+}  // namespace flash_rt

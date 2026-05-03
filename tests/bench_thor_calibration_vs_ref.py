@@ -11,7 +11,7 @@ prompt, fixed noise, and ``pytorch_raw_output`` (1, 10, 32) — the
 authoritative ground truth.
 
 Calibration observations: stratified LIBERO-10 samples via
-``flash_vla.datasets.libero``. LIBERO has only two camera streams;
+``flash_rt.datasets.libero``. LIBERO has only two camera streams;
 for a 3-view frontend we duplicate the wrist image into the third
 channel (activation statistics remain realistic; the goal is
 distribution coverage, not exact geometry).
@@ -56,9 +56,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 DEFAULT_LIBERO = os.environ.get("LIBERO_ROOT", "/workspace/libero_10_image")
-DEFAULT_CKPT   = os.environ.get(
-    "PI05_CKPT",
-    "<your_pi05_torch_ckpt>")
+DEFAULT_CKPT   = os.environ.get("PI05_CKPT", "/workspace/pytorch_checkpoints/pi05_libero_converted")
 DEFAULT_REF    = os.environ.get("PI05_FP32_REF", "/tmp/pytorch_reference.npz")
 
 
@@ -83,7 +81,7 @@ def _load_ref(path: str):
 
 
 def _build_pipe(ckpt: str, prompt_toks: np.ndarray):
-    from flash_vla.frontends.torch.pi05_thor import Pi05TorchFrontendThor
+    from flash_rt.frontends.torch.pi05_thor import Pi05TorchFrontendThor
     pipe = Pi05TorchFrontendThor(ckpt, num_views=3, autotune=0)
     pipe.set_prompt(prompt_toks.tolist())
     return pipe
@@ -109,7 +107,7 @@ def _promote_obs_3view(obs: dict) -> dict:
 
 
 def _load_obs_lib(libero_root: str, n: int) -> list:
-    from flash_vla.datasets.libero import load_calibration_obs
+    from flash_rt.datasets.libero import load_calibration_obs
     base = load_calibration_obs(libero_root, n=n, verbose=False)
     return [_promote_obs_3view(o) for o in base]
 
@@ -138,7 +136,7 @@ def _replay_with_ref_noise(pipe, noise_fp16: np.ndarray, obs: dict) -> np.ndarra
 
 
 def _clear_cache() -> None:
-    cdir = pathlib.Path.home() / ".flash_vla" / "calibration"
+    cdir = pathlib.Path.home() / ".flash_rt" / "calibration"
     if cdir.exists():
         for f in cdir.glob("*.json"):
             f.unlink()

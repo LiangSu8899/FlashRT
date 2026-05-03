@@ -1,6 +1,6 @@
-# FlashVLA — Stable Public API
+# FlashRT — Stable Public API
 
-This document enumerates every symbol that is part of FlashVLA's public
+This document enumerates every symbol that is part of FlashRT's public
 stability contract. Symbols listed here will not be removed or have their
 signatures changed without a major version bump.
 
@@ -9,17 +9,17 @@ internals) may change between minor releases.
 
 ---
 
-## Top-level (`flash_vla`)
+## Top-level (`flash_rt`)
 
 ```python
-import flash_vla
+import flash_rt
 
-flash_vla.__version__   # str, e.g. "2.2.0"
-flash_vla.load_model    # → VLAModel
-flash_vla.VLAModel      # inference wrapper
+flash_rt.__version__   # str, e.g. "2.2.0"
+flash_rt.load_model    # → VLAModel
+flash_rt.VLAModel      # inference wrapper
 ```
 
-### `flash_vla.load_model(...)`
+### `flash_rt.load_model(...)`
 
 ```python
 def load_model(
@@ -45,7 +45,7 @@ def load_model(
 Returns a `VLAModel` wrapping the appropriate frontend for the detected
 (or explicitly specified) GPU architecture.
 
-### `flash_vla.VLAModel`
+### `flash_rt.VLAModel`
 
 ```python
 class VLAModel:
@@ -70,10 +70,10 @@ class VLAModel:
 
 ---
 
-## Hardware dispatch (`flash_vla.hardware`)
+## Hardware dispatch (`flash_rt.hardware`)
 
 ```python
-from flash_vla.hardware import detect_arch, resolve_pipeline_class
+from flash_rt.hardware import detect_arch, resolve_pipeline_class
 ```
 
 ### `detect_arch() -> str`
@@ -89,7 +89,7 @@ Lazily imports and returns the concrete frontend class for the given
 ### `_PIPELINE_MAP`
 
 ```python
-flash_vla.hardware._PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]]
+flash_rt.hardware._PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]]
 ```
 
 The dispatch table mapping `(config, framework, arch)` to
@@ -99,10 +99,10 @@ at import time to register new models — see
 
 ---
 
-## AttentionBackend protocol (`flash_vla.hardware.backend`)
+## AttentionBackend protocol (`flash_rt.hardware.backend`)
 
 ```python
-from flash_vla.hardware.backend import (
+from flash_rt.hardware.backend import (
     AttentionBackend,    # Protocol class
     AttentionBackendBase,  # Optional base with accessor defaults
     AttentionSpec,       # Full model attention specification
@@ -160,8 +160,8 @@ between minor releases. Plugins that subclass or call into these
 should pin a minor version.
 
 ```python
-from flash_vla.hardware.rtx.attn_backend       import RtxFlashAttnBackend
-from flash_vla.hardware.rtx.attn_backend_groot import RtxFlashAttnBackendGroot
+from flash_rt.hardware.rtx.attn_backend       import RtxFlashAttnBackend
+from flash_rt.hardware.rtx.attn_backend_groot import RtxFlashAttnBackendGroot
 ```
 
 Both classes are framework-neutral — used by torch and jax frontends
@@ -171,12 +171,12 @@ aliases and will be removed in the next major version.
 
 ---
 
-## Core utilities (`flash_vla.core`)
+## Core utilities (`flash_rt.core`)
 
 ```python
-from flash_vla.core.cuda_buffer import CudaBuffer
-from flash_vla.core.cuda_graph import CUDAGraph
-from flash_vla.core.quant.calibrator import load_calibration, save_calibration
+from flash_rt.core.cuda_buffer import CudaBuffer
+from flash_rt.core.cuda_graph import CUDAGraph
+from flash_rt.core.quant.calibrator import load_calibration, save_calibration
 ```
 
 These are used by both pipelines and frontends. Their public API is
@@ -186,34 +186,34 @@ stable; internal helper functions are not.
 
 ## Native extension modules
 
-FlashVLA ships two pybind11 Python extension modules:
+FlashRT ships two pybind11 Python extension modules:
 
 ```python
-from flash_vla import flash_vla_kernels   # always present
-from flash_vla import flash_vla_fa2       # RTX (SM80/86/89/120) only
+from flash_rt import flash_rt_kernels   # always present
+from flash_rt import flash_rt_fa2       # RTX (SM80/86/89/120) only
 ```
 
-### `flash_vla.flash_vla_kernels`
+### `flash_rt.flash_rt_kernels`
 
 The main kernel module — hand-written CUDA code plus cuBLASLt/
 CUTLASS wrappers for memory-bound ops (norm, activation, fusion,
 FP8 quant, residual, gate-geglu, true-silu, etc.) and Thor-specific attention
 (`fvk.attention_qkv_fp16`). Binary name pattern:
-`flash_vla_kernels.cpython-<abi>.so`, ~3 MB.
+`flash_rt_kernels.cpython-<abi>.so`, ~3 MB.
 
 All `fvk.<symbol>(...)` calls seen in pipeline code live here.
 Signatures are internal — plug-ins should go through the
 `AttentionBackend` protocol, not call `fvk.*` directly.
 
-### `flash_vla.flash_vla_fa2`
+### `flash_rt.flash_rt_fa2`
 
 Vendored Flash-Attention 2 v2.7.4.post1 (forward only, fp16 + bf16,
 SM80-family SASS). Binary name pattern:
-`flash_vla_fa2.cpython-<abi>.so`, ~135 MB. Only built when
+`flash_rt_fa2.cpython-<abi>.so`, ~135 MB. Only built when
 `GPU_ARCH ∈ {80, 86, 89, 120}`. Exposes:
 
 ```python
-flash_vla_fa2.fwd_fp16(
+flash_rt_fa2.fwd_fp16(
     Q, K, V, O, softmax_lse,
     softmax_lse_accum=0, o_accum=0,   # splitkv scratch ptrs; 0 disables splitkv
     *,
@@ -224,7 +224,7 @@ flash_vla_fa2.fwd_fp16(
     num_sms=0,                         # required for splitkv heuristic
     stream=0,
 )
-flash_vla_fa2.fwd_bf16(...)            # same signature, bfloat16 dtype
+flash_rt_fa2.fwd_bf16(...)            # same signature, bfloat16 dtype
 ```
 
 All pointer args are int device pointers (`tensor.data_ptr()`).
@@ -238,9 +238,9 @@ the hardware family (RTX), not the frontend framework — the **same**
 backend instance serves both torch and jax frontends.
 
 Thor (SM110) builds do **not** produce this module — attention on
-Thor uses `flash_vla_kernels.attention_qkv_fp16` (cuBLAS-decomposed)
+Thor uses `flash_rt_kernels.attention_qkv_fp16` (cuBLAS-decomposed)
 because FA2's Ampere tile shapes aren't tuned for Thor's unified
-LPDDR memory model. Code importing `flash_vla_fa2` must therefore
+LPDDR memory model. Code importing `flash_rt_fa2` must therefore
 guard for `ImportError` on Thor deployments, or stay inside the
 `AttentionBackend` protocol which handles the dispatch transparently.
 
@@ -249,7 +249,7 @@ guard for `ImportError` on Thor deployments, or stay inside the
 ## Directory structure (post-refactor)
 
 ```
-flash_vla/
+flash_rt/
 ├── __init__.py              # load_model, VLAModel
 ├── api.py                   # load_model implementation
 ├── core/                    # shared utilities (CudaBuffer, CUDAGraph, calibrator)
@@ -326,16 +326,16 @@ Thor frontends' per-layer weight-loading loops are expressed as
 The public surface is three things:
 
 ```python
-from flash_vla.executors.weight_loader import (
+from flash_rt.executors.weight_loader import (
     Item, LayerBlock, ModelWeightSpec, WeightLoader,
 )
-from flash_vla.executors.torch_weights import (  # torch side
+from flash_rt.executors.torch_weights import (  # torch side
     SafetensorsSource, DictSource,
     Cat, FusedQKV, FusedGateUp,
     ToFp16, ToFp32, T, tT, InterleaveQK, Quant, Mul,
     Attr, TensorList, FlatCat,
 )
-from flash_vla.executors.jax_weights import (  # jax side
+from flash_rt.executors.jax_weights import (  # jax side
     OrbaxDictSource,
     Transpose, Astype, Contiguous, JaxQuant,
     NumpyAttr, NumpyList, CudaBufferAttr, CudaBufferFlat,
@@ -347,7 +347,7 @@ are public. Adding new sink/transform/composite classes is
 backwards-compatible; existing ones will not be removed or renamed
 without a major version bump.
 
-**Spec file naming**: `flash_vla/frontends/{torch,jax}/_<model>_thor_spec.py`,
+**Spec file naming**: `flash_rt/frontends/{torch,jax}/_<model>_thor_spec.py`,
 each exporting a `build_spec() -> ModelWeightSpec`. Shared block
 builders live in `_thor_spec_common.py` per framework.
 
@@ -372,7 +372,7 @@ registering an external-plugin model via `_PIPELINE_MAP`.
 When adding a new model or kernel, read these in order:
 
 1. [`docs/adding_new_model.md`](adding_new_model.md) — end-to-end
-   walkthrough for wiring a new VLA model into FlashVLA on Thor
+   walkthrough for wiring a new VLA model into FlashRT on Thor
    (AttentionSpec → WEIGHT_SPEC → pipeline forward → frontend →
    calibration → graph capture → registration → tests).
 2. [`docs/calibration.md`](calibration.md) — FP8 weight/activation

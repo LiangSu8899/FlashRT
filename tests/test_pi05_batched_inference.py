@@ -47,9 +47,9 @@ def _make_dummy_obs():
                     reason=f"pi05 ckpt missing at {CKPT_PI05}")
 def test_default_path_unchanged_no_batched_mode():
     """Without ``set_batched_mode``, pipeline class is the standard one."""
-    from flash_vla.frontends.torch.pi05_rtx import Pi05TorchFrontendRtx
-    from flash_vla.models.pi05.pipeline_rtx import Pi05Pipeline
-    from flash_vla.models.pi05.pipeline_rtx_batched import Pi05BatchedPipeline
+    from flash_rt.frontends.torch.pi05_rtx import Pi05TorchFrontendRtx
+    from flash_rt.models.pi05.pipeline_rtx import Pi05Pipeline
+    from flash_rt.models.pi05.pipeline_rtx_batched import Pi05BatchedPipeline
 
     rt = Pi05TorchFrontendRtx(CKPT_PI05, num_views=2)
     rt.set_prompt("pick up the cup")
@@ -62,11 +62,11 @@ def test_default_path_unchanged_no_batched_mode():
                     reason=f"pi05 ckpt missing at {CKPT_PI05}")
 def test_set_batched_mode_builds_batched_pipeline():
     """``set_batched_mode`` + ``set_prompt_batch`` builds Pi05BatchedPipeline."""
-    from flash_vla.frontends.torch.pi05_rtx import Pi05TorchFrontendRtx
-    from flash_vla.hardware.rtx.attn_backend_batched_pi05 import (
+    from flash_rt.frontends.torch.pi05_rtx import Pi05TorchFrontendRtx
+    from flash_rt.hardware.rtx.attn_backend_batched_pi05 import (
         RtxFlashAttnBatchedBackendPi05,
     )
-    from flash_vla.models.pi05.pipeline_rtx_batched import Pi05BatchedPipeline
+    from flash_rt.models.pi05.pipeline_rtx_batched import Pi05BatchedPipeline
 
     rt = Pi05TorchFrontendRtx(CKPT_PI05, num_views=2)
     rt.set_batched_mode(enable=True)
@@ -81,7 +81,7 @@ def test_set_batched_mode_builds_batched_pipeline():
                     reason=f"pi05 ckpt missing at {CKPT_PI05}")
 def test_set_prompt_batch_rejects_wrong_size():
     """Wrong-sized prompt list is rejected at the boundary."""
-    from flash_vla.frontends.torch.pi05_rtx import Pi05TorchFrontendRtx
+    from flash_rt.frontends.torch.pi05_rtx import Pi05TorchFrontendRtx
 
     rt = Pi05TorchFrontendRtx(CKPT_PI05, num_views=2)
     rt.set_batched_mode(enable=True)
@@ -94,7 +94,7 @@ def test_set_prompt_batch_rejects_wrong_size():
                     reason=f"pi05 ckpt missing at {CKPT_PI05}")
 def test_infer_batch_returns_two_finite_action_chunks():
     """End-to-end batched inference returns 2 finite action chunks."""
-    from flash_vla.frontends.torch.pi05_rtx import Pi05TorchFrontendRtx
+    from flash_rt.frontends.torch.pi05_rtx import Pi05TorchFrontendRtx
 
     rt = Pi05TorchFrontendRtx(CKPT_PI05, num_views=2)
     rt.set_batched_mode(enable=True)
@@ -124,7 +124,7 @@ def test_infer_batch_both_slots_yield_plausible_actions():
     require an API to inject identical noise per slot — out of scope for
     v0.1.0 generic batched inference.
     """
-    from flash_vla.frontends.torch.pi05_rtx import Pi05TorchFrontendRtx
+    from flash_rt.frontends.torch.pi05_rtx import Pi05TorchFrontendRtx
 
     rt = Pi05TorchFrontendRtx(CKPT_PI05, num_views=2)
     rt.set_batched_mode(enable=True)

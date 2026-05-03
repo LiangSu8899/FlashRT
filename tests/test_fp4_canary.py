@@ -31,7 +31,7 @@ def run_variant(cls, **kw):
     wrist = np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8)
     obs = {"image": img, "wrist_image": wrist}
 
-    pipe = cls("<your_pi05_torch_ckpt>",
+    pipe = cls(os.environ.get("FLASH_RT_PI05_CKPT", "/workspace/pytorch_checkpoints/pi05_libero_converted"),
                num_views=2, autotune=3, **kw)
     pipe.set_prompt("pick up the red block and place it in the tray")
     for _ in range(5):
@@ -67,14 +67,14 @@ def main():
     print("=" * 70)
 
     # (A) Base reference
-    from flash_vla.frontends.torch.pi05_thor import Pi05TorchFrontendThor
+    from flash_rt.frontends.torch.pi05_thor import Pi05TorchFrontendThor
     print("\n[A] Pi05TorchFrontendThor (base, FP8-only)")
     a_act, a_p50 = run_variant(Pi05TorchFrontendThor)
     a_cos = cos(a_act, prod)
     print(f"    cos vs prod = {a_cos:.6f}   p50 = {a_p50:.1f}ms")
 
     # (B) Subclass, FP4 off
-    from flash_vla.frontends.torch.pi05_thor_fp4 import Pi05TorchFrontendThorFP4
+    from flash_rt.frontends.torch.pi05_thor_fp4 import Pi05TorchFrontendThorFP4
     print("\n[B] Pi05TorchFrontendThorFP4(use_fp4_encoder_ffn=False)")
     b_act, b_p50 = run_variant(Pi05TorchFrontendThorFP4,
                                 use_fp4_encoder_ffn=False)

@@ -4,7 +4,7 @@
 
 A general kernel library composed into static graphs — no ONNX export, no engine compilation, no per-driver rebuild. Hand-written kernels (norm / activation / fusion / RoPE / FP8 / NVFP4 GEMM / attention) cover standard transformer, DiT, and SigLIP primitives. The composition pattern itself is hardware-agnostic; today the codebase ships with NVIDIA implementations spanning edge to server (Jetson AGX Thor through A100 / RTX 4090 / 5090).
 
-The flagship integration is **FlashVLA** — production VLA control for Pi0, Pi0.5, GROOT N1.6, and Pi0-FAST, validated on LIBERO. The same kernel set also powers the BAGEL world-model image-generation pipeline (research preview) and audio / video generation (4× over PyTorch). The pattern is workload-shaped (small-batch realtime), not model-class-shaped.
+The flagship integration today is **VLA control** — production frontends for Pi0, Pi0.5, GROOT N1.6, and Pi0-FAST, validated on LIBERO. The same kernel set also powers the BAGEL world-model image-generation pipeline (research preview) and audio / video generation (4× over PyTorch). The pattern is workload-shaped (small-batch realtime), not model-class-shaped.
 
 Existing inference tooling is shaped for different workloads — TensorRT for tactic-search compile to frozen engines, vLLM / SGLang for high-batch LLM serving. FlashRT targets the small-batch realtime cell with hand-tuned kernels and no compile step.
 
@@ -18,7 +18,7 @@ Existing inference tooling is shaped for different workloads — TensorRT for ta
 
 ## FlashRT is easy to use with:
 
-- **3-line API**: `flash_vla.load_model(...).predict(images, prompt)`
+- **3-line API**: `flash_rt.load_model(...).predict(images, prompt)`
 - **Auto-dispatched hardware**: same code path on Jetson Thor / RTX 5090 / RTX 4090
 - **PyTorch and JAX frontends** share one kernel binary, equivalent results (cosine ≥ 0.999)
 - **Plugin model registration** — add a new VLA via one frontend file + a declarative `WEIGHT_SPEC`, no fork required
@@ -45,9 +45,9 @@ Pi0.5: 44 ms / 23 Hz on Jetson AGX Thor (2v, FP8) · 39.78 ms / 25 Hz (2v, NVFP4
 > Already built? Run the snippet below. **Not yet built? See [Build & install](#build--install) first** — `cmake .. && make -j` produces the kernel `.so` files this snippet imports. About 6 minutes from `git clone` to first inference.
 
 ```python
-import flash_vla   # Python module name; project is FlashRT (see About)
+import flash_rt   # Python module name; project is FlashRT (see About)
 
-model = flash_vla.load_model(
+model = flash_rt.load_model(
     checkpoint="/path/to/pi05_checkpoint",
     config="pi05",          # or "pi0", "groot", "pi0fast"
     framework="torch",      # or "jax"
@@ -144,12 +144,12 @@ Measure locally by wrapping `model.predict(...)` in
 | Triton-based VLA | RTX 5090 | — | 26.6 ms (2v) | — | arXiv 2510.26742 |
 | NVIDIA VLA-Perf | RTX 4090 | 31.06 ms (Pi0 3B) | — | — | arXiv 2602.18397 |
 | NVIDIA Isaac GR00T (TensorRT) | Jetson Thor | — | 91–95 ms (3v) | ~95 ms | [Isaac GR00T](https://github.com/NVIDIA/Isaac-GR00T) |
-| **FlashVLA** | **RTX 5090** | **21.16 ms** (2v) | **17.58 ms** (2v) | **13.08 ms** (T=50, 2v) | this work |
-| **FlashVLA** | **Jetson Thor** | **46 ms** (2v) | **39.78 ms** (2v) / **51.51 ms** (3v) (NVFP4) | **45 ms** (T=50, 2v) | this work |
+| **FlashRT** | **RTX 5090** | **21.16 ms** (2v) | **17.58 ms** (2v) | **13.08 ms** (T=50, 2v) | this work |
+| **FlashRT** | **Jetson Thor** | **46 ms** (2v) | **39.78 ms** (2v) / **51.51 ms** (3v) (NVFP4) | **45 ms** (T=50, 2v) | this work |
 
-On the same Jetson AGX Thor hardware, FlashVLA goes from the original openpi JAX baseline (1.4 Hz) to 23 Hz (FP8) / 25 Hz (NVFP4) — a **~16-18× speedup at zero accuracy loss** (cosine ≥ 0.9996 vs the production reference).
+On the same Jetson AGX Thor hardware, FlashRT goes from the original openpi JAX baseline (1.4 Hz) to 23 Hz (FP8) / 25 Hz (NVFP4) — a **~16-18× speedup at zero accuracy loss** (cosine ≥ 0.9996 vs the production reference).
 
-FlashVLA Pi0.5 Thor numbers above are the NVFP4 production preset (`use_fp4=True`); the FP8 baseline is 44.0 ms 2v / 54.8 ms 3v at the same task success (491/500). See [Latency (Thor)](#latency-thor) for the full sweep.
+FlashRT Pi0.5 Thor numbers above are the NVFP4 production preset (`use_fp4=True`); the FP8 baseline is 44.0 ms 2v / 54.8 ms 3v at the same task success (491/500). See [Latency (Thor)](#latency-thor) for the full sweep.
 
 ### Tested hardware + what's theoretically supported
 
@@ -179,7 +179,7 @@ your numbers / logs:
   [`docs/adding_new_model.md`](docs/adding_new_model.md) for the
   integration walkthrough; [`docs/kernel_catalog.md`](docs/kernel_catalog.md)
   has the parts list and a re-use decision tree for judging
-  whether FlashVLA fits before you start wiring anything up.
+  whether FlashRT fits before you start wiring anything up.
 
 Drive-by benchmarks, bug reports, and "this crashed on my X" traces
 are all welcome. The footprint is small — one author, one laptop,
@@ -220,9 +220,9 @@ Linux flow, then come back.
 ### 3 Lines of Code
 
 ```python
-import flash_vla
+import flash_rt
 
-model = flash_vla.load_model(
+model = flash_rt.load_model(
     checkpoint="/path/to/checkpoint",
     framework="torch",    # or "jax"
     autotune=3,           # 0=off, 3=default, 5=thorough
@@ -235,7 +235,7 @@ actions = model.predict(
 # Pi0.5: actions shape (10, 7) — 10 future steps, 7 DOF
 
 # Pi0 (continuous state input):
-model = flash_vla.load_model(
+model = flash_rt.load_model(
     checkpoint="/path/to/pi0_checkpoint",
     config="pi0",
 )
@@ -247,7 +247,7 @@ actions = model.predict(
 # Note: Pi0 also accepts 'state' in observation dict for continuous state input
 
 # GROOT N1.6:
-model = flash_vla.load_model(
+model = flash_rt.load_model(
     checkpoint="/path/to/groot_checkpoint",
     config="groot",
 )
@@ -255,7 +255,7 @@ actions = model.predict(images=[base_img, wrist_img], prompt="pick up the red bl
 # GROOT: actions shape (50, 128) — 50 steps, 128-dim padded
 
 # Pi0-FAST (autoregressive — discrete token generation, not diffusion):
-model = flash_vla.load_model(
+model = flash_rt.load_model(
     checkpoint="/path/to/pi0_fast_base",  # Orbax (jax) or safetensors-converted (torch)
     config="pi0fast",
     framework="torch",  # or "jax"
@@ -265,7 +265,7 @@ actions = model.predict(images=[base_img, wrist_img], prompt="pick up the red bl
 # to continuous actions via the FAST tokenizer (DCT inverse).
 
 # Pi0-FAST max-performance mode (for fixed-prompt 24h deployment):
-model = flash_vla.load_model(
+model = flash_rt.load_model(
     checkpoint="/path/to/pi0_fast_base",
     config="pi0fast",
     decode_cuda_graph=True,       # capture decode loop as CUDA Graph
@@ -280,7 +280,7 @@ model = flash_vla.load_model(
 | **safetensors** (HuggingFace/PyTorch) | `"torch"` | `model.safetensors` |
 | **Orbax** (JAX/Physical Intelligence) | `"jax"` | `checkpoint/` dir |
 
-Both frontends produce equivalent results (cosine > 0.999) and share the same `flash_vla_kernels.so`.
+Both frontends produce equivalent results (cosine > 0.999) and share the same `flash_rt_kernels.so`.
 
 ### Hardware Auto-Dispatch
 
@@ -290,9 +290,9 @@ time and routes to the best-matching backend automatically:
 
 | Compute capability | GPU | Backend |
 |---|---|---|
-| SM110 (11.0) | Jetson AGX Thor | `flash_vla.hardware.thor.*` |
-| SM120 (12.0) | RTX 5090 Blackwell | `flash_vla.hardware.rtx.*`, falling back to Thor for models without a 5090-native class (Pi0-FAST uses Thor's in-file SM120 runtime fork) |
-| SM89  (8.9)  | RTX 4090 Ada | `flash_vla.hardware.rtx.*` |
+| SM110 (11.0) | Jetson AGX Thor | `flash_rt.hardware.thor.*` |
+| SM120 (12.0) | RTX 5090 Blackwell | `flash_rt.hardware.rtx.*`, falling back to Thor for models without a 5090-native class (Pi0-FAST uses Thor's in-file SM120 runtime fork) |
+| SM89  (8.9)  | RTX 4090 Ada | `flash_rt.hardware.rtx.*` |
 
 Override with `hardware="thor"` / `"rtx_sm120"` / `"rtx_sm89"` for
 cross-hardware debugging — `"auto"` (default) is what you almost
@@ -303,7 +303,7 @@ backend at runtime is more expensive to debug than a clean crash.
 ```python
 # Same code path on every supported GPU. On an RTX 5090 this resolves
 # to RtxTorchGroot; on Jetson Thor it resolves to ThorPipelineTorchGroot.
-model = flash_vla.load_model(
+model = flash_rt.load_model(
     "/path/to/groot_checkpoint",
     config="groot",
     embodiment_tag="gr1",     # see GROOT embodiment slots below
@@ -355,7 +355,7 @@ Pi0-FAST supports two decode modes, controlled by `decode_cuda_graph`:
 
 - **Default mode** (`decode_cuda_graph=False`): Each decode token runs through a
   Python loop with per-step kernel launches. Lowest startup cost. FP8 calibration
-  scales are cached to `~/.flash_vla/calibration/` after the first run — subsequent
+  scales are cached to `~/.flash_rt/calibration/` after the first run — subsequent
   `set_prompt` calls with the same checkpoint skip the 2.4s calibration entirely.
 
 - **Max-performance mode** (`decode_cuda_graph=True`): The action-phase decode loop
@@ -366,13 +366,13 @@ Pi0-FAST supports two decode modes, controlled by `decode_cuda_graph`:
 
 ```python
 # Default: good for interactive / multi-prompt scenarios
-model = flash_vla.load_model(checkpoint, config="pi0fast")
+model = flash_rt.load_model(checkpoint, config="pi0fast")
 model.set_prompt("pick up the red block", state=state)
 # set_prompt: 0.1s (cached) / 2.5s (first run)
 # infer: ~464 ms per 50-token sequence
 
 # Max-performance: best for fixed-prompt continuous control
-model = flash_vla.load_model(
+model = flash_rt.load_model(
     checkpoint, config="pi0fast",
     decode_cuda_graph=True,
     decode_graph_steps=46,    # covers sequences up to 46 action tokens (50 total)
@@ -383,7 +383,7 @@ model.set_prompt("pick up the red block", state=state)
 ```
 
 **Calibration caching**: FP8 activation scales are automatically cached per
-checkpoint and sequence length. Delete `~/.flash_vla/calibration/` to force
+checkpoint and sequence length. Delete `~/.flash_rt/calibration/` to force
 recalibration. The first `infer()` call always recalibrates with real image
 data regardless of cache.
 
@@ -395,7 +395,7 @@ FFN stack. Currently implemented for **Pi0.5 torch only** — passing
 and falls back to FP8.
 
 ```python
-model = flash_vla.load_model(
+model = flash_rt.load_model(
     checkpoint,
     config="pi05",
     use_fp4=True,    # single flag → enables the production-validated preset
@@ -430,7 +430,7 @@ L7-9 subset).
 **Requirements**:
 - SM100+ GPU (validated on Thor SM110). Non-SM100 hardware silently falls
   back to FP8.
-- `flash_vla_fp4.so` extension (built alongside `flash_vla_kernels.so`).
+- `flash_rt_fp4.so` extension (built alongside `flash_rt_kernels.so`).
 
 **Measured on Thor SM110, Pi0.5 / LIBERO Spatial 10 × 50 = 500 episodes**:
 
@@ -480,71 +480,60 @@ extension modules:
 
 | Artifact | Size | What it contains |
 |---|---|---|
-| `flash_vla/flash_vla_kernels.so` | ~3 MB | Hand-written memory-bound kernels (norm, activation, fusion, FP8 quant, cuBLASLt wrappers, Thor FMHA). **Always built.** |
-| `flash_vla/flash_vla_fa2.so` | ~135 MB | Vendored Flash-Attention 2 v2.7.4.post1 fwd (fp16 + bf16, SM80/86/89/120). **Built only on RTX targets** — Thor skips it and uses `fvk.attention_qkv_fp16` (cuBLAS-decomposed) for attention instead. |
+| `flash_rt/flash_rt_kernels.so` | ~3 MB | Hand-written memory-bound kernels (norm, activation, fusion, FP8 quant, cuBLASLt wrappers, Thor FMHA). **Always built.** |
+| `flash_rt/flash_rt_fa2.so` | ~135 MB | Vendored Flash-Attention 2 v2.7.4.post1 fwd (fp16 + bf16, SM80/86/89/120). **Built only on RTX targets** — Thor skips it and uses `fvk.attention_qkv_fp16` (cuBLAS-decomposed) for attention instead. |
 
 **Crucially — no `pip install flash-attn` required.** The FA2 kernel
-is vendored at source level and built into `flash_vla_fa2.so` during
-`cmake`/`make`; at runtime `import flash_vla` loads both .so files
+is vendored at source level and built into `flash_rt_fa2.so` during
+`cmake`/`make`; at runtime `import flash_rt` loads both .so files
 directly, so you never hit the `flash-attn` wheel's
 `torch × CUDA × driver × glibc` compatibility matrix. Setting
 `FVK_RTX_FA2=0` is still supported as a fall-back to `pip flash-attn`
 for debugging, but the default path has zero pip-wheel dependency.
 
-### Option A — Docker (recommended for exact reproduction)
+### Option A — Prebuilt Docker image (fastest, recommended)
 
-FlashVLA is tested against NVIDIA's NGC PyTorch container. Build
-inside the container so the CUDA/torch/nvcc toolchain is already
-pinned and known-good:
+The published image already has CUDA 13.0, PyTorch 2.9, the
+FlashRT kernels prebuilt, and CUTLASS vendored — pull and run, no
+local compile, no `flash-attn` wheel hunting:
 
 ```bash
-# Host: launch container with GPU + repo mount
-docker run -d --gpus all --ipc=host --network=host --name flashrt-dev \
-  -v $(pwd):/workspace/FlashRT \
-  nvcr.io/nvidia/pytorch:25.10-py3 sleep infinity
-
-# Inside the container
-docker exec -it flashrt-dev bash
-cd /workspace/FlashRT
-
-# CUTLASS 4.x (for the main FP4/FP8 kernels — this is *separate* from
-# the CUTLASS 3.x vendored for FA2 under csrc/attention/flash_attn_2_src/)
-git clone --depth 1 --branch v4.4.2 \
-    https://github.com/NVIDIA/cutlass.git third_party/cutlass
-
-# Python deps — torch + jax are already in the NGC image; add ours
-pip install -e ".[torch]"          # or "[jax]" / "[all]"
-# NOTE: editable mode (-e) is required. The cmake build below drops
-# compiled .so files into flash_vla/ in the source tree; editable
-# install makes that directory importable directly. A non-editable
-# `pip install .` would install a copy BEFORE the .so files exist and
-# `import flash_vla` would fail at runtime with a missing-module error.
-
-# Build — CMake auto-detects GPU arch via nvidia-smi.
-# On RTX (SM80/86/89/120) this produces BOTH flash_vla_kernels.so and
-# flash_vla_fa2.so; on Thor (SM110) it produces only the former.
-# CMake writes .so files directly into flash_vla/ at build time —
-# no separate `cp`, `make install`, or `ninja install` step needed.
-cmake -B build -S .
-cmake --build build -j$(nproc)
-
-# Verify
-python -c "import flash_vla; from flash_vla import flash_vla_kernels, flash_vla_fa2; \
-           print('kernels:', flash_vla_kernels.has_cutlass_sm100()); \
-           print('fa2.fwd_fp16:', callable(flash_vla_fa2.fwd_fp16)); \
-           print('fa2.fwd_bf16:', callable(flash_vla_fa2.fwd_bf16))"
-# kernels: True/False  (True on Thor, False on RTX — expected)
-# fa2.fwd_fp16: True
-# fa2.fwd_bf16: True
+docker pull ghcr.io/liangsu8899/flashrt:latest
+docker run --rm --gpus all -it ghcr.io/liangsu8899/flashrt:latest
+# Drops you in a Python REPL with `flash_rt` already imported.
 ```
 
-The `nvcr.io/nvidia/pytorch:25.10-py3` image includes CUDA 13.0,
-cuBLASLt, PyTorch 2.9 (with SM120 support), and nvcc 13.0.88 — all
-pinned versions that match this repo's CI. For 4090 you use the same
-image; see [`docs/deployment_rtx4090.md`](docs/deployment_rtx4090.md)
-for a step-by-step.
+For Modal / RunPod / Vast and other cloud runners, point the image
+config at the same registry — Modal cold-start drops from a 10-minute
+kernel compile to a ~30-second pull:
 
-### Option B — Native Linux (no Docker)
+```python
+image = modal.Image.from_registry("ghcr.io/liangsu8899/flashrt:0.2.0")
+```
+
+Tags + advanced usage (build args, slim variants, mounting checkpoints):
+see [`docker/README.md`](docker/README.md).
+
+> **Thor (SM110)** is not covered by this image — Jetson is ARM64 and
+> uses a different NVIDIA base. Thor users follow Option C below.
+
+### Option B — Build the Docker image yourself
+
+If you need a different GPU arch, want to pin a specific commit, or
+prefer to vet the image source:
+
+```bash
+git clone https://github.com/LiangSu8899/FlashRT.git
+cd FlashRT
+docker build -t flashrt:dev -f docker/Dockerfile .
+docker run --rm --gpus all -it flashrt:dev
+```
+
+Build args (`GPU_ARCH`, `FA2_HDIMS`, `BASE_IMAGE`, `CUTLASS_REF`)
+documented in [`docker/README.md`](docker/README.md). Cold build on a
+fresh host is ~25 min (NGC pull + FA2 codegen); warm rebuild ~12 min.
+
+### Option C — Native Linux (no Docker)
 
 System requirements:
 
@@ -605,14 +594,14 @@ git clone --depth 1 --branch v4.4.2 \
 
 pip install -e ".[torch]"          # or "[jax]" / "[all]"
 # NOTE: editable mode (-e) is required. The cmake build below drops
-# compiled .so files into flash_vla/ in the source tree; editable
+# compiled .so files into flash_rt/ in the source tree; editable
 # install makes that directory importable directly. A non-editable
 # `pip install .` would install a copy BEFORE the .so files exist and
-# `import flash_vla` would fail at runtime with a missing-module error.
+# `import flash_rt` would fail at runtime with a missing-module error.
 
 cmake -B build -S .                 # auto-detects GPU arch
 cmake --build build -j$(nproc)
-# CMake writes .so files directly into flash_vla/ — no `cp` /
+# CMake writes .so files directly into flash_rt/ — no `cp` /
 # `make install` / `ninja install` step needed.
 ```
 
@@ -632,7 +621,7 @@ cmake -B build -S . -DGPU_ARCH=80    # A100               (FA2 sm_80 AOT)
 FA2 is enabled by CMake when `GPU_ARCH ∈ {80, 86, 89, 120}`. Other
 arches (notably Thor SM110 and SM90 Hopper) route attention through
 the cuBLAS-decomposed `fvk.attention_qkv_fp16` path instead of FA2 —
-`flash_vla_fa2.so` simply isn't built, and no runtime error results.
+`flash_rt_fa2.so` simply isn't built, and no runtime error results.
 
 ### Build timing (one-time)
 
@@ -640,8 +629,8 @@ On a 5090 with CUDA 13 in a warm container, `make -j$(nproc)`:
 
 | Target | Time |
 |---|---|
-| `flash_vla_kernels` (main kernels) | ~2 min |
-| `flash_vla_fa2` (FA2 vendor, default — 12 kernel .cu files × 3 arches) | **~4.5 min** (267 s) |
+| `flash_rt_kernels` (main kernels) | ~2 min |
+| `flash_rt_fa2` (FA2 vendor, default — 12 kernel .cu files × 3 arches) | **~4.5 min** (267 s) |
 | Full `make -j$(nproc)` | ~6.5 min |
 
 Subsequent rebuilds of only the hand-written kernels take ~2 min —
@@ -664,7 +653,7 @@ opt-in CMake flags trade binary coverage for iteration speed:
 | `-DFA2_DTYPES="fp16"` | `"fp16;bf16"` | Drop bf16 (Pi0 is fp16-only; Pi0.5 / GROOT need bf16) | **179 s** (−33%) |
 | `-DFA2_ARCH_NATIVE_ONLY=ON -DFA2_HDIMS="96;256" -DFA2_DTYPES="fp16"` | — | All three combined (single-card + pi0-only) | **87 s** (−67%) |
 
-Shipped `flash_vla_fa2.so` size also shrinks — the all-three-slim
+Shipped `flash_rt_fa2.so` size also shrinks — the all-three-slim
 build produces **17.8 MB** (vs 135 MB default), a **87% reduction**
 in binary size on the FA2 module.
 
@@ -734,14 +723,14 @@ Expected: `P50: ~44 ms (23 Hz)` on Thor.
 
 ## Architecture
 
-FlashVLA is layered so that **framework-specific IO** (safetensors / Orbax),
+FlashRT is layered so that **framework-specific IO** (safetensors / Orbax),
 **declarative weight loading**, **framework-agnostic compute** (pointer-only
 pipelines), and **hardware-dispatched attention kernels** each live in their
 own module. Adding a new model touches at most one file per layer; adding a
 new GPU target touches only `hardware/`.
 
 ```
-flash_vla/
+flash_rt/
 ├── api.py                     ← Public API: load_model() + VLAModel.predict()
 │
 ├── hardware/                  ← Hardware-dispatch + attention protocol
@@ -788,14 +777,14 @@ flash_vla/
 │   ├── quant/calibrator.py    ←   FP8 calibration cache (save/load)
 │   └── weights/               ←   loader.py, weight_cache, transformer
 │
-├── flash_vla/configs/         ← Per-model YAML configs (pi05.yaml, etc.)
-└── flash_vla_kernels.*.so     ← 93 CUDA kernels (pybind11 — built from csrc/)
+├── flash_rt/configs/         ← Per-model YAML configs (pi05.yaml, etc.)
+└── flash_rt_kernels.*.so     ← 93 CUDA kernels (pybind11 — built from csrc/)
 
 csrc/                       ← C++/CUDA source (compiled once, .so kept in repo)
 ├── kernels/                ← norm, activation, rope, quantize, fusion
 ├── gemm/                   ← cuBLASLt FP8 + CUTLASS FP8 helpers
 ├── attention/              ← CUTLASS FMHA (strided, per-view)
-└── bindings.cpp            ← pybind11 → flash_vla_kernels.so
+└── bindings.cpp            ← pybind11 → flash_rt_kernels.so
 
 docs/                       ← Documentation
 ├── stable_api.md           ← Public API + naming convention
@@ -838,7 +827,7 @@ examples/
    [`docs/plugin_model_template.md`](docs/plugin_model_template.md)).
 5. **Calibration framework-agnostic + cached** — FP8 activation scales
    are computed once per `(checkpoint, seq_len)` pair, cached to
-   `~/.flash_vla/calibration/`, then baked as host-scalar alphas
+   `~/.flash_rt/calibration/`, then baked as host-scalar alphas
    (`act_scale × weight_scale`) into every CUDA Graph capture. See
    [`docs/calibration.md`](docs/calibration.md).
 6. **CUDA Graph captures the entire forward** — Python loop unrolled at
@@ -881,9 +870,9 @@ Cosine similarity measured with matched noise injection.
 
 | Comparison | Cosine |
 |-----------|--------|
-| FlashVLA Torch vs Production | **0.9996** |
-| FlashVLA JAX vs Production | **0.9999** |
-| FlashVLA Torch vs JAX | **0.9998** |
+| FlashRT Torch vs Production | **0.9996** |
+| FlashRT JAX vs Production | **0.9999** |
+| FlashRT Torch vs JAX | **0.9998** |
 
 **Module-level byte-exact verification** (same input → same output):
 - SigLIP (27 layers): byte-exact
@@ -896,16 +885,16 @@ Cosine similarity measured with matched noise injection.
 
 | Frontend | 1-view | 2-view | 3-view |
 |----------|--------|--------|--------|
-| **FlashVLA Torch** | **36.5 ms** (27 Hz) | **44.0 ms** (23 Hz) | **54.8 ms** (18 Hz) |
-| **FlashVLA JAX** (autotune=5) | **37.3 ms** (27 Hz) | **44.9 ms** (22 Hz) | **54.4 ms** (18 Hz) |
+| **FlashRT Torch** | **36.5 ms** (27 Hz) | **44.0 ms** (23 Hz) | **54.8 ms** (18 Hz) |
+| **FlashRT JAX** (autotune=5) | **37.3 ms** (27 Hz) | **44.9 ms** (22 Hz) | **54.4 ms** (18 Hz) |
 | NVIDIA TensorRT baseline | — | 91–95 ms | — |
 
 ### Pi0
 
 | Frontend | 1-view | 2-view | 3-view |
 |----------|--------|--------|--------|
-| **FlashVLA Torch** (autotune=5) | **37.6 ms** (27 Hz) | **45.8 ms** (22 Hz) | **56.7 ms** (18 Hz) |
-| **FlashVLA JAX** (autotune=5) | **37.8 ms** (26 Hz) | **45.8 ms** (22 Hz) | **55.9 ms** (18 Hz) |
+| **FlashRT Torch** (autotune=5) | **37.6 ms** (27 Hz) | **45.8 ms** (22 Hz) | **56.7 ms** (18 Hz) |
+| **FlashRT JAX** (autotune=5) | **37.8 ms** (26 Hz) | **45.8 ms** (22 Hz) | **55.9 ms** (18 Hz) |
 
 Each additional camera view adds ~6 ms (256 extra SigLIP tokens → more encoder DRAM traffic + SigLIP forward).
 
@@ -923,7 +912,7 @@ E2E precision: cosine **0.998** vs FP16 PyTorch reference (Torch and JAX both).
 T = action_horizon. T=50 is the padded max across all embodiments (used in production). T=16 is LIBERO-specific.
 
 E2E precision: cosine **0.999** vs FP32 PyTorch reference. NVIDIA PyTorch baseline: ~95 ms.
-FP8 activation scales calibrated per-layer for both Qwen3 and DiT, cached to `~/.flash_vla/calibration/`.
+FP8 activation scales calibrated per-layer for both Qwen3 and DiT, cached to `~/.flash_rt/calibration/`.
 
 ### Pi0-FAST
 
@@ -968,8 +957,8 @@ logit projection drops from 257K → 2K vocab (saves ~5 ms/token).
 
 | Backend | Prefill xn | First logit | Decode xn | Decode logit | First token |
 |---------|-----------|-------------|-----------|--------------|-------------|
-| **FlashVLA Torch** | 0.998 | 0.999 | 0.995 | 0.998 | MATCH (4022) |
-| **FlashVLA JAX**   | 0.995 | 0.997 | 0.987 | 0.993 | MATCH (4022) |
+| **FlashRT Torch** | 0.998 | 0.999 | 0.995 | 0.998 | MATCH (4022) |
+| **FlashRT JAX**   | 0.995 | 0.997 | 0.987 | 0.993 | MATCH (4022) |
 
 Both backends match JAX's first decoded token exactly, with all internal hidden
 states ≥ 0.987 cosine vs the JAX bf16 reference (gemma_fast.Module.apply).
@@ -992,7 +981,7 @@ the engine itself.
 | **replay** (`cuda.Event` around `graph.replay()`) | GPU kernels only, captured graph(s) | Engine latency, comparisons between backends, apples-to-apples vs other kernel-level reports |
 | **wall** (`time.perf_counter()` around `rtx.infer()`) | Everything inside `rtx.infer`: copies, graph, sync, decode, un-normalize | What a Python caller feels |
 
-Replay is the canonical FlashVLA benchmark column because:
+Replay is the canonical FlashRT benchmark column because:
 - it's compiler/CPU independent (same kernels → same replay regardless of
   whether the Python wrapper is on Thor's Arm CPU or a 5090 host x86),
 - it's what other framework benchmarks (NVIDIA Isaac, Triton-based VLA work)
@@ -1012,9 +1001,9 @@ After the model is loaded and `set_prompt(...)` has been called once
 graph replays directly:
 
 ```python
-import torch, flash_vla, statistics
+import torch, flash_rt, statistics
 
-model = flash_vla.load_model("pi05", "/path/to/ckpt", framework="torch")
+model = flash_rt.load_model("pi05", "/path/to/ckpt", framework="torch")
 model.predict(images=[base, wrist], prompt="task")  # warm
 
 graph = model._pipe._enc_ae_graph
@@ -1042,7 +1031,7 @@ Swap `config="groot"` and `action_horizon=50/16` for the GROOT rows.
 
 | Frontend | 1-view | 2-view | 3-view |
 |----------|--------|--------|--------|
-| **FlashVLA Torch (replay p50)** | **14.48 ms** (69 Hz) | **17.58 ms** (57 Hz) | **20.00 ms** (50 Hz) |
+| **FlashRT Torch (replay p50)** | **14.48 ms** (69 Hz) | **17.58 ms** (57 Hz) | **20.00 ms** (50 Hz) |
 | (Wall p50 for reference) | 15.92 ms | 19.58 ms | 23.24 ms |
 
 Replay std across 500 timed iterations is ~0.2 ms (1v) / 0.56 ms (2v) /
@@ -1091,14 +1080,14 @@ number: GROOT has more graph-external work than Pi0.5.
 
 | Frontend | 1-view | 2-view | 3-view |
 |----------|--------|--------|--------|
-| **FlashVLA Torch (replay p50)** | **11.90 ms** (84 Hz) | **13.08 ms** (76 Hz) | **13.92 ms** (72 Hz) |
+| **FlashRT Torch (replay p50)** | **11.90 ms** (84 Hz) | **13.08 ms** (76 Hz) | **13.92 ms** (72 Hz) |
 | (Wall p50 for reference) | 12.77 ms | 15.60 ms | 15.23 ms |
 
 **T = 16** (LIBERO-style short horizon — skips ~34 rows in every DiT block)
 
 | Frontend | 1-view | 2-view | 3-view |
 |----------|--------|--------|--------|
-| **FlashVLA Torch (replay p50)** | **11.31 ms** (88 Hz) | **12.53 ms** (80 Hz) | **13.36 ms** (75 Hz) |
+| **FlashRT Torch (replay p50)** | **11.31 ms** (88 Hz) | **12.53 ms** (80 Hz) | **13.36 ms** (75 Hz) |
 | (Wall p50 for reference) | 12.18 ms | 15.06 ms | 14.66 ms |
 
 Replay std < 0.02 ms across all 6 cells — the graphs are deterministic

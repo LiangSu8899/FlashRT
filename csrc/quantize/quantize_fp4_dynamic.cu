@@ -1,5 +1,5 @@
 // ============================================================================
-//  FlashVLA — fp16 → NVFP4 dynamic quantize CUDA kernel impl.
+//  FlashRT — fp16 → NVFP4 dynamic quantize CUDA kernel impl.
 //
 //  Naming / format:
 //    NVFP4 element = e2m1 (sign + 2 exp + 1 mantissa) stored as 4 bits.
@@ -27,7 +27,7 @@
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 
-namespace flash_vla {
+namespace flash_rt {
 namespace fp4 {
 
 // ── Device helpers ────────────────────────────────────────────────────────
@@ -179,4 +179,4 @@ int dequantize_fp4_to_fp16(
 }
 
 }  // namespace fp4
-}  // namespace flash_vla
+}  // namespace flash_rt

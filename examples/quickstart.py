@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FlashVLA — Quickstart.
+FlashRT — Quickstart.
 
 Usage:
     # PyTorch:
@@ -36,11 +36,11 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 import numpy as np
-import flash_vla
+import flash_rt
 
 
 def main():
-    parser = argparse.ArgumentParser(description="FlashVLA quickstart")
+    parser = argparse.ArgumentParser(description="FlashRT quickstart")
     parser.add_argument('--checkpoint', required=True)
     parser.add_argument('--framework', default='torch', choices=['torch', 'jax'])
     parser.add_argument('--num_views', type=int, default=2)
@@ -82,7 +82,7 @@ def main():
     # ══════════════════════════════════════════
     #  3 lines
     # ══════════════════════════════════════════
-    model = flash_vla.load_model(
+    model = flash_rt.load_model(
         checkpoint=args.checkpoint,
         framework=args.framework,
         num_views=args.num_views,

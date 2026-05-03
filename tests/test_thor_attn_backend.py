@@ -49,7 +49,7 @@ def _fake_slots():
 
 
 def test_construct_ok():
-    from flash_vla.hardware.thor.attn_backend import (
+    from flash_rt.hardware.thor.attn_backend import (
         ThorFlashAttnBackend, make_pi05_attention_spec,
     )
     siglip, encoder, decoder, _, _ = _fake_slots()
@@ -70,7 +70,7 @@ def test_construct_ok():
 
 
 def test_siglip_slot_ptrs():
-    from flash_vla.hardware.thor.attn_backend import (
+    from flash_rt.hardware.thor.attn_backend import (
         ThorFlashAttnBackend, make_pi05_attention_spec,
     )
     siglip, encoder, decoder, _, D_sig = _fake_slots()
@@ -93,7 +93,7 @@ def test_siglip_slot_ptrs():
 
 
 def test_encoder_slot_ptrs():
-    from flash_vla.hardware.thor.attn_backend import (
+    from flash_rt.hardware.thor.attn_backend import (
         ThorFlashAttnBackend, make_pi05_attention_spec,
     )
     siglip, encoder, decoder, stride, _ = _fake_slots()
@@ -116,7 +116,7 @@ def test_encoder_slot_ptrs():
 
 
 def test_decoder_slot_ptrs():
-    from flash_vla.hardware.thor.attn_backend import (
+    from flash_rt.hardware.thor.attn_backend import (
         ThorFlashAttnBackend, make_pi05_attention_spec,
     )
     siglip, encoder, decoder, stride, _ = _fake_slots()
@@ -138,7 +138,7 @@ def test_decoder_slot_ptrs():
 
 
 def test_layer_idx_oob():
-    from flash_vla.hardware.thor.attn_backend import (
+    from flash_rt.hardware.thor.attn_backend import (
         ThorFlashAttnBackend, make_pi05_attention_spec,
     )
     siglip, encoder, decoder, _, _ = _fake_slots()
@@ -157,7 +157,7 @@ def test_layer_idx_oob():
 
 
 def test_reject_null_ptr():
-    from flash_vla.hardware.thor.attn_backend import (
+    from flash_rt.hardware.thor.attn_backend import (
         ThorFlashAttnBackend, make_pi05_attention_spec,
     )
     siglip, encoder, decoder, _, _ = _fake_slots()
@@ -175,7 +175,7 @@ def test_reject_null_ptr():
 
 
 def test_reject_bad_D():
-    from flash_vla.hardware.thor.attn_backend import (
+    from flash_rt.hardware.thor.attn_backend import (
         ThorFlashAttnBackend, make_pi05_attention_spec,
     )
     siglip, encoder, decoder, _, _ = _fake_slots()
@@ -193,8 +193,8 @@ def test_reject_bad_D():
 
 
 def test_reject_extra_site():
-    from flash_vla.hardware.thor.attn_backend import ThorFlashAttnBackend
-    from flash_vla.hardware.backend import AttentionSpec
+    from flash_rt.hardware.thor.attn_backend import ThorFlashAttnBackend
+    from flash_rt.hardware.backend import AttentionSpec
     # Build a spec with an unexpected site.
     spec = AttentionSpec()
     spec.add_site("siglip",  num_layers=27, num_q_heads=16, num_kv_heads=16,
@@ -220,7 +220,7 @@ def test_reject_extra_site():
 
 def _make_pi0_backend():
     """Helper: build a Pi0-spec'd ThorFlashAttnBackend with fake ptrs."""
-    from flash_vla.hardware.thor.attn_backend import (
+    from flash_rt.hardware.thor.attn_backend import (
         ThorFlashAttnBackend, make_pi0_attention_spec,
     )
     siglip, encoder, decoder, _, _ = _fake_slots()
@@ -233,14 +233,14 @@ def _make_pi0_backend():
 
 def test_pi0_spec_decoder_extra():
     """Pi0 decoder site carries extra={'kernel': 'state_masked'}."""
-    from flash_vla.hardware.thor.attn_backend import make_pi0_attention_spec
+    from flash_rt.hardware.thor.attn_backend import make_pi0_attention_spec
     spec = make_pi0_attention_spec(num_views=2, enc_seq_max=600, S_dec=11)
     dec = spec.site("decoder")
     assert dec.extra.get("kernel") == "state_masked", dec.extra
     assert dec.max_q_seq == 11, dec.max_q_seq
     assert dec.max_kv_seq == 611, dec.max_kv_seq
     # Pi0.5 spec: default extra (no kernel key).
-    from flash_vla.hardware.thor.attn_backend import make_pi05_attention_spec
+    from flash_rt.hardware.thor.attn_backend import make_pi05_attention_spec
     p05 = make_pi05_attention_spec(num_views=2, enc_seq_max=600)
     assert "kernel" not in p05.site("decoder").extra, p05.site("decoder").extra
     print("  PASS  test_pi0_spec_decoder_extra")
@@ -273,8 +273,8 @@ def test_state_masked_state_nk_range():
 
 def test_unknown_kernel_rejected():
     """A site with extra['kernel'] set to an unknown value raises at run()."""
-    from flash_vla.hardware.thor.attn_backend import ThorFlashAttnBackend
-    from flash_vla.hardware.backend import AttentionSpec
+    from flash_rt.hardware.thor.attn_backend import ThorFlashAttnBackend
+    from flash_rt.hardware.backend import AttentionSpec
     spec = AttentionSpec()
     spec.add_site("siglip",  num_layers=27, num_q_heads=16, num_kv_heads=16,
                              head_dim=72, max_q_seq=256)

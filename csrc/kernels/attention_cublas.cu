@@ -1,5 +1,5 @@
 // ================================================================
-// FlashVLA — cuBLAS attention (GQA-compatible)
+// FlashRT — cuBLAS attention (GQA-compatible)
 // Direct port of pi05 engine attention pattern:
 //   1. QK^T via cublasGemmEx (CUBLAS_OP_T, CUBLAS_OP_N)
 //   2. softmax_fp16 (separate kernel)

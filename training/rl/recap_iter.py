@@ -34,8 +34,8 @@ from dataclasses import dataclass, field
 import numpy as np
 import torch
 
-from flash_vla.core.rl.reward import compute_episode_value_targets
-from flash_vla.core.rl.value_function import StandaloneValueFunction
+from flash_rt.core.rl.reward import compute_episode_value_targets
+from flash_rt.core.rl.value_function import StandaloneValueFunction
 from training.rl.lerobot_libero import LeRobotLiberoDataset
 from training.rl.train_value import SyntheticDataset, train_value
 from training.rl.value_infer import (

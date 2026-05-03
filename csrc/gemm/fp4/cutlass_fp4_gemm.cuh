@@ -1,5 +1,5 @@
 // ============================================================================
-//  FlashVLA — NVFP4 (e2m1 + UE4M3 block-scale, block=16) GEMM for Thor SM110.
+//  FlashRT — NVFP4 (e2m1 + UE4M3 block-scale, block=16) GEMM for Thor SM110.
 //
 //  Minimal C-style entry points used by the pybind layer. Kernel bodies live
 //  in cutlass_fp4_gemm.cu and are based on CUTLASS example 72a
@@ -14,7 +14,7 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 
-namespace flash_vla {
+namespace flash_rt {
 namespace fp4 {
 
 // Invariants (enforced at call sites and / or static_assert'd):
@@ -54,4 +54,4 @@ const char* cutlass_fp4_gemm_variant_name(int idx);
 int cutlass_fp4_gemm_num_variants();
 
 } // namespace fp4
-} // namespace flash_vla
+} // namespace flash_rt

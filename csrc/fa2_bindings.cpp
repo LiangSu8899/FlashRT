@@ -1,15 +1,15 @@
 // ============================================================================
-//  FlashVLA — pybind module for vendored Flash-Attention 2.
+//  FlashRT — pybind module for vendored Flash-Attention 2.
 //
-//  Built as a SEPARATE .so from flash_vla_kernels.so to keep the main kernel
+//  Built as a SEPARATE .so from flash_rt_kernels.so to keep the main kernel
 //  binary small (~3.6 MB) and to avoid FA2's heavy CUTLASS 3.x template
 //  compile time from gating every rebuild of our own kernels. Follows the
-//  same pattern as flash_vla_fp4.so.
+//  same pattern as flash_rt_fp4.so.
 //
 //  Python-side usage:
 //
-//      import flash_vla.flash_vla_kernels as fvk        # unchanged
-//      import flash_vla.flash_vla_fa2     as fa2        # new, additive
+//      import flash_rt.flash_rt_kernels as fvk        # unchanged
+//      import flash_rt.flash_rt_fa2     as fa2        # new, additive
 //      fa2.fwd_fp16(Q, K, V, O, ...)
 //      fa2.fwd_bf16(Q, K, V, O, ...)    # added in the bf16-vendor step
 //
@@ -104,8 +104,8 @@ static auto make_fwd(Fn fn) {
 }
 
 
-PYBIND11_MODULE(flash_vla_fa2, m) {
-    m.doc() = "FlashVLA — vendored Flash-Attention 2 forward (fp16 + bf16).";
+PYBIND11_MODULE(flash_rt_fa2, m) {
+    m.doc() = "FlashRT — vendored Flash-Attention 2 forward (fp16 + bf16).";
 
     m.def("fwd_fp16", make_fwd(&fvk_attention_fa2_fwd_fp16),
         py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("O"), py::arg("softmax_lse"),

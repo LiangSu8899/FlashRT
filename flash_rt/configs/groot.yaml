@@ -1,0 +1,73 @@
+# FlashRT — GROOT N1.6 model configuration
+# Eagle3-VL backbone (SigLIP2 + Qwen3-1.7B) + AlternateVLDiT action head
+name: groot
+
+# ── Backbone: Eagle3-VL ──
+backbone_type: eagle3_vl
+backbone_hidden: 2048            # Qwen3 output dim = DiT cross_attention_dim
+
+# Vision encoder (SigLIP2, but use_windows_attn=false, use_rope=false in this model)
+vision:
+  type: siglip2
+  patch_size: 14
+  image_size: 224
+  num_patches: 256               # per view: (224/14)^2
+  hidden_dim: 1152
+  num_layers: 27
+  num_heads: 16
+  head_dim: 72                   # 1152/16
+  ffn_dim: 4304
+  use_windows_attn: false        # from Eagle config — no sliding window
+  use_rope: false                # from Eagle config — learned 1D position
+
+# Language model (Qwen3-1.7B, part of Eagle backbone)
+llm:
+  type: qwen3
+  hidden_dim: 2048
+  num_layers: 28
+  num_heads: 16                  # query heads
+  num_kv_heads: 8                # GQA 2:1
+  head_dim: 128
+  ffn_dim: 6144                  # gate_proj / up_proj output dim
+  rope_theta: 1000000.0
+  activation: silu               # Qwen3 FFN uses SiLU (not GELU!)
+  has_qk_norm: true              # RMSNorm on Q/K after projection
+  attention_bias: false
+
+# ── Action Head: AlternateVLDiT ──
+action_head:
+  type: alternate_vl_dit
+  inner_dim: 1536                # 32 heads * 48 head_dim
+  num_layers: 32
+  num_heads: 32
+  head_dim: 48
+  ffn_mult: 4                   # FFN inner = 1536 * 4 = 6144
+  ffn_activation: geglu          # GEGLU — use gate_geglu_merged_* kernels
+  norm_type: ada_layer_norm      # AdaLayerNorm (not AdaRMSNorm)
+  attention_bias: true           # DiT attention has bias
+  dropout: 0.2
+  output_dim: 1024               # proj_out_2 output
+  interleave_self_attention: true
+  attend_text_every_n_blocks: 2
+
+# ── Flow Matching ──
+flow_matching:
+  num_inference_steps: 4         # Euler integration steps
+  num_timestep_buckets: 1000
+  # Timestep values: t=0 → disc=0, t=0.25 → 250, t=0.5 → 500, t=0.75 → 750
+
+# ── Action / State ──
+action_dim: 29                   # padded max across all embodiments
+state_dim: 29
+action_horizon: 16
+max_num_embodiments: 32
+
+# ── Quantization ──
+quant:
+  enabled: true
+  dtype: fp8
+  vision: fp8                    # SigLIP2
+  llm: fp8                       # Qwen3
+  dit: bf16                      # DiT: tiny seqs, FP8 gain limited — start BF16
+  action_head: bf16
+  calibration: runtime

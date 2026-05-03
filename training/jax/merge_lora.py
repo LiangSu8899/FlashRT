@@ -6,7 +6,7 @@ containing both the frozen base weights and the trained LoRA
 adapters, this tool produces a *standalone* Orbax checkpoint with
 the LoRA delta folded into the base — drop-in for openpi-style
 inference, including
-:class:`flash_vla.frontends.jax.pi05_rtx.Pi05JaxFrontendRtx`.
+:class:`flash_rt.frontends.jax.pi05_rtx.Pi05JaxFrontendRtx`.
 
 Math, per LoRA-bearing layer ``L``::
 
@@ -23,7 +23,7 @@ Two openpi naming patterns are handled by the same code path
 * FeedForward (``parent/X_lora_a``)       — base at ``parent/X``
 
 There is **no PyTorch in the merge path** — the JAX line stays
-JAX-native end to end. Users running the FlashVLA torch frontend
+JAX-native end to end. Users running the FlashRT torch frontend
 have a separate, parallel torch path
 (``training.rl.merge_lora``); the two never need to meet.
 """
@@ -77,7 +77,7 @@ def _save_orbax_from_flat(
     When ``wrap_in_params`` is True (the default), the saved tree gets
     a ``{"params": <model>}`` outer dict. openpi's ``restore_params``
     (the loader path
-    :func:`flash_vla.core.weights.loader._load_orbax` uses for
+    :func:`flash_rt.core.weights.loader._load_orbax` uses for
     inference) expects this wrapper — without it the loader raises
     ``KeyError('params')`` at metadata read.
 

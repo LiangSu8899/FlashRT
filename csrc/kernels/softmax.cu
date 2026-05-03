@@ -1,5 +1,5 @@
 // ================================================================
-// FlashVLA — Softmax kernel (FP16)
+// FlashRT — Softmax kernel (FP16)
 // Direct port of pi05 softmax_bf16_kernel.
 // 1 warp per row, vectorized __half2 load/store.
 // ================================================================

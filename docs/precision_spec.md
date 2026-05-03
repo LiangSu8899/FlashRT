@@ -20,7 +20,7 @@ that code written against it doesn't have to change when we add more.
 ## 1. Structure
 
 ```python
-from flash_vla.core.precision_spec import PrecisionSpec, ModelPrecisionSpec
+from flash_rt.core.precision_spec import PrecisionSpec, ModelPrecisionSpec
 
 spec = PrecisionSpec(
     dtype="fp8_e4m3",            # fp32 | fp16 | bf16 | fp8_e4m3 | fp8_e5m2 | nvfp4 | int8 | int4
@@ -55,7 +55,7 @@ fall back to a kernel that doesn't match the user's QAT scheme.
 |---|---|---|---|
 | `fp8_e4m3` | `per_channel` | `symmetric` | Per-channel FP8 GEMM kernel variant |
 | `fp8_e5m2` | `per_tensor` | `symmetric` | E5M2 descale variants |
-| `nvfp4` | `per_group` (size 16) | `symmetric` | Already partially shipped on Thor as separate module (`flash_vla_fp4`) |
+| `nvfp4` | `per_group` (size 16) | `symmetric` | Already partially shipped on Thor as separate module (`flash_rt_fp4`) |
 | `int8` | `per_tensor` | `symmetric` | INT8 GEMM path |
 | anything | anything | `asymmetric` | Kernels that consume a zero point |
 

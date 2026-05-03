@@ -76,7 +76,7 @@ import numpy as np
 import torch
 
 # Force a fresh calibration cache pass — wipe any persisted scales.
-cdir = pathlib.Path.home() / ".cache" / "flash_vla"
+cdir = pathlib.Path.home() / ".cache" / "flash_rt"
 if cdir.exists():
     for f in cdir.glob("*_n17_Se*.json"):
         f.unlink()
@@ -99,7 +99,7 @@ else:
             f"aux-list has {len(aux_list)} entries, need >= {n}")
     aux_list = aux_list[:n]
 
-from flash_vla.frontends.torch.groot_n17_thor import GrootN17TorchFrontendThor
+from flash_rt.frontends.torch.groot_n17_thor import GrootN17TorchFrontendThor
 pipe = GrootN17TorchFrontendThor("CKPT", num_views=2)
 pipe.set_prompt(aux=aux, prompt="")
 

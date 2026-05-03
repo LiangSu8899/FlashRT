@@ -85,7 +85,7 @@ def _flashrt_runs() -> "FlashRTRun | None":
     skip in that case.
     """
     try:
-        from flash_vla.frontends.torch.groot_n17_thor import GrootN17TorchFrontendThor
+        from flash_rt.frontends.torch.groot_n17_thor import GrootN17TorchFrontendThor
     except Exception as e:  # pragma: no cover
         pytest.skip(f"frontend not importable: {e}")
 
@@ -111,7 +111,7 @@ class FlashRTRun:
 
     def __init__(self, fixture: dict):
         # Lazy: avoid importing torch.cuda etc. unless we are actually running.
-        from flash_vla.frontends.torch.groot_n17_thor import GrootN17TorchFrontendThor
+        from flash_rt.frontends.torch.groot_n17_thor import GrootN17TorchFrontendThor
         self.fixture = fixture
         # NotImplementedError will propagate from constructor
         self.frontend = GrootN17TorchFrontendThor()
@@ -141,7 +141,7 @@ def vit_artifacts(fixture):
     from _groot_n17_runner import (
         load_tensor, fvk, gemm_runner, Fp8Calibrator, build_vit_rope_tables,
     )
-    from flash_vla.hardware.thor.attn_backend_groot_n17 import (
+    from flash_rt.hardware.thor.attn_backend_groot_n17 import (
         ThorGrootN17AttnBackend, make_groot_n17_attention_spec,
     )
     import torch.nn.functional as F
@@ -327,7 +327,7 @@ def vit_artifacts(fixture):
 @pytest.mark.parametrize("i", list(range(1, 24)))   # layer 0 deferred (needs patch-embed input)
 def test_vit_block(fixture, vit_artifacts, i):
     """Per-layer cosine: golden vit_block_{i-1} → run layer i alone → cmp vs vit_block_{i}."""
-    from flash_vla.models.groot_n17 import pipeline_thor
+    from flash_rt.models.groot_n17 import pipeline_thor
 
     art = vit_artifacts
     S, D = art["dims"]["S"], art["dims"]["D"]
@@ -471,7 +471,7 @@ def test_deepstack_merger(fixture, deepstack_artifacts, j):
     smooth-quant pre-pass (fold per-input-channel scale into preceding
     LayerNorm gamma) is later introduced, this can tighten back to 0.999.
     """
-    from flash_vla.models.groot_n17 import pipeline_thor
+    from flash_rt.models.groot_n17 import pipeline_thor
     from _groot_n17_runner import gemm_runner
 
     art = deepstack_artifacts
@@ -507,7 +507,7 @@ def llm_artifacts(fixture):
     from _groot_n17_runner import (
         load_tensor, fvk, gemm_runner, Fp8Calibrator,
     )
-    from flash_vla.hardware.thor.attn_backend_groot_n17 import (
+    from flash_rt.hardware.thor.attn_backend_groot_n17 import (
         ThorGrootN17AttnBackend, make_groot_n17_attention_spec,
     )
     import torch.nn.functional as F
@@ -775,7 +775,7 @@ def test_llm_layer(fixture, llm_artifacts, i):
     a test-only fallback. A causal-supporting fp16 kernel would be added
     in Phase 5 for production.
     """
-    from flash_vla.models.groot_n17 import pipeline_thor
+    from flash_rt.models.groot_n17 import pipeline_thor
     from _groot_n17_runner import load_tensor   # noqa  (cached)
 
     art = llm_artifacts
@@ -836,7 +836,7 @@ def test_vlln(fixture):
         pytest.skip("CUDA required")
 
     from _groot_n17_runner import load_tensor, fvk
-    from flash_vla.models.groot_n17 import pipeline_thor
+    from flash_rt.models.groot_n17 import pipeline_thor
 
     fvk_mod = fvk()
 
@@ -883,7 +883,7 @@ def vlsa_artifacts(fixture):
         pytest.skip("CUDA required")
 
     from _groot_n17_runner import load_tensor, fvk, gemm_runner, Fp8Calibrator
-    from flash_vla.hardware.thor.attn_backend_groot_n17 import (
+    from flash_rt.hardware.thor.attn_backend_groot_n17 import (
         ThorGrootN17AttnBackend, make_groot_n17_attention_spec,
     )
     import torch.nn.functional as F
@@ -1051,7 +1051,7 @@ def vlsa_artifacts(fixture):
 @pytest.mark.parametrize("i", [0, 1, 2, 3])
 def test_vlsa_block(fixture, vlsa_artifacts, i):
     """Per-layer cosine: golden input → run layer i alone → cmp vs vlsa_block_{i}."""
-    from flash_vla.models.groot_n17 import pipeline_thor
+    from flash_rt.models.groot_n17 import pipeline_thor
 
     art = vlsa_artifacts
     T, D = art["dims"]["T"], art["dims"]["D"]
@@ -1104,7 +1104,7 @@ def test_actions_e2e(fixture):
 
 def test_bf16_forwards_importable():
     """Smoke: the 4 bf16 forwards are callable (no NotImplementedError)."""
-    from flash_vla.models.groot_n17 import pipeline_thor
+    from flash_rt.models.groot_n17 import pipeline_thor
     for fn_name in ("embodiment_state_encode", "embodiment_action_encode",
                     "embodiment_action_decode", "dit_forward"):
         fn = getattr(pipeline_thor, fn_name)

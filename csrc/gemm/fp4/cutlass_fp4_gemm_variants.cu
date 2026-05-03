@@ -1,5 +1,5 @@
 // ============================================================================
-//  FlashVLA — parametric NVFP4 GEMM kernel variants for small-M tuning.
+//  FlashRT — parametric NVFP4 GEMM kernel variants for small-M tuning.
 //
 //  Allows instantiating multiple (MmaTileShape, ClusterShape) configs at
 //  compile time. Each variant exported as a separate extern "C"-style runner
@@ -20,7 +20,7 @@
 #include "cutlass/detail/sm100_blockscaled_layout.hpp"
 #include "cute/tensor.hpp"
 
-namespace flash_vla {
+namespace flash_rt {
 namespace fp4 {
 namespace variants {
 
@@ -188,4 +188,4 @@ const char* cutlass_fp4_gemm_variant_name(int idx) {
 int cutlass_fp4_gemm_num_variants() { return 10; }
 
 }  // namespace fp4
-}  // namespace flash_vla
+}  // namespace flash_rt

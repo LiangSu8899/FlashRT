@@ -1,4 +1,4 @@
-"""JAX-side FP8 GEMM op backed by FlashVLA's cuBLASLt kernel.
+"""JAX-side FP8 GEMM op backed by FlashRT's cuBLASLt kernel.
 
 This module mirrors the PyTorch path's ``training.lora.fp8_autograd``
 on the JAX side:

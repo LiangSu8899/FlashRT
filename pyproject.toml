@@ -3,9 +3,9 @@ requires = ["setuptools>=64", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "flash-vla"
+name = "flash-rt"
 version = "0.1.0"
-description = "FlashRT — realtime CUDA inference engine for small-batch, latency-sensitive AI workloads. Flagship integration: FlashVLA (Pi0, Pi0.5, GROOT N1.6, Pi0-FAST)."
+description = "FlashRT — realtime CUDA inference engine for small-batch, latency-sensitive AI workloads. Ships VLA frontends for Pi0, Pi0.5, Pi0-FAST, GROOT N1.6/N1.7."
 readme = "README.md"
 license = {text = "Apache-2.0"}
 requires-python = ">=3.10"
@@ -22,15 +22,15 @@ eval = ["opencv-python", "tqdm"]
 # Optional. Required only for the legacy upstream attention path
 # (FVK_RTX_FA2=0 / FVK_RTX_FA2_SITES=...) and the GROOT N1.6/N1.7
 # backend. Default RTX Pi0 / Pi0.5 inference uses the vendored
-# flash_vla_fa2.so and does NOT need this. If pip cannot find a
+# flash_rt_fa2.so and does NOT need this. If pip cannot find a
 # prebuilt wheel for your torch+CUDA+Python combo, grab one from
 # https://github.com/Dao-AILab/flash-attention/releases — building
 # the sdist takes 30+ minutes on cold cloud images.
 flash-attn = ["flash-attn"]
-all = ["flash-vla[torch,jax,server,eval]"]
+all = ["flash-rt[torch,jax,server,eval]"]
 
 [tool.setuptools.packages.find]
-include = ["flash_vla*"]
+include = ["flash_rt*"]
 
 [tool.setuptools.package-data]
-flash_vla = ["*.so", "*.yaml", "*.model"]
+flash_rt = ["*.so", "*.yaml", "*.model"]

@@ -1,5 +1,5 @@
 // ================================================================
-// FlashVLA — MHA batched cuBLAS attention (for DiT)
+// FlashRT — MHA batched cuBLAS attention (for DiT)
 // Supports multi-head attention where nheads_q == nheads_kv (MHA).
 // Uses cublasGemmStridedBatchedEx for per-head QK^T and PV.
 //

@@ -1,11 +1,11 @@
 // ============================================================================
-//  FlashVLA — pybind module for NVFP4 kernels.
+//  FlashRT — pybind module for NVFP4 kernels.
 //
-//  Built as a SEPARATE .so from flash_vla_kernels.so (which stays untouched).
+//  Built as a SEPARATE .so from flash_rt_kernels.so (which stays untouched).
 //  Python-side usage:
 //
-//      import flash_vla.flash_vla_kernels as fvk        # unchanged
-//      import flash_vla.flash_vla_fp4    as fvk_fp4     # new, additive
+//      import flash_rt.flash_rt_kernels as fvk        # unchanged
+//      import flash_rt.flash_rt_fp4    as fvk_fp4     # new, additive
 //
 //  All pointer args are passed as int (ctypes.c_void_p.value) to mirror the
 //  existing fvk convention; everything is host/device pointer pass-through.
@@ -23,13 +23,13 @@
 #include "fused_fp4/norm_silu_fp4_sfa.cuh"
 #include "fused_fp4/silu_mul_two_fp4_to_fp4.cuh"
 
-extern "C" int flash_vla_per_channel_mul_fp16(
+extern "C" int flash_rt_per_channel_mul_fp16(
     uintptr_t x, uintptr_t inv_s, int S, int D, uintptr_t stream);
 
 namespace py = pybind11;
 
-PYBIND11_MODULE(flash_vla_fp4, m) {
-  m.doc() = "FlashVLA — NVFP4 (Thor SM110) add-on kernels";
+PYBIND11_MODULE(flash_rt_fp4, m) {
+  m.doc() = "FlashRT — NVFP4 (Thor SM110) add-on kernels";
 
   // ── GEMM ──
   m.def("cutlass_fp4_sq_fp16",
@@ -37,7 +37,7 @@ PYBIND11_MODULE(flash_vla_fp4, m) {
            uintptr_t B, uintptr_t SFB,
            uintptr_t D, int M, int N, int K,
            float alpha, float beta, uintptr_t stream) -> int {
-          return flash_vla::fp4::cutlass_fp4_sq_fp16(
+          return flash_rt::fp4::cutlass_fp4_sq_fp16(
               reinterpret_cast<void const*>(A),
               reinterpret_cast<void const*>(SFA),
               reinterpret_cast<void const*>(B),
@@ -67,7 +67,7 @@ Phase 4 will add the layout conversion helper.
   m.def("quantize_fp4_dynamic_fp16",
         [](uintptr_t src, uintptr_t packed, uintptr_t scales,
            int N, int D, uintptr_t stream) -> int {
-          return flash_vla::fp4::quantize_fp4_dynamic_fp16(
+          return flash_rt::fp4::quantize_fp4_dynamic_fp16(
               reinterpret_cast<void const*>(src),
               reinterpret_cast<void*>(packed),
               reinterpret_cast<void*>(scales),
@@ -84,7 +84,7 @@ tile-interleave conversion is required.
   m.def("dequantize_fp4_to_fp16",
         [](uintptr_t packed, uintptr_t scales, uintptr_t dst,
            int N, int D, uintptr_t stream) -> int {
-          return flash_vla::fp4::dequantize_fp4_to_fp16(
+          return flash_rt::fp4::dequantize_fp4_to_fp16(
               reinterpret_cast<void const*>(packed),
               reinterpret_cast<void const*>(scales),
               reinterpret_cast<void*>(dst),
@@ -97,7 +97,7 @@ tile-interleave conversion is required.
   m.def("quantize_fp4_dynamic_sfa_fp16",
         [](uintptr_t src, uintptr_t packed, uintptr_t sfa,
            int N, int D, bool is_sfb, uintptr_t stream) -> int {
-          return flash_vla::fp4::quantize_fp4_dynamic_sfa_fp16(
+          return flash_rt::fp4::quantize_fp4_dynamic_sfa_fp16(
               reinterpret_cast<void const*>(src),
               reinterpret_cast<void*>(packed),
               reinterpret_cast<void*>(sfa),
@@ -115,7 +115,7 @@ reshape_linear_scales_to_sfa, in a single kernel launch.
   m.def("reshape_linear_scales_to_sfa",
         [](uintptr_t src, uintptr_t dst, int rows, int D, bool is_sfb,
            uintptr_t stream) -> int {
-          return flash_vla::fp4::reshape_linear_scales_to_sfa(
+          return flash_rt::fp4::reshape_linear_scales_to_sfa(
               reinterpret_cast<void const*>(src),
               reinterpret_cast<void*>(dst),
               rows, D, is_sfb,
@@ -127,7 +127,7 @@ reshape_linear_scales_to_sfa, in a single kernel launch.
         "or SFB (is_sfb=True) tile-interleaved layout.");
 
   m.def("sfa_size_bytes",
-        &flash_vla::fp4::sfa_size_bytes,
+        &flash_rt::fp4::sfa_size_bytes,
         py::arg("rows"), py::arg("D"), py::arg("is_sfb"),
         "Byte size of the CUTLASS SFA (or SFB) buffer for the given problem.");
 
@@ -136,7 +136,7 @@ reshape_linear_scales_to_sfa, in a single kernel launch.
         [](int idx, uintptr_t A, uintptr_t SFA, uintptr_t B, uintptr_t SFB,
            uintptr_t D, int M, int N, int K, float alpha, float beta,
            uintptr_t stream) -> int {
-          return flash_vla::fp4::cutlass_fp4_gemm_variant(
+          return flash_rt::fp4::cutlass_fp4_gemm_variant(
               idx, reinterpret_cast<void const*>(A), reinterpret_cast<void const*>(SFA),
               reinterpret_cast<void const*>(B), reinterpret_cast<void const*>(SFB),
               reinterpret_cast<void*>(D), M, N, K, alpha, beta,
@@ -149,19 +149,19 @@ reshape_linear_scales_to_sfa, in a single kernel launch.
         py::arg("stream") = 0,
         "Call one of the NVFP4 GEMM variants by index. Used for tile/schedule tuning.");
 
-  m.def("cutlass_fp4_gemm_variant_name", &flash_vla::fp4::cutlass_fp4_gemm_variant_name,
+  m.def("cutlass_fp4_gemm_variant_name", &flash_rt::fp4::cutlass_fp4_gemm_variant_name,
         py::arg("idx"), "Human-readable name of variant at index.");
-  m.def("cutlass_fp4_gemm_num_variants", &flash_vla::fp4::cutlass_fp4_gemm_num_variants,
+  m.def("cutlass_fp4_gemm_num_variants", &flash_rt::fp4::cutlass_fp4_gemm_num_variants,
         "Count of available GEMM variants.");
 
-  m.def("has_nvfp4", &flash_vla::fp4::has_nvfp4_sm110,
+  m.def("has_nvfp4", &flash_rt::fp4::has_nvfp4_sm110,
         "True iff this .so was built with CUTLASS SM100 support (NVFP4 usable).");
 
   // ── fp16-output fused norm kernels (additive, for FP4 frontend path) ──
   m.def("rms_norm_noweight_fp16",
         [](uintptr_t x, uintptr_t out, int seq_len, int dim,
            uintptr_t stream) {
-          flash_vla::fused_fp16::rms_norm_noweight_fp16(
+          flash_rt::fused_fp16::rms_norm_noweight_fp16(
               reinterpret_cast<const __half*>(x),
               reinterpret_cast<__half*>(out),
               seq_len, dim,
@@ -176,7 +176,7 @@ reshape_linear_scales_to_sfa, in a single kernel launch.
   m.def("residual_add_rms_norm_noweight_fp16",
         [](uintptr_t residual, uintptr_t x, uintptr_t out,
            int seq_len, int dim, uintptr_t stream) {
-          flash_vla::fused_fp16::residual_add_rms_norm_noweight_fp16(
+          flash_rt::fused_fp16::residual_add_rms_norm_noweight_fp16(
               reinterpret_cast<__half*>(residual),
               reinterpret_cast<const __half*>(x),
               reinterpret_cast<__half*>(out),
@@ -192,7 +192,7 @@ reshape_linear_scales_to_sfa, in a single kernel launch.
   m.def("rms_norm_fp4_sfa_fp16",
         [](uintptr_t x, uintptr_t packed, uintptr_t sfa,
            int seq_len, int dim, uintptr_t stream) {
-          flash_vla::fused_fp4::rms_norm_fp4_sfa_fp16(
+          flash_rt::fused_fp4::rms_norm_fp4_sfa_fp16(
               reinterpret_cast<const __half*>(x),
               reinterpret_cast<uint8_t*>(packed),
               reinterpret_cast<uint8_t*>(sfa),
@@ -207,7 +207,7 @@ reshape_linear_scales_to_sfa, in a single kernel launch.
         [](uintptr_t residual, uintptr_t x,
            uintptr_t packed, uintptr_t sfa,
            int seq_len, int dim, uintptr_t stream) {
-          flash_vla::fused_fp4::residual_add_rms_norm_fp4_sfa_v2_fp16(
+          flash_rt::fused_fp4::residual_add_rms_norm_fp4_sfa_v2_fp16(
               reinterpret_cast<__half*>(residual),
               reinterpret_cast<const __half*>(x),
               reinterpret_cast<uint8_t*>(packed),
@@ -223,7 +223,7 @@ reshape_linear_scales_to_sfa, in a single kernel launch.
         [](uintptr_t residual, uintptr_t x,
            uintptr_t packed, uintptr_t sfa,
            int seq_len, int dim, uintptr_t stream) {
-          flash_vla::fused_fp4::residual_add_rms_norm_fp4_sfa_fp16(
+          flash_rt::fused_fp4::residual_add_rms_norm_fp4_sfa_fp16(
               reinterpret_cast<__half*>(residual),
               reinterpret_cast<const __half*>(x),
               reinterpret_cast<uint8_t*>(packed),
@@ -239,7 +239,7 @@ reshape_linear_scales_to_sfa, in a single kernel launch.
   m.def("gate_geglu_fp4_sfa_fp16",
         [](uintptr_t merged, uintptr_t packed, uintptr_t sfa,
            int seq_len, int half_dim, uintptr_t stream) {
-          flash_vla::fused_fp4::gate_silu_mul_fp4_sfa_fp16(
+          flash_rt::fused_fp4::gate_silu_mul_fp4_sfa_fp16(
               reinterpret_cast<const __half*>(merged),
               reinterpret_cast<uint8_t*>(packed),
               reinterpret_cast<uint8_t*>(sfa),
@@ -253,7 +253,7 @@ reshape_linear_scales_to_sfa, in a single kernel launch.
   m.def("gate_geglu_fp4_sfa_v2_fp16",
         [](uintptr_t merged, uintptr_t packed, uintptr_t sfa,
            int seq_len, int half_dim, uintptr_t stream) {
-          flash_vla::fused_fp4::gate_silu_mul_fp4_sfa_v2_fp16(
+          flash_rt::fused_fp4::gate_silu_mul_fp4_sfa_v2_fp16(
               reinterpret_cast<const __half*>(merged),
               reinterpret_cast<uint8_t*>(packed),
               reinterpret_cast<uint8_t*>(sfa),
@@ -269,7 +269,7 @@ reshape_linear_scales_to_sfa, in a single kernel launch.
         [](uintptr_t residual, uintptr_t x, uintptr_t inv_s,
            uintptr_t packed, uintptr_t sfa,
            int seq_len, int dim, uintptr_t stream) {
-          flash_vla::fused_fp4::residual_add_rms_norm_mul_fp4_sfa_fp16(
+          flash_rt::fused_fp4::residual_add_rms_norm_mul_fp4_sfa_fp16(
               reinterpret_cast<__half*>(residual),
               reinterpret_cast<const __half*>(x),
               reinterpret_cast<const __half*>(inv_s),
@@ -288,7 +288,7 @@ reshape_linear_scales_to_sfa, in a single kernel launch.
         [](uintptr_t merged, uintptr_t inv_s,
            uintptr_t packed, uintptr_t sfa,
            int seq_len, int half_dim, uintptr_t stream) {
-          flash_vla::fused_fp4::gate_silu_mul_mul_fp4_sfa_v2_fp16(
+          flash_rt::fused_fp4::gate_silu_mul_mul_fp4_sfa_v2_fp16(
               reinterpret_cast<const __half*>(merged),
               reinterpret_cast<const __half*>(inv_s),
               reinterpret_cast<uint8_t*>(packed),
@@ -303,7 +303,7 @@ reshape_linear_scales_to_sfa, in a single kernel launch.
   // ── AWQ per-channel inverse scale multiply ──
   m.def("per_channel_mul_fp16",
         [](uintptr_t x, uintptr_t inv_s, int S, int D, uintptr_t stream) {
-          flash_vla_per_channel_mul_fp16(x, inv_s, S, D, stream);
+          flash_rt_per_channel_mul_fp16(x, inv_s, S, D, stream);
         },
         py::arg("x"), py::arg("inv_s"), py::arg("S"), py::arg("D"),
         py::arg("stream") = 0,
@@ -316,7 +316,7 @@ reshape_linear_scales_to_sfa, in a single kernel launch.
            uintptr_t B_packed, uintptr_t SFB,
            uintptr_t D_packed, uintptr_t D_SFD,
            int M, int N, int K, uintptr_t stream) -> int {
-          return flash_vla::fp4::cutlass_fp4_gemm_fp4out(
+          return flash_rt::fp4::cutlass_fp4_gemm_fp4out(
               reinterpret_cast<void const*>(A_packed),
               reinterpret_cast<void const*>(SFA),
               reinterpret_cast<void const*>(B_packed),
@@ -343,7 +343,7 @@ Drop-in for cutlass_fp4_sq_fp16 when downstream consumes FP4 + SFA directly.
            uintptr_t inv_s,
            uintptr_t out_packed,  uintptr_t out_sfa,
            int seq_len, int half_dim, uintptr_t stream) {
-          flash_vla::fused_fp4::silu_mul_two_mul_fp4_to_fp4(
+          flash_rt::fused_fp4::silu_mul_two_mul_fp4_to_fp4(
               reinterpret_cast<const uint8_t*>(gate_packed),
               reinterpret_cast<const uint8_t*>(gate_sfa),
               reinterpret_cast<const uint8_t*>(up_packed),
@@ -367,7 +367,7 @@ Drop-in for cutlass_fp4_sq_fp16 when downstream consumes FP4 + SFA directly.
            uintptr_t up_packed,   uintptr_t up_sfa,
            uintptr_t out_packed,  uintptr_t out_sfa,
            int seq_len, int half_dim, uintptr_t stream) {
-          flash_vla::fused_fp4::silu_mul_two_fp4_to_fp4(
+          flash_rt::fused_fp4::silu_mul_two_fp4_to_fp4(
               reinterpret_cast<const uint8_t*>(gate_packed),
               reinterpret_cast<const uint8_t*>(gate_sfa),
               reinterpret_cast<const uint8_t*>(up_packed),

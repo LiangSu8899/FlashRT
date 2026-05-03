@@ -4,8 +4,8 @@ Mirrors :mod:`training.rl.value_infer` 1-for-1 on the JAX side. The
 torch-touching parts (``predict_value`` callable, GPU eval batching)
 are replaced with their JAX equivalents; the numpy advantage /
 threshold / binarisation pipeline reuses the framework-agnostic
-primitives in :mod:`flash_vla.core.rl.advantage` and
-:mod:`flash_vla.core.rl.reward`.
+primitives in :mod:`flash_rt.core.rl.advantage` and
+:mod:`flash_rt.core.rl.reward`.
 
 Two surface variants matching PyTorch:
 
@@ -28,12 +28,12 @@ import flax.nnx as nnx
 import jax.numpy as jnp
 import numpy as np
 
-from flash_vla.core.rl.advantage import (
+from flash_rt.core.rl.advantage import (
     binarize_advantages,
     compute_nstep_advantages,
     compute_per_task_thresholds,
 )
-from flash_vla.core.rl.reward import compute_dense_rewards_from_targets
+from flash_rt.core.rl.reward import compute_dense_rewards_from_targets
 from training.rl.train_value import SyntheticDataset
 
 from .train_value import _set_dropout_deterministic

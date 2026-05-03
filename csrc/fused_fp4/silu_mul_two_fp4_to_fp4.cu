@@ -1,5 +1,5 @@
 // ============================================================================
-//  FlashVLA — silu_mul_two_fp4_to_fp4: P1 split-GU FFN combiner.
+//  FlashRT — silu_mul_two_fp4_to_fp4: P1 split-GU FFN combiner.
 //
 //  Reads two FP4 inputs (gate, up — each packed [S, H/2] + SFA) produced
 //  by separate NVFP4 GEMMs, dequantizes each, computes silu(gate) * up in
@@ -36,7 +36,7 @@
 #  define FV_HAVE_CUTLASS 0
 #endif
 
-namespace flash_vla {
+namespace flash_rt {
 namespace fused_fp4 {
 
 #if FV_HAVE_CUTLASS
@@ -261,4 +261,4 @@ void silu_mul_two_mul_fp4_to_fp4(
 }
 
 }  // namespace fused_fp4
-}  // namespace flash_vla
+}  // namespace flash_rt

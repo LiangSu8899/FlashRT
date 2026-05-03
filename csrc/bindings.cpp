@@ -1,5 +1,5 @@
 // ================================================================
-// FlashVLA — pybind11 bindings
+// FlashRT — pybind11 bindings
 // Exposes GemmRunner + all CUDA kernels to Python
 // ================================================================
 
@@ -22,8 +22,8 @@ extern "C" int run_w4a8_gemm(void*, void*, void*, void*, void*, int, int, int, c
 extern "C" float launch_w4a8_gemm(void*, void*, void*, void*, void*, void*, int, int, int, float, float, int, int);
 #endif
 
-// ENABLE_FA2 moved to a separate pybind module (flash_vla_fa2.so —
-// csrc/fa2_bindings.cpp). This keeps the main flash_vla_kernels.so
+// ENABLE_FA2 moved to a separate pybind module (flash_rt_fa2.so —
+// csrc/fa2_bindings.cpp). This keeps the main flash_rt_kernels.so
 // small and its build fast by isolating FA2's heavy CUTLASS 3.x
 // template codegen.
 
@@ -40,8 +40,8 @@ extern "C" int cutlass_fp8_wide_bf16out(void*, void*, void*, int, int, int, floa
 extern "C" int cutlass_fp8_t1_bf16out(void*, void*, void*, int, int, int, float, float, cudaStream_t);
 #endif
 
-PYBIND11_MODULE(flash_vla_kernels, m) {
-    m.doc() = "FlashVLA C++/CUDA inference kernels";
+PYBIND11_MODULE(flash_rt_kernels, m) {
+    m.doc() = "FlashRT C++/CUDA inference kernels";
 
     // ── FvkContext: per-instance cuBLAS handle ──
     py::class_<FvkContext>(m, "FvkContext")
@@ -1131,8 +1131,8 @@ PYBIND11_MODULE(flash_vla_kernels, m) {
        py::arg("attn_scale") = 1.0f, py::arg("stream") = 0);
 
     // FA2 bindings (fvk.attention_fa2_fwd_fp16/bf16) moved to a separate
-    // pybind module flash_vla_fa2.so — see csrc/fa2_bindings.cpp. This
-    // keeps flash_vla_kernels.so small and fast to rebuild.
+    // pybind module flash_rt_fa2.so — see csrc/fa2_bindings.cpp. This
+    // keeps flash_rt_kernels.so small and fast to rebuild.
 
     // ── DiT bf16 helpers (Phase 5a-2) ────────────────────────────────
     m.def("layer_norm_no_affine_bf16",

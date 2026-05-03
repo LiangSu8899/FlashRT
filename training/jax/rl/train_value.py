@@ -9,7 +9,7 @@ Mirrors :func:`training.rl.train_value.train_value` step-for-step:
    (:func:`training.jax.rl._reward_jax.compute_soft_value_loss`).
 3. Run inference to predict ``V(o)``, derive N-step advantages, and
    compute per-task threshold ``ε_ℓ`` for the ~30 % positive ratio
-   (:mod:`flash_vla.core.rl.advantage`).
+   (:mod:`flash_rt.core.rl.advantage`).
 4. Return the trained model + indicator array + loss history.
 
 The synthetic dataset class is reused from
@@ -26,12 +26,12 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-from flash_vla.core.rl.advantage import (
+from flash_rt.core.rl.advantage import (
     binarize_advantages,
     compute_nstep_advantages,
     compute_per_task_thresholds,
 )
-from flash_vla.core.rl.reward import compute_dense_rewards_from_targets
+from flash_rt.core.rl.reward import compute_dense_rewards_from_targets
 from training.rl.train_value import SyntheticDataset
 
 from ._reward_jax import compute_soft_value_loss
