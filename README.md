@@ -4,13 +4,13 @@
 
 A general kernel library composed into static graphs — no ONNX export, no engine compilation, no per-driver rebuild. Hand-written kernels (norm / activation / fusion / RoPE / FP8 / NVFP4 GEMM / attention) cover standard transformer, DiT, and SigLIP primitives. The composition pattern itself is hardware-agnostic; today the codebase ships with NVIDIA implementations spanning edge to server (Jetson AGX Thor through A100 / RTX 4090 / 5090).
 
-The flagship integration today is **VLA control** — production frontends for Pi0, Pi0.5, GROOT N1.6, and Pi0-FAST, validated on LIBERO. The same kernel set also powers the BAGEL world-model image-generation pipeline (research preview) and audio / video generation (4× over PyTorch). The pattern is workload-shaped (small-batch realtime), not model-class-shaped.
+The flagship integration today is **VLA control** — production frontends for Pi0, Pi0.5, GROOT N1.6, and Pi0-FAST, validated on LIBERO. The same kernel set also powers the BAGEL world-model image-generation pipeline (research preview) and audio / video generation (4× over PyTorch). FlashRT now also serves **single-stream LLM inference** — the v1 release ships **Qwen3.6-27B (NVFP4)** at **129 tok/s decode** with **256 K context on a single RTX 5090** and an OpenAI-compatible HTTP server. The pattern is workload-shaped (small-batch realtime), not model-class-shaped.
 
 Existing inference tooling is shaped for different workloads — TensorRT for tactic-search compile to frozen engines, vLLM / SGLang for high-batch LLM serving. FlashRT targets the small-batch realtime cell with hand-tuned kernels and no compile step.
 
 ## FlashRT is fast with:
 
-- **~120 hand-written CUDA kernels**: norm, activation, residual+norm+quant fusion, RoPE / qkv-split, FP8 / NVFP4 GEMM, cuBLASLt FP8, CUTLASS SM100 FP8, vendored Flash-Attention 2, Thor CUTLASS FMHA
+- **hand-written CUDA kernels**: norm, activation, residual+norm+quant fusion, RoPE / qkv-split, FP8 / NVFP4 GEMM, cuBLASLt FP8, CUTLASS SM100 FP8, vendored Flash-Attention 2, Thor CUTLASS FMHA
 - **Static CUDA Graph capture** of the entire forward — zero Python overhead at replay
 - **Production FP8 (E4M3) and NVFP4** with automatic per-tensor calibration, JSON-cached to disk
 - **No compile, no export**: direct safetensors / Orbax loading, first call ~3 s, every call after is graph replay
@@ -26,7 +26,8 @@ Existing inference tooling is shaped for different workloads — TensorRT for ta
 
 ## FlashRT supports:
 
-- **Models**: Pi0, Pi0.5, GROOT N1.6, Pi0-FAST — all production-validated on LIBERO. BAGEL world-model (research preview) — image-gen pipeline at ~4× vs PyTorch.
+- **VLA models**: Pi0, Pi0.5, GROOT N1.6, Pi0-FAST — all production-validated on LIBERO. BAGEL world-model (research preview) — image-gen pipeline at ~4× vs PyTorch.
+- **LLM**: **Qwen3.6-27B NVFP4 — 129 tok/s decode, 256 K context, single RTX 5090** — speculative decoding via the FP8 ckpt's MTP head, OpenAI-compatible HTTP server.
 - **Hardware (today)**: NVIDIA Jetson AGX Thor (SM110), RTX 5090 (SM120), RTX 4090 (SM89), and SM80 / SM86 / SM89 cards (A100, RTX 3090, 4060 Ti, etc.). The kernel composition pattern is portable to other accelerators.
 - **Frameworks**: PyTorch (safetensors) + JAX (Orbax) — same compiled kernels
 
@@ -36,7 +37,8 @@ Pi0.5: 44 ms / 23 Hz on Jetson AGX Thor (2v, FP8) · 39.78 ms / 25 Hz (2v, NVFP4
 
 - [Install FlashRT](#build--install)
 - [Quick Start](#quick-start)
-- [API snippets — Pi0 / Pi0.5 / GROOT / Pi0-FAST](#api-snippets)
+- [API snippets — Pi0 / Pi0.5 / GROOT / Pi0-FAST / Qwen3.6](#api-snippets)
+- [Qwen3.6-27B NVFP4 LLM path — quickstart, K selection, measured throughput](docs/qwen36_nvfp4.md) · [parameter reference](docs/qwen36_usage.md) · [OpenAI-compatible server example](examples/qwen36_openai_server.py)
 - [Adding a new model](docs/adding_new_model.md)
 - [Architecture](docs/architecture.md)
 
@@ -67,7 +69,8 @@ First call: ~3 s (calibration + CUDA Graph capture). Every subsequent call: 44 m
 | If you want to … | Read |
 |---|---|
 | **Run your first inference** | [Build & install](#build--install) — Docker and native Linux paths |
-| **See API examples for all 4 models** | [API snippets](#api-snippets) |
+| **See API examples for all 4 VLA models + the Qwen3.6 LLM** | [API snippets](#api-snippets) |
+| **Run Qwen3.6-27B NVFP4 (LLM, 129 tok/s on RTX 5090)** | [`docs/qwen36_nvfp4.md`](docs/qwen36_nvfp4.md) — quickstart, K selection, measured throughput · [`docs/qwen36_usage.md`](docs/qwen36_usage.md) — full parameter reference · [`examples/qwen36_openai_server.py`](examples/qwen36_openai_server.py) — OpenAI-compatible HTTP server |
 | **Look up the stable Python API surface** | [`docs/stable_api.md`](docs/stable_api.md) |
 | **Integrate a new model into FlashRT** | [`docs/adding_new_model.md`](docs/adding_new_model.md) — end-to-end walkthrough; external plugin pattern in [`docs/plugin_model_template.md`](docs/plugin_model_template.md) |
 | **Understand the architecture** | [`docs/architecture.md`](docs/architecture.md) — the 8 infrastructure components and how they compose |
@@ -97,6 +100,39 @@ First call: ~3 s (calibration + CUDA Graph capture). Every subsequent call: 44 m
 | **GROOT N1.6** | **RTX 5090** (SM120) | **13.08 ms** (T=50, 2v) / **12.53 ms** (T=16, 2v) | **76 / 80 Hz** |
 | **Pi0-FAST** | **Jetson AGX Thor** (SM110) | **8.1 ms/token** (28 ms prefill + 8.1 × N decode) | **123 tok/s** |
 | **Pi0-FAST** | **RTX 5090** (SM120) | **2.39 ms/token** (11 ms prefill + 2.39 × N decode) | **418 tok/s** |
+
+### LLM — Qwen3.6-27B NVFP4 (RTX 5090)
+
+Single-stream chat-completion latency. NVFP4 W4A16 main weights +
+FP8→NVFP4-converted MTP head for K-step speculative decoding. All
+numbers are decode-only tok/s (excluding prefill); same metric vLLM
+and TensorRT-LLM report. Measured on the standard prompt (`"Explain
+quantum entanglement in one short paragraph."`, 11 prompt tokens) at
+output length 128.
+
+| Configuration | Decode latency | Throughput | Notes |
+|---|---|---|---|
+| **Qwen3.6-27B NVFP4** + spec K=3 | **8.49 ms/token** | **117.8 tok/s** | conservative default |
+| **Qwen3.6-27B NVFP4** + spec K=6 | **7.74 ms/token** | **128.9 tok/s** | recommended for short outputs (≤ 256 tokens) |
+
+Long-context decode at fixed context length (TurboQuant packed KV
+cache, single-token forward, AL=3.17 amortization):
+
+| ctx | forward latency | est. tok/s with spec |
+|---|---|---|
+| 8 K | 26.6 ms | 119 |
+| 32 K | 38.7 ms | 81 |
+| 128 K | 87.7 ms | 36 |
+| **256 K** | **153 ms** | **21** ← single-card |
+
+CUDA Graph capture+replay at 32 K / 64 K / 128 K / 256 K passes the
+cosine = 1.000000 gate (bit-identical token output across replays).
+TTFT scales linearly at ~22 ms / prompt-token.
+
+Realistic per-prompt variance (5 prompts × NTOK 128/256) is documented
+in [`docs/qwen36_nvfp4.md`](docs/qwen36_nvfp4.md) §3 — peak 131 tok/s,
+mean ~110-115, low ~83 on free-form creative prompts. K=3 is more
+robust for long generations; K=6 is the headline number.
 
 ### VRAM footprint (inference only, 2 views on RTX 5090)
 
@@ -271,6 +307,51 @@ model = flash_rt.load_model(
     decode_cuda_graph=True,       # capture decode loop as CUDA Graph
     decode_graph_steps=46,        # action tokens per inference (50 total with text prefix)
 )
+```
+
+#### Qwen3.6-27B NVFP4 (LLM, RTX 5090)
+
+The LLM path uses a dedicated frontend — same kernel binary, separate
+generation API since chat completion has a different surface from VLA
+control. See [`docs/qwen36_usage.md`](docs/qwen36_usage.md) for the
+full parameter reference and [`docs/qwen36_nvfp4.md`](docs/qwen36_nvfp4.md)
+for the K-curve / measured throughput / model-dependency notes.
+
+```python
+import os
+import torch
+from flash_rt.frontends.torch.qwen36_rtx import Qwen36TorchFrontendRtx
+
+# The NVFP4 ckpt has no MTP head; point this env var at a paired
+# FP8 ckpt directory that contains mtp.safetensors. Without it,
+# speculative decode is disabled (pure-decode still works at ~36 tok/s).
+os.environ["FLASHRT_QWEN36_MTP_CKPT_DIR"] = "/path/to/qwen36_fp8_ckpt"
+
+fe = Qwen36TorchFrontendRtx(
+    "/path/to/qwen36_nvfp4",   # prithivMLmods/Qwen3.6-27B-NVFP4
+    quant="nvfp4",
+)
+
+prompt = "Explain quantum entanglement in one short paragraph."
+input_ids = fe._tokenizer(prompt, return_tensors="pt").input_ids.cuda()
+
+out = fe.generate_own_speculative_KN_nvfp4(
+    input_ids, max_new_tokens=256, K=6,   # K=6 peaks at NTOK<=128
+)
+text = fe._tokenizer.decode(out[0, input_ids.shape[1]:].tolist())
+print(text)
+```
+
+For an OpenAI-API-compatible HTTP server (chat completions, drop-in
+replacement for `OpenAI(base_url=...)`), see
+[`examples/qwen36_openai_server.py`](examples/qwen36_openai_server.py):
+
+```bash
+export FLASHRT_QWEN36_MTP_CKPT_DIR=/path/to/qwen36_fp8_ckpt
+python examples/qwen36_openai_server.py \
+    --checkpoint /path/to/qwen36_nvfp4 \
+    --port 8000 --K 6
+# Then: curl http://localhost:8000/v1/chat/completions ...
 ```
 
 ### Framework Choice
