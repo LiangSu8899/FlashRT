@@ -34,8 +34,9 @@ __global__ void absmax_kernel(const T* __restrict__ x, float* max_val, int n) {
     if (threadIdx.x == 0) atomicMax((int*)max_val, __float_as_int(local_max));
 }
 
-FVK_KERNEL_INSTANTIATE(__global__ void absmax_kernel<__half>(const __half*, float*, int))
-FVK_KERNEL_INSTANTIATE(__global__ void absmax_kernel<__nv_bfloat16>(const __nv_bfloat16*, float*, int))
+template __global__ void absmax_kernel<__half>(const __half*, float*, int);
+template __global__ void absmax_kernel<__nv_bfloat16>(const __nv_bfloat16*, float*, int);
+
 // Verbatim production quant_fp8_static_k: 4 elem/thread, packed uint32 store
 __global__ void quantize_fp8_kernel(const __half* in, __nv_fp8_e4m3* out, const float* descale_ptr, int n) {
     int i = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
@@ -71,8 +72,9 @@ __global__ void quantize_fp8_kernel_generic(const T* __restrict__ input,
     }
 }
 
-FVK_KERNEL_INSTANTIATE(__global__ void quantize_fp8_kernel_generic<__half>(const __half*, __nv_fp8_e4m3*, const float*, int))
-FVK_KERNEL_INSTANTIATE(__global__ void quantize_fp8_kernel_generic<__nv_bfloat16>(const __nv_bfloat16*, __nv_fp8_e4m3*, const float*, int))
+template __global__ void quantize_fp8_kernel_generic<__half>(const __half*, __nv_fp8_e4m3*, const float*, int);
+template __global__ void quantize_fp8_kernel_generic<__nv_bfloat16>(const __nv_bfloat16*, __nv_fp8_e4m3*, const float*, int);
+
 float quantize_fp8(const __nv_bfloat16* input, __nv_fp8_e4m3* output,
                    float* d_scale, int n, cudaStream_t stream) {
     float* d_max;
@@ -454,6 +456,242 @@ void quantize_bf16_to_nvfp4_swizzled(const __nv_bfloat16* input, uint8_t* fp4_da
     int smem_size = num_blocks * sizeof(float);
     quantize_bf16_to_nvfp4_swizzled_kernel<<<rows, threads, smem_size, stream>>>(
         input, fp4_data, scale_factors, cols, num_blocks, n_row_blocks, n_col_blocks);
+}
+
+// ================================================================
+// FUSED: rms_norm(x) + nvfp4 swizzled-SF quant.
+// Single kernel replaces (rms_norm_bf16 → quantize_bf16_to_nvfp4_swizzled).
+// Reads input bf16 ONCE, writes packed FP4 + swizzled SF directly.
+//
+// Math (Qwen3.5 RMSNorm with (1+w) precomputed weight):
+//   rms     = rsqrt( mean(x^2) + eps )
+//   normed  = x * rms * weight                 (per-element)
+//   then quantize 16-element blocks of `normed` to NVFP4 e2m1 + UE4M3 SF.
+//
+// Layout: shared memory holds normed BF16 row + per-block scale (UE4M3 →
+// fp32). One thread block per row.
+// ================================================================
+__global__ void rms_norm_to_nvfp4_swizzled_bf16_kernel(
+    const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ rms_weight,    // (D,)
+    uint8_t* __restrict__ packed,                    // (rows, D/2)
+    uint8_t* __restrict__ sf_swz,
+    int cols, int num_blocks, int n_col_blocks,
+    float eps)
+{
+    const int row = blockIdx.x;
+    const __nv_bfloat16* row_in = x + (size_t)row * cols;
+    uint8_t* row_fp4 = packed + (size_t)row * cols / 2;
+
+    // smem layout:
+    //   [0 .. 31]                       warp-reduction scratch (block_reduce_sum)
+    //   [32 .. 32+num_blocks-1]         per-16-element-block fp32 scales
+    //   [32+num_blocks ..]              cols/2 bf16x2 packed normed values
+    extern __shared__ float smem_dyn[];
+    float* warp_red = smem_dyn;
+    float* sf_smem = smem_dyn + 32;
+    __nv_bfloat16* normed = reinterpret_cast<__nv_bfloat16*>(sf_smem + num_blocks);
+
+    // ── Phase 1: sum of squares → RMS ──
+    float local_ssq = 0.f;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        float v = __bfloat162float(row_in[i]);
+        local_ssq += v * v;
+    }
+    float ssq = block_reduce_sum(local_ssq, warp_red);
+    const float rms = rsqrtf(ssq / cols + eps);
+
+    // ── Phase 2: produce normed values into smem (bf16) + per-block amax ──
+    for (int b = threadIdx.x; b < num_blocks; b += blockDim.x)
+        sf_smem[b] = 0.f;
+    __syncthreads();
+
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        float xv = __bfloat162float(row_in[i]);
+        float wv = __bfloat162float(rms_weight[i]);
+        float n_fp32 = xv * rms * wv;
+        __nv_bfloat16 nb = __float2bfloat16(n_fp32);
+        normed[i] = nb;
+        // amax over the bf16-rounded value (matches the unfused path
+        // where rms_norm writes BF16 to global, then quantize reads
+        // BF16 → fp32 → fabsf; bit-equivalent).
+        float n_bf16 = __bfloat162float(nb);
+        int blk = i >> 4;
+        atomicMax((int*)&sf_smem[blk], __float_as_int(fabsf(n_bf16)));
+    }
+    __syncthreads();
+
+    // ── Phase 3: per-block UE4M3 scale → swizzled SF write + dequant for pack ──
+    int rb = row / 128;
+    int ri = row % 128;
+    for (int b = threadIdx.x; b < num_blocks; b += blockDim.x) {
+        float amax = __int_as_float(*(int*)&sf_smem[b]);
+        float scale = amax / 6.0f;
+        uint8_t ue_scale = float_to_ue4m3_ceil(scale);
+
+        int cb = b / 4;
+        int ci = b % 4;
+        int out_idx = (rb * n_col_blocks + cb) * 512
+                      + (ri % 32) * 16 + (ri / 32) * 4 + ci;
+        sf_swz[out_idx] = ue_scale;
+        sf_smem[b] = ue4m3_to_float(ue_scale);
+    }
+    __syncthreads();
+
+    // ── Phase 4: pack normed → FP4 e2m1 (2 per byte) ──
+    int half_cols = cols >> 1;
+    for (int p = threadIdx.x; p < half_cols; p += blockDim.x) {
+        int i = p * 2;
+        int blk = i >> 4;
+        float scale = sf_smem[blk];
+        float inv_scale = (scale > 0.f) ? (1.f / scale) : 0.f;
+
+        float v0 = __bfloat162float(normed[i]) * inv_scale;
+        float v1 = __bfloat162float(normed[i + 1]) * inv_scale;
+        // Same-block always (16-element blocks, pairs are within block).
+        uint8_t lo = float_to_fp4_e2m1(v0);
+        uint8_t hi = float_to_fp4_e2m1(v1);
+        row_fp4[p] = (hi << 4) | (lo & 0x0F);
+    }
+}
+
+void rms_norm_to_nvfp4_swizzled_bf16(
+    const __nv_bfloat16* x, const __nv_bfloat16* rms_weight,
+    uint8_t* packed, uint8_t* sf_swz,
+    int rows, int cols, float eps,
+    cudaStream_t stream)
+{
+    int num_blocks = (cols + 15) / 16;
+    int n_col_blocks = (num_blocks + 3) / 4;
+    int threads = 256;
+    // smem: 32 fp32 reduction scratch + num_blocks fp32 scales + cols bf16 normed
+    size_t smem_size = 32 * sizeof(float)
+                       + num_blocks * sizeof(float)
+                       + cols * sizeof(__nv_bfloat16);
+    rms_norm_to_nvfp4_swizzled_bf16_kernel<<<rows, threads, smem_size, stream>>>(
+        x, rms_weight, packed, sf_swz, cols, num_blocks, n_col_blocks, eps);
+}
+
+// ================================================================
+// FUSED: residual_add(h_in, attn_proj) -> h_post (bf16 written to
+// global) -> rms_norm(h_post, weight) -> nvfp4 packed + swizzled SF.
+// Replaces the (torch.add + rms_norm + quantize_bf16_to_nvfp4_swizzled)
+// 3-launch sequence at every per-layer post-attn transition.
+// Layout mirrors rms_norm_to_nvfp4_swizzled_bf16_kernel (same smem
+// arrangement; same swizzle math).
+// ================================================================
+__global__ void residual_add_rms_norm_to_nvfp4_swizzled_bf16_kernel(
+    const __nv_bfloat16* __restrict__ h_in,
+    const __nv_bfloat16* __restrict__ attn_proj,
+    __nv_bfloat16* __restrict__ h_post,
+    const __nv_bfloat16* __restrict__ rms_weight,    // (D,) precomputed (1+w)
+    uint8_t* __restrict__ packed,                    // (rows, cols/2)
+    uint8_t* __restrict__ sf_swz,
+    int cols, int num_blocks, int n_col_blocks,
+    float eps)
+{
+    const int row = blockIdx.x;
+    const __nv_bfloat16* row_h_in = h_in + (size_t)row * cols;
+    const __nv_bfloat16* row_attn = attn_proj + (size_t)row * cols;
+    __nv_bfloat16* row_h_post = h_post + (size_t)row * cols;
+    uint8_t* row_fp4 = packed + (size_t)row * cols / 2;
+
+    // smem: same layout as rms_norm_to_nvfp4_swizzled_bf16_kernel
+    extern __shared__ float smem_dyn[];
+    float* warp_red = smem_dyn;
+    float* sf_smem = smem_dyn + 32;
+    __nv_bfloat16* normed = reinterpret_cast<__nv_bfloat16*>(
+        sf_smem + num_blocks);
+
+    // ── Phase 1: residual sum + ssq, write h_post bf16 + accumulate ssq ──
+    float local_ssq = 0.f;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        float a = __bfloat162float(row_h_in[i]);
+        float b = __bfloat162float(row_attn[i]);
+        float r_fp32 = a + b;
+        // Write h_post in bf16 (downstream MLP residual reads this; the
+        // round here matches the unfused torch.add bf16 output exactly).
+        __nv_bfloat16 r_bf = __float2bfloat16(r_fp32);
+        row_h_post[i] = r_bf;
+        // ssq computed over bf16-rounded value (matches unfused path
+        // where rms_norm reads bf16-rounded residual from global).
+        float r_bf_fp32 = __bfloat162float(r_bf);
+        local_ssq += r_bf_fp32 * r_bf_fp32;
+    }
+    float ssq = block_reduce_sum(local_ssq, warp_red);
+    const float rms = rsqrtf(ssq / cols + eps);
+
+    // ── Phase 2: produce normed (bf16) into smem + per-block amax ──
+    for (int b = threadIdx.x; b < num_blocks; b += blockDim.x)
+        sf_smem[b] = 0.f;
+    __syncthreads();
+
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) {
+        // Re-read the bf16 residual we just wrote (avoids holding fp32
+        // sum in regs across the block-reduction).
+        float xv = __bfloat162float(row_h_post[i]);
+        float wv = __bfloat162float(rms_weight[i]);
+        float n_fp32 = xv * rms * wv;
+        __nv_bfloat16 nb = __float2bfloat16(n_fp32);
+        normed[i] = nb;
+        float n_bf16 = __bfloat162float(nb);
+        int blk = i >> 4;
+        atomicMax((int*)&sf_smem[blk], __float_as_int(fabsf(n_bf16)));
+    }
+    __syncthreads();
+
+    // ── Phase 3: per-block UE4M3 SF + swizzled write ──
+    int rb = row / 128;
+    int ri = row % 128;
+    for (int b = threadIdx.x; b < num_blocks; b += blockDim.x) {
+        float amax = __int_as_float(*(int*)&sf_smem[b]);
+        float scale = amax / 6.0f;
+        uint8_t ue_scale = float_to_ue4m3_ceil(scale);
+
+        int cb = b / 4;
+        int ci = b % 4;
+        int out_idx = (rb * n_col_blocks + cb) * 512
+                      + (ri % 32) * 16 + (ri / 32) * 4 + ci;
+        sf_swz[out_idx] = ue_scale;
+        sf_smem[b] = ue4m3_to_float(ue_scale);
+    }
+    __syncthreads();
+
+    // ── Phase 4: pack normed → FP4 e2m1 (2 per byte) ──
+    int half_cols = cols >> 1;
+    for (int p = threadIdx.x; p < half_cols; p += blockDim.x) {
+        int i = p * 2;
+        int blk = i >> 4;
+        float scale = sf_smem[blk];
+        float inv_scale = (scale > 0.f) ? (1.f / scale) : 0.f;
+
+        float v0 = __bfloat162float(normed[i]) * inv_scale;
+        float v1 = __bfloat162float(normed[i + 1]) * inv_scale;
+        uint8_t lo = float_to_fp4_e2m1(v0);
+        uint8_t hi = float_to_fp4_e2m1(v1);
+        row_fp4[p] = (hi << 4) | (lo & 0x0F);
+    }
+}
+
+void residual_add_rms_norm_to_nvfp4_swizzled_bf16(
+    const __nv_bfloat16* h_in,
+    const __nv_bfloat16* attn_proj,
+    __nv_bfloat16* h_post,
+    const __nv_bfloat16* rms_weight,
+    uint8_t* packed, uint8_t* sf_swz,
+    int rows, int cols, float eps,
+    cudaStream_t stream)
+{
+    int num_blocks = (cols + 15) / 16;
+    int n_col_blocks = (num_blocks + 3) / 4;
+    int threads = 256;
+    size_t smem_size = 32 * sizeof(float)
+                       + num_blocks * sizeof(float)
+                       + cols * sizeof(__nv_bfloat16);
+    residual_add_rms_norm_to_nvfp4_swizzled_bf16_kernel
+        <<<rows, threads, smem_size, stream>>>(
+            h_in, attn_proj, h_post, rms_weight,
+            packed, sf_swz, cols, num_blocks, n_col_blocks, eps);
 }
 
 // ================================================================

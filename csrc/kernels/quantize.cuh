@@ -51,6 +51,31 @@ void quantize_bf16_to_nvfp4_swizzled(const __nv_bfloat16* input, uint8_t* fp4_da
                                        uint8_t* scale_factors, int rows, int cols,
                                        cudaStream_t stream = 0);
 
+// Fused: rms_norm(x, weight) -> nvfp4 packed + swizzled SF (Qwen3.5 (1+w)
+// convention; weight is the precomputed (1+w) tensor).
+void rms_norm_to_nvfp4_swizzled_bf16(
+    const __nv_bfloat16* x, const __nv_bfloat16* rms_weight,
+    uint8_t* packed, uint8_t* sf_swz,
+    int rows, int cols, float eps,
+    cudaStream_t stream = 0);
+
+// Fused: h_post = h_in + attn_proj; rms_norm(h_post, weight) -> nvfp4
+// packed + swizzled SF. The h_post bf16 buffer is also written to
+// global memory because the post-MLP residual addition needs it.
+//
+// Replaces the (torch.add + rms_norm + quantize_bf16_to_nvfp4_swizzled)
+// 3-launch sequence at every per-layer post-attn / post-MLP transition.
+// Bit-equivalent to the unfused sequence under the same bf16 rounding
+// model (residual sum -> bf16 round -> ssq + amax over bf16 values).
+void residual_add_rms_norm_to_nvfp4_swizzled_bf16(
+    const __nv_bfloat16* h_in,
+    const __nv_bfloat16* attn_proj,
+    __nv_bfloat16* h_post,
+    const __nv_bfloat16* rms_weight,
+    uint8_t* packed, uint8_t* sf_swz,
+    int rows, int cols, float eps,
+    cudaStream_t stream = 0);
+
 void quantize_bf16_to_mxfp8(const __nv_bfloat16* input, __nv_fp8_e4m3* fp8_data,
                               uint8_t* scale_factors, int rows, int cols,
                               cudaStream_t stream = 0);

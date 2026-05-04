@@ -235,6 +235,57 @@ if(ENABLE_SM100_CUTLASS)
   message(STATUS "libfmha_fp16_strided.so: building for sm_${GPU_ARCH} (Thor FMHA for SigLIP)")
 endif()
 
+# ── CUTLASS SM120a block-128 FP8 GEMM (Path B for Qwen3.6) ──
+# DeepSeek-V3 layout: per-token activation x 128x128 weight block scale.
+# Built from CUTLASS 4.x example 87b, requires sm_120a (SM120 with the
+# 'a' arch-accelerated suffix that enables F8F6F4 MMA + TMA SM120).
+if(GPU_ARCH STREQUAL "120")
+  add_library(cutlass_sm120_block_obj OBJECT
+    csrc/gemm/cutlass_sm120_block128_fp8_gemm.cu)
+  set_target_properties(cutlass_sm120_block_obj PROPERTIES
+    CUDA_STANDARD 17
+    POSITION_INDEPENDENT_CODE ON
+  )
+  target_include_directories(cutlass_sm120_block_obj PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm
+    ${CUTLASS_INCLUDE}
+    ${CUTLASS_DIR}/tools/util/include
+  )
+  target_compile_options(cutlass_sm120_block_obj PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr -O3 --use_fast_math
+      ${GPU_GENCODE}
+    >
+  )
+  message(STATUS "SM120a CUTLASS block-128 FP8: ENABLED")
+endif()
+
+# ── CUTLASS SM120a NVFP4 W4A16 GEMM (Qwen3.6 NVFP4 ckpt) ──
+# Block-scaled FP4 e2m1 weights × FP4 e2m1 act (post quant) × FP8 ue4m3
+# group scales × BF16 output. Ported from NVIDIA unit test
+# sm120_bs_gemm_nvf4_nvf4_f32_bf16.cu — sm_120a / sm_121a.
+if(GPU_ARCH STREQUAL "120")
+  add_library(cutlass_nvfp4_w4a16_sm120_obj OBJECT
+    csrc/gemm/fp4/cutlass_nvfp4_w4a16_gemm_sm120.cu)
+  set_target_properties(cutlass_nvfp4_w4a16_sm120_obj PROPERTIES
+    CUDA_STANDARD 17
+    POSITION_INDEPENDENT_CODE ON
+  )
+  target_include_directories(cutlass_nvfp4_w4a16_sm120_obj PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm/fp4
+    ${CUTLASS_INCLUDE}
+    ${CUTLASS_DIR}/tools/util/include
+  )
+  target_compile_options(cutlass_nvfp4_w4a16_sm120_obj PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr -O3 --use_fast_math
+      ${GPU_GENCODE}
+    >
+  )
+  message(STATUS "SM120a CUTLASS NVFP4 W4A16 GEMM: ENABLED")
+endif()
+
 # ── CUTLASS block-scaled kernels (sm_120a only) ──
 if(ENABLE_NVFP4)
   add_library(gemm_kernels_obj OBJECT csrc/gemm/gemm_kernels.cu)
@@ -440,6 +491,20 @@ pybind11_add_module(flash_rt_kernels
   csrc/kernels/decoder_fused.cu
   csrc/kernels/dit_bf16.cu
   csrc/kernels/attention_dit_bf16.cu
+  csrc/quantize/fp8_block128_dequant.cu
+  csrc/quantize/fp8_block128_to_nvfp4_swizzled.cu
+  csrc/quantize/bf16_weight_to_nvfp4_swizzled.cu
+  csrc/quantize/fp8_per_token_block_quant.cu
+  csrc/quantize/tq_dequant_kv.cu
+  csrc/quantize/wmma_probe.cu
+  csrc/quantize/tq_dequant_cutlass.cu
+  csrc/gemm/fp8_block128_gemm.cu
+  csrc/kernels/causal_conv1d_qwen36.cu
+  csrc/kernels/gated_deltanet_qwen36.cu
+  csrc/kernels/rms_norm_gated_silu_qwen36.cu
+  csrc/kernels/silu_mul_qwen36.cu
+  csrc/kernels/bf16_matvec_qwen36.cu
+  csrc/kernels/bf16_matmul_qwen36.cu
   csrc/attention/fmha_dispatch.cu
   csrc/bindings.cpp
 )
@@ -455,6 +520,23 @@ endif()
 if(ENABLE_NVFP4)
   target_sources(flash_rt_kernels PRIVATE $<TARGET_OBJECTS:gemm_kernels_obj>)
   target_compile_definitions(flash_rt_kernels PRIVATE ENABLE_NVFP4=1)
+endif()
+
+# SM120a CUTLASS block-128 FP8 GEMM (Path B for Qwen3.6).
+if(GPU_ARCH STREQUAL "120")
+  target_sources(flash_rt_kernels PRIVATE
+    $<TARGET_OBJECTS:cutlass_sm120_block_obj>)
+  target_compile_definitions(flash_rt_kernels PRIVATE
+    ENABLE_CUTLASS_SM120_BLOCK_FP8=1)
+endif()
+
+# SM120a CUTLASS NVFP4 W4A16 GEMM (Qwen3.6 NVFP4 ckpt path).
+if(GPU_ARCH STREQUAL "120")
+  target_sources(flash_rt_kernels PRIVATE
+    $<TARGET_OBJECTS:cutlass_nvfp4_w4a16_sm120_obj>
+    csrc/quantize/nvfp4_sf_reshape_sm120.cu)
+  target_compile_definitions(flash_rt_kernels PRIVATE
+    ENABLE_CUTLASS_SM120_NVFP4_W4A16=1)
 endif()
 
 # (ENABLE_FA2 object-lib is linked into flash_rt_fa2.so only — see

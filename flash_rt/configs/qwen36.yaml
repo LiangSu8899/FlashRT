@@ -1,0 +1,68 @@
+# FlashRT — Qwen3.6-27B (architecture name: qwen3_5)
+# Hybrid Gated-DeltaNet + softmax-attention transformer with FP8 weights.
+#
+# Note: The model is publicly branded "Qwen3.6" but its config.json registers
+# architectures=Qwen3_5ForConditionalGeneration / model_type=qwen3_5. We follow
+# the public brand name (qwen36) for FlashRT's own naming so future readers
+# match the checkpoint folder.
+name: qwen36
+
+# ── Backbone family ──
+backbone_type: qwen36_hybrid     # 48 linear-attn + 16 full-attn, every-4 pattern
+backbone_hidden: 5120
+
+# ── Language model (decoder-only) ──
+llm:
+  type: qwen36
+  hidden_dim: 5120
+  num_layers: 64                 # 64 = 48 linear_attention + 16 full_attention
+  full_attn_period: 4            # full attn at indices 3, 7, 11, ..., 63
+  vocab_size: 248320
+
+  # Full-attn layers (16 of them)
+  full_attn:
+    num_q_heads: 24
+    num_kv_heads: 4              # GQA 6:1
+    head_dim: 256
+    has_output_gate: true
+    rope_theta: null             # set from config.text_config.rope_theta at load time
+
+  # Linear-attn layers (48 of them) — Gated DeltaNet
+  linear_attn:
+    num_k_heads: 16
+    num_v_heads: 48
+    head_dim: 128
+    conv_kernel_size: 4
+
+  # MLP (dense SwiGLU on every layer; not MoE despite shared_expert_gate naming)
+  mlp:
+    intermediate_dim: 17408
+    activation: silu             # true SiLU (NOT GELU/GEGLU); use silu_mul_split_*
+
+  # Multi-token prediction head (1 layer of full attn)
+  mtp:
+    num_layers: 1
+    use_dedicated_embeddings: false
+
+# ── Vision tower (only used in multimodal path; Phase 5 work) ──
+vision:
+  type: qwen36_vit
+  hidden_dim: 1152
+  num_blocks: 27
+  num_heads: 16
+  patch_size: 16
+  out_hidden_size: 5120
+
+# ── Quantization ──
+quant:
+  weights: fp8_e4m3              # block-128 scaled
+  weight_block: [128, 128]
+  activations: fp8_e4m3_dynamic  # dynamic per-token
+  # Modules kept in BF16 (not FP8): embeddings, lm_head, all visual blocks,
+  # linear_attn.{A_log, conv1d, dt_bias, in_proj_a, in_proj_b}, all layernorms,
+  # MTP self_attn projections. Full list at config.json:quantization_config.modules_to_not_convert.
+
+# ── KV cache budget ──
+kv_cache:
+  max_seq_len: 8192              # only the 16 full-attn layers grow KV
+  full_attn_layer_count: 16
