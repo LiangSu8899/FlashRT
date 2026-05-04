@@ -112,9 +112,6 @@ spec stats: K=6  attempts=31  p_full=0.290  p_ind=0.522  AL=4.10
 `AL=4.10` means each spec cycle emits 4.1 tokens on average; `p_full`
 is the fraction of cycles where the full draft chain is accepted.
 
-Pre-session baseline (post-α-S3, K=3 default) on the same prompt:
-**92.10 tok/s**. v1 release improvement: **+39.9%**.
-
 ## 3. Choosing `K` (speculative chain length)
 
 `K` is the MTP draft chain length per spec cycle. Verify processes
@@ -124,12 +121,12 @@ right `K` depends on prompt distribution and target output length.
 ### Measured K-curve (single prompt, NTOK=128)
 
 ```
- K   decode tok/s   AL    p_ind   vs original 92.10
- 3   119.23         3.17  0.733   +29.5%
- 4   112.68         3.17  0.556   +22.4%   (drafter trough)
- 5   124.15         3.74  0.559   +34.8%
- 6   129.44         4.10  0.522   +40.5%   ★ peak (NTOK=128)
- 7   119.16         3.97  0.429   +29.4%   (rolls off)
+ K   decode tok/s   AL    p_ind
+ 3   119.23         3.17  0.733
+ 4   112.68         3.17  0.556   (drafter trough)
+ 5   124.15         3.74  0.559
+ 6   129.44         4.10  0.522   ★ peak (NTOK=128)
+ 7   119.16         3.97  0.429   (rolls off)
 ```
 
 Why `K=6` wins at NTOK=128: AL keeps growing through `K=6` faster than
@@ -299,27 +296,4 @@ HF_HUB_OFFLINE=1
 TRANSFORMERS_OFFLINE=1
 ```
 
-`internal-tests/` is gitignored — these probe scripts ship as part of
-the v1 release for reproduction but are dev-local.
-
-## 7. Optimization history (this release vs prior)
-
-```
-phase                                            decode tok/s  Δ
-α-S3 baseline (CUTLASS EVT dequant, K=3)            92.10      —
-A2c-2 fuse in_proj_a/b BF16 matvec                  92.40      +0.3%
-A1'-S0 per-step lin state save + skip recovery     117.62      +27.7%
-A2c-3 chained per-step state via in/out kernels    119.24      +29.5%
-A1'-S1 K_save_max=8 + spec K=6 default             128.87      +39.9%
-```
-
-The biggest single lever was eliminating the partial-accept recovery
-forward (A1'-S0): the spec loop's `restore + recovery forward` path
-fired on ~43% of cycles and cost ~21 ms each. By saving the lin/conv
-state at every step **inside** the verify K-iter recurrent loop, the
-spec loop reads the correct state directly on partial accept — no
-recovery forward needed. This collapsed average cycle time from 34.4
-ms to 27.0 ms.
-
-Detailed per-commit notes are in the `git log` for commits `ea2be34`,
-`1825d93`, `372b37c`, `a1e59e1`, `1d4e102` on `feat/qwen36-integration`.
+`internal-tests/` is gitignored — micro-bench probes are dev-local.
