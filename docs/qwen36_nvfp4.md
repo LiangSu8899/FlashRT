@@ -2,9 +2,52 @@
 
 This document covers the FlashRT NVFP4 inference path for Qwen3.6-27B,
 including model dependencies, the speculative-decode `K` selection, real
-measured throughput data, and reproduction commands. Numbers come from
-the v1 release on `feat/qwen36-integration` (commit `1d4e102`),
-RTX 5090 (sm_120, 32 GB HBM, BW 1.79 TB/s).
+measured throughput data, and reproduction commands. Numbers in this
+doc were measured on RTX 5090 (sm_120, 32 GB HBM, BW 1.79 TB/s).
+
+For the full per-parameter API reference (constructor, generate args,
+env vars), see [`qwen36_usage.md`](qwen36_usage.md). For an OpenAI-API
+compatible HTTP server, see
+[`examples/qwen36_openai_server.py`](../examples/qwen36_openai_server.py).
+
+## 0. Quickstart
+
+The minimum to run Qwen3.6-27B NVFP4 with K=6 speculative decode at
+~129 tok/s decode on RTX 5090. Step 1 is one-time; step 2 is the
+inference call.
+
+```python
+# 1) Build the kernels (one-time, from the FlashRT repo root)
+#    cmake -S . -B build && cmake --build build -j --target flash_rt_kernels
+#    flash_rt_kernels*.so lands directly in flash_rt/ — no manual cp.
+
+# 2) Inference
+import os, torch
+from flash_rt.frontends.torch.qwen36_rtx import Qwen36TorchFrontendRtx
+
+# Tell the frontend where to find the FP8 ckpt's mtp.safetensors
+# (see §1 below on why).
+os.environ['FLASHRT_QWEN36_MTP_CKPT_DIR'] = '<path-to-FP8-ckpt-dir>'
+
+fe = Qwen36TorchFrontendRtx(
+    '<path-to-NVFP4-ckpt-dir>',   # prithivMLmods/Qwen3.6-27B-NVFP4
+    quant='nvfp4',
+)
+
+prompt = 'Explain quantum entanglement in one short paragraph.'
+input_ids = fe._tokenizer(prompt, return_tensors='pt').input_ids.cuda()
+
+out = fe.generate_own_speculative_KN_nvfp4(
+    input_ids, max_new_tokens=256, K=6,
+)
+
+text = fe._tokenizer.decode(out[0, input_ids.shape[1]:].tolist())
+print(text)
+```
+
+`K=6` is the recommended default (peaks at ~129 tok/s decode on RTX
+5090 for short prompts). For sustained / long generations, drop to
+`K=5` or `K=3` — see §3 for the full curve.
 
 ## 1. Model dependencies
 

@@ -1,0 +1,337 @@
+#!/usr/bin/env python3
+"""
+FlashRT — Qwen3.6-27B NVFP4 OpenAI-compatible HTTP server.
+
+Serves the /v1/chat/completions endpoint backed by the FlashRT NVFP4
+inference path. Clients targeting the OpenAI API can swap their base
+URL to this server without code changes.
+
+Usage:
+    pip install fastapi uvicorn
+
+    # Required env: paired FP8 ckpt dir for the MTP head.
+    export FLASHRT_QWEN36_MTP_CKPT_DIR=/path/to/qwen36_fp8_ckpt
+
+    python examples/qwen36_openai_server.py \\
+        --checkpoint /path/to/qwen36_nvfp4 \\
+        --port 8000 \\
+        --K 6
+
+    # Test (non-streaming):
+    curl http://localhost:8000/v1/chat/completions \\
+        -H "Content-Type: application/json" \\
+        -d '{
+              "model": "qwen3.6-27b-nvfp4",
+              "messages": [{"role": "user", "content": "Hello!"}],
+              "max_tokens": 128,
+              "stream": false
+            }'
+
+    # OpenAI Python client:
+    #   from openai import OpenAI
+    #   client = OpenAI(base_url="http://localhost:8000/v1", api_key="-")
+    #   resp = client.chat.completions.create(
+    #       model="qwen3.6-27b-nvfp4",
+    #       messages=[{"role": "user", "content": "Hi"}],
+    #       max_tokens=128,
+    #   )
+
+Limits in v1 (see docs/qwen36_usage.md):
+    * Batch size 1 (concurrent requests are serialized; do not run
+      multiple workers against one GPU).
+    * Greedy decode only — temperature / top_p / top_k / n / seed
+      / stop / logit_bias are accepted but ignored.
+    * stream=True returns one chunk with the full response (true
+      token-by-token streaming requires a frontend modification).
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import logging
+import os
+import sys
+import time
+import uuid
+from typing import Any, Dict, List, Optional
+
+# ────────────────────────────────────────────────────────────────────
+# Logger
+# ────────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+)
+log = logging.getLogger('qwen36_openai_server')
+
+
+# ────────────────────────────────────────────────────────────────────
+# Frontend wrapper
+# ────────────────────────────────────────────────────────────────────
+class Qwen36Engine:
+    """Thin wrapper around Qwen36TorchFrontendRtx with chat-template
+    rendering and a single-request lock (batch=1 only)."""
+
+    def __init__(self, checkpoint: str, *, K: int, max_seq: int,
+                 device: str, model_name: str):
+        import torch
+        from flash_rt.frontends.torch.qwen36_rtx import (
+            Qwen36TorchFrontendRtx,
+        )
+
+        log.info('loading NVFP4 ckpt from %s ...', checkpoint)
+        t0 = time.perf_counter()
+        self.fe = Qwen36TorchFrontendRtx(
+            checkpoint, quant='nvfp4',
+            device=device, max_seq=max_seq,
+        )
+        log.info('loaded in %.1f s', time.perf_counter() - t0)
+        self.K = int(K)
+        self.model_name = model_name
+        self.lock = asyncio.Lock()
+        self._torch = torch
+
+        if self.fe._weights.ptrs.get('mtp') is None:
+            log.warning(
+                'MTP head not loaded (FLASHRT_QWEN36_MTP_CKPT_DIR '
+                'unset?) — speculative decode disabled. The server '
+                'will fall back to single-token decode (~36 tok/s).')
+            self.spec_enabled = False
+        else:
+            self.spec_enabled = True
+            log.info('MTP head loaded; spec K=%d enabled', self.K)
+
+    def _render_chat(self, messages: List[Dict[str, str]]) -> str:
+        """Apply Qwen's chat template to a list of {role, content}."""
+        return self.fe._tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+        )
+
+    async def generate(
+        self,
+        messages: List[Dict[str, str]],
+        max_tokens: int,
+    ) -> Dict[str, Any]:
+        """Run one chat-completion. Returns a dict with the new
+        text and basic timing/stat fields."""
+        torch = self._torch
+        async with self.lock:
+            prompt = self._render_chat(messages)
+            input_ids = self.fe._tokenizer(
+                prompt, return_tensors='pt').input_ids.cuda()
+            prompt_len = int(input_ids.shape[1])
+
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            if self.spec_enabled:
+                out = self.fe.generate_own_speculative_KN_nvfp4(
+                    input_ids, max_new_tokens=max_tokens, K=self.K,
+                )
+            else:
+                out = self._single_token_decode(input_ids, max_tokens)
+            torch.cuda.synchronize()
+            wall_s = time.perf_counter() - t0
+
+            new_tokens = out[0, prompt_len:].tolist()
+            text = self.fe._tokenizer.decode(
+                new_tokens, skip_special_tokens=True)
+
+            return {
+                'text': text,
+                'prompt_tokens': prompt_len,
+                'completion_tokens': len(new_tokens),
+                'wall_s': wall_s,
+                'tok_per_s': len(new_tokens) / wall_s if wall_s else 0,
+            }
+
+    def _single_token_decode(self, input_ids, max_tokens):
+        """Fallback when MTP is not loaded. Slower path (~36 tok/s)."""
+        torch = self._torch
+        fe = self.fe
+        fe.reset_state()
+        if not hasattr(fe, '_rope_cos_table'):
+            fe._build_rope_table()
+
+        prompt_len = int(input_ids.shape[1])
+        generated = list(input_ids[0].tolist())
+        cur_pos = 0
+        with torch.no_grad():
+            for p in range(prompt_len):
+                fe._static_token_id.copy_(input_ids[:, p:p + 1])
+                cos, sin = fe._rope_cos_sin(cur_pos)
+                fe.forward_own_decode_nvfp4(
+                    fe._static_token_id, cos, sin, cur_pos)
+                cur_pos += 1
+            for _ in range(max_tokens):
+                tok = fe._logits_buf.argmax(
+                    dim=-1, keepdim=True).view(1, 1)
+                generated.append(int(tok.item()))
+                fe._static_token_id.copy_(tok)
+                cos, sin = fe._rope_cos_sin(cur_pos)
+                fe.forward_own_decode_nvfp4(
+                    fe._static_token_id, cos, sin, cur_pos)
+                cur_pos += 1
+        return torch.tensor([generated], device='cuda')
+
+
+# ────────────────────────────────────────────────────────────────────
+# OpenAI-compatible HTTP layer (FastAPI)
+# ────────────────────────────────────────────────────────────────────
+def build_app(engine: Qwen36Engine):
+    from fastapi import FastAPI, HTTPException
+    from fastapi.responses import StreamingResponse
+
+    app = FastAPI(title='FlashRT Qwen3.6 NVFP4 OpenAI-compatible server')
+
+    @app.get('/v1/models')
+    async def list_models():
+        return {
+            'object': 'list',
+            'data': [{
+                'id': engine.model_name,
+                'object': 'model',
+                'created': int(time.time()),
+                'owned_by': 'flash-rt',
+            }],
+        }
+
+    @app.post('/v1/chat/completions')
+    async def chat_completions(req: Dict[str, Any]):
+        messages = req.get('messages')
+        if not messages or not isinstance(messages, list):
+            raise HTTPException(400, 'messages is required')
+        max_tokens = int(req.get('max_tokens') or 256)
+        stream = bool(req.get('stream', False))
+        # Validate roles — Qwen template accepts system/user/assistant.
+        for m in messages:
+            if m.get('role') not in ('system', 'user', 'assistant'):
+                raise HTTPException(
+                    400, f'unsupported role: {m.get("role")!r}')
+            if not isinstance(m.get('content'), str):
+                raise HTTPException(
+                    400, 'message.content must be a string')
+
+        result = await engine.generate(messages, max_tokens)
+        completion_id = f'chatcmpl-{uuid.uuid4().hex[:24]}'
+        created = int(time.time())
+
+        log.info(
+            'chat.completions: %d -> %d tokens in %.2fs (%.1f tok/s)',
+            result['prompt_tokens'],
+            result['completion_tokens'],
+            result['wall_s'],
+            result['tok_per_s'],
+        )
+
+        usage = {
+            'prompt_tokens': result['prompt_tokens'],
+            'completion_tokens': result['completion_tokens'],
+            'total_tokens': (result['prompt_tokens']
+                             + result['completion_tokens']),
+        }
+
+        if stream:
+            # We don't have token-by-token streaming yet (v1 limit);
+            # emit the full message in one delta then [DONE]. Clients
+            # that target streaming will see one big chunk.
+            async def gen():
+                first = {
+                    'id': completion_id,
+                    'object': 'chat.completion.chunk',
+                    'created': created,
+                    'model': engine.model_name,
+                    'choices': [{
+                        'index': 0,
+                        'delta': {
+                            'role': 'assistant',
+                            'content': result['text'],
+                        },
+                        'finish_reason': None,
+                    }],
+                }
+                yield f'data: {json.dumps(first)}\n\n'
+                last = {
+                    'id': completion_id,
+                    'object': 'chat.completion.chunk',
+                    'created': created,
+                    'model': engine.model_name,
+                    'choices': [{
+                        'index': 0,
+                        'delta': {},
+                        'finish_reason': 'stop',
+                    }],
+                    'usage': usage,
+                }
+                yield f'data: {json.dumps(last)}\n\n'
+                yield 'data: [DONE]\n\n'
+
+            return StreamingResponse(gen(), media_type='text/event-stream')
+
+        return {
+            'id': completion_id,
+            'object': 'chat.completion',
+            'created': created,
+            'model': engine.model_name,
+            'choices': [{
+                'index': 0,
+                'message': {
+                    'role': 'assistant',
+                    'content': result['text'],
+                },
+                'finish_reason': 'stop',
+            }],
+            'usage': usage,
+        }
+
+    @app.get('/health')
+    async def health():
+        return {'status': 'ok', 'model': engine.model_name,
+                'spec_enabled': engine.spec_enabled,
+                'K': engine.K}
+
+    return app
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument('--checkpoint', required=True,
+                   help='Path to NVFP4 main ckpt (compressed-tensors).')
+    p.add_argument('--port', type=int, default=8000)
+    p.add_argument('--host', default='0.0.0.0')
+    p.add_argument('--K', type=int, default=6,
+                   help='MTP draft chain length per spec cycle. '
+                   'Default 6 (peak for short generations on RTX 5090).')
+    p.add_argument('--max-seq', type=int, default=2048,
+                   help='KV cache + scratch dim. Increase for long ctx.')
+    p.add_argument('--device', default='cuda:0')
+    p.add_argument('--model-name', default='qwen3.6-27b-nvfp4',
+                   help='Identifier returned by /v1/models and echoed '
+                   'in completion responses.')
+    args = p.parse_args()
+
+    if 'FLASHRT_QWEN36_MTP_CKPT_DIR' not in os.environ:
+        log.warning(
+            'FLASHRT_QWEN36_MTP_CKPT_DIR is not set — speculative '
+            'decode will be disabled and tok/s will fall to ~36. See '
+            'docs/qwen36_usage.md for the FP8 ckpt requirement.')
+
+    try:
+        import uvicorn
+    except ImportError:
+        sys.exit('uvicorn is required: pip install uvicorn fastapi')
+
+    engine = Qwen36Engine(
+        checkpoint=args.checkpoint,
+        K=args.K,
+        max_seq=args.max_seq,
+        device=args.device,
+        model_name=args.model_name,
+    )
+    app = build_app(engine)
+    uvicorn.run(app, host=args.host, port=args.port,
+                log_level='warning')
+
+
+if __name__ == '__main__':
+    main()
