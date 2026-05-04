@@ -4,7 +4,7 @@
 
 A general kernel library composed into static graphs — no ONNX export, no engine compilation, no per-driver rebuild. Hand-written kernels (norm / activation / fusion / RoPE / FP8 / NVFP4 GEMM / attention) cover standard transformer, DiT, and SigLIP primitives. The composition pattern itself is hardware-agnostic; today the codebase ships with NVIDIA implementations spanning edge to server (Jetson AGX Thor through A100 / RTX 4090 / 5090).
 
-The flagship integration today is **VLA control** — production frontends for Pi0, Pi0.5, GROOT N1.6, and Pi0-FAST, validated on LIBERO. The same kernel set also powers the BAGEL world-model image-generation pipeline (research preview) and audio / video generation (4× over PyTorch). FlashRT now also serves **single-stream LLM inference** — the v1 release ships **Qwen3.6-27B (NVFP4)** at **129 tok/s decode** with **256 K context on a single RTX 5090** and an OpenAI-compatible HTTP server. The pattern is workload-shaped (small-batch realtime), not model-class-shaped.
+The flagship integration today is **VLA control** — production frontends for Pi0, Pi0.5, GROOT N1.6, and Pi0-FAST, validated on LIBERO. The same kernel set also powers the BAGEL world-model image-generation pipeline (research preview) and audio / video generation (4× over PyTorch). FlashRT now also serves **single-stream LLM inference** — the v1 release ships **Qwen3.6-27B (NVFP4)** with **256 K context on a single RTX 5090**, an OpenAI-compatible HTTP server, and decode throughput of **~100 tok/s typical / 129 tok/s peak** (real warm-state range across mixed chat / reasoning / code prompts; see [Performance](#performance) for the breakdown). The pattern is workload-shaped (small-batch realtime), not model-class-shaped.
 
 Existing inference tooling is shaped for different workloads — TensorRT for tactic-search compile to frozen engines, vLLM / SGLang for high-batch LLM serving. FlashRT targets the small-batch realtime cell with hand-tuned kernels and no compile step.
 
@@ -27,7 +27,7 @@ Existing inference tooling is shaped for different workloads — TensorRT for ta
 ## FlashRT supports:
 
 - **VLA models**: Pi0, Pi0.5, GROOT N1.6, Pi0-FAST — all production-validated on LIBERO. BAGEL world-model (research preview) — image-gen pipeline at ~4× vs PyTorch.
-- **LLM**: **Qwen3.6-27B NVFP4 — 129 tok/s decode, 256 K context, single RTX 5090** — speculative decoding via the FP8 ckpt's MTP head, OpenAI-compatible HTTP server.
+- **LLM**: **Qwen3.6-27B NVFP4 — ~100 tok/s typical / 129 tok/s peak decode, 256 K context, single RTX 5090** — speculative decoding via the FP8 ckpt's MTP head, OpenAI-compatible HTTP server.
 - **Hardware (today)**: NVIDIA Jetson AGX Thor (SM110), RTX 5090 (SM120), RTX 4090 (SM89), and SM80 / SM86 / SM89 cards (A100, RTX 3090, 4060 Ti, etc.). The kernel composition pattern is portable to other accelerators.
 - **Frameworks**: PyTorch (safetensors) + JAX (Orbax) — same compiled kernels
 
@@ -70,7 +70,7 @@ First call: ~3 s (calibration + CUDA Graph capture). Every subsequent call: 44 m
 |---|---|
 | **Run your first inference** | [Build & install](#build--install) — Docker and native Linux paths |
 | **See API examples for all 4 VLA models + the Qwen3.6 LLM** | [API snippets](#api-snippets) |
-| **Run Qwen3.6-27B NVFP4 (LLM, 129 tok/s on RTX 5090)** | [`docs/qwen36_nvfp4.md`](docs/qwen36_nvfp4.md) — quickstart, K selection, measured throughput · [`docs/qwen36_usage.md`](docs/qwen36_usage.md) — full parameter reference · [`examples/qwen36_openai_server.py`](examples/qwen36_openai_server.py) — OpenAI-compatible HTTP server |
+| **Run Qwen3.6-27B NVFP4 (LLM, ~100 tok/s typical / 129 tok/s peak on RTX 5090)** | [`docs/qwen36_nvfp4.md`](docs/qwen36_nvfp4.md) — quickstart, K selection, measured throughput · [`docs/qwen36_usage.md`](docs/qwen36_usage.md) — full parameter reference · [`examples/qwen36_openai_server.py`](examples/qwen36_openai_server.py) — OpenAI-compatible HTTP server |
 | **Look up the stable Python API surface** | [`docs/stable_api.md`](docs/stable_api.md) |
 | **Integrate a new model into FlashRT** | [`docs/adding_new_model.md`](docs/adding_new_model.md) — end-to-end walkthrough; external plugin pattern in [`docs/plugin_model_template.md`](docs/plugin_model_template.md) |
 | **Understand the architecture** | [`docs/architecture.md`](docs/architecture.md) — the 8 infrastructure components and how they compose |
@@ -106,14 +106,41 @@ First call: ~3 s (calibration + CUDA Graph capture). Every subsequent call: 44 m
 Single-stream chat-completion latency. NVFP4 W4A16 main weights +
 FP8→NVFP4-converted MTP head for K-step speculative decoding. All
 numbers are decode-only tok/s (excluding prefill); same metric vLLM
-and TensorRT-LLM report. Measured on the standard prompt (`"Explain
-quantum entanglement in one short paragraph."`, 11 prompt tokens) at
-output length 128.
+and TensorRT-LLM report.
 
-| Configuration | Decode latency | Throughput | Notes |
-|---|---|---|---|
-| **Qwen3.6-27B NVFP4** + spec K=3 | **8.49 ms/token** | **117.8 tok/s** | conservative default |
-| **Qwen3.6-27B NVFP4** + spec K=6 | **7.74 ms/token** | **128.9 tok/s** | recommended for short outputs (≤ 256 tokens) |
+**Peak (single prompt, NTOK=128, no chat template)** — `"Explain
+quantum entanglement in one short paragraph."`, 11 prompt tokens:
+
+| Configuration | Decode latency | Throughput |
+|---|---|---|
+| **Qwen3.6-27B NVFP4** + spec K=3 | **8.49 ms/token** | **117.8 tok/s** |
+| **Qwen3.6-27B NVFP4** + spec K=6 | **7.74 ms/token** | **128.9 tok/s** |
+
+**Real-world warm-state (chat-template + NTOK=256, mixed-task workload)**
+— measured across 6 prompts (EN chat / EN reasoning / CN chat / CN
+factual / CN poetry / Code) at K=6:
+
+| Stat | tok/s |
+|---|---:|
+| **mean** | **~93** |
+| min (Code prompt) | 75 |
+| max (CN factual prompt) | 101 |
+
+So users can expect roughly **~100 tok/s typical** in production with
+peak around **129 tok/s** on the easiest prompt class. The cliff is
+content-dependent (drafter alignment with the input distribution):
+
+* **Instruction-following / factual / chat** prompts hit the headline
+  rate — drafter aligns well with the prompt distribution.
+* **Code generation** drops to ~75 tok/s — drafter has lower acceptance
+  on punctuation / indentation / bracket tokens. Same trade-off seen
+  in vLLM and SGLang spec decode.
+* **Long generations** (NTOK ≥ 256) shave ~5-10 tok/s vs short outputs
+  — drafter quality decays past the prompt's local distribution.
+* **First call** at a new (prompt_len, max_tokens) shape pays a
+  ~5-25 s CUDA-Graph capture cost. The bundled OpenAI server
+  ([`examples/qwen36_openai_server.py`](examples/qwen36_openai_server.py))
+  pre-captures common shapes at startup via `--warmup`.
 
 Long-context decode at fixed context length (TurboQuant packed KV
 cache, single-token forward, AL=3.17 amortization):
@@ -129,10 +156,8 @@ CUDA Graph capture+replay at 32 K / 64 K / 128 K / 256 K passes the
 cosine = 1.000000 gate (bit-identical token output across replays).
 TTFT scales linearly at ~22 ms / prompt-token.
 
-Realistic per-prompt variance (5 prompts × NTOK 128/256) is documented
-in [`docs/qwen36_nvfp4.md`](docs/qwen36_nvfp4.md) §3 — peak 131 tok/s,
-mean ~110-115, low ~83 on free-form creative prompts. K=3 is more
-robust for long generations; K=6 is the headline number.
+The full per-prompt variance breakdown (5 prompts × NTOK 128/256 ×
+K=3/6) is in [`docs/qwen36_nvfp4.md`](docs/qwen36_nvfp4.md) §3.
 
 ### VRAM footprint (inference only, 2 views on RTX 5090)
 
