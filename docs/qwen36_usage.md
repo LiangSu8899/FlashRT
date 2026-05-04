@@ -128,6 +128,32 @@ prompt = fe._tokenizer.apply_chat_template(
 input_ids = fe._tokenizer(prompt, return_tensors='pt').input_ids.cuda()
 ```
 
+## Cold-start vs warm-state
+
+The headline 90-130 tok/s decode rate is the **warm-state** number —
+what you measure after CUDA Graphs for the relevant `cur_pos` range
+have been captured. The **first call** at a previously-unseen
+`(prompt_len, max_new_tokens)` shape pays a one-time graph-capture
+cost of roughly 5-25 s (proportional to `prompt_len + max_new_tokens`
+and to whether spec-K verify graphs at those positions are also new),
+manifesting as ~20-40 tok/s for that first call only.
+
+This is a property of the CUDA Graph capture/replay model, shared
+with SGLang and vLLM's compile mode. TensorRT-LLM avoids it by AOT
+engine compilation (paid at deploy time instead). vLLM eager and TGI
+avoid it by not capturing graphs (paying per-launch overhead per
+step instead).
+
+For a server deployment, run a dummy generation at startup over the
+prompt_len/max_tokens shapes you expect to see — this populates the
+graph cache before live traffic arrives. The bundled OpenAI server
+example does this automatically via `--warmup` (default
+`32:128,128:256`); see [`examples/qwen36_openai_server.py`](../examples/qwen36_openai_server.py).
+
+After warmup, requests at the same shape stay warm. Requests at
+different shapes will still pay capture cost on the parts of their
+`cur_pos` range not yet covered.
+
 ## Known limits in v1
 
 - **Batch size 1 only.** Multi-batch / continuous batching not in v1.

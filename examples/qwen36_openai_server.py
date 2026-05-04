@@ -15,7 +15,18 @@ Usage:
     python examples/qwen36_openai_server.py \\
         --checkpoint /path/to/qwen36_nvfp4 \\
         --port 8000 \\
-        --K 6
+        --K 6 \\
+        --warmup 32:128,128:256
+
+    # The --warmup flag pre-captures CUDA Graphs for the listed
+    # (prompt_len:max_tokens) shapes at startup so the FIRST real
+    # request hits the warm 90-130 tok/s speed range. Without
+    # warmup, that first request pays a ~5-25 s graph-capture
+    # penalty (standard CUDA Graph cold-start cost — same trade-off
+    # as SGLang / vLLM compile mode). Each warmed shape covers
+    # cur_pos in [0, prompt_len + max_tokens], so picking 1-2
+    # representative shapes from your traffic distribution is
+    # usually enough.
 
     # Test (non-streaming):
     curl http://localhost:8000/v1/chat/completions \\
@@ -101,6 +112,53 @@ class Qwen36Engine:
         else:
             self.spec_enabled = True
             log.info('MTP head loaded; spec K=%d enabled', self.K)
+
+    def warmup(self, shapes: List[tuple]) -> None:
+        """Pre-capture CUDA Graphs for typical (prompt_len, max_tokens)
+        shapes by running dummy generations. Without this, the FIRST
+        request at each new (prompt_len, max_tokens) shape pays a
+        ~5-25 s graph-capture penalty (the headline 90-130 tok/s
+        warm number applies only to requests AFTER the cur_pos range
+        is captured). Standard practice for graph-based inference
+        engines (SGLang, vLLM compile mode, etc.).
+
+        Args:
+          shapes: list of (prompt_len, max_tokens) tuples to pre-warm.
+            Defaults to a single (64, 256) shape if empty.
+        """
+        if not shapes:
+            return
+        torch = self._torch
+        log.info('warmup: pre-capturing graphs for %d shape(s) ...',
+                 len(shapes))
+        # Dummy text — only the token count matters for graph capture,
+        # not the content. Pad with 'a's.
+        for prompt_len, max_tok in shapes:
+            t0 = time.perf_counter()
+            dummy_text = 'a ' * (prompt_len - 1)  # ~1 token each
+            input_ids = self.fe._tokenizer(
+                dummy_text, return_tensors='pt').input_ids.cuda()
+            # Trim/pad to exact prompt_len.
+            if input_ids.shape[1] >= prompt_len:
+                input_ids = input_ids[:, :prompt_len]
+            else:
+                pad = torch.full(
+                    (1, prompt_len - input_ids.shape[1]),
+                    self.fe._tokenizer.pad_token_id or 0,
+                    device='cuda', dtype=torch.long)
+                input_ids = torch.cat([input_ids, pad], dim=1)
+            torch.cuda.synchronize()
+            if self.spec_enabled:
+                _ = self.fe.generate_own_speculative_KN_nvfp4(
+                    input_ids, max_new_tokens=max_tok, K=self.K)
+            else:
+                _ = self._single_token_decode(input_ids, max_tok)
+            torch.cuda.synchronize()
+            log.info(
+                '  warmup shape=(prompt=%d, max_tok=%d) in %.1f s',
+                prompt_len, max_tok, time.perf_counter() - t0)
+        log.info('warmup done — first real request will be at the warm '
+                 '(~90-130 tok/s) speed range')
 
     def _render_chat(self, messages: List[Dict[str, str]]) -> str:
         """Apply Qwen's chat template to a list of {role, content}."""
@@ -308,7 +366,28 @@ def main():
     p.add_argument('--model-name', default='qwen3.6-27b-nvfp4',
                    help='Identifier returned by /v1/models and echoed '
                    'in completion responses.')
+    p.add_argument(
+        '--warmup', default='32:128,128:256',
+        help='Comma-separated list of "prompt_len:max_tokens" shapes '
+        'to pre-capture CUDA Graphs for at startup. Without this, the '
+        'first request at each new shape pays a ~5-25 s graph-capture '
+        'penalty before reaching the headline 90-130 tok/s warm speed. '
+        'Default warms typical short-chat (32:128) and longer-context '
+        '(128:256) shapes. Set to empty string to skip warmup.')
     args = p.parse_args()
+
+    warmup_shapes = []
+    if args.warmup.strip():
+        for spec in args.warmup.split(','):
+            spec = spec.strip()
+            if not spec:
+                continue
+            try:
+                pl, mt = spec.split(':')
+                warmup_shapes.append((int(pl), int(mt)))
+            except ValueError:
+                sys.exit(f'invalid --warmup spec: {spec!r} '
+                         '(expected "prompt_len:max_tokens")')
 
     if 'FLASHRT_QWEN36_MTP_CKPT_DIR' not in os.environ:
         log.warning(
@@ -328,6 +407,8 @@ def main():
         device=args.device,
         model_name=args.model_name,
     )
+    if warmup_shapes:
+        engine.warmup(warmup_shapes)
     app = build_app(engine)
     uvicorn.run(app, host=args.host, port=args.port,
                 log_level='warning')
