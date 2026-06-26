@@ -504,7 +504,8 @@ if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121")
   add_library(sm120_nvfp4_ffn_obj OBJECT
     csrc/gemm/fp4/cutlass_nvfp4_gemm_bias_gelu_bf16out_sm120.cu
     csrc/gemm/fp4/cutlass_nvfp4_gemm_bias_gelu_fp4out_sm120.cu
-    csrc/gemm/fp4/cutlass_nvfp4_gemm_dn_streamk_bias_sm120.cu)
+    csrc/gemm/fp4/cutlass_nvfp4_gemm_dn_streamk_bias_sm120.cu
+    csrc/gemm/fp4/cutlass_nvfp4_dual_gemm_silu_fp4out_sm120.cu)
   set_target_properties(sm120_nvfp4_ffn_obj PROPERTIES
     CUDA_STANDARD 17
     POSITION_INDEPENDENT_CODE ON

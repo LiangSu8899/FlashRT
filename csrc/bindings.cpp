@@ -24,6 +24,7 @@
 #include "gemm/fp4/cutlass_nvfp4_w4a16_gemm_sm120.cuh"
 #include "gemm/fp4/cutlass_nvfp4_gemm_bias_gelu_bf16out_sm120.cuh"
 #include "gemm/fp4/cutlass_nvfp4_gemm_bias_gelu_fp4out_sm120.cuh"
+#include "gemm/fp4/cutlass_nvfp4_dual_gemm_silu_fp4out_sm120.cuh"
 #include "gemm/fp4/cutlass_nvfp4_gemm_dn_streamk_bias_sm120.cuh"
 #endif
 #ifdef ENABLE_CUTLASS_SM100_NVFP4_W4A16
@@ -5940,6 +5941,32 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("bias"), py::arg("D_packed"), py::arg("SFD"),
         py::arg("M"), py::arg("N"), py::arg("K"),
         py::arg("alpha") = 1.0f,
+        py::arg("stream") = 0);
+
+    // Fused SwiGLU NVFP4 GEMM (gate+up share A, silu(gate)*up, FP4 out).
+    // M0 scaffold = single projection silu(A@Bgate)->FP4; dual accumulator
+    // lands incrementally on this stable interface. See
+    // cutlass_nvfp4_dual_gemm_silu_fp4out_sm120.cuh.
+    m.def("fp4_w4a16_dual_gemm_silu_fp4out_sm120",
+        [](uintptr_t A_packed, uintptr_t Bgate_packed, uintptr_t Bup_packed,
+           uintptr_t SFA, uintptr_t SFBgate, uintptr_t SFBup,
+           uintptr_t D_packed, uintptr_t SFD,
+           int M, int N, int K,
+           float alpha_gate, float alpha_up,
+           uintptr_t stream) {
+            flash_rt::gemm::fp4_w4a16_dual_gemm_silu_fp4out_sm120(
+                to_ptr(A_packed), to_ptr(Bgate_packed), to_ptr(Bup_packed),
+                to_ptr(SFA), to_ptr(SFBgate), to_ptr(SFBup),
+                to_ptr(D_packed), to_ptr(SFD),
+                M, N, K,
+                alpha_gate, alpha_up,
+                to_stream(stream));
+        },
+        py::arg("A_packed"), py::arg("Bgate_packed"), py::arg("Bup_packed"),
+        py::arg("SFA"), py::arg("SFBgate"), py::arg("SFBup"),
+        py::arg("D_packed"), py::arg("SFD"),
+        py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("alpha_gate") = 1.0f, py::arg("alpha_up") = 1.0f,
         py::arg("stream") = 0);
 
     // Recipe C step 3: NVFP4 W4A16 GEMM_dn + per-col bias epilogue, BF16
