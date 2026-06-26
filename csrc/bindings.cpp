@@ -139,6 +139,7 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #include "kernels/gated_deltanet_qwen36.cuh"
 #include "kernels/qwen3_qkv_post_proc.cuh"
 #include "kernels/silu_mul_to_nvfp4_swizzled.cuh"
+#include "kernels/fp4_swiglu_compact_sm120.cuh"
 #include "kernels/rms_norm_gated_silu_qwen36.cuh"
 #include "kernels/silu_mul_qwen36.cuh"
 #include "kernels/qwen36_misc.cuh"
@@ -5969,6 +5970,17 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("M"), py::arg("N"), py::arg("K"),
         py::arg("alpha_gate") = 1.0f, py::arg("alpha_up") = 1.0f,
         py::arg("stream") = 0);
+
+    // Even-column compaction of the SwiGLU epilogue-fold FP4 output
+    // ([M,inter] dup'd bytes -> [M,inter/2] packed NVFP4). SFD passes through.
+    m.def("fp4_swiglu_even_col_compact",
+        [](uintptr_t in_packed, uintptr_t out_packed, int M, int inter,
+           uintptr_t stream) {
+            flash_rt::kernels::fp4_swiglu_even_col_compact(
+                to_ptr(in_packed), to_ptr(out_packed), M, inter, to_stream(stream));
+        },
+        py::arg("in_packed"), py::arg("out_packed"),
+        py::arg("M"), py::arg("inter"), py::arg("stream") = 0);
 
     // Tile-shape sweep over the production SM120 fp4 GEMM family (BF16 out),
     // for measuring per-tile efficiency (e.g. the 128x64 dual-accumulator

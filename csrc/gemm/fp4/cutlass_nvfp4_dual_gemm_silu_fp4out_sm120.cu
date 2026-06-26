@@ -68,7 +68,12 @@ using TileShape    = Shape<_128, _128, _256>;
 using ClusterShape = Shape<_1, _1, _1>;
 using Sm1xxBlkScaledConfig = cutlass::detail::Sm1xxBlockScaledConfig<16>;
 
-constexpr int OutputSFVectorSize = 16;
+// M2b: SF vector size 32 over the INTERLEAVED gate|up GEMM output (N=2*inter)
+// == per-16-OUTPUT-col after the silu_mul 2->1 collapse. The swizzled SFD byte
+// layout (rows M, n_blocks = 2*inter/32 = inter/16) is then BYTE-IDENTICAL to
+// the down GEMM's per-16 SFA for [M, inter], so the SFD passes straight through;
+// only the FP4 data needs the trivial even-column nibble compaction.
+constexpr int OutputSFVectorSize = 32;
 
 // SwiGLU fold (M2a): silu(alpha_gate*gate) * (alpha_up*up) on adjacent
 // interleaved accumulator columns, then per-block-16 NVFP4 quant + FP4 out.
