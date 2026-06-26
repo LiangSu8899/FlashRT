@@ -19,5 +19,15 @@ int fp4_normfold_probe_sm120_bf16out(
     const void* SFA, const void* SFB,
     float alpha, cudaStream_t stream);
 
+// Variant-selectable form. variant 0 = <128,128,256> (production tile, identity
+// anchor); variant 1 = <128,128,64> (the BLK_K=64 tile the bf16-A norm-fold
+// requires for smem budget). Returns -99 on an unknown variant.
+int fp4_normfold_probe_sm120_bf16out_v(
+    int variant,
+    const void* A_packed, const void* B_packed, void* D_bf16,
+    int M, int N, int K,
+    const void* SFA, const void* SFB,
+    float alpha, cudaStream_t stream);
+
 }  // namespace gemm
 }  // namespace flash_rt

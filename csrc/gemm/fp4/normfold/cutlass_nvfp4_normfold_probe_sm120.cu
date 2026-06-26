@@ -49,124 +49,125 @@ using LayoutD = cutlass::layout::RowMajor;
 constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;  // 8
 constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;  // 8
 
-using TileShape    = Shape<_128, _128, _256>;
 using ClusterShape = Shape<_1, _1, _1>;
-
 using Sm1xxBlkScaledConfig = cutlass::detail::Sm1xxBlockScaledConfig<16>;
 
-// Epilogue: identical to the production GEMM.
-using CollectiveEpilogue =
-    typename cutlass::epilogue::collective::CollectiveBuilder<
-        cutlass::arch::Sm120, cutlass::arch::OpClassTensorOp,
-        TileShape, ClusterShape,
-        cutlass::epilogue::collective::EpilogueTileAuto,
-        ElementAccumulator, ElementCompute,
-        ElementC, LayoutC, AlignmentC,
-        ElementD, LayoutD, AlignmentD,
-        cutlass::epilogue::collective::EpilogueScheduleAuto
-    >::CollectiveOp;
+// One TileShape variant of the forked-collective GEMM. Epilogue/scheduler/args
+// are the production config; only the mainloop is NormFoldBuilder::CollectiveOp.
+// variant 0 = <128,128,256> (production tile, the identity anchor); variant 1 =
+// <128,128,64> (the BLK_K=64 tile the bf16-A fold REQUIRES — bf16 A is 64KB/stage
+// at K=256 so only 1 stage fits <100KB smem, violating Stages>=2; at K=64 it is
+// 16KB/stage and fits. This variant proves the K=64 tile builds + runs correct).
+template <class TileShape>
+struct ProbeVariant {
+  using CollectiveEpilogue =
+      typename cutlass::epilogue::collective::CollectiveBuilder<
+          cutlass::arch::Sm120, cutlass::arch::OpClassTensorOp,
+          TileShape, ClusterShape,
+          cutlass::epilogue::collective::EpilogueTileAuto,
+          ElementAccumulator, ElementCompute,
+          ElementC, LayoutC, AlignmentC,
+          ElementD, LayoutD, AlignmentD,
+          cutlass::epilogue::collective::EpilogueScheduleAuto
+      >::CollectiveOp;
 
-// Mainloop: the FORKED collective, assembled via NormFoldBuilder with the same
-// StageCountAutoCarveout the production GEMM uses.
-using CollectiveMainloop = typename normfold::NormFoldBuilder<
-    TileShape, ClusterShape,
-    cutlass::gemm::collective::StageCountAutoCarveout<
-        static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>
->::CollectiveOp;
+  using CollectiveMainloop = typename normfold::NormFoldBuilder<
+      TileShape, ClusterShape,
+      cutlass::gemm::collective::StageCountAutoCarveout<
+          static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>
+  >::CollectiveOp;
 
-using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
-    Shape<int, int, int, int>,
-    CollectiveMainloop,
-    CollectiveEpilogue,
-    cutlass::gemm::PersistentScheduler>;
+  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+      Shape<int, int, int, int>,
+      CollectiveMainloop, CollectiveEpilogue,
+      cutlass::gemm::PersistentScheduler>;
+  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 
-using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
-
-// Per-shape workspace cache (mirrors the production path).
-struct ShapeKey {
-  int M, N, K;
-  bool operator==(const ShapeKey& o) const { return M == o.M && N == o.N && K == o.K; }
-};
-struct ShapeKeyHash {
-  size_t operator()(const ShapeKey& k) const noexcept {
-    return (static_cast<size_t>(k.M) * 1315423911u)
-         ^ (static_cast<size_t>(k.N) * 2654435761u)
-         ^ static_cast<size_t>(k.K);
-  }
-};
-struct CachedWorkspace { void* ptr = nullptr; size_t size = 0; };
-std::unordered_map<ShapeKey, CachedWorkspace, ShapeKeyHash> g_ws_cache;
-std::mutex g_ws_mu;
-
-void* get_workspace(int M, int N, int K, size_t needed) {
-  std::lock_guard<std::mutex> lk(g_ws_mu);
-  ShapeKey key{M, N, K};
-  auto it = g_ws_cache.find(key);
-  if (it != g_ws_cache.end() && it->second.size >= needed) return it->second.ptr;
-  if (it != g_ws_cache.end()) { cudaFree(it->second.ptr); g_ws_cache.erase(it); }
-  CachedWorkspace w; w.size = needed;
-  if (needed > 0) cudaMalloc(&w.ptr, needed);
-  g_ws_cache[key] = w;
-  return w.ptr;
-}
-
-cutlass::Status run_probe(
-    const void* A_packed, const void* B_packed, void* D_bf16,
-    int M, int N, int K,
-    const void* SFA, const void* SFB,
-    float alpha, cudaStream_t stream)
-{
-  using StrideA = typename Gemm::GemmKernel::StrideA;
-  using StrideB = typename Gemm::GemmKernel::StrideB;
-  using StrideC = typename Gemm::GemmKernel::StrideC;
-  using StrideD = typename Gemm::GemmKernel::StrideD;
-
-  StrideA stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(M, K, 1));
-  StrideB stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(N, K, 1));
-  StrideC stride_C = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(M, N, 1));
-  StrideD stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(M, N, 1));
-
-  auto problem_shape_MNKL = cute::make_shape(M, N, K, 1);
-  auto layout_SFA = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(problem_shape_MNKL);
-  auto layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(problem_shape_MNKL);
-
-  using ArrayElementA = typename Gemm::GemmKernel::CollectiveMainloop::ArrayElementA;
-  using ArrayElementB = typename Gemm::GemmKernel::CollectiveMainloop::ArrayElementB;
-
-  typename Gemm::Arguments args{
-      cutlass::gemm::GemmUniversalMode::kGemm,
-      {M, N, K, 1},
-      {
-          reinterpret_cast<ArrayElementA const*>(A_packed), stride_A,
-          reinterpret_cast<ArrayElementB const*>(B_packed), stride_B,
-          reinterpret_cast<ElementSF const*>(SFA), layout_SFA,
-          reinterpret_cast<ElementSF const*>(SFB), layout_SFB
-      },
-      {
-          {alpha, 0.0f},
-          nullptr, stride_C,
-          reinterpret_cast<ElementD*>(D_bf16), stride_D
-      }
+  // Per-shape workspace cache.
+  struct ShapeKey {
+    int M, N, K;
+    bool operator==(const ShapeKey& o) const { return M == o.M && N == o.N && K == o.K; }
   };
+  struct ShapeKeyHash {
+    size_t operator()(const ShapeKey& k) const noexcept {
+      return (static_cast<size_t>(k.M) * 1315423911u)
+           ^ (static_cast<size_t>(k.N) * 2654435761u)
+           ^ static_cast<size_t>(k.K);
+    }
+  };
+  struct CachedWorkspace { void* ptr = nullptr; size_t size = 0; };
 
-  Gemm gemm;
-  size_t ws_size = Gemm::get_workspace_size(args);
-  void* ws_ptr = get_workspace(M, N, K, ws_size);
+  static cutlass::Status run(
+      const void* A_packed, const void* B_packed, void* D_bf16,
+      int M, int N, int K, const void* SFA, const void* SFB,
+      float alpha, cudaStream_t stream) {
+    static std::unordered_map<ShapeKey, CachedWorkspace, ShapeKeyHash> ws_cache;
+    static std::mutex ws_mu;
 
-  auto status = gemm.can_implement(args);
-  if (status != cutlass::Status::kSuccess) {
-    std::fprintf(stderr, "[fp4_normfold_probe_sm120] can_implement FAIL M=%d N=%d K=%d (status=%d)\n",
-                 M, N, K, static_cast<int>(status));
-    return status;
+    using StrideA = typename Gemm::GemmKernel::StrideA;
+    using StrideB = typename Gemm::GemmKernel::StrideB;
+    using StrideC = typename Gemm::GemmKernel::StrideC;
+    using StrideD = typename Gemm::GemmKernel::StrideD;
+
+    StrideA stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(M, K, 1));
+    StrideB stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(N, K, 1));
+    StrideC stride_C = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(M, N, 1));
+    StrideD stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(M, N, 1));
+
+    auto problem_shape_MNKL = cute::make_shape(M, N, K, 1);
+    auto layout_SFA = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(problem_shape_MNKL);
+    auto layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(problem_shape_MNKL);
+
+    using ArrayElementA = typename Gemm::GemmKernel::CollectiveMainloop::ArrayElementA;
+    using ArrayElementB = typename Gemm::GemmKernel::CollectiveMainloop::ArrayElementB;
+
+    typename Gemm::Arguments args{
+        cutlass::gemm::GemmUniversalMode::kGemm,
+        {M, N, K, 1},
+        {
+            reinterpret_cast<ArrayElementA const*>(A_packed), stride_A,
+            reinterpret_cast<ArrayElementB const*>(B_packed), stride_B,
+            reinterpret_cast<ElementSF const*>(SFA), layout_SFA,
+            reinterpret_cast<ElementSF const*>(SFB), layout_SFB
+        },
+        { {alpha, 0.0f}, nullptr, stride_C, reinterpret_cast<ElementD*>(D_bf16), stride_D }
+    };
+
+    Gemm gemm;
+    size_t ws_size = Gemm::get_workspace_size(args);
+    void* ws_ptr = nullptr;
+    {
+      std::lock_guard<std::mutex> lk(ws_mu);
+      ShapeKey key{M, N, K};
+      auto it = ws_cache.find(key);
+      if (it != ws_cache.end() && it->second.size >= ws_size) {
+        ws_ptr = it->second.ptr;
+      } else {
+        if (it != ws_cache.end()) { cudaFree(it->second.ptr); ws_cache.erase(it); }
+        CachedWorkspace w; w.size = ws_size;
+        if (ws_size > 0) cudaMalloc(&w.ptr, ws_size);
+        ws_cache[key] = w; ws_ptr = w.ptr;
+      }
+    }
+
+    auto status = gemm.can_implement(args);
+    if (status != cutlass::Status::kSuccess) {
+      std::fprintf(stderr, "[fp4_normfold_probe_sm120] can_implement FAIL M=%d N=%d K=%d (status=%d)\n",
+                   M, N, K, static_cast<int>(status));
+      return status;
+    }
+    status = gemm.initialize(args, ws_ptr, stream);
+    if (status != cutlass::Status::kSuccess) {
+      std::fprintf(stderr, "[fp4_normfold_probe_sm120] initialize FAIL M=%d N=%d K=%d (status=%d)\n",
+                   M, N, K, static_cast<int>(status));
+      return status;
+    }
+    return gemm.run(stream);
   }
-  status = gemm.initialize(args, ws_ptr, stream);
-  if (status != cutlass::Status::kSuccess) {
-    std::fprintf(stderr, "[fp4_normfold_probe_sm120] initialize FAIL M=%d N=%d K=%d (status=%d)\n",
-                 M, N, K, static_cast<int>(status));
-    return status;
-  }
-  return gemm.run(stream);
-}
+};
+
+using V0 = ProbeVariant<Shape<_128, _128, _256>>;  // identity anchor (production tile)
+using V1 = ProbeVariant<Shape<_128, _128, _64>>;   // BLK_K=64 (bf16-A fold prereq)
 
 }  // namespace
 
@@ -176,8 +177,21 @@ int fp4_normfold_probe_sm120_bf16out(
     const void* SFA, const void* SFB,
     float alpha, cudaStream_t stream)
 {
-  cutlass::Status status = run_probe(A_packed, B_packed, D_bf16, M, N, K, SFA, SFB, alpha, stream);
-  return static_cast<int>(status);
+  return static_cast<int>(V0::run(A_packed, B_packed, D_bf16, M, N, K, SFA, SFB, alpha, stream));
+}
+
+int fp4_normfold_probe_sm120_bf16out_v(
+    int variant,
+    const void* A_packed, const void* B_packed, void* D_bf16,
+    int M, int N, int K,
+    const void* SFA, const void* SFB,
+    float alpha, cudaStream_t stream)
+{
+  switch (variant) {
+    case 0: return static_cast<int>(V0::run(A_packed, B_packed, D_bf16, M, N, K, SFA, SFB, alpha, stream));
+    case 1: return static_cast<int>(V1::run(A_packed, B_packed, D_bf16, M, N, K, SFA, SFB, alpha, stream));
+    default: return -99;
+  }
 }
 
 }  // namespace gemm
