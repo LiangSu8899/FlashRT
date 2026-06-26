@@ -25,6 +25,7 @@
 #include "gemm/fp4/cutlass_nvfp4_gemm_bias_gelu_bf16out_sm120.cuh"
 #include "gemm/fp4/cutlass_nvfp4_gemm_bias_gelu_fp4out_sm120.cuh"
 #include "gemm/fp4/cutlass_nvfp4_dual_gemm_silu_fp4out_sm120.cuh"
+#include "gemm/fp4/cutlass_nvfp4_w4a16_tilesweep_sm120.cuh"
 #include "gemm/fp4/cutlass_nvfp4_gemm_dn_streamk_bias_sm120.cuh"
 #endif
 #ifdef ENABLE_CUTLASS_SM100_NVFP4_W4A16
@@ -5968,6 +5969,26 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("M"), py::arg("N"), py::arg("K"),
         py::arg("alpha_gate") = 1.0f, py::arg("alpha_up") = 1.0f,
         py::arg("stream") = 0);
+
+    // Tile-shape sweep over the production SM120 fp4 GEMM family (BF16 out),
+    // for measuring per-tile efficiency (e.g. the 128x64 dual-accumulator
+    // tile) and tuning narrow-N shapes. Returns 0 on success.
+    m.def("fp4_w4a16_tilesweep_sm120_bf16out",
+        [](int variant, uintptr_t A, uintptr_t B, uintptr_t D,
+           int M, int N, int K, uintptr_t SFA, uintptr_t SFB,
+           float alpha, uintptr_t stream) {
+            return flash_rt::gemm::fp4_w4a16_tilesweep_sm120_bf16out(
+                variant, to_ptr(A), to_ptr(B), to_ptr(D), M, N, K,
+                to_ptr(SFA), to_ptr(SFB), alpha, to_stream(stream));
+        },
+        py::arg("variant"), py::arg("A"), py::arg("B"), py::arg("D"),
+        py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("SFA"), py::arg("SFB"),
+        py::arg("alpha") = 1.0f, py::arg("stream") = 0);
+    m.def("fp4_w4a16_tilesweep_sm120_num_variants",
+        []() { return flash_rt::gemm::fp4_w4a16_tilesweep_sm120_num_variants(); });
+    m.def("fp4_w4a16_tilesweep_sm120_name",
+        [](int v) { return std::string(flash_rt::gemm::fp4_w4a16_tilesweep_sm120_name(v)); });
 
     // Recipe C step 3: NVFP4 W4A16 GEMM_dn + per-col bias epilogue, BF16
     // output, **StreamK scheduler**. Replaces (GEMM_dn + add_bias_bf16)
