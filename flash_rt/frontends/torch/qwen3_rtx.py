@@ -366,6 +366,26 @@ class Qwen3TorchFrontendRtx:
             self._fvk, 'silu_mul_merged_to_nvfp4_swizzled_grouped32_bf16',
             self._fvk.silu_mul_merged_to_nvfp4_swizzled_bf16,
         )
+        # SwiGLU epilogue fold (prefill): fuse silu(gate)*up into the gate_up
+        # GEMM epilogue (interleaved gate|up weight, FP4 out, SF32) + an even-
+        # column compaction, replacing the [gate_up GEMM bf16 + silu_mul]
+        # 2-launch chain. Standalone-measured −18 µs/layer (−0.66 ms/36).
+        # Env-gated; needs the interleaved weight + the fused-kernel symbols.
+        import os as _os
+        inter0 = int(layers0['intermediate']) if 'intermediate' in layers0 \
+            else int(self._cfg['intermediate'])
+        self._enable_swiglu_fold_prefill = (
+            _os.environ.get('FLASH_RT_QWEN3_SWIGLU_FOLD', '0') == '1'
+            and 'gate_up_il_packed' in layers0
+            and hasattr(self._fvk, 'fp4_w4a16_dual_gemm_silu_fp4out_sm120')
+            and hasattr(self._fvk, 'fp4_swiglu_even_col_compact'))
+        if self._enable_swiglu_fold_prefill:
+            # Full-width dup'd FP4 output of the fused SwiGLU GEMM: [S, 2*inter]
+            # FP4 = [S, inter] bytes. Compacted into the down-input scratch.
+            self._swiglu_fold_out = torch.empty(
+                Sq_max, inter0, device=device, dtype=torch.uint8)
+        else:
+            self._swiglu_fold_out = None
 
         # CUDA Graph capture state.
         #   _captured_decode_graphs  : dict[cur_pos    -> torch.cuda.CUDAGraph]
@@ -1153,7 +1173,32 @@ class Qwen3TorchFrontendRtx:
         # checkpoint has homogeneous gate/up alpha, then consume the
         # merged [gate|up] output directly in the silu+quant kernel.
         ap_dn, sf_dn, _ = self._nvfp4_scratch[(hidden, inter)]
-        if self._gate_up_prefill_out is not None:
+        if self._enable_swiglu_fold_prefill:
+            # SwiGLU epilogue fold: one fused GEMM on the interleaved gate|up
+            # weight does silu(gate)*up in its FP4 epilogue (SF32 -> per-16-
+            # output SFD written straight into sf_dn), then an even-column
+            # compaction packs the FP4 data into the down-input ap_dn. Replaces
+            # [gate_up GEMM bf16 + silu_mul] with no bf16 round-trip.
+            il_N = int(lw['gate_up_il_N'])
+            # The blockscale-FP4 SFD output requires M aligned to 128 (the SF
+            # swizzle atom row dim). Pad M up; the extra rows are garbage but
+            # down only reads the real S rows, and the SFD swizzle rounds S and
+            # Mp to the same 128-multiple so the layout is identical for 0..S-1.
+            Mp = ((S + 127) // 128) * 128
+            fold_out = self._swiglu_fold_out[:Mp]
+            il_w = int(lw['gate_up_il_packed'])
+            il_sf = int(lw['gate_up_il_sf'])
+            fvk.fp4_w4a16_dual_gemm_silu_fp4out_sm120(
+                ap_mlp.data_ptr(), il_w, il_w,
+                sf_mlp.data_ptr(), il_sf, il_sf,
+                fold_out.data_ptr(), sf_dn.data_ptr(),
+                Mp, il_N, hidden,
+                float(lw['mlp_gate_alpha']), float(lw['mlp_up_alpha']), s,
+            )
+            fvk.fp4_swiglu_even_col_compact(
+                fold_out.data_ptr(), ap_dn.data_ptr(), S, inter, s,
+            )
+        elif self._gate_up_prefill_out is not None:
             gate_up_buf = self._gate_up_prefill_out[:S]
             prefill_gemm(
                 ap_mlp.data_ptr(), int(lw['gate_up_packed']),
