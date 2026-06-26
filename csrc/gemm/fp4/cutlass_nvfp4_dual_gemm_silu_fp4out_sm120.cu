@@ -28,6 +28,8 @@
 
 #include "cutlass/util/packed_stride.hpp"
 
+#include "sm120_silu_mul_blockscale_visitor.hpp"
+
 #include <cstdio>
 #include <mutex>
 #include <unordered_map>
@@ -68,16 +70,16 @@ using Sm1xxBlkScaledConfig = cutlass::detail::Sm1xxBlockScaledConfig<16>;
 
 constexpr int OutputSFVectorSize = 16;
 
-// SiLu(x) = x * sigmoid(x).  Single-input activation for M0; the SwiGLU
-// multiply (silu(gate)*up) lands in the dual-accumulator epilogue at M2.
-using FusionOperation = cutlass::epilogue::fusion::LinCombPerColBiasEltActBlockScaleFactor<
-    cutlass::epilogue::thread::SiLu,
+// SwiGLU fold (M2a): silu(alpha_gate*gate) * (alpha_up*up) on adjacent
+// interleaved accumulator columns, then per-block-16 NVFP4 quant + FP4 out.
+// The silu_mul is baked into the forked store node (visit()); full-width
+// output (each pair duplicated) for M2a — M2b compacts the store.
+using FusionOperation = cutlass::epilogue::fusion::SiluMulBlockScaleFactor<
     OutputSFVectorSize,
     ElementD,
     ElementCompute,
     ElementSFD,
-    LayoutSFDTag,
-    ElementBias>;
+    LayoutSFDTag>;
 
 using CollectiveEpilogue =
     typename cutlass::epilogue::collective::CollectiveBuilder<
@@ -174,7 +176,7 @@ void fp4_w4a16_dual_gemm_silu_fp4out_sm120(
     void*       SFD,
     int M, int N, int K,
     float alpha_gate,
-    float /*alpha_up*/,
+    float alpha_up,
     cudaStream_t stream)
 {
   using StrideA = typename Gemm::GemmKernel::StrideA;
@@ -205,15 +207,19 @@ void fp4_w4a16_dual_gemm_silu_fp4out_sm120(
           reinterpret_cast<ElementSF const*>(SFBgate), layout_SFB
       },
       {
-          {alpha_gate, 0.0f},
+          {1.0f, 0.0f},   // GEMM linear (alpha,beta); per-proj scales below
           nullptr, strC,
           reinterpret_cast<ElementD*>(D_packed), strD
       }
   };
-  args.epilogue.thread.bias_ptr = get_zero_bias(N);
+  // Bgate_packed / SFBgate hold the INTERLEAVED gate|up weight (gate@2i,
+  // up@2i+1); N = 2*intermediate. The forked epilogue applies the per-
+  // projection scales and silu(gate)*up.
   args.epilogue.thread.block_scale_factor_ptr =
       reinterpret_cast<ElementSFD*>(SFD);
   args.epilogue.thread.norm_constant_ptr = norm_const_dev;
+  args.epilogue.thread.alpha_gate = alpha_gate;
+  args.epilogue.thread.alpha_up = alpha_up;
 
   Gemm gemm;
   size_t ws_size = Gemm::get_workspace_size(args);
