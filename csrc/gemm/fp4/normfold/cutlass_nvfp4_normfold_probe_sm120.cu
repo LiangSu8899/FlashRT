@@ -168,6 +168,7 @@ struct ProbeVariant {
 
 using V0 = ProbeVariant<Shape<_128, _128, _256>>;  // identity anchor (production tile)
 using V1 = ProbeVariant<Shape<_128, _128, _64>>;   // BLK_K=64 (bf16-A fold prereq)
+using V2 = ProbeVariant<Shape<_128, _128, _128>>;  // BLK_K=128 (bf16-direct candidate)
 
 }  // namespace
 
@@ -190,6 +191,7 @@ int fp4_normfold_probe_sm120_bf16out_v(
   switch (variant) {
     case 0: return static_cast<int>(V0::run(A_packed, B_packed, D_bf16, M, N, K, SFA, SFB, alpha, stream));
     case 1: return static_cast<int>(V1::run(A_packed, B_packed, D_bf16, M, N, K, SFA, SFB, alpha, stream));
+    case 2: return static_cast<int>(V2::run(A_packed, B_packed, D_bf16, M, N, K, SFA, SFB, alpha, stream));
     default: return -99;
   }
 }
