@@ -24,6 +24,7 @@
 #include "cutlass/util/packed_stride.hpp"
 
 #include "sm120_normfold_builder.hpp"
+#include "sm120_normfold_mma_tma_bf16a.hpp"
 
 #include <cstdio>
 #include <mutex>
@@ -170,6 +171,79 @@ using V0 = ProbeVariant<Shape<_128, _128, _256>>;  // identity anchor (productio
 using V1 = ProbeVariant<Shape<_128, _128, _64>>;   // BLK_K=64 (bf16-A fold prereq)
 using V2 = ProbeVariant<Shape<_128, _128, _128>>;  // BLK_K=128 (bf16-direct candidate)
 
+// ── bf16-A fold variant (M-FULL-3a-ii): A is bf16, quantized in the consumer. ──
+template <class TileShape>
+struct ProbeVariantBf16A {
+  using CollectiveEpilogue =
+      typename cutlass::epilogue::collective::CollectiveBuilder<
+          cutlass::arch::Sm120, cutlass::arch::OpClassTensorOp,
+          TileShape, ClusterShape,
+          cutlass::epilogue::collective::EpilogueTileAuto,
+          ElementAccumulator, ElementCompute,
+          ElementC, LayoutC, AlignmentC,
+          ElementD, LayoutD, AlignmentD,
+          cutlass::epilogue::collective::EpilogueScheduleAuto
+      >::CollectiveOp;
+  // bf16 A is 4x the fp4 footprint (32 KB/stage at 128x128), so force the minimum
+  // 2 stages — StageCountAutoCarveout would over-provision and overflow sm120 smem.
+  static constexpr int kAmaxBytes =
+      static_cast<int>(cute::size<0>(TileShape{})) *
+      (static_cast<int>(cute::size<2>(TileShape{})) / 16) * static_cast<int>(sizeof(float));
+  using CollectiveMainloop = typename normfold::NormFoldBuilderBf16A<
+      TileShape, ClusterShape,
+      cutlass::gemm::collective::StageCount<2>
+  >::CollectiveOp;
+  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+      Shape<int, int, int, int>,
+      CollectiveMainloop, CollectiveEpilogue,
+      cutlass::gemm::PersistentScheduler>;
+  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+
+  static cutlass::Status run(
+      const void* A_bf16, const void* B_packed, void* D_bf16,
+      int M, int N, int K, const void* SFB, float alpha, cudaStream_t stream) {
+    using StrideA = typename Gemm::GemmKernel::StrideA;
+    using StrideB = typename Gemm::GemmKernel::StrideB;
+    using StrideC = typename Gemm::GemmKernel::StrideC;
+    using StrideD = typename Gemm::GemmKernel::StrideD;
+    StrideA stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(M, K, 1));
+    StrideB stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(N, K, 1));
+    StrideC stride_C = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(M, N, 1));
+    StrideD stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(M, N, 1));
+    auto problem_shape_MNKL = cute::make_shape(M, N, K, 1);
+    auto layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(problem_shape_MNKL);
+    using ArrayElementB = typename Gemm::GemmKernel::CollectiveMainloop::ArrayElementB;
+
+    typename Gemm::Arguments args{
+        cutlass::gemm::GemmUniversalMode::kGemm,
+        {M, N, K, 1},
+        {
+            reinterpret_cast<cutlass::bfloat16_t const*>(A_bf16), stride_A,
+            reinterpret_cast<ArrayElementB const*>(B_packed), stride_B,
+            reinterpret_cast<ElementSF const*>(SFB), layout_SFB
+        },
+        { {alpha, 0.0f}, nullptr, stride_C, reinterpret_cast<ElementD*>(D_bf16), stride_D }
+    };
+    Gemm gemm;
+    static void* ws = nullptr; static size_t ws_cap = 0;
+    size_t need = Gemm::get_workspace_size(args);
+    if (need > ws_cap) { if (ws) cudaFree(ws); cudaMalloc(&ws, need); ws_cap = need; }
+    auto st = gemm.can_implement(args);
+    if (st != cutlass::Status::kSuccess) {
+      std::fprintf(stderr, "[normfold_bf16a] can_implement FAIL M=%d N=%d K=%d (status=%d)\n",
+                   M, N, K, static_cast<int>(st));
+      return st;
+    }
+    st = gemm.initialize(args, ws, stream);
+    if (st != cutlass::Status::kSuccess) {
+      std::fprintf(stderr, "[normfold_bf16a] initialize FAIL (status=%d)\n", static_cast<int>(st));
+      return st;
+    }
+    return gemm.run(stream);
+  }
+};
+using VB = ProbeVariantBf16A<Shape<_128, _128, _128>>;
+
 }  // namespace
 
 int fp4_normfold_probe_sm120_bf16out(
@@ -194,6 +268,13 @@ int fp4_normfold_probe_sm120_bf16out_v(
     case 2: return static_cast<int>(V2::run(A_packed, B_packed, D_bf16, M, N, K, SFA, SFB, alpha, stream));
     default: return -99;
   }
+}
+
+int fp4_normfold_bf16a_probe_sm120(
+    const void* A_bf16, const void* B_packed, void* D_bf16,
+    int M, int N, int K, const void* SFB, float alpha, cudaStream_t stream)
+{
+  return static_cast<int>(VB::run(A_bf16, B_packed, D_bf16, M, N, K, SFB, alpha, stream));
 }
 
 }  // namespace gemm

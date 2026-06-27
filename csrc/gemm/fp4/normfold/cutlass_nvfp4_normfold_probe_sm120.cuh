@@ -29,5 +29,11 @@ int fp4_normfold_probe_sm120_bf16out_v(
     const void* SFA, const void* SFB,
     float alpha, cudaStream_t stream);
 
+// bf16-A norm fold (M-FULL-3a-ii): A is bf16 (un-quantized), quantized to NVFP4 in
+// the consumer; B/SFB are the usual fp4 weight + scales. No SFA input. <128,128,128>.
+int fp4_normfold_bf16a_probe_sm120(
+    const void* A_bf16, const void* B_packed, void* D_bf16,
+    int M, int N, int K, const void* SFB, float alpha, cudaStream_t stream);
+
 }  // namespace gemm
 }  // namespace flash_rt
