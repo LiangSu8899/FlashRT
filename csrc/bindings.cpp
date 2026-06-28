@@ -6688,6 +6688,44 @@ graph-replay safe) to fill the SMs on long K. M in 1..16; N%8==0; K%64==0;
         py::arg("in_row_stride"), py::arg("cache_row_stride"),
         py::arg("eps") = 1e-6f, py::arg("stream") = 0);
 
+    // v3 warp-per-row vectorized contiguous-4 (256B/warp transaction; ~1 ULP).
+    m.def("qwen3_q_norm_rope_qstage_prefill_v3_bf16",
+        [](uintptr_t q_pre, uintptr_t q_norm_w,
+           uintptr_t cos, uintptr_t sin, uintptr_t q_buf_dst,
+           int n_q_heads, int S, int in_row_stride, int out_row_stride,
+           float eps, uintptr_t stream) -> int {
+            return flash_rt::kernels::qwen3_q_norm_rope_qstage_prefill_v3_bf16(
+                to_ptr(q_pre), to_ptr(q_norm_w),
+                to_ptr(cos), to_ptr(sin), to_ptr(q_buf_dst),
+                n_q_heads, S, in_row_stride, out_row_stride,
+                eps, to_stream(stream));
+        },
+        py::arg("q_pre"), py::arg("q_norm_w"),
+        py::arg("cos"), py::arg("sin"), py::arg("q_buf_dst"),
+        py::arg("n_q_heads"), py::arg("S"),
+        py::arg("in_row_stride"), py::arg("out_row_stride"),
+        py::arg("eps") = 1e-6f, py::arg("stream") = 0);
+
+    m.def("qwen3_k_norm_rope_kvwrite_prefill_v3_bf16",
+        [](uintptr_t k_pre, uintptr_t v_pre, uintptr_t k_norm_w,
+           uintptr_t cos, uintptr_t sin,
+           uintptr_t k_cache_dst, uintptr_t v_cache_dst,
+           int n_kv_heads, int S, int in_row_stride, int cache_row_stride,
+           float eps, uintptr_t stream) -> int {
+            return flash_rt::kernels::qwen3_k_norm_rope_kvwrite_prefill_v3_bf16(
+                to_ptr(k_pre), to_ptr(v_pre), to_ptr(k_norm_w),
+                to_ptr(cos), to_ptr(sin),
+                to_ptr(k_cache_dst), to_ptr(v_cache_dst),
+                n_kv_heads, S, in_row_stride, cache_row_stride,
+                eps, to_stream(stream));
+        },
+        py::arg("k_pre"), py::arg("v_pre"), py::arg("k_norm_w"),
+        py::arg("cos"), py::arg("sin"),
+        py::arg("k_cache_dst"), py::arg("v_cache_dst"),
+        py::arg("n_kv_heads"), py::arg("S"),
+        py::arg("in_row_stride"), py::arg("cache_row_stride"),
+        py::arg("eps") = 1e-6f, py::arg("stream") = 0);
+
     m.def("ada_rms_norm_style_int8", [](uintptr_t x, uintptr_t weight, uintptr_t style,
                                          uintptr_t out, uintptr_t gate_out,
                                          int seq_len, int dim, float eps,

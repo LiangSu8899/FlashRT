@@ -378,6 +378,14 @@ class Qwen3TorchFrontendRtx:
         self._quant_q = getattr(
             self._fvk, 'quantize_bf16_to_nvfp4_swizzled_v2',
             self._fvk.quantize_bf16_to_nvfp4_swizzled)
+        # q/k norm+RoPE: one-block-per-row warp kernel (2.5x, ~1 ULP) — falls
+        # back to the per-(head,row) kernel if the v3 symbol is absent.
+        self._qnr_q = getattr(
+            self._fvk, 'qwen3_q_norm_rope_qstage_prefill_v3_bf16',
+            self._fvk.qwen3_q_norm_rope_qstage_prefill_bf16)
+        self._knr_q = getattr(
+            self._fvk, 'qwen3_k_norm_rope_kvwrite_prefill_v3_bf16',
+            self._fvk.qwen3_k_norm_rope_kvwrite_prefill_bf16)
         # SwiGLU epilogue fold (prefill): fuse silu(gate)*up into the gate_up
         # GEMM epilogue (interleaved gate|up weight, FP4 out, SF32) + an even-
         # column compaction, replacing the [gate_up GEMM bf16 + silu_mul]
@@ -1085,13 +1093,13 @@ class Qwen3TorchFrontendRtx:
                       + start_pos * self._attn.kv_row_stride_bytes)
             k_cache_dst = self._attn.K_cache.data_ptr() + kv_off
             v_cache_dst = self._attn.V_cache.data_ptr() + kv_off
-            fvk.qwen3_q_norm_rope_qstage_prefill_bf16(
+            self._qnr_q(
                 qkv_out[:, :Nq].data_ptr(), int(lw['q_norm_w']),
                 cos_S.data_ptr(), sin_S.data_ptr(),
                 self._attn.Q_buf[:, :S].data_ptr(),
                 n_q, S, qkv_N, n_q * hd, eps, s,
             )
-            fvk.qwen3_k_norm_rope_kvwrite_prefill_bf16(
+            self._knr_q(
                 qkv_out[:, Nq:Nq + Nk].data_ptr(),
                 qkv_out[:, Nq + Nk:].data_ptr(), int(lw['k_norm_w']),
                 cos_S.data_ptr(), sin_S.data_ptr(),
