@@ -6043,6 +6043,18 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("M"), py::arg("N"), py::arg("K"), py::arg("SFB"),
         py::arg("alpha") = 1.0f, py::arg("stream") = 0);
 
+    m.def("fp4_normfold_pq_probe_sm120",
+        [](uintptr_t A, uintptr_t B, uintptr_t D,
+           int M, int N, int K, uintptr_t SFB,
+           float alpha, uintptr_t stream) {
+            return flash_rt::gemm::fp4_normfold_pq_probe_sm120(
+                to_ptr(A), to_ptr(B), to_ptr(D), M, N, K,
+                to_ptr(SFB), alpha, to_stream(stream));
+        },
+        py::arg("A"), py::arg("B"), py::arg("D"),
+        py::arg("M"), py::arg("N"), py::arg("K"), py::arg("SFB"),
+        py::arg("alpha") = 1.0f, py::arg("stream") = 0);
+
     // Recipe C step 3: NVFP4 W4A16 GEMM_dn + per-col bias epilogue, BF16
     // output, **StreamK scheduler**. Replaces (GEMM_dn + add_bias_bf16)
     // chain. StreamK recovers SM utilization at motus Wan FFN GEMM_dn

@@ -244,6 +244,86 @@ struct ProbeVariantBf16A {
 };
 using VB = ProbeVariantBf16A<Shape<_128, _128, _128>>;
 
+// ── producer-quant (PQ): smem_A is FP4 (stock consumer reads it), the producer TMAs
+// bf16 A into a staging buffer, the consumer quantizes it (natural layout) → fp4 sA +
+// SFA. The mainloop keeps the identity 8-field Arguments (ptr_SFA unused → nullptr). ──
+template <class TileShape>
+struct ProbeVariantPQ {
+  // PQ K128 needs ~7KB less epilogue smem (single-buffer fp4 sA already saved 8KB) — a
+  // smaller explicit EpilogueTile shrinks the epilogue smem so K128 fits the sm120 cap.
+  using CollectiveEpilogue =
+      typename cutlass::epilogue::collective::CollectiveBuilder<
+          cutlass::arch::Sm120, cutlass::arch::OpClassTensorOp,
+          TileShape, ClusterShape,
+          cutlass::epilogue::collective::EpilogueTileAuto,
+          ElementAccumulator, ElementCompute,
+          ElementC, LayoutC, AlignmentC,
+          ElementD, LayoutD, AlignmentD,
+          cutlass::epilogue::collective::EpilogueScheduleAuto
+      >::CollectiveOp;
+  using CollectiveMainloop = typename normfold::NormFoldBuilderPQ<
+      TileShape, ClusterShape,
+      cutlass::gemm::collective::StageCount<2>
+  >::CollectiveOp;
+  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+      Shape<int, int, int, int>,
+      CollectiveMainloop, CollectiveEpilogue,
+      cutlass::gemm::PersistentScheduler>;
+  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+
+  static cutlass::Status run(
+      const void* A_bf16, const void* B_packed, void* D_bf16,
+      int M, int N, int K, const void* SFB, float alpha, cudaStream_t stream) {
+    using StrideA = typename Gemm::GemmKernel::StrideA;
+    using StrideB = typename Gemm::GemmKernel::StrideB;
+    using StrideC = typename Gemm::GemmKernel::StrideC;
+    using StrideD = typename Gemm::GemmKernel::StrideD;
+    StrideA stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(M, K, 1));
+    StrideB stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(N, K, 1));
+    StrideC stride_C = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(M, N, 1));
+    StrideD stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(M, N, 1));
+    auto problem_shape_MNKL = cute::make_shape(M, N, K, 1);
+    auto layout_SFA = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(problem_shape_MNKL);
+    auto layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(problem_shape_MNKL);
+    using ArrayElementB = typename Gemm::GemmKernel::CollectiveMainloop::ArrayElementB;
+
+    typename Gemm::Arguments args{
+        cutlass::gemm::GemmUniversalMode::kGemm,
+        {M, N, K, 1},
+        {   // mainloop (identity 8-field): bf16 A, B, ptr_SFA points at SFB (a valid
+            // non-null buffer — the SFA TMA descriptor is built but NEVER issued; SFA
+            // is produced by the consumer's quantize_tile_natural), SFB.
+            reinterpret_cast<cutlass::bfloat16_t const*>(A_bf16), stride_A,
+            reinterpret_cast<ArrayElementB const*>(B_packed), stride_B,
+            reinterpret_cast<ElementSF const*>(SFB), layout_SFA,
+            reinterpret_cast<ElementSF const*>(SFB), layout_SFB
+        },
+        { {alpha, 0.0f}, nullptr, stride_C, reinterpret_cast<ElementD*>(D_bf16), stride_D }
+    };
+    Gemm gemm;
+    static void* ws = nullptr; static size_t ws_cap = 0;
+    size_t need = Gemm::get_workspace_size(args);
+    if (need > ws_cap) { if (ws) cudaFree(ws); cudaMalloc(&ws, need); ws_cap = need; }
+    auto st = gemm.can_implement(args);
+    if (st != cutlass::Status::kSuccess) {
+      std::fprintf(stderr, "[normfold_pq] can_implement FAIL M=%d N=%d K=%d (status=%d)\n",
+                   M, N, K, static_cast<int>(st));
+      return st;
+    }
+    st = gemm.initialize(args, ws, stream);
+    if (st != cutlass::Status::kSuccess) {
+      std::fprintf(stderr, "[normfold_pq] initialize FAIL (status=%d)\n", static_cast<int>(st));
+      return st;
+    }
+    return gemm.run(stream);
+  }
+};
+// BLK_K=128 = BIT-EXACT. The bf16 staging is now SINGLE-buffer (PIPE=1, freed via the
+// bf16_empty mbarrier after the consumer quantizes it), halving it 65536→32768 so K128
+// fits the sm120 ~100KB smem cap. At K128 the BLK_K=64 SF-atom degeneracy is gone, so
+// cos vs the separate quantize(A)+prod-GEMM path is ~1.0 (K128/K256 identity = 1.0).
+using VPQ = ProbeVariantPQ<Shape<_128, _128, _128>>;
+
 }  // namespace
 
 int fp4_normfold_probe_sm120_bf16out(
@@ -275,6 +355,13 @@ int fp4_normfold_bf16a_probe_sm120(
     int M, int N, int K, const void* SFB, float alpha, cudaStream_t stream)
 {
   return static_cast<int>(VB::run(A_bf16, B_packed, D_bf16, M, N, K, SFB, alpha, stream));
+}
+
+int fp4_normfold_pq_probe_sm120(
+    const void* A_bf16, const void* B_packed, void* D_bf16,
+    int M, int N, int K, const void* SFB, float alpha, cudaStream_t stream)
+{
+  return static_cast<int>(VPQ::run(A_bf16, B_packed, D_bf16, M, N, K, SFB, alpha, stream));
 }
 
 }  // namespace gemm

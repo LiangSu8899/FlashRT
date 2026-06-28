@@ -35,5 +35,12 @@ int fp4_normfold_bf16a_probe_sm120(
     const void* A_bf16, const void* B_packed, void* D_bf16,
     int M, int N, int K, const void* SFB, float alpha, cudaStream_t stream);
 
+// PRODUCER-QUANT (PQ) norm fold: A is bf16; the producer TMAs it to a bf16 staging
+// buffer and the consumer quantizes it (NATURAL layout) into fp4 sA + SFA, then the
+// stock fp4 consumer reads it. Same args as the bf16a probe. <128,128,128>.
+int fp4_normfold_pq_probe_sm120(
+    const void* A_bf16, const void* B_packed, void* D_bf16,
+    int M, int N, int K, const void* SFB, float alpha, cudaStream_t stream);
+
 }  // namespace gemm
 }  // namespace flash_rt

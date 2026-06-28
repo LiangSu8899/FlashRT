@@ -27,6 +27,7 @@
 
 #include "sm120_normfold_mma_tma.hpp"        // forked CollectiveMma + MainloopSm120NormFold
 #include "sm120_normfold_mma_tma_bf16a.hpp"  // bf16-A CollectiveMma + MainloopSm120NormFoldBf16A
+#include "sm120_normfold_mma_tma_pq.hpp"     // producer-quant CollectiveMma + MainloopSm120NormFoldPQ
 
 namespace flash_rt {
 namespace gemm {
@@ -148,6 +149,58 @@ struct NormFoldBuilderBf16A {
       typename StockOp::GmemTiledCopyPairA,
       SmemLayoutAtomsA,
       SmemCopyAtomsA,
+      cute::identity,
+      typename StockOp::GmemTiledCopyPairB,
+      typename StockOp::SmemLayoutAtomsB,
+      typename StockOp::SmemCopyAtomsB,
+      cute::identity>;
+};
+
+// ── producer-quant (PQ) variant: smem_A is FP4 (consumer reads it stock = roofline),
+// the producer TMAs bf16 A into a separate staging buffer, and the consumer quantizes
+// it (natural layout) into smem_A + SFA. Uses the IDENTITY fp4 atoms verbatim (the
+// consumer is unchanged) — only the dispatch tag swaps to MainloopSm120NormFoldPQ.
+template <class TileShape_MNK, class ClusterShape_MNK, class StageCountType>
+struct NormFoldBuilderPQ {
+  using ElementA           = cutlass::float_e2m1_t;
+  using ElementB           = cutlass::float_e2m1_t;
+  using ElementAccumulator = float;
+  using ElementSF          = cutlass::float_ue4m3_t;
+  using LayoutA = cutlass::layout::RowMajor;
+  using LayoutB = cutlass::layout::ColumnMajor;
+  using ElementPairA = cutlass::nv_float4_t<cutlass::float_e2m1_t>;
+  using ElementPairB = cutlass::nv_float4_t<cutlass::float_e2m1_t>;
+  static constexpr int AlignmentA = 16 * 8 / cutlass::sizeof_bits<ElementA>::value;
+  static constexpr int AlignmentB = 16 * 8 / cutlass::sizeof_bits<ElementB>::value;
+
+  using StockOp = typename cutlass::gemm::collective::CollectiveBuilder<
+      cutlass::arch::Sm120, cutlass::arch::OpClassBlockScaledTensorOp,
+      ElementPairA, LayoutA, AlignmentA,
+      ElementPairB, LayoutB, AlignmentB,
+      ElementAccumulator,
+      TileShape_MNK, ClusterShape_MNK,
+      StageCountType,
+      cutlass::gemm::KernelTmaWarpSpecializedCooperative
+  >::CollectiveOp;
+  using StockDP = typename StockOp::DispatchPolicy;
+
+  using DispatchPolicy = cutlass::gemm::collective::MainloopSm120NormFoldPQ<
+      StockDP::Stages,
+      StockDP::SchedulerPipelineStageCount,
+      typename StockDP::ClusterShape,
+      typename StockDP::Schedule>;
+
+  using CollectiveOp = cutlass::gemm::collective::CollectiveMma<
+      DispatchPolicy,
+      TileShape_MNK,
+      cute::tuple<ElementA, ElementSF>,
+      typename StockOp::StridePairA,
+      cute::tuple<ElementB, ElementSF>,
+      typename StockOp::StridePairB,
+      typename StockOp::TiledMma,
+      typename StockOp::GmemTiledCopyPairA,
+      typename StockOp::SmemLayoutAtomsA,
+      typename StockOp::SmemCopyAtomsA,
       cute::identity,
       typename StockOp::GmemTiledCopyPairB,
       typename StockOp::SmemLayoutAtomsB,
