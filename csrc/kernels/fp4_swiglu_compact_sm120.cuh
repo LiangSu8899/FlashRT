@@ -20,5 +20,11 @@ void fp4_swiglu_even_col_compact(
     const void* in_packed, void* out_packed, int M, int inter,
     cudaStream_t stream);
 
+// Vectorized (16B-load / 8B-store) variant of the above — same semantics, higher
+// memory-bandwidth efficiency. Falls back to the scalar kernel if inter % 16 != 0.
+void fp4_swiglu_even_col_compact_v2(
+    const void* in_packed, void* out_packed, int M, int inter,
+    cudaStream_t stream);
+
 }  // namespace kernels
 }  // namespace flash_rt

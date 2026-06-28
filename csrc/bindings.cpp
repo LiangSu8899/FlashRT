@@ -5983,6 +5983,16 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("in_packed"), py::arg("out_packed"),
         py::arg("M"), py::arg("inter"), py::arg("stream") = 0);
 
+    // Vectorized variant of the above (16B-load / 8B-store) — same semantics.
+    m.def("fp4_swiglu_even_col_compact_v2",
+        [](uintptr_t in_packed, uintptr_t out_packed, int M, int inter,
+           uintptr_t stream) {
+            flash_rt::kernels::fp4_swiglu_even_col_compact_v2(
+                to_ptr(in_packed), to_ptr(out_packed), M, inter, to_stream(stream));
+        },
+        py::arg("in_packed"), py::arg("out_packed"),
+        py::arg("M"), py::arg("inter"), py::arg("stream") = 0);
+
     // Tile-shape sweep over the production SM120 fp4 GEMM family (BF16 out),
     // for measuring per-tile efficiency (e.g. the 128x64 dual-accumulator
     // tile) and tuning narrow-N shapes. Returns 0 on success.
