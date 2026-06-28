@@ -366,6 +366,18 @@ class Qwen3TorchFrontendRtx:
             self._fvk, 'silu_mul_merged_to_nvfp4_swizzled_grouped32_bf16',
             self._fvk.silu_mul_merged_to_nvfp4_swizzled_bf16,
         )
+        # Faster bit-identical norm+quant kernels (register prefetch + fused
+        # atomic-free back-phase + branchless e2m1); fall back to v1 (and to v1
+        # for cols>4096 internally). Used at every norm→nvfp4 site.
+        self._resnorm_q = getattr(
+            self._fvk, 'residual_add_rms_norm_to_nvfp4_swizzled_bf16_v2',
+            self._fvk.residual_add_rms_norm_to_nvfp4_swizzled_bf16)
+        self._rmsnorm_q = getattr(
+            self._fvk, 'rms_norm_to_nvfp4_swizzled_bf16_v2',
+            self._fvk.rms_norm_to_nvfp4_swizzled_bf16)
+        self._quant_q = getattr(
+            self._fvk, 'quantize_bf16_to_nvfp4_swizzled_v2',
+            self._fvk.quantize_bf16_to_nvfp4_swizzled)
         # SwiGLU epilogue fold (prefill): fuse silu(gate)*up into the gate_up
         # GEMM epilogue (interleaved gate|up weight, FP4 out, SF32) + an even-
         # column compaction, replacing the [gate_up GEMM bf16 + silu_mul]
@@ -517,7 +529,7 @@ class Qwen3TorchFrontendRtx:
         #    (M=1, K=hidden=4096). Reuse the (4096, 4096) scratch — its
         #    K dim matches.
         ap, sf, _out = self._nvfp4_scratch[(4096, 4096)]
-        fvk.quantize_bf16_to_nvfp4_swizzled(
+        self._quant_q(
             x_norm.data_ptr(), ap.data_ptr(), sf.data_ptr(),
             1, hidden, s,
         )
@@ -640,7 +652,7 @@ class Qwen3TorchFrontendRtx:
             ap_h, sf_h = prequant_ap, prequant_sf
         else:
             ap_h, sf_h, _ = self._nvfp4_scratch[(n_q * hd, hidden)]
-            fvk.rms_norm_to_nvfp4_swizzled_bf16(
+            self._rmsnorm_q(
                 h2.data_ptr(), int(lw['input_norm_w']),
                 ap_h.data_ptr(), sf_h.data_ptr(),
                 1, hidden, eps, s,
@@ -755,7 +767,7 @@ class Qwen3TorchFrontendRtx:
         # 10) o_proj NVFP4: K = n_q*hd = hidden, N = hidden.
         attn_2d = attn_out.reshape(1, n_q * hd).contiguous()
         ap_h2, sf_h2, _ = self._nvfp4_scratch[(hidden, hidden)]   # same shape as q
-        fvk.quantize_bf16_to_nvfp4_swizzled(
+        self._quant_q(
             attn_2d.data_ptr(), ap_h2.data_ptr(), sf_h2.data_ptr(),
             1, n_q * hd, s,
         )
@@ -776,7 +788,7 @@ class Qwen3TorchFrontendRtx:
         attn_proj = out_op_buf[:1].view(1, 1, hidden)
         h_post = self._res_mid[:, :1]
         ap_mlp, sf_mlp, _ = self._nvfp4_scratch[(inter, hidden)]
-        fvk.residual_add_rms_norm_to_nvfp4_swizzled_bf16(
+        self._resnorm_q(
             h_in.data_ptr(), attn_proj.data_ptr(), h_post.data_ptr(),
             int(lw['post_attn_norm_w']),
             ap_mlp.data_ptr(), sf_mlp.data_ptr(),
@@ -817,7 +829,7 @@ class Qwen3TorchFrontendRtx:
                 gate_v.data_ptr(), up_v.data_ptr(),
                 self._mlp_silu_mul_out[:1].data_ptr(), inter, s,
             )
-            fvk.quantize_bf16_to_nvfp4_swizzled(
+            self._quant_q(
                 self._mlp_silu_mul_out[:1].data_ptr(),
                 ap_dn.data_ptr(), sf_dn.data_ptr(),
                 1, inter, s,
@@ -847,7 +859,7 @@ class Qwen3TorchFrontendRtx:
             # qkv GEMM read from it at step 2, by step 16 it's
             # consumer-done so we can safely overwrite for L+1.
             next_ap, next_sf, _ = self._nvfp4_scratch[(n_q * hd, hidden)]
-            fvk.residual_add_rms_norm_to_nvfp4_swizzled_bf16(
+            self._resnorm_q(
                 h_post.data_ptr(),
                 mlp_out.contiguous().data_ptr(),
                 h_out_v.data_ptr(),
@@ -911,7 +923,7 @@ class Qwen3TorchFrontendRtx:
             hd = cfg['head_dim']
             ap0, sf0, _ = self._nvfp4_scratch[(n_q * hd, hidden)]
             h0_v = h.view(1, hidden).contiguous()
-            fvk.rms_norm_to_nvfp4_swizzled_bf16(
+            self._rmsnorm_q(
                 h0_v.data_ptr(),
                 int(layers_ptrs[0]['input_norm_w']),
                 ap0.data_ptr(), sf0.data_ptr(),
@@ -1006,7 +1018,7 @@ class Qwen3TorchFrontendRtx:
         if prequant_ap is not None and prequant_sf is not None:
             ap_h, sf_h = prequant_ap, prequant_sf
         else:
-            fvk.rms_norm_to_nvfp4_swizzled_bf16(
+            self._rmsnorm_q(
                 h2.data_ptr(), int(lw['input_norm_w']),
                 ap_h.data_ptr(), sf_h.data_ptr(), S, hidden, eps, s,
             )
@@ -1147,7 +1159,7 @@ class Qwen3TorchFrontendRtx:
         # 9) o_proj NVFP4 at M=S.
         attn_2d = attn_out.reshape(S, n_q * hd).contiguous()
         ap_h2, sf_h2, _ = self._nvfp4_scratch[(hidden, hidden)]
-        fvk.quantize_bf16_to_nvfp4_swizzled(
+        self._quant_q(
             attn_2d.data_ptr(), ap_h2.data_ptr(), sf_h2.data_ptr(),
             S, n_q * hd, s,
         )
@@ -1165,7 +1177,7 @@ class Qwen3TorchFrontendRtx:
         attn_proj = out_op_buf[:S].view(1, S, hidden)
         h_post = self._res_mid[:, :S]
         ap_mlp, sf_mlp, _ = self._nvfp4_scratch[(inter, hidden)]
-        fvk.residual_add_rms_norm_to_nvfp4_swizzled_bf16(
+        self._resnorm_q(
             h_in_S.data_ptr(), attn_proj.data_ptr(), h_post.data_ptr(),
             int(lw['post_attn_norm_w']),
             ap_mlp.data_ptr(), sf_mlp.data_ptr(), S, hidden, eps, s,
@@ -1272,7 +1284,7 @@ class Qwen3TorchFrontendRtx:
             # nvfp4_quant(rms_norm(h_out, next_norm_w)). Reuse the
             # (n_q*hd, hidden) NVFP4 scratch — consumer-done by step 3.
             next_ap, next_sf, _ = self._nvfp4_scratch[(n_q * hd, hidden)]
-            fvk.residual_add_rms_norm_to_nvfp4_swizzled_bf16(
+            self._resnorm_q(
                 h_post.data_ptr(), mlp_out.contiguous().data_ptr(),
                 h_out_v.data_ptr(), int(next_input_norm_w),
                 next_ap.data_ptr(), next_sf.data_ptr(), S, hidden, eps, s,
@@ -1402,7 +1414,7 @@ class Qwen3TorchFrontendRtx:
             hd = cfg['head_dim']
             ap0, sf0, _ = self._nvfp4_scratch[(n_q * hd, hidden)]
             h0_v = h.view(S, hidden).contiguous()
-            fvk.rms_norm_to_nvfp4_swizzled_bf16(
+            self._rmsnorm_q(
                 h0_v.data_ptr(), int(layers_ptrs[0]['input_norm_w']),
                 ap0.data_ptr(), sf0.data_ptr(), S, hidden, eps, s,
             )
@@ -1583,7 +1595,7 @@ class Qwen3TorchFrontendRtx:
             hd = cfg['head_dim']
             ap0, sf0, _ = self._nvfp4_scratch[(n_q * hd, hidden)]
             h0_v = h.view(S, hidden).contiguous()
-            fvk.rms_norm_to_nvfp4_swizzled_bf16(
+            self._rmsnorm_q(
                 h0_v.data_ptr(), int(layers_ptrs[0]['input_norm_w']),
                 ap0.data_ptr(), sf0.data_ptr(), S, hidden, eps, s,
             )

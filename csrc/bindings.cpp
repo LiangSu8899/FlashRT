@@ -1013,6 +1013,16 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     }, py::arg("input"), py::arg("fp4_data"), py::arg("scale_factors"),
        py::arg("rows"), py::arg("cols"), py::arg("stream") = 0);
 
+    m.def("quantize_bf16_to_nvfp4_swizzled_v2", [](uintptr_t input, uintptr_t fp4_data,
+                                                   uintptr_t scale_factors, int rows, int cols,
+                                                   uintptr_t stream) {
+        quantize_bf16_to_nvfp4_swizzled_v2(typed_ptr<__nv_bfloat16>(input),
+                                           reinterpret_cast<uint8_t*>(fp4_data),
+                                           reinterpret_cast<uint8_t*>(scale_factors),
+                                           rows, cols, to_stream(stream));
+    }, py::arg("input"), py::arg("fp4_data"), py::arg("scale_factors"),
+       py::arg("rows"), py::arg("cols"), py::arg("stream") = 0);
+
     m.def("quantize_bf16_to_nvfp4_swizzled_k14336",
         [](uintptr_t input, uintptr_t fp4_data, uintptr_t scale_factors,
            int rows, int cols, uintptr_t stream) {
@@ -1207,6 +1217,23 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("rows"), py::arg("cols"),
         py::arg("eps") = 1e-6f, py::arg("stream") = 0);
 
+    // Atomic-free amax variant (bit-identical to the above).
+    m.def("rms_norm_to_nvfp4_swizzled_bf16_v2",
+        [](uintptr_t x, uintptr_t weight,
+           uintptr_t packed, uintptr_t sf_swz,
+           int rows, int cols, float eps, uintptr_t stream) {
+            rms_norm_to_nvfp4_swizzled_bf16_v2(
+                typed_ptr<__nv_bfloat16>(x),
+                typed_ptr<__nv_bfloat16>(weight),
+                reinterpret_cast<uint8_t*>(packed),
+                reinterpret_cast<uint8_t*>(sf_swz),
+                rows, cols, eps, to_stream(stream));
+        },
+        py::arg("x"), py::arg("weight"),
+        py::arg("packed"), py::arg("sf_swz"),
+        py::arg("rows"), py::arg("cols"),
+        py::arg("eps") = 1e-6f, py::arg("stream") = 0);
+
     // Fused: affine LayerNorm(x, weight, bias) -> nvfp4 packed +
     // swizzled SF. Used by Motus cross-attn norm3 -> Q NVFP4 path.
     m.def("layer_norm_to_nvfp4_swizzled_bf16",
@@ -1238,6 +1265,27 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
            uintptr_t packed, uintptr_t sf_swz,
            int rows, int cols, float eps, uintptr_t stream) {
             residual_add_rms_norm_to_nvfp4_swizzled_bf16(
+                typed_ptr<__nv_bfloat16>(h_in),
+                typed_ptr<__nv_bfloat16>(attn_proj),
+                typed_ptr<__nv_bfloat16>(h_post),
+                typed_ptr<__nv_bfloat16>(weight),
+                reinterpret_cast<uint8_t*>(packed),
+                reinterpret_cast<uint8_t*>(sf_swz),
+                rows, cols, eps, to_stream(stream));
+        },
+        py::arg("h_in"), py::arg("attn_proj"), py::arg("h_post"),
+        py::arg("weight"),
+        py::arg("packed"), py::arg("sf_swz"),
+        py::arg("rows"), py::arg("cols"),
+        py::arg("eps") = 1e-6f, py::arg("stream") = 0);
+
+    // Faster bit-identical variant (register prefetch + fused atomic-free
+    // back-phase + branchless e2m1). Falls back to v1 for cols > 4096.
+    m.def("residual_add_rms_norm_to_nvfp4_swizzled_bf16_v2",
+        [](uintptr_t h_in, uintptr_t attn_proj, uintptr_t h_post,
+           uintptr_t weight, uintptr_t packed, uintptr_t sf_swz,
+           int rows, int cols, float eps, uintptr_t stream) {
+            residual_add_rms_norm_to_nvfp4_swizzled_bf16_v2(
                 typed_ptr<__nv_bfloat16>(h_in),
                 typed_ptr<__nv_bfloat16>(attn_proj),
                 typed_ptr<__nv_bfloat16>(h_post),
