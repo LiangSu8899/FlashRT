@@ -369,13 +369,15 @@ class Qwen3TorchFrontendRtx:
         # SwiGLU epilogue fold (prefill): fuse silu(gate)*up into the gate_up
         # GEMM epilogue (interleaved gate|up weight, FP4 out, SF32) + an even-
         # column compaction, replacing the [gate_up GEMM bf16 + silu_mul]
-        # 2-launch chain. Standalone-measured −18 µs/layer (−0.66 ms/36).
-        # Env-gated; needs the interleaved weight + the fused-kernel symbols.
+        # 2-launch chain. Graph-validated −0.438 ms/prefill (S=512: 10.95→10.52),
+        # HF red line holds (argmax-vs-HF fold == base 2/4, cos(fold,HF)≥base).
+        # DEFAULT-ON; only activates when the interleaved weight + fused-kernel
+        # symbols exist (guards below), and FLASH_RT_QWEN3_SWIGLU_FOLD=0 disables.
         import os as _os
         inter0 = int(layers0['intermediate']) if 'intermediate' in layers0 \
             else int(self._cfg['intermediate'])
         self._enable_swiglu_fold_prefill = (
-            _os.environ.get('FLASH_RT_QWEN3_SWIGLU_FOLD', '0') == '1'
+            _os.environ.get('FLASH_RT_QWEN3_SWIGLU_FOLD', '1') != '0'
             and 'gate_up_il_packed' in layers0
             and hasattr(self._fvk, 'fp4_w4a16_dual_gemm_silu_fp4out_sm120')
             and hasattr(self._fvk, 'fp4_swiglu_even_col_compact'))
