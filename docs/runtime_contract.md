@@ -92,6 +92,13 @@ Nexus should not implement or own these rules. It adopts `frt_runtime_export_v1`
 and drives snapshot/restore/replay; FlashRT model runtimes prepare inputs and
 decode outputs.
 
+Pi0.5 is the reference C++ model runtime under `cpp/models/pi05/`. The current
+implementation is the adopted-export path: setup/capture can still be produced
+by Python, while the native runtime owns vision prepare, graph replay dispatch,
+action decode, and export lifetime. A future pure C++ checkpoint
+loader/tokenizer/capture path must produce the same `frt_runtime_export_v1`, so
+Nexus and serving hosts do not change.
+
 ## Extending the ABI
 
 Additive only after v1: append struct fields (bump `FRT_RUNTIME_ABI_VERSION` +

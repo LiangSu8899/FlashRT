@@ -18,11 +18,20 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 include(CTest)
 
+option(FLASHRT_CPP_WITH_EXEC "Build/link the exec layer for native replay" ON)
+if(FLASHRT_CPP_WITH_EXEC AND NOT TARGET flashrt_exec)
+  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../exec
+                   ${CMAKE_CURRENT_BINARY_DIR}/exec)
+endif()
+
 add_library(flashrt_cpp INTERFACE)
 target_include_directories(flashrt_cpp
   INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/runtime/include
             ${CMAKE_CURRENT_SOURCE_DIR}/../runtime/include
             ${CMAKE_CURRENT_SOURCE_DIR}/../exec/include)
+if(FLASHRT_CPP_WITH_EXEC)
+  target_link_libraries(flashrt_cpp INTERFACE flashrt_exec)
+endif()
 
 add_library(flashrt_cpp_modalities STATIC
   modalities/src/types.cpp
@@ -39,7 +48,8 @@ target_link_libraries(flashrt_cpp_vla
 
 add_library(flashrt_cpp_pi05 STATIC
   models/pi05/src/spec.cpp
-  models/pi05/src/io.cpp)
+  models/pi05/src/io.cpp
+  models/pi05/src/runtime.cpp)
 target_include_directories(flashrt_cpp_pi05
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/include)
 target_link_libraries(flashrt_cpp_pi05
@@ -50,4 +60,9 @@ if(BUILD_TESTING)
   target_link_libraries(test_cpp_modalities
     PRIVATE flashrt_cpp_pi05 flashrt_cpp_modalities)
   add_test(NAME cpp_modalities COMMAND test_cpp_modalities)
+
+  add_executable(test_pi05_runtime tests/test_pi05_runtime.cpp)
+  target_link_libraries(test_pi05_runtime
+    PRIVATE flashrt_cpp_pi05 flashrt_cpp_modalities)
+  add_test(NAME pi05_runtime COMMAND test_pi05_runtime)
 endif()

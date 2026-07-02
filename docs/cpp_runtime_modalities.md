@@ -66,6 +66,17 @@ Pi0.5 is the first adapter:
   deployment stats.
 - `flashrt::models::pi05::RuntimeIo` binds those specs to concrete tensor
   views and exposes `prepare_vision()` / `read_actions()`.
+- `flashrt::models::pi05::Runtime` is the full C++ runtime shell for the
+  adopted-export path: it retains `frt_runtime_export_v1`, binds Pi0.5 IO,
+  calls replay, and exposes the VLA family interface.
+
+Current Pi0.5 status:
+
+- complete C++ hot-path shell: prepare vision, replay graph, read action;
+- complete lifecycle for adopted Python/native exports: retain/release;
+- complete build target: `flashrt_cpp_pi05`;
+- native checkpoint loader/tokenizer/capture is not implemented yet. It will
+  become a producer for the same `frt_runtime_export_v1`, not a Nexus feature.
 
 ## CPU Reference First
 
@@ -97,6 +108,13 @@ Production model runtimes should make these true after setup:
 - RGB/BGR -> RGB normalize -> BF16 NHWC packing;
 - missing/wrong view count rejection;
 - BF16 model action -> unnormalized robot action.
+
+`cpp/tests/test_pi05_runtime.cpp` validates the model runtime shell:
+
+- export retain/release;
+- Pi0.5 manifest exposure;
+- `prepare_vision -> replay_tick -> read_actions`;
+- replay dispatch to the export graph/key/stream.
 
 Build:
 
