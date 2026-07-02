@@ -33,6 +33,7 @@ from flash_rt.subgraphs.stage_plan import (
     register_stage_plan,
     resolve_stage_plan,
 )
+from flash_rt.subgraphs.capture import register_export_graph
 
 CHECKS = []
 
@@ -204,6 +205,24 @@ def check_stage_plan_registry():
         missing_vjp = False
     check("VJP-guided RTC plan fails without a producer VJP graph",
           missing_vjp)
+    class Dummy:
+        pass
+    try:
+        register_export_graph(Dummy(), "bad", object(), variants=())
+    except ValueError as e:
+        empty_variants_rejected = "at least one variant" in str(e)
+    else:
+        empty_variants_rejected = False
+    check("subgraph export rejects empty graph variants",
+          empty_variants_rejected)
+    try:
+        register_export_graph(Dummy(), "bad_stream", object(), stream=1)
+    except ValueError as e:
+        int_stream_rejected = "StreamSpec name" in str(e)
+    else:
+        int_stream_rejected = False
+    check("subgraph export rejects non-main integer stream ids",
+          int_stream_rejected)
 
 
 def check_vjp_guided_port_lowering(setup):

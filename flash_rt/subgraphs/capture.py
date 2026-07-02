@@ -106,19 +106,23 @@ def _stream_name(stream: str | int) -> str:
 def register_export_graph(pipeline: object, name: str, graph: object, *,
                           stream: str | int = "main",
                           variants: Sequence[int] = (0,)) -> None:
+    variants = tuple(variants)
+    if not variants:
+        raise ValueError("register_export_graph requires at least one variant")
     records = getattr(pipeline, "_flashrt_subgraph_export_graphs", None)
     if records is None:
         records = []
         setattr(pipeline, "_flashrt_subgraph_export_graphs", records)
     records[:] = [r for r in records if r.name != name]
     records.append(ExportGraphRecord(name, graph, _stream_name(stream),
-                                     tuple(variants)))
+                                     variants))
 
 
 def register_captured_graph(pipeline: object, name: str, cuda_graph: object, *,
                             exec_name: str | None = None,
                             stream: str | int = "main",
                             variants: Sequence[int] = (0,)) -> None:
+    variants = tuple(variants)
     if len(variants) != 1:
         raise ValueError(
             "register_captured_graph accepts one captured CUDA graph for one "
@@ -134,7 +138,7 @@ def register_captured_graph(pipeline: object, name: str, cuda_graph: object, *,
         cuda_graph=cuda_graph,
         exec_name=exec_name or name,
         stream=_stream_name(stream),
-        variants=tuple(variants),
+        variants=variants,
     )
     records.append(rec)
     materialize_captured_graphs(pipeline)
