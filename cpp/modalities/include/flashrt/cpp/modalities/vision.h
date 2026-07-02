@@ -46,13 +46,33 @@ Status preprocess_vision_cpu(const VisionPreprocessSpec& spec,
                              const std::vector<VisionFrame>& frames,
                              TensorView output);
 
+/* Persistent staging pool for the device vision path — the hot-path no-alloc
+ * discipline applied to sensor input. Fixed capacity allocated once (one
+ * device slot plus one pinned-host bounce slot per view); per-frame
+ * preprocess then performs NO cudaMalloc/cudaFree and its H2D copies run
+ * from pinned memory. A frame larger than a slot is an
+ * kInsufficientStorage ERROR, never a silent fallback allocation. */
+struct VisionStaging {
+    void* device = nullptr;
+    void* host_pinned = nullptr;
+    std::uint64_t slot_bytes = 0;
+    std::uint32_t slots = 0;
+};
+
+Status vision_staging_create(VisionStaging* out, std::uint32_t n_views,
+                             std::uint64_t max_frame_bytes);
+void vision_staging_destroy(VisionStaging*);
+
 /* Dispatch entry used by model runtimes. Host outputs use the CPU reference.
  * Device outputs use the CUDA resize/normalize kernel when enabled, otherwise
- * the conservative CPU reference -> H2D staging fallback. */
+ * the conservative CPU reference -> H2D staging fallback. Production device
+ * paths pass `staging`; without it the CUDA path allocates per frame
+ * (dev/one-shot use only). */
 Status preprocess_vision(const VisionPreprocessSpec& spec,
                          const std::vector<VisionFrame>& frames,
                          TensorView output,
-                         void* stream = nullptr);
+                         void* stream = nullptr,
+                         VisionStaging* staging = nullptr);
 
 std::uint64_t required_vision_output_bytes(const VisionPreprocessSpec& spec);
 

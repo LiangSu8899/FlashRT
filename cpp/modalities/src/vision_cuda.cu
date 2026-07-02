@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -192,7 +193,8 @@ const char* cuda_error(cudaError_t rc) {
 Status preprocess_vision_cuda(const VisionPreprocessSpec& spec,
                               const std::vector<VisionFrame>& frames,
                               TensorView output,
-                              void* stream) {
+                              void* stream,
+                              VisionStaging* staging) {
     if (spec.view_order.empty()) {
         return Status::error(StatusCode::kInvalidArgument,
                              "vision view_order is empty");
@@ -222,9 +224,14 @@ Status preprocess_vision_cuda(const VisionPreprocessSpec& spec,
                              "vision device output storage is invalid");
     }
 
+    if (staging && staging->slots < spec.view_order.size()) {
+        return Status::error(StatusCode::kInsufficientStorage,
+                             "vision staging has fewer slots than views");
+    }
+
     cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
-    std::vector<void*> device_frames;
-    device_frames.reserve(spec.view_order.size());
+    std::vector<void*> device_frames;   /* fallback path only */
+    device_frames.reserve(staging ? 0 : spec.view_order.size());
 
     auto cleanup = [&]() {
         for (void* p : device_frames) cudaFree(p);
@@ -249,16 +256,38 @@ Status preprocess_vision_cuda(const VisionPreprocessSpec& spec,
             static_cast<std::uint64_t>(stride) *
             static_cast<std::uint64_t>(frame->height);
         void* d_src = nullptr;
-        cudaError_t rc = cudaMalloc(&d_src, bytes);
-        if (rc != cudaSuccess) {
-            cleanup();
-            return Status::error(StatusCode::kBackend,
-                                 std::string("cudaMalloc vision source failed: ") +
-                                     cuda_error(rc));
+        cudaError_t rc = cudaSuccess;
+        if (staging) {
+            /* hot path: fixed slots, no allocation. Bounce through the pinned
+             * slot so the H2D copy is a true async transfer, then the caller
+             * may reuse its frame memory after the end-of-call sync. */
+            if (bytes > staging->slot_bytes) {
+                cleanup();
+                return Status::error(
+                    StatusCode::kInsufficientStorage,
+                    "vision frame exceeds the staging slot capacity: " +
+                        spec.view_order[v]);
+            }
+            const std::uint64_t off = staging->slot_bytes * v;
+            void* h_slot = static_cast<char*>(staging->host_pinned) + off;
+            d_src = static_cast<char*>(staging->device) + off;
+            std::memcpy(h_slot, frame->image.data, bytes);
+            rc = cudaMemcpyAsync(d_src, h_slot, bytes,
+                                 cudaMemcpyHostToDevice, cuda_stream);
+        } else {
+            /* dev/one-shot path: per-frame allocation */
+            rc = cudaMalloc(&d_src, bytes);
+            if (rc != cudaSuccess) {
+                cleanup();
+                return Status::error(
+                    StatusCode::kBackend,
+                    std::string("cudaMalloc vision source failed: ") +
+                        cuda_error(rc));
+            }
+            device_frames.push_back(d_src);
+            rc = cudaMemcpyAsync(d_src, frame->image.data, bytes,
+                                 cudaMemcpyHostToDevice, cuda_stream);
         }
-        device_frames.push_back(d_src);
-        rc = cudaMemcpyAsync(d_src, frame->image.data, bytes,
-                             cudaMemcpyHostToDevice, cuda_stream);
         if (rc != cudaSuccess) {
             cleanup();
             return Status::error(StatusCode::kBackend,

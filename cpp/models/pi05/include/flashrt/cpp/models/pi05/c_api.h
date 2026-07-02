@@ -48,6 +48,13 @@ typedef struct frt_pi05_runtime_config {
      * FRT_PI05_DTYPE_FLOAT16. */
     int image_dtype;
     int action_dtype;
+
+    /* Optional ABI extension: capacity of the persistent vision staging pool
+     * (allocated once at create; the per-frame hot path never allocates).
+     * Zero keeps the defaults (1280x720). A camera frame larger than the
+     * capacity is a per-call error, never a fallback allocation. */
+    int max_frame_width;
+    int max_frame_height;
 } frt_pi05_runtime_config;
 
 typedef struct frt_pi05_vision_frame {

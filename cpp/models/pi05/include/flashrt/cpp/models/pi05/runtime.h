@@ -29,6 +29,11 @@ struct RuntimeConfig {
     std::string image_buffer_name = "observation_images_normalized";
     std::string action_buffer_name = "diffusion_noise";
 
+    /* Persistent vision-staging capacity (see c_api.h): allocated once at
+     * construction so prepare_vision never allocates on the hot path. */
+    int max_frame_width = 1280;
+    int max_frame_height = 720;
+
     /* Optional host/device overrides. If left null, Runtime derives tensor
      * views from the export's named buffers. The current CPU reference
      * preprocess/postprocess requires host tensors; GPU processors will use
@@ -76,6 +81,7 @@ private:
     RuntimeConfig config_;
     families::vla::Manifest manifest_;
     modalities::Status status_;
+    modalities::VisionStaging staging_;
     RuntimeIo io_;
     frt_graph graph_ = nullptr;
     frt_shape_key graph_key_ = 0;

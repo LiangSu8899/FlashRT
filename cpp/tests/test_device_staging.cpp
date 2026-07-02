@@ -79,6 +79,34 @@ void test_vision_h2d_staging() {
     assert(std::fabs(bfloat16_to_float(got[1]) -
                      (127.0f / 127.5f - 1.0f)) < 0.01f);
     assert(std::fabs(bfloat16_to_float(got[2]) - 1.0f) < 0.01f);
+
+    /* the persistent staging pool (hot path: no per-frame allocation) must
+     * produce the same bytes as the allocating dev path, tick after tick */
+    flashrt::modalities::VisionStaging pool;
+    st = flashrt::modalities::vision_staging_create(&pool, 1, sizeof(rgb));
+    assert(st.ok_status() && pool.device && pool.host_pinned);
+    std::vector<std::uint16_t> pooled(bytes / 2);
+    for (int round = 0; round < 3; ++round) {
+        assert(cudaMemset(device, 0, bytes) == cudaSuccess);
+        st = preprocess_vision(spec, {frame}, dst, nullptr, &pool);
+        assert(st.ok_status());
+        assert(cudaMemcpy(pooled.data(), device, bytes,
+                          cudaMemcpyDeviceToHost) == cudaSuccess);
+        assert(pooled == got);
+    }
+    /* over-capacity frames are a hard error, never a fallback allocation */
+    VisionFrame big = frame;
+    big.width = 64; big.height = 64; big.stride_bytes = 64 * 3;
+    big.image.bytes = 64ull * 64 * 3;
+    std::vector<std::uint8_t> big_pixels(64ull * 64 * 3, 7);
+    big.image.data = big_pixels.data();
+    big.image.shape = Shape{64, 64, 3};
+    st = preprocess_vision(spec, {big}, dst, nullptr, &pool);
+    assert(!st.ok_status());
+    assert(st.code == flashrt::modalities::StatusCode::kInsufficientStorage);
+    flashrt::modalities::vision_staging_destroy(&pool);
+    assert(pool.device == nullptr && pool.host_pinned == nullptr);
+
     cudaFree(device);
 }
 

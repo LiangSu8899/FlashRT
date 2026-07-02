@@ -22,7 +22,8 @@ public:
               int chunk = kDefaultChunk,
               int model_action_dim = kModelActionDim,
               int robot_action_dim = kLiberoActionDim,
-              modalities::DType image_dtype = modalities::DType::kBFloat16);
+              modalities::DType image_dtype = modalities::DType::kBFloat16,
+              modalities::VisionStaging* staging = nullptr);
 
     modalities::Status prepare_vision(
         const std::vector<modalities::VisionFrame>& frames) const;
@@ -40,6 +41,7 @@ private:
     modalities::TensorView image_input_;
     modalities::TensorView action_output_;
     void* stream_ = nullptr;
+    modalities::VisionStaging* staging_ = nullptr;   /* borrowed */
     modalities::VisionPreprocessSpec vision_spec_;
     modalities::ActionPostprocessSpec action_spec_;
 };

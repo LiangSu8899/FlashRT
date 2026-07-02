@@ -13,10 +13,12 @@ RuntimeIo::RuntimeIo(int num_views,
                      int chunk,
                      int model_action_dim,
                      int robot_action_dim,
-                     modalities::DType image_dtype)
+                     modalities::DType image_dtype,
+                     modalities::VisionStaging* staging)
     : image_input_(image_input),
       action_output_(action_output),
       stream_(stream),
+      staging_(staging),
       vision_spec_(vision_preprocess_spec(num_views)),
       action_spec_(action_postprocess_spec(action_mean, action_stddev, chunk,
                                            model_action_dim, robot_action_dim)) {
@@ -26,7 +28,7 @@ RuntimeIo::RuntimeIo(int num_views,
 modalities::Status RuntimeIo::prepare_vision(
     const std::vector<modalities::VisionFrame>& frames) const {
     return modalities::preprocess_vision(vision_spec_, frames, image_input_,
-                                         stream_);
+                                         stream_, staging_);
 }
 
 modalities::Status RuntimeIo::read_actions(

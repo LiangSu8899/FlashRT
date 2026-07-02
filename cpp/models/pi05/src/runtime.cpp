@@ -70,6 +70,7 @@ Runtime::Runtime(const frt_runtime_export_v1* exp, RuntimeConfig config)
 }
 
 Runtime::~Runtime() {
+    modalities::vision_staging_destroy(&staging_);
     release_export();
 }
 
@@ -151,10 +152,24 @@ modalities::Status Runtime::bind() {
         manifest_.state_regions.push_back(std::move(region));
     }
 
+    /* Persistent staging: the per-frame hot path never allocates. Only the
+     * device path needs it (host-tensor overrides preprocess on the CPU). */
+    modalities::VisionStaging* staging = nullptr;
+    if (image.place == modalities::MemoryPlace::kDevice) {
+        const std::uint64_t max_frame_bytes =
+            static_cast<std::uint64_t>(config_.max_frame_width) *
+            static_cast<std::uint64_t>(config_.max_frame_height) * 4ull;
+        modalities::Status st = modalities::vision_staging_create(
+            &staging_, static_cast<std::uint32_t>(config_.num_views),
+            max_frame_bytes);
+        if (!st.ok_status()) return st;
+        staging = &staging_;
+    }
+
     io_ = RuntimeIo(config_.num_views, image, action, config_.action_mean,
                     config_.action_stddev, find_native_stream(exp_, stream_id_),
                     config_.chunk, config_.model_action_dim,
-                    config_.robot_action_dim, config_.image_dtype);
+                    config_.robot_action_dim, config_.image_dtype, staging);
     return modalities::Status::ok();
 }
 

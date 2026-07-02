@@ -16,7 +16,54 @@ namespace modalities {
 Status preprocess_vision_cuda(const VisionPreprocessSpec& spec,
                               const std::vector<VisionFrame>& frames,
                               TensorView output,
-                              void* stream);
+                              void* stream,
+                              VisionStaging* staging);
+#endif
+
+#ifdef FLASHRT_CPP_WITH_CUDA_STAGING
+Status vision_staging_create(VisionStaging* out, std::uint32_t n_views,
+                             std::uint64_t max_frame_bytes) {
+    if (!out || !n_views || !max_frame_bytes) {
+        return Status::error(StatusCode::kInvalidArgument,
+                             "invalid vision staging capacity");
+    }
+    *out = VisionStaging{};
+    const std::uint64_t total = max_frame_bytes * n_views;
+    cudaError_t rc = cudaMalloc(&out->device, total);
+    if (rc != cudaSuccess) {
+        return Status::error(StatusCode::kBackend,
+                             std::string("vision staging cudaMalloc failed: ") +
+                                 cudaGetErrorString(rc));
+    }
+    rc = cudaMallocHost(&out->host_pinned, total);
+    if (rc != cudaSuccess) {
+        cudaFree(out->device);
+        *out = VisionStaging{};
+        return Status::error(StatusCode::kBackend,
+                             std::string("vision staging cudaMallocHost failed: ") +
+                                 cudaGetErrorString(rc));
+    }
+    out->slot_bytes = max_frame_bytes;
+    out->slots = n_views;
+    return Status::ok();
+}
+
+void vision_staging_destroy(VisionStaging* s) {
+    if (!s) return;
+    if (s->device) cudaFree(s->device);
+    if (s->host_pinned) cudaFreeHost(s->host_pinned);
+    *s = VisionStaging{};
+}
+#else
+Status vision_staging_create(VisionStaging* out, std::uint32_t, std::uint64_t) {
+    if (out) *out = VisionStaging{};
+    return Status::error(StatusCode::kUnsupported,
+                         "vision staging requires the CUDA staging build");
+}
+
+void vision_staging_destroy(VisionStaging* s) {
+    if (s) *s = VisionStaging{};
+}
 #endif
 
 namespace {
@@ -206,7 +253,8 @@ Status preprocess_vision_cpu(const VisionPreprocessSpec& spec,
 Status preprocess_vision(const VisionPreprocessSpec& spec,
                          const std::vector<VisionFrame>& frames,
                          TensorView output,
-                         void* stream) {
+                         void* stream,
+                         VisionStaging* staging) {
     if (output.place == MemoryPlace::kHost ||
         output.place == MemoryPlace::kHostPinned) {
         return preprocess_vision_cpu(spec, frames, output);
@@ -226,8 +274,9 @@ Status preprocess_vision(const VisionPreprocessSpec& spec,
                              "vision device output storage is too small");
     }
 #ifdef FLASHRT_CPP_WITH_CUDA_KERNELS
-    return preprocess_vision_cuda(spec, frames, output, stream);
+    return preprocess_vision_cuda(spec, frames, output, stream, staging);
 #else
+    (void)staging;
     std::vector<std::uint8_t> staging(static_cast<std::size_t>(bytes));
     TensorView host_output;
     host_output.data = staging.data();

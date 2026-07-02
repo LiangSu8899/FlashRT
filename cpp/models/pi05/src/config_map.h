@@ -82,6 +82,14 @@ inline RuntimeConfig make_config(const frt_pi05_runtime_config* in) {
                   sizeof(in->action_dtype))) {
         cfg.action_dtype = dtype(in->action_dtype);
     }
+    if (has_field(in, offsetof(frt_pi05_runtime_config, max_frame_width),
+                  sizeof(in->max_frame_width)) && in->max_frame_width > 0) {
+        cfg.max_frame_width = in->max_frame_width;
+    }
+    if (has_field(in, offsetof(frt_pi05_runtime_config, max_frame_height),
+                  sizeof(in->max_frame_height)) && in->max_frame_height > 0) {
+        cfg.max_frame_height = in->max_frame_height;
+    }
     return cfg;
 }
 
