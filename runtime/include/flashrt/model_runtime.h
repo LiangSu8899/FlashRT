@@ -107,7 +107,9 @@ enum frt_rt_port_update {
 /* ------------------------------------------------------------------ */
 
 /* One sensor frame handed to an IMAGE/DEPTH port. `set_input` receives an
- * array of these; `bytes` of the call = n_frames * sizeof(frt_image_view). */
+ * array of these; `bytes` of the call = n_frames * sizeof(frt_image_view).
+ * Frames are matched to the model's camera views POSITIONALLY, in the view
+ * order the producer declared (see the port's manifest entry). */
 typedef struct frt_image_view {
     uint32_t struct_size;      /* = sizeof(frt_image_view)                 */
     uint32_t pixel_format;     /* enum frt_rt_pixel_format                 */
@@ -167,7 +169,8 @@ typedef struct frt_model_runtime_verbs {
                      const void* data, uint64_t bytes, int stream);
 
     /* Read one output port through the producer's postprocess (e.g. action
-     * unnormalize). Raw readback needs no verb — use the port's buffer. */
+     * unnormalize). `capacity`/`written` are BYTES. Raw readback needs no
+     * verb — use the port's buffer. */
     int (*get_output)(void* self, uint32_t port,
                       void* out, uint64_t capacity, uint64_t* written,
                       int stream);

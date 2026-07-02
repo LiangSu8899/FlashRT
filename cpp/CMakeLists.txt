@@ -33,6 +33,10 @@ if(FLASHRT_CPP_WITH_EXEC AND NOT TARGET flashrt_exec)
   add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../exec
                    ${CMAKE_CURRENT_BINARY_DIR}/exec)
 endif()
+if(NOT TARGET flashrt_runtime)
+  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../runtime
+                   ${CMAKE_CURRENT_BINARY_DIR}/runtime)
+endif()
 
 add_library(flashrt_cpp INTERFACE)
 target_include_directories(flashrt_cpp
@@ -84,9 +88,10 @@ target_link_libraries(flashrt_cpp_pi05
   PUBLIC flashrt_cpp_modalities flashrt_cpp_vla)
 
 add_library(flashrt_cpp_pi05_c SHARED
-  models/pi05/src/c_api.cpp)
+  models/pi05/src/c_api.cpp
+  models/pi05/src/model_runtime.cpp)
 target_link_libraries(flashrt_cpp_pi05_c
-  PUBLIC flashrt_cpp_pi05)
+  PUBLIC flashrt_cpp_pi05 flashrt_runtime)
 target_include_directories(flashrt_cpp_pi05_c
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/include)
 
@@ -111,5 +116,10 @@ if(BUILD_TESTING)
     target_link_libraries(test_pi05_c_api
       PRIVATE flashrt_cpp_pi05_c flashrt_exec CUDA::cudart)
     add_test(NAME pi05_c_api COMMAND test_pi05_c_api)
+
+    add_executable(test_pi05_model_runtime tests/test_pi05_model_runtime.cpp)
+    target_link_libraries(test_pi05_model_runtime
+      PRIVATE flashrt_cpp_pi05_c flashrt_exec flashrt_runtime CUDA::cudart)
+    add_test(NAME pi05_model_runtime COMMAND test_pi05_model_runtime)
   endif()
 endif()
