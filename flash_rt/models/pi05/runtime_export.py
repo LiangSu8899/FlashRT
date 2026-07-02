@@ -131,7 +131,7 @@ def export_model_runtime(pl, identity=None, extra_regions=None,
                 _rt.PortSpec("prefix_weights", "tensor", "f32", "flat",
                              "in", "swap", shape=(chunk,),
                              buffer=wrap["rtc_prefix_weights"]),
-                _rt.PortSpec("guidance_weight", "tensor", "f32", "scalar",
+                _rt.PortSpec("guidance_weight", "tensor", "f32", "flat",
                              "in", "swap", shape=(1,),
                              buffer=wrap["rtc_guidance_weight"]),
             ])
@@ -161,7 +161,7 @@ def export_model_runtime(pl, identity=None, extra_regions=None,
                 _rt.PortSpec("prefix_weights", "tensor", "f32", "flat",
                              "in", "swap", shape=(chunk,),
                              buffer=wrap["rtc_prefix_weights"]),
-                _rt.PortSpec("guidance_weight", "tensor", "f32", "scalar",
+                _rt.PortSpec("guidance_weight", "tensor", "f32", "flat",
                              "in", "swap", shape=(1,),
                              buffer=wrap["rtc_guidance_weight"]),
             ])
@@ -250,8 +250,13 @@ def _parts(pl, identity, extra_regions):
     ]
     from flash_rt.subgraphs.capture import export_graph_records
     for rec in export_graph_records(pl):
-        graphs.append(_rt.GraphSpec(rec.name, rec.graph, rec.stream,
-                                    rec.variants))
+        graphs.append(_rt.GraphSpec(
+            name=rec.name,
+            graph=rec.graph,
+            default_key=rec.variants[0],
+            keys=rec.variants,
+            stream=rec.stream,
+        ))
     buffers = [
         _rt.BufferSpec("observation_images_normalized",
                        wrap["observation_images_normalized"], "input"),

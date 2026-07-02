@@ -25,7 +25,7 @@ import _flashrt_runtime as rt
 import flash_rt.runtime.export as export_mod
 from flash_rt.runtime.export import (
     BufferSpec, GraphSpec, PortSpec, RegionSpec, StageSpec, StreamSpec,
-    build_model_runtime, DTYPE, MODALITY, UPDATE,
+    build_model_runtime, DTYPE, LAYOUT, MODALITY, UPDATE,
 )
 from flash_rt.subgraphs.stage_plan import (
     StagePlan,
@@ -206,7 +206,55 @@ def check_stage_plan_registry():
           missing_vjp)
 
 
+def check_vjp_guided_port_lowering(setup):
+    ctx, sid, src, dst, g = setup
+    from flash_rt.subgraphs.pi05 import stage_plans as _pi05_plans  # noqa: F401
+    plan = resolve_stage_plan("context_rtc_vjp_guided_action", model="pi05")
+    mr = build_model_runtime(
+        ctx,
+        streams=[StreamSpec("main", sid)],
+        graphs=[
+            GraphSpec("infer", g, stream="main"),
+            GraphSpec("context", g, stream="main"),
+            GraphSpec("decode_rtc_vjp_guided", g, stream="main"),
+        ],
+        buffers=[BufferSpec("prev", src, "input"),
+                 BufferSpec("actions", dst, ("input", "output")),
+                 BufferSpec("weights", src, "input"),
+                 BufferSpec("guidance", src, "input")],
+        regions=[RegionSpec("boundary", dst)],
+        ports=[
+            PortSpec("prev_action_chunk", "tensor", "bf16", "flat", "in",
+                     "swap", shape=(10, 32), buffer=src),
+            PortSpec("actions_raw", "tensor", "bf16", "flat", "out",
+                     "swap", shape=(10, 32), buffer=dst),
+            PortSpec("prefix_weights", "tensor", "f32", "flat", "in",
+                     "swap", shape=(10,), buffer=src, nbytes=40),
+            PortSpec("guidance_weight", "tensor", "f32", "flat", "in",
+                     "swap", shape=(1,), buffer=src, nbytes=4),
+        ],
+        stages=plan.to_stage_specs(export_mod),
+        identity={"model": "pi05", "plan": "context_rtc_vjp_guided_action"},
+        manifest_extra={"stage_plan": plan.manifest()},
+    )
+    try:
+        m = ModelV1.from_address(mr.ptr)
+        guidance = m.ports[3]
+        check("VJP-guided RTC ports lower with ABI-supported flat scalar",
+              guidance.name == b"guidance_weight"
+              and guidance.layout == LAYOUT["flat"]
+              and guidance.rank == 1
+              and guidance.shape[0] == 1
+              and guidance.bytes == 4)
+        check("VJP-guided RTC plan lowers to context -> guided action",
+              mr.stages() == [{"graph": 1, "after": []},
+                              {"graph": 2, "after": [0]}])
+    finally:
+        mr.release()
+
+
 def main():
+    CHECKS.clear()
     setup = make_setup()
     ctx, sid, src, dst, g = setup
 
@@ -265,6 +313,7 @@ def main():
 
     print("== stage plan registry ==")
     check_stage_plan_registry()
+    check_vjp_guided_port_lowering(setup)
 
     print("== verbs through the C function pointers ==")
     rc = rt.model_set_input(mr.ptr, 1, b"\xAA\xBB", -1)
@@ -302,4 +351,8 @@ def main():
 
 
 if __name__ == "__main__":
+    main()
+
+
+def test_main():
     main()

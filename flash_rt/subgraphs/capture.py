@@ -18,7 +18,7 @@ CaptureHook = Callable[[object, object, int], None]
 class ExportGraphRecord:
     name: str
     graph: object
-    stream: int = 0
+    stream: str = "main"
     variants: Sequence[int] = (0,)
 
 
@@ -27,7 +27,7 @@ class CapturedGraphRecord:
     name: str
     cuda_graph: object
     exec_name: str
-    stream: int = 0
+    stream: str = "main"
     variants: Sequence[int] = (0,)
     materialized: bool = False
 
@@ -91,20 +91,33 @@ def capture_graph(pipeline: object, stream_handle: object, body: Callable[[], No
     return graph
 
 
+def _stream_name(stream: str | int) -> str:
+    if isinstance(stream, str):
+        if not stream:
+            raise ValueError("stream name must be non-empty")
+        return stream
+    if stream == 0:
+        return "main"
+    raise ValueError(
+        "subgraph stream must be a StreamSpec name; integer 0 is accepted "
+        "only as a backward-compatible alias for 'main'")
+
+
 def register_export_graph(pipeline: object, name: str, graph: object, *,
-                          stream: int = 0,
+                          stream: str | int = "main",
                           variants: Sequence[int] = (0,)) -> None:
     records = getattr(pipeline, "_flashrt_subgraph_export_graphs", None)
     if records is None:
         records = []
         setattr(pipeline, "_flashrt_subgraph_export_graphs", records)
     records[:] = [r for r in records if r.name != name]
-    records.append(ExportGraphRecord(name, graph, stream, tuple(variants)))
+    records.append(ExportGraphRecord(name, graph, _stream_name(stream),
+                                     tuple(variants)))
 
 
 def register_captured_graph(pipeline: object, name: str, cuda_graph: object, *,
                             exec_name: str | None = None,
-                            stream: int = 0,
+                            stream: str | int = "main",
                             variants: Sequence[int] = (0,)) -> None:
     if len(variants) != 1:
         raise ValueError(
@@ -120,7 +133,7 @@ def register_captured_graph(pipeline: object, name: str, cuda_graph: object, *,
         name=name,
         cuda_graph=cuda_graph,
         exec_name=exec_name or name,
-        stream=stream,
+        stream=_stream_name(stream),
         variants=tuple(variants),
     )
     records.append(rec)

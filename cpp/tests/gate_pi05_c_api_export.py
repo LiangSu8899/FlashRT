@@ -10,7 +10,7 @@ This is intentionally an in-process phase-1 test:
 Run inside the CUDA container from the repo root:
     PYTHONPATH=.:./exec/build:./runtime/build \
     python cpp/tests/gate_pi05_c_api_export.py \
-      --checkpoint /workspace/PI/checkpoints/pi05_libero_pytorch --fp8
+      --checkpoint "${PI05_CHECKPOINT:-/path/to/pi05_libero_pytorch}" --fp8
 """
 
 from __future__ import annotations

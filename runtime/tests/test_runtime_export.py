@@ -106,6 +106,7 @@ def build(ctx, sid, src, dst, g, identity=None, regions=None, manifest=None):
 
 
 def main():
+    CHECKS.clear()
     setup = make_setup()
     ctx, sid, src, dst, g = setup
 
@@ -180,4 +181,8 @@ def main():
 
 
 if __name__ == "__main__":
+    main()
+
+
+def test_main():
     main()

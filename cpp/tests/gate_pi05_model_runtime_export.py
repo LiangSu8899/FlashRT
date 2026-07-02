@@ -4,7 +4,7 @@ Run inside the CUDA container from the repo root:
 
     PYTHONPATH=.:./exec/build-container:./runtime/build-container \
     python cpp/tests/gate_pi05_model_runtime_export.py \
-      --checkpoint /workspace/PI/checkpoints/pi05_libero_pytorch --fp8 \
+      --checkpoint "${PI05_CHECKPOINT:-/path/to/pi05_libero_pytorch}" --fp8 \
       --lib cpp/build-container/libflashrt_cpp_pi05_c.so
 
 The gate compares three surfaces:
