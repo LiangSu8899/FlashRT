@@ -28,31 +28,6 @@ target_include_directories(flashrt_runtime
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
          ${CMAKE_CURRENT_SOURCE_DIR}/../exec/include)
 
-add_library(flashrt_runtime_modalities STATIC
-  ../runtime_modalities/src/types.cpp
-  ../runtime_modalities/src/vision_cpu.cpp
-  ../runtime_modalities/src/action_cpu.cpp)
-target_include_directories(flashrt_runtime_modalities
-  PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../runtime_modalities/include)
-
-add_library(flashrt_pi05_runtime_spec STATIC
-  ../runtime_models/pi05/src/cpp_runtime_spec.cpp
-  ../runtime_models/pi05/src/cpp_runtime_io.cpp)
-target_include_directories(flashrt_pi05_runtime_spec
-  PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../runtime_models/pi05/include)
-target_link_libraries(flashrt_pi05_runtime_spec
-  PUBLIC flashrt_runtime_modalities)
-
-target_include_directories(flashrt_runtime
-  PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../runtime_modalities/include)
-
-if(BUILD_TESTING)
-  add_executable(test_runtime_modalities tests/test_modalities.cpp)
-  target_link_libraries(test_runtime_modalities
-    PRIVATE flashrt_pi05_runtime_spec flashrt_runtime_modalities)
-  add_test(NAME runtime_modalities COMMAND test_runtime_modalities)
-endif()
-
 # --- pybind setup/dev module (optional) ---
 find_package(Python3 COMPONENTS Interpreter Development.Module QUIET)
 find_package(pybind11 CONFIG QUIET)

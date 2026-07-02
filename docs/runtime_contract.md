@@ -78,15 +78,15 @@ region set validated by `serving/robot_recap/verify_capsule.py`).
 ## C++ model runtime layer
 
 The runtime export is still only the hand-off surface. Model IO semantics live
-one layer above it in FlashRT's C++ runtime:
+one layer above it in FlashRT's native C++ path:
 
-- `runtime/include/flashrt/runtime_cpp.h` defines the non-frozen C++ model
-  runtime interface.
-- `runtime_modalities/` contains reusable modality primitives: tensor views,
+- `cpp/runtime/` defines the non-frozen native runtime manager interfaces.
+- `cpp/modalities/` contains reusable modality primitives: tensor views,
   vision preprocess, and action postprocess.
-- `runtime_models/<model>/` contains thin model adapters that bind those
-  primitives to concrete buffer names, shapes, normalization, action schemas,
-  and state regions.
+- `cpp/families/` contains model-family contracts such as VLA.
+- `cpp/models/<model>/` contains thin model adapters that bind family +
+  modality primitives to concrete buffer names, shapes, normalization, action
+  schemas, and state regions.
 
 Nexus should not implement or own these rules. It adopts `frt_runtime_export_v1`
 and drives snapshot/restore/replay; FlashRT model runtimes prepare inputs and

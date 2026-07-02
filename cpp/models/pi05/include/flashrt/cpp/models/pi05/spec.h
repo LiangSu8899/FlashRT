@@ -1,8 +1,8 @@
 #ifndef FLASHRT_MODELS_PI05_CPP_RUNTIME_SPEC_H
 #define FLASHRT_MODELS_PI05_CPP_RUNTIME_SPEC_H
 
-#include "flashrt/modalities/action.h"
-#include "flashrt/modalities/vision.h"
+#include "flashrt/cpp/modalities/action.h"
+#include "flashrt/cpp/modalities/vision.h"
 
 #include <vector>
 

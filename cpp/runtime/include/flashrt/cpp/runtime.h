@@ -2,8 +2,8 @@
 #define FLASHRT_RUNTIME_CPP_H
 
 #include "flashrt/runtime.h"
-#include "flashrt/modalities/action.h"
-#include "flashrt/modalities/vision.h"
+#include "flashrt/cpp/modalities/action.h"
+#include "flashrt/cpp/modalities/vision.h"
 
 #include <string>
 #include <vector>

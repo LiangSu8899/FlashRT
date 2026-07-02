@@ -1,4 +1,4 @@
-#include "flashrt/models/pi05/cpp_runtime_io.h"
+#include "flashrt/cpp/models/pi05/io.h"
 
 namespace flashrt {
 namespace models {

@@ -1,7 +1,7 @@
 #ifndef FLASHRT_MODELS_PI05_CPP_RUNTIME_IO_H
 #define FLASHRT_MODELS_PI05_CPP_RUNTIME_IO_H
 
-#include "flashrt/models/pi05/cpp_runtime_spec.h"
+#include "flashrt/cpp/models/pi05/spec.h"
 
 namespace flashrt {
 namespace models {

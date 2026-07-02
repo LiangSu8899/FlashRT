@@ -1,7 +1,7 @@
-#include "flashrt/modalities/action.h"
-#include "flashrt/modalities/vision.h"
-#include "flashrt/models/pi05/cpp_runtime_io.h"
-#include "flashrt/models/pi05/cpp_runtime_spec.h"
+#include "flashrt/cpp/modalities/action.h"
+#include "flashrt/cpp/modalities/vision.h"
+#include "flashrt/cpp/models/pi05/io.h"
+#include "flashrt/cpp/models/pi05/spec.h"
 
 #include <cassert>
 #include <cmath>

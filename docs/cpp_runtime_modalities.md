@@ -1,8 +1,9 @@
-# FlashRT C++ Runtime Modalities
+# FlashRT C++ Native Runtime
 
-This layer is the native model-runtime side above `frt_runtime_export_v1`.
-It owns model IO semantics: modality preprocess, prompt/state binding, replay
-inputs, and action postprocess. It is deliberately inside FlashRT, not Nexus.
+The `cpp/` tree is the native model-runtime side above
+`frt_runtime_export_v1`. It owns model IO semantics: modality preprocess,
+prompt/state binding, replay inputs, and action postprocess. It is deliberately
+inside FlashRT, not Nexus.
 
 Nexus consumes only the exported runtime surface:
 
@@ -27,24 +28,31 @@ Stable ABI:
 - `frt_runtime_export_v1`
 - `FRT_RUNTIME_OPEN_V1_SYMBOL`
 
-Non-frozen C++ runtime API:
+Non-frozen C++ path:
 
-- `runtime/include/flashrt/runtime_cpp.h`
-- `runtime_modalities/include/flashrt/modalities/*.h`
-- `runtime_models/<model>/`
+- `cpp/runtime/`: native runtime manager interfaces.
+- `cpp/modalities/`: reusable modality primitives.
+- `cpp/families/`: model-family contracts such as VLA.
+- `cpp/models/`: concrete model adapters such as Pi0.5.
 
 The C++ API is allowed to evolve until multiple real model runtimes have forced
 the common shape. The export ABI remains the stable hand-off.
 
 ## Modality Split
 
-Common primitives live in `runtime_modalities/`:
+Common primitives live in `cpp/modalities/`:
 
 - `types.h`: tensor view, dtype, layout, memory place, status.
 - `vision.h`: view-order guarded resize/normalize/layout pack.
 - `action.h`: slice, unnormalize, clamp, action schema.
 
-Model adapters live in `runtime_models/<model>/`:
+Model-family contracts live in `cpp/families/<family>/`:
+
+- define the common flow shared by a class of models;
+- keep Pi0.5-specific rules out of the runtime manager;
+- give the second VLA model a place to land without copying Pi0.5.
+
+Model adapters live in `cpp/models/<model>/`:
 
 - declare required views, target shape, dtype, normalization, output buffers;
 - declare action chunk/model dim/robot dim/schema/stats;
@@ -83,7 +91,7 @@ Production model runtimes should make these true after setup:
 
 ## Tests
 
-`runtime/tests/test_modalities.cpp` validates the first contracts:
+`cpp/tests/test_modalities.cpp` validates the first contracts:
 
 - Pi0.5 vision spec shape/order/dtype;
 - RGB/BGR -> RGB normalize -> BF16 NHWC packing;
@@ -93,7 +101,7 @@ Production model runtimes should make these true after setup:
 Build:
 
 ```
-cmake -S runtime -B runtime/build -DCMAKE_BUILD_TYPE=Release
-cmake --build runtime/build -j
-ctest --test-dir runtime/build --output-on-failure
+cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release
+cmake --build cpp/build -j
+ctest --test-dir cpp/build --output-on-failure
 ```

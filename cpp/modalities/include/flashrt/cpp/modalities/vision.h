@@ -1,7 +1,7 @@
 #ifndef FLASHRT_MODALITIES_VISION_H
 #define FLASHRT_MODALITIES_VISION_H
 
-#include "flashrt/modalities/types.h"
+#include "flashrt/cpp/modalities/types.h"
 
 #include <string>
 #include <vector>
