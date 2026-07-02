@@ -75,6 +75,49 @@ capture stream, graphs = `infer` / `decode_only`, buffers = the pipeline IO
 surface, default capsule region = the rollout boundary (`diffusion_noise`, the
 region set validated by `serving/robot_recap/verify_capsule.py`).
 
+## The model runtime ABI (`flashrt/model_runtime.h`)
+
+The export describes a captured model's static execution assets; it does not
+say how dynamic inputs enter the model each tick. That is the model runtime
+ABI — `frt_model_runtime_v1` — the standard face of one deployed, tickable
+model:
+
+```
+                 ┌────────────────────────────────────────────┐
+   host tick ──► │ frt_model_runtime_v1                       │
+                 │   ports[]   modality/dtype/shape/update    │
+                 │   stages[]  subgraph DAG (export graphs)   │
+                 │   verbs     set_input · get_output ·       │
+                 │             prepare(warm) · step(sugar)    │
+                 │   exp ────► frt_runtime_export_v1          │
+                 │             (state/replay kernel, frozen)  │
+                 └────────────────────────────────────────────┘
+```
+
+The contract is data first, verbs as sugar. Ports carry the load-bearing
+**update class** — the two-speed hot path:
+
+- `SWAP` — the port is a device-buffer window; the host writes raw bytes
+  directly (its own copy verb / `cap_swap`). Microsecond lane, zero model
+  code in the loop. (observation tensors, noise seeds, numeric state)
+- `STAGED` — the runtime's `set_input` transforms host data (tokenize /
+  resize / normalize / embed) into bound buffers. (prompt text, camera frames)
+- `SETUP` — legal only outside the tick.
+
+Production contract for both hot classes: never recapture, never allocate,
+never rebind graph pointers — only buffer contents change. Replay graphs are
+fixed-shape or bucket-keyed; a bucket miss is handled by `prepare` in the
+warm phase, never inside a tick. `step` fires the declared stage order for
+simple hosts; scheduling hosts fire stages themselves (that is what the stage
+DAG is for).
+
+Two construction paths: the export builder assembles export + ports + stages
+under ONE identity (`frt_runtime_builder_finish_model` — a port-schema change
+changes the fingerprint), or `frt_model_runtime_wrap` wraps an existing
+export with ports/verbs (the native-adapter path; identity inherited).
+Consumers retain/release only the model runtime; it holds the export
+reference internally.
+
 ## C++ model runtime layer
 
 The runtime export is still only the hand-off surface. Model IO semantics live
@@ -113,10 +156,14 @@ Additive only after v1: append struct fields (bump `FRT_RUNTIME_ABI_VERSION` +
 
 ```
 PYTHONPATH=.:./exec/build:./runtime/build python runtime/tests/test_runtime_export.py
+./runtime/build/test_model_runtime
 ```
 
-Covers: ctypes-mirror layout check of every field, fingerprint determinism /
-identity sensitivity / region-order sensitivity / manifest insensitivity,
-retain-release lifetime against the Python anchor, and replay through exported
-handles. The consumer side is validated in the FlashRT-Nexus repo (adopt +
-snapshot/restore through the capsule core).
+The export test covers: ctypes-mirror layout check of every field, fingerprint
+determinism / identity sensitivity / region-order sensitivity / manifest
+insensitivity, retain-release lifetime against the Python anchor, and replay
+through exported handles. The model-runtime test covers: port/stage
+declaration and validation, port schema in the identity fingerprint, verb
+dispatch, and lifetime on both construction paths. The consumer side is
+validated in the FlashRT-Nexus repo (adopt + snapshot/restore through the
+capsule core).
