@@ -97,7 +97,9 @@ implementation is the adopted-export path: setup/capture can still be produced
 by Python, while the native runtime owns vision prepare, graph replay dispatch,
 action decode, and export lifetime. It includes a CUDA vision
 resize/normalize/cast path for device buffers, with CPU reference tests, and a
-conservative D2H action staging path. A future pure C++ checkpoint
+conservative D2H action staging path. The `flashrt_cpp_pi05_c` target exposes a
+small C host ABI around this path so C/Python/serving shells can drive the
+adopted export without including C++ classes. A future pure C++ checkpoint
 loader/tokenizer/capture path must produce the same `frt_runtime_export_v1`, so
 Nexus and serving hosts do not change.
 

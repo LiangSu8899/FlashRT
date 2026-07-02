@@ -13,6 +13,7 @@ project(flashrt_cpp LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
@@ -82,6 +83,13 @@ target_include_directories(flashrt_cpp_pi05
 target_link_libraries(flashrt_cpp_pi05
   PUBLIC flashrt_cpp_modalities flashrt_cpp_vla)
 
+add_library(flashrt_cpp_pi05_c SHARED
+  models/pi05/src/c_api.cpp)
+target_link_libraries(flashrt_cpp_pi05_c
+  PUBLIC flashrt_cpp_pi05)
+target_include_directories(flashrt_cpp_pi05_c
+  PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/include)
+
 if(BUILD_TESTING)
   add_executable(test_cpp_modalities tests/test_modalities.cpp)
   target_link_libraries(test_cpp_modalities
@@ -98,5 +106,10 @@ if(BUILD_TESTING)
     target_link_libraries(test_device_staging
       PRIVATE flashrt_cpp_pi05 flashrt_cpp_modalities CUDA::cudart)
     add_test(NAME device_staging COMMAND test_device_staging)
+
+    add_executable(test_pi05_c_api tests/test_pi05_c_api.cpp)
+    target_link_libraries(test_pi05_c_api
+      PRIVATE flashrt_cpp_pi05_c flashrt_exec CUDA::cudart)
+    add_test(NAME pi05_c_api COMMAND test_pi05_c_api)
   endif()
 endif()

@@ -75,6 +75,9 @@ Current Pi0.5 status:
 - complete C++ hot-path shell: prepare vision, replay graph, read action;
 - complete lifecycle for adopted Python/native exports: retain/release;
 - complete build target: `flashrt_cpp_pi05`;
+- C host ABI target: `flashrt_cpp_pi05_c`, exporting
+  `frt_pi05_runtime_create`, `frt_pi05_runtime_prepare_vision`,
+  `frt_pi05_runtime_replay_tick`, and `frt_pi05_runtime_read_actions`;
 - CUDA vision path: host camera frames -> H2D raw frame -> CUDA
   resize/normalize/cast directly into export device buffers;
 - conservative action staging path: device action buffer -> D2H -> CPU
@@ -128,6 +131,15 @@ device is present:
 - vision preprocess into a device tensor via CUDA kernel, compared against the
   CPU reference;
 - action postprocess from a device tensor via D2H staging.
+
+`cpp/tests/test_pi05_c_api.cpp` validates the C host ABI against real exec
+buffers:
+
+- creates a `frt_runtime_export_v1` with Pi0.5 buffer names;
+- creates the Pi0.5 C runtime from that export;
+- prepares a host RGB frame into the export image device buffer;
+- reads actions from the export action device buffer;
+- verifies export retain/release ownership.
 
 Build:
 
