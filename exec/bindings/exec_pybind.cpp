@@ -71,6 +71,10 @@ PYBIND11_MODULE(_flashrt_exec, m) {
             return frt_graph_replay(g.h, key, stream_id);  // return rc (e.g. NO_VARIANT) to caller
         }, py::arg("key"), py::arg("stream_id") = 0)
         .def("has_variant", [](PyGraph& g, std::uint64_t key) { return frt_graph_has_variant(g.h, key) != 0; })
+        .def("evict", [](PyGraph& g, std::uint64_t key) { return frt_graph_evict(g.h, key); },
+             "Drop one variant (host eviction policy; evict at a safe point only).")
+        .def("evict_lru", [](PyGraph& g) { return frt_graph_evict_lru(g.h); })
+        .def("variant_count", [](PyGraph& g) { return frt_graph_variant_count(g.h); })
         .def("raw", [](PyGraph& g) { return reinterpret_cast<std::uintptr_t>(g.h); },
              "Opaque frt_graph handle (uintptr) — for the runtime-export builder.");
 
