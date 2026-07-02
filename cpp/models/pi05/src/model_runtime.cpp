@@ -14,8 +14,12 @@ namespace {
 using flashrt::modalities::Status;
 using flashrt::models::pi05::cface::status_code;
 
-/* Port indices — fixed for the Pi0.5 face (array order below). */
-enum { kPortImages = 0, kPortPrompt = 1, kPortNoise = 2, kPortActions = 3 };
+/* Port indices — fixed for the Pi0.5 face (array order below). No prompt
+ * port on the adopted-export path: the prompt embedding is baked before
+ * capture and cannot be updated, so declaring it would be an
+ * advertise-and-refuse STAGED port. The native tokenizer producer adds it
+ * back as a real STAGED port (a fingerprint change, as it should be). */
+enum { kPortImages = 0, kPortNoise = 1, kPortActions = 2 };
 
 struct Adapter {
     std::unique_ptr<flashrt::models::pi05::Runtime> runtime;
@@ -97,15 +101,6 @@ int set_input(void* self, uint32_t port, const void* data, uint64_t bytes,
             }
             a->last_error.clear();
             return 0;
-        }
-        case kPortPrompt: {
-            std::string text(static_cast<const char*>(data),
-                             data ? static_cast<size_t>(bytes) : 0);
-            int rc = a->runtime->set_prompt(text.c_str());
-            if (rc != 0)
-                a->last_error = "prompt updates are not supported by the "
-                                "adopted-export Pi05 runtime";
-            return rc;
         }
         case kPortNoise:
             a->last_error =
@@ -213,16 +208,12 @@ extern "C" int frt_pi05_model_runtime_create(
     const frt_runtime_buffer_desc* action_buf = find_buffer(exp, action_name);
     const uint32_t io_dtype = rt_dtype(manifest.vision.output_dtype);
 
-    frt_runtime_port_desc ports[4] = {};
+    frt_runtime_port_desc ports[3] = {};
     ports[kPortImages] = {"images", FRT_RT_MOD_IMAGE, io_dtype,
                           FRT_RT_LAYOUT_NHWC, FRT_RT_PORT_IN,
                           FRT_RT_PORT_STAGED, 1, a->image_shape, 4, 30,
                           image_buf ? image_buf->handle : nullptr, 0,
                           image_buf ? image_buf->bytes : 0};
-    ports[kPortPrompt] = {"prompt", FRT_RT_MOD_TEXT, io_dtype,
-                          FRT_RT_LAYOUT_FLAT, FRT_RT_PORT_IN,
-                          FRT_RT_PORT_STAGED, 0, nullptr, 0, 0,
-                          nullptr, 0, 0};
     ports[kPortNoise] = {"noise", FRT_RT_MOD_TENSOR, io_dtype,
                          FRT_RT_LAYOUT_FLAT, FRT_RT_PORT_IN,
                          FRT_RT_PORT_SWAP, 0, a->noise_shape, 2, 0,
@@ -259,7 +250,7 @@ extern "C" int frt_pi05_model_runtime_create(
 
     Adapter* raw = a.release();
     frt_model_runtime_v1* m = frt_model_runtime_wrap(
-        exp, ports, 4, stages, 1, &verbs, raw, raw, destroy_adapter);
+        exp, ports, 3, stages, 1, &verbs, raw, raw, destroy_adapter);
     if (!m) {
         delete raw;
         return -1;

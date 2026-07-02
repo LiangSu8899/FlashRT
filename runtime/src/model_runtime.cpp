@@ -21,6 +21,18 @@ bool valid_port_args(const char* name, uint32_t direction, uint32_t update,
     return true;
 }
 
+/* Default stubs for verbs a producer does not provide: report unsupported
+ * (-3) instead of leaving null function pointers for consumers to crash on. */
+int stub_set_input(void*, uint32_t, const void*, uint64_t, int) { return -3; }
+int stub_get_output(void*, uint32_t, void*, uint64_t, uint64_t*, int) {
+    return -3;
+}
+int stub_prepare(void*, uint32_t, frt_shape_key) { return -3; }
+int stub_step(void*) { return -3; }
+const char* stub_last_error(void*) {
+    return "verb not provided by this producer";
+}
+
 void copy_verbs(frt_model_runtime_v1* m, const frt_model_runtime_verbs* verbs,
                 void* verbs_self) {
     m->verbs.struct_size = (uint32_t)sizeof(frt_model_runtime_verbs);
@@ -31,6 +43,11 @@ void copy_verbs(frt_model_runtime_v1* m, const frt_model_runtime_verbs* verbs,
         m->verbs.step = verbs->step;
         m->verbs.last_error = verbs->last_error;
     }
+    if (!m->verbs.set_input) m->verbs.set_input = stub_set_input;
+    if (!m->verbs.get_output) m->verbs.get_output = stub_get_output;
+    if (!m->verbs.prepare) m->verbs.prepare = stub_prepare;
+    if (!m->verbs.step) m->verbs.step = stub_step;
+    if (!m->verbs.last_error) m->verbs.last_error = stub_last_error;
     m->self = verbs_self;
 }
 

@@ -69,7 +69,8 @@ def export_model_runtime(pl, identity=None, extra_regions=None):
 
       images    IN  SWAP  the normalized observation tensor window
       noise     IN  SWAP  the diffusion seed (also the action output window)
-      encoder_x IN  SWAP  the encoder residual-stream/prompt slot
+      encoder_x IN  SWAP  the encoder residual-stream/prompt-embedding slot
+                          (TENSOR — STATE is reserved for real proprioception)
       actions   OUT SWAP  raw bf16 action chunk (= diffusion_noise after step)
 
     Prompt staging (text -> embeds) stays with the frontend / the native
@@ -89,7 +90,7 @@ def export_model_runtime(pl, identity=None, extra_regions=None):
                      buffer=wrap["observation_images_normalized"]),
         _rt.PortSpec("noise", "tensor", "bf16", "flat", "in", "swap",
                      shape=(chunk, 32), buffer=wrap["diffusion_noise"]),
-        _rt.PortSpec("encoder_x", "state", "bf16", "flat", "in", "swap",
+        _rt.PortSpec("encoder_x", "tensor", "bf16", "flat", "in", "swap",
                      buffer=wrap["encoder_x"]),
         _rt.PortSpec("actions", "action", "bf16", "flat", "out", "swap",
                      shape=(chunk, 32), buffer=wrap["diffusion_noise"]),

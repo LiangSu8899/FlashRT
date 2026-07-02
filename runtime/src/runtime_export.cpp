@@ -63,7 +63,19 @@ void finish_export_into(Holder* h, frt_runtime_builder_s* b,
                           (long long)p.shape[d]);
             id += line;
         }
-        id += '\n';
+        /* the bound window is contractual: which declared buffer (index
+         * into the buffers array; -1 = staged-only), offset, bytes. The
+         * cadence hint stays OUT — it is advisory, not contract. */
+        long long buf_index = -1;
+        for (size_t bi = 0; bi < h->buffers.size(); ++bi)
+            if (p.buffer && h->buffers[bi].handle == p.buffer) {
+                buf_index = (long long)bi;
+                break;
+            }
+        std::snprintf(line, sizeof(line), ":%lld:%llu:%llu\n", buf_index,
+                      (unsigned long long)p.offset,
+                      (unsigned long long)p.bytes);
+        id += line;
     }
     for (size_t i = 0; i < h->stages.size(); ++i) {
         const auto& s = h->stages[i];

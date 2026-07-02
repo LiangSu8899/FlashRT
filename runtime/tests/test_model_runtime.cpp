@@ -47,6 +47,7 @@ static frt_runtime_builder make_builder() {
     frt_shape_key keys[1] = {0};
     frt_runtime_builder_add_graph(b, "encode", FAKE_G0, 0, keys, 1, 0);
     frt_runtime_builder_add_graph(b, "decode", FAKE_G1, 0, keys, 1, 0);
+    frt_runtime_builder_add_buffer(b, "b0", FAKE_B0, 4096, 1);
     frt_runtime_builder_add_identity(b, "model", "unit");
     return b;
 }
@@ -54,16 +55,17 @@ static frt_runtime_builder make_builder() {
 static const int64_t IMG_SHAPE[4] = {3, 224, 224, 3};
 static const int64_t ACT_SHAPE[2] = {50, 32};
 
-static void add_ports_and_stages(frt_runtime_builder b, int64_t img_h = 224) {
+static void add_ports_and_stages(frt_runtime_builder b, int64_t img_h = 224,
+                                 uint64_t act_bytes = 3200) {
     const int64_t img[4] = {3, img_h, 224, 3};
     frt_runtime_builder_add_port(b, "images", FRT_RT_MOD_IMAGE,
                                  FRT_RT_DTYPE_BF16, FRT_RT_LAYOUT_NHWC,
                                  FRT_RT_PORT_IN, FRT_RT_PORT_STAGED, 1,
-                                 img, 4, 30, FAKE_B0, 0, 0);
+                                 img, 4, 30, nullptr, 0, 0);
     frt_runtime_builder_add_port(b, "actions", FRT_RT_MOD_ACTION,
                                  FRT_RT_DTYPE_BF16, FRT_RT_LAYOUT_FLAT,
                                  FRT_RT_PORT_OUT, FRT_RT_PORT_STAGED, 0,
-                                 ACT_SHAPE, 2, 0, FAKE_B0, 0, 3200);
+                                 ACT_SHAPE, 2, 0, FAKE_B0, 0, act_bytes);
     const uint32_t after1[1] = {0};
     frt_runtime_builder_add_stage(b, 0, nullptr, 0);
     frt_runtime_builder_add_stage(b, 1, after1, 1);
@@ -89,6 +91,13 @@ int main() {
         frt_model_runtime_v1* m = frt_runtime_builder_finish_model(
             b, nullptr, nullptr, nullptr, nullptr, nullptr);
         CHECK(m != nullptr, "finish_model after refused finish");
+        /* absent producer verbs become unsupported stubs, never null */
+        CHECK(m->verbs.set_input && m->verbs.step && m->verbs.last_error,
+              "null verbs are stubbed");
+        CHECK(m->verbs.set_input(m->self, 0, nullptr, 0, -1) == -3 &&
+                  m->verbs.step(m->self) == -3 &&
+                  m->verbs.last_error(m->self)[0] != '\0',
+              "stubs report unsupported (-3) with an explanation");
         m->release(m->owner);
     }
 
@@ -121,8 +130,12 @@ int main() {
           m->stages[1].after[0] == 0, "stage DAG round-trips");
 
     std::string id = m->exp->identity;
-    CHECK(id.find("port:0:images:1:3:2:0:1:1:3,224,224,3") != std::string::npos,
-          "identity carries the port schema");
+    CHECK(id.find("port:0:images:1:3:2:0:1:1:3,224,224,3:-1:0:0") !=
+              std::string::npos,
+          "identity carries the port schema (staged-only window = -1)");
+    CHECK(id.find("port:1:actions:4:3:0:1:1:0:50,32:0:0:3200") !=
+              std::string::npos,
+          "identity carries the bound window (buffer index/offset/bytes)");
     CHECK(id.find("stage:1:1:0") != std::string::npos,
           "identity carries the stage DAG");
     CHECK(m->exp->fingerprint ==
@@ -138,6 +151,16 @@ int main() {
         CHECK(m2 && m2->exp->fingerprint != m->exp->fingerprint,
               "port shape change changes the fingerprint");
         m2->release(m2->owner);
+    }
+    /* bound-window change => different fingerprint (schema unchanged) */
+    {
+        frt_runtime_builder b3 = make_builder();
+        add_ports_and_stages(b3, /*img_h=*/224, /*act_bytes=*/6400);
+        frt_model_runtime_v1* m3 = frt_runtime_builder_finish_model(
+            b3, &verbs, &vlog, nullptr, nullptr, nullptr);
+        CHECK(m3 && m3->exp->fingerprint != m->exp->fingerprint,
+              "port window change changes the fingerprint");
+        m3->release(m3->owner);
     }
 
     /* verbs plumb through self */

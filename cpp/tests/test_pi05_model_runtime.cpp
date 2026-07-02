@@ -140,14 +140,14 @@ int main() {
           "frt_pi05_model_runtime_create");
     CHECK(owner.retain >= 1, "export retained");
     CHECK(m->exp == &exp, "model runtime carries the export");
-    CHECK(m->n_ports == 4 && m->n_stages == 1, "port/stage counts");
+    CHECK(m->n_ports == 3 && m->n_stages == 1, "port/stage counts");
     CHECK(std::strcmp(m->ports[0].name, "images") == 0 &&
               m->ports[0].update == FRT_RT_PORT_STAGED &&
               m->ports[0].shape[1] == 224,
           "images port schema");
-    CHECK(std::strcmp(m->ports[2].name, "noise") == 0 &&
-              m->ports[2].update == FRT_RT_PORT_SWAP &&
-              m->ports[2].buffer == action,
+    CHECK(std::strcmp(m->ports[1].name, "noise") == 0 &&
+              m->ports[1].update == FRT_RT_PORT_SWAP &&
+              m->ports[1].buffer == action,
           "noise SWAP port exposes the device window");
     CHECK(m->stages[0].graph == 0, "stage resolves the infer graph");
 
@@ -170,11 +170,13 @@ int main() {
     for (std::uint16_t v : img_host) if (v) { nonzero = true; break; }
     CHECK(nonzero, "staged image input reached the device buffer");
 
-    CHECK(m->verbs.set_input(m->self, 2, rgb, 4, -1) < 0,
+    CHECK(m->verbs.set_input(m->self, 1, rgb, 4, -1) < 0,
           "SWAP port refuses the staged verb (write the window instead)");
-    CHECK(m->verbs.set_input(m->self, 1, "x", 1, -1) < 0 &&
-              m->verbs.last_error(m->self)[0] != '\0',
-          "non-empty prompt refused with an explanation (adopted export)");
+    bool has_prompt = false;
+    for (std::uint64_t i = 0; i < m->n_ports; ++i)
+        if (std::strcmp(m->ports[i].name, "prompt") == 0) has_prompt = true;
+    CHECK(!has_prompt,
+          "no prompt port on the adopted-export face (no advertise-and-refuse)");
 
     /* step = replay the captured graph; decoded actions come back */
     CHECK(m->verbs.step(m->self) == 0, "step replays the infer graph");
@@ -186,7 +188,7 @@ int main() {
 
     float out[3] = {};
     std::uint64_t written = 0;
-    CHECK(m->verbs.get_output(m->self, 3, out, sizeof(out), &written, -1) == 0
+    CHECK(m->verbs.get_output(m->self, 2, out, sizeof(out), &written, -1) == 0
               && written == sizeof(out),
           "get_output(actions) in bytes");
     CHECK(std::fabs(out[0] - 12.0f) < 0.01f &&
@@ -195,7 +197,7 @@ int main() {
           "actions are unnormalized (clip to [-1,1], * stddev, + mean)");
 
     float small[1] = {};
-    CHECK(m->verbs.get_output(m->self, 3, small, sizeof(small), &written, -1)
+    CHECK(m->verbs.get_output(m->self, 2, small, sizeof(small), &written, -1)
               == -5 && written == sizeof(out),
           "get_output reports the needed size on short buffers");
 

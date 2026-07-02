@@ -24,6 +24,9 @@
  *                        (tokenize / resize / normalize / embed) into bound
  *                        buffers, optionally firing a micro-graph.
  *   FRT_RT_PORT_SETUP  : legal only outside the tick (weights, calibration).
+ * A STAGED declaration is a PROMISE: the port accepts hot updates. A producer
+ * that cannot update an input in the hot phase declares SETUP or omits the
+ * port — never advertise-and-refuse.
  *
  * Production contract for BOTH hot classes (SWAP, STAGED) — conformance
  * suites pin these down:
@@ -156,7 +159,9 @@ typedef struct frt_runtime_stage_desc {
 /* ------------------------------------------------------------------ */
 /* Verbs — implemented by the producer, called by the host.            */
 /* set_input / get_output are HOT (contract above); prepare is WARM;   */
-/* step is sugar over the stage list.                                  */
+/* step is sugar over the stage list. The construction paths fill any  */
+/* verb the producer omits with an unsupported stub (returns -3), so   */
+/* every entry is always callable — never a null pointer.              */
 /* ------------------------------------------------------------------ */
 typedef struct frt_model_runtime_verbs {
     uint32_t struct_size;      /* = sizeof(frt_model_runtime_verbs)        */
@@ -222,7 +227,9 @@ typedef int (*frt_model_runtime_open_v1_fn)(const char* config_json,
 /* assembles export + ports + stages in one identity. Port and stage   */
 /* records join the canonical identity string, so a port-schema change */
 /* changes the fingerprint (a schema change means the captured IO      */
-/* surface changed; stored state must be refused).                     */
+/* surface changed; stored state must be refused). A port's identity   */
+/* covers its schema AND its bound window (buffer index/offset/bytes); */
+/* only cadence_hint_hz stays out — it is advisory, not contract.      */
 /* ------------------------------------------------------------------ */
 int frt_runtime_builder_add_port(frt_runtime_builder, const char* name,
                                  uint32_t modality, uint32_t dtype,
