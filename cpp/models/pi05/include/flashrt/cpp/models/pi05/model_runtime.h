@@ -7,11 +7,10 @@
  *
  *   port "images"  IN  STAGED  IMAGE   set_input <- frt_image_view[] in the
  *                                      declared camera-view order
- *   port "prompt"  IN  STAGED  TEXT    adopted-export path: prompt embedding
+ *   no "prompt" port                  adopted-export path: prompt embedding
  *                                      is prepared by the producer before
- *                                      capture; non-empty updates are refused
- *                                      (a native tokenizer producer lifts this
- *                                      without changing hosts)
+ *                                      capture. A native tokenizer producer
+ *                                      adds a real STAGED TEXT port later.
  *   port "noise"   IN  SWAP    TENSOR  the diffusion seed window — the host
  *                                      writes raw bytes directly
  *   port "actions" OUT STAGED  ACTION  get_output -> unnormalized f32 robot
