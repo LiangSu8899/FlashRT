@@ -1,13 +1,13 @@
-# RTC-lite Runtime Design
+# Legacy Async Chunk Runner Runtime Design
 
-RTC-lite is an execution-layer wrapper for action chunk policies. It does not
+The legacy async chunk runner is an execution-layer wrapper for action chunk policies. It does not
 change model weights, denoising math, CUDA kernels, or calibration. The goal is
 to keep a foreground controller supplied with actions while the model generates
 the next action chunk in a background worker.
 
 ## Scope
 
-RTC-lite is intended for policies with this contract:
+The legacy async chunk runner is intended for policies with this contract:
 
 ```text
 observation -> action_chunk[horizon, action_dim]
@@ -61,7 +61,7 @@ background worker:
   actions = adapter.infer_actions(latest_obs)
 ```
 
-The foreground loop owns timing. RTC-lite does not sleep, run robot IO, or
+The foreground loop owns timing. The legacy async chunk runner does not sleep, run robot IO, or
 change the frontend's CUDA stream policy.
 
 ## Policies
@@ -84,6 +84,6 @@ gradient guidance through the policy.
 
 ## What This Is Not
 
-RTC-lite does not implement a new policy or train-time chunking method. It is an
+The legacy async chunk runner does not implement a new policy or train-time chunking method. It is an
 inference scheduling layer. It validates action supply at a fixed controller
 rate; robot task success still has to be measured in the target environment.

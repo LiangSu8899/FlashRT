@@ -17,8 +17,11 @@
  *                                      actions (capacity/written in bytes)
  *   stage 0                            the configured infer graph
  *
- * This is the model-specific ADAPTER construction path
- * (frt_model_runtime_wrap): identity/fingerprint inherit from the export.
+ * Two construction paths are exposed:
+ *   - create(exp, ...): legacy adapter path for an export that did not already
+ *     carry a model-runtime declaration; it declares the single infer stage.
+ *   - create_over(model, ...): production path. The producer owns ports,
+ *     stage DAG, identity and fingerprint; Pi0.5 C++ only replaces verbs.
  */
 #ifndef FLASHRT_CPP_MODELS_PI05_MODEL_RUNTIME_H
 #define FLASHRT_CPP_MODELS_PI05_MODEL_RUNTIME_H
@@ -38,6 +41,15 @@ extern "C" {
 int frt_pi05_model_runtime_create(const frt_runtime_export_v1* exp,
                                   const frt_pi05_runtime_config* config,
                                   frt_model_runtime_v1** out);
+
+/* Build a retained Pi0.5 native verb overlay over an existing model-runtime
+ * declaration. Ports/stages/identity/fingerprint are inherited exactly from
+ * `model`; the returned object replaces only set_input/get_output/prepare/step.
+ * Required ports by name: "images" (IMAGE IN STAGED) and "actions" (ACTION OUT
+ * STAGED). Optional "noise" must be TENSOR IN SWAP if present. */
+int frt_pi05_model_runtime_create_over(const frt_model_runtime_v1* model,
+                                       const frt_pi05_runtime_config* config,
+                                       frt_model_runtime_v1** out);
 
 #ifdef __cplusplus
 }

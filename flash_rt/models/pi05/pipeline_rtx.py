@@ -379,6 +379,15 @@ class Pi05Pipeline:
         # Gate buffer for SiLU-gated EVT fusion (decoder): (ds, DEC_H) BF16
         B["decoder_gate_buf"] = CudaBuffer.device_empty(ds * DEC_H, BF16)
         B["diffusion_noise"] = CudaBuffer.device_empty(ds * ACTION_DIM, BF16)
+        # Optional RTC-prefix conditioning slot. It is only read by the
+        # explicit rtc-prefix action graph, not by the default full graph.
+        B["rtc_prev_action_chunk"] = CudaBuffer.device_empty(
+            ds * ACTION_DIM, BF16)
+        # Optional full RTC-guidance controls. These are producer hot inputs
+        # for a future VJP-guided action graph; default/prefix graphs ignore
+        # them and therefore keep byte-identical behavior.
+        B["rtc_prefix_weights"] = CudaBuffer.device_empty(ds, FP32)
+        B["rtc_guidance_weight"] = CudaBuffer.device_empty(1, FP32)
         # Decoder scratch for ada_rms_norm output + gate
         B["x_normed_buf"] = CudaBuffer.device_empty(ds * DEC_D, BF16)
         B["gate_buf"] = CudaBuffer.device_empty(ds * DEC_D, BF16)
@@ -1424,7 +1433,23 @@ class Pi05Pipeline:
     #   Phase C: Gemma-300M decoder (flow matching)
     # ══════════════════════════════════════════════════════════════════
 
-    def transformer_decoder(self, stream: int = 0) -> None:
+    def _copy_rtc_prefix(self, prefix_len: int, stream: int = 0) -> None:
+        if prefix_len <= 0:
+            return
+        if prefix_len > self.chunk_size:
+            raise ValueError(
+                f"rtc prefix_len {prefix_len} exceeds chunk_size "
+                f"{self.chunk_size}")
+        nbytes = int(prefix_len) * ACTION_DIM * 2
+        self.fvk.gpu_copy(
+            self.bufs["diffusion_noise"].ptr.value,
+            self.bufs["rtc_prev_action_chunk"].ptr.value,
+            nbytes,
+            stream,
+        )
+
+    def transformer_decoder(self, stream: int = 0,
+                            rtc_prefix_len: int = 0) -> None:
         """Run 10-step diffusion denoise on ``bufs['diffusion_noise']``."""
         fvk = self.fvk
         gemm = self.gemm
@@ -1438,6 +1463,7 @@ class Pi05Pipeline:
         try:
             for step in range(self.num_steps):
                 self._fp8_current_decoder_step = step
+                self._copy_rtc_prefix(rtc_prefix_len, stream)
                 # C0: Action input projection: noise (ds, 32) → decoder_x (ds, 1024)
                 gemm.bf16_nn(
                     B["diffusion_noise"].ptr.value,
@@ -1473,6 +1499,7 @@ class Pi05Pipeline:
                     B["diffusion_noise"].ptr.value,
                     B["decoder_action_buf"].ptr.value,
                     ds * ACTION_DIM, stream=stream)
+                self._copy_rtc_prefix(rtc_prefix_len, stream)
         finally:
             self._fp8_current_decoder_step = prev_decoder_step
 
@@ -2018,6 +2045,9 @@ class Pi05Pipeline:
         if getattr(self, "_use_exec", False):
             self._exec_dec.adopt(0, self._decoder_only_graph._graph_exec.value)
 
+        from flash_rt.subgraphs.capture import run_capture_hooks
+        run_capture_hooks(self, stream_handle, stream_int)
+
     # ══════════════════════════════════════════════════════════════════
     #   Public API
     # ══════════════════════════════════════════════════════════════════
@@ -2037,6 +2067,21 @@ class Pi05Pipeline:
         final actions from here after.
         """
         return self.bufs["diffusion_noise"]
+
+    @property
+    def input_rtc_prev_action_chunk_buf(self) -> CudaBuffer:
+        """Optional RTC-prefix input: previous raw action chunk (chunk, 32)."""
+        return self.bufs["rtc_prev_action_chunk"]
+
+    @property
+    def input_rtc_prefix_weights_buf(self) -> CudaBuffer:
+        """Optional RTC VJP input: per-action prefix weights (chunk,)."""
+        return self.bufs["rtc_prefix_weights"]
+
+    @property
+    def input_rtc_guidance_weight_buf(self) -> CudaBuffer:
+        """Optional RTC VJP input: scalar maximum guidance weight."""
+        return self.bufs["rtc_guidance_weight"]
 
     @property
     def input_encoder_x_buf(self) -> CudaBuffer:
@@ -2160,7 +2205,9 @@ class Pi05Pipeline:
         return export_runtime(self, identity=identity,
                               extra_regions=extra_regions)
 
-    def export_model_runtime(self, identity=None, extra_regions=None):
+    def export_model_runtime(self, identity=None, extra_regions=None,
+                             stage_plan="full", io="python",
+                             stage_plan_kwargs=None):
         """Package the captured pipeline as an ``frt_model_runtime_v1``.
 
         See :func:`flash_rt.models.pi05.runtime_export.export_model_runtime`
@@ -2168,4 +2215,6 @@ class Pi05Pipeline:
         """
         from flash_rt.models.pi05.runtime_export import export_model_runtime
         return export_model_runtime(self, identity=identity,
-                                    extra_regions=extra_regions)
+                                    extra_regions=extra_regions,
+                                    stage_plan=stage_plan, io=io,
+                                    stage_plan_kwargs=stage_plan_kwargs)

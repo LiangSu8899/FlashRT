@@ -74,7 +74,7 @@ class RTCConfig:
         if self.blend_steps < 0:
             raise ValueError("blend_steps must be non-negative")
         if self.max_workers != 1:
-            raise ValueError("RTC-lite supports exactly one model worker")
+            raise ValueError("legacy async chunk runner supports exactly one model worker")
 
     @property
     def period_s(self) -> float:

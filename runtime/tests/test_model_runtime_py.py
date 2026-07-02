@@ -22,9 +22,16 @@ import weakref
 import _flashrt_exec as ex
 import _flashrt_runtime as rt
 
+import flash_rt.runtime.export as export_mod
 from flash_rt.runtime.export import (
     BufferSpec, GraphSpec, PortSpec, RegionSpec, StageSpec, StreamSpec,
     build_model_runtime, DTYPE, MODALITY, UPDATE,
+)
+from flash_rt.subgraphs.stage_plan import (
+    StagePlan,
+    list_stage_plans,
+    register_stage_plan,
+    resolve_stage_plan,
 )
 
 CHECKS = []
@@ -109,6 +116,96 @@ def build(setup, img_h=224, verbs=None):
     )
 
 
+def build_split(setup):
+    ctx, sid, src, dst, g = setup
+    plan = StagePlan.context_action()
+    return build_model_runtime(
+        ctx,
+        streams=[StreamSpec("main", sid)],
+        graphs=[
+            GraphSpec("infer", g, 0, (0,)),
+            GraphSpec("context", g, 0, (0,)),
+            GraphSpec("decode_only", g, 0, (0,)),
+        ],
+        buffers=[BufferSpec("src", src, "input"),
+                 BufferSpec("dst", dst, "output")],
+        regions=[RegionSpec("boundary", dst)],
+        ports=[
+            PortSpec("images", "image", "bf16", "nhwc", "in", "staged",
+                     required=True, shape=(1, 224, 224, 3), cadence_hz=30),
+            PortSpec("obs", "state", "bf16", "flat", "in", "swap",
+                     shape=(32,), buffer=src),
+            PortSpec("actions", "action", "bf16", "flat", "out", "staged",
+                     shape=(4,), buffer=dst),
+        ],
+        stages=plan.to_stage_specs(export_mod),
+        identity={"model": "trivial", "quant": "none"},
+        manifest_extra={"stage_plan": plan.manifest()},
+    )
+
+
+def check_stage_plan_registry():
+    register_stage_plan(
+        "unit_chain",
+        lambda **_: StagePlan.chain(
+            "unit_chain",
+            ("vlm", "vit", "dit_0_4", "dit_5_9", "action_expert"),
+            metadata={"owner": "unit-test", "granularity": "vla-structural"},
+        ),
+        model="unit",
+        replace=True,
+    )
+    plan = resolve_stage_plan("unit_chain", model="unit")
+    manifest = plan.manifest()
+    check("registered model stage plan resolves by name", (
+        manifest["name"] == "unit_chain"
+        and manifest["metadata"]["granularity"] == "vla-structural"
+        and [s["graph"] for s in manifest["stages"]] == [
+            "vlm", "vit", "dit_0_4", "dit_5_9", "action_expert"
+        ]
+        and manifest["stages"][2]["after"] == ["vit"]))
+    specs = plan.to_stage_specs(type("ExportMirror", (), {
+        "StageSpec": StageSpec,
+    }))
+    check("registered chain lowers to ordered stage specs", (
+        len(specs) == 5
+        and specs[0].graph == "vlm" and specs[0].after == ()
+        and specs[4].graph == "action_expert" and specs[4].after == (3,)))
+    check("registry lists global and model-specific plans", (
+        "full" in list_stage_plans(model="unit")
+        and "unit_chain" in list_stage_plans(model="unit")
+        and "unit_chain" not in list_stage_plans()))
+    register_stage_plan(
+        "unit_chunks",
+        lambda *, chunk_size=2, total=4: StagePlan.chain(
+            "unit_chunks",
+            tuple(f"denoise_{i}_{min(i + chunk_size, total) - 1}"
+                  for i in range(0, total, chunk_size)),
+            metadata={"chunk_size": chunk_size, "total": total},
+        ),
+        model="unit",
+        replace=True,
+    )
+    chunked = resolve_stage_plan("unit_chunks", model="unit",
+                                 chunk_size=3, total=8).manifest()
+    check("registered factories accept export-time kwargs", (
+        chunked["metadata"] == {"chunk_size": 3, "total": 8}
+        and [s["graph"] for s in chunked["stages"]] == [
+            "denoise_0_2", "denoise_3_5", "denoise_6_7"
+        ]))
+    from flash_rt.subgraphs.pi05 import stage_plans as _pi05_plans  # noqa: F401
+    vjp = resolve_stage_plan("context_rtc_vjp_guided_action", model="pi05")
+    try:
+        vjp.validate(graph_names=("infer", "context", "decode_only"),
+                     stream_names=("main",))
+    except ValueError as e:
+        missing_vjp = "decode_rtc_vjp_guided" in str(e)
+    else:
+        missing_vjp = False
+    check("VJP-guided RTC plan fails without a producer VJP graph",
+          missing_vjp)
+
+
 def main():
     setup = make_setup()
     ctx, sid, src, dst, g = setup
@@ -158,6 +255,16 @@ def main():
     check("port shape change changes the fingerprint",
           mr2.fingerprint != mr.fingerprint)
     mr2.release()
+    split = build_split(setup)
+    check("context_action stage plan exports two ordered stages", (
+        split.stages() == [{"graph": 1, "after": []},
+                           {"graph": 2, "after": [0]}]))
+    check("stage plan change changes the fingerprint",
+          split.fingerprint != mr.fingerprint)
+    split.release()
+
+    print("== stage plan registry ==")
+    check_stage_plan_registry()
 
     print("== verbs through the C function pointers ==")
     rc = rt.model_set_input(mr.ptr, 1, b"\xAA\xBB", -1)

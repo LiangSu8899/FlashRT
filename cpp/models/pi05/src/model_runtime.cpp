@@ -4,6 +4,7 @@
 #include "config_map.h"
 
 #include <cstring>
+#include <cstdint>
 #include <memory>
 #include <new>
 #include <string>
@@ -20,11 +21,16 @@ using flashrt::models::pi05::cface::status_code;
  * advertise-and-refuse STAGED port. The native tokenizer producer adds it
  * back as a real STAGED port (a fingerprint change, as it should be). */
 enum { kPortImages = 0, kPortNoise = 1, kPortActions = 2 };
+constexpr uint32_t kNoPort = UINT32_MAX;
 
 struct Adapter {
     std::unique_ptr<flashrt::models::pi05::Runtime> runtime;
     std::string last_error;
     std::vector<std::string> view_order;
+    const frt_model_runtime_v1* source_model = nullptr;
+    uint32_t images_port = kPortImages;
+    uint32_t noise_port = kPortNoise;
+    uint32_t actions_port = kPortActions;
 
     int64_t image_shape[4] = {0, 0, 0, 3};
     int64_t noise_shape[2] = {0, 0};
@@ -40,6 +46,53 @@ uint32_t rt_dtype(flashrt::modalities::DType d) {
         case DType::kBFloat16: return FRT_RT_DTYPE_BF16;
     }
     return FRT_RT_DTYPE_BF16;
+}
+
+flashrt::modalities::DType model_dtype(uint32_t d) {
+    using flashrt::modalities::DType;
+    switch (d) {
+        case FRT_RT_DTYPE_U8: return DType::kUInt8;
+        case FRT_RT_DTYPE_F32: return DType::kFloat32;
+        case FRT_RT_DTYPE_F16: return DType::kFloat16;
+        case FRT_RT_DTYPE_BF16:
+        default: return DType::kBFloat16;
+    }
+}
+
+flashrt::modalities::Layout model_layout(uint32_t l) {
+    using flashrt::modalities::Layout;
+    switch (l) {
+        case FRT_RT_LAYOUT_HWC: return Layout::kHWC;
+        case FRT_RT_LAYOUT_NHWC: return Layout::kNHWC;
+        case FRT_RT_LAYOUT_CHW: return Layout::kCHW;
+        case FRT_RT_LAYOUT_NCHW: return Layout::kNCHW;
+        case FRT_RT_LAYOUT_FLAT:
+        default: return Layout::kFlat;
+    }
+}
+
+flashrt::modalities::TensorView tensor_from_port(
+        const frt_runtime_port_desc& p) {
+    flashrt::modalities::TensorView view;
+    if (!p.buffer) return view;
+    auto* base = static_cast<unsigned char*>(frt_buffer_dptr(p.buffer));
+    if (!base) return view;
+    const uint64_t total = frt_buffer_bytes(p.buffer);
+    if (p.offset > total) return view;
+    if (p.bytes && p.bytes > total - p.offset) return view;
+    view.data = base + p.offset;
+    view.bytes = p.bytes ? p.bytes : (total - p.offset);
+    view.dtype = model_dtype(p.dtype);
+    view.place = flashrt::modalities::MemoryPlace::kDevice;
+    view.layout = model_layout(p.layout);
+    view.shape.rank = p.rank > flashrt::modalities::Shape::kMaxRank
+                          ? flashrt::modalities::Shape::kMaxRank
+                          : p.rank;
+    for (uint32_t i = 0; i < view.shape.rank; ++i) {
+        view.shape.dims[i] = p.shape[i] > 0 ? static_cast<uint64_t>(p.shape[i])
+                                            : 0;
+    }
+    return view;
 }
 
 flashrt::modalities::PixelFormat view_pixel_format(uint32_t value) {
@@ -59,8 +112,7 @@ int set_input(void* self, uint32_t port, const void* data, uint64_t bytes,
     (void)stream;  /* the pi05 runtime stages on the export's graph stream */
     auto* a = static_cast<Adapter*>(self);
     if (!a || !a->runtime) return -1;
-    switch (port) {
-        case kPortImages: {
+    if (port == a->images_port) {
             if (!data || !bytes || bytes % sizeof(frt_image_view)) {
                 a->last_error = "images payload must be frt_image_view[]";
                 return -1;
@@ -101,15 +153,14 @@ int set_input(void* self, uint32_t port, const void* data, uint64_t bytes,
             }
             a->last_error.clear();
             return 0;
-        }
-        case kPortNoise:
-            a->last_error =
-                "noise is a SWAP port: write its buffer window directly";
-            return -3;
-        default:
-            a->last_error = "unknown or non-input port";
-            return -1;
     }
+    if (port == a->noise_port) {
+        a->last_error =
+            "noise is a SWAP port: write its buffer window directly";
+        return -3;
+    }
+    a->last_error = "unknown or non-input port";
+    return -1;
 }
 
 int get_output(void* self, uint32_t port, void* out, uint64_t capacity,
@@ -117,7 +168,7 @@ int get_output(void* self, uint32_t port, void* out, uint64_t capacity,
     (void)stream;
     auto* a = static_cast<Adapter*>(self);
     if (!a || !a->runtime || !out) return -1;
-    if (port != kPortActions) {
+    if (port != a->actions_port) {
         a->last_error = "unknown or non-output port";
         return -1;
     }
@@ -149,6 +200,44 @@ int prepare(void* self, uint32_t graph, frt_shape_key key) {
 int step(void* self) {
     auto* a = static_cast<Adapter*>(self);
     if (!a || !a->runtime) return -1;
+    if (a->source_model) {
+        const frt_model_runtime_v1* m = a->source_model;
+        const frt_runtime_export_v1* exp = m->exp;
+        if (!exp || (!exp->graphs && exp->n_graphs)) return -1;
+        for (uint64_t i = 0; i < m->n_stages; ++i) {
+            const auto& stage = m->stages[i];
+            if (stage.graph >= exp->n_graphs) {
+                a->last_error = "Pi05 stage references a missing graph";
+                return -1;
+            }
+            const int stream_id = exp->graphs[stage.graph].stream_id;
+            for (uint32_t d = 0; d < stage.n_after; ++d) {
+                const uint32_t dep = stage.after[d];
+                if (dep >= i || m->stages[dep].graph >= exp->n_graphs) {
+                    a->last_error = "Pi05 stage dependency is invalid";
+                    return -1;
+                }
+                if (exp->graphs[m->stages[dep].graph].stream_id != stream_id) {
+                    a->last_error =
+                        "cross-stream stage DAG requires a host scheduler";
+                    return -3;
+                }
+            }
+            const auto& graph = exp->graphs[stage.graph];
+            if (!graph.handle) {
+                a->last_error = "Pi05 stage graph has no handle";
+                return -1;
+            }
+            const int rc = frt_graph_replay(graph.handle, graph.default_key,
+                                            stream_id);
+            if (rc != 0) {
+                a->last_error = "Pi05 stage replay failed";
+                return rc;
+            }
+        }
+        a->last_error.clear();
+        return 0;
+    }
     int rc = a->runtime->replay_tick();
     if (rc != 0) a->last_error = "Pi05 graph replay failed";
     return rc;
@@ -167,6 +256,33 @@ const frt_runtime_buffer_desc* find_buffer(const frt_runtime_export_v1* exp,
         if (exp->buffers[i].name && name == exp->buffers[i].name)
             return &exp->buffers[i];
     return nullptr;
+}
+
+const frt_runtime_graph_desc* graph_for_first_stage(
+        const frt_model_runtime_v1* model) {
+    if (!model || !model->exp || !model->n_stages) return nullptr;
+    const uint32_t graph = model->stages[0].graph;
+    if (graph >= model->exp->n_graphs) return nullptr;
+    return &model->exp->graphs[graph];
+}
+
+uint32_t find_port_index(const frt_model_runtime_v1* model,
+                         const char* name) {
+    if (!model || !name) return kNoPort;
+    for (uint64_t i = 0; i < model->n_ports; ++i) {
+        const char* n = model->ports[i].name;
+        if (n && std::strcmp(n, name) == 0) return static_cast<uint32_t>(i);
+    }
+    return kNoPort;
+}
+
+bool compatible_port(const frt_model_runtime_v1* model, uint32_t port,
+                     uint32_t modality, uint32_t direction,
+                     uint32_t update) {
+    if (!model || port == kNoPort || port >= model->n_ports) return false;
+    const auto& p = model->ports[port];
+    return p.modality == modality && p.direction == direction &&
+           p.update == update;
 }
 
 }  // namespace
@@ -251,6 +367,76 @@ extern "C" int frt_pi05_model_runtime_create(
     Adapter* raw = a.release();
     frt_model_runtime_v1* m = frt_model_runtime_wrap(
         exp, ports, 3, stages, 1, &verbs, raw, raw, destroy_adapter);
+    if (!m) {
+        delete raw;
+        return -1;
+    }
+    *out = m;
+    return 0;
+}
+
+extern "C" int frt_pi05_model_runtime_create_over(
+        const frt_model_runtime_v1* model,
+        const frt_pi05_runtime_config* config,
+        frt_model_runtime_v1** out) {
+    if (!model || !out) return -1;
+    *out = nullptr;
+    if (model->abi_version != FRT_MODEL_RUNTIME_ABI_VERSION ||
+        model->struct_size < sizeof(frt_model_runtime_v1) ||
+        !model->exp || !model->retain || !model->release) {
+        return -1;
+    }
+    constexpr std::size_t kConfigRequiredSize =
+        offsetof(frt_pi05_runtime_config, image_dtype);
+    if (config && config->struct_size < kConfigRequiredSize) return -1;
+
+    const uint32_t images = find_port_index(model, "images");
+    const uint32_t noise = find_port_index(model, "noise");
+    const uint32_t actions = find_port_index(model, "actions");
+    if (!compatible_port(model, images, FRT_RT_MOD_IMAGE, FRT_RT_PORT_IN,
+                         FRT_RT_PORT_STAGED) ||
+        !compatible_port(model, actions, FRT_RT_MOD_ACTION, FRT_RT_PORT_OUT,
+                         FRT_RT_PORT_STAGED)) {
+        return -2;
+    }
+    if (noise != kNoPort &&
+        !compatible_port(model, noise, FRT_RT_MOD_TENSOR, FRT_RT_PORT_IN,
+                         FRT_RT_PORT_SWAP)) {
+        return -2;
+    }
+
+    auto cfg = flashrt::models::pi05::cface::make_config(config);
+    if (model->n_stages) {
+        const auto* graph = graph_for_first_stage(model);
+        if (!graph || !graph->name) return -2;
+        cfg.graph_name = graph->name;
+    }
+    cfg.image_input_override = tensor_from_port(model->ports[images]);
+    cfg.action_output_override = tensor_from_port(model->ports[actions]);
+
+    auto a = std::unique_ptr<Adapter>(new (std::nothrow) Adapter());
+    if (!a) return -5;
+    a->runtime.reset(new (std::nothrow)
+                         flashrt::models::pi05::Runtime(model->exp, cfg));
+    if (!a->runtime) return -5;
+    if (!a->runtime->ok()) return status_code(a->runtime->status());
+    a->source_model = model;
+    a->images_port = images;
+    a->noise_port = noise;
+    a->actions_port = actions;
+    a->view_order = a->runtime->manifest().vision.view_order;
+
+    frt_model_runtime_verbs verbs{};
+    verbs.struct_size = sizeof(verbs);
+    verbs.set_input = set_input;
+    verbs.get_output = get_output;
+    verbs.prepare = prepare;
+    verbs.step = step;
+    verbs.last_error = last_error;
+
+    Adapter* raw = a.release();
+    frt_model_runtime_v1* m = frt_model_runtime_override_verbs(
+        model, &verbs, raw, raw, nullptr, destroy_adapter);
     if (!m) {
         delete raw;
         return -1;

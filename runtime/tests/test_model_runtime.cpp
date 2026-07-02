@@ -162,6 +162,23 @@ int main() {
               "port window change changes the fingerprint");
         m3->release(m3->owner);
     }
+    /* graph stream placement is deployment identity too */
+    {
+        frt_runtime_builder b4 = frt_runtime_builder_create(FAKE_CTX);
+        frt_runtime_builder_add_stream(b4, "main", 0, 0, nullptr);
+        frt_runtime_builder_add_stream(b4, "aux", 1, -1, nullptr);
+        frt_shape_key keys[1] = {0};
+        frt_runtime_builder_add_graph(b4, "encode", FAKE_G0, 0, keys, 1, 1);
+        frt_runtime_builder_add_graph(b4, "decode", FAKE_G1, 0, keys, 1, 1);
+        frt_runtime_builder_add_buffer(b4, "b0", FAKE_B0, 4096, 1);
+        frt_runtime_builder_add_identity(b4, "model", "unit");
+        add_ports_and_stages(b4);
+        frt_model_runtime_v1* m4 = frt_runtime_builder_finish_model(
+            b4, &verbs, &vlog, nullptr, nullptr, nullptr);
+        CHECK(m4 && m4->exp->fingerprint != m->exp->fingerprint,
+              "graph stream change changes the fingerprint");
+        m4->release(m4->owner);
+    }
 
     /* verbs plumb through self */
     m->verbs.set_input(m->self, 0, nullptr, 0, -1);
@@ -222,6 +239,60 @@ int main() {
         wm->release(wm->owner);
         CHECK(wrapper_freed == 1 && eo.releases == 1,
               "wrapper release frees the producer instance and the export");
+    }
+
+    /* --- verb override path: inherit declarations, replace only verbs --- */
+    {
+        Owner base_owner;
+        VerbLog base_vlog;
+        frt_runtime_builder ob = make_builder();
+        add_ports_and_stages(ob);
+        frt_model_runtime_v1* base = frt_runtime_builder_finish_model(
+            ob, &verbs, &base_vlog, &base_owner, owner_retain,
+            owner_release);
+        CHECK(base != nullptr, "override base model");
+
+        Owner native_owner;
+        VerbLog native_vlog;
+        frt_model_runtime_verbs native_verbs{};
+        native_verbs.struct_size = sizeof(native_verbs);
+        native_verbs.set_input = v_set_input;
+        native_verbs.get_output = v_get_output;
+        native_verbs.prepare = v_prepare;
+        native_verbs.step = v_step;
+        native_verbs.last_error = v_last_error;
+
+        frt_model_runtime_v1* over = frt_model_runtime_override_verbs(
+            base, &native_verbs, &native_vlog, &native_owner, owner_retain,
+            owner_release);
+        CHECK(over != nullptr, "frt_model_runtime_override_verbs");
+        CHECK(over->exp == base->exp && over->ports == base->ports &&
+                  over->stages == base->stages,
+              "override inherits export, ports, and stages by reference");
+        CHECK(over->n_ports == 2 && over->n_stages == 2 &&
+                  std::strcmp(over->ports[0].name, "images") == 0 &&
+                  over->stages[1].after[0] == 0,
+              "override preserves producer declarations");
+        CHECK(over->exp->fingerprint == base->exp->fingerprint,
+              "override does not change deployment identity");
+
+        over->verbs.set_input(over->self, 0, nullptr, 0, -1);
+        over->verbs.get_output(over->self, 1, nullptr, 0, nullptr, -1);
+        over->verbs.prepare(over->self, 0, 0);
+        over->verbs.step(over->self);
+        CHECK(native_vlog.set_input == 1 && native_vlog.get_output == 1 &&
+                  native_vlog.prepare == 1 && native_vlog.step == 1 &&
+                  base_vlog.step == 0,
+              "override verbs dispatch to the native object only");
+
+        CHECK(base_owner.retains == 1 && native_owner.retains == 1,
+              "override retains the model handle and native verb owner");
+        base->release(base->owner);
+        CHECK(base_owner.releases == 0,
+              "base model stays alive while override references it");
+        over->release(over->owner);
+        CHECK(native_owner.releases == 1 && base_owner.releases == 1,
+              "override release frees native owner and drops the base model");
     }
 
     std::printf(g_fail ? "\n== MODEL RUNTIME ABI FAILED ==\n"

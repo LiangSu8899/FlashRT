@@ -1277,6 +1277,8 @@ class Pi05TorchFrontendRtxFP16:
                     "(~0.96 vs dynamic 0.991 on test sequence). Set "
                     "FVK_PI05_RTX_INT8_ENCODER_STATIC=0 to disable.")
             self.pipeline.autotune_gemms()
+            from flash_rt.subgraphs.capture import apply_frontend_capture_hooks
+            apply_frontend_capture_hooks(self)
             self.pipeline.record_infer_graph(external_stream_int=stream_int)
 
         self.calibrated = True
@@ -1342,6 +1344,8 @@ class Pi05TorchFrontendRtxFP16:
 
             self.pipeline.fp8_calibrated = True
             self.pipeline.autotune_gemms()
+            from flash_rt.subgraphs.capture import apply_frontend_capture_hooks
+            apply_frontend_capture_hooks(self)
             self.pipeline.record_infer_graph(external_stream_int=stream_int)
 
         self.calibrated = True
@@ -1706,6 +1710,8 @@ class Pi05TorchFrontendRtxFP16:
                 noise, self.pipeline.input_noise_buf, stream_int)
             self.pipeline.calibrate_fp8()
             self.pipeline.autotune_gemms()
+            from flash_rt.subgraphs.capture import apply_frontend_capture_hooks
+            apply_frontend_capture_hooks(self)
             self.pipeline.record_infer_graph(external_stream_int=stream_int)
         self.calibrated = True
         self.graph_recorded = True

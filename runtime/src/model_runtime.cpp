@@ -212,3 +212,67 @@ extern "C" frt_model_runtime_v1* frt_model_runtime_wrap(
     m.release = wrapper_release;
     return &w->model;
 }
+
+/* ---- verb override path: inherit declarations, replace verbs -------------- */
+
+namespace {
+
+struct VerbOverride {
+    std::atomic<int> refs{1};
+    const frt_model_runtime_v1* base = nullptr;
+    void* owner = nullptr;
+    void (*release_owner)(void*) = nullptr;
+    frt_model_runtime_v1 model{};
+};
+
+extern "C" void override_retain(void* owner) {
+    static_cast<VerbOverride*>(owner)->refs.fetch_add(1,
+                                                      std::memory_order_relaxed);
+}
+
+extern "C" void override_release(void* owner) {
+    VerbOverride* o = static_cast<VerbOverride*>(owner);
+    if (o->refs.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        if (o->release_owner) o->release_owner(o->owner);
+        if (o->base && o->base->release) o->base->release(o->base->owner);
+        delete o;
+    }
+}
+
+bool valid_model_runtime(const frt_model_runtime_v1* m) {
+    if (!m || m->abi_version != FRT_MODEL_RUNTIME_ABI_VERSION ||
+        m->struct_size < sizeof(frt_model_runtime_v1)) return false;
+    if (!m->exp || !m->retain || !m->release) return false;
+    if ((m->n_ports && !m->ports) || (m->n_stages && !m->stages)) return false;
+    return true;
+}
+
+}  // namespace
+
+extern "C" frt_model_runtime_v1* frt_model_runtime_override_verbs(
+        const frt_model_runtime_v1* in,
+        const frt_model_runtime_verbs* verbs, void* verbs_self,
+        void* owner, void (*retain_owner)(void*),
+        void (*release_owner)(void*)) {
+    if (!valid_model_runtime(in)) return nullptr;
+
+    auto* o = new VerbOverride();
+    o->base = in;
+    o->owner = owner;
+    o->release_owner = release_owner;
+
+    in->retain(in->owner);
+    if (retain_owner) retain_owner(owner);
+
+    frt_model_runtime_v1& m = o->model;
+    m.abi_version = FRT_MODEL_RUNTIME_ABI_VERSION;
+    m.struct_size = (uint32_t)sizeof(frt_model_runtime_v1);
+    m.exp = in->exp;
+    m.ports = in->ports;     m.n_ports = in->n_ports;
+    m.stages = in->stages;   m.n_stages = in->n_stages;
+    copy_verbs(&m, verbs, verbs_self);
+    m.owner = o;
+    m.retain = override_retain;
+    m.release = override_release;
+    return &o->model;
+}

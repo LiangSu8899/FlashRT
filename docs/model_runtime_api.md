@@ -38,7 +38,12 @@ object and stay valid while a reference is held.
 
 `frt_runtime_stage_desc` — one schedulable stage: `graph` (index into the
 export's graphs) plus `after[n_after]` (earlier stage indices). Declared array
-order is the sequential order `step` uses.
+order is the sequential order `step` uses. Stage streams are not a separate
+field: replay stream comes from the referenced graph descriptor.
+
+Graph stream placement and the stage DAG are deployment identity. A cut from
+`full` to `context_action`, a stream move, or a dependency change changes the
+fingerprint; this is intentional state-safety, not a cache miss.
 
 ## The object
 
@@ -96,11 +101,12 @@ the fingerprint, and stored state is refused. Canonical record formats:
 
 ```
 port:<i>:<name>:<modality>:<dtype>:<layout>:<dir>:<update>:<req>:<d0,d1,..>:<buf_idx>:<off>:<bytes>
+graph:<name>:<stream_id>
 stage:<i>:<graph>:<after0,after1,..>
 ```
 
-**Adapter** — wrap an existing export with ports/verbs (the native path over
-a Python-built export; identity inherited, ports not re-fingerprinted):
+**Adapter** — wrap an existing export with ports/verbs; identity inherited,
+ports not re-fingerprinted:
 
 ```c
 frt_model_runtime_v1* m = frt_model_runtime_wrap(
@@ -108,14 +114,103 @@ frt_model_runtime_v1* m = frt_model_runtime_wrap(
     &verbs, verbs_self, wrapper_owner, wrapper_release);
 ```
 
+**Verb override** — inherit an existing model-runtime declaration and replace
+only verbs. This is the standard hand-off when a setup producer owns capture,
+ports, stage DAG and fingerprint, while a native C++ runtime owns hot-path
+transforms:
+
+```c
+frt_model_runtime_v1* m = frt_model_runtime_override_verbs(
+    producer_model, &verbs, verbs_self,
+    native_owner, retain_native_owner, release_native_owner);
+```
+
+The override retains `producer_model`, so inherited port/stage pointers remain
+valid even if the original producer reference is released first. Deployment
+identity is unchanged.
+
 **Native factory (symbol convention)** — a model-runtime `.so` exports
 `FRT_MODEL_RUNTIME_OPEN_V1_SYMBOL`:
 `int frt_model_runtime_open_v1(const char* config_json, frt_model_runtime_v1** out)`.
 
-**Reference producers**: `frt_pi05_model_runtime_create`
-(`cpp/models/pi05/`) and `Pi05Pipeline.export_model_runtime()`
+**Reference producers**: `Pi05Pipeline.export_model_runtime()`
 (`flash_rt/models/pi05/runtime_export.py`, via
-`flash_rt.runtime.export.build_model_runtime`).
+`flash_rt.runtime.export.build_model_runtime`) and the native Pi0.5 verb
+overlay `frt_pi05_model_runtime_create_over` (`cpp/models/pi05/`).
+
+Pi0.5 export knobs:
+
+- `stage_plan="full"` exports one `infer` stage.
+- `stage_plan="context_action"` exports `context -> decode_only` only after
+  enabling `flash_rt.subgraphs.pi05.context_action` before graph capture.
+- `stage_plan="context_rtc_prefix_action"` exports
+  `context -> decode_rtc_prefix` only after enabling
+  `flash_rt.subgraphs.pi05.rtc_prefix` before graph capture. This mode adds
+  raw SWAP tensor ports `prev_action_chunk` and `actions_raw` with shape
+  `(chunk_length, 32)`; `prefix_len` is fixed at capture/export time through
+  `stage_plan_kwargs`.
+- `stage_plan="context_rtc_vjp_guided_action"` exports
+  `context -> decode_rtc_vjp_guided` only when a producer-supplied
+  `DenoiserVjpProvider` captured or adopted that graph. This mode adds raw
+  SWAP tensor ports `prev_action_chunk`, `actions_raw`, `prefix_weights`
+  `(chunk_length,) f32`, and `guidance_weight` `(1,) f32`.
+- `io="python"` exports the Python frontend SWAP-tensor face.
+- `io="native"` exports the C++ runtime face (`images/actions` STAGED,
+  `noise` SWAP), intended for `frt_pi05_model_runtime_create_over`.
+
+For VLA outputs, the `actions` port shape is the logical host-visible action
+chunk after postprocess: `(chunk_length, robot_action_dim)` for flat robot
+actions. It is not required to match the internal diffusion/action buffer
+shape. Pi0.5, for example, keeps `diffusion_noise` as `(chunk_length, 32)` but
+declares native `actions` as `(chunk_length, 7)` for LIBERO-style robot output.
+Other deployments may export `(50, 7)` or another fixed action shape through
+the same port contract; schedulers must read the declared port shape instead
+of assuming `(10, 7)`.
+
+Stage-plan names are resolved by `flash_rt.subgraphs.stage_plan`:
+
+```python
+from flash_rt.subgraphs.stage_plan import Stage, StagePlan, register_stage_plan
+
+register_stage_plan(
+    "prefill_decode",
+    StagePlan((
+        Stage("prefill", graph="prefill"),
+        Stage("decode", graph="decode", after=("prefill",)),
+    ), name="prefill_decode"),
+    model="my_llm",
+)
+```
+
+Subgraph packages should keep their built-in plans in `stage_plans.py` and
+import that module before export. Customer plans use the same registration API.
+Registered factories may receive export-time `stage_plan_kwargs` for choices
+such as diffusion chunk size. The ABI still receives only graph indices and
+dependency indices; it never receives the plan name as executable policy.
+The full capture-hook workflow is in
+[`subgraph_stage_plans.md`](subgraph_stage_plans.md).
+
+Export-time selection:
+
+```python
+model = pipeline.export_model_runtime(
+    stage_plan="prefill_decode",
+    io="native",
+)
+
+chunked = pipeline.export_model_runtime(
+    stage_plan="denoise_chunks",
+    stage_plan_kwargs={"chunk_size": 5, "total_steps": 10},
+    io="native",
+)
+```
+
+Every graph named by the resolved plan must already exist in the producer's
+export. Validation happens during export: unknown graph, unknown stream, stream
+mismatch, duplicate stage name, or a dependency on a later stage is rejected.
+For structural cuts, the required gate is bit-exact split replay versus full
+replay under the same input/noise. Approximate thresholds are not sufficient
+for a boundary-only split.
 
 ## Graph-cache verbs (exec layer)
 

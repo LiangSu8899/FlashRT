@@ -96,11 +96,15 @@ int main() {
     frt_runtime_stream_desc stream_desc{};
     stream_desc.name = "main";
     stream_desc.stream_id = sid;
-    frt_runtime_graph_desc graph_desc{};
-    graph_desc.name = "infer";
-    graph_desc.handle = graph;
-    graph_desc.default_key = 0;
-    graph_desc.stream_id = sid;
+    frt_runtime_graph_desc graph_desc[2]{};
+    graph_desc[0].name = "infer";
+    graph_desc[0].handle = graph;
+    graph_desc[0].default_key = 0;
+    graph_desc[0].stream_id = sid;
+    graph_desc[1].name = "decode_only";
+    graph_desc[1].handle = graph;
+    graph_desc[1].default_key = 0;
+    graph_desc[1].stream_id = sid;
     frt_runtime_buffer_desc buffers[2]{};
     buffers[0].name = "observation_images_normalized";
     buffers[0].handle = image;
@@ -117,7 +121,7 @@ int main() {
     exp.struct_size = sizeof(exp);
     exp.ctx = ctx;
     exp.streams = &stream_desc; exp.n_streams = 1;
-    exp.graphs = &graph_desc;   exp.n_graphs = 1;
+    exp.graphs = graph_desc;    exp.n_graphs = 2;
     exp.buffers = buffers;      exp.n_buffers = 2;
     exp.identity = "pi05-model-runtime-test";
     exp.owner = &owner;
@@ -208,6 +212,83 @@ int main() {
     CHECK(owner.release == 0, "alive after paired retain/release");
     m->release(m->owner);
     CHECK(owner.release == retains, "all export references dropped");
+
+    /* production path: inherit producer declarations, override only verbs */
+    cudaMemset(frt_buffer_dptr(action), 0, action_bytes);
+    frt_runtime_port_desc ports[3] = {};
+    const int64_t image_shape[4] = {1, 224, 224, 3};
+    const int64_t noise_shape[2] = {1, 4};
+    const int64_t action_shape[2] = {1, 3};
+    ports[0].name = "images";
+    ports[0].modality = FRT_RT_MOD_IMAGE;
+    ports[0].dtype = FRT_RT_DTYPE_BF16;
+    ports[0].layout = FRT_RT_LAYOUT_NHWC;
+    ports[0].direction = FRT_RT_PORT_IN;
+    ports[0].update = FRT_RT_PORT_STAGED;
+    ports[0].required = 1;
+    ports[0].shape = image_shape;
+    ports[0].rank = 4;
+    ports[0].buffer = image;
+    ports[0].bytes = image_bytes;
+    ports[1].name = "noise";
+    ports[1].modality = FRT_RT_MOD_TENSOR;
+    ports[1].dtype = FRT_RT_DTYPE_BF16;
+    ports[1].layout = FRT_RT_LAYOUT_FLAT;
+    ports[1].direction = FRT_RT_PORT_IN;
+    ports[1].update = FRT_RT_PORT_SWAP;
+    ports[1].shape = noise_shape;
+    ports[1].rank = 2;
+    ports[1].buffer = action;
+    ports[1].bytes = action_bytes;
+    ports[2].name = "actions";
+    ports[2].modality = FRT_RT_MOD_ACTION;
+    ports[2].dtype = FRT_RT_DTYPE_BF16;
+    ports[2].layout = FRT_RT_LAYOUT_FLAT;
+    ports[2].direction = FRT_RT_PORT_OUT;
+    ports[2].update = FRT_RT_PORT_STAGED;
+    ports[2].shape = action_shape;
+    ports[2].rank = 2;
+    ports[2].buffer = action;
+    ports[2].bytes = action_bytes;
+    uint32_t after_action[1] = {0};
+    frt_runtime_stage_desc stages[2]{};
+    stages[0].graph = 0;
+    stages[1].graph = 1;
+    stages[1].after = after_action;
+    stages[1].n_after = 1;
+
+    frt_model_runtime_v1* producer = frt_model_runtime_wrap(
+        &exp, ports, 3, stages, 2, nullptr, nullptr, nullptr, nullptr);
+    CHECK(producer != nullptr, "producer model declaration for create_over");
+
+    frt_model_runtime_v1* over = nullptr;
+    CHECK(frt_pi05_model_runtime_create_over(producer, &cfg, &over) == 0 &&
+              over,
+          "frt_pi05_model_runtime_create_over");
+    CHECK(over->exp == producer->exp && over->ports == producer->ports &&
+              over->stages == producer->stages,
+          "create_over inherits producer declarations");
+    CHECK(over->n_stages == 2 && over->stages[1].graph == 1 &&
+              over->stages[1].after[0] == 0,
+          "create_over preserves a producer-declared two-stage DAG");
+    producer->release(producer->owner);
+    CHECK(owner.release == retains,
+          "producer declaration stays alive through the override");
+
+    CHECK(over->verbs.set_input(over->self, 0, &view, sizeof(view), -1) == 0,
+          "create_over set_input(images)");
+    CHECK(over->verbs.step(over->self) == 0,
+          "create_over step replays the declared stage");
+    cudaDeviceSynchronize();
+    float over_out[3] = {};
+    written = 0;
+    CHECK(over->verbs.get_output(over->self, 2, over_out, sizeof(over_out),
+                                 &written, -1) == 0 &&
+              std::fabs(over_out[0] - 12.0f) < 0.01f,
+          "create_over get_output(actions)");
+    over->release(over->owner);
+    CHECK(owner.release == owner.retain,
+          "create_over releases its native runtime and inherited producer");
 
     frt_graph_destroy(graph);
     frt_ctx_destroy(ctx);

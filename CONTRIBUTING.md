@@ -217,6 +217,13 @@ reviewers hold every PR to:
 - `cpp/` altitude rule: `modalities/` knows pixels and tensors, never models;
   `families/` knows a model class's IO shape, never buffer names;
   `models/<m>/` binds names and constants, never re-implements a transform.
+- Subgraph cuts are producer-authored: capture hooks register under
+  `flash_rt/subgraphs/` and leave pipeline logic untouched; the C++ runtime
+  consumes the declared `stages[]` and never assumes graph names (the verb
+  override path). Rules and examples:
+  [`docs/subgraph_stage_plans.md`](docs/subgraph_stage_plans.md). A structural
+  cut is a re-ordering, not an approximation — split-vs-full replay must stay
+  bit-exact (`cpp/tests/gate_pi05_model_runtime_export.py` is the gate).
 
 ### Calibration And Precision
 

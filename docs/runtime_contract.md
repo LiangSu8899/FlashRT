@@ -77,8 +77,6 @@ region set validated by `serving/robot_recap/verify_capsule.py`).
 
 ## The model runtime ABI (`flashrt/model_runtime.h`)
 
-![the model-runtime face](figures/model_runtime_face.png)
-
 The export describes a captured model's static execution assets; it does not
 say how dynamic inputs enter the model each tick. That is the model runtime
 ABI — `frt_model_runtime_v1` — the standard face of one deployed, tickable
@@ -105,8 +103,6 @@ The contract is data first, verbs as sugar. Ports carry the load-bearing
 - `STAGED` — the runtime's `set_input` transforms host data (tokenize /
   resize / normalize / embed) into bound buffers. (prompt text, camera frames)
 - `SETUP` — legal only outside the tick.
-
-![two-speed tick](figures/two_speed_tick.png)
 
 Production contract for both hot classes: never recapture, never allocate,
 never rebind graph pointers — only buffer contents change. Replay graphs are

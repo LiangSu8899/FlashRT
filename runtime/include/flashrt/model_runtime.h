@@ -136,7 +136,10 @@ typedef struct frt_runtime_port_desc {
     uint32_t direction;        /* frt_rt_port_direction                    */
     uint32_t update;           /* frt_rt_port_update                       */
     uint32_t required;         /* must be written before the first tick    */
-    const int64_t* shape;      /* device-side dims; -1 = bucket-variable   */
+    const int64_t* shape;      /* declared port tensor dims; for STAGED
+                                * outputs this is the host-visible payload,
+                                * not necessarily the raw bound buffer shape;
+                                * -1 = bucket-variable                     */
     uint32_t rank;
     uint32_t cadence_hint_hz;  /* expected update rate; 0 = unknown. Hint,
                                 * not contract — scheduling stays host-side */
@@ -267,6 +270,20 @@ frt_model_runtime_v1* frt_model_runtime_wrap(
     const frt_runtime_stage_desc* stages, uint64_t n_stages,
     const frt_model_runtime_verbs* verbs, void* verbs_self,
     void* wrapper_owner, void (*wrapper_release)(void*));
+
+/* ------------------------------------------------------------------ */
+/* Construction path 3 — VERB OVERRIDE: keep an existing model runtime */
+/* declaration (export + ports + stages) and replace only the verbs.   */
+/* This is the clean hand-off when one producer owns capture/schema and */
+/* a native runtime owns hot-path transforms. The override retains `in` */
+/* so all inherited descriptor pointers stay valid; consumers release   */
+/* only the returned object. `retain_owner`/`release_owner` manage the  */
+/* native verb object, called once at construction/destruction.         */
+/* ------------------------------------------------------------------ */
+frt_model_runtime_v1* frt_model_runtime_override_verbs(
+    const frt_model_runtime_v1* in,
+    const frt_model_runtime_verbs* verbs, void* verbs_self,
+    void* owner, void (*retain_owner)(void*), void (*release_owner)(void*));
 
 #ifdef __cplusplus
 }  /* extern "C" */

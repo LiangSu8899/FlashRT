@@ -9,13 +9,17 @@ cannot promise. This document is the structure map; the interface reference is
 
 ## One struct, two producers
 
-![the model-runtime face](figures/model_runtime_face.png)
-
 Everything converges on `frt_model_runtime_v1` (the standard face of one
 deployed, tickable model). The Python setup bridge produces it today; a native
 model-runtime `.so` (`frt_model_runtime_open_v1`) produces the same struct
 later. Consumers — FlashRT-Nexus, robot loops, FFI hosts — never change when
 the producer does.
+
+The clean hybrid path is **verb override**: the setup producer exports the
+authoritative ports, stage DAG, graph streams, identity and fingerprint; a
+native C++ runtime retains that declaration and replaces only
+`set_input`/`get_output`/`prepare`/`step`. This keeps model-specific capture
+decisions out of C++ hot-path code while still removing Python from the tick.
 
 ## Tree layout
 
@@ -47,8 +51,6 @@ binds names and constants, never re-implements a transform. Nothing under
 
 ## The production tick
 
-![two-speed tick](figures/two_speed_tick.png)
-
 Ports declare the update class; the class decides the lane:
 
 - **SWAP** — the port is a device-buffer window; the host writes raw bytes
@@ -64,6 +66,44 @@ Ports declare the update class; the class decides the lane:
 Hot contract for both hot lanes (pinned by tests, not just prose): never
 recapture, never allocate, never rebind graph pointers — only buffer contents
 change, and replay output tracks them.
+
+## Stage plans
+
+Graph cuts are producer-owned. The model-runtime ABI stores only graph indices
+and dependency indices; it does not know customer plan names or model structure.
+Optional cuts are managed outside the C++ runtime under `flash_rt/subgraphs/`.
+See [`subgraph_stage_plans.md`](subgraph_stage_plans.md) for the customer
+registration and capture-hook workflow.
+
+The C++ runtime does not parse manifests or hardcode split names. For Pi0.5,
+`frt_pi05_model_runtime_create_over` inherits the producer's declarations and
+maps only the public ports it implements (`images`, optional `noise`,
+`actions`). `step` is convenience only: same-stream stage chains may replay
+sequentially; cross-stream dependencies require a host scheduler.
+
+Pi0.5's default producer plan is:
+
+- `stage_plan="full"`: one `infer` graph.
+
+The optional `flash_rt.subgraphs.pi05.context_action` module can be enabled
+before graph capture to add `stage_plan="context_action"`: `context` (prompt
+copy + vision + encoder) followed by `decode_only` (action decoder). The
+correctness gate checks full replay and split replay produce equivalent
+actions for the same inputs.
+
+It also exposes two IO faces over the same captured graphs:
+
+- `io="python"`: Python frontend hot loop; normalized tensors are SWAP ports.
+- `io="native"`: native C++ hot loop; raw images/actions are STAGED and noise
+  remains a SWAP port. This is the face consumed by
+  `frt_pi05_model_runtime_create_over`.
+
+The native `actions` port declares the logical output chunk delivered by
+`get_output`, not necessarily the raw model buffer layout. A Pi0.5 producer may
+store `(chunk, 32)` diffusion state internally while exposing `(chunk, 7)`
+robot actions. GROOT-like or other VLA producers can expose `(50, 7)` through
+the same descriptor; the chunk length is data on the port, not a runtime
+constant.
 
 ## Graph-variant cache
 

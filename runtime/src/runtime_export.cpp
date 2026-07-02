@@ -38,12 +38,15 @@ void finish_export_into(Holder* h, frt_runtime_builder_s* b,
      * it is identity. */
     std::string id = "frt-runtime-identity-v1\n";
     id += b->identity_pairs;
+    char line[192];
     for (const auto& g : h->graphs) {
         id += "graph:";
         id += g.name;
+        id += ':';
+        std::snprintf(line, sizeof(line), "%d", g.stream_id);
+        id += line;
         id += '\n';
     }
-    char line[192];
     for (size_t i = 0; i < h->regions.size(); ++i) {
         const auto& r = h->regions[i];
         std::snprintf(line, sizeof(line), "region:%zu:%s:%llu:%llu:%u\n",

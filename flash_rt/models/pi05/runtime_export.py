@@ -24,6 +24,8 @@ def exec_enable(pl) -> None:
         pl._exec_full.adopt(0, pl._graph._graph_exec.value)
     if getattr(pl, "_decoder_only_graph", None) is not None:
         pl._exec_dec.adopt(0, pl._decoder_only_graph._graph_exec.value)
+    from flash_rt.subgraphs.capture import materialize_captured_graphs
+    materialize_captured_graphs(pl)
     pl._exec_enabled = True
     pl._use_exec = True
     pl._exec_inited = True
@@ -60,12 +62,14 @@ def export_runtime(pl, identity=None, extra_regions=None):
     )
 
 
-def export_model_runtime(pl, identity=None, extra_regions=None):
+def export_model_runtime(pl, identity=None, extra_regions=None,
+                         stage_plan="full", io="python",
+                         stage_plan_kwargs=None):
     """Package a captured Pi0.5 pipeline as an ``frt_model_runtime_v1``.
 
-    The Python-producer face mirrors the native one: the frontend already
-    delivers normalized device tensors, so every input is a SWAP window
-    (raw bytes, no staged transform in the loop):
+    ``io="python"`` mirrors the Python frontend: the frontend already delivers
+    normalized device tensors, so every input is a SWAP window (raw bytes, no
+    staged transform in the loop):
 
       images    IN  SWAP  the normalized observation tensor window
       noise     IN  SWAP  the diffusion seed (also the action output window)
@@ -73,32 +77,118 @@ def export_model_runtime(pl, identity=None, extra_regions=None):
                           (TENSOR — STATE is reserved for real proprioception)
       actions   OUT SWAP  raw bf16 action chunk (= diffusion_noise after step)
 
+    ``io="native"`` declares the native C++ runtime face over the same captured
+    graphs: images/actions are STAGED, noise is SWAP, and the C++ runtime
+    supplies the verbs through ``frt_model_runtime_override_verbs``.
+
     Prompt staging (text -> embeds) stays with the frontend / the native
-    tokenizer producer. ``step`` replays the infer graph; the decode_only
-    graph remains addressable through the export for temporal-caching hosts.
+    tokenizer producer. ``stage_plan`` defaults to the full infer graph; an
+    explicit StagePlan or registered plan name may select already-captured
+    graphs from this export. ``stage_plan_kwargs`` are passed only to
+    registered plan factories, for deployment-specific graph cuts.
     """
     parts = _parts(pl, identity, extra_regions)
     from flash_rt.runtime import export as _rt
+    from flash_rt.subgraphs.pi05 import stage_plans as _pi05_stage_plans  # noqa: F401
+    from flash_rt.subgraphs.stage_plan import resolve_stage_plan
 
     wrap = parts["wrap"]
+    plan = resolve_stage_plan(stage_plan, model="pi05",
+                              **(stage_plan_kwargs or {}))
+    uses_rtc_prefix = any(
+        stage.graph_name() == "decode_rtc_prefix" for stage in plan.stages)
+    uses_rtc_vjp = any(
+        stage.graph_name() == "decode_rtc_vjp_guided"
+        for stage in plan.stages)
     num_views = int(getattr(pl, "num_views", 0) or 0)
-    chunk = wrap["diffusion_noise"].nbytes() // (32 * 2)  # (chunk, 32) bf16
-    ports = [
-        _rt.PortSpec("images", "image", "bf16", "nhwc", "in", "swap",
-                     required=True, shape=(num_views, 224, 224, 3),
-                     cadence_hz=30,
-                     buffer=wrap["observation_images_normalized"]),
-        _rt.PortSpec("noise", "tensor", "bf16", "flat", "in", "swap",
-                     shape=(chunk, 32), buffer=wrap["diffusion_noise"]),
-        _rt.PortSpec("encoder_x", "tensor", "bf16", "flat", "in", "swap",
-                     buffer=wrap["encoder_x"]),
-        _rt.PortSpec("actions", "action", "bf16", "flat", "out", "swap",
-                     shape=(chunk, 32), buffer=wrap["diffusion_noise"]),
-    ]
-    stages = [_rt.StageSpec("infer")]
+    chunk = wrap["diffusion_noise"].nbytes() // (32 * 2)  # 2-byte action dtype
+    robot_action_dim = _robot_action_dim(pl)
+    tensor_dtype = _tensor_dtype(pl)
+    if io == "python":
+        ports = [
+            _rt.PortSpec("images", "image", tensor_dtype, "nhwc", "in", "swap",
+                         required=True, shape=(num_views, 224, 224, 3),
+                         cadence_hz=30,
+                         buffer=wrap["observation_images_normalized"]),
+            _rt.PortSpec("noise", "tensor", tensor_dtype, "flat", "in", "swap",
+                         shape=(chunk, 32), buffer=wrap["diffusion_noise"]),
+            _rt.PortSpec("encoder_x", "tensor", tensor_dtype, "flat", "in", "swap",
+                         buffer=wrap["encoder_x"]),
+            _rt.PortSpec("actions", "action", tensor_dtype, "flat", "out", "swap",
+                         shape=(chunk, 32), buffer=wrap["diffusion_noise"]),
+        ]
+        if uses_rtc_prefix or uses_rtc_vjp:
+            ports.extend([
+                _rt.PortSpec("prev_action_chunk", "tensor", tensor_dtype,
+                             "flat", "in", "swap", shape=(chunk, 32),
+                             buffer=wrap["rtc_prev_action_chunk"]),
+                _rt.PortSpec("actions_raw", "tensor", tensor_dtype, "flat",
+                             "out", "swap", shape=(chunk, 32),
+                             buffer=wrap["diffusion_noise"]),
+            ])
+        if uses_rtc_vjp:
+            ports.extend([
+                _rt.PortSpec("prefix_weights", "tensor", "f32", "flat",
+                             "in", "swap", shape=(chunk,),
+                             buffer=wrap["rtc_prefix_weights"]),
+                _rt.PortSpec("guidance_weight", "tensor", "f32", "scalar",
+                             "in", "swap", shape=(1,),
+                             buffer=wrap["rtc_guidance_weight"]),
+            ])
+    elif io == "native":
+        ports = [
+            _rt.PortSpec("images", "image", tensor_dtype, "nhwc", "in", "staged",
+                         required=True, shape=(num_views, 224, 224, 3),
+                         cadence_hz=30,
+                         buffer=wrap["observation_images_normalized"]),
+            _rt.PortSpec("noise", "tensor", tensor_dtype, "flat", "in", "swap",
+                         shape=(chunk, 32), buffer=wrap["diffusion_noise"]),
+            _rt.PortSpec("actions", "action", tensor_dtype, "flat", "out",
+                         "staged", shape=(chunk, robot_action_dim),
+                         buffer=wrap["diffusion_noise"]),
+        ]
+        if uses_rtc_prefix or uses_rtc_vjp:
+            ports.extend([
+                _rt.PortSpec("prev_action_chunk", "tensor", tensor_dtype,
+                             "flat", "in", "swap", shape=(chunk, 32),
+                             buffer=wrap["rtc_prev_action_chunk"]),
+                _rt.PortSpec("actions_raw", "tensor", tensor_dtype, "flat",
+                             "out", "swap", shape=(chunk, 32),
+                             buffer=wrap["diffusion_noise"]),
+            ])
+        if uses_rtc_vjp:
+            ports.extend([
+                _rt.PortSpec("prefix_weights", "tensor", "f32", "flat",
+                             "in", "swap", shape=(chunk,),
+                             buffer=wrap["rtc_prefix_weights"]),
+                _rt.PortSpec("guidance_weight", "tensor", "f32", "scalar",
+                             "in", "swap", shape=(1,),
+                             buffer=wrap["rtc_guidance_weight"]),
+            ])
+    else:
+        raise ValueError(f"unknown Pi05 model-runtime io face {io!r}")
+    plan.validate(graph_names=[g.name for g in parts["graphs"]],
+                  stream_names=[s.name for s in parts["streams"]])
+    graph_stream = {g.name: g.stream for g in parts["graphs"]}
+    for stage in plan.stages:
+        if graph_stream[stage.graph_name()] != stage.stream:
+            raise ValueError(
+                f"stage {stage.name!r} declares stream {stage.stream!r}, "
+                f"but graph {stage.graph_name()!r} was exported on "
+                f"{graph_stream[stage.graph_name()]!r}")
+    stages = plan.to_stage_specs(_rt)
 
     def step():
-        return pl._exec_full.replay(0, pl._exec_gs_id)
+        rc = 0
+        graph_by_name = {g.name: g.graph for g in parts["graphs"]}
+        stream_by_name = {s.name: s.stream_id for s in parts["streams"]}
+        for stage in plan.stages:
+            graph = graph_by_name[stage.graph_name()]
+            stream_id = stream_by_name[stage.stream]
+            rc = graph.replay(0, stream_id)
+            if rc != 0:
+                return rc
+        return rc
 
     return _rt.build_model_runtime(
         pl._exec_ctx,
@@ -109,9 +199,29 @@ def export_model_runtime(pl, identity=None, extra_regions=None):
         ports=ports,
         stages=stages,
         identity=parts["identity"],
+        manifest_extra={"stage_plan": plan.manifest(), "io": io},
         owner=parts["owner"],
         step=step,
     )
+
+
+def _tensor_dtype(pl):
+    """Device tensor dtype for Pi0.5 IO buffers."""
+    if type(pl).__name__.endswith("FP16"):
+        return "f16"
+    return "bf16"
+
+
+def _robot_action_dim(pl):
+    """Logical robot action dimension exposed by the STAGED output face."""
+    try:
+        q01 = pl.norm_stats["actions"]["q01"]
+        if q01:
+            return int(min(len(q01), 32))
+    except Exception:
+        pass
+    from flash_rt.core.utils.actions import LIBERO_ACTION_DIM
+    return int(LIBERO_ACTION_DIM)
 
 
 def _parts(pl, identity, extra_regions):
@@ -127,7 +237,8 @@ def _parts(pl, identity, extra_regions):
     wrap = {
         name: ctx.wrap(name, pl.bufs[name].ptr.value, pl.bufs[name].nbytes)
         for name in ("observation_images_normalized", "diffusion_noise",
-                     "encoder_x")
+                     "encoder_x", "rtc_prev_action_chunk",
+                     "rtc_prefix_weights", "rtc_guidance_weight")
     }
 
     streams = [_rt.StreamSpec(
@@ -137,12 +248,22 @@ def _parts(pl, identity, extra_regions):
         _rt.GraphSpec("infer", pl._exec_full, 0, (0,)),
         _rt.GraphSpec("decode_only", pl._exec_dec, 0, (0,)),
     ]
+    from flash_rt.subgraphs.capture import export_graph_records
+    for rec in export_graph_records(pl):
+        graphs.append(_rt.GraphSpec(rec.name, rec.graph, rec.stream,
+                                    rec.variants))
     buffers = [
         _rt.BufferSpec("observation_images_normalized",
                        wrap["observation_images_normalized"], "input"),
         _rt.BufferSpec("diffusion_noise", wrap["diffusion_noise"],
                        ("input", "output")),
         _rt.BufferSpec("encoder_x", wrap["encoder_x"], ("input", "state")),
+        _rt.BufferSpec("rtc_prev_action_chunk",
+                       wrap["rtc_prev_action_chunk"], "input"),
+        _rt.BufferSpec("rtc_prefix_weights",
+                       wrap["rtc_prefix_weights"], "input"),
+        _rt.BufferSpec("rtc_guidance_weight",
+                       wrap["rtc_guidance_weight"], "input"),
     ]
     regions = [_rt.RegionSpec("rollout_boundary", wrap["diffusion_noise"])]
     anchored = [wrap]
