@@ -27,6 +27,16 @@ const frt_runtime_buffer_desc* find_buffer(const frt_runtime_export_v1* exp,
     return nullptr;
 }
 
+void* find_native_stream(const frt_runtime_export_v1* exp, int stream_id) {
+    if (!exp || (!exp->streams && exp->n_streams)) return nullptr;
+    for (std::uint64_t i = 0; i < exp->n_streams; ++i) {
+        if (exp->streams[i].stream_id == stream_id) {
+            return exp->streams[i].native_handle;
+        }
+    }
+    return nullptr;
+}
+
 modalities::TensorView device_tensor_from_buffer(
     const frt_runtime_buffer_desc* desc,
     modalities::DType dtype,
@@ -53,7 +63,8 @@ Runtime::Runtime(const frt_runtime_export_v1* exp, RuntimeConfig config)
     : exp_(exp),
       config_(std::move(config)),
       status_(modalities::Status::ok()),
-      io_(1, modalities::TensorView{}, modalities::TensorView{}, {}, {}) {
+      io_(1, modalities::TensorView{}, modalities::TensorView{}, {}, {},
+          nullptr) {
     status_ = bind();
     if (status_.ok_status()) retain_export();
 }
@@ -140,7 +151,8 @@ modalities::Status Runtime::bind() {
     }
 
     io_ = RuntimeIo(config_.num_views, image, action, config_.action_mean,
-                    config_.action_stddev, config_.chunk,
+                    config_.action_stddev, find_native_stream(exp_, stream_id_),
+                    config_.chunk,
                     config_.model_action_dim, config_.robot_action_dim);
     return modalities::Status::ok();
 }

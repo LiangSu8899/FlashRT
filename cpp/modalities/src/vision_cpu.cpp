@@ -11,6 +11,14 @@
 
 namespace flashrt {
 namespace modalities {
+
+#ifdef FLASHRT_CPP_WITH_CUDA_KERNELS
+Status preprocess_vision_cuda(const VisionPreprocessSpec& spec,
+                              const std::vector<VisionFrame>& frames,
+                              TensorView output,
+                              void* stream);
+#endif
+
 namespace {
 
 int channels(PixelFormat f) {
@@ -217,6 +225,9 @@ Status preprocess_vision(const VisionPreprocessSpec& spec,
         return Status::error(StatusCode::kInsufficientStorage,
                              "vision device output storage is too small");
     }
+#ifdef FLASHRT_CPP_WITH_CUDA_KERNELS
+    return preprocess_vision_cuda(spec, frames, output, stream);
+#else
     std::vector<std::uint8_t> staging(static_cast<std::size_t>(bytes));
     TensorView host_output;
     host_output.data = staging.data();
@@ -247,6 +258,7 @@ Status preprocess_vision(const VisionPreprocessSpec& spec,
                                  cudaGetErrorString(rc));
     }
     return Status::ok();
+#endif
 #endif
 }
 

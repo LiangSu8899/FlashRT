@@ -141,7 +141,7 @@ void test_pi05_runtime_io_adapter() {
 
     flashrt::models::pi05::RuntimeIo io(
         1, image_dst, action_src,
-        {1.0f, 2.0f, 3.0f}, {10.0f, 20.0f, 30.0f},
+        {1.0f, 2.0f, 3.0f}, {10.0f, 20.0f, 30.0f}, nullptr,
         /*chunk=*/1, /*model_action_dim=*/4, /*robot_action_dim=*/3);
 
     const std::uint8_t image_rgb[] = {

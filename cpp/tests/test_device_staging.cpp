@@ -20,6 +20,7 @@ using flashrt::modalities::VisionFrame;
 using flashrt::modalities::bfloat16_to_float;
 using flashrt::modalities::float_to_bfloat16;
 using flashrt::modalities::postprocess_action;
+using flashrt::modalities::preprocess_vision_cpu;
 using flashrt::modalities::preprocess_vision;
 using flashrt::modalities::required_action_output_bytes;
 using flashrt::modalities::required_vision_output_bytes;
@@ -61,13 +62,23 @@ void test_vision_h2d_staging() {
     auto st = preprocess_vision(spec, {frame}, dst);
     assert(st.ok_status());
 
-    std::uint16_t first[3] = {};
-    assert(cudaMemcpy(first, device, sizeof(first),
+    std::vector<std::uint16_t> got(bytes / 2);
+    assert(cudaMemcpy(got.data(), device, bytes,
                       cudaMemcpyDeviceToHost) == cudaSuccess);
-    assert(std::fabs(bfloat16_to_float(first[0]) - (-1.0f)) < 0.01f);
-    assert(std::fabs(bfloat16_to_float(first[1]) -
+    std::vector<std::uint16_t> ref(bytes / 2);
+    TensorView ref_dst{ref.data(), bytes, DType::kBFloat16, MemoryPlace::kHost,
+                       Layout::kNHWC, Shape{1, 224, 224, 3}};
+    st = preprocess_vision_cpu(spec, {frame}, ref_dst);
+    assert(st.ok_status());
+
+    for (std::size_t i = 0; i < got.size(); ++i) {
+        assert(std::fabs(bfloat16_to_float(got[i]) -
+                         bfloat16_to_float(ref[i])) < 0.01f);
+    }
+    assert(std::fabs(bfloat16_to_float(got[0]) - (-1.0f)) < 0.01f);
+    assert(std::fabs(bfloat16_to_float(got[1]) -
                      (127.0f / 127.5f - 1.0f)) < 0.01f);
-    assert(std::fabs(bfloat16_to_float(first[2]) - 1.0f) < 0.01f);
+    assert(std::fabs(bfloat16_to_float(got[2]) - 1.0f) < 0.01f);
     cudaFree(device);
 }
 
@@ -108,6 +119,6 @@ int main() {
     }
     test_vision_h2d_staging();
     test_action_d2h_staging();
-    std::cout << "PASS - CUDA modality staging\n";
+    std::cout << "PASS - CUDA modality kernels/staging\n";
     return 0;
 }

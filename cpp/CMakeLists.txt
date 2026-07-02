@@ -20,7 +20,12 @@ include(CTest)
 
 option(FLASHRT_CPP_WITH_EXEC "Build/link the exec layer for native replay" ON)
 option(FLASHRT_CPP_WITH_CUDA_STAGING "Enable conservative CUDA H2D/D2H modality staging" ON)
+option(FLASHRT_CPP_WITH_CUDA_KERNELS "Enable CUDA modality kernels" ON)
 if(FLASHRT_CPP_WITH_CUDA_STAGING)
+  find_package(CUDAToolkit REQUIRED)
+endif()
+if(FLASHRT_CPP_WITH_CUDA_KERNELS)
+  enable_language(CUDA)
   find_package(CUDAToolkit REQUIRED)
 endif()
 if(FLASHRT_CPP_WITH_EXEC AND NOT TARGET flashrt_exec)
@@ -37,16 +42,29 @@ if(FLASHRT_CPP_WITH_EXEC)
   target_link_libraries(flashrt_cpp INTERFACE flashrt_exec)
 endif()
 
-add_library(flashrt_cpp_modalities STATIC
+set(FLASHRT_CPP_MODALITY_SRCS
   modalities/src/types.cpp
   modalities/src/vision_cpu.cpp
   modalities/src/action_cpu.cpp)
+if(FLASHRT_CPP_WITH_CUDA_KERNELS)
+  list(APPEND FLASHRT_CPP_MODALITY_SRCS modalities/src/vision_cuda.cu)
+endif()
+
+add_library(flashrt_cpp_modalities STATIC ${FLASHRT_CPP_MODALITY_SRCS})
 target_include_directories(flashrt_cpp_modalities
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/modalities/include)
 if(FLASHRT_CPP_WITH_CUDA_STAGING)
   target_compile_definitions(flashrt_cpp_modalities
     PUBLIC FLASHRT_CPP_WITH_CUDA_STAGING=1)
   target_link_libraries(flashrt_cpp_modalities PUBLIC CUDA::cudart)
+endif()
+if(FLASHRT_CPP_WITH_CUDA_KERNELS)
+  target_compile_definitions(flashrt_cpp_modalities
+    PRIVATE FLASHRT_CPP_WITH_CUDA_KERNELS=1)
+  target_link_libraries(flashrt_cpp_modalities PUBLIC CUDA::cudart)
+  set_target_properties(flashrt_cpp_modalities PROPERTIES
+    CUDA_STANDARD 17
+    CUDA_STANDARD_REQUIRED ON)
 endif()
 
 add_library(flashrt_cpp_vla INTERFACE)

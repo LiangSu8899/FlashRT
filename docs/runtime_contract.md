@@ -95,11 +95,11 @@ decode outputs.
 Pi0.5 is the reference C++ model runtime under `cpp/models/pi05/`. The current
 implementation is the adopted-export path: setup/capture can still be produced
 by Python, while the native runtime owns vision prepare, graph replay dispatch,
-action decode, and export lifetime. It includes a conservative CPU-reference
-plus CUDA staging path for device buffers; a future GPU-native
-resize/normalize path replaces only that modality implementation. A future pure
-C++ checkpoint loader/tokenizer/capture path must produce the same
-`frt_runtime_export_v1`, so Nexus and serving hosts do not change.
+action decode, and export lifetime. It includes a CUDA vision
+resize/normalize/cast path for device buffers, with CPU reference tests, and a
+conservative D2H action staging path. A future pure C++ checkpoint
+loader/tokenizer/capture path must produce the same `frt_runtime_export_v1`, so
+Nexus and serving hosts do not change.
 
 ## Extending the ABI
 

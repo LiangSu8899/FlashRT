@@ -18,6 +18,7 @@ public:
               modalities::TensorView action_output,
               std::vector<float> action_mean,
               std::vector<float> action_stddev,
+              void* stream = nullptr,
               int chunk = kDefaultChunk,
               int model_action_dim = kModelActionDim,
               int robot_action_dim = kLiberoActionDim);
@@ -37,6 +38,7 @@ public:
 private:
     modalities::TensorView image_input_;
     modalities::TensorView action_output_;
+    void* stream_ = nullptr;
     modalities::VisionPreprocessSpec vision_spec_;
     modalities::ActionPostprocessSpec action_spec_;
 };
