@@ -2013,11 +2013,18 @@ class Pi05PipelineFP16:
             "FLASHRT_PI05_USE_EXEC", "0") not in ("0", "", "false", "False")
         if not self._use_exec:
             return
-        from flash_rt.runtime import exec as _frt
-        self._exec_ctx = _frt.Ctx()
-        self._exec_gs_id = self._exec_ctx.wrap_stream(int(self._graph_stream.value))
-        self._exec_full = self._exec_ctx.graph("pi05_infer", 1)
-        self._exec_dec = self._exec_ctx.graph("pi05_decode_only", 1)
+        from flash_rt.models.pi05.runtime_export import exec_enable
+        exec_enable(self)
+
+    def export_runtime(self, identity=None, extra_regions=None):
+        """Package the captured pipeline as an ``frt_runtime_export_v1``.
+
+        See :func:`flash_rt.models.pi05.runtime_export.export_runtime` (the
+        shared FP8/FP16 producer) for the argument contract.
+        """
+        from flash_rt.models.pi05.runtime_export import export_runtime
+        return export_runtime(self, identity=identity,
+                              extra_regions=extra_regions)
 
     def record_infer_graph(self, external_stream_int: int | None = None) -> None:
         """Capture the full pipeline as a CUDA Graph.
