@@ -1,0 +1,15 @@
+flowchart TB
+    subgraph P["producers — one face, two implementation paths"]
+        A1["Python setup bridge (today): flash_rt/runtime/export.py — capture · calibrate · autotune, process stays resident<br/>native C++ model runtime .so (later): cpp/models/&lt;model&gt;/ — frt_model_runtime_open_v1(config) → the same struct"]
+    end
+    subgraph M["frt_model_runtime_v1 — one deployed, tickable model (C ABI)"]
+        A2["ports[] dynamic-IO declarations: modality · dtype · shape · SWAP/STAGED/SETUP<br/>stages[] subgraph DAG: graph index + after deps — step as a whole, or schedule per stage<br/>verbs: set_input · get_output · prepare (warm variant capture) · step (sugar)"]
+    end
+    subgraph E["exp → frt_runtime_export_v1 — the frozen execution/state kernel"]
+        A3["ctx · streams · graphs · buffers · capsule regions<br/>identity/fingerprint: port schema + bound windows + region layout all hashed"]
+    end
+    subgraph C["consumers — handles only, no Python / torch / model code"]
+        A4["FlashRT-Nexus capsule host · robot loop · server shell · ctypes/FFI host"]
+    end
+    P --> M --> E
+    M --> C

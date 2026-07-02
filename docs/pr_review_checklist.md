@@ -116,7 +116,9 @@ Keep responsibilities in their owner layer.
 | Layer | Owns | Must not own |
 |---|---|---|
 | `csrc/` | C++/CUDA kernels, launch wrappers, pybind ABI, vendor kernel adapters | model routing, prompts, checkpoint names, serving policy |
-| `exec/` | C ABI replay mechanism: Buffer, Graph, Plan, Event, ShapeKey | sessions, schedulers, KV semantics, protocol fields, model policy |
+| `exec/` | C ABI replay mechanism: Buffer, Graph, Plan, Event, ShapeKey; graph-cache mechanism (evict/count) | sessions, schedulers, KV semantics, protocol fields, model policy, eviction policy |
+| `runtime/` | frozen hand-off ABI: `frt_runtime_export_v1` + `frt_model_runtime_v1` (ports, stage DAG, verbs), builder, identity/fingerprint rule | model transforms, modality processing, scheduling, anything model-named |
+| `cpp/` | native model-runtime implementations: modality primitives, family contracts, per-model adapters presenting the generic face | new public ABI surfaces (the struct in `runtime/` is the only deployment surface) |
 | `flash_rt/hardware/` | arch detection, attention backend factories, hardware-generic primitives | model-specific decoder logic or checkpoint-specific shapes |
 | `flash_rt/models/<model>/` | per-model compute pipeline and model-local helpers | public root exports, serving protocol, unrelated shared utilities |
 | `flash_rt/frontends/<framework>/` | IO path, weight loading, calibration, buffer allocation, graph capture | low-level kernel implementations, cross-model policy |
@@ -132,6 +134,11 @@ Blockers:
   or checkpoint keys from one model.
 - `exec/` gains a field or verb whose meaning is specific to one model family,
   protocol, session policy, scheduler policy, or KV-cache policy.
+- `runtime/` gains a model-named field, a scenario verb, or a non-additive
+  struct change; or a port is declared `STAGED` while its `set_input` refuses
+  hot updates (advertise-and-refuse).
+- A hot-path verb (`set_input`/`get_output`, SWAP writes, tick) allocates,
+  recaptures, or rebinds graph pointers.
 
 ## 6. Public API And Import Boundaries
 

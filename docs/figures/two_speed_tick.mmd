@@ -1,0 +1,24 @@
+flowchart LR
+    subgraph IN["sensors / upstream"]
+        direction TB
+        S1["observation tensors · noise seeds<br/>numeric state (already device format)"]
+        S2["camera frames · text commands<br/>(need transform: resize/normalize/tokenize)"]
+    end
+    subgraph TICK["production tick — hot contract: never recapture · never alloc · never rebind"]
+        direction TB
+        L1["SWAP fast lane (µs)<br/>host writes the bound buffer window<br/>cap_swap, zero model code"]
+        L2["STAGED lane<br/>producer set_input: fixed-capacity staging pool<br/>pinned bounce → async H2D → kernel"]
+        G["stages[] subgraph DAG replay<br/>vision → encoder → action / VLM+AE split<br/>cross-stream: pre-created events, alloc-free tick"]
+        L1 --> G
+        L2 --> G
+    end
+    subgraph OUT["outputs"]
+        O1["actions: raw window readback<br/>or get_output unnormalize"]
+    end
+    subgraph WARM["warm phase (outside the tick)"]
+        W1["prepare(graph, key)<br/>shape-bucket variant capture · evict at safe points only"]
+    end
+    S1 --> L1
+    S2 --> L2
+    G --> O1
+    WARM -.-> G
