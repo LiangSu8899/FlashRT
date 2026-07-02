@@ -36,6 +36,9 @@ modalities::ActionPostprocessSpec action_postprocess_spec(
     spec.schema = "eef_delta_xyz_rpy_gripper";
     spec.mean = mean;
     spec.stddev = stddev;
+    spec.clip_model_input = true;
+    spec.model_input_min = -1.0f;
+    spec.model_input_max = 1.0f;
     return spec;
 }
 

@@ -151,8 +151,8 @@ int main() {
     assert(rc == 0);
     assert(n_written == 3);
     assert(std::fabs(out[0] - 12.0f) < 0.01f);
-    assert(std::fabs(out[1] - 14.0f) < 0.01f);
-    assert(std::fabs(out[2] - 42.0f) < 0.01f);
+    assert(std::fabs(out[1] - 17.0f) < 0.01f);
+    assert(std::fabs(out[2] - 34.0f) < 0.01f);
 
     frt_pi05_runtime_destroy(rt);
     assert(owner.release == 1);

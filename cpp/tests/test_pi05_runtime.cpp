@@ -134,7 +134,7 @@ void test_adopted_export_runtime_flow() {
         st = runtime.read_actions(&actions);
         assert(st.ok_status());
         assert(actions.size() == 3);
-        assert(std::fabs(actions[0] - 14.0f) < 0.01f);
+        assert(std::fabs(actions[0] - 12.0f) < 0.01f);
         assert(std::fabs(actions[1] - 17.0f) < 0.01f);
         assert(std::fabs(actions[2] - 32.0f) < 0.01f);
     }

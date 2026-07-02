@@ -19,6 +19,9 @@ struct RuntimeConfig {
     int model_action_dim = kModelActionDim;
     int robot_action_dim = kLiberoActionDim;
 
+    modalities::DType image_dtype = modalities::DType::kBFloat16;
+    modalities::DType action_dtype = modalities::DType::kBFloat16;
+
     std::vector<float> action_mean;
     std::vector<float> action_stddev;
 

@@ -78,6 +78,10 @@ Status postprocess_action_cpu(const ActionPostprocessSpec& spec,
                 static_cast<std::uint64_t>(t) * spec.model_dim +
                 static_cast<std::uint64_t>(d);
             float value = load_value(model_output.data, src_idx, model_output.dtype);
+            if (spec.clip_model_input) {
+                value = std::max(spec.model_input_min,
+                                 std::min(spec.model_input_max, value));
+            }
             if (!spec.stddev.empty()) value *= spec.stddev[d];
             if (!spec.mean.empty()) value += spec.mean[d];
             if (spec.clamp) {

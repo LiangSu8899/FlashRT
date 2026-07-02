@@ -16,6 +16,9 @@ struct ActionPostprocessSpec {
     std::string schema;
     std::vector<float> mean;
     std::vector<float> stddev;
+    bool clip_model_input = false;
+    float model_input_min = -1.0f;
+    float model_input_max = 1.0f;
     std::vector<float> min_value;
     std::vector<float> max_value;
     bool clamp = false;

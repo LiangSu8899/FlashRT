@@ -19,6 +19,13 @@ enum frt_pi05_pixel_format {
     FRT_PI05_PIXEL_GRAY8 = 4,
 };
 
+enum frt_pi05_dtype {
+    FRT_PI05_DTYPE_DEFAULT  = 0,
+    FRT_PI05_DTYPE_BFLOAT16 = 1,
+    FRT_PI05_DTYPE_FLOAT16  = 2,
+    FRT_PI05_DTYPE_FLOAT32  = 3,
+};
+
 typedef struct frt_pi05_runtime_config {
     uint32_t struct_size;
 
@@ -35,6 +42,12 @@ typedef struct frt_pi05_runtime_config {
     const char* graph_name;
     const char* image_buffer_name;
     const char* action_buffer_name;
+
+    /* Optional ABI extension. Zero keeps the v1 default: BF16 buffers, which
+     * is the production FP8 Pi0.5 path. FP16 reference exports set both to
+     * FRT_PI05_DTYPE_FLOAT16. */
+    int image_dtype;
+    int action_dtype;
 } frt_pi05_runtime_config;
 
 typedef struct frt_pi05_vision_frame {

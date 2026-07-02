@@ -1,5 +1,6 @@
 #include "flashrt/cpp/modalities/vision.h"
 
+#include <cuda_fp16.h>
 #include <cuda_runtime_api.h>
 
 #include <algorithm>
@@ -119,6 +120,8 @@ __device__ __forceinline__ void store_value(void* out,
                                            float value) {
     if (dtype == 1) {
         static_cast<float*>(out)[index] = value;
+    } else if (dtype == 2) {
+        static_cast<__half*>(out)[index] = __float2half_rn(value);
     } else {
         static_cast<std::uint16_t*>(out)[index] = f32_to_bf16(value);
     }
@@ -203,9 +206,10 @@ Status preprocess_vision_cuda(const VisionPreprocessSpec& spec,
                              "CUDA vision preprocess currently writes NHWC");
     }
     if (spec.output_dtype != DType::kBFloat16 &&
+        spec.output_dtype != DType::kFloat16 &&
         spec.output_dtype != DType::kFloat32) {
         return Status::error(StatusCode::kUnsupported,
-                             "CUDA vision preprocess supports bf16/fp32 output");
+                             "CUDA vision preprocess supports bf16/fp16/fp32 output");
     }
     if (spec.require_exact_views && frames.size() != spec.view_order.size()) {
         return Status::error(StatusCode::kShapeMismatch,
@@ -269,7 +273,8 @@ Status preprocess_vision_cuda(const VisionPreprocessSpec& spec,
             static_cast<const std::uint8_t*>(d_src),
             frame->width, frame->height, stride, format_code(frame->format), ch,
             output.data,
-            spec.output_dtype == DType::kFloat32 ? 1 : 0,
+            spec.output_dtype == DType::kFloat32 ? 1 :
+            (spec.output_dtype == DType::kFloat16 ? 2 : 0),
             static_cast<int>(v), spec.target_width, spec.target_height,
             spec.normalize.mode == NormalizeMode::kScaleShift ? 0 : 1,
             spec.normalize.scale, spec.normalize.shift,

@@ -111,7 +111,7 @@ modalities::Status Runtime::bind() {
     if (!has_tensor_override(image)) {
         const auto* b = find_buffer(exp_, config_.image_buffer_name);
         image = device_tensor_from_buffer(
-            b, modalities::DType::kBFloat16, modalities::Layout::kNHWC,
+            b, config_.image_dtype, modalities::Layout::kNHWC,
             modalities::Shape{static_cast<std::uint64_t>(config_.num_views),
                               kImageSize, kImageSize, 3});
     }
@@ -119,7 +119,7 @@ modalities::Status Runtime::bind() {
     if (!has_tensor_override(action)) {
         const auto* b = find_buffer(exp_, config_.action_buffer_name);
         action = device_tensor_from_buffer(
-            b, modalities::DType::kBFloat16, modalities::Layout::kFlat,
+            b, config_.action_dtype, modalities::Layout::kFlat,
             modalities::Shape{static_cast<std::uint64_t>(config_.chunk),
                               static_cast<std::uint64_t>(config_.model_action_dim)});
     }
@@ -135,6 +135,7 @@ modalities::Status Runtime::bind() {
     }
 
     manifest_.vision = vision_preprocess_spec(config_.num_views);
+    manifest_.vision.output_dtype = config_.image_dtype;
     manifest_.action = action_postprocess_spec(
         config_.action_mean, config_.action_stddev, config_.chunk,
         config_.model_action_dim, config_.robot_action_dim);
@@ -152,8 +153,8 @@ modalities::Status Runtime::bind() {
 
     io_ = RuntimeIo(config_.num_views, image, action, config_.action_mean,
                     config_.action_stddev, find_native_stream(exp_, stream_id_),
-                    config_.chunk,
-                    config_.model_action_dim, config_.robot_action_dim);
+                    config_.chunk, config_.model_action_dim,
+                    config_.robot_action_dim, config_.image_dtype);
     return modalities::Status::ok();
 }
 

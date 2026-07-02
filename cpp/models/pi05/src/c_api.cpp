@@ -3,6 +3,7 @@
 #include "flashrt/cpp/models/pi05/runtime.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstring>
 #include <exception>
 #include <memory>
@@ -47,6 +48,22 @@ flashrt::modalities::PixelFormat pixel_format(int value) {
     return PixelFormat::kRGB8;
 }
 
+flashrt::modalities::DType dtype(int value) {
+    using flashrt::modalities::DType;
+    switch (value) {
+        case FRT_PI05_DTYPE_FLOAT16: return DType::kFloat16;
+        case FRT_PI05_DTYPE_FLOAT32: return DType::kFloat32;
+        case FRT_PI05_DTYPE_BFLOAT16:
+        case FRT_PI05_DTYPE_DEFAULT:
+        default: return DType::kBFloat16;
+    }
+}
+
+bool has_field(const frt_pi05_runtime_config* in, std::size_t offset,
+               std::size_t bytes) {
+    return in && in->struct_size >= offset + bytes;
+}
+
 flashrt::models::pi05::RuntimeConfig make_config(
     const frt_pi05_runtime_config* in) {
     flashrt::models::pi05::RuntimeConfig cfg;
@@ -66,6 +83,14 @@ flashrt::models::pi05::RuntimeConfig make_config(
     if (in->graph_name) cfg.graph_name = in->graph_name;
     if (in->image_buffer_name) cfg.image_buffer_name = in->image_buffer_name;
     if (in->action_buffer_name) cfg.action_buffer_name = in->action_buffer_name;
+    if (has_field(in, offsetof(frt_pi05_runtime_config, image_dtype),
+                  sizeof(in->image_dtype))) {
+        cfg.image_dtype = dtype(in->image_dtype);
+    }
+    if (has_field(in, offsetof(frt_pi05_runtime_config, action_dtype),
+                  sizeof(in->action_dtype))) {
+        cfg.action_dtype = dtype(in->action_dtype);
+    }
     return cfg;
 }
 
@@ -77,7 +102,9 @@ extern "C" int frt_pi05_runtime_create(
     frt_pi05_runtime** out) {
     if (!exp || !out) return -1;
     *out = nullptr;
-    if (config && config->struct_size < sizeof(frt_pi05_runtime_config)) {
+    constexpr std::size_t kConfigRequiredSize =
+        offsetof(frt_pi05_runtime_config, image_dtype);
+    if (config && config->struct_size < kConfigRequiredSize) {
         return -1;
     }
     auto* h = new (std::nothrow) frt_pi05_runtime_s();

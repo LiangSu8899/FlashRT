@@ -21,7 +21,8 @@ public:
               void* stream = nullptr,
               int chunk = kDefaultChunk,
               int model_action_dim = kModelActionDim,
-              int robot_action_dim = kLiberoActionDim);
+              int robot_action_dim = kLiberoActionDim,
+              modalities::DType image_dtype = modalities::DType::kBFloat16);
 
     modalities::Status prepare_vision(
         const std::vector<modalities::VisionFrame>& frames) const;
