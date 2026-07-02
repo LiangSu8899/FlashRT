@@ -61,6 +61,33 @@ _ROLE_NAMES = {
     "state": ROLE_STATE, "scratch": ROLE_SCRATCH,
 }
 
+# Model-runtime enums (ABI-frozen values, re-exported from the C module).
+MODALITY = {
+    "tensor": int(_c.MOD_TENSOR), "image": int(_c.MOD_IMAGE),
+    "text": int(_c.MOD_TEXT), "state": int(_c.MOD_STATE),
+    "action": int(_c.MOD_ACTION), "audio": int(_c.MOD_AUDIO),
+    "depth": int(_c.MOD_DEPTH), "force": int(_c.MOD_FORCE),
+}
+DTYPE = {
+    "u8": int(_c.DTYPE_U8), "f32": int(_c.DTYPE_F32), "f16": int(_c.DTYPE_F16),
+    "bf16": int(_c.DTYPE_BF16), "i32": int(_c.DTYPE_I32),
+    "i64": int(_c.DTYPE_I64),
+}
+LAYOUT = {
+    "flat": int(_c.LAYOUT_FLAT), "hwc": int(_c.LAYOUT_HWC),
+    "nhwc": int(_c.LAYOUT_NHWC), "chw": int(_c.LAYOUT_CHW),
+    "nchw": int(_c.LAYOUT_NCHW),
+}
+DIRECTION = {"in": int(_c.PORT_IN), "out": int(_c.PORT_OUT)}
+UPDATE = {
+    "swap": int(_c.PORT_SWAP), "staged": int(_c.PORT_STAGED),
+    "setup": int(_c.PORT_SETUP),
+}
+
+
+def _enum(table: Mapping[str, int], value: int | str) -> int:
+    return value if isinstance(value, int) else table[value]
+
 
 def _role_mask(role: int | str | Sequence[str]) -> int:
     """Accept an int mask, a name ("input"), or names ("input", "output")."""
@@ -108,6 +135,38 @@ class RegionSpec:
 
 
 @dataclass
+class PortSpec:
+    """One dynamic input/output of the tick (see flashrt/model_runtime.h).
+
+    ``update`` is the load-bearing field: "swap" ports are raw device windows
+    the host writes directly; "staged" ports go through the producer's
+    ``set_input``/``get_output`` callables; "setup" is illegal inside a tick.
+    """
+
+    name: str
+    modality: int | str            # MODALITY name or value
+    dtype: int | str = "bf16"      # device-side tensor dtype
+    layout: int | str = "flat"
+    direction: int | str = "in"
+    update: int | str = "swap"
+    required: bool = False
+    shape: Sequence[int] = ()
+    cadence_hz: int = 0
+    buffer: Any = None             # exec-binding Buffer for the SWAP window
+    offset: int = 0
+    nbytes: int | None = None      # None = whole buffer (when buffer is set)
+
+
+@dataclass
+class StageSpec:
+    """One schedulable stage: an export graph + dependencies on earlier
+    stages (indices). Declared order is the sequential ``step`` order."""
+
+    graph: str                     # GraphSpec.name
+    after: Sequence[int] = ()
+
+
+@dataclass
 class RuntimeExport:
     """A finished export. ``ptr`` is the ``frt_runtime_export_v1*`` to hand to a
     native consumer. The export holds one reference; this object anchors every
@@ -127,6 +186,32 @@ class RuntimeExport:
         """Drop the producer's reference (native retains keep it alive)."""
         if self.ptr:
             _c.export_release(self.ptr)
+            self.ptr = 0
+
+
+@dataclass
+class ModelRuntime:
+    """A finished model runtime. ``ptr`` is the ``frt_model_runtime_v1*`` a
+    native consumer adopts (it retains/releases only this object; the export
+    reference is internal). ``export_ptr`` points at the embedded export."""
+
+    ptr: int
+    export_ptr: int
+    fingerprint: int
+    identity: str
+    manifest: str | None
+    _anchor: Any = field(repr=False, default=None)
+
+    def ports(self) -> list:
+        return list(_c.model_ports(self.ptr))
+
+    def stages(self) -> list:
+        return list(_c.model_stages(self.ptr))
+
+    def release(self) -> None:
+        """Drop the producer's reference (native retains keep it alive)."""
+        if self.ptr:
+            _c.model_release(self.ptr)
             self.ptr = 0
 
 
@@ -161,9 +246,73 @@ def build_export(
     - ``manifest_extra``: merged into the auto-generated discovery manifest.
     - ``owner``: the producer object to keep alive (e.g. the model pipeline).
     """
+    b, anchor, manifest_json = _assemble(
+        ctx, streams=streams, graphs=graphs, buffers=buffers, regions=regions,
+        ports=(), stages=(), identity=identity, manifest_extra=manifest_extra,
+        owner=owner)
+    ptr = b.finish(anchor)
+    return RuntimeExport(
+        ptr=ptr,
+        fingerprint=int(_c.export_fingerprint(ptr)),
+        identity=_c.export_identity(ptr),
+        manifest=manifest_json,
+        _anchor=anchor,
+    )
+
+
+def build_model_runtime(
+    ctx: Any,
+    *,
+    streams: Sequence[StreamSpec],
+    graphs: Sequence[GraphSpec],
+    buffers: Sequence[BufferSpec] = (),
+    regions: Sequence[RegionSpec] = (),
+    ports: Sequence[PortSpec] = (),
+    stages: Sequence[StageSpec] = (),
+    identity: Mapping[str, str],
+    manifest_extra: Mapping[str, Any] | None = None,
+    owner: Any = None,
+    set_input=None,
+    get_output=None,
+    prepare=None,
+    step=None,
+) -> ModelRuntime:
+    """Assemble an ``frt_model_runtime_v1``: an export plus the dynamic-IO
+    contract (ports, stage DAG, optional verb callables) under one identity —
+    a port-schema change changes the fingerprint.
+
+    Verb callables (all optional; absent verbs report unsupported):
+      ``set_input(port, payload: bytes, stream) -> int``,
+      ``get_output(port, stream) -> bytes``,
+      ``prepare(graph, key) -> int``, ``step() -> int``.
+    They run under GIL-acquiring trampolines, so a native consumer may call
+    them from any thread. SWAP ports need no callable — hosts write the
+    declared buffer window directly.
+    """
+    b, anchor, manifest_json = _assemble(
+        ctx, streams=streams, graphs=graphs, buffers=buffers, regions=regions,
+        ports=ports, stages=stages, identity=identity,
+        manifest_extra=manifest_extra, owner=owner)
+    anchor._objs.append((set_input, get_output, prepare, step))
+    ptr = b.finish_model(anchor, set_input=set_input, get_output=get_output,
+                         prepare=prepare, step=step)
+    export_ptr = int(_c.model_export_ptr(ptr))
+    return ModelRuntime(
+        ptr=ptr,
+        export_ptr=export_ptr,
+        fingerprint=int(_c.export_fingerprint(export_ptr)),
+        identity=_c.export_identity(export_ptr),
+        manifest=manifest_json,
+        _anchor=anchor,
+    )
+
+
+def _assemble(ctx, *, streams, graphs, buffers, regions, ports, stages,
+              identity, manifest_extra, owner):
     if not streams:
         raise ValueError("at least one stream is required")
     stream_ids = {s.name: s.stream_id for s in streams}
+    graph_index = {g.name: i for i, g in enumerate(graphs)}
 
     b = _c.Builder(ctx.raw())
     for s in streams:
@@ -179,6 +328,19 @@ def build_export(
     for r in regions:
         nbytes = r.buffer.nbytes() if r.nbytes is None else r.nbytes
         b.add_region(r.name, r.buffer.raw(), r.offset, nbytes, r.flags)
+    for p in ports:
+        buffer_raw = p.buffer.raw() if p.buffer is not None else 0
+        nbytes = p.nbytes
+        if nbytes is None:
+            nbytes = p.buffer.nbytes() if p.buffer is not None else 0
+        b.add_port(p.name, _enum(MODALITY, p.modality), _enum(DTYPE, p.dtype),
+                   _enum(LAYOUT, p.layout), _enum(DIRECTION, p.direction),
+                   _enum(UPDATE, p.update), int(bool(p.required)),
+                   list(p.shape), p.cadence_hz, buffer_raw, p.offset, nbytes)
+    for st in stages:
+        if st.graph not in graph_index:
+            raise ValueError(f"stage references unknown graph {st.graph!r}")
+        b.add_stage(graph_index[st.graph], list(st.after))
     for k, v in identity.items():
         b.add_identity(str(k), str(v))
 
@@ -192,6 +354,17 @@ def build_export(
                              "bytes": (r.buffer.nbytes() if r.nbytes is None else r.nbytes),
                              "flags": r.flags} for r in regions],
     }
+    if ports:
+        manifest["ports"] = [
+            {"name": p.name, "modality": _enum(MODALITY, p.modality),
+             "dtype": _enum(DTYPE, p.dtype), "layout": _enum(LAYOUT, p.layout),
+             "direction": _enum(DIRECTION, p.direction),
+             "update": _enum(UPDATE, p.update), "required": bool(p.required),
+             "shape": list(p.shape), "cadence_hz": p.cadence_hz}
+            for p in ports]
+    if stages:
+        manifest["stages"] = [
+            {"graph": st.graph, "after": list(st.after)} for st in stages]
     if manifest_extra:
         manifest.update(dict(manifest_extra))
     manifest_json = json.dumps(manifest, sort_keys=True)
@@ -199,20 +372,18 @@ def build_export(
 
     anchor = _Anchor([ctx, [g.graph for g in graphs],
                       [buf.buffer for buf in buffers],
-                      [r.buffer for r in regions], owner])
-    ptr = b.finish(anchor)
-    return RuntimeExport(
-        ptr=ptr,
-        fingerprint=int(_c.export_fingerprint(ptr)),
-        identity=_c.export_identity(ptr),
-        manifest=manifest_json,
-        _anchor=anchor,
-    )
+                      [r.buffer for r in regions],
+                      [p.buffer for p in ports if p.buffer is not None],
+                      owner])
+    return b, anchor, manifest_json
 
 
 __all__ = [
-    "RuntimeExport", "StreamSpec", "GraphSpec", "BufferSpec", "RegionSpec",
-    "build_export",
+    "RuntimeExport", "ModelRuntime",
+    "StreamSpec", "GraphSpec", "BufferSpec", "RegionSpec", "PortSpec",
+    "StageSpec",
+    "build_export", "build_model_runtime",
     "ROLE_INPUT", "ROLE_OUTPUT", "ROLE_STATE", "ROLE_SCRATCH",
     "REGION_SNAPSHOT", "REGION_RESTORE", "REGION_DEFAULT",
+    "MODALITY", "DTYPE", "LAYOUT", "DIRECTION", "UPDATE",
 ]

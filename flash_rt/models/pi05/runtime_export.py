@@ -46,6 +46,75 @@ def export_runtime(pl, identity=None, extra_regions=None):
       default rollout boundary (``diffusion_noise`` — the region set
       validated by serving/robot_recap/verify_capsule.py).
     """
+    parts = _parts(pl, identity, extra_regions)
+    from flash_rt.runtime import export as _rt
+
+    return _rt.build_export(
+        pl._exec_ctx,
+        streams=parts["streams"],
+        graphs=parts["graphs"],
+        buffers=parts["buffers"],
+        regions=parts["regions"],
+        identity=parts["identity"],
+        owner=parts["owner"],
+    )
+
+
+def export_model_runtime(pl, identity=None, extra_regions=None):
+    """Package a captured Pi0.5 pipeline as an ``frt_model_runtime_v1``.
+
+    The Python-producer face mirrors the native one: the frontend already
+    delivers normalized device tensors, so every input is a SWAP window
+    (raw bytes, no staged transform in the loop):
+
+      images    IN  SWAP  the normalized observation tensor window
+      noise     IN  SWAP  the diffusion seed (also the action output window)
+      encoder_x IN  SWAP  the encoder residual-stream/prompt slot
+      actions   OUT SWAP  raw bf16 action chunk (= diffusion_noise after step)
+
+    Prompt staging (text -> embeds) stays with the frontend / the native
+    tokenizer producer. ``step`` replays the infer graph; the decode_only
+    graph remains addressable through the export for temporal-caching hosts.
+    """
+    parts = _parts(pl, identity, extra_regions)
+    from flash_rt.runtime import export as _rt
+
+    wrap = parts["wrap"]
+    num_views = int(getattr(pl, "num_views", 0) or 0)
+    chunk = wrap["diffusion_noise"].nbytes() // (32 * 2)  # (chunk, 32) bf16
+    ports = [
+        _rt.PortSpec("images", "image", "bf16", "nhwc", "in", "swap",
+                     required=True, shape=(num_views, 224, 224, 3),
+                     cadence_hz=30,
+                     buffer=wrap["observation_images_normalized"]),
+        _rt.PortSpec("noise", "tensor", "bf16", "flat", "in", "swap",
+                     shape=(chunk, 32), buffer=wrap["diffusion_noise"]),
+        _rt.PortSpec("encoder_x", "state", "bf16", "flat", "in", "swap",
+                     buffer=wrap["encoder_x"]),
+        _rt.PortSpec("actions", "action", "bf16", "flat", "out", "swap",
+                     shape=(chunk, 32), buffer=wrap["diffusion_noise"]),
+    ]
+    stages = [_rt.StageSpec("infer")]
+
+    def step():
+        return pl._exec_full.replay(0, pl._exec_gs_id)
+
+    return _rt.build_model_runtime(
+        pl._exec_ctx,
+        streams=parts["streams"],
+        graphs=parts["graphs"],
+        buffers=parts["buffers"],
+        regions=parts["regions"],
+        ports=ports,
+        stages=stages,
+        identity=parts["identity"],
+        owner=parts["owner"],
+        step=step,
+    )
+
+
+def _parts(pl, identity, extra_regions):
+    """Shared assembly for the plain export and the model-runtime export."""
     if getattr(pl, "_graph", None) is None:
         raise RuntimeError("export_runtime requires record_infer_graph() first")
     exec_enable(pl)
@@ -91,12 +160,12 @@ def export_runtime(pl, identity=None, extra_regions=None):
     }
     ident.update({str(k): str(v) for k, v in (identity or {}).items()})
 
-    return _rt.build_export(
-        ctx,
-        streams=streams,
-        graphs=graphs,
-        buffers=buffers,
-        regions=regions,
-        identity=ident,
-        owner=(pl, anchored),
-    )
+    return {
+        "wrap": wrap,
+        "streams": streams,
+        "graphs": graphs,
+        "buffers": buffers,
+        "regions": regions,
+        "identity": ident,
+        "owner": (pl, anchored),
+    }
