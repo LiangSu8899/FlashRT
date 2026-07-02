@@ -25,6 +25,17 @@ Status postprocess_action_cpu(const ActionPostprocessSpec& spec,
                               TensorView model_output,
                               std::vector<float>* robot_actions);
 
+/* Dispatch entry used by model runtimes. Host outputs use the CPU reference.
+ * Device outputs use the conservative D2H staging path when CUDA staging is
+ * enabled. */
+Status postprocess_action(const ActionPostprocessSpec& spec,
+                          TensorView model_output,
+                          std::vector<float>* robot_actions,
+                          void* stream = nullptr);
+
+std::uint64_t required_action_output_bytes(const ActionPostprocessSpec& spec,
+                                           DType dtype);
+
 }  // namespace modalities
 }  // namespace flashrt
 

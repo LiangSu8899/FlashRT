@@ -75,6 +75,9 @@ Current Pi0.5 status:
 - complete C++ hot-path shell: prepare vision, replay graph, read action;
 - complete lifecycle for adopted Python/native exports: retain/release;
 - complete build target: `flashrt_cpp_pi05`;
+- conservative device staging path: host camera frames -> CPU reference
+  preprocess -> H2D into export device buffers; device action buffer -> D2H ->
+  CPU reference postprocess;
 - native checkpoint loader/tokenizer/capture is not implemented yet. It will
   become a producer for the same `frt_runtime_export_v1`, not a Nexus feature.
 
@@ -86,8 +89,10 @@ The current implementation is a CPU reference path:
 - `postprocess_action_cpu`
 
 This is intentional. It gives every later CUDA/DMA/zero-copy fast path a golden
-contract. A GPU implementation must match the CPU reference within the declared
-tolerance and preserve the same view-order, shape, dtype, and schema guards.
+contract. The current device path is a conservative staging implementation,
+not the final performance path. A GPU resize/normalize implementation must
+match the CPU reference within the declared tolerance and preserve the same
+view-order, shape, dtype, and schema guards.
 
 ## Hot Path Rules
 
@@ -115,6 +120,12 @@ Production model runtimes should make these true after setup:
 - Pi0.5 manifest exposure;
 - `prepare_vision -> replay_tick -> read_actions`;
 - replay dispatch to the export graph/key/stream.
+
+`cpp/tests/test_device_staging.cpp` validates the device staging bridge when a
+CUDA device is present:
+
+- vision preprocess into a device tensor via H2D staging;
+- action postprocess from a device tensor via D2H staging.
 
 Build:
 

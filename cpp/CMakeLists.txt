@@ -19,6 +19,10 @@ endif()
 include(CTest)
 
 option(FLASHRT_CPP_WITH_EXEC "Build/link the exec layer for native replay" ON)
+option(FLASHRT_CPP_WITH_CUDA_STAGING "Enable conservative CUDA H2D/D2H modality staging" ON)
+if(FLASHRT_CPP_WITH_CUDA_STAGING)
+  find_package(CUDAToolkit REQUIRED)
+endif()
 if(FLASHRT_CPP_WITH_EXEC AND NOT TARGET flashrt_exec)
   add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../exec
                    ${CMAKE_CURRENT_BINARY_DIR}/exec)
@@ -39,6 +43,11 @@ add_library(flashrt_cpp_modalities STATIC
   modalities/src/action_cpu.cpp)
 target_include_directories(flashrt_cpp_modalities
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/modalities/include)
+if(FLASHRT_CPP_WITH_CUDA_STAGING)
+  target_compile_definitions(flashrt_cpp_modalities
+    PUBLIC FLASHRT_CPP_WITH_CUDA_STAGING=1)
+  target_link_libraries(flashrt_cpp_modalities PUBLIC CUDA::cudart)
+endif()
 
 add_library(flashrt_cpp_vla INTERFACE)
 target_include_directories(flashrt_cpp_vla
@@ -65,4 +74,11 @@ if(BUILD_TESTING)
   target_link_libraries(test_pi05_runtime
     PRIVATE flashrt_cpp_pi05 flashrt_cpp_modalities)
   add_test(NAME pi05_runtime COMMAND test_pi05_runtime)
+
+  if(FLASHRT_CPP_WITH_CUDA_STAGING)
+    add_executable(test_device_staging tests/test_device_staging.cpp)
+    target_link_libraries(test_device_staging
+      PRIVATE flashrt_cpp_pi05 flashrt_cpp_modalities CUDA::cudart)
+    add_test(NAME device_staging COMMAND test_device_staging)
+  endif()
 endif()

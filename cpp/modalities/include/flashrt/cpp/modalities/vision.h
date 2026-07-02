@@ -46,6 +46,15 @@ Status preprocess_vision_cpu(const VisionPreprocessSpec& spec,
                              const std::vector<VisionFrame>& frames,
                              TensorView output);
 
+/* Dispatch entry used by model runtimes. Host outputs use the CPU reference.
+ * Device outputs use the conservative staging path when CUDA staging is
+ * enabled: CPU reference -> H2D copy. A future GPU resize/normalize kernel
+ * should replace only this implementation, not model adapters. */
+Status preprocess_vision(const VisionPreprocessSpec& spec,
+                         const std::vector<VisionFrame>& frames,
+                         TensorView output,
+                         void* stream = nullptr);
+
 std::uint64_t required_vision_output_bytes(const VisionPreprocessSpec& spec);
 
 }  // namespace modalities

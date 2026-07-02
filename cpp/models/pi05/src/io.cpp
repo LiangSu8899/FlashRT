@@ -20,13 +20,13 @@ RuntimeIo::RuntimeIo(int num_views,
 
 modalities::Status RuntimeIo::prepare_vision(
     const std::vector<modalities::VisionFrame>& frames) const {
-    return modalities::preprocess_vision_cpu(vision_spec_, frames, image_input_);
+    return modalities::preprocess_vision(vision_spec_, frames, image_input_);
 }
 
 modalities::Status RuntimeIo::read_actions(
     std::vector<float>* robot_actions) const {
-    return modalities::postprocess_action_cpu(action_spec_, action_output_,
-                                              robot_actions);
+    return modalities::postprocess_action(action_spec_, action_output_,
+                                          robot_actions);
 }
 
 }  // namespace pi05

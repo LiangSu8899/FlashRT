@@ -47,6 +47,7 @@ enum class StatusCode {
     kUnsupported,
     kShapeMismatch,
     kInsufficientStorage,
+    kBackend,
 };
 
 struct Status {

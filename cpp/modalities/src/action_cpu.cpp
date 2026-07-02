@@ -1,6 +1,11 @@
 #include "flashrt/cpp/modalities/action.h"
 
 #include <algorithm>
+#include <vector>
+
+#ifdef FLASHRT_CPP_WITH_CUDA_STAGING
+#include <cuda_runtime_api.h>
+#endif
 
 namespace flashrt {
 namespace modalities {
@@ -25,6 +30,14 @@ bool has_dim(const std::vector<float>& v, int dim) {
 }
 
 }  // namespace
+
+std::uint64_t required_action_output_bytes(const ActionPostprocessSpec& spec,
+                                           DType dtype) {
+    if (spec.chunk <= 0 || spec.model_dim <= 0) return 0;
+    return static_cast<std::uint64_t>(spec.chunk) *
+           static_cast<std::uint64_t>(spec.model_dim) *
+           static_cast<std::uint64_t>(dtype_size(dtype));
+}
 
 Status postprocess_action_cpu(const ActionPostprocessSpec& spec,
                               TensorView model_output,
@@ -75,6 +88,56 @@ Status postprocess_action_cpu(const ActionPostprocessSpec& spec,
         }
     }
     return Status::ok();
+}
+
+Status postprocess_action(const ActionPostprocessSpec& spec,
+                          TensorView model_output,
+                          std::vector<float>* robot_actions,
+                          void* stream) {
+    if (model_output.place == MemoryPlace::kHost ||
+        model_output.place == MemoryPlace::kHostPinned) {
+        return postprocess_action_cpu(spec, model_output, robot_actions);
+    }
+    if (model_output.place != MemoryPlace::kDevice) {
+        return Status::error(StatusCode::kUnsupported,
+                             "action output memory place is unsupported");
+    }
+#ifndef FLASHRT_CPP_WITH_CUDA_STAGING
+    (void)stream;
+    return Status::error(StatusCode::kUnsupported,
+                         "device action staging was not enabled at build time");
+#else
+    const std::uint64_t bytes =
+        required_action_output_bytes(spec, model_output.dtype);
+    if (!model_output.data || model_output.bytes < bytes) {
+        return Status::error(StatusCode::kInsufficientStorage,
+                             "device action output storage is too small");
+    }
+    std::vector<std::uint8_t> staging(static_cast<std::size_t>(bytes));
+    cudaError_t rc = cudaSuccess;
+    if (stream) {
+        auto* cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+        rc = cudaMemcpyAsync(staging.data(), model_output.data, bytes,
+                             cudaMemcpyDeviceToHost, cuda_stream);
+        if (rc == cudaSuccess) rc = cudaStreamSynchronize(cuda_stream);
+    } else {
+        rc = cudaMemcpy(staging.data(), model_output.data, bytes,
+                        cudaMemcpyDeviceToHost);
+    }
+    if (rc != cudaSuccess) {
+        return Status::error(StatusCode::kBackend,
+                             std::string("cuda D2H action staging failed: ") +
+                                 cudaGetErrorString(rc));
+    }
+    TensorView host;
+    host.data = staging.data();
+    host.bytes = bytes;
+    host.dtype = model_output.dtype;
+    host.place = MemoryPlace::kHost;
+    host.layout = model_output.layout;
+    host.shape = model_output.shape;
+    return postprocess_action_cpu(spec, host, robot_actions);
+#endif
 }
 
 }  // namespace modalities

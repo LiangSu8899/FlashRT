@@ -3,6 +3,11 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <vector>
+
+#ifdef FLASHRT_CPP_WITH_CUDA_STAGING
+#include <cuda_runtime_api.h>
+#endif
 
 namespace flashrt {
 namespace modalities {
@@ -188,6 +193,61 @@ Status preprocess_vision_cpu(const VisionPreprocessSpec& spec,
         }
     }
     return Status::ok();
+}
+
+Status preprocess_vision(const VisionPreprocessSpec& spec,
+                         const std::vector<VisionFrame>& frames,
+                         TensorView output,
+                         void* stream) {
+    if (output.place == MemoryPlace::kHost ||
+        output.place == MemoryPlace::kHostPinned) {
+        return preprocess_vision_cpu(spec, frames, output);
+    }
+    if (output.place != MemoryPlace::kDevice) {
+        return Status::error(StatusCode::kUnsupported,
+                             "vision output memory place is unsupported");
+    }
+#ifndef FLASHRT_CPP_WITH_CUDA_STAGING
+    (void)stream;
+    return Status::error(StatusCode::kUnsupported,
+                         "device vision staging was not enabled at build time");
+#else
+    const std::uint64_t bytes = required_vision_output_bytes(spec);
+    if (!output.data || output.bytes < bytes) {
+        return Status::error(StatusCode::kInsufficientStorage,
+                             "vision device output storage is too small");
+    }
+    std::vector<std::uint8_t> staging(static_cast<std::size_t>(bytes));
+    TensorView host_output;
+    host_output.data = staging.data();
+    host_output.bytes = bytes;
+    host_output.dtype = spec.output_dtype;
+    host_output.place = MemoryPlace::kHost;
+    host_output.layout = spec.output_layout;
+    host_output.shape = Shape{static_cast<std::uint64_t>(spec.view_order.size()),
+                              static_cast<std::uint64_t>(spec.target_height),
+                              static_cast<std::uint64_t>(spec.target_width),
+                              3};
+    Status st = preprocess_vision_cpu(spec, frames, host_output);
+    if (!st.ok_status()) return st;
+
+    cudaError_t rc = cudaSuccess;
+    if (stream) {
+        auto* cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+        rc = cudaMemcpyAsync(output.data, staging.data(), bytes,
+                             cudaMemcpyHostToDevice, cuda_stream);
+        if (rc == cudaSuccess) rc = cudaStreamSynchronize(cuda_stream);
+    } else {
+        rc = cudaMemcpy(output.data, staging.data(), bytes,
+                        cudaMemcpyHostToDevice);
+    }
+    if (rc != cudaSuccess) {
+        return Status::error(StatusCode::kBackend,
+                             std::string("cuda H2D vision staging failed: ") +
+                                 cudaGetErrorString(rc));
+    }
+    return Status::ok();
+#endif
 }
 
 }  // namespace modalities
