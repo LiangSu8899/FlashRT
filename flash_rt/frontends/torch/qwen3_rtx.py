@@ -386,6 +386,19 @@ class Qwen3TorchFrontendRtx:
         self._knr_q = getattr(
             self._fvk, 'qwen3_k_norm_rope_kvwrite_prefill_v3_bf16',
             self._fvk.qwen3_k_norm_rope_kvwrite_prefill_bf16)
+        # STEP D fold: norm_rope variants that ALSO emit per-token e4m3 Q/K (+
+        # scale) and fp16 V, so the fp8 prefill attention needs no separate
+        # quant/cast. None unless both the kernel and the fp8 attn path exist.
+        self._qnr_q_fp8 = getattr(
+            self._fvk, 'qwen3_q_norm_rope_qstage_prefill_v3_fp8', None)
+        self._knr_q_fp8 = getattr(
+            self._fvk, 'qwen3_k_norm_rope_kvwrite_prefill_v3_fp8', None)
+        # Direct-e4m3 fold (no per-token scale; V e4m3 too) for the all-fp8
+        # prefill attention path.
+        self._qnr_q_fp8_direct = getattr(
+            self._fvk, 'qwen3_q_norm_rope_qstage_prefill_v3_fp8_direct', None)
+        self._knr_q_fp8_direct = getattr(
+            self._fvk, 'qwen3_k_norm_rope_kvwrite_prefill_v3_fp8_direct', None)
         # SwiGLU epilogue fold (prefill): fuse silu(gate)*up into the gate_up
         # GEMM epilogue (interleaved gate|up weight, FP4 out, SF32) + an even-
         # column compaction, replacing the [gate_up GEMM bf16 + silu_mul]
@@ -1093,19 +1106,68 @@ class Qwen3TorchFrontendRtx:
                       + start_pos * self._attn.kv_row_stride_bytes)
             k_cache_dst = self._attn.K_cache.data_ptr() + kv_off
             v_cache_dst = self._attn.V_cache.data_ptr() + kv_off
-            self._qnr_q(
-                qkv_out[:, :Nq].data_ptr(), int(lw['q_norm_w']),
-                cos_S.data_ptr(), sin_S.data_ptr(),
-                self._attn.Q_buf[:, :S].data_ptr(),
-                n_q, S, qkv_N, n_q * hd, eps, s,
-            )
-            self._knr_q(
-                qkv_out[:, Nq:Nq + Nk].data_ptr(),
-                qkv_out[:, Nq + Nk:].data_ptr(), int(lw['k_norm_w']),
-                cos_S.data_ptr(), sin_S.data_ptr(),
-                k_cache_dst, v_cache_dst,
-                n_kv, S, qkv_N, kv_row_elems, eps, s,
-            )
+            # STEP D: when the fp8 prefill-attn path is active for this bucket,
+            # fold per-token e4m3 Q/K (+scale) and fp16 V emission into the
+            # norm_rope kernels (no separate quant/cast). Gate MUST match the
+            # backend run() trigger (S a multiple of 128, within sp_max).
+            _fp8_gate = (getattr(self._attn, '_fp8_prefill', False)
+                         and S % 128 == 0
+                         and S <= getattr(self._attn, '_fp8_sp_max', 0))
+            _fp8_direct = (_fp8_gate
+                           and getattr(self._attn, '_fp8_direct', False)
+                           and self._qnr_q_fp8_direct is not None)
+            _fp8 = (_fp8_gate and not _fp8_direct
+                    and self._qnr_q_fp8 is not None)
+            if _fp8_direct:
+                self._qnr_q_fp8_direct(
+                    qkv_out[:, :Nq].data_ptr(), int(lw['q_norm_w']),
+                    cos_S.data_ptr(), sin_S.data_ptr(),
+                    0,                              # skip redundant bf16 Q_buf
+                    self._attn._fp8_q8.data_ptr(),
+                    n_q, S, qkv_N, n_q * hd, eps, s,
+                )
+                self._knr_q_fp8_direct(
+                    qkv_out[:, Nq:Nq + Nk].data_ptr(),
+                    qkv_out[:, Nq + Nk:].data_ptr(), int(lw['k_norm_w']),
+                    cos_S.data_ptr(), sin_S.data_ptr(),
+                    k_cache_dst, v_cache_dst,
+                    self._attn._fp8_k8.data_ptr(),
+                    self._attn._fp8_v8.data_ptr(),
+                    n_kv, S, qkv_N, kv_row_elems, eps, s,
+                )
+            elif _fp8:
+                self._qnr_q_fp8(
+                    qkv_out[:, :Nq].data_ptr(), int(lw['q_norm_w']),
+                    cos_S.data_ptr(), sin_S.data_ptr(),
+                    0,                              # skip redundant bf16 Q_buf
+                    self._attn._fp8_q8.data_ptr(),
+                    self._attn._fp8_qs.data_ptr(),
+                    n_q, S, qkv_N, n_q * hd, eps, s,
+                )
+                self._knr_q_fp8(
+                    qkv_out[:, Nq:Nq + Nk].data_ptr(),
+                    qkv_out[:, Nq + Nk:].data_ptr(), int(lw['k_norm_w']),
+                    cos_S.data_ptr(), sin_S.data_ptr(),
+                    k_cache_dst, v_cache_dst,
+                    self._attn._fp8_k8.data_ptr(),
+                    self._attn._fp8_ks.data_ptr(),
+                    self._attn._fp8_vf.data_ptr(),
+                    n_kv, S, qkv_N, kv_row_elems, eps, s,
+                )
+            else:
+                self._qnr_q(
+                    qkv_out[:, :Nq].data_ptr(), int(lw['q_norm_w']),
+                    cos_S.data_ptr(), sin_S.data_ptr(),
+                    self._attn.Q_buf[:, :S].data_ptr(),
+                    n_q, S, qkv_N, n_q * hd, eps, s,
+                )
+                self._knr_q(
+                    qkv_out[:, Nq:Nq + Nk].data_ptr(),
+                    qkv_out[:, Nq + Nk:].data_ptr(), int(lw['k_norm_w']),
+                    cos_S.data_ptr(), sin_S.data_ptr(),
+                    k_cache_dst, v_cache_dst,
+                    n_kv, S, qkv_N, kv_row_elems, eps, s,
+                )
         else:
             # 4) q/k_norm at (S*n_q, hd) and (S*n_kv, hd) flat views.
             q_pre_flat = q_pre.contiguous().view(S * n_q, hd)

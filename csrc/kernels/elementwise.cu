@@ -1522,6 +1522,117 @@ void quant_per_block_int8_bf16_d128(const __nv_bfloat16* x,
             x, out, scale, L, H);
 }
 
+// ── fp8 (e4m3) per-token-block quant, NHD d128 ──
+// Mirror of quant_int8_bf16_nhd_d128_kernel but emits e4m3 (scale = amax/448).
+// Used by the qwen3 fp8-QK prefill attention: BLOCK=32 matches Q kPerWarp
+// (WARP_Q=32), BLOCK=64 matches K kPerWarp (WARP_K=CTA_K=64). Scale layout
+// [B, H, ceil(L/BLOCK)] matches the attention kernel's q_scale/k_scale index.
+template<int BLOCK_TOKENS>
+__global__ void quant_fp8_bf16_nhd_d128_kernel(
+    const __nv_bfloat16* __restrict__ x,
+    __nv_fp8_e4m3* __restrict__ out,
+    float* __restrict__ scale,
+    int L, int H) {
+    constexpr int D = 128;
+    constexpr int PACK = 8;
+    constexpr int THREADS_PER_TOKEN = D / PACK;
+    constexpr float E4M3_MAX = 448.0f;
+    const int block_id = blockIdx.x;
+    const int h = blockIdx.y;
+    const int b = blockIdx.z;
+    const int tid = threadIdx.x;
+    const int token_in_block = tid / THREADS_PER_TOKEN;
+    const int d_pack = tid - token_in_block * THREADS_PER_TOKEN;
+    const int pos = block_id * BLOCK_TOKENS + token_in_block;
+    float vals[PACK];
+    float amax = 1.0e-7f;
+    if (pos < L) {
+        const __nv_bfloat16* src =
+            x + (((long long)b * L + pos) * H + h) * D + d_pack * PACK;
+#pragma unroll
+        for (int i = 0; i < PACK; ++i) {
+            vals[i] = __bfloat162float(src[i]);
+            amax = fmaxf(amax, fabsf(vals[i]));
+        }
+    } else {
+#pragma unroll
+        for (int i = 0; i < PACK; ++i) vals[i] = 0.0f;
+    }
+    __shared__ float smem[1024];
+    smem[tid] = amax;
+    __syncthreads();
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) smem[tid] = fmaxf(smem[tid], smem[tid + stride]);
+        __syncthreads();
+    }
+    const float s = smem[0] * (1.0f / E4M3_MAX);
+    if (tid == 0) {
+        scale[((long long)b * H + h) * gridDim.x + block_id] = s;
+    }
+    if (pos < L) {
+        const float inv_s = E4M3_MAX / smem[0];
+        __nv_fp8_e4m3* dst = out + (((long long)b * L + pos) * H + h) * D + d_pack * PACK;
+        __nv_fp8x4_e4m3 lo(make_float4(vals[0] * inv_s, vals[1] * inv_s,
+                                       vals[2] * inv_s, vals[3] * inv_s));
+        __nv_fp8x4_e4m3 hi(make_float4(vals[4] * inv_s, vals[5] * inv_s,
+                                       vals[6] * inv_s, vals[7] * inv_s));
+        reinterpret_cast<__nv_fp8x4_e4m3*>(dst)[0] = lo;
+        reinterpret_cast<__nv_fp8x4_e4m3*>(dst)[1] = hi;
+    }
+}
+
+// L = real token count (amax guard, no padding pollution); Lpad = padded token
+// count (>= L, multiple of BLOCK) that sets the scale-array stride so it matches
+// the attention kernel's per-head stride ceil(Lq/CTA_Q)*num_warps_q. Pass
+// Lpad == L when the caller already padded the seq to a CTA_Q (128) multiple.
+void quant_per_warp_fp8_bf16_d128(const __nv_bfloat16* x,
+                                  void* out,
+                                  float* scale,
+                                  int B, int L, int Lpad, int H,
+                                  cudaStream_t stream) {
+    if (B <= 0 || L <= 0 || H <= 0) return;
+    constexpr int D = 128;
+    constexpr int PACK = 8;
+    constexpr int BLOCK = 32;
+    if (Lpad < L) Lpad = L;
+    quant_fp8_bf16_nhd_d128_kernel<BLOCK>
+        <<<dim3((Lpad + BLOCK - 1) / BLOCK, H, B), BLOCK * (D / PACK), 0, stream>>>(
+            x, reinterpret_cast<__nv_fp8_e4m3*>(out), scale, L, H);
+}
+
+void quant_per_block64_fp8_bf16_d128(const __nv_bfloat16* x,
+                                     void* out,
+                                     float* scale,
+                                     int B, int L, int Lpad, int H,
+                                     cudaStream_t stream) {
+    if (B <= 0 || L <= 0 || H <= 0) return;
+    constexpr int D = 128;
+    constexpr int PACK = 8;
+    constexpr int BLOCK = 64;
+    if (Lpad < L) Lpad = L;
+    quant_fp8_bf16_nhd_d128_kernel<BLOCK>
+        <<<dim3((Lpad + BLOCK - 1) / BLOCK, H, B), BLOCK * (D / PACK), 0, stream>>>(
+            x, reinterpret_cast<__nv_fp8_e4m3*>(out), scale, L, H);
+}
+
+// Per-token (BLOCK=1) fp8 quant: each token gets its own e4m3 scale (over its
+// 128 channels). No cross-token pollution -> no padding/Lpad concern. scale
+// layout [B, H, L] (one scalar per token,head) = the per-token attention's
+// q_scale[B,Hq,Lq] / k_scale[B,Hkv,Lk]. This is the FOLD-friendly granularity.
+void quant_per_token_fp8_bf16_d128(const __nv_bfloat16* x,
+                                   void* out,
+                                   float* scale,
+                                   int B, int L, int H,
+                                   cudaStream_t stream) {
+    if (B <= 0 || L <= 0 || H <= 0) return;
+    constexpr int D = 128;
+    constexpr int PACK = 8;
+    constexpr int BLOCK = 1;
+    quant_fp8_bf16_nhd_d128_kernel<BLOCK>
+        <<<dim3(L, H, B), BLOCK * (D / PACK), 0, stream>>>(
+            x, reinterpret_cast<__nv_fp8_e4m3*>(out), scale, L, H);
+}
+
 // ── Bias + Gate × Residual (G6.7) ──
 // Fused: residual[s, d] = residual[s, d] + (x[s, d] + bias[d]) * gate[s, d]
 // Replaces the chain  add_bias_bf16(x, bias, S, D)  +  gate_mul_residual(

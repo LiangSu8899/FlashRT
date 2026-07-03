@@ -183,6 +183,8 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #include "attention/fmha_dispatch.h"
 #ifdef ENABLE_MOTUS_SAGE2_RAW
 #include "attention/sage2/sage2_attn_raw.cuh"
+#include "attention/sage2/sage2_attn_f8_raw.cuh"
+#include "attention/fmha_fp8_causal_gqa_sm120.cuh"
 #endif
 
 namespace py = pybind11;
@@ -3835,6 +3837,40 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("v_scale"), py::arg("B"), py::arg("Lq"),
         py::arg("Lk"), py::arg("Hq"), py::arg("Hkv"),
         py::arg("softmax_scale"), py::arg("stream") = 0);
+
+    // Additive fp8-QK / fp16-PV causal GQA attention (qwen3 prefill).
+    m.def("sage2_qk_f8_sv_f16_bf16_gqa_nhd_d128_causal",
+        [](uintptr_t q_fp8, uintptr_t k_fp8, uintptr_t v_fp16,
+           uintptr_t out_bf16, uintptr_t q_scale, uintptr_t k_scale,
+           int B, int Lq, int Lk, int Hq, int Hkv,
+           float softmax_scale, bool per_token, uintptr_t stream) {
+            return flash_rt::attention::sage2::qk_f8_sv_f16_bf16_gqa_nhd_d128_causal(
+                to_ptr(q_fp8), to_ptr(k_fp8), to_ptr(v_fp16),
+                to_ptr(out_bf16), to_ptr(q_scale), to_ptr(k_scale),
+                B, Lq, Lk, Hq, Hkv, softmax_scale, per_token, to_stream(stream));
+        },
+        py::arg("q_fp8"), py::arg("k_fp8"), py::arg("v_fp16"),
+        py::arg("out_bf16"), py::arg("q_scale"), py::arg("k_scale"),
+        py::arg("B"), py::arg("Lq"), py::arg("Lk"),
+        py::arg("Hq"), py::arg("Hkv"),
+        py::arg("softmax_scale"), py::arg("per_token") = false,
+        py::arg("stream") = 0);
+
+    // All-fp8 causal GQA attention (raw e4m3 Q/K/V, bf16 out). Returns
+    // non-zero when the shape is unsupported (caller falls back to FA2).
+    m.def("fmha_fp8_causal_gqa_nhd_d128",
+        [](uintptr_t q_fp8, uintptr_t k_fp8, uintptr_t v_fp8,
+           uintptr_t out_bf16, int Lq, int Lk, int Hq, int Hkv,
+           float softmax_scale, uintptr_t stream) {
+            return flash_rt::attention::fmha_fp8_causal_gqa_nhd_d128(
+                to_ptr(q_fp8), to_ptr(k_fp8), to_ptr(v_fp8),
+                to_ptr(out_bf16), Lq, Lk, Hq, Hkv,
+                softmax_scale, to_stream(stream));
+        },
+        py::arg("q_fp8"), py::arg("k_fp8"), py::arg("v_fp8"),
+        py::arg("out_bf16"), py::arg("Lq"), py::arg("Lk"),
+        py::arg("Hq"), py::arg("Hkv"),
+        py::arg("softmax_scale"), py::arg("stream") = 0);
 #endif
 
     m.def("quant_per_block_int8_bf16_d128",
@@ -3842,6 +3878,38 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
            int B, int L, int H, uintptr_t stream) {
             quant_per_block_int8_bf16_d128(
                 typed_ptr<__nv_bfloat16>(x), reinterpret_cast<int8_t*>(out),
+                reinterpret_cast<float*>(scale), B, L, H, to_stream(stream));
+        },
+        py::arg("x"), py::arg("out"), py::arg("scale"),
+        py::arg("B"), py::arg("L"), py::arg("H"), py::arg("stream") = 0);
+
+    m.def("quant_per_warp_fp8_bf16_d128",
+        [](uintptr_t x, uintptr_t out, uintptr_t scale,
+           int B, int L, int Lpad, int H, uintptr_t stream) {
+            quant_per_warp_fp8_bf16_d128(
+                typed_ptr<__nv_bfloat16>(x), reinterpret_cast<void*>(out),
+                reinterpret_cast<float*>(scale), B, L, Lpad, H, to_stream(stream));
+        },
+        py::arg("x"), py::arg("out"), py::arg("scale"),
+        py::arg("B"), py::arg("L"), py::arg("Lpad"), py::arg("H"),
+        py::arg("stream") = 0);
+
+    m.def("quant_per_block64_fp8_bf16_d128",
+        [](uintptr_t x, uintptr_t out, uintptr_t scale,
+           int B, int L, int Lpad, int H, uintptr_t stream) {
+            quant_per_block64_fp8_bf16_d128(
+                typed_ptr<__nv_bfloat16>(x), reinterpret_cast<void*>(out),
+                reinterpret_cast<float*>(scale), B, L, Lpad, H, to_stream(stream));
+        },
+        py::arg("x"), py::arg("out"), py::arg("scale"),
+        py::arg("B"), py::arg("L"), py::arg("Lpad"), py::arg("H"),
+        py::arg("stream") = 0);
+
+    m.def("quant_per_token_fp8_bf16_d128",
+        [](uintptr_t x, uintptr_t out, uintptr_t scale,
+           int B, int L, int H, uintptr_t stream) {
+            quant_per_token_fp8_bf16_d128(
+                typed_ptr<__nv_bfloat16>(x), reinterpret_cast<void*>(out),
                 reinterpret_cast<float*>(scale), B, L, H, to_stream(stream));
         },
         py::arg("x"), py::arg("out"), py::arg("scale"),
@@ -6722,6 +6790,88 @@ graph-replay safe) to fill the SMs on long K. M in 1..16; N%8==0; K%64==0;
         py::arg("k_pre"), py::arg("v_pre"), py::arg("k_norm_w"),
         py::arg("cos"), py::arg("sin"),
         py::arg("k_cache_dst"), py::arg("v_cache_dst"),
+        py::arg("n_kv_heads"), py::arg("S"),
+        py::arg("in_row_stride"), py::arg("cache_row_stride"),
+        py::arg("eps") = 1e-6f, py::arg("stream") = 0);
+
+    m.def("qwen3_q_norm_rope_qstage_prefill_v3_fp8",
+        [](uintptr_t q_pre, uintptr_t q_norm_w, uintptr_t cos, uintptr_t sin,
+           uintptr_t q_buf_dst, uintptr_t q8_dst, uintptr_t q_scale_dst,
+           int n_q_heads, int S, int in_row_stride, int out_row_stride,
+           float eps, uintptr_t stream) -> int {
+            return flash_rt::kernels::qwen3_q_norm_rope_qstage_prefill_v3_fp8(
+                to_ptr(q_pre), to_ptr(q_norm_w), to_ptr(cos), to_ptr(sin),
+                to_ptr(q_buf_dst), to_ptr(q8_dst), to_ptr(q_scale_dst),
+                n_q_heads, S, in_row_stride, out_row_stride, eps,
+                to_stream(stream));
+        },
+        py::arg("q_pre"), py::arg("q_norm_w"), py::arg("cos"), py::arg("sin"),
+        py::arg("q_buf_dst"), py::arg("q8_dst"), py::arg("q_scale_dst"),
+        py::arg("n_q_heads"), py::arg("S"),
+        py::arg("in_row_stride"), py::arg("out_row_stride"),
+        py::arg("eps") = 1e-6f, py::arg("stream") = 0);
+
+    m.def("qwen3_k_norm_rope_kvwrite_prefill_v3_fp8",
+        [](uintptr_t k_pre, uintptr_t v_pre, uintptr_t k_norm_w,
+           uintptr_t cos, uintptr_t sin,
+           uintptr_t k_cache_dst, uintptr_t v_cache_dst,
+           uintptr_t k8_dst, uintptr_t k_scale_dst, uintptr_t v_fp16_dst,
+           int n_kv_heads, int S, int in_row_stride, int cache_row_stride,
+           float eps, uintptr_t stream) -> int {
+            return flash_rt::kernels::qwen3_k_norm_rope_kvwrite_prefill_v3_fp8(
+                to_ptr(k_pre), to_ptr(v_pre), to_ptr(k_norm_w),
+                to_ptr(cos), to_ptr(sin),
+                to_ptr(k_cache_dst), to_ptr(v_cache_dst),
+                to_ptr(k8_dst), to_ptr(k_scale_dst), to_ptr(v_fp16_dst),
+                n_kv_heads, S, in_row_stride, cache_row_stride, eps,
+                to_stream(stream));
+        },
+        py::arg("k_pre"), py::arg("v_pre"), py::arg("k_norm_w"),
+        py::arg("cos"), py::arg("sin"),
+        py::arg("k_cache_dst"), py::arg("v_cache_dst"),
+        py::arg("k8_dst"), py::arg("k_scale_dst"), py::arg("v_fp16_dst"),
+        py::arg("n_kv_heads"), py::arg("S"),
+        py::arg("in_row_stride"), py::arg("cache_row_stride"),
+        py::arg("eps") = 1e-6f, py::arg("stream") = 0);
+
+    // Direct-e4m3 variants (no per-token scale; V emitted as e4m3) feeding
+    // the all-fp8 prefill attention.
+    m.def("qwen3_q_norm_rope_qstage_prefill_v3_fp8_direct",
+        [](uintptr_t q_pre, uintptr_t q_norm_w, uintptr_t cos, uintptr_t sin,
+           uintptr_t q_buf_dst, uintptr_t q8_dst,
+           int n_q_heads, int S, int in_row_stride, int out_row_stride,
+           float eps, uintptr_t stream) -> int {
+            return flash_rt::kernels::qwen3_q_norm_rope_qstage_prefill_v3_fp8_direct(
+                to_ptr(q_pre), to_ptr(q_norm_w), to_ptr(cos), to_ptr(sin),
+                to_ptr(q_buf_dst), to_ptr(q8_dst),
+                n_q_heads, S, in_row_stride, out_row_stride, eps,
+                to_stream(stream));
+        },
+        py::arg("q_pre"), py::arg("q_norm_w"), py::arg("cos"), py::arg("sin"),
+        py::arg("q_buf_dst"), py::arg("q8_dst"),
+        py::arg("n_q_heads"), py::arg("S"),
+        py::arg("in_row_stride"), py::arg("out_row_stride"),
+        py::arg("eps") = 1e-6f, py::arg("stream") = 0);
+
+    m.def("qwen3_k_norm_rope_kvwrite_prefill_v3_fp8_direct",
+        [](uintptr_t k_pre, uintptr_t v_pre, uintptr_t k_norm_w,
+           uintptr_t cos, uintptr_t sin,
+           uintptr_t k_cache_dst, uintptr_t v_cache_dst,
+           uintptr_t k8_dst, uintptr_t v8_dst,
+           int n_kv_heads, int S, int in_row_stride, int cache_row_stride,
+           float eps, uintptr_t stream) -> int {
+            return flash_rt::kernels::qwen3_k_norm_rope_kvwrite_prefill_v3_fp8_direct(
+                to_ptr(k_pre), to_ptr(v_pre), to_ptr(k_norm_w),
+                to_ptr(cos), to_ptr(sin),
+                to_ptr(k_cache_dst), to_ptr(v_cache_dst),
+                to_ptr(k8_dst), to_ptr(v8_dst),
+                n_kv_heads, S, in_row_stride, cache_row_stride, eps,
+                to_stream(stream));
+        },
+        py::arg("k_pre"), py::arg("v_pre"), py::arg("k_norm_w"),
+        py::arg("cos"), py::arg("sin"),
+        py::arg("k_cache_dst"), py::arg("v_cache_dst"),
+        py::arg("k8_dst"), py::arg("v8_dst"),
         py::arg("n_kv_heads"), py::arg("S"),
         py::arg("in_row_stride"), py::arg("cache_row_stride"),
         py::arg("eps") = 1e-6f, py::arg("stream") = 0);
