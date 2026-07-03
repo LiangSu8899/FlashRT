@@ -11736,8 +11736,36 @@ class Qwen36TorchFrontendRtx:
             self._captured_drafter_graphs_dflash, eff_ctx, g)
         return g
 
+    def _dflash_verify_forward_K(self, token_ids_K, cos_K, sin_K,
+                                 cur_pos: int, K: int, tap_buf):
+        """Arch hook: the S=K verify forward used by DFlash spec decode.
+
+        Default is the BF16-staged KV verify. Subclasses whose K-row
+        layer path requires a different KV mode (Thor: FP8-KV) override
+        this with the matching wrapper; the DFlash orchestration and
+        graph capture above it stay shared.
+        """
+        return self.forward_own_decode_K_nvfp4(
+            token_ids_K, cos_K, sin_K, cur_pos, K, tap_buf=tap_buf)
+
+    def _dflash_prefill_nvfp4(self, input_ids):
+        """Arch hook: prompt prefill for DFlash spec decode.
+
+        Default walks the prompt through the per-position S=1 captured
+        graphs, which writes the BF16 KV cache the default verify
+        forward reads. Subclasses whose verify attends over a different
+        KV store (Thor: FP8-KV) override this with a prefill that
+        populates that store. Returns the (1, 1) first greedy token.
+        """
+        prompt_len = int(input_ids.shape[1])
+        for p in range(prompt_len):
+            self._static_token_id.copy_(input_ids[:, p:p + 1])
+            g_pf = self._ensure_graph_for_pos_nvfp4(p)
+            self._replay_pos_graph(g_pf, p)
+        return self._logits_buf.argmax(dim=-1, keepdim=True).view(1, 1)
+
     def _ensure_verify_graph_dflash_nvfp4(self, cur_pos: int, K: int):
-        """Lazy CUDA Graph for forward_own_decode_K_nvfp4 WITH tap_buf.
+        """Lazy CUDA Graph for the DFlash verify forward WITH tap_buf.
 
         Mirror of ``_ensure_verify_graph_nvfp4`` but binds
         ``tap_buf=self._dflash_taps_buf`` at capture time so the 5
@@ -11777,9 +11805,9 @@ class Qwen36TorchFrontendRtx:
             sin_K = self._verify_static_sin[:, :K]
             tap_buf = self._dflash_taps_buf
             for _ in range(2):
-                self.forward_own_decode_K_nvfp4(
-                    tokens_K, cos_K, sin_K, cur_pos, K=K,
-                    tap_buf=tap_buf)
+                self._dflash_verify_forward_K(
+                    tokens_K, cos_K, sin_K, cur_pos, K,
+                    tap_buf)
                 _restore()
 
         gs.synchronize()
@@ -11787,9 +11815,9 @@ class Qwen36TorchFrontendRtx:
         with torch.cuda.graph(
                 g, stream=gs, pool=self._graph_mempool,
         ), torch.no_grad():
-            self.forward_own_decode_K_nvfp4(
-                tokens_K, cos_K, sin_K, cur_pos, K=K,
-                tap_buf=tap_buf)
+            self._dflash_verify_forward_K(
+                tokens_K, cos_K, sin_K, cur_pos, K,
+                tap_buf)
         with torch.cuda.stream(gs), torch.no_grad():
             _restore()
         gs.synchronize()
@@ -11854,15 +11882,9 @@ class Qwen36TorchFrontendRtx:
         self._dflash_taps_buf.zero_()
 
         with torch.no_grad():
-            # 1) Prefill (same as MTP path) — sequential S=1 forwards
-            # via the per-cur_pos captured S=1 graph.
-            gs_pf = self._graph_stream
-            for p in range(prompt_len):
-                self._static_token_id.copy_(input_ids[:, p:p + 1])
-                g_pf = self._ensure_graph_for_pos_nvfp4(p)
-                self._replay_pos_graph(g_pf, p)
-            tok = self._logits_buf.argmax(
-                dim=-1, keepdim=True).view(1, 1)
+            # 1) Prefill via the arch hook (default: sequential S=1
+            # forwards through the per-cur_pos captured graphs).
+            tok = self._dflash_prefill_nvfp4(input_ids)
             generated = [tok]
             cur_pos = prompt_len
 

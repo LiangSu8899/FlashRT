@@ -1092,3 +1092,45 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
         return self._thor_mtp_prefill_K_nvfp4(
             prev_h_rows, token_ids, pos_start, rows,
             cache_base_pos=cache_base_pos)
+
+    # ---------- DFlash integration ----------
+    #
+    # DFlash verifies at S=block_size (16), above
+    # ``_THOR_K_ROW_FAST_PATH_MAX``, so the K-row layers route to
+    # ``_thor_full_K_forward`` / ``_thor_lin_K_forward`` — and the
+    # full-attn K-row is single-XQA-path over the persistent FP8 KV
+    # cache. Three consequences, each handled by one override below:
+    # the drafter load must guarantee the FP8 cache exists, the prompt
+    # prefill must populate it, and the verify forward must run with
+    # the FP8-KV mode flag active.
+
+    def _load_dflash_drafter(self, ckpt_dir: str | None = None) -> None:
+        super()._load_dflash_drafter(ckpt_dir)
+        # Short-ctx constructions (user_max_seq <= LONG_CTX_THRESHOLD)
+        # never allocate the persistent FP8 KV cache; the Thor DFlash
+        # verify cannot run without it.
+        if not hasattr(self, '_fp8_K_cache'):
+            self._load_fp8_kv_cache(max_seq=self._user_max_seq + 16)
+            self._long_kv_cache_mode = 'fp8'
+
+    def _dflash_prefill_nvfp4(self, input_ids):
+        """Thor override: chunked FP8-KV prompt prefill.
+
+        The default per-position walk writes only the BF16 KV cache;
+        the Thor verify attends over the FP8 cache, so the prompt rows
+        must land there. The chunked prefill is also the production
+        Thor TTFT path (batched XQA instead of one forward per token).
+        """
+        _, logits = self._prefill_long_ctx_tq_chunked(input_ids)
+        return logits.argmax(dim=-1, keepdim=True).view(1, 1)
+
+    def _dflash_verify_forward_K(self, token_ids_K, cos_K, sin_K,
+                                 cur_pos: int, K: int, tap_buf):
+        """Thor override: run the DFlash verify in FP8-KV mode.
+
+        Same wrapper as the production long-ctx spec verify, so the
+        K-row layer dispatch sees ``_fp8_kv_verify_active`` for the
+        whole S=K forward.
+        """
+        return self.forward_own_decode_K_nvfp4_fp8kv(
+            token_ids_K, cos_K, sin_K, cur_pos, K, tap_buf=tap_buf)
