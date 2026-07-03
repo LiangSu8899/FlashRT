@@ -249,6 +249,14 @@ void rms_norm_to_nvfp4_swizzled_bf16_v2(
     int rows, int cols, float eps,
     cudaStream_t stream = 0);
 
+// v3: vectorized memory pipeline (uint4 loads / uint2 packed stores) — same
+// math as v2; falls back to v2 for rows the vector path cannot cover.
+void rms_norm_to_nvfp4_swizzled_bf16_v3(
+    const __nv_bfloat16* x, const __nv_bfloat16* rms_weight,
+    uint8_t* packed, uint8_t* sf_swz,
+    int rows, int cols, float eps,
+    cudaStream_t stream = 0);
+
 // Fused: affine LayerNorm(x, weight, bias) -> nvfp4 packed + swizzled SF.
 // Used by Motus cross-attn norm3 -> Q NVFP4 projection so the BF16
 // normalized activation does not round-trip through global memory.

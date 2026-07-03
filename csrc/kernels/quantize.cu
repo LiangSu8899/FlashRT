@@ -1953,6 +1953,135 @@ void rms_norm_to_nvfp4_swizzled_bf16_v2(
         x, rms_weight, packed, sf_swz, cols, num_blocks, n_col_blocks, eps);
 }
 
+// ── v3: vectorized memory pipeline (same math as v2) ──
+// v2's phase-1 loads x one bf16 at a time: a warp transaction moves 64B =
+// half a 128B line, capping the kernel at ~50% of HBM peak (measured 49%
+// at the S=512 prefill norm). v3 loads x and the norm weight as uint4
+// (8 x bf16) per thread and stores each 16-element block's 8 packed FP4
+// bytes as one uint2, keeping every transaction full-width. The ssq
+// accumulation regroups (contiguous 8-chunks per thread instead of
+// column-strided singles), so the fp32 sum can differ from v2 in the
+// last ulp — same trade the v3 norm+RoPE kernels made.
+__global__ void rms_norm_to_nvfp4_swizzled_bf16_v3_kernel(
+    const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ rms_weight,
+    uint8_t* __restrict__ packed,
+    uint8_t* __restrict__ sf_swz,
+    int cols, int num_blocks, int n_col_blocks,
+    float eps)
+{
+    const int row = blockIdx.x;
+    const __nv_bfloat16* row_in = x + (size_t)row * cols;
+    uint8_t* row_fp4 = packed + (size_t)row * cols / 2;
+
+    extern __shared__ float smem_dyn[];
+    float* warp_red = smem_dyn;
+    __nv_bfloat16* normed = reinterpret_cast<__nv_bfloat16*>(warp_red + 32);
+
+    // ── Phase 1: uint4 (8 x bf16) row loads, sum of squares ──
+    constexpr int VEC = 8;
+    constexpr int MAXCHUNK = 2;                 // covers cols <= 2*8*blockDim
+    const int n_chunks = cols / VEC;
+    uint4 xr[MAXCHUNK];
+    #pragma unroll
+    for (int k = 0; k < MAXCHUNK; ++k) {
+        int c = threadIdx.x + k * blockDim.x;
+        if (c < n_chunks)
+            xr[k] = reinterpret_cast<const uint4*>(row_in)[c];
+    }
+    float local_ssq = 0.f;
+    #pragma unroll
+    for (int k = 0; k < MAXCHUNK; ++k) {
+        int c = threadIdx.x + k * blockDim.x;
+        if (c < n_chunks) {
+            const __nv_bfloat16* v = reinterpret_cast<const __nv_bfloat16*>(&xr[k]);
+            #pragma unroll
+            for (int j = 0; j < VEC; ++j) {
+                float f = __bfloat162float(v[j]);
+                local_ssq += f * f;
+            }
+        }
+    }
+    float ssq = block_reduce_sum(local_ssq, warp_red);
+    const float rms = rsqrtf(ssq / cols + eps);
+
+    // ── Phase 2: normalize from the cached regs (weight also uint4), stage
+    // the normed row to smem with full uint4 stores ──
+    #pragma unroll
+    for (int k = 0; k < MAXCHUNK; ++k) {
+        int c = threadIdx.x + k * blockDim.x;
+        if (c < n_chunks) {
+            uint4 wr = reinterpret_cast<const uint4*>(rms_weight)[c];
+            const __nv_bfloat16* v = reinterpret_cast<const __nv_bfloat16*>(&xr[k]);
+            const __nv_bfloat16* w = reinterpret_cast<const __nv_bfloat16*>(&wr);
+            uint4 nr;
+            __nv_bfloat16* n = reinterpret_cast<__nv_bfloat16*>(&nr);
+            #pragma unroll
+            for (int j = 0; j < VEC; ++j)
+                n[j] = __float2bfloat16(
+                    __bfloat162float(v[j]) * rms * __bfloat162float(w[j]));
+            reinterpret_cast<uint4*>(normed)[c] = nr;
+        }
+    }
+    __syncthreads();
+
+    // ── Phase 3: fused amax → SF → pack (same as v2), 8-byte packed store ──
+    const int rb = row / 128;
+    const int ri = row % 128;
+    for (int b = threadIdx.x; b < num_blocks; b += blockDim.x) {
+        const int base = b << 4;
+        float vals[16];
+        float amax = 0.f;
+        #pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            vals[j] = __bfloat162float(normed[base + j]);
+            amax = fmaxf(amax, fabsf(vals[j]));
+        }
+        float scale = amax / 6.0f;
+        uint8_t ue_scale = float_to_ue4m3_ceil(scale);
+
+        int cb = b / 4;
+        int ci = b % 4;
+        int out_idx = (rb * n_col_blocks + cb) * 512
+                      + (ri % 32) * 16 + (ri / 32) * 4 + ci;
+        sf_swz[out_idx] = ue_scale;
+
+        float fscale = ue4m3_to_float(ue_scale);
+        float inv_scale = (fscale > 0.f) ? (1.f / fscale) : 0.f;
+        uint8_t pk[8];
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            uint8_t lo = float_to_fp4_e2m1_branchless(vals[2 * j]     * inv_scale);
+            uint8_t hi = float_to_fp4_e2m1_branchless(vals[2 * j + 1] * inv_scale);
+            pk[j] = (hi << 4) | (lo & 0x0F);
+        }
+        *reinterpret_cast<uint2*>(row_fp4 + base / 2) =
+            *reinterpret_cast<const uint2*>(pk);
+    }
+}
+
+void rms_norm_to_nvfp4_swizzled_bf16_v3(
+    const __nv_bfloat16* x, const __nv_bfloat16* rms_weight,
+    uint8_t* packed, uint8_t* sf_swz,
+    int rows, int cols, float eps,
+    cudaStream_t stream)
+{
+    int num_blocks = (cols + 15) / 16;
+    int n_col_blocks = (num_blocks + 3) / 4;
+    int threads = 256;
+    // The vector path needs 16-element-aligned rows and its register budget
+    // covers cols <= 8*2*threads. Fall back to v2 (which falls back to v1)
+    // outside that envelope.
+    if (cols % 16 != 0 || cols > 8 * 2 * threads) {
+        rms_norm_to_nvfp4_swizzled_bf16_v2(x, rms_weight, packed, sf_swz,
+                                           rows, cols, eps, stream);
+        return;
+    }
+    size_t smem_size = 32 * sizeof(float) + cols * sizeof(__nv_bfloat16);
+    rms_norm_to_nvfp4_swizzled_bf16_v3_kernel<<<rows, threads, smem_size, stream>>>(
+        x, rms_weight, packed, sf_swz, cols, num_blocks, n_col_blocks, eps);
+}
+
 // ================================================================
 // FUSED: affine layer_norm(x, weight, bias) + nvfp4 swizzled-SF quant.
 // Matches the unfused Motus cross path:

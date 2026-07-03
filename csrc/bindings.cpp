@@ -1236,6 +1236,22 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("rows"), py::arg("cols"),
         py::arg("eps") = 1e-6f, py::arg("stream") = 0);
 
+    m.def("rms_norm_to_nvfp4_swizzled_bf16_v3",
+        [](uintptr_t x, uintptr_t weight,
+           uintptr_t packed, uintptr_t sf_swz,
+           int rows, int cols, float eps, uintptr_t stream) {
+            rms_norm_to_nvfp4_swizzled_bf16_v3(
+                typed_ptr<__nv_bfloat16>(x),
+                typed_ptr<__nv_bfloat16>(weight),
+                reinterpret_cast<uint8_t*>(packed),
+                reinterpret_cast<uint8_t*>(sf_swz),
+                rows, cols, eps, to_stream(stream));
+        },
+        py::arg("x"), py::arg("weight"),
+        py::arg("packed"), py::arg("sf_swz"),
+        py::arg("rows"), py::arg("cols"),
+        py::arg("eps") = 1e-6f, py::arg("stream") = 0);
+
     // Fused: affine LayerNorm(x, weight, bias) -> nvfp4 packed +
     // swizzled SF. Used by Motus cross-attn norm3 -> Q NVFP4 path.
     m.def("layer_norm_to_nvfp4_swizzled_bf16",

@@ -373,8 +373,9 @@ class Qwen3TorchFrontendRtx:
             self._fvk, 'residual_add_rms_norm_to_nvfp4_swizzled_bf16_v2',
             self._fvk.residual_add_rms_norm_to_nvfp4_swizzled_bf16)
         self._rmsnorm_q = getattr(
-            self._fvk, 'rms_norm_to_nvfp4_swizzled_bf16_v2',
-            self._fvk.rms_norm_to_nvfp4_swizzled_bf16)
+            self._fvk, 'rms_norm_to_nvfp4_swizzled_bf16_v3',
+            getattr(self._fvk, 'rms_norm_to_nvfp4_swizzled_bf16_v2',
+                    self._fvk.rms_norm_to_nvfp4_swizzled_bf16))
         self._quant_q = getattr(
             self._fvk, 'quantize_bf16_to_nvfp4_swizzled_v2',
             self._fvk.quantize_bf16_to_nvfp4_swizzled)
