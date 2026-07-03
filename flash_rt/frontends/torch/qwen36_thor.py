@@ -206,7 +206,13 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
     # per-position sub-loop. Bit-exact to running K sequential single-
     # token forwards (see DESIGN §4.5 for the leaf-kernel set).
     def _layer_forward_lin_K_nvfp4(self, L, h_in_K, K):
-        if K <= self._THOR_K_ROW_FAST_PATH_MAX:
+        # Delegate the whole save-steps range to parent, not just the
+        # fast-path max: parent's per-step recurrent branch is active
+        # for K <= _K_save_max, stays per-token-equivalent on SM110,
+        # and writes the per-step state checkpoints the DFlash
+        # partial-accept rollback reads (_K_save_max is grown to the
+        # DFlash verify q_seq at drafter load).
+        if K <= max(self._THOR_K_ROW_FAST_PATH_MAX, self._K_save_max):
             return super()._layer_forward_lin_K_nvfp4(L, h_in_K, K)
         if K > self.MAX_Q_SEQ:
             return self._thor_lin_K_dispatch(L, h_in_K, K)
@@ -214,7 +220,14 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
 
     def _layer_forward_full_K_nvfp4(
             self, L, h_in_K, cos_K, sin_K, cur_pos, K):
-        if K <= self._THOR_K_ROW_FAST_PATH_MAX:
+        # Delegate the whole save-steps range to parent, mirroring the
+        # lin dispatch above. The DFlash spec loop commits per-row
+        # state/KV from its S=16 verify (slot-copy rollback); rows must
+        # therefore come from the SAME kernel family as the K<=7 spec
+        # verifies, or the two paths' occasional rounding disagreements
+        # surface as greedy divergence (measured: bit-identical for ~39
+        # cycles, then a single full-attn row event cascades).
+        if K <= max(self._THOR_K_ROW_FAST_PATH_MAX, self._K_save_max):
             return super()._layer_forward_full_K_nvfp4(
                 L, h_in_K, cos_K, sin_K, cur_pos, K)
         if K > self.MAX_Q_SEQ:
@@ -1105,6 +1118,8 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
     # the FP8-KV mode flag active.
 
     def _load_dflash_drafter(self, ckpt_dir: str | None = None) -> None:
+        import torch
+
         super()._load_dflash_drafter(ckpt_dir)
         # Short-ctx constructions (user_max_seq <= LONG_CTX_THRESHOLD)
         # never allocate the persistent FP8 KV cache; the Thor DFlash
@@ -1112,6 +1127,35 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
         if not hasattr(self, '_fp8_K_cache'):
             self._load_fp8_kv_cache(max_seq=self._user_max_seq + 16)
             self._long_kv_cache_mode = 'fp8'
+        # Grow the per-step state checkpoints to the DFlash verify
+        # q_seq (block_size = _MAX_PUBLIC_SPEC_K + 1). The lin K-row
+        # save-steps branch then covers the whole verify, and the
+        # partial-accept rollback becomes two constant-time copies
+        # instead of a second main-model forward.
+        needed = self._MAX_PUBLIC_SPEC_K + 1
+        if self._K_save_max < needed:
+            self._K_save_max = needed
+            self._K_lin_state_per_step = torch.empty(
+                needed, *self._lin_state.shape,
+                device=self._lin_state.device,
+                dtype=self._lin_state.dtype)
+            self._K_lin_conv_state_per_step = torch.empty(
+                needed, *self._lin_conv_state.shape,
+                device=self._lin_conv_state.device,
+                dtype=self._lin_conv_state.dtype)
+            # Any K-row graph captured before the grow baked the old
+            # checkpoint buffers — drop those graphs so they re-capture
+            # against the new allocations.
+            for cache_name in (
+                    '_captured_verify_graphs_fp8kv',
+                    '_captured_prefill_graphs_fp8kv',
+                    '_captured_verify_graphs_tq',
+                    '_captured_prefill_graphs_tq',
+                    '_captured_verify_graphs_dflash',
+            ):
+                cache = getattr(self, cache_name, None)
+                if cache:
+                    cache.clear()
 
     def _dflash_prefill_nvfp4(self, input_ids):
         """Thor override: chunked FP8-KV prompt prefill.
@@ -1134,3 +1178,40 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
         """
         return self.forward_own_decode_K_nvfp4_fp8kv(
             token_ids_K, cos_K, sin_K, cur_pos, K, tap_buf=tap_buf)
+
+    def _dflash_snap_state(self, cur_pos: int, Kv: int) -> None:
+        """Thor override: nothing to snapshot.
+
+        The rollback reads the per-step checkpoints written during the
+        verify K-row itself. The Thor verify never writes the BF16 KV
+        cache, and FP8 rows past the accept point are overwritten by
+        the next verify before any read.
+        """
+        return
+
+    def _dflash_partial_rollback(self, cur_pos: int, N: int, Kv: int,
+                                 tok, drafts, cos_KN, sin_KN) -> None:
+        """Thor override: constant-time state rollback.
+
+        The verify at S=Kv ran the lin K-row save-steps branch
+        (``Kv <= _K_save_max`` after drafter load), so the state after
+        every verify row is checkpointed; committing N drafts is a copy
+        from slot N. Same pattern as the long-ctx MTP spec loop. Taps
+        for rows <= N are already in ``_dflash_taps_buf`` from the main
+        verify.
+        """
+        import torch
+
+        from flash_rt import flash_rt_kernels as fvk
+
+        s = torch.cuda.current_stream().cuda_stream
+        fvk.gpu_copy(
+            self._lin_state.data_ptr(),
+            self._K_lin_state_per_step[N].data_ptr(),
+            self._lin_state.numel() * 2, s,
+        )
+        fvk.gpu_copy(
+            self._lin_conv_state.data_ptr(),
+            self._K_lin_conv_state_per_step[N].data_ptr(),
+            self._lin_conv_state.numel() * 2, s,
+        )

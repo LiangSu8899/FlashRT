@@ -11764,6 +11764,59 @@ class Qwen36TorchFrontendRtx:
             self._replay_pos_graph(g_pf, p)
         return self._logits_buf.argmax(dim=-1, keepdim=True).view(1, 1)
 
+    def _dflash_snap_state(self, cur_pos: int, Kv: int) -> None:
+        """Arch hook: snapshot state the partial-accept rollback needs.
+
+        Runs on the snap stream, overlapped with the drafter forward.
+        Subclasses whose rollback reads per-step state checkpoints
+        written during the verify itself (Thor) override this with a
+        no-op.
+        """
+        self._snap_lin_buf.copy_(self._lin_state)
+        self._snap_conv_buf.copy_(self._lin_conv_state)
+        self._snap_K_buf[:, :Kv].copy_(
+            self._attn.K_cache[:, cur_pos:cur_pos + Kv])
+        self._snap_V_buf[:, :Kv].copy_(
+            self._attn.V_cache[:, cur_pos:cur_pos + Kv])
+
+    def _dflash_partial_rollback(self, cur_pos: int, N: int, Kv: int,
+                                 tok, drafts, cos_KN, sin_KN) -> None:
+        """Arch hook: fix up state after a partial accept of N drafts.
+
+        On exit the recurrent/conv state and KV must reflect exactly
+        the N+1 committed rows [tok, drafts[:N]] at
+        [cur_pos, cur_pos+N+1), and ``_dflash_taps_buf[:, N]`` must
+        hold the taps of the last committed row.
+
+        Default: restore the pre-verify snapshot, then re-advance with
+        the committed rows via a tapped verify at K=N+1 (a second
+        main-model forward). Subclasses with per-step state saves in
+        the verify K-row (Thor) override this with constant-time state
+        copies instead.
+        """
+        import torch
+
+        self._lin_state.copy_(self._snap_lin_buf)
+        self._lin_conv_state.copy_(self._snap_conv_buf)
+        self._attn.K_cache[:, cur_pos:cur_pos + Kv].copy_(
+            self._snap_K_buf[:, :Kv])
+        self._attn.V_cache[:, cur_pos:cur_pos + Kv].copy_(
+            self._snap_V_buf[:, :Kv])
+
+        Kr = N + 1
+        self._verify_static_tokens[:, 0:1].copy_(tok)
+        if N > 0:
+            self._verify_static_tokens[:, 1:Kr].copy_(
+                drafts[:N].view(1, N))
+        self._verify_static_cos[:, :Kr].copy_(cos_KN[:, :Kr])
+        self._verify_static_sin[:, :Kr].copy_(sin_KN[:, :Kr])
+        rg = self._ensure_verify_graph_dflash_nvfp4(cur_pos, Kr)
+        gs = self._graph_stream
+        gs.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(gs):
+            rg.replay()
+        torch.cuda.current_stream().wait_stream(gs)
+
     def _ensure_verify_graph_dflash_nvfp4(self, cur_pos: int, K: int):
         """Lazy CUDA Graph for the DFlash verify forward WITH tap_buf.
 
@@ -11901,14 +11954,7 @@ class Qwen36TorchFrontendRtx:
                 snap_stream = self._snap_stream
                 snap_stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(snap_stream):
-                    self._snap_lin_buf.copy_(self._lin_state)
-                    self._snap_conv_buf.copy_(self._lin_conv_state)
-                    self._snap_K_buf[:, :Kv].copy_(
-                        self._attn.K_cache[
-                            :, cur_pos:cur_pos + Kv])
-                    self._snap_V_buf[:, :Kv].copy_(
-                        self._attn.V_cache[
-                            :, cur_pos:cur_pos + Kv])
+                    self._dflash_snap_state(cur_pos, Kv)
 
                 # 2b) Drafter forward (P7).
                 # Caller writes static inputs (prev_token + hidden_taps).
@@ -11988,38 +12034,12 @@ class Qwen36TorchFrontendRtx:
                     for j in range(N + 1):
                         if len(generated) < max_new_tokens:
                             generated.append(argmax_at(j))
-                    # Restore pre-verify state.
-                    self._lin_state.copy_(self._snap_lin_buf)
-                    self._lin_conv_state.copy_(self._snap_conv_buf)
-                    self._attn.K_cache[
-                        :, cur_pos:cur_pos + Kv].copy_(
-                            self._snap_K_buf[:, :Kv])
-                    self._attn.V_cache[
-                        :, cur_pos:cur_pos + Kv].copy_(
-                            self._snap_V_buf[:, :Kv])
-
-                    # Re-advance with N+1 valid inputs via tapped verify
-                    # at K=N+1 (always — including N=0; same code path
-                    # as N>0). Re-uses the dflash verify graph cache.
-                    Kr = N + 1
-                    rec_cos = cos_KN[:, :Kr]
-                    rec_sin = sin_KN[:, :Kr]
-                    self._verify_static_tokens[:, 0:1].copy_(tok)
-                    if N > 0:
-                        self._verify_static_tokens[:, 1:Kr].copy_(
-                            drafts[:N].view(1, N))
-                    self._verify_static_cos[:, :Kr].copy_(rec_cos)
-                    self._verify_static_sin[:, :Kr].copy_(rec_sin)
-                    rg = self._ensure_verify_graph_dflash_nvfp4(
-                        cur_pos, Kr)
-                    gs.wait_stream(torch.cuda.current_stream())
-                    with torch.cuda.stream(gs):
-                        rg.replay()
-                    torch.cuda.current_stream().wait_stream(gs)
+                    self._dflash_partial_rollback(
+                        cur_pos, N, Kv, tok, drafts, cos_KN, sin_KN)
                     tok = argmax_at(N)
                     self._dflash_taps_buf[:, 0].copy_(
                         self._dflash_taps_buf[:, N])
-                    cur_pos += Kr
+                    cur_pos += N + 1
 
             if len(generated) > max_new_tokens:
                 generated = generated[:max_new_tokens]
