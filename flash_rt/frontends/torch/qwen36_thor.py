@@ -977,8 +977,11 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
     # NOT enable TurboQuant; FP8-KV is selected by
     # ``FLASHRT_QWEN36_LONG_KV_CACHE=fp8``. The env is honoured here
     # for explicit user overrides (bisection, ablation).
-    def _long_tq_effective_k(self, prompt_len: int, K: int) -> int:
-        target_k = super()._long_tq_effective_k(prompt_len, K)
+    def _long_tq_effective_k(
+            self, prompt_len: int, K: int,
+            max_new_tokens: int | None = None) -> int:
+        target_k = super()._long_tq_effective_k(
+            prompt_len, K, max_new_tokens)
         if os.environ.get('FLASHRT_QWEN36_TQ_SPEC_K', ''):
             return target_k
         if target_k > 6 and int(prompt_len) >= 12288:
