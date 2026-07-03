@@ -49,6 +49,35 @@ Rule of altitude: `modalities/` knows pixels and tensors, never models;
 binds names and constants, never re-implements a transform. Nothing under
 `cpp/` is ABI — the struct in `runtime/` is the deployment surface.
 
+## Model and hardware binding
+
+The model boundary and the hardware boundary are intentionally different.
+
+The **model** is selected by the native overlay/factory that the host loads:
+`cpp/models/pi05/` exports `frt_pi05_model_runtime_create_over`, a future
+GROOT runtime would export its own model factory, and so on. That code owns the
+model's hot-path transforms: image normalization, state packing, action
+postprocess, and the names/shapes of public ports it supports.
+
+The **hardware** is selected before the C++ runtime sees the model: the Python
+or native setup producer chooses the hardware pipeline, captures the graphs,
+allocates live buffers, calibrates precision-specific paths, and writes the
+canonical identity/fingerprint. The C++ overlay then inherits those graph,
+stream, stage, and buffer declarations with `frt_model_runtime_override_verbs`.
+
+So the expected setup shape is:
+
+1. The hardware-specific pipeline builds a ready model instance.
+2. `flash_rt/models/<model>/runtime_export.py` exports that instance as the
+   model family's standard `frt_model_runtime_v1` face.
+3. `cpp/models/<model>/` overlays native hot verbs on that exact declaration.
+4. Nexus or a robot loop consumes only the resulting model-runtime handle.
+
+If two hardware pipelines expose the same logical ports and stage DAG, they can
+share one native C++ overlay. If their visible contract differs, the difference
+must be represented in the producer identity and handled with a distinct plan,
+model key, or overlay; it should not leak into Nexus as ad hoc hardware logic.
+
 ## The production tick
 
 Ports declare the update class; the class decides the lane:
