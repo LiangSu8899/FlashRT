@@ -5979,6 +5979,20 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("alpha") = 1.0f,
         py::arg("stream") = 0);
 
+    m.def("fp4_w4a16_gemm_residual_sm120_bf16out",
+        [](uintptr_t A_packed, uintptr_t B_packed, uintptr_t C_residual,
+           uintptr_t D, int M, int N, int K,
+           uintptr_t SFA, uintptr_t SFB, float alpha, uintptr_t stream) {
+            flash_rt::gemm::fp4_w4a16_gemm_residual_sm120_bf16out(
+                to_ptr(A_packed), to_ptr(B_packed), to_ptr(C_residual),
+                to_ptr(D), M, N, K, to_ptr(SFA), to_ptr(SFB),
+                alpha, to_stream(stream));
+        },
+        py::arg("A_packed"), py::arg("B_packed"), py::arg("C_residual"),
+        py::arg("D"), py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("SFA"), py::arg("SFB"),
+        py::arg("alpha") = 1.0f, py::arg("stream") = 0);
+
     // Wide-N variant of fp4_w4a16_gemm_sm120_bf16out. TileShape
     // <128, 256, 128> instead of <128, 128, 256>. Profiled faster
     // for shapes with very large N (lm_head N=248320: 88% peak BW

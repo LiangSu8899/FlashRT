@@ -362,6 +362,19 @@ class Qwen3TorchFrontendRtx:
         # CUTLASS W4A16 kernel beats the pingpong variant for the
         # short buckets and is tied at the largest bucket.
         self._prefill_gemm = self._fvk.fp4_w4a16_gemm_sm120_bf16out
+        # Residual-fused NVFP4 GEMM (D = alpha*A*B + C): folds the o_proj/down
+        # residual add into the epilogue so the following rms_norm reads ONE
+        # tensor. None unless the variant is built (additive; falls back to the
+        # separate residual_add path).
+        self._prefill_gemm_residual = getattr(
+            self._fvk, 'fp4_w4a16_gemm_residual_sm120_bf16out', None)
+        # The fused residual is added in FP32 inside the GEMM epilogue (vs bf16
+        # in the separate norm kernel) — slightly MORE accurate but a small
+        # behavioural change (S=512 argmax unchanged, logits cos ~0.992 vs the
+        # unfused path). Default ON; FLASH_RT_QWEN3_NO_RESID_FUSE=1 disables.
+        import os as _os
+        if _os.environ.get('FLASH_RT_QWEN3_NO_RESID_FUSE', '0') == '1':
+            self._prefill_gemm_residual = None
         self._prefill_silu_merged = getattr(
             self._fvk, 'silu_mul_merged_to_nvfp4_swizzled_grouped32_bf16',
             self._fvk.silu_mul_merged_to_nvfp4_swizzled_bf16,
@@ -1234,25 +1247,40 @@ class Qwen3TorchFrontendRtx:
             attn_2d.data_ptr(), ap_h2.data_ptr(), sf_h2.data_ptr(),
             S, n_q * hd, s,
         )
-        out_op_buf = self._nvfp4_scratch[(hidden, hidden)][2]
-        prefill_gemm(
-            ap_h2.data_ptr(), int(lw['o_proj_packed']),
-            out_op_buf.data_ptr(),
-            S, hidden, n_q * hd,
-            sf_h2.data_ptr(), int(lw['o_proj_sf']),
-            float(lw['o_proj_alpha']),
-            s,
-        )
-
-        # 10) Residual 1.
-        attn_proj = out_op_buf[:S].view(1, S, hidden)
+        # 9b+10) o_proj GEMM + Residual 1. When the residual-fused GEMM variant
+        # is built, fold the residual add (C = h_in_S) into the o_proj epilogue
+        # (D = o_proj + residual = h_post) so the post-attn norm is a plain
+        # rms_norm+quant reading ONE tensor (h_post) instead of two.
         h_post = self._res_mid[:, :S]
         ap_mlp, sf_mlp, _ = self._nvfp4_scratch[(inter, hidden)]
-        self._resnorm_q(
-            h_in_S.data_ptr(), attn_proj.data_ptr(), h_post.data_ptr(),
-            int(lw['post_attn_norm_w']),
-            ap_mlp.data_ptr(), sf_mlp.data_ptr(), S, hidden, eps, s,
-        )
+        if self._prefill_gemm_residual is not None:
+            self._prefill_gemm_residual(
+                ap_h2.data_ptr(), int(lw['o_proj_packed']),
+                h_in_S.data_ptr(), h_post.data_ptr(),
+                S, hidden, n_q * hd,
+                sf_h2.data_ptr(), int(lw['o_proj_sf']),
+                float(lw['o_proj_alpha']), s,
+            )
+            self._rmsnorm_q(
+                h_post.data_ptr(), int(lw['post_attn_norm_w']),
+                ap_mlp.data_ptr(), sf_mlp.data_ptr(), S, hidden, eps, s,
+            )
+        else:
+            out_op_buf = self._nvfp4_scratch[(hidden, hidden)][2]
+            prefill_gemm(
+                ap_h2.data_ptr(), int(lw['o_proj_packed']),
+                out_op_buf.data_ptr(),
+                S, hidden, n_q * hd,
+                sf_h2.data_ptr(), int(lw['o_proj_sf']),
+                float(lw['o_proj_alpha']),
+                s,
+            )
+            attn_proj = out_op_buf[:S].view(1, S, hidden)
+            self._resnorm_q(
+                h_in_S.data_ptr(), attn_proj.data_ptr(), h_post.data_ptr(),
+                int(lw['post_attn_norm_w']),
+                ap_mlp.data_ptr(), sf_mlp.data_ptr(), S, hidden, eps, s,
+            )
 
         # 11) MLP gate/up at M=S. Use the packed fused weight when the
         # checkpoint has homogeneous gate/up alpha, then consume the
@@ -1325,7 +1353,27 @@ class Qwen3TorchFrontendRtx:
                 S, inter, s,
             )
 
-        # 12) MLP down at M=S, K=intermediate, N=hidden.
+        # 12) MLP down + 15) Residual 2. For a NON-final layer with the residual-
+        # fused GEMM, fold residual_2 (C = h_post) into the down epilogue
+        # (D = down + h_post = h_out) so the next input-norm reads one tensor.
+        # The final layer keeps the separate residual + final-norm path.
+        if next_input_norm_w and self._prefill_gemm_residual is not None:
+            h_out = self._layer_out_a if (L % 2 == 0) else self._layer_out_b
+            h_out_v = h_out[:, :S]
+            next_ap, next_sf, _ = self._nvfp4_scratch[(n_q * hd, hidden)]
+            self._prefill_gemm_residual(
+                ap_dn.data_ptr(), int(lw['mlp_down_packed']),
+                h_post.data_ptr(), h_out_v.data_ptr(),
+                S, hidden, inter,
+                sf_dn.data_ptr(), int(lw['mlp_down_sf']),
+                float(lw['mlp_down_alpha']), s,
+            )
+            self._rmsnorm_q(
+                h_out_v.data_ptr(), int(next_input_norm_w),
+                next_ap.data_ptr(), next_sf.data_ptr(), S, hidden, eps, s,
+            )
+            return h_out_v
+
         down_out_buf = self._nvfp4_scratch[(hidden, inter)][2]
         prefill_gemm(
             ap_dn.data_ptr(), int(lw['mlp_down_packed']),
