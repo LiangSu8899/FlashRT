@@ -38,5 +38,22 @@ int fmha_fp8_causal_gqa_nhd_d128(
     float        softmax_scale,
     cudaStream_t stream);
 
+// Variant emitting O directly as NVFP4 (packed (Lq, Hq*128/2) u8 + swizzled
+// ue4m3 group scales — the o_proj GEMM's A-operand format), skipping the
+// bf16 O round-trip and the standalone quantize launch. Byte-identical to
+// the [bf16 O + quantize kernel] chain (values round through bf16 first).
+int fmha_fp8_causal_gqa_nhd_d128_fp4out(
+    const void*  q_fp8,
+    const void*  k_fp8,
+    const void*  v_fp8,
+    void*        out_fp4,
+    void*        out_sf,
+    int          Lq,
+    int          Lk,
+    int          num_q_heads,
+    int          num_kv_heads,
+    float        softmax_scale,
+    cudaStream_t stream);
+
 }  // namespace attention
 }  // namespace flash_rt

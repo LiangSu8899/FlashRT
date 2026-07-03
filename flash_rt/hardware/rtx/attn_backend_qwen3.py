@@ -164,6 +164,13 @@ class RtxFlashAttnBackendQwen3:
                 self._fp8_direct = True
                 self._fp8_prefill = True
                 self._fp8_attn_fn = fn
+                # fp4-out epilogue: O emitted directly as the o_proj GEMM's
+                # NVFP4 A-operand (skips the bf16 O + quantize launch). The
+                # frontend hands the packed/SF scratch pointers before run().
+                self._fp8_fp4out_fn = getattr(
+                    _fvk, "fmha_fp8_causal_gqa_nhd_d128_fp4out", None)
+                self._fp8_o_fp4 = 0
+                self._fp8_o_sf = 0
                 sp = ((self._max_q_seq + 127) // 128) * 128
                 self._fp8_sp_max = sp
                 hq, hkv, hd = self.NUM_Q_HEADS, self.NUM_KV_HEADS, self.HEAD_DIM
@@ -348,6 +355,18 @@ class RtxFlashAttnBackendQwen3:
         Sp = q_seq
         if self._fp8_direct:
             # All-fp8 path: raw e4m3 Q/K/V, no scales.
+            if self._fp8_fp4out_fn is not None and self._fp8_o_fp4:
+                rc = self._fp8_fp4out_fn(
+                    q_fp8=self._fp8_q8.data_ptr(),
+                    k_fp8=self._fp8_k8.data_ptr(),
+                    v_fp8=self._fp8_v8.data_ptr(),
+                    out_fp4=self._fp8_o_fp4, out_sf=self._fp8_o_sf,
+                    Lq=Sp, Lk=Sp,
+                    Hq=self.NUM_Q_HEADS, Hkv=self.NUM_KV_HEADS,
+                    softmax_scale=softmax_scale, stream=stream)
+                if rc != 0:
+                    raise RuntimeError(f"qwen3 fp8 prefill attn rc={rc}")
+                return self.O_buf.data_ptr()
             rc = self._fp8_attn_fn(
                 q_fp8=self._fp8_q8.data_ptr(), k_fp8=self._fp8_k8.data_ptr(),
                 v_fp8=self._fp8_v8.data_ptr(), out_bf16=self.O_buf.data_ptr(),

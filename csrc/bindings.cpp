@@ -3887,6 +3887,23 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("out_bf16"), py::arg("Lq"), py::arg("Lk"),
         py::arg("Hq"), py::arg("Hkv"),
         py::arg("softmax_scale"), py::arg("stream") = 0);
+
+    // fp4-out variant: O emitted as NVFP4 packed + swizzled SF (the o_proj
+    // A-operand), skipping the bf16 O round-trip + quantize launch.
+    m.def("fmha_fp8_causal_gqa_nhd_d128_fp4out",
+        [](uintptr_t q_fp8, uintptr_t k_fp8, uintptr_t v_fp8,
+           uintptr_t out_fp4, uintptr_t out_sf,
+           int Lq, int Lk, int Hq, int Hkv,
+           float softmax_scale, uintptr_t stream) {
+            return flash_rt::attention::fmha_fp8_causal_gqa_nhd_d128_fp4out(
+                to_ptr(q_fp8), to_ptr(k_fp8), to_ptr(v_fp8),
+                to_ptr(out_fp4), to_ptr(out_sf), Lq, Lk, Hq, Hkv,
+                softmax_scale, to_stream(stream));
+        },
+        py::arg("q_fp8"), py::arg("k_fp8"), py::arg("v_fp8"),
+        py::arg("out_fp4"), py::arg("out_sf"),
+        py::arg("Lq"), py::arg("Lk"), py::arg("Hq"), py::arg("Hkv"),
+        py::arg("softmax_scale"), py::arg("stream") = 0);
 #endif
 
     m.def("quant_per_block_int8_bf16_d128",

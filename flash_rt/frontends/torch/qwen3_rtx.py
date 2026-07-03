@@ -1232,7 +1232,19 @@ class Qwen3TorchFrontendRtx:
                 v_new = kv_proj_out_buf[:S].view(S, n_kv, hd)
             self._attn.V_cache[L, start_pos:start_pos + S].copy_(v_new)
 
-        # 8) Run FA2 causal: q_seq=S, kv_seq=start_pos+S.
+        # 8) Run FA2 causal: q_seq=S, kv_seq=start_pos+S. On the all-fp8
+        # attention path the kernel's fp4-out epilogue writes O straight into
+        # the o_proj NVFP4 scratch (ap_h2/sf_h2), skipping the bf16 O buffer
+        # and the standalone quantize launch below (byte-identical output).
+        ap_h2, sf_h2, _ = self._nvfp4_scratch[(hidden, hidden)]
+        _fp8_fp4out = (
+            getattr(self._attn, '_fp8_direct', False)
+            and getattr(self._attn, '_fp8_fp4out_fn', None) is not None
+            and S % 128 == 0
+            and S <= getattr(self._attn, '_fp8_sp_max', 0))
+        if _fp8_fp4out:
+            self._attn._fp8_o_fp4 = ap_h2.data_ptr()
+            self._attn._fp8_o_sf = sf_h2.data_ptr()
         kv_seq = start_pos + S
         self._attn.run(
             'full', layer_idx=L, q_seq=S, kv_seq=kv_seq,
@@ -1240,13 +1252,14 @@ class Qwen3TorchFrontendRtx:
         )
         attn_out = self._attn.O_buf[:, :S]
 
-        # 9) o_proj NVFP4 at M=S.
-        attn_2d = attn_out.reshape(S, n_q * hd).contiguous()
-        ap_h2, sf_h2, _ = self._nvfp4_scratch[(hidden, hidden)]
-        self._quant_q(
-            attn_2d.data_ptr(), ap_h2.data_ptr(), sf_h2.data_ptr(),
-            S, n_q * hd, s,
-        )
+        # 9) o_proj NVFP4 at M=S (already produced in-epilogue on the fp4-out
+        # attention path).
+        if not _fp8_fp4out:
+            attn_2d = attn_out.reshape(S, n_q * hd).contiguous()
+            self._quant_q(
+                attn_2d.data_ptr(), ap_h2.data_ptr(), sf_h2.data_ptr(),
+                S, n_q * hd, s,
+            )
         # 9b+10) o_proj GEMM + Residual 1. When the residual-fused GEMM variant
         # is built, fold the residual add (C = h_in_S) into the o_proj epilogue
         # (D = o_proj + residual = h_post) so the post-attn norm is a plain

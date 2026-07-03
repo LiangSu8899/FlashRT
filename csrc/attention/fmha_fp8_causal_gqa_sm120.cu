@@ -63,11 +63,58 @@ __device__ __forceinline__ void cp_async16(void* dst_smem, const void* src_gmem)
   asm volatile("cp.async.ca.shared.global [%0],[%1],16;\n" ::"r"(a), "l"(src_gmem));
 }
 
+// NVFP4 encode helpers (same formulas as the standalone quantize kernels,
+// replicated so the epilogue emits byte-identical packed/SF output).
+__device__ __forceinline__ uint8_t fp4_e2m1_encode(float v) {
+  float a = fabsf(v);
+  uint8_t sign = (v < 0.0f) ? 0x8u : 0x0u;
+  uint8_t mag = (uint8_t)((a >= 0.25f) + (a >= 0.75f) + (a >= 1.25f)
+                        + (a >= 1.75f) + (a >= 2.5f)  + (a >= 3.5f)
+                        + (a >= 5.0f));
+  return sign | mag;
+}
+__device__ __forceinline__ uint8_t ue4m3_ceil_encode(float v) {
+  if (v <= 0.0f) return 0;
+  if (v > 240.0f) return 0xFE;
+  uint32_t bits = __float_as_uint(v);
+  int float_exp = ((bits >> 23) & 0xFF) - 127;
+  uint32_t frac = bits & 0x7FFFFF;
+  int ue_exp = float_exp + 7;
+  if (ue_exp <= 0) {
+    float scaled = v * 512.0f;
+    int m = (int)ceilf(scaled);
+    if (m > 7) return (1 << 3) | 0;
+    if (m < 1) m = 1;
+    return (uint8_t)m;
+  }
+  if (ue_exp >= 15) return 0xFE;
+  int m = (int)(frac >> 20);
+  if (frac & 0xFFFFF) m++;
+  if (m >= 8) { m = 0; ue_exp++; }
+  if (ue_exp >= 15) return 0xFE;
+  return (uint8_t)((ue_exp << 3) | m);
+}
+__device__ __forceinline__ float ue4m3_decode(uint8_t v) {
+  int e = (v >> 3) & 0xF;
+  int m = v & 0x7;
+  if (e == 0) return ldexpf((float)m / 8.0f, -6);
+  return ldexpf(1.0f + (float)m / 8.0f, e - 7);
+}
+
+// Fp4Out=false: O written as bf16 (Lq, Hq, 128).
+// Fp4Out=true : O emitted directly as NVFP4 (packed (Lq, Hq*128/2) u8 +
+//   swizzled ue4m3 SF, the o_proj GEMM's A-operand format), skipping the
+//   bf16 O round-trip and the standalone quantize launch. Values round
+//   through bf16 in-register first, so packed/SF bytes are identical to
+//   the [bf16 O write + quantize kernel] chain.
+template <bool Fp4Out>
 __global__ void __launch_bounds__(kThreads, 1)
 fmha_fp8_kernel(const __nv_fp8_e4m3* __restrict__ Q,
                 const __nv_fp8_e4m3* __restrict__ K,
                 const __nv_fp8_e4m3* __restrict__ V,
-                __nv_bfloat16* __restrict__ O, float scale) {
+                __nv_bfloat16* __restrict__ O,
+                uint8_t* __restrict__ o_fp4,
+                uint8_t* __restrict__ o_sf, float scale) {
   __shared__ __align__(16) uint8_t Qs[kQTile * kHeadDim], Ks[kKTile * kHeadDim],
       Vt[kHeadDim * kVtPad], Ps[kQTile * kKTile], Kraw[kKTile * kHeadDim],
       Vraw[kKTile * kHeadDim];
@@ -212,15 +259,60 @@ fmha_fp8_kernel(const __nv_fp8_e4m3* __restrict__ Q,
     }
   }
   float ip0 = 1.f / (li0 * kPScale), ip1 = 1.f / (li1 * kPScale);
+  if constexpr (!Fp4Out) {
 #pragma unroll
-  for (int nb = 0; nb < kDBlk; nb++) {
-    int d = nb * 8;
-    size_t r0 = (size_t)(q_base + qrow0 + g) * kQHeads * kHeadDim + head * kHeadDim + d;
-    size_t r1 = (size_t)(q_base + qrow0 + g + 8) * kQHeads * kHeadDim + head * kHeadDim + d;
-    O[r0 + 2 * tt + 0] = __float2bfloat16(Oc[nb][0] * ip0);
-    O[r0 + 2 * tt + 1] = __float2bfloat16(Oc[nb][1] * ip0);
-    O[r1 + 2 * tt + 0] = __float2bfloat16(Oc[nb][2] * ip1);
-    O[r1 + 2 * tt + 1] = __float2bfloat16(Oc[nb][3] * ip1);
+    for (int nb = 0; nb < kDBlk; nb++) {
+      int d = nb * 8;
+      size_t r0 = (size_t)(q_base + qrow0 + g) * kQHeads * kHeadDim + head * kHeadDim + d;
+      size_t r1 = (size_t)(q_base + qrow0 + g + 8) * kQHeads * kHeadDim + head * kHeadDim + d;
+      O[r0 + 2 * tt + 0] = __float2bfloat16(Oc[nb][0] * ip0);
+      O[r0 + 2 * tt + 1] = __float2bfloat16(Oc[nb][1] * ip0);
+      O[r1 + 2 * tt + 0] = __float2bfloat16(Oc[nb][2] * ip1);
+      O[r1 + 2 * tt + 1] = __float2bfloat16(Oc[nb][3] * ip1);
+    }
+  } else {
+    // Each 16-element quant block b of this head's 128 output columns lives
+    // in one lane quad (same g, tt=0..3): nb=2b holds block columns
+    // 2tt/2tt+1, nb=2b+1 holds 8+2tt/8+2tt+1. amax and the 8 packed bytes
+    // assemble with two quad shuffles each; the tt==0 lane stores the
+    // 8-byte block and its swizzled SF byte.
+    constexpr int kK = kQHeads * kHeadDim;          // o_proj K = 4096
+    constexpr int kNColBlocks = (kK / 16 + 3) / 4;  // SF swizzle col groups
+#pragma unroll
+    for (int half = 0; half < 2; ++half) {          // rows m0, m1
+      const int row = q_base + qrow0 + g + 8 * half;
+      const float ip = half ? ip1 : ip0;
+      const int rb = row / 128, ri = row % 128;
+#pragma unroll
+      for (int b = 0; b < kHeadDim / 16; ++b) {
+        float v0 = __bfloat162float(__float2bfloat16(Oc[2 * b][2 * half + 0] * ip));
+        float v1 = __bfloat162float(__float2bfloat16(Oc[2 * b][2 * half + 1] * ip));
+        float v2 = __bfloat162float(__float2bfloat16(Oc[2 * b + 1][2 * half + 0] * ip));
+        float v3 = __bfloat162float(__float2bfloat16(Oc[2 * b + 1][2 * half + 1] * ip));
+        float amax = fmaxf(fmaxf(fabsf(v0), fabsf(v1)), fmaxf(fabsf(v2), fabsf(v3)));
+        amax = fmaxf(amax, __shfl_xor_sync(~0u, amax, 1));
+        amax = fmaxf(amax, __shfl_xor_sync(~0u, amax, 2));
+        uint8_t ue = ue4m3_ceil_encode(amax / 6.0f);
+        float fscale = ue4m3_decode(ue);
+        float inv = (fscale > 0.f) ? (1.f / fscale) : 0.f;
+        // lane tt contributes packed byte tt (from nb=2b) and byte 4+tt.
+        uint32_t lo = (uint32_t)((fp4_e2m1_encode(v1 * inv) << 4)
+                                 | (fp4_e2m1_encode(v0 * inv) & 0xF)) << (8 * tt);
+        uint32_t hi = (uint32_t)((fp4_e2m1_encode(v3 * inv) << 4)
+                                 | (fp4_e2m1_encode(v2 * inv) & 0xF)) << (8 * tt);
+        lo |= __shfl_xor_sync(~0u, lo, 1); lo |= __shfl_xor_sync(~0u, lo, 2);
+        hi |= __shfl_xor_sync(~0u, hi, 1); hi |= __shfl_xor_sync(~0u, hi, 2);
+        if (tt == 0) {
+          uint2 pk = make_uint2(lo, hi);
+          *reinterpret_cast<uint2*>(
+              &o_fp4[(size_t)row * (kK / 2) + head * (kHeadDim / 2) + 8 * b]) = pk;
+          const int gb = head * (kHeadDim / 16) + b;   // global col block
+          const int cb = gb / 4, ci = gb % 4;
+          o_sf[(size_t)(rb * kNColBlocks + cb) * 512
+               + (ri % 32) * 16 + (ri / 32) * 4 + ci] = ue;
+        }
+      }
+    }
   }
 }
 
@@ -233,9 +325,25 @@ int fmha_fp8_causal_gqa_nhd_d128(
   if (Lq != Lk || Lq <= 0 || (Lq % kQTile) != 0) return 1;
   if (num_q_heads != kQHeads || num_kv_heads != kKVHeads) return 1;
   dim3 grid(Lq / kQTile, kQHeads);
-  fmha_fp8_kernel<<<grid, kThreads, 0, stream>>>(
+  fmha_fp8_kernel<false><<<grid, kThreads, 0, stream>>>(
       (const __nv_fp8_e4m3*)q_fp8, (const __nv_fp8_e4m3*)k_fp8,
-      (const __nv_fp8_e4m3*)v_fp8, (__nv_bfloat16*)out_bf16, softmax_scale);
+      (const __nv_fp8_e4m3*)v_fp8, (__nv_bfloat16*)out_bf16,
+      nullptr, nullptr, softmax_scale);
+  return 0;
+}
+
+int fmha_fp8_causal_gqa_nhd_d128_fp4out(
+    const void* q_fp8, const void* k_fp8, const void* v_fp8,
+    void* out_fp4, void* out_sf,
+    int Lq, int Lk, int num_q_heads, int num_kv_heads,
+    float softmax_scale, cudaStream_t stream) {
+  if (Lq != Lk || Lq <= 0 || (Lq % kQTile) != 0) return 1;
+  if (num_q_heads != kQHeads || num_kv_heads != kKVHeads) return 1;
+  dim3 grid(Lq / kQTile, kQHeads);
+  fmha_fp8_kernel<true><<<grid, kThreads, 0, stream>>>(
+      (const __nv_fp8_e4m3*)q_fp8, (const __nv_fp8_e4m3*)k_fp8,
+      (const __nv_fp8_e4m3*)v_fp8, nullptr,
+      (uint8_t*)out_fp4, (uint8_t*)out_sf, softmax_scale);
   return 0;
 }
 
