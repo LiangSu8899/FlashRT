@@ -138,6 +138,38 @@ identity is unchanged.
 `flash_rt.runtime.export.build_model_runtime`) and the native Pi0.5 verb
 overlay `frt_pi05_model_runtime_create_over` (`cpp/models/pi05/`).
 
+## Producer layout: model contract vs hardware pipeline
+
+The clean default is one export module per logical model family contract:
+
+```
+flash_rt/models/<model>/runtime_export.py     ports, stages, identity, export helpers
+flash_rt/models/<model>/pipeline_rtx.py       RTX graph capture and live buffers
+flash_rt/models/<model>/pipeline_thor.py      Thor graph capture and live buffers
+cpp/models/<model>/                           native hot-path verb overlay
+```
+
+`runtime_export.py` is not the hardware implementation. It is the shared
+contract that lowers a ready pipeline into `frt_model_runtime_v1`: declared
+ports, graph/stage descriptors, stream placement, identity fields, and optional
+stage-plan selection. Each hardware pipeline owns its graph capture, buffers,
+kernel choices, calibration, and setup policy, then delegates
+`export_model_runtime(...)` to that model export module.
+
+The C++ runtime consumes the resulting declaration. It distinguishes the model
+by the native factory/overlay it loads (`cpp/models/<model>/...`) and by the
+declared port schema it implements; it should not branch on hardware unless a
+real input/output transform differs. Hardware identity comes from the producer:
+the graph handles, stream table, buffer descriptors, pipeline class, precision,
+architecture, and other setup fields included in the canonical identity and
+fingerprint.
+
+This means an RTX Pi0.5 producer and a Thor Pi0.5 producer may both feed the
+same native Pi0.5 C++ runtime if they expose the same logical model-runtime
+contract. If a hardware path needs incompatible graph names, stage cuts, port
+shapes, or hot-input semantics, it is a different deployment identity and must
+either use distinct stage-plan names/model keys or a separate native overlay.
+
 Pi0.5 export knobs:
 
 - `stage_plan="full"` exports one `infer` stage.
