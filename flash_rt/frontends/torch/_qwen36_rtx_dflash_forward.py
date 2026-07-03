@@ -799,3 +799,142 @@ def dflash_drafter_forward_capture(frontend) -> torch.Tensor:
                 buf['logits'].data_ptr(),
                 M, VOCAB, H, s, widen=True)
     return buf['logits']
+
+
+# ====================================================================
+# Per-token window variant
+# ====================================================================
+#
+# The shift-window above appends ONE fc-projected tap set per spec
+# cycle, so window entries are ~AL committed tokens apart while the
+# drafter attends to them at consecutive positions. The per-token
+# variant keeps a window of features for EVERY committed token: the
+# orchestration appends N+1 entries after each accept (and seeds the
+# window from the prompt tail at prefill), and the drafter forward
+# below only READS the window — no fc, no shift — which also makes the
+# graph capture side-effect free.
+
+def alloc_pertoken_window(frontend, win: int) -> None:
+    """Allocate the per-token feature window + append scratch."""
+    buf = frontend._dflash_buf
+    if buf.get('pt_window') is not None and buf['pt_win'] == win:
+        return
+    if win > buf['max_ctx']:
+        raise ValueError(
+            f'window {win} exceeds drafter max_ctx {buf["max_ctx"]}')
+    H = buf['hidden']
+    dev = frontend.device
+    buf['pt_window'] = torch.zeros(
+        win, H, dtype=torch.bfloat16, device=dev)
+    buf['pt_shift_scratch'] = torch.empty_like(buf['pt_window'])
+    buf['pt_proj_out'] = torch.empty(
+        buf['max_ctx'], H, dtype=torch.bfloat16, device=dev)
+    buf['pt_taps_rows'] = torch.empty(
+        max(buf['block'], win), 5, H, dtype=torch.bfloat16, device=dev)
+    buf['pt_seed_taps'] = torch.empty(
+        5, win, H, dtype=torch.bfloat16, device=dev)
+    buf['pt_win'] = win
+    buf['pt_valid'] = 0
+
+
+def reset_pertoken_window(frontend) -> None:
+    """Clear per-token window state. Call at the start of a generate."""
+    buf = frontend._dflash_buf
+    if buf.get('pt_window') is not None:
+        buf['pt_window'].zero_()
+        buf['pt_valid'] = 0
+
+
+def pertoken_window_append(frontend, taps_rows) -> None:
+    """Append fc-projected features of R committed rows to the window.
+
+    taps_rows: (R, 5, hidden) bf16 — verify tap_buf rows of the
+    committed tokens, oldest first. Shift-left by R, write the R new
+    features at the tail. Runs eagerly on the current stream, outside
+    the drafter graph.
+    """
+    from flash_rt import flash_rt_kernels as fvk
+
+    buf = frontend._dflash_buf
+    d = frontend._weights.ptrs['dflash']
+    s = torch.cuda.current_stream().cuda_stream
+    H = buf['hidden']
+    FC_IN = buf['fc_in']
+    eps = float(d['rms_norm_eps'])
+    win = buf['pt_window']
+    W = buf['pt_win']
+    R = int(taps_rows.shape[0])
+    if R > W:
+        taps_rows = taps_rows[-W:]
+        R = W
+
+    x = taps_rows.reshape(R, FC_IN).contiguous()
+    ap_t, sf_t = buf['act_Mctx_K5120']
+    _quant_act(fvk, x, ap_t, sf_t, R, FC_IN, s)
+    _gemm_nvfp4(fvk, ap_t.data_ptr(), sf_t.data_ptr(),
+                d['fc_packed'], d['fc_sf'], d['fc_alpha'],
+                buf['pt_proj_out'].data_ptr(), R, H, FC_IN, s)
+    if R < W:
+        scratch = buf['pt_shift_scratch']
+        scratch[:W - R].copy_(win[R:])
+        win[:W - R].copy_(scratch[:W - R])
+    fvk.rms_norm(
+        int(buf['pt_proj_out'].data_ptr()), int(d['hidden_norm_w']),
+        int(win[W - R:W].data_ptr()),
+        R, H, eps, int(s),
+    )
+    buf['pt_valid'] = min(buf['pt_valid'] + R, W)
+
+
+def dflash_drafter_forward_pertoken(frontend,
+                                    valid_ctx: int | None = None):
+    """Drafter forward over the per-token window (read-only).
+
+    valid_ctx: number of valid tail rows to attend to. None means the
+    full window — the shape the captured graph bakes in. Callers pass
+    the actual valid count during ramp-up (window not yet full).
+
+    Returns: logits (block, vocab) bf16 in buf['logits'].
+    """
+    from flash_rt import flash_rt_kernels as fvk
+
+    s = torch.cuda.current_stream().cuda_stream
+    buf = frontend._dflash_buf
+    d = frontend._weights.ptrs['dflash']
+    M = buf['block']
+    H = buf['hidden']
+    VOCAB = buf['vocab']
+    eps = float(d['rms_norm_eps'])
+    W = buf['pt_win']
+    ctx_len = W if valid_ctx is None else int(valid_ctx)
+    if not (1 <= ctx_len <= W):
+        raise ValueError(f'valid_ctx={ctx_len} out of [1, {W}]')
+    win = buf['pt_window'][W - ctx_len:W]
+
+    fvk.qwen36_embedding_lookup_bf16(
+        buf['ids_static'].data_ptr(),
+        int(frontend._weights.ptrs['embed_w']),
+        buf['embed_buf'].data_ptr(), M, H, s,
+    )
+    fvk.gpu_copy(
+        buf['h_b'].data_ptr(), buf['embed_buf'].data_ptr(),
+        M * H * 2, s,
+    )
+    h = buf['h_b']
+    for L in range(buf['n_layers']):
+        h = _drafter_layer_forward(
+            frontend, fvk, L, h, win, ctx_len, s)
+    fvk.rms_norm(
+        int(h.data_ptr()), int(d['final_norm_w']),
+        int(buf['h_final_norm'].data_ptr()),
+        M, H, eps, int(s),
+    )
+    ap_lm, sf_lm = buf['act_M16_K5120']
+    _quant_act(fvk, buf['h_final_norm'], ap_lm, sf_lm, M, H, s)
+    _gemm_nvfp4(fvk, ap_lm.data_ptr(), sf_lm.data_ptr(),
+                frontend._weights.ptrs['lm_head_packed'],
+                frontend._weights.ptrs['lm_head_sf'],
+                frontend._weights.ptrs['lm_head_alpha'],
+                buf['logits'].data_ptr(),
+                M, VOCAB, H, s, widen=True)
+    return buf['logits']

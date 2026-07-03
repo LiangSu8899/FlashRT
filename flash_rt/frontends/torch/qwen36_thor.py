@@ -1156,6 +1156,16 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
                 cache = getattr(self, cache_name, None)
                 if cache:
                     cache.clear()
+        # Per-token drafter window (default on for Thor): the drafter
+        # attends to fc-projected features of every committed token.
+        # Measured on Thor at ctx=128: steady AL 2.53 -> 3.49 vs the
+        # one-entry-per-cycle shift window.
+        if not hasattr(self, '_dflash_pertoken_window'):
+            self._dflash_pertoken_window = os.environ.get(
+                'FLASHRT_QWEN36_DFLASH_PERTOKEN', '1',
+            ).strip().lower() not in ('0', 'false', 'off')
+            self._dflash_pertoken_win = int(os.environ.get(
+                'FLASHRT_QWEN36_DFLASH_WINDOW', '128') or '128')
 
     def _dflash_prefill_nvfp4(self, input_ids):
         """Thor override: chunked FP8-KV prompt prefill.
@@ -1164,8 +1174,43 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
         the Thor verify attends over the FP8 cache, so the prompt rows
         must land there. The chunked prefill is also the production
         Thor TTFT path (batched XQA instead of one forward per token).
+
+        In per-token-window mode the last min(window, prompt) tokens
+        run as a separate tap-captured chunk so the drafter window
+        starts seeded with the prompt tail's features instead of
+        ramping from empty.
         """
-        _, logits = self._prefill_long_ctx_tq_chunked(input_ids)
+        seed_window = (
+            getattr(self, '_dflash_pertoken_window', False)
+            and os.environ.get(
+                'FLASHRT_QWEN36_DFLASH_WINDOW_SEED', '1',
+            ).strip().lower() not in ('0', 'false', 'off'))
+        if not seed_window:
+            _, logits = self._prefill_long_ctx_tq_chunked(input_ids)
+            return logits.argmax(dim=-1, keepdim=True).view(1, 1)
+
+        from flash_rt.frontends.torch._qwen36_rtx_dflash_forward import (
+            alloc_pertoken_window,
+            pertoken_window_append,
+        )
+
+        alloc_pertoken_window(
+            self, int(getattr(self, '_dflash_pertoken_win', 128)))
+        buf = self._dflash_buf
+        P = int(input_ids.shape[1])
+        tail = min(int(buf['pt_win']), P)
+        if P > tail:
+            self._prefill_long_ctx_tq_chunked(input_ids[:, :P - tail])
+        d = self._rope_dim
+        cos_T = self._rope_cos_table[P - tail:P].view(1, tail, d)
+        sin_T = self._rope_sin_table[P - tail:P].view(1, tail, d)
+        seed = buf['pt_seed_taps']
+        logits = self.forward_own_decode_K_nvfp4_fp8kv(
+            input_ids[:, P - tail:], cos_T, sin_T, P - tail, tail,
+            tap_buf=seed, logits_mode='last')
+        rows = buf['pt_taps_rows'][:tail]
+        rows.copy_(seed[:, :tail].permute(1, 0, 2))
+        pertoken_window_append(self, rows)
         return logits.argmax(dim=-1, keepdim=True).view(1, 1)
 
     def _dflash_verify_forward_K(self, token_ids_K, cos_K, sin_K,

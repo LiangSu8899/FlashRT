@@ -11817,6 +11817,40 @@ class Qwen36TorchFrontendRtx:
             rg.replay()
         torch.cuda.current_stream().wait_stream(gs)
 
+    def _ensure_drafter_graph_dflash_pertoken(self):
+        """Lazy CUDA Graph for the per-token-window drafter forward.
+
+        The forward is read-only over the window (updates happen
+        outside the graph via ``pertoken_window_append``), so capture
+        needs no state snapshot/restore. One graph per frontend — the
+        window length is fixed at alloc time.
+        """
+        import torch
+
+        from flash_rt.frontends.torch._qwen36_rtx_dflash_forward import (
+            dflash_drafter_forward_pertoken,
+        )
+
+        g = getattr(self, '_captured_drafter_graph_pertoken', None)
+        if g is not None:
+            return g
+
+        gs = self._graph_stream
+        gs.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(gs), torch.no_grad():
+            for _ in range(2):
+                dflash_drafter_forward_pertoken(self)
+        gs.synchronize()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(
+                g, stream=gs, pool=self._graph_mempool,
+        ), torch.no_grad():
+            dflash_drafter_forward_pertoken(self)
+        gs.synchronize()
+        torch.cuda.current_stream().wait_stream(gs)
+        self._captured_drafter_graph_pertoken = g
+        return g
+
     def _ensure_verify_graph_dflash_nvfp4(self, cur_pos: int, K: int):
         """Lazy CUDA Graph for the DFlash verify forward WITH tap_buf.
 
@@ -11930,6 +11964,20 @@ class Qwen36TorchFrontendRtx:
         eff_ctx = int(getattr(self, '_dflash_eff_ctx', 16))
         alloc_drafter_capture_window(self, eff_ctx)
         reset_drafter_capture_state(self)
+        # Per-token window mode: the drafter attends to fc-projected
+        # features of every committed token instead of one entry per
+        # spec cycle. The prefill hook may seed the window from the
+        # prompt tail.
+        pertoken = bool(getattr(self, '_dflash_pertoken_window', False))
+        if pertoken:
+            from flash_rt.frontends.torch._qwen36_rtx_dflash_forward import (  # noqa: E501
+                alloc_pertoken_window,
+                pertoken_window_append,
+                reset_pertoken_window,
+            )
+            alloc_pertoken_window(
+                self, int(getattr(self, '_dflash_pertoken_win', 128)))
+            reset_pertoken_window(self)
         # Initialize taps to zero — first drafter call gets no real
         # signal; AL on cycle 0 will be lower than steady-state.
         self._dflash_taps_buf.zero_()
@@ -11964,15 +12012,29 @@ class Qwen36TorchFrontendRtx:
                 # (avoids zero-dilution that hurts AL). Once the window
                 # is full, replay the captured graph.
                 self._dflash_buf['ids_static'][0:1].copy_(tok.view(1))
-                self._dflash_buf['hidden_taps_static'].copy_(
-                    self._dflash_taps_buf[:, 0])
-                if self._spec_attempts < eff_ctx:
+                if pertoken:
+                    valid = int(self._dflash_buf['pt_valid'])
+                    if valid < int(self._dflash_buf['pt_win']):
+                        from flash_rt.frontends.torch._qwen36_rtx_dflash_forward import (  # noqa: E501
+                            dflash_drafter_forward_pertoken,
+                        )
+                        dflash_drafter_forward_pertoken(
+                            self, max(1, valid))
+                    else:
+                        drafter_g = (
+                            self._ensure_drafter_graph_dflash_pertoken())
+                        drafter_g.replay()
+                elif self._spec_attempts < eff_ctx:
                     from flash_rt.frontends.torch._qwen36_rtx_dflash_forward import (  # noqa: E501
                         dflash_drafter_forward_capture_eager,
                     )
+                    self._dflash_buf['hidden_taps_static'].copy_(
+                        self._dflash_taps_buf[:, 0])
                     valid_ctx = self._spec_attempts + 1
                     dflash_drafter_forward_capture_eager(self, valid_ctx)
                 else:
+                    self._dflash_buf['hidden_taps_static'].copy_(
+                        self._dflash_taps_buf[:, 0])
                     drafter_g = self._ensure_drafter_graph_dflash_nvfp4(
                         eff_ctx)
                     drafter_g.replay()
@@ -12040,6 +12102,14 @@ class Qwen36TorchFrontendRtx:
                     self._dflash_taps_buf[:, 0].copy_(
                         self._dflash_taps_buf[:, N])
                     cur_pos += N + 1
+                if pertoken:
+                    # Window gains one feature per state-advanced row
+                    # (N+1 on partial accept, Kv on full accept).
+                    R = (Kv if N == K else N + 1)
+                    rows = self._dflash_buf['pt_taps_rows'][:R]
+                    rows.copy_(
+                        self._dflash_taps_buf[:, :R].permute(1, 0, 2))
+                    pertoken_window_append(self, rows)
 
             if len(generated) > max_new_tokens:
                 generated = generated[:max_new_tokens]
