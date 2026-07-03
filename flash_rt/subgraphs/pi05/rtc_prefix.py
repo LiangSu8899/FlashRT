@@ -52,6 +52,10 @@ def _install_pipeline(pipeline: object, prefix_len: int) -> None:
 
 def _capture_rtc_prefix_graph(pl: object, stream_handle: object,
                               stream_int: int, prefix_len: int) -> None:
+    capture = getattr(pl, "capture_rtc_prefix_graph", None)
+    if capture is not None:
+        capture(stream_handle, stream_int, prefix_len)
+        return
     if getattr(pl, "_decode_rtc_prefix_graph", None) is not None:
         return
     if int(prefix_len) > int(getattr(pl, "chunk_size", 0)):

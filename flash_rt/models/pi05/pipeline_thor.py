@@ -56,8 +56,20 @@ def _action_update_fp16(ctx, fvk, xn, aow, aob, noise, rows, cols, dim,
 # Decoder (18 layers, 10 diffusion steps, static FP8)
 # ══════════════════════════════════════════════════════════════════
 
+def _copy_rtc_prefix(bufs, dims, stream: int, prefix_len: int) -> None:
+    if prefix_len <= 0:
+        return
+    if prefix_len > int(dims["S"]):
+        raise ValueError(
+            f"rtc prefix_len {prefix_len} exceeds chunk_size {dims['S']}")
+    prev = bufs.get("rtc_prev_action_chunk")
+    if not prev:
+        raise ValueError("rtc_prev_action_chunk buffer is required")
+    _gpu_copy(bufs["noise"], prev, int(prefix_len) * 32 * 2, stream)
+
+
 def decoder_forward(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None,
-                    use_fp8=True):
+                    use_fp8=True, rtc_prefix_len: int = 0):
     """Full AE decoder forward pass ≡ pi05 ae_forward_static.
 
     Args:
@@ -78,10 +90,15 @@ def decoder_forward(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None,
             FP8 norm/quantize kernels are split into their FP16
             equivalents (``adarms_fp16``, ``gate_res_fp16``,
             ``gate_geglu_merged_fp16``). Used for FP16 baseline runs.
+        rtc_prefix_len: Optional prefix length for RTC prefix-lock action
+            graphs. When non-zero, the prefix rows of ``noise`` are restored
+            from ``bufs['rtc_prev_action_chunk']`` before each denoise step and
+            after each action update.
     """
     if not use_fp8:
         return _decoder_forward_fp16(ctx, fvk, bufs, weights, dims, stream,
-                                      attn=attn)
+                                      attn=attn,
+                                      rtc_prefix_len=rtc_prefix_len)
     S = dims['S']
     D = dims['D']
     H = dims['H']
@@ -133,8 +150,10 @@ def decoder_forward(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None,
     rope = weights['rope']
     w_scales = weights['w_scales']
     act_scales = weights['act_scales']
+    rtc_prefix_len = int(rtc_prefix_len or 0)
 
     for s in range(steps):
+        _copy_rtc_prefix(bufs, dims, stream, rtc_prefix_len)
         step_scale_base = s * layers * 4
         # ── Action input: noise → x ──
         fvk.gmm_fp16(ctx, noise, ain_w, x, S, D, 32, 0.0, stream)
@@ -226,13 +245,15 @@ def decoder_forward(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None,
 
         _action_update_fp16(ctx, fvk, xn, aow, aob, noise, S, 32, D,
                             stream, dt, action_f32, aob_dt)
+        _copy_rtc_prefix(bufs, dims, stream, rtc_prefix_len)
 
 
 # ══════════════════════════════════════════════════════════════════
 # FP16 decoder path (no quantization, FP16 weights, baseline only)
 # ══════════════════════════════════════════════════════════════════
 
-def _decoder_forward_fp16(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None):
+def _decoder_forward_fp16(ctx, fvk, bufs, weights, dims, stream=0, *,
+                          attn=None, rtc_prefix_len: int = 0):
     """FP16-only decoder forward. Structure mirrors the FP8 path; every
     GEMM is ``fvk.gmm_fp16`` and the fused FP8 norm kernels are split.
 
@@ -266,8 +287,10 @@ def _decoder_forward_fp16(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None)
     aob_dt = weights.get('aob_dt')
     dt = weights.get('dt')
     fs = weights['fs']; rope = weights['rope']
+    rtc_prefix_len = int(rtc_prefix_len or 0)
 
     for s in range(steps):
+        _copy_rtc_prefix(bufs, dims, stream, rtc_prefix_len)
         fvk.gmm_fp16(ctx, noise, ain_w, x, S, D, 32, 0.0, stream)
         fvk.add_bias_fp16(x, ain_b, S, D, stream)
 
@@ -336,6 +359,7 @@ def _decoder_forward_fp16(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None)
         fvk.adarms_fp16(x, fs_ptr, xn, gate, S, D, stream)
         _action_update_fp16(ctx, fvk, xn, aow, aob, noise, S, 32, D,
                             stream, dt, action_f32, aob_dt)
+        _copy_rtc_prefix(bufs, dims, stream, rtc_prefix_len)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -576,6 +600,10 @@ class Pi05ThorPipeline:
         self.tensor_dtype = str(tensor_dtype)
         self.hardware = str(hardware)
         self._cudart = ctypes.CDLL("libcudart.so")
+        from flash_rt.subgraphs.capture import run_capture_hooks
+        run_capture_hooks(
+            self, self._graph_stream,
+            int(getattr(self._graph_stream, "value", self._graph_stream) or 0))
 
     def _ensure_runtime_export_ready(self) -> None:
         owner = getattr(self, "_runtime_owner", None)
@@ -609,6 +637,23 @@ class Pi05ThorPipeline:
     @property
     def input_rtc_guidance_weight_buf(self):
         return self.bufs["rtc_guidance_weight"]
+
+    def capture_context_action_graphs(self, stream_handle, stream_int) -> None:
+        owner = getattr(self, "_runtime_owner", None)
+        if owner is None or not hasattr(
+                owner, "_capture_model_runtime_context_action_graphs"):
+            raise RuntimeError("Pi05 Thor owner cannot capture context_action")
+        owner._capture_model_runtime_context_action_graphs(
+            self, stream_handle, stream_int)
+
+    def capture_rtc_prefix_graph(self, stream_handle, stream_int,
+                                 prefix_len: int) -> None:
+        owner = getattr(self, "_runtime_owner", None)
+        if owner is None or not hasattr(
+                owner, "_capture_model_runtime_rtc_prefix_graph"):
+            raise RuntimeError("Pi05 Thor owner cannot capture rtc_prefix")
+        owner._capture_model_runtime_rtc_prefix_graph(
+            self, stream_handle, stream_int, prefix_len)
 
     def forward(self) -> int:
         self._ensure_runtime_export_ready()

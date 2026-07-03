@@ -50,6 +50,10 @@ def _run_context(pl: object, stream: int) -> None:
 
 def _capture_context_graph(pl: object, stream_handle: object,
                            stream_int: int) -> None:
+    capture = getattr(pl, "capture_context_action_graphs", None)
+    if capture is not None:
+        capture(stream_handle, stream_int)
+        return
     if getattr(pl, "_context_graph", None) is not None:
         return
     graph = capture_graph(
