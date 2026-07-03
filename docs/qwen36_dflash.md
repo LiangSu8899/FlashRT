@@ -43,7 +43,7 @@ fe = Qwen36TorchFrontendThor(
     quant="nvfp4",
     max_seq=32768,
 )
-fe._load_dflash_drafter()          # reads FLASHRT_QWEN36_DFLASH_CKPT_DIR
+fe.init_dflash_drafter()          # reads FLASHRT_QWEN36_DFLASH_CKPT_DIR
 
 ids = fe._tokenizer.apply_chat_template(
     [{"role": "user", "content": "Plan the pick-and-place task."}],
@@ -88,18 +88,40 @@ decoding, 64/256-token delta method:
 
 | prompt | MTP AL / tok/s | DFlash AL / tok/s |
 |---|---:|---:|
-| robot task -> JSON plan | 2.87 / 33.7 | **4.92 / 52.8** |
-| robot navigation plan | 2.59 / 30.5 | 3.20 / 34.4 |
-| prose explanation | 2.43 / 28.6 | 2.87 / 30.8 |
+| robot task -> JSON plan | 2.87 / 33.7 | **4.57 / 48.9** |
+| robot navigation plan | 2.59 / 30.5 | 3.25 / 34.8 |
+| prose explanation | 2.43 / 28.5 | 3.00 / 31.7 |
 
 Cycle anatomy on Thor: one S=16 verify (~86 ms, weight-read bound) +
 one drafter graph replay (~7 ms). A partial accept costs two
 constant-time state copies from the per-step checkpoints written
-during the verify itself — there is no recovery forward.
+during the verify itself — there is no recovery forward. The accept
+decision includes one host synchronization per cycle
+(`argmin().item()` on the match mask); at ~10 us it is three orders
+of magnitude below the verify cost and is included in every number
+above. A device-side accept loop is possible follow-up work, not a
+prerequisite.
 
 Output quality is lossless: the verify pass is the greedy ground
 truth, and generated tokens are byte-identical to the FP8-KV MTP
 reference on all measured prompts.
+
+## Serving
+
+A stateless OpenAI-compatible host for this path lives in
+[`serving/qwen36_dflash_agent`](../serving/qwen36_dflash_agent) —
+single-stream request/response serving with per-request DFlash
+generation and accept-length telemetry:
+
+```bash
+python -m serving.qwen36_dflash_agent.server \
+  --checkpoint /models/Qwen3.6-27B-NVFP4 --max-seq 32768 --K 15
+curl -s http://127.0.0.1:8000/health
+```
+
+For long-running agent sessions (prefix reuse, tool calling, SSE
+streaming) use [`serving/qwen36_agent`](../serving/qwen36_agent),
+which serves the MTP spec path.
 
 ## Notes
 

@@ -37,7 +37,7 @@ See [Supported Models](#supported-models), [Hardware Support](#hardware-support)
 
 ## News
 
-- [2026/07] **DFlash block-diffusion speculative decoding** for Qwen3.6-27B NVFP4 on Jetson AGX Thor: one 15-token drafter block per cycle, constant-time partial-accept rollback, and a per-token drafter context window with prompt-tail seeding — **52.8 tok/s on structured robot-plan prompts vs 33.7 tok/s for the MTP chain (+57%)**, lossless greedy output. See [Qwen3.6 DFlash](docs/qwen36_dflash.md).
+- [2026/07] **DFlash block-diffusion speculative decoding** for Qwen3.6-27B NVFP4 on Jetson AGX Thor: one 15-token drafter block per cycle, constant-time partial-accept rollback, and a per-token drafter context window with prompt-tail seeding — **48.9 tok/s on structured robot-plan prompts vs 33.7 tok/s for the MTP chain (+45%)**, lossless greedy output. See [Qwen3.6 DFlash](docs/qwen36_dflash.md).
 - [2026/06] **Higgs Audio v3 TTS-4B** lands on FlashRT with a kernelized FP8/BF16 decode path, streaming-friendly generation API, and a FastAPI serving host. See [Higgs usage](docs/higgs_audio_v3.md#3-quickstart), [Higgs performance](docs/higgs_audio_v3.md#performance), and [Higgs serving](serving/higgs_audio_agent/README.md).
 - [2026/06] **FlashRT HF Kernels** are available as Hugging Face Kernel Hub packages under the `flashrt` namespace. See [LiangSu8899/FlashRT-HF-kernels](https://github.com/LiangSu8899/FlashRT-HF-kernels) and [huggingface.co/flashrt](https://huggingface.co/flashrt).
 - [2026/06] The `serving/` layer is documented as the scenario-host layer for OpenAI-compatible LLM/audio serving and robot execution-state hosts. See [serving README](serving/README.md), [serving design](docs/serving_design.md), and [architecture](docs/architecture.md).

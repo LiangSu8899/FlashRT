@@ -11614,6 +11614,14 @@ class Qwen36TorchFrontendRtx:
     # N6-A4: DFlash spec decode (block-diffusion drafter + chain verify)
     # ==================================================================
 
+    def init_dflash_drafter(self, ckpt_dir: str | None = None) -> None:
+        """Public entry: load the DFlash drafter for spec decode.
+
+        ``ckpt_dir`` falls back to ``FLASHRT_QWEN36_DFLASH_CKPT_DIR``.
+        Must be called before ``generate_own_speculative_DFlash_nvfp4``.
+        """
+        self._load_dflash_drafter(ckpt_dir)
+
     def _load_dflash_drafter(self, ckpt_dir: str | None = None) -> None:
         """Load the z-lab/Qwen3.6-27B-DFlash drafter (NVFP4 W4A16).
 
@@ -11763,6 +11771,23 @@ class Qwen36TorchFrontendRtx:
             g_pf = self._ensure_graph_for_pos_nvfp4(p)
             self._replay_pos_graph(g_pf, p)
         return self._logits_buf.argmax(dim=-1, keepdim=True).view(1, 1)
+
+    def _dflash_window_commit(self, N: int) -> None:
+        """Append the committed rows' features to the per-token window.
+
+        Tap rows 0..N are the state-advanced verify rows
+        [tok, drafts[:N]], oldest first. Callers must invoke this
+        BEFORE the end-of-cycle taps[:, 0] shuffle, which overwrites
+        row 0 with row N.
+        """
+        from flash_rt.frontends.torch._qwen36_rtx_dflash_forward import (
+            pertoken_window_append,
+        )
+
+        R = N + 1
+        rows = self._dflash_buf['pt_taps_rows'][:R]
+        rows.copy_(self._dflash_taps_buf[:, :R].permute(1, 0, 2))
+        pertoken_window_append(self, rows)
 
     def _dflash_snap_state(self, cur_pos: int, Kv: int) -> None:
         """Arch hook: snapshot state the partial-accept rollback needs.
@@ -11972,7 +11997,6 @@ class Qwen36TorchFrontendRtx:
         if pertoken:
             from flash_rt.frontends.torch._qwen36_rtx_dflash_forward import (  # noqa: E501
                 alloc_pertoken_window,
-                pertoken_window_append,
                 reset_pertoken_window,
             )
             alloc_pertoken_window(
@@ -12088,9 +12112,6 @@ class Qwen36TorchFrontendRtx:
                         if len(generated) < max_new_tokens:
                             generated.append(argmax_at(j))
                     tok = argmax_at(K)
-                    # Move taps[K] -> taps[0] for next cycle
-                    self._dflash_taps_buf[:, 0].copy_(
-                        self._dflash_taps_buf[:, K])
                     cur_pos += Kv
                 else:
                     for j in range(N + 1):
@@ -12099,17 +12120,16 @@ class Qwen36TorchFrontendRtx:
                     self._dflash_partial_rollback(
                         cur_pos, N, Kv, tok, drafts, cos_KN, sin_KN)
                     tok = argmax_at(N)
-                    self._dflash_taps_buf[:, 0].copy_(
-                        self._dflash_taps_buf[:, N])
                     cur_pos += N + 1
                 if pertoken:
-                    # Window gains one feature per state-advanced row
-                    # (N+1 on partial accept, Kv on full accept).
-                    R = (Kv if N == K else N + 1)
-                    rows = self._dflash_buf['pt_taps_rows'][:R]
-                    rows.copy_(
-                        self._dflash_taps_buf[:, :R].permute(1, 0, 2))
-                    pertoken_window_append(self, rows)
+                    # Must precede the taps[:, 0] shuffle below — it
+                    # reads tap rows 0..N and the shuffle overwrites
+                    # row 0.
+                    self._dflash_window_commit(N)
+                # Move taps[N] -> taps[0] as the next drafter input
+                # (N == K on a full accept).
+                self._dflash_taps_buf[:, 0].copy_(
+                    self._dflash_taps_buf[:, N])
 
             if len(generated) > max_new_tokens:
                 generated = generated[:max_new_tokens]
