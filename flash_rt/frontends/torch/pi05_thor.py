@@ -25,6 +25,7 @@ from flash_rt.hardware.thor.shared_primitives import (
     encoder_forward_calibrate,
 )
 from flash_rt.models.pi05.pipeline_thor import (
+    Pi05ThorPipeline,
     decoder_forward,
     decoder_forward_calibrate,
 )
@@ -60,6 +61,49 @@ _cudart = ctypes.CDLL("libcudart.so")
 # ---------------------------------------------------------------------------
 
 from flash_rt.core.thor_frontend_utils import embed_prompt_torch as embed_prompt  # noqa: E402
+
+
+class _TorchTensorBuffer:
+    """CudaBuffer-compatible view over a stable CUDA torch.Tensor."""
+
+    def __init__(self, tensor: torch.Tensor):
+        if not tensor.is_cuda:
+            raise ValueError("runtime-export tensor buffer must be CUDA")
+        self.tensor = tensor.contiguous()
+        self.ptr = ctypes.c_void_p(int(self.tensor.data_ptr()))
+        self.nbytes = self.tensor.numel() * self.tensor.element_size()
+
+    def upload(self, arr: np.ndarray) -> None:
+        arr = np.ascontiguousarray(arr)
+        if arr.nbytes != self.nbytes:
+            raise ValueError(
+                f"upload size mismatch: {arr.nbytes} != {self.nbytes}")
+        _cudart.cudaMemcpy(
+            self.ptr, ctypes.c_void_p(arr.ctypes.data), self.nbytes, 1)
+
+    def download(self, arr: np.ndarray) -> None:
+        if arr.nbytes > self.nbytes:
+            raise ValueError(
+                f"download size mismatch: {arr.nbytes} > {self.nbytes}")
+        _cudart.cudaDeviceSynchronize()
+        _cudart.cudaMemcpy(
+            ctypes.c_void_p(arr.ctypes.data), self.ptr, arr.nbytes, 2)
+
+    def download_new(self, shape, dtype) -> np.ndarray:
+        arr = np.empty(shape, dtype=dtype)
+        self.download(arr)
+        return arr
+
+
+class _TorchGraphExport:
+    """Expose torch CUDAGraph with the field shape used by runtime_export."""
+
+    def __init__(self, graph: torch.cuda.CUDAGraph):
+        self._graph = graph
+        self._graph_exec = ctypes.c_void_p(int(graph.raw_cuda_graph_exec()))
+
+    def replay(self, stream=None):
+        self._graph.replay()
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +164,14 @@ class Pi05TorchFrontendThor:
         self.latency_records = []
         self.calibrated = False
         self.graph_captured = False
+        self.pipeline = Pi05ThorPipeline(batch_size=1)
+        self.pipeline.bind_runtime_owner(self)
+        self._model_runtime_full_graph = None
+        self._model_runtime_graph_stream = None
+        self._model_runtime_torch_stream = None
+        self._runtime_rtc_prev_action_chunk = None
+        self._runtime_rtc_prefix_weights = None
+        self._runtime_rtc_guidance_weight = None
         self._real_data_calibrated = False
         self.current_prompt_len = 0
         self._fixed_shape_active = False
@@ -1529,7 +1581,161 @@ class Pi05TorchFrontendThor:
                             use_fp8=self.use_fp8)
             self._enc_ae_graph.capture_end()
         torch.cuda.synchronize()
+        self._model_runtime_full_graph = None
         logger.info("Enc+AE CUDA graph captured (Se=%d)", Se)
+
+    def _capture_model_runtime_full_graph(self) -> None:
+        """Capture one full Pi0.5 Thor graph for model-runtime export."""
+        Se = self.Se
+        total_keys = self.total_keys
+        Le = self.Le; La = self.La; De = self.De; He = self.He
+        NHe = self.NHe; HDe = self.HDe
+        Sa = self.Sa; Da = self.Da; Ha = self.Ha
+
+        enc_bufs = {
+            'x':       self._enc_x.data_ptr(),
+            'x_fp8':   self._enc_x_fp8.data_ptr(),
+            'qkv':     self._enc_qkv_buf.data_ptr(),
+            'logits':  self._enc_logits.data_ptr(),
+            'attn_out': self._enc_attn.data_ptr(),
+            'o_fp8':   self._enc_o_fp8.data_ptr(),
+            'gate':    self._enc_gate.data_ptr(),
+            'hidden':  self._enc_hidden.data_ptr(),
+            'hid_fp8': self._enc_hid_fp8.data_ptr(),
+            'fg':      self._enc_fg.data_ptr(),
+            'ctx':     self._ctx,
+            'x_norm':  self._enc_attn.data_ptr(),
+            'ones':    (self._enc_ones_fp16.data_ptr()
+                        if self._enc_ones_fp16 is not None else 0),
+        }
+        enc_weights = {
+            'qkv_w':     [w.data_ptr() for w in self._enc_qkv_w],
+            'o_w':       [w.data_ptr() for w in self._enc_o_w],
+            'gate_w':    [w.data_ptr() for w in self._enc_gu_w],
+            'down_w':    [w.data_ptr() for w in self._enc_d_w],
+            'rope':      self._enc_rope.data_ptr(),
+            'Kc':        self._Kc.reshape(-1).data_ptr(),
+            'Vc':        self._Vc.reshape(-1).data_ptr(),
+            'act_scales':  self._enc_calib_scales.data_ptr(),
+            'alpha_host':  self._enc_alpha_host,
+        }
+        enc_dims = {
+            'Se': Se, 'D': De, 'H': He, 'NH': NHe, 'HD': HDe,
+            'L': Le, 'total_keys': total_keys,
+        }
+
+        ae_bufs = {
+            'noise':   self._g_noise.data_ptr(),
+            'x':       self._ae_x.data_ptr(),
+            'xn':      self._ae_xn.data_ptr(),
+            'gate':    self._ae_gate.data_ptr(),
+            'qkv':     self._ae_qkv.data_ptr(),
+            'logits':  self._ae_logits.data_ptr(),
+            'attn_out': self._ae_attn.data_ptr(),
+            'hid':     self._ae_hid.data_ptr(),
+            'fg':      self._ae_fg.data_ptr(),
+            'action_f32': self._ae_action_f32.data_ptr(),
+            'xn_fp8':  self._ae_xn_fp8.data_ptr(),
+            'hid_fp8': self._ae_hid_fp8.data_ptr(),
+            'ctx_fp8': self._ae_ctx_fp8.data_ptr(),
+        }
+        ae_weights = {
+            'ain_w':      self._ain_w.data_ptr(),
+            'ain_b':      self._ain_b.data_ptr(),
+            'sa':         self._sa_all.data_ptr(),
+            'qw':         self._dec_qkv_flat.data_ptr(),
+            'Kc':         self._Kc.reshape(-1).data_ptr(),
+            'Vc':         self._Vc.reshape(-1).data_ptr(),
+            'dec_devpos': self._attn.dec_devpos.data_ptr(),
+            'ow':         self._dec_o_flat.data_ptr(),
+            'sf':         self._sf_all.data_ptr(),
+            'gw':         self._dec_gu_flat.data_ptr(),
+            'dw':         self._dec_d_flat.data_ptr(),
+            'aow':        self._aow.data_ptr(),
+            'aob':        self._aob.data_ptr(),
+            'aob_dt':     self._aob_dt.data_ptr(),
+            'dt':         self._ae_dt,
+            'fs':         self._fs_all.data_ptr(),
+            'rope':       self._dec_rope.data_ptr(),
+            'w_scales':   self._ae_w_dev.data_ptr(),
+            'act_scales': self._ae_calib_scales.data_ptr(),
+        }
+        ae_dims = {
+            'S': Sa, 'D': Da, 'H': Ha, 'NH': 8, 'HD': 256,
+            'steps': 10, 'layers': La, 'enc_seq': Se,
+            'total_keys': total_keys,
+            'fixed_shape': self._fixed_shape_active,
+        }
+
+        def _run(stream_int):
+            self._patch_embed_ops(stream_int)
+            siglip_forward(self._gemm, fvk, self._sig_bufs,
+                           self._sig_weights, self._sig_dims,
+                           stream=stream_int, attn=self._attn,
+                           use_fp8=self.use_fp8)
+            self._postln_project_ops(stream_int)
+            self._Kc.zero_()
+            self._Vc.zero_()
+            encoder_forward(self._gemm, fvk, enc_bufs, enc_weights,
+                            enc_dims, stream=stream_int, attn=self._attn,
+                            use_fp8=self.use_fp8)
+            decoder_forward(self._ctx, fvk, ae_bufs, ae_weights,
+                            ae_dims, stream=stream_int, attn=self._attn,
+                            use_fp8=self.use_fp8)
+
+        for _ in range(3):
+            _run(0)
+        torch.cuda.synchronize()
+
+        stream = torch.cuda.Stream()
+        graph = torch.cuda.CUDAGraph()
+        stream_int = stream.cuda_stream
+        with torch.cuda.stream(stream):
+            graph.capture_begin()
+            _run(stream_int)
+            graph.capture_end()
+        torch.cuda.synchronize()
+
+        self._model_runtime_torch_stream = stream
+        self._model_runtime_graph_stream = ctypes.c_void_p(stream_int)
+        self._model_runtime_full_graph = _TorchGraphExport(graph)
+        logger.info("Pi0.5 Thor model-runtime full graph captured (Se=%d)", Se)
+
+    def _ensure_model_runtime_export(self) -> None:
+        if not self.graph_captured:
+            raise RuntimeError(
+                "Pi0.5 Thor export requires set_prompt()/predict() first")
+        if self._model_runtime_full_graph is None:
+            self._capture_model_runtime_full_graph()
+        if self._runtime_rtc_prev_action_chunk is None:
+            self._runtime_rtc_prev_action_chunk = CudaBuffer.device_empty(
+                self.Sa * 32, np.float16)
+            self._runtime_rtc_prefix_weights = CudaBuffer.device_empty(
+                self.Sa, np.float32)
+            self._runtime_rtc_guidance_weight = CudaBuffer.device_empty(
+                1, np.float32)
+
+        bufs = {
+            "observation_images_normalized": self._img_buf,
+            "diffusion_noise": _TorchTensorBuffer(self._g_noise),
+            "encoder_x": _TorchTensorBuffer(self._enc_x),
+            "rtc_prev_action_chunk": self._runtime_rtc_prev_action_chunk,
+            "rtc_prefix_weights": self._runtime_rtc_prefix_weights,
+            "rtc_guidance_weight": self._runtime_rtc_guidance_weight,
+        }
+        self.pipeline.bind_runtime_export(
+            graph=self._model_runtime_full_graph,
+            graph_stream=self._model_runtime_graph_stream,
+            bufs=bufs,
+            decoder_only_graph=None,
+            num_views=self.num_views,
+            max_prompt_len=getattr(self, "_S_lang", self.current_prompt_len),
+            chunk_size=self.Sa,
+            norm_stats=self.norm_stats,
+            use_fp8=self.use_fp8,
+            tensor_dtype="f16",
+            hardware="thor_sm110",
+        )
 
     def _capture_enc_ae_graph_b2(self):
         """Capture B=N encoder + decoder as a CUDA graph (Stage 2).

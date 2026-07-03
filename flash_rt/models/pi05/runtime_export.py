@@ -19,10 +19,13 @@ def exec_enable(pl) -> None:
     pl._exec_ctx = _frt.Ctx()
     pl._exec_gs_id = pl._exec_ctx.wrap_stream(int(pl._graph_stream.value))
     pl._exec_full = pl._exec_ctx.graph("pi05_infer", 1)
-    pl._exec_dec = pl._exec_ctx.graph("pi05_decode_only", 1)
+    has_decode_only = getattr(pl, "_decoder_only_graph", None) is not None
+    pl._exec_dec = (
+        pl._exec_ctx.graph("pi05_decode_only", 1)
+        if has_decode_only else None)
     if getattr(pl, "_graph", None) is not None:
         pl._exec_full.adopt(0, pl._graph._graph_exec.value)
-    if getattr(pl, "_decoder_only_graph", None) is not None:
+    if has_decode_only:
         pl._exec_dec.adopt(0, pl._decoder_only_graph._graph_exec.value)
     from flash_rt.subgraphs.capture import materialize_captured_graphs
     materialize_captured_graphs(pl)
@@ -207,6 +210,9 @@ def export_model_runtime(pl, identity=None, extra_regions=None,
 
 def _tensor_dtype(pl):
     """Device tensor dtype for Pi0.5 IO buffers."""
+    dtype = getattr(pl, "tensor_dtype", None)
+    if dtype:
+        return str(dtype)
     if type(pl).__name__.endswith("FP16"):
         return "f16"
     return "bf16"
@@ -244,10 +250,9 @@ def _parts(pl, identity, extra_regions):
     streams = [_rt.StreamSpec(
         "main", pl._exec_gs_id,
         native_handle=int(pl._graph_stream.value or 0))]
-    graphs = [
-        _rt.GraphSpec("infer", pl._exec_full, 0, (0,)),
-        _rt.GraphSpec("decode_only", pl._exec_dec, 0, (0,)),
-    ]
+    graphs = [_rt.GraphSpec("infer", pl._exec_full, 0, (0,))]
+    if getattr(pl, "_decoder_only_graph", None) is not None:
+        graphs.append(_rt.GraphSpec("decode_only", pl._exec_dec, 0, (0,)))
     from flash_rt.subgraphs.capture import export_graph_records
     for rec in export_graph_records(pl):
         graphs.append(_rt.GraphSpec(
@@ -280,10 +285,15 @@ def _parts(pl, identity, extra_regions):
     ident = {
         "model": "pi05",
         "pipeline": type(pl).__name__,
+        "hardware": str(getattr(pl, "hardware", "")),
+        "tensor_dtype": _tensor_dtype(pl),
         "use_fp8": str(bool(getattr(pl, "use_fp8", False))),
         "use_int8_decoder": str(bool(getattr(pl, "use_int8_decoder", False))),
         "num_views": str(getattr(pl, "num_views", "")),
         "max_prompt_len": str(getattr(pl, "max_prompt_len", "")),
+        "chunk_size": str(getattr(pl, "chunk_size", "")),
+        "model_action_dim": "32",
+        "robot_action_dim": str(_robot_action_dim(pl)),
     }
     ident.update({str(k): str(v) for k, v in (identity or {}).items()})
 

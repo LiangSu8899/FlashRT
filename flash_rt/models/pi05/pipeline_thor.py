@@ -23,6 +23,7 @@ Classes:
     Pi05ThorPipeline           — B=1 facade for SigLIP + enc_ae replay
 """
 
+import ctypes
 import math
 
 from flash_rt.hardware.thor.shared_primitives import (
@@ -530,6 +531,7 @@ class Pi05ThorPipeline:
                 f"Pi05ThorPipeline base class supports only B=1; got "
                 f"B={batch_size}. Use Pi05ThorBatchedPipeline for B>1.")
         self.batch_size = int(batch_size)
+        self._runtime_owner = None
 
     def run_pipeline(self, *, replay_siglip, replay_enc_ae) -> None:
         """Replay the captured SigLIP graph followed by enc_ae graph.
@@ -543,3 +545,96 @@ class Pi05ThorPipeline:
         """
         replay_siglip()
         replay_enc_ae()
+
+    def bind_runtime_owner(self, owner: object) -> None:
+        """Attach the frontend that owns Thor buffers and graph capture."""
+        self._runtime_owner = owner
+
+    def bind_runtime_export(
+            self, *, graph: object, graph_stream: object, bufs: dict,
+            decoder_only_graph: object | None = None,
+            num_views: int, max_prompt_len: int, chunk_size: int,
+            norm_stats=None, use_fp8: bool = True,
+            tensor_dtype: str = "f16", hardware: str = "thor_sm110") -> None:
+        """Bind the standard Pi0.5 runtime-export surface.
+
+        Thor frontends own the actual storage/capture. This facade exposes the
+        same producer attributes as the RTX pipeline so the shared
+        ``runtime_export.py`` contract can lower either hardware path without
+        hardware branches in C++ or Nexus.
+        """
+        self._graph = graph
+        self._decoder_only_graph = decoder_only_graph
+        self._graph_stream = graph_stream
+        self.bufs = dict(bufs)
+        self.num_views = int(num_views)
+        self.max_prompt_len = int(max_prompt_len)
+        self.chunk_size = int(chunk_size)
+        self.norm_stats = norm_stats or {}
+        self.use_fp8 = bool(use_fp8)
+        self.use_int8_decoder = False
+        self.tensor_dtype = str(tensor_dtype)
+        self.hardware = str(hardware)
+        self._cudart = ctypes.CDLL("libcudart.so")
+
+    def _ensure_runtime_export_ready(self) -> None:
+        owner = getattr(self, "_runtime_owner", None)
+        if owner is not None and hasattr(owner, "_ensure_model_runtime_export"):
+            owner._ensure_model_runtime_export()
+        if getattr(self, "_graph", None) is None:
+            raise RuntimeError(
+                "Pi05 Thor runtime export requires a captured full graph; "
+                "call set_prompt()/predict() before export")
+
+    @property
+    def input_images_buf(self):
+        return self.bufs["observation_images_normalized"]
+
+    @property
+    def input_noise_buf(self):
+        return self.bufs["diffusion_noise"]
+
+    @property
+    def input_encoder_x_buf(self):
+        return self.bufs["encoder_x"]
+
+    @property
+    def input_rtc_prev_action_chunk_buf(self):
+        return self.bufs["rtc_prev_action_chunk"]
+
+    @property
+    def input_rtc_prefix_weights_buf(self):
+        return self.bufs["rtc_prefix_weights"]
+
+    @property
+    def input_rtc_guidance_weight_buf(self):
+        return self.bufs["rtc_guidance_weight"]
+
+    def forward(self) -> int:
+        self._ensure_runtime_export_ready()
+        if getattr(self, "_use_exec", False):
+            rc = self._exec_full.replay(0, self._exec_gs_id)
+            if rc != 0:
+                raise RuntimeError(f"frt pi05 thor infer replay rc={rc}")
+        else:
+            self._graph.replay(self._graph_stream)
+        self._cudart.cudaStreamSynchronize(self._graph_stream)
+        return self.bufs["diffusion_noise"].ptr.value
+
+    def export_runtime(self, identity=None, extra_regions=None):
+        """Package the captured Thor pipeline as ``frt_runtime_export_v1``."""
+        self._ensure_runtime_export_ready()
+        from flash_rt.models.pi05.runtime_export import export_runtime
+        return export_runtime(self, identity=identity,
+                              extra_regions=extra_regions)
+
+    def export_model_runtime(self, identity=None, extra_regions=None,
+                             stage_plan="full", io="python",
+                             stage_plan_kwargs=None):
+        """Package the captured Thor pipeline as ``frt_model_runtime_v1``."""
+        self._ensure_runtime_export_ready()
+        from flash_rt.models.pi05.runtime_export import export_model_runtime
+        return export_model_runtime(self, identity=identity,
+                                    extra_regions=extra_regions,
+                                    stage_plan=stage_plan, io=io,
+                                    stage_plan_kwargs=stage_plan_kwargs)
