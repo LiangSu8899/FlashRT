@@ -167,8 +167,13 @@ class Pi05TorchFrontendThor:
         self.pipeline = Pi05ThorPipeline(batch_size=1)
         self.pipeline.bind_runtime_owner(self)
         self._model_runtime_full_graph = None
+        self._model_runtime_context_graph = None
+        self._model_runtime_decode_only_graph = None
+        self._model_runtime_rtc_prefix_graphs = {}
         self._model_runtime_graph_stream = None
         self._model_runtime_torch_stream = None
+        self._model_runtime_context_stream = None
+        self._model_runtime_decode_only_stream = None
         self._runtime_rtc_prev_action_chunk = None
         self._runtime_rtc_prefix_weights = None
         self._runtime_rtc_guidance_weight = None
@@ -1582,7 +1587,192 @@ class Pi05TorchFrontendThor:
             self._enc_ae_graph.capture_end()
         torch.cuda.synchronize()
         self._model_runtime_full_graph = None
+        self._model_runtime_context_graph = None
+        self._model_runtime_decode_only_graph = None
+        self._model_runtime_rtc_prefix_graphs = {}
+        self.pipeline._decoder_only_graph = None
         logger.info("Enc+AE CUDA graph captured (Se=%d)", Se)
+
+    def _runtime_encoder_spec(self):
+        Se = self.Se
+        total_keys = self.total_keys
+        Le = self.Le; De = self.De; He = self.He
+        NHe = self.NHe; HDe = self.HDe
+        enc_bufs = {
+            'x':       self._enc_x.data_ptr(),
+            'x_fp8':   self._enc_x_fp8.data_ptr(),
+            'qkv':     self._enc_qkv_buf.data_ptr(),
+            'logits':  self._enc_logits.data_ptr(),
+            'attn_out': self._enc_attn.data_ptr(),
+            'o_fp8':   self._enc_o_fp8.data_ptr(),
+            'gate':    self._enc_gate.data_ptr(),
+            'hidden':  self._enc_hidden.data_ptr(),
+            'hid_fp8': self._enc_hid_fp8.data_ptr(),
+            'fg':      self._enc_fg.data_ptr(),
+            'ctx':     self._ctx,
+            'x_norm':  self._enc_attn.data_ptr(),
+            'ones':    (self._enc_ones_fp16.data_ptr()
+                        if self._enc_ones_fp16 is not None else 0),
+        }
+        enc_weights = {
+            'qkv_w':     [w.data_ptr() for w in self._enc_qkv_w],
+            'o_w':       [w.data_ptr() for w in self._enc_o_w],
+            'gate_w':    [w.data_ptr() for w in self._enc_gu_w],
+            'down_w':    [w.data_ptr() for w in self._enc_d_w],
+            'rope':      self._enc_rope.data_ptr(),
+            'Kc':        self._Kc.reshape(-1).data_ptr(),
+            'Vc':        self._Vc.reshape(-1).data_ptr(),
+            'act_scales': self._enc_calib_scales.data_ptr(),
+            'alpha_host': self._enc_alpha_host,
+        }
+        enc_dims = {
+            'Se': Se, 'D': De, 'H': He, 'NH': NHe, 'HD': HDe,
+            'L': Le, 'total_keys': total_keys,
+        }
+        return enc_bufs, enc_weights, enc_dims
+
+    def _runtime_decoder_spec(self):
+        Se = self.Se
+        total_keys = self.total_keys
+        La = self.La
+        Sa = self.Sa; Da = self.Da; Ha = self.Ha
+        ae_bufs = {
+            'noise':   self._g_noise.data_ptr(),
+            'x':       self._ae_x.data_ptr(),
+            'xn':      self._ae_xn.data_ptr(),
+            'gate':    self._ae_gate.data_ptr(),
+            'qkv':     self._ae_qkv.data_ptr(),
+            'logits':  self._ae_logits.data_ptr(),
+            'attn_out': self._ae_attn.data_ptr(),
+            'hid':     self._ae_hid.data_ptr(),
+            'fg':      self._ae_fg.data_ptr(),
+            'action_f32': self._ae_action_f32.data_ptr(),
+            'xn_fp8':  self._ae_xn_fp8.data_ptr(),
+            'hid_fp8': self._ae_hid_fp8.data_ptr(),
+            'ctx_fp8': self._ae_ctx_fp8.data_ptr(),
+        }
+        if self._runtime_rtc_prev_action_chunk is not None:
+            ae_bufs['rtc_prev_action_chunk'] = (
+                self._runtime_rtc_prev_action_chunk.ptr.value)
+        ae_weights = {
+            'ain_w':      self._ain_w.data_ptr(),
+            'ain_b':      self._ain_b.data_ptr(),
+            'sa':         self._sa_all.data_ptr(),
+            'qw':         self._dec_qkv_flat.data_ptr(),
+            'Kc':         self._Kc.reshape(-1).data_ptr(),
+            'Vc':         self._Vc.reshape(-1).data_ptr(),
+            'dec_devpos': self._attn.dec_devpos.data_ptr(),
+            'ow':         self._dec_o_flat.data_ptr(),
+            'sf':         self._sf_all.data_ptr(),
+            'gw':         self._dec_gu_flat.data_ptr(),
+            'dw':         self._dec_d_flat.data_ptr(),
+            'aow':        self._aow.data_ptr(),
+            'aob':        self._aob.data_ptr(),
+            'aob_dt':     self._aob_dt.data_ptr(),
+            'dt':         self._ae_dt,
+            'fs':         self._fs_all.data_ptr(),
+            'rope':       self._dec_rope.data_ptr(),
+            'w_scales':   self._ae_w_dev.data_ptr(),
+            'act_scales': self._ae_calib_scales.data_ptr(),
+        }
+        ae_dims = {
+            'S': Sa, 'D': Da, 'H': Ha, 'NH': 8, 'HD': 256,
+            'steps': 10, 'layers': La, 'enc_seq': Se,
+            'total_keys': total_keys,
+            'fixed_shape': self._fixed_shape_active,
+        }
+        return ae_bufs, ae_weights, ae_dims
+
+    def _capture_runtime_graph(self, body, *, log_name: str):
+        for _ in range(3):
+            body(0)
+        torch.cuda.synchronize()
+
+        stream = torch.cuda.Stream()
+        graph = torch.cuda.CUDAGraph()
+        stream_int = stream.cuda_stream
+        with torch.cuda.stream(stream):
+            graph.capture_begin()
+            body(stream_int)
+            graph.capture_end()
+        torch.cuda.synchronize()
+        logger.info("Pi0.5 Thor model-runtime %s graph captured", log_name)
+        return stream, _TorchGraphExport(graph)
+
+    def _run_model_runtime_context(self, stream_int: int, enc_bufs,
+                                   enc_weights, enc_dims) -> None:
+        self._patch_embed_ops(stream_int)
+        siglip_forward(self._gemm, fvk, self._sig_bufs,
+                       self._sig_weights, self._sig_dims,
+                       stream=stream_int, attn=self._attn,
+                       use_fp8=self.use_fp8)
+        self._postln_project_ops(stream_int)
+        self._Kc.zero_()
+        self._Vc.zero_()
+        encoder_forward(self._gemm, fvk, enc_bufs, enc_weights,
+                        enc_dims, stream=stream_int, attn=self._attn,
+                        use_fp8=self.use_fp8)
+
+    def _run_model_runtime_decode(self, stream_int: int, ae_bufs,
+                                  ae_weights, ae_dims,
+                                  rtc_prefix_len: int = 0) -> None:
+        decoder_forward(self._ctx, fvk, ae_bufs, ae_weights,
+                        ae_dims, stream=stream_int, attn=self._attn,
+                        use_fp8=self.use_fp8,
+                        rtc_prefix_len=rtc_prefix_len)
+
+    def _capture_model_runtime_context_action_graphs(
+            self, pipeline, stream_handle, stream_int) -> None:
+        del stream_handle, stream_int
+        if getattr(self, "_model_runtime_context_graph", None) is None:
+            enc_bufs, enc_weights, enc_dims = self._runtime_encoder_spec()
+            stream, graph = self._capture_runtime_graph(
+                lambda s: self._run_model_runtime_context(
+                    s, enc_bufs, enc_weights, enc_dims),
+                log_name="context")
+            self._model_runtime_context_stream = stream
+            self._model_runtime_context_graph = graph
+            from flash_rt.subgraphs.capture import register_captured_graph
+            register_captured_graph(
+                pipeline, "context", graph, exec_name="pi05_thor_context",
+                stream="main", variants=(0,))
+
+        if getattr(self, "_model_runtime_decode_only_graph", None) is None:
+            ae_bufs, ae_weights, ae_dims = self._runtime_decoder_spec()
+            stream, graph = self._capture_runtime_graph(
+                lambda s: self._run_model_runtime_decode(
+                    s, ae_bufs, ae_weights, ae_dims),
+                log_name="decode_only")
+            self._model_runtime_decode_only_stream = stream
+            self._model_runtime_decode_only_graph = graph
+        pipeline._decoder_only_graph = self._model_runtime_decode_only_graph
+
+    def _capture_model_runtime_rtc_prefix_graph(
+            self, pipeline, stream_handle, stream_int, prefix_len: int) -> None:
+        del stream_handle, stream_int
+        prefix = int(prefix_len)
+        if prefix < 0:
+            raise ValueError("prefix_len must be >= 0")
+        if prefix > int(self.Sa):
+            raise ValueError(
+                f"prefix_len {prefix} exceeds chunk_size {self.Sa}")
+        cached = getattr(self, "_model_runtime_rtc_prefix_graphs", None)
+        if cached is None:
+            cached = {}
+            self._model_runtime_rtc_prefix_graphs = cached
+        if prefix in cached:
+            return
+        ae_bufs, ae_weights, ae_dims = self._runtime_decoder_spec()
+        stream, graph = self._capture_runtime_graph(
+            lambda s: self._run_model_runtime_decode(
+                s, ae_bufs, ae_weights, ae_dims, rtc_prefix_len=prefix),
+            log_name=f"decode_rtc_prefix_{prefix}")
+        cached[prefix] = (stream, graph)
+        from flash_rt.subgraphs.capture import register_captured_graph
+        register_captured_graph(
+            pipeline, "decode_rtc_prefix", graph,
+            exec_name=f"pi05_thor_decode_rtc_prefix_{prefix}",
+            stream="main", variants=(0,))
 
     def _capture_model_runtime_full_graph(self) -> None:
         """Capture one full Pi0.5 Thor graph for model-runtime export."""
