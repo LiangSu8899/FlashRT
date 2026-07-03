@@ -203,20 +203,19 @@ class Pi05TorchFrontendThor:
         self._gemm = fvk.GemmRunner()
 
         # ---- Load CUTLASS FMHA (compiled from csrc/attention/) ----
-        # Search order: next to the checkpoint, then the installed
-        # ``flash_rt/`` package dir (pip + editable installs land here via
-        # the ``package-data = ["*.so"]`` glob in pyproject.toml), then the
-        # uncopied ``build/`` output of a fresh cmake run, then the docker
-        # container convention ``/workspace/``.
+        # Search order: explicit override, next to the checkpoint, then the
+        # installed ``flash_rt/`` package dir (pip + editable installs land
+        # here via the ``package-data = ["*.so"]`` glob in pyproject.toml),
+        # then the uncopied ``build/`` output of a fresh cmake run.
         fmha_paths = [
+            os.environ.get("FLASHRT_FMHA_LIBRARY", ""),
             str(checkpoint_dir.parent / "libfmha_fp16_strided.so"),
             str(pathlib.Path(__file__).parent.parent.parent / "libfmha_fp16_strided.so"),
             str(pathlib.Path(__file__).parent.parent.parent.parent / "build" / "libfmha_fp16_strided.so"),
-            "/workspace/libfmha_fp16_strided.so",
         ]
         fmha_loaded = False
         for p in fmha_paths:
-            if pathlib.Path(p).exists():
+            if p and pathlib.Path(p).exists():
                 ret = fvk.load_fmha_strided_library(p)
                 if ret == 0:
                     fmha_loaded = True
@@ -250,10 +249,17 @@ class Pi05TorchFrontendThor:
             checkpoint_dir / "assets" / "physical-intelligence" / "libero" / "norm_stats.json",
             checkpoint_dir.parent / "pi05_libero" / "assets" / "physical-intelligence" / "libero" / "norm_stats.json",
             checkpoint_dir / "norm_stats.json",
-            pathlib.Path("/root/.cache/openpi/openpi-assets/checkpoints/pi05_libero/"
-                         "assets/physical-intelligence/libero/norm_stats.json"),
             *lerobot_candidates(checkpoint_dir),
         ]
+        openpi_assets_dir = os.environ.get("OPENPI_ASSETS_DIR")
+        if openpi_assets_dir:
+            root = pathlib.Path(openpi_assets_dir)
+            candidates.extend([
+                root / "checkpoints" / "pi05_libero" / "assets"
+                / "physical-intelligence" / "libero" / "norm_stats.json",
+                root / "pi05_libero" / "assets" / "physical-intelligence"
+                / "libero" / "norm_stats.json",
+            ])
         self.norm_stats = load_norm_stats(
             candidates, checkpoint_dir=checkpoint_dir)
 

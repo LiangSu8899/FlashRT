@@ -131,14 +131,15 @@ class Pi05JaxFrontendThor:
         if fmha_path is None:
             # Search order matches the torch Thor frontends: ckpt-adjacent,
             # ``flash_rt/`` package dir (pip / editable install target),
-            # fresh cmake ``build/`` output, docker ``/workspace/``.
+            # fresh cmake ``build/`` output. Use FLASHRT_FMHA_LIBRARY for an
+            # explicit out-of-tree location.
             _here = pathlib.Path(__file__)
-            for c in [str(checkpoint_dir.parent / 'libfmha_fp16_strided.so'),
+            for c in [os.environ.get('FLASHRT_FMHA_LIBRARY', ''),
+                      str(checkpoint_dir.parent / 'libfmha_fp16_strided.so'),
                       str(_here.parent.parent.parent / 'libfmha_fp16_strided.so'),
                       str(_here.parent.parent.parent.parent / 'build'
-                          / 'libfmha_fp16_strided.so'),
-                      '/workspace/libfmha_fp16_strided.so']:
-                if os.path.exists(c):
+                          / 'libfmha_fp16_strided.so')]:
+                if c and os.path.exists(c):
                     fmha_path = c
                     break
         if fmha_path:
