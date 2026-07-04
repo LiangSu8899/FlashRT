@@ -11772,6 +11772,33 @@ class Qwen36TorchFrontendRtx:
             self._replay_pos_graph(g_pf, p)
         return self._logits_buf.argmax(dim=-1, keepdim=True).view(1, 1)
 
+    @staticmethod
+    def _dflash_relaxed_matches(logits_K, drafts, all_argmax,
+                                topk: int, delta: float, close_id: int):
+        """Relaxed draft acceptance for the thinking phase.
+
+        A draft row is accepted when its token is inside the verify
+        logits' top-``topk`` AND within ``delta`` of the argmax logit
+        (a raw-logit margin equals a log-prob margin). Rows from the
+        first draft that closes the think block fall back to strict
+        argmax matching so the visible answer stays exact-verified.
+        Returns a 0/1 tensor of shape (K,).
+        """
+        import torch
+
+        K = int(drafts.shape[0])
+        topv, topi = torch.topk(logits_K, topk, dim=-1)
+        ok = (
+            (topi == drafts.view(K, 1))
+            & ((topv[:, :1] - topv) <= delta)
+        ).any(-1).long()
+        close_mask = drafts == close_id
+        if bool(close_mask.any().item()):
+            idx = int(close_mask.nonzero()[0].item())
+            strict = (all_argmax[:K] == drafts).long()
+            ok[idx:] = strict[idx:]
+        return ok
+
     def _dflash_window_commit(self, N: int) -> None:
         """Append the committed rows' features to the per-token window.
 
@@ -12002,6 +12029,34 @@ class Qwen36TorchFrontendRtx:
             alloc_pertoken_window(
                 self, int(getattr(self, '_dflash_pertoken_win', 128)))
             reset_pertoken_window(self)
+        # Relaxed acceptance for the thinking phase (opt-in; mirrors
+        # the TensorRT-LLM MTP policy): inside a <think> block a draft
+        # is accepted when it is in the verify logits' top-k AND within
+        # a logit margin of the argmax; the accepted token is then the
+        # DRAFT (rows already condition on drafts, so state/KV stay
+        # consistent). Rows from the first draft that closes the think
+        # block fall back to strict argmax matching. Default off — the
+        # strict path is byte-identical with this disabled.
+        relaxed = None
+        if os.environ.get(
+                'FLASHRT_QWEN36_DFLASH_RELAXED_THINKING', '0',
+        ).strip().lower() in ('1', 'true', 'on'):
+            think_open = self._tokenizer.convert_tokens_to_ids('<think>')
+            think_close = self._tokenizer.convert_tokens_to_ids('</think>')
+            if isinstance(think_open, int) and think_open >= 0:
+                relaxed = {
+                    'topk': max(1, int(os.environ.get(
+                        'FLASHRT_QWEN36_DFLASH_RELAXED_TOPK', '3'))),
+                    'delta': float(os.environ.get(
+                        'FLASHRT_QWEN36_DFLASH_RELAXED_DELTA', '1.0')),
+                    'open': int(think_open),
+                    'close': int(think_close),
+                }
+        # The chat template opens the think block at the end of the
+        # generation prompt, so the phase can start active.
+        in_think = bool(
+            relaxed is not None
+            and relaxed['open'] in input_ids[0, -8:].tolist())
         # Initialize taps to zero — first drafter call gets no real
         # signal; AL on cycle 0 will be lower than steady-state.
         self._dflash_taps_buf.zero_()
@@ -12094,7 +12149,14 @@ class Qwen36TorchFrontendRtx:
 
                 # 2d) Argmax + accept-prefix
                 all_argmax = logits_KN.argmax(dim=-1)        # (Kv,) long
-                matches = (all_argmax[:K] == drafts).long()
+                relaxed_cycle = relaxed is not None and in_think
+                if relaxed_cycle:
+                    matches = self._dflash_relaxed_matches(
+                        logits_KN[:K], drafts, all_argmax,
+                        relaxed['topk'], relaxed['delta'],
+                        relaxed['close'])
+                else:
+                    matches = (all_argmax[:K] == drafts).long()
                 matches_pad = torch.cat([
                     matches,
                     torch.zeros(1, device=matches.device,
@@ -12105,22 +12167,39 @@ class Qwen36TorchFrontendRtx:
                 self._spec_accepts += N
 
                 argmax_at = (lambda j: all_argmax[j:j + 1].view(1, 1))
+                if relaxed_cycle:
+                    # Accepted rows commit the DRAFT token (the verify
+                    # rows and per-step state condition on the drafts);
+                    # the bonus row commits the argmax as usual.
+                    commit_at = (lambda j: (
+                        drafts[j:j + 1].view(1, 1) if j < N
+                        else argmax_at(j)))
+                else:
+                    commit_at = argmax_at
 
                 if N == K:
                     self._spec_full += 1
                     for j in range(Kv):
                         if len(generated) < max_new_tokens:
-                            generated.append(argmax_at(j))
+                            generated.append(commit_at(j))
                     tok = argmax_at(K)
                     cur_pos += Kv
                 else:
                     for j in range(N + 1):
                         if len(generated) < max_new_tokens:
-                            generated.append(argmax_at(j))
+                            generated.append(commit_at(j))
                     self._dflash_partial_rollback(
                         cur_pos, N, Kv, tok, drafts, cos_KN, sin_KN)
                     tok = argmax_at(N)
                     cur_pos += N + 1
+                if relaxed is not None:
+                    ids = (drafts[:N].tolist() if N else [])
+                    ids.append(int(all_argmax[N].item()))
+                    for t in ids:
+                        if t == relaxed['open']:
+                            in_think = True
+                        elif t == relaxed['close']:
+                            in_think = False
                 if pertoken:
                     # Must precede the taps[:, 0] shuffle below — it
                     # reads tap rows 0..N and the shuffle overwrites

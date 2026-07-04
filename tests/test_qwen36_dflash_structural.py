@@ -152,3 +152,47 @@ def test_thor_pertoken_window_env_override(monkeypatch):
     monkeypatch.setenv("FLASHRT_QWEN36_DFLASH_WINDOW", "64")
     fe = _thor_drafter_load(monkeypatch)
     assert fe._dflash_pertoken_win == 64
+
+
+def _relaxed(logits, drafts, topk=3, delta=1.0, close_id=99):
+    all_argmax = logits.argmax(dim=-1)
+    return Qwen36TorchFrontendRtx._dflash_relaxed_matches(
+        logits, drafts, all_argmax, topk, delta, close_id)
+
+
+def test_relaxed_accepts_topk_within_margin():
+    # row 0: draft is argmax; row 1: draft is 2nd-best inside margin;
+    # row 2: draft is 2nd-best OUTSIDE margin; row 3: draft not in topk
+    logits = torch.tensor([
+        [5.0, 1.0, 0.0, 0.0],
+        [5.0, 4.5, 0.0, 0.0],
+        [5.0, 2.0, 0.0, 0.0],
+        [5.0, 4.9, 4.8, 4.7],
+    ])
+    drafts = torch.tensor([0, 1, 1, 3])
+    ok = _relaxed(logits, drafts, topk=3, delta=1.0)
+    assert ok.tolist() == [1, 1, 0, 0]
+
+
+def test_relaxed_strict_after_think_close():
+    # row 1 closes the think block -> rows 1+ require exact argmax
+    logits = torch.tensor([
+        [5.0, 4.5, 0.0, 0.0],
+        [5.0, 4.9, 0.0, 0.0],
+        [5.0, 4.9, 0.0, 0.0],
+    ])
+    drafts = torch.tensor([1, 2, 1])   # draft row 1 is close_id=2
+    ok = _relaxed(logits, drafts, topk=3, delta=1.0, close_id=2)
+    # row 0 relaxed-accepted; row 1 (close) strict: argmax=0 != 2 -> 0;
+    # row 2 strict: argmax=0 != 1 -> 0
+    assert ok.tolist() == [1, 0, 0]
+
+
+def test_relaxed_strict_rows_match_argmax():
+    logits = torch.tensor([
+        [5.0, 4.5, 0.0],
+        [1.0, 6.0, 0.0],
+    ])
+    drafts = torch.tensor([2, 1])      # row 0 closes -> strict from row 0
+    ok = _relaxed(logits, drafts, topk=3, delta=10.0, close_id=2)
+    assert ok.tolist() == [0, 1]
