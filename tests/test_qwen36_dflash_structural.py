@@ -87,15 +87,14 @@ def test_window_commit_full_accept_covers_all_rows(monkeypatch):
         seen[0][:, 0, 0], torch.arange(1.0, KV + 1))
 
 
-def test_generate_loop_commits_window_before_tap_shuffle():
-    src = inspect.getsource(
-        Qwen36TorchFrontendRtx.generate_own_speculative_DFlash_nvfp4)
-    commit = src.index("_dflash_window_commit")
-    shuffle = src.index(
-        "_dflash_taps_buf[:, 0].copy_", commit)
+def test_spec_loop_commits_window_before_tap_shuffle():
+    from flash_rt.frontends.torch.spec_session import SpecSession
+    src = inspect.getsource(SpecSession.step)
+    commit = src.index("drafter.commit")
+    shuffle = src.index("_dflash_taps_buf[:, 0].copy_", commit)
     assert commit < shuffle, (
-        "the per-token window must be committed before the taps[:, 0] "
-        "shuffle overwrites row 0")
+        "the drafter context commit must precede the taps[:, 0] "
+        "shuffle that overwrites row 0 (invariant I3)")
 
 
 def test_generate_fails_fast_without_drafter():
@@ -196,3 +195,84 @@ def test_relaxed_strict_rows_match_argmax():
     drafts = torch.tensor([2, 1])      # row 0 closes -> strict from row 0
     ok = _relaxed(logits, drafts, topk=3, delta=10.0, close_id=2)
     assert ok.tolist() == [0, 1]
+
+
+class _StubTok:
+    def convert_tokens_to_ids(self, t):
+        return {"<think>": 10, "</think>": 11}.get(t, -1)
+
+
+def _session_stub():
+    fe = Qwen36TorchFrontendRtx.__new__(Qwen36TorchFrontendRtx)
+
+    class _Weights:
+        ptrs = {"dflash": {"loaded": True}}
+
+    fe._weights = _Weights()
+    fe.MAX_Q_SEQ = 2048
+    fe._MAX_PUBLIC_SPEC_K = 15
+    fe._tokenizer = _StubTok()
+    return fe
+
+
+def test_session_policy_default_strict(monkeypatch):
+    from flash_rt.frontends.torch.spec_session import StrictArgmax
+    monkeypatch.delenv(
+        "FLASHRT_QWEN36_DFLASH_RELAXED_THINKING", raising=False)
+    fe = _session_stub()
+    session = fe.make_dflash_session(max_new_tokens=8, K=15)
+    assert isinstance(session.policy, StrictArgmax)
+
+
+def test_session_policy_relaxed_from_env(monkeypatch):
+    from flash_rt.frontends.torch.spec_session import RelaxedThinking
+    monkeypatch.setenv("FLASHRT_QWEN36_DFLASH_RELAXED_THINKING", "1")
+    monkeypatch.setenv("FLASHRT_QWEN36_DFLASH_RELAXED_TOPK", "5")
+    fe = _session_stub()
+    session = fe.make_dflash_session(max_new_tokens=8, K=15)
+    assert isinstance(session.policy, RelaxedThinking)
+    assert session.policy.topk == 5
+    assert session.policy.open_id == 10
+
+
+def test_relaxed_policy_phase_machine():
+    from flash_rt.frontends.torch.spec_session import RelaxedThinking
+    pol = RelaxedThinking(topk=3, delta=1.0, open_id=10, close_id=11)
+    pol.begin(torch.tensor([[1, 2, 10]]))       # prompt opens think
+    assert pol.in_think
+    # commit crossing </think> flips the phase off
+    pol.observe(1, torch.tensor([11, 5]), torch.tensor([11, 5, 7]))
+    assert not pol.in_think
+    # a later <think> re-opens it
+    pol.observe(1, torch.tensor([10, 5]), torch.tensor([10, 5, 7]))
+    assert pol.in_think
+
+
+def test_session_boundary_names():
+    fe = _session_stub()
+    fe._lin_state = torch.zeros(2)
+    fe._lin_conv_state = torch.zeros(2)
+    fe._dflash_taps_buf = torch.zeros(5, 4, HIDDEN)
+    fe._dflash_buf = {"pt_window": torch.zeros(4, HIDDEN),
+                      "pt_valid": 4}
+    session = fe.make_dflash_session(max_new_tokens=8, K=15)
+    b = session.boundary()
+    for key in ("cur_pos", "lin_state", "lin_conv_state",
+                "drafter_window", "taps_row0"):
+        assert key in b
+
+
+def test_session_interrupt_stops_before_step(monkeypatch):
+    from flash_rt.frontends.torch import spec_session as ss
+    fe = _session_stub()
+    session = fe.make_dflash_session(max_new_tokens=4, K=15)
+    calls = []
+    monkeypatch.setattr(
+        session, "begin", lambda ids: calls.append("begin"))
+    monkeypatch.setattr(
+        session, "step", lambda: calls.append("step"))
+    session.generated = [torch.zeros(1, 1, dtype=torch.long)]
+    session.request_interrupt()
+    out = session.generate(torch.zeros(1, 2, dtype=torch.long))
+    assert calls == ["begin"]
+    assert out.shape[1] == 3
