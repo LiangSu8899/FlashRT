@@ -206,28 +206,56 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
     # per-position sub-loop. Bit-exact to running K sequential single-
     # token forwards (see DESIGN §4.5 for the leaf-kernel set).
     def _layer_forward_lin_K_nvfp4(self, L, h_in_K, K):
-        # Delegate the whole save-steps range to parent, not just the
-        # fast-path max: parent's per-step recurrent branch is active
-        # for K <= _K_save_max, stays per-token-equivalent on SM110,
-        # and writes the per-step state checkpoints the DFlash
-        # partial-accept rollback reads (_K_save_max is grown to the
-        # DFlash verify q_seq at drafter load).
-        if K <= max(self._THOR_K_ROW_FAST_PATH_MAX, self._K_save_max):
+        # K <= 7 stays on parent's per-step branch — the production
+        # MTP spec verify path, untouched. The 8..16 band (DFlash
+        # verify) defaults to parent as well: greedy parity against
+        # the MTP reference is anchored to parent-family rounding, and
+        # a Thor-family verify measurably drifts from it. The opt-in
+        # chunk-saves route (FLASHRT_QWEN36_THOR_LIN_CHUNK_SAVES=1)
+        # trades that token-exact parity for ~5% lower verify cost
+        # (chunk kernels + per-step checkpoints in one pass) — for
+        # deployments gating on task-level quality instead.
+        if K <= self._THOR_K_ROW_FAST_PATH_MAX:
+            return super()._layer_forward_lin_K_nvfp4(L, h_in_K, K)
+        if K <= self._K_save_max:
+            if self._thor_lin_chunk_saves_enabled():
+                return self._thor_lin_K_forward(L, h_in_K, K)
             return super()._layer_forward_lin_K_nvfp4(L, h_in_K, K)
         if K > self.MAX_Q_SEQ:
             return self._thor_lin_K_dispatch(L, h_in_K, K)
         return self._thor_lin_K_forward(L, h_in_K, K)
 
+    def _thor_lin_chunk_saves_enabled(self) -> bool:
+        cached = getattr(self, '_thor_lin_saves_flag', None)
+        if cached is None:
+            from flash_rt import flash_rt_kernels as fvk
+
+            cached = (
+                hasattr(fvk, 'causal_conv1d_qwen36_update_chunk_saves_bf16')
+                and hasattr(
+                    fvk,
+                    'qwen36_gdn_chunk_from_conv_smem_strided_saves_bf16')
+                and os.environ.get(
+                    'FLASHRT_QWEN36_THOR_LIN_CHUNK_SAVES', '0',
+                ).strip().lower() in ('1', 'true', 'on'))
+            self._thor_lin_saves_flag = cached
+        return cached
+
     def _layer_forward_full_K_nvfp4(
             self, L, h_in_K, cos_K, sin_K, cur_pos, K):
-        # Delegate the whole save-steps range to parent, mirroring the
-        # lin dispatch above. The DFlash spec loop commits per-row
-        # state/KV from its S=16 verify (slot-copy rollback); rows must
-        # therefore come from the SAME kernel family as the K<=7 spec
-        # verifies, or the two paths' occasional rounding disagreements
-        # surface as greedy divergence (measured: bit-identical for ~39
-        # cycles, then a single full-attn row event cascades).
-        if K <= max(self._THOR_K_ROW_FAST_PATH_MAX, self._K_save_max):
+        # The verify must stay on ONE kernel family end to end: rows
+        # committed by one family while other rows (or the rollback
+        # checkpoints) come from another surface the families'
+        # occasional rounding disagreements as greedy divergence.
+        # K <= 7 (the production MTP verify) stays on parent. The
+        # 8..16 band follows the lin dispatch: Thor from-scratch when
+        # the chunk-saves kernels serve the lin layers, parent
+        # otherwise — mixing families across layer types measurably
+        # breaks greedy parity.
+        if K <= self._THOR_K_ROW_FAST_PATH_MAX:
+            return super()._layer_forward_full_K_nvfp4(
+                L, h_in_K, cos_K, sin_K, cur_pos, K)
+        if K <= self._K_save_max and not self._thor_lin_chunk_saves_enabled():
             return super()._layer_forward_full_K_nvfp4(
                 L, h_in_K, cos_K, sin_K, cur_pos, K)
         if K > self.MAX_Q_SEQ:
@@ -315,12 +343,28 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
         lin_rank = self._linear_layer_rank(L)
         conv_state = self._lin_conv_state[lin_rank]
         conv_out_K = self._K_lin_conv_out[:K]
-        fvk.causal_conv1d_qwen36_update_chunk_bf16(
-            out_qkv_K.data_ptr(), int(lw['conv1d_w']),
-            int(lw['conv1d_b']),
-            conv_out_K.data_ptr(), conv_state.data_ptr(),
-            1, K, 10240, 4, True, s,
-        )
+        # Inside the save-steps range, dump per-step state checkpoints
+        # for the spec-decode partial-accept rollback (same slots the
+        # parent per-step branch writes).
+        save_steps = (
+            K <= self._K_save_max and self._thor_lin_chunk_saves_enabled())
+        if save_steps:
+            conv_steps = self._K_lin_conv_state_per_step
+            fvk.causal_conv1d_qwen36_update_chunk_saves_bf16(
+                out_qkv_K.data_ptr(), int(lw['conv1d_w']),
+                int(lw['conv1d_b']),
+                conv_out_K.data_ptr(), conv_state.data_ptr(),
+                conv_steps[0, lin_rank].data_ptr(),
+                conv_steps.stride(0),
+                1, K, 10240, 4, True, s,
+            )
+        else:
+            fvk.causal_conv1d_qwen36_update_chunk_bf16(
+                out_qkv_K.data_ptr(), int(lw['conv1d_w']),
+                int(lw['conv1d_b']),
+                conv_out_K.data_ptr(), conv_state.data_ptr(),
+                1, K, 10240, 4, True, s,
+            )
 
         # (7-9) Fused conv_out -> split + Q/K broadcast + GDN gating
         # + GDN chunk recurrent in one launch. Replaces three separate
@@ -329,15 +373,29 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
         attn_out_K = self._K_lin_attn_out[:K]
         a_stride = a_vec_K.stride(0)
         b_stride = b_vec_K.stride(0)
-        fvk.qwen36_gdn_chunk_from_conv_smem_strided_bf16(
-            conv_out_K.data_ptr(),
-            a_vec_K.data_ptr(), b_vec_K.data_ptr(),
-            lw['neg_A_log_exp_fp32_t'].data_ptr(),
-            lw['dt_bias_fp32_t'].data_ptr(),
-            rec_state.data_ptr(),
-            attn_out_K.data_ptr(),
-            K, 48, a_stride, b_stride, True, s,
-        )
+        if save_steps:
+            lin_steps = self._K_lin_state_per_step
+            fvk.qwen36_gdn_chunk_from_conv_smem_strided_saves_bf16(
+                conv_out_K.data_ptr(),
+                a_vec_K.data_ptr(), b_vec_K.data_ptr(),
+                lw['neg_A_log_exp_fp32_t'].data_ptr(),
+                lw['dt_bias_fp32_t'].data_ptr(),
+                rec_state.data_ptr(),
+                lin_steps[0, lin_rank].data_ptr(),
+                lin_steps.stride(0),
+                attn_out_K.data_ptr(),
+                K, 48, a_stride, b_stride, True, s,
+            )
+        else:
+            fvk.qwen36_gdn_chunk_from_conv_smem_strided_bf16(
+                conv_out_K.data_ptr(),
+                a_vec_K.data_ptr(), b_vec_K.data_ptr(),
+                lw['neg_A_log_exp_fp32_t'].data_ptr(),
+                lw['dt_bias_fp32_t'].data_ptr(),
+                rec_state.data_ptr(),
+                attn_out_K.data_ptr(),
+                K, 48, a_stride, b_stride, True, s,
+            )
 
         # (10) rms_norm_gated_silu @ M=K*48, dim=128.
         attn_out_flat = attn_out_K.view(K * 48, 128)

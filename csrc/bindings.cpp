@@ -4157,6 +4157,25 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("B"), py::arg("S"), py::arg("conv_dim"), py::arg("k"),
         py::arg("apply_silu") = true, py::arg("stream") = 0);
 
+    m.def("causal_conv1d_qwen36_update_chunk_saves_bf16",
+        [](uintptr_t x, uintptr_t w, uintptr_t bias,
+           uintptr_t out, uintptr_t state,
+           uintptr_t state_steps, int64_t step_stride,
+           int B, int S, int conv_dim, int k, bool apply_silu,
+           uintptr_t stream) {
+            flash_rt::kernels::causal_conv1d_qwen36_update_chunk_saves_bf16(
+                to_ptr(x), to_ptr(w),
+                bias ? to_ptr(bias) : nullptr,
+                to_ptr(out), to_ptr(state),
+                to_ptr(state_steps), step_stride,
+                B, S, conv_dim, k, apply_silu, to_stream(stream));
+        },
+        py::arg("x"), py::arg("w"), py::arg("bias"),
+        py::arg("out"), py::arg("state"),
+        py::arg("state_steps"), py::arg("step_stride"),
+        py::arg("B"), py::arg("S"), py::arg("conv_dim"), py::arg("k"),
+        py::arg("apply_silu") = true, py::arg("stream") = 0);
+
     m.def("causal_conv1d_qwen36_update_chunk_parallel_bf16",
         [](uintptr_t x, uintptr_t w, uintptr_t bias,
            uintptr_t out, uintptr_t state,
@@ -4872,6 +4891,31 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("conv_out"), py::arg("a"), py::arg("b"),
         py::arg("neg_exp_A_log"), py::arg("dt_bias"),
         py::arg("state"), py::arg("out"),
+        py::arg("S"), py::arg("num_v_heads"),
+        py::arg("a_stride"), py::arg("b_stride"),
+        py::arg("use_qk_l2norm") = true, py::arg("stream") = 0);
+
+    m.def("qwen36_gdn_chunk_from_conv_smem_strided_saves_bf16",
+        [](uintptr_t conv_out, uintptr_t a, uintptr_t b,
+           uintptr_t neg_exp_A_log, uintptr_t dt_bias,
+           uintptr_t state, uintptr_t state_steps, int64_t step_stride,
+           uintptr_t out,
+           int S, int num_v_heads, int a_stride, int b_stride,
+           bool use_qk_l2norm, uintptr_t stream) {
+            flash_rt::kernels::
+                qwen36_gdn_chunk_from_conv_smem_strided_saves_bf16(
+                    to_ptr(conv_out), to_ptr(a), to_ptr(b),
+                    reinterpret_cast<const float*>(neg_exp_A_log),
+                    reinterpret_cast<const float*>(dt_bias),
+                    to_ptr(state), to_ptr(state_steps), step_stride,
+                    to_ptr(out),
+                    S, num_v_heads, a_stride, b_stride,
+                    use_qk_l2norm, to_stream(stream));
+        },
+        py::arg("conv_out"), py::arg("a"), py::arg("b"),
+        py::arg("neg_exp_A_log"), py::arg("dt_bias"),
+        py::arg("state"), py::arg("state_steps"),
+        py::arg("step_stride"), py::arg("out"),
         py::arg("S"), py::arg("num_v_heads"),
         py::arg("a_stride"), py::arg("b_stride"),
         py::arg("use_qk_l2norm") = true, py::arg("stream") = 0);

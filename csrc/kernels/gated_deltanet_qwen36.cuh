@@ -216,6 +216,26 @@ void qwen36_gdn_chunk_from_conv_smem_strided_bf16(
     bool use_qk_l2norm,
     cudaStream_t stream);
 
+// Chunk variant with per-step state checkpoints: dumps the post-step
+// (bf16-rounded) recurrent state to state_steps + s * step_stride for
+// every step s, for the spec-decode partial-accept rollback.
+void qwen36_gdn_chunk_from_conv_smem_strided_saves_bf16(
+    const void* conv_out,
+    const void* a,
+    const void* b,
+    const float* neg_exp_A_log,
+    const float* dt_bias,
+    void*       state,
+    void*       state_steps,
+    int64_t     step_stride,
+    void*       out,
+    int S,
+    int num_v_heads,
+    int a_stride,
+    int b_stride,
+    bool use_qk_l2norm,
+    cudaStream_t stream);
+
 // Chunk/WY Gated DeltaNet building blocks. These are the native
 // FlashRT replacement path for the Python/Triton FLA chunk implementation.
 // First specialization targets Qwen3.6 shapes:
