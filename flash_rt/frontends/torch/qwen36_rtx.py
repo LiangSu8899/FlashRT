@@ -11775,29 +11775,12 @@ class Qwen36TorchFrontendRtx:
     @staticmethod
     def _dflash_relaxed_matches(logits_K, drafts, all_argmax,
                                 topk: int, delta: float, close_id: int):
-        """Relaxed draft acceptance for the thinking phase.
+        """Relaxed thinking-phase acceptance; the math lives on the
+        acceptance policy (see spec_session.RelaxedThinking)."""
+        from flash_rt.frontends.torch.spec_session import RelaxedThinking
 
-        A draft row is accepted when its token is inside the verify
-        logits' top-``topk`` AND within ``delta`` of the argmax logit
-        (a raw-logit margin equals a log-prob margin). Rows from the
-        first draft that closes the think block fall back to strict
-        argmax matching so the visible answer stays exact-verified.
-        Returns a 0/1 tensor of shape (K,).
-        """
-        import torch
-
-        K = int(drafts.shape[0])
-        topv, topi = torch.topk(logits_K, topk, dim=-1)
-        ok = (
-            (topi == drafts.view(K, 1))
-            & ((topv[:, :1] - topv) <= delta)
-        ).any(-1).long()
-        close_mask = drafts == close_id
-        if bool(close_mask.any().item()):
-            idx = int(close_mask.nonzero()[0].item())
-            strict = (all_argmax[:K] == drafts).long()
-            ok[idx:] = strict[idx:]
-        return ok
+        return RelaxedThinking.relaxed_matches(
+            logits_K, drafts, all_argmax, topk, delta, close_id)
 
     def _dflash_window_commit(self, N: int) -> None:
         """Append the committed rows' features to the per-token window.
@@ -11990,11 +11973,24 @@ class Qwen36TorchFrontendRtx:
         Returns:
             (1, prompt_len + N) cuda long, trimmed to max_new_tokens.
         """
-        import torch
+        session = self.make_dflash_session(
+            max_new_tokens=max_new_tokens, K=K)
+        return session.generate(input_ids)
 
-        from flash_rt.frontends.torch._qwen36_rtx_dflash_forward import (
-            alloc_drafter_capture_window,
-            reset_drafter_capture_state,
+    def make_dflash_session(self, *, max_new_tokens: int, K: int = 15):
+        """Build a SpecSession for the DFlash path.
+
+        The session exposes the step()-granular drive surface and the
+        boundary() named-buffer set; ``generate_own_speculative_DFlash_
+        nvfp4`` is its one-shot wrapper. The acceptance policy comes
+        from the environment (strict by default; relaxed thinking via
+        FLASHRT_QWEN36_DFLASH_RELAXED_THINKING).
+        """
+        from flash_rt.frontends.torch.spec_session import (
+            DFlashBlockDrafter,
+            RelaxedThinking,
+            SpecSession,
+            StrictArgmax,
         )
 
         if self._weights.ptrs.get('dflash') is None:
@@ -12006,214 +12002,12 @@ class Qwen36TorchFrontendRtx:
             raise ValueError(
                 f'K={K} out of range — need 1<=K<={max_spec_k}')
 
-        prompt_len = int(input_ids.shape[1])
-
-        self.reset_state()
-        if not hasattr(self, '_rope_cos_table'):
-            self._build_rope_table()
-        # P7: prepare capture window (eff_ctx-sized shift buffer) and
-        # clear shift state. eff_ctx defaults to 16 (sweet spot per P5).
-        eff_ctx = int(getattr(self, '_dflash_eff_ctx', 16))
-        alloc_drafter_capture_window(self, eff_ctx)
-        reset_drafter_capture_state(self)
-        # Per-token window mode: the drafter attends to fc-projected
-        # features of every committed token instead of one entry per
-        # spec cycle. The prefill hook may seed the window from the
-        # prompt tail.
-        pertoken = bool(getattr(self, '_dflash_pertoken_window', False))
-        if pertoken:
-            from flash_rt.frontends.torch._qwen36_rtx_dflash_forward import (  # noqa: E501
-                alloc_pertoken_window,
-                reset_pertoken_window,
-            )
-            alloc_pertoken_window(
-                self, int(getattr(self, '_dflash_pertoken_win', 128)))
-            reset_pertoken_window(self)
-        # Relaxed acceptance for the thinking phase (opt-in; mirrors
-        # the TensorRT-LLM MTP policy): inside a <think> block a draft
-        # is accepted when it is in the verify logits' top-k AND within
-        # a logit margin of the argmax; the accepted token is then the
-        # DRAFT (rows already condition on drafts, so state/KV stay
-        # consistent). Rows from the first draft that closes the think
-        # block fall back to strict argmax matching. Default off — the
-        # strict path is byte-identical with this disabled.
-        relaxed = None
-        if os.environ.get(
-                'FLASHRT_QWEN36_DFLASH_RELAXED_THINKING', '0',
-        ).strip().lower() in ('1', 'true', 'on'):
-            think_open = self._tokenizer.convert_tokens_to_ids('<think>')
-            think_close = self._tokenizer.convert_tokens_to_ids('</think>')
-            if isinstance(think_open, int) and think_open >= 0:
-                relaxed = {
-                    'topk': max(1, int(os.environ.get(
-                        'FLASHRT_QWEN36_DFLASH_RELAXED_TOPK', '3'))),
-                    'delta': float(os.environ.get(
-                        'FLASHRT_QWEN36_DFLASH_RELAXED_DELTA', '1.0')),
-                    'open': int(think_open),
-                    'close': int(think_close),
-                }
-        # The chat template opens the think block at the end of the
-        # generation prompt, so the phase can start active.
-        in_think = bool(
-            relaxed is not None
-            and relaxed['open'] in input_ids[0, -8:].tolist())
-        # Initialize taps to zero — first drafter call gets no real
-        # signal; AL on cycle 0 will be lower than steady-state.
-        self._dflash_taps_buf.zero_()
-
-        with torch.no_grad():
-            # 1) Prefill via the arch hook (default: sequential S=1
-            # forwards through the per-cur_pos captured graphs).
-            tok = self._dflash_prefill_nvfp4(input_ids)
-            generated = [tok]
-            cur_pos = prompt_len
-
-            self._spec_attempts = 0
-            self._spec_accepts = 0
-            self._spec_full = 0
-
-            d = self._rope_dim
-            Kv = K + 1
-
-            # 2) Spec decode loop
-            while len(generated) < max_new_tokens:
-                # 2a) Snap main state (overlap with drafter on default).
-                snap_stream = self._snap_stream
-                snap_stream.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(snap_stream):
-                    self._dflash_snap_state(cur_pos, Kv)
-
-                # 2b) Drafter forward (P7).
-                # Caller writes static inputs (prev_token + hidden_taps).
-                # During ramp-up (first eff_ctx cycles) the window is
-                # not yet fully populated -> use eager forward with the
-                # actual valid_ctx so attention only sees real history
-                # (avoids zero-dilution that hurts AL). Once the window
-                # is full, replay the captured graph.
-                self._dflash_buf['ids_static'][0:1].copy_(tok.view(1))
-                if pertoken:
-                    valid = int(self._dflash_buf['pt_valid'])
-                    if valid < int(self._dflash_buf['pt_win']):
-                        from flash_rt.frontends.torch._qwen36_rtx_dflash_forward import (  # noqa: E501
-                            dflash_drafter_forward_pertoken,
-                        )
-                        dflash_drafter_forward_pertoken(
-                            self, max(1, valid))
-                    else:
-                        drafter_g = (
-                            self._ensure_drafter_graph_dflash_pertoken())
-                        drafter_g.replay()
-                elif self._spec_attempts < eff_ctx:
-                    from flash_rt.frontends.torch._qwen36_rtx_dflash_forward import (  # noqa: E501
-                        dflash_drafter_forward_capture_eager,
-                    )
-                    self._dflash_buf['hidden_taps_static'].copy_(
-                        self._dflash_taps_buf[:, 0])
-                    valid_ctx = self._spec_attempts + 1
-                    dflash_drafter_forward_capture_eager(self, valid_ctx)
-                else:
-                    self._dflash_buf['hidden_taps_static'].copy_(
-                        self._dflash_taps_buf[:, 0])
-                    drafter_g = self._ensure_drafter_graph_dflash_nvfp4(
-                        eff_ctx)
-                    drafter_g.replay()
-                draft_logits = self._dflash_buf['logits']
-                draft_tokens = draft_logits.argmax(dim=-1)   # (16,)
-                # block_size=16 layout: input[0]=prev_token (verify of
-                # self, position cur_pos-1), input[1..15]=MASK (positions
-                # cur_pos..cur_pos+14). draft output[i] predicts position
-                # cur_pos-1+i; we want predictions of cur_pos..cur_pos+K-1
-                # so take output[1:K+1].
-                drafts = draft_tokens[1:K + 1]               # (K,)
-
-                # Wait for snap before verify mutates state.
-                torch.cuda.current_stream().wait_stream(snap_stream)
-
-                # 2c) Main verify (S=K+1=16) WITH tap capture.
-                cos_KN = self._rope_cos_table[
-                    cur_pos:cur_pos + Kv].view(1, Kv, d)
-                sin_KN = self._rope_sin_table[
-                    cur_pos:cur_pos + Kv].view(1, Kv, d)
-                self._verify_static_tokens[:, 0:1].copy_(tok)
-                self._verify_static_tokens[:, 1:Kv].copy_(
-                    drafts.view(1, K))
-                self._verify_static_cos[:, :Kv].copy_(cos_KN)
-                self._verify_static_sin[:, :Kv].copy_(sin_KN)
-                vg = self._ensure_verify_graph_dflash_nvfp4(cur_pos, Kv)
-                gs = self._graph_stream
-                gs.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(gs):
-                    vg.replay()
-                torch.cuda.current_stream().wait_stream(gs)
-                logits_KN = self._K_logits_buf[:Kv]
-
-                # 2d) Argmax + accept-prefix
-                all_argmax = logits_KN.argmax(dim=-1)        # (Kv,) long
-                relaxed_cycle = relaxed is not None and in_think
-                if relaxed_cycle:
-                    matches = self._dflash_relaxed_matches(
-                        logits_KN[:K], drafts, all_argmax,
-                        relaxed['topk'], relaxed['delta'],
-                        relaxed['close'])
-                else:
-                    matches = (all_argmax[:K] == drafts).long()
-                matches_pad = torch.cat([
-                    matches,
-                    torch.zeros(1, device=matches.device,
-                                dtype=matches.dtype),
-                ])
-                N = int(matches_pad.argmin().item())
-                self._spec_attempts += 1
-                self._spec_accepts += N
-
-                argmax_at = (lambda j: all_argmax[j:j + 1].view(1, 1))
-                if relaxed_cycle:
-                    # Accepted rows commit the DRAFT token (the verify
-                    # rows and per-step state condition on the drafts);
-                    # the bonus row commits the argmax as usual.
-                    commit_at = (lambda j: (
-                        drafts[j:j + 1].view(1, 1) if j < N
-                        else argmax_at(j)))
-                else:
-                    commit_at = argmax_at
-
-                if N == K:
-                    self._spec_full += 1
-                    for j in range(Kv):
-                        if len(generated) < max_new_tokens:
-                            generated.append(commit_at(j))
-                    tok = argmax_at(K)
-                    cur_pos += Kv
-                else:
-                    for j in range(N + 1):
-                        if len(generated) < max_new_tokens:
-                            generated.append(commit_at(j))
-                    self._dflash_partial_rollback(
-                        cur_pos, N, Kv, tok, drafts, cos_KN, sin_KN)
-                    tok = argmax_at(N)
-                    cur_pos += N + 1
-                if relaxed is not None:
-                    ids = (drafts[:N].tolist() if N else [])
-                    ids.append(int(all_argmax[N].item()))
-                    for t in ids:
-                        if t == relaxed['open']:
-                            in_think = True
-                        elif t == relaxed['close']:
-                            in_think = False
-                if pertoken:
-                    # Must precede the taps[:, 0] shuffle below — it
-                    # reads tap rows 0..N and the shuffle overwrites
-                    # row 0.
-                    self._dflash_window_commit(N)
-                # Move taps[N] -> taps[0] as the next drafter input
-                # (N == K on a full accept).
-                self._dflash_taps_buf[:, 0].copy_(
-                    self._dflash_taps_buf[:, N])
-
-            if len(generated) > max_new_tokens:
-                generated = generated[:max_new_tokens]
-
-        return torch.cat([input_ids] + generated, dim=1)
+        policy = RelaxedThinking.from_env(self._tokenizer)
+        if policy is None:
+            policy = StrictArgmax()
+        return SpecSession(
+            self, DFlashBlockDrafter(self, K), policy,
+            max_new_tokens=max_new_tokens)
 
     def _layer_types(self) -> list:
         """Source-agnostic layer_types accessor (works for both quant paths)."""
