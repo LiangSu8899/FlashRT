@@ -106,6 +106,39 @@ Output quality is lossless: the verify pass is the greedy ground
 truth, and generated tokens are byte-identical to the FP8-KV MTP
 reference on all measured prompts.
 
+## Relaxed thinking-phase acceptance (opt-in)
+
+Qwen3.6 reasons inside a `<think>` block before answering, and the
+thinking stream dominates the token budget. Mirroring the
+TensorRT-LLM MTP policy, relaxed acceptance treats a draft as accepted
+inside the think block when it is in the verify logits' top-k and
+within a logit margin of the argmax; the accepted token is the draft
+itself. Rows from the first draft that closes the think block fall
+back to strict matching, so everything after `</think>` — the visible
+answer — remains exact-verified greedy.
+
+| Env | Default | Meaning |
+|---|---|---|
+| `FLASHRT_QWEN36_DFLASH_RELAXED_THINKING` | `0` | Enable relaxed acceptance inside `<think>`. |
+| `FLASHRT_QWEN36_DFLASH_RELAXED_TOPK` | `3` | Candidate set size. |
+| `FLASHRT_QWEN36_DFLASH_RELAXED_DELTA` | `1.0` | Logit margin vs the argmax (equals a log-prob margin). |
+
+Measured on Thor (thinking-enabled robot JSON-plan prompt, steady
+state): AL 3.78 -> 5.42, **40.4 -> 57.7 tok/s (+43%)**. Prompts whose
+drafts rarely reach the top-k see no change (a math prompt measured
+neutral). The thinking stream is no longer token-identical to the
+strict run — enable this only where the product gates on the final
+answer, not the reasoning transcript.
+
+## Opt-in chunk-saves verify kernels (Thor)
+
+`FLASHRT_QWEN36_THOR_LIN_CHUNK_SAVES=1` routes the DFlash verify's
+linear-attention layers to chunk kernels that emit the per-step
+rollback checkpoints in one pass (~5% lower cycle time). This moves
+the verify off the kernel family that the MTP reference path uses, so
+greedy output is no longer token-identical to that reference — same
+tradeoff class as relaxed acceptance. Default off.
+
 ## Serving
 
 A stateless OpenAI-compatible host for this path lives in
