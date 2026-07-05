@@ -70,11 +70,36 @@ def _summary(rows):
     }
 
 
+def _resolve_frontend_name(name: str) -> str:
+    if name == "auto":
+        import torch
+
+        cap = torch.cuda.get_device_capability(0)
+        return "thor" if cap == (11, 0) else "rtx"
+    return name
+
+
+def _frontend_cls(name: str):
+    name = _resolve_frontend_name(name)
+    if name == "thor":
+        from flash_rt.frontends.torch.qwen36_thor import (
+            Qwen36TorchFrontendThor,
+        )
+
+        return Qwen36TorchFrontendThor
+    if name == "rtx":
+        from flash_rt.frontends.torch.qwen36_rtx import (
+            Qwen36TorchFrontendRtx,
+        )
+
+        return Qwen36TorchFrontendRtx
+    raise ValueError(f"unknown frontend {name!r}")
+
+
 def _bench_mtp(args, case: Case):
     import torch
-    from flash_rt.frontends.torch.qwen36_rtx import Qwen36TorchFrontendRtx
 
-    fe = Qwen36TorchFrontendRtx(
+    fe = _frontend_cls(args.frontend)(
         args.checkpoint, quant="nvfp4", max_seq=args.max_seq)
     ids = _input_ids(fe, case)
 
@@ -106,9 +131,8 @@ def _bench_mtp(args, case: Case):
 
 def _bench_dflash(args, case: Case):
     import torch
-    from flash_rt.frontends.torch.qwen36_rtx import Qwen36TorchFrontendRtx
 
-    fe = Qwen36TorchFrontendRtx(
+    fe = _frontend_cls(args.frontend)(
         args.checkpoint, quant="nvfp4", max_seq=args.max_seq)
     fe.init_dflash_drafter(args.dflash_checkpoint or None)
     ids = _input_ids(fe, case)
@@ -163,6 +187,9 @@ def main() -> int:
     parser.add_argument("--max-seq", type=int, default=2048)
     parser.add_argument("--mtp-k", type=int, default=6)
     parser.add_argument("--dflash-k", type=int, default=15)
+    parser.add_argument(
+        "--frontend", choices=("auto", "thor", "rtx"), default="auto",
+        help="frontend implementation; auto selects Thor on SM110")
     parser.add_argument("--repeats", type=int, default=3)
     args = parser.parse_args()
 
@@ -208,6 +235,8 @@ def main() -> int:
     print(json.dumps({
         "device": torch.cuda.get_device_name(0),
         "capability": torch.cuda.get_device_capability(0),
+        "frontend": args.frontend,
+        "resolved_frontend": _resolve_frontend_name(args.frontend),
         "metric": (
             "decode-active tok/s = (new_tokens - 1) * 1000 / decode_ms; "
             "prefill excluded"),
