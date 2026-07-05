@@ -378,7 +378,7 @@ from flash_rt.runtime.rtc import (
 )
 ```
 
-RTC-lite is a beta inference scheduling utility for action-chunk
+The legacy async chunk runner is a beta inference scheduling utility for action-chunk
 policies. It does not change model numerics or calibration; it only
 serves action chunks at a fixed controller rate while a background worker
 prepares the next chunk. See `docs/rtc_lite_design.md`.

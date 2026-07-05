@@ -29,6 +29,7 @@ from flash_rt.hardware.thor.shared_primitives import (
     encoder_forward_calibrate,
 )
 from flash_rt.models.pi05.pipeline_thor import (
+    Pi05ThorPipeline,
     decoder_forward,
     decoder_forward_calibrate,
 )
@@ -82,6 +83,12 @@ class Pi05JaxFrontendThor:
 
         checkpoint_dir = pathlib.Path(checkpoint_dir)
         self.use_fp8 = bool(use_fp8)
+        self.pipeline = Pi05ThorPipeline(batch_size=1)
+        self.pipeline.bind_runtime_owner(self)
+        self._model_runtime_full_graph = None
+        self._runtime_rtc_prev_action_chunk = None
+        self._runtime_rtc_prefix_weights = None
+        self._runtime_rtc_guidance_weight = None
         mode = os.environ.get("FLASHRT_PI05_STATE_PROMPT_MODE",
                               state_prompt_mode)
         if mode not in ("exact", "fixed"):
@@ -124,14 +131,15 @@ class Pi05JaxFrontendThor:
         if fmha_path is None:
             # Search order matches the torch Thor frontends: ckpt-adjacent,
             # ``flash_rt/`` package dir (pip / editable install target),
-            # fresh cmake ``build/`` output, docker ``/workspace/``.
+            # fresh cmake ``build/`` output. Use FLASHRT_FMHA_LIBRARY for an
+            # explicit out-of-tree location.
             _here = pathlib.Path(__file__)
-            for c in [str(checkpoint_dir.parent / 'libfmha_fp16_strided.so'),
+            for c in [os.environ.get('FLASHRT_FMHA_LIBRARY', ''),
+                      str(checkpoint_dir.parent / 'libfmha_fp16_strided.so'),
                       str(_here.parent.parent.parent / 'libfmha_fp16_strided.so'),
                       str(_here.parent.parent.parent.parent / 'build'
-                          / 'libfmha_fp16_strided.so'),
-                      '/workspace/libfmha_fp16_strided.so']:
-                if os.path.exists(c):
+                          / 'libfmha_fp16_strided.so')]:
+                if c and os.path.exists(c):
                     fmha_path = c
                     break
         if fmha_path:
@@ -1286,7 +1294,81 @@ class Pi05JaxFrontendThor:
         _run(stream_int)
         self.enc_ae_graph.end_capture(stream)
         _cudart.cudaStreamSynchronize(stream)
+        self._model_runtime_full_graph = None
         logger.info(f"Enc+AE CUDA Graph captured (Se={self.Se})")
+
+    def _capture_model_runtime_full_graph(self) -> None:
+        """Capture one full Pi0.5 Thor graph for model-runtime export."""
+        from flash_rt.core.cuda_graph import CUDAGraph
+
+        stream = self._stream
+        cudart = self._cudart
+        stream_int = stream.value or 0
+        (sig_bufs, sig_weights, sig_dims,
+         postln_bufs, postln_weights, postln_dims) = (
+            self._build_siglip_call_specs())
+        enc_bufs, enc_weights, enc_dims = self._build_enc_dicts(stream_int)
+        ae_bufs, ae_weights, ae_dims = self._build_ae_dicts(stream_int)
+
+        def _run(st):
+            self._run_siglip(st, sig_bufs, sig_weights, sig_dims,
+                             postln_bufs, postln_weights, postln_dims)
+            self.Kc.zero_(stream)
+            self.Vc.zero_(stream)
+            encoder_forward(self._gemm, self._fvk, enc_bufs, enc_weights,
+                            enc_dims, st, attn=self._attn)
+            decoder_forward(self._ctx, self._fvk, ae_bufs, ae_weights,
+                            ae_dims, st, attn=self._attn)
+
+        for _ in range(3):
+            _run(stream_int)
+        cudart.cudaStreamSynchronize(stream)
+
+        graph = CUDAGraph()
+        graph.begin_capture(stream)
+        _run(stream_int)
+        graph.end_capture(stream)
+        cudart.cudaStreamSynchronize(stream)
+        self._model_runtime_full_graph = graph
+        logger.info("JAX Pi0.5 Thor model-runtime full graph captured (Se=%d)",
+                    self.Se)
+
+    def _ensure_model_runtime_export(self) -> None:
+        if not hasattr(self, "enc_ae_graph"):
+            raise RuntimeError(
+                "Pi0.5 Thor export requires set_prompt()/predict() first")
+        if self._model_runtime_full_graph is None:
+            self._capture_model_runtime_full_graph()
+        if self._runtime_rtc_prev_action_chunk is None:
+            CB = self._CudaBuffer
+            self._runtime_rtc_prev_action_chunk = CB.device_empty(
+                self.Sa * 32, np.float16)
+            self._runtime_rtc_prefix_weights = CB.device_empty(
+                self.Sa, np.float32)
+            self._runtime_rtc_guidance_weight = CB.device_empty(
+                1, np.float32)
+
+        bufs = {
+            "observation_images_normalized": self.img_buf,
+            "diffusion_noise": self.g_noise,
+            "encoder_x": self.enc_x,
+            "rtc_prev_action_chunk": self._runtime_rtc_prev_action_chunk,
+            "rtc_prefix_weights": self._runtime_rtc_prefix_weights,
+            "rtc_guidance_weight": self._runtime_rtc_guidance_weight,
+        }
+        self.pipeline.bind_runtime_export(
+            graph=self._model_runtime_full_graph,
+            graph_stream=self._stream,
+            bufs=bufs,
+            decoder_only_graph=None,
+            num_views=self.num_views,
+            max_prompt_len=getattr(self, "S_lang", 0),
+            chunk_size=self.Sa,
+            norm_stats=getattr(self, "norm_stats", {}),
+            use_fp8=self.use_fp8,
+            tensor_dtype="f16",
+            hardware="thor_sm110",
+        )
 
     # -----------------------------------------------------------------------
     # B=N batched inference (JAX side — Stage 2/3 parallel to torch)

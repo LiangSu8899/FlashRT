@@ -896,6 +896,134 @@ __global__ void qwen36_gdn_chunk_from_conv_smem_kernel(
   }
 }
 
+// Per-step-checkpoint variant of the chunk kernel above: identical
+// math and rounding cadence (the state is rounded to bf16 after every
+// step exactly as the original does between steps), plus a dump of
+// each step's rounded state into ``state_steps`` (step s at
+// state_steps + s * step_stride). Slot s byte-matches the committed
+// state of an S = s + 1 run, which is what the spec-decode
+// partial-accept rollback copies.
+template <int HD>
+__global__ void qwen36_gdn_chunk_from_conv_smem_saves_kernel(
+    const __nv_bfloat16* __restrict__ conv_out,
+    const __nv_bfloat16* __restrict__ a_in,
+    const __nv_bfloat16* __restrict__ b_in,
+    const float* __restrict__ neg_exp_A_log,
+    const float* __restrict__ dt_bias,
+    __nv_bfloat16* __restrict__ state,
+    __nv_bfloat16* __restrict__ state_steps,
+    int64_t step_stride,
+    __nv_bfloat16* __restrict__ out_,
+    int S,
+    int num_v_heads,
+    int a_stride,
+    int b_stride,
+    bool use_qk_l2norm)
+{
+  static_assert(HD == 128, "HD must be 128 for Qwen3.6");
+  const int h = blockIdx.x;
+  const int b = blockIdx.y;
+  const int t = threadIdx.x;
+  if (t >= HD) return;
+
+  extern __shared__ float smem[];
+  float* state_s = smem;
+  float* qs = state_s + HD * HD;
+  float* ks = qs + HD;
+  float* scratch = ks + HD;
+
+  const size_t state_h_off =
+      (((size_t)b * num_v_heads + h)) * HD * HD;
+  #pragma unroll 16
+  for (int i = 0; i < HD; ++i) {
+    state_s[i * HD + t] = static_cast<float>(
+        state[state_h_off + (size_t)i * HD + t]);
+  }
+  __syncthreads();
+
+  const int src_h = h / 3;
+  for (int s = 0; s < S; ++s) {
+    const size_t row = static_cast<size_t>(s) * 10240;
+    const size_t out_off = ((size_t)s * num_v_heads + h) * HD + t;
+    qs[t] = static_cast<float>(conv_out[row + src_h * HD + t]);
+    ks[t] = static_cast<float>(conv_out[row + 2048 + src_h * HD + t]);
+    __syncthreads();
+
+    if (use_qk_l2norm) {
+      float q_sq = qs[t] * qs[t];
+      float k_sq = ks[t] * ks[t];
+      q_sq = block_reduce_sum<HD>(q_sq, scratch);
+      // See the non-saves kernel for why this barrier is required
+      // between the two block reductions sharing ``scratch``.
+      __syncthreads();
+      k_sq = block_reduce_sum<HD>(k_sq, scratch);
+      const float q_inv = rsqrtf(q_sq + kEps);
+      const float k_inv = rsqrtf(k_sq + kEps);
+      qs[t] *= q_inv;
+      ks[t] *= k_inv;
+      __syncthreads();
+    }
+
+    qs[t] *= rsqrtf(static_cast<float>(HD));
+    __syncthreads();
+
+    const float av =
+        static_cast<float>(a_in[s * a_stride + h]) + dt_bias[h];
+    const float sp = log1pf(__expf(av));
+    const float g_log = static_cast<float>(
+        __float2bfloat16(neg_exp_A_log[h] * sp));
+    const float g_t = __expf(g_log);
+    const float bv = static_cast<float>(b_in[s * b_stride + h]);
+    const float beta_t = static_cast<float>(
+        __float2bfloat16(1.0f / (1.0f + __expf(-bv))));
+
+    #pragma unroll 16
+    for (int i = 0; i < HD; ++i) {
+      state_s[i * HD + t] *= g_t;
+    }
+
+    float kv_mem = 0.0f;
+    #pragma unroll 16
+    for (int i = 0; i < HD; ++i) {
+      kv_mem = fmaf(state_s[i * HD + t], ks[i], kv_mem);
+    }
+
+    const float v_t =
+        static_cast<float>(conv_out[row + 4096 + h * HD + t]);
+    const float delta = (v_t - kv_mem) * beta_t;
+
+    #pragma unroll 16
+    for (int i = 0; i < HD; ++i) {
+      state_s[i * HD + t] =
+          fmaf(ks[i], delta, state_s[i * HD + t]);
+    }
+
+    float out_t = 0.0f;
+    #pragma unroll 16
+    for (int i = 0; i < HD; ++i) {
+      out_t = fmaf(state_s[i * HD + t], qs[i], out_t);
+    }
+    out_[out_off] = __float2bfloat16(out_t);
+
+    #pragma unroll 16
+    for (int i = 0; i < HD; ++i) {
+      const __nv_bfloat16 v =
+          __float2bfloat16(state_s[i * HD + t]);
+      state_steps[
+          (size_t)s * step_stride + state_h_off + (size_t)i * HD + t] =
+          v;
+      state_s[i * HD + t] = static_cast<float>(v);
+    }
+    __syncthreads();
+  }
+
+  #pragma unroll 16
+  for (int i = 0; i < HD; ++i) {
+    state[state_h_off + (size_t)i * HD + t] =
+        __float2bfloat16(state_s[i * HD + t]);
+  }
+}
+
 __global__ void qwen36_gdn_wy_norm_qk_kernel(
     const __nv_bfloat16* __restrict__ q16,
     const __nv_bfloat16* __restrict__ k16,
@@ -1465,6 +1593,50 @@ void qwen36_gdn_chunk_from_conv_smem_strided_bf16(
       neg_exp_A_log,
       dt_bias,
       reinterpret_cast<__nv_bfloat16*>(state),
+      reinterpret_cast<__nv_bfloat16*>(out),
+      S, num_v_heads, a_stride, b_stride, use_qk_l2norm);
+}
+
+void qwen36_gdn_chunk_from_conv_smem_strided_saves_bf16(
+    const void* conv_out,
+    const void* a,
+    const void* b,
+    const float* neg_exp_A_log,
+    const float* dt_bias,
+    void*       state,
+    void*       state_steps,
+    int64_t     step_stride,
+    void*       out,
+    int S,
+    int num_v_heads,
+    int a_stride,
+    int b_stride,
+    bool use_qk_l2norm,
+    cudaStream_t stream)
+{
+  if (S <= 0 || num_v_heads <= 0) return;
+  dim3 grid(num_v_heads, 1);
+  dim3 block(kHD);
+  constexpr size_t kSmemBytes =
+      (kHD * kHD + 2 * kHD + 32) * sizeof(float);
+  static bool attr_set = false;
+  if (!attr_set) {
+    cudaFuncSetAttribute(
+        qwen36_gdn_chunk_from_conv_smem_saves_kernel<kHD>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        static_cast<int>(kSmemBytes));
+    attr_set = true;
+  }
+  qwen36_gdn_chunk_from_conv_smem_saves_kernel<kHD><<<
+      grid, block, kSmemBytes, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(conv_out),
+      reinterpret_cast<const __nv_bfloat16*>(a),
+      reinterpret_cast<const __nv_bfloat16*>(b),
+      neg_exp_A_log,
+      dt_bias,
+      reinterpret_cast<__nv_bfloat16*>(state),
+      reinterpret_cast<__nv_bfloat16*>(state_steps),
+      step_stride,
       reinterpret_cast<__nv_bfloat16*>(out),
       S, num_v_heads, a_stride, b_stride, use_qk_l2norm);
 }

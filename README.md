@@ -46,7 +46,7 @@ See [Supported Models](#supported-models), [Hardware Support](#hardware-support)
 - [2026/05] **Lingbot-VLA** is supported. See [Lingbot usage](https://github.com/LiangSu8899/FlashRT/blob/main/docs/lingbot_usage.md).
 - [2026/05] Community Pi0.5 hardware benchmarks: thanks to [@cuihengrui35](https://github.com/cuihengrui35) for **RTX 5060 Ti** results (**41.4 ms / ~24 Hz**, plus LIBERO Spatial **344/350 = 98.3%**) and [@wangerforcs](https://github.com/wangerforcs) for **NVIDIA L40** results (**26.6 ms / 38 Hz**) on 2-view FP8. See [community benchmarks](#community-benchmarks).
 - [2026/05] Special thanks to [@gugudeshubao](https://github.com/gugudeshubao) for the **Pi0.5 Jetson AGX Orin (SM87) port**: INT8 W8A8 kernels, Orin tile dispatch, frame-cache inference, deployment docs, and benchmark results. Thanks also to [@strayberry](https://github.com/strayberry) for Orin BF16 Pi0.5 testing. See [Orin deployment](docs/deployment_orin.md) and [community benchmarks](#community-benchmarks).
-- [2026/05] **Motus RTX beta** lands in FlashRT: Stage3 fast profile reaches **~167 ms** E2E on RTX 5090, **~100 ms** with TeaCache, and RTC-lite supports 50 Hz action streaming. See [Motus usage](docs/motus_usage_beta.md) and [Benchmark](#benchmark).
+- [2026/05] **Motus RTX beta** lands in FlashRT: Stage3 fast profile reaches **~167 ms** E2E on RTX 5090, **~100 ms** with TeaCache, and legacy async chunk runner supports 50 Hz action streaming. See [Motus usage](docs/motus_usage_beta.md) and [Benchmark](#benchmark).
 
 ---
 
@@ -203,7 +203,7 @@ First call: ~3 s (calibration + CUDA Graph capture). Every subsequent call: 44 m
 | **Run Qwen3.6-27B NVFP4 (LLM, 256 K on RTX 5090; Spark/GB10 supported)** | [`docs/qwen36_nvfp4.md`](docs/qwen36_nvfp4.md) — quickstart, K selection, measured throughput · [`docs/qwen36_spark.md`](docs/qwen36_spark.md) — DGX Spark usage and performance · [`docs/qwen36_usage.md`](docs/qwen36_usage.md) — full parameter reference · [`serving/qwen36_agent/`](serving/qwen36_agent/README.md) — OpenAI-compatible HTTP server |
 | **Run Qwen3-8B NVFP4 text serving** | [`docs/qwen3_8b_nvfp4.md`](docs/qwen3_8b_nvfp4.md) · [`examples/qwen3_openai_server.py`](examples/qwen3_openai_server.py) |
 | **Run Higgs Audio v3 TTS** | [`docs/higgs_audio_v3.md`](docs/higgs_audio_v3.md) — usage + performance · [`serving/higgs_audio_agent/`](serving/higgs_audio_agent/README.md) — HTTP serving |
-| **Run Motus RTX beta, TeaCache, or RTC-lite** | [`docs/motus_usage_beta.md`](docs/motus_usage_beta.md) · [`docs/rtc_lite_design.md`](docs/rtc_lite_design.md) |
+| **Run Motus RTX beta, TeaCache, or legacy async chunk runner** | [`docs/motus_usage_beta.md`](docs/motus_usage_beta.md) · [`docs/rtc_lite_design.md`](docs/rtc_lite_design.md) |
 | **Run Wan2.2 TI2V-5B official-pipeline baseline** | [`docs/wan22_usage.md`](docs/wan22_usage.md) |
 | **Use FlashRT kernels through Hugging Face Kernel Hub** | [`LiangSu8899/FlashRT-HF-kernels`](https://github.com/LiangSu8899/FlashRT-HF-kernels) · [`huggingface.co/flashrt`](https://huggingface.co/flashrt) |
 | **Run serving hosts** | [`serving/README.md`](serving/README.md) — scenario hosts · [`docs/serving_design.md`](docs/serving_design.md) — capsules and roadmap · [`docs/serving_production.md`](docs/serving_production.md) — production notes |
@@ -967,7 +967,7 @@ examples/
 - **GROOT N1.7** (`config="groot_n17"`) — 49 ms on Jetson AGX Thor, 22 ms on RTX 5090; [usage guide](USAGE.md#groot-n17-rtx), [API snippet](#groot-n17-rtx)
 - **Pi0-FAST** (`config="pi0fast"`) — [usage guide](USAGE.md#pi0-fast), [performance modes](#pi0-fast-performance-modes)
 - **LingBot-VLA** — [LingBot usage](docs/lingbot_usage.md), [Thor latency](docs/lingbot_usage.md#5-accuracy--latency-thor-sm_110-cuda-graph-replay)
-- **Motus Stage3 RTX beta** (`config="motus"`) — [Motus usage](docs/motus_usage_beta.md), [RTC-lite](docs/rtc_lite_design.md)
+- **Motus Stage3 RTX beta** (`config="motus"`) — [Motus usage](docs/motus_usage_beta.md), [legacy async chunk runner](docs/rtc_lite_design.md)
 - **Wan2.2 TI2V-5B** (`config="wan22_ti2v_5b"`) — [Wan2.2 usage](docs/wan22_usage.md)
 - **Higgs Audio v3 TTS-4B** — [Higgs usage](docs/higgs_audio_v3.md#3-quickstart), [Higgs serving](serving/higgs_audio_agent/README.md)
 - **Qwen3.6-27B NVFP4** — [Qwen3.6 usage](docs/qwen36_nvfp4.md), [parameter reference](docs/qwen36_usage.md), [serving](serving/qwen36_agent/README.md)

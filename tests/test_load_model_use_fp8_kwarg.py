@@ -2,7 +2,7 @@ import ast
 from pathlib import Path
 import sys
 import types
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -787,12 +787,12 @@ def test_groot_n17_rtx_sm120_rejects_use_fp8_false_without_fp16():
         )
 
 
-def test_pi05_rtx_fp8_layout_selection():
-    from flash_rt.frontends.torch.pi05_rtx import _select_fp8_layout
+def test_frontend_fp8_layout_selection():
+    from flash_rt.frontends._fp8_layout import select_fp8_layout
 
-    assert _select_fp8_layout("rtx_sm89", None) == "nk"
-    assert _select_fp8_layout("rtx_sm120", None) == "kn"
-    assert _select_fp8_layout("rtx_sm120", "nk") == "nk"
+    assert select_fp8_layout("rtx_sm89", None) == "nk"
+    assert select_fp8_layout("rtx_sm120", None) == "kn"
+    assert select_fp8_layout("rtx_sm120", "nk") == "nk"
 
 
 def test_vla_frontend_constructors_accept_use_fp8():
@@ -866,3 +866,67 @@ def test_pi05_jax_rtx_frontend_mirrors_runtime_knobs():
         "_int8_weight_scales",
     ):
         assert attr in assigned
+
+
+def _make_dit_fp8_fixtures(fp8_layout):
+    """Build minimal Mock/dict fixtures for ``dit_forward`` FP8 dispatch tests."""
+    from flash_rt.models.groot_n17 import pipeline_thor
+
+    class DummyAttn:
+        def get_slot_ptrs(self, site, layer_idx):
+            return {"Q": 31, "K": 32, "V": 33, "O": 34}
+
+        def run(self, site, layer_idx, q_seq, *, kv_seq=None, stream=0, state_nk=None):
+            return None
+
+    gemm = Mock()
+    fvk = Mock()
+    attn = DummyAttn()
+    dims = {"Sa": 2, "D": 4, "FF": 8, "Skv_text": 1, "Skv_image": 1}
+    bufs = {
+        "h": 1, "xn": 2, "o_proj_out": 3, "ff_proj_out": 4,
+        "qkv_xn_fp8": 5, "qkv_buf": 6, "xn_fp8": 7, "ff_fp8": 8,
+    }
+    weights = {
+        "scale_msa": [11] * 32, "shift_msa": [12] * 32,
+        "q_w": [13] * 32, "q_b": [14] * 32,
+        "k_w": [15] * 32, "k_b": [16] * 32,
+        "v_w": [17] * 32, "v_b": [18] * 32,
+        "o_w": [19] * 32, "o_b": [20] * 32,
+        "ff_proj_w": [21] * 32, "ff_proj_b": [22] * 32,
+        "ff_down_w": [23] * 32, "ff_down_b": [24] * 32,
+        "qkv_w_fp8": [25] * 16, "qkv_b": [26] * 16,
+        "act_qkv_scale": [27] * 16, "w_qkv_scale": [28] * 16,
+        "qkv_fp8_layout": fp8_layout,
+        "ff_proj_w_fp8": [29] * 32, "ff_down_w_fp8": [30] * 32,
+        "act_fc1_scale": [41] * 32, "act_fc2_scale": [42] * 32,
+        "w_fc1_scale": [43] * 32, "w_fc2_scale": [44] * 32,
+        "ff_fp8_layout": fp8_layout,
+    }
+    return pipeline_thor, gemm, fvk, bufs, weights, dims, attn
+
+
+def test_groot_n17_dit_fp8_kn_layout_dispatches_nn_dev():
+    pipeline_thor, gemm, fvk, bufs, weights, dims, attn = _make_dit_fp8_fixtures("kn")
+
+    pipeline_thor.dit_forward(
+        gemm=gemm, fvk=fvk, bufs=bufs, weights=weights,
+        dims=dims, attn=attn, layers_subset=[1],
+    )
+
+    assert gemm.fp8_nn_dev.call_count == 3
+    gemm.fp8_run_dev.assert_not_called()
+    gemm.fp8_nt_dev.assert_not_called()
+
+
+def test_groot_n17_dit_fp8_nk_layout_dispatches_nt_dev():
+    pipeline_thor, gemm, fvk, bufs, weights, dims, attn = _make_dit_fp8_fixtures("nk")
+
+    pipeline_thor.dit_forward(
+        gemm=gemm, fvk=fvk, bufs=bufs, weights=weights,
+        dims=dims, attn=attn, layers_subset=[1],
+    )
+
+    assert gemm.fp8_nt_dev.call_count == 3
+    gemm.fp8_nn_dev.assert_not_called()
+    gemm.fp8_run_dev.assert_not_called()

@@ -11614,6 +11614,14 @@ class Qwen36TorchFrontendRtx:
     # N6-A4: DFlash spec decode (block-diffusion drafter + chain verify)
     # ==================================================================
 
+    def init_dflash_drafter(self, ckpt_dir: str | None = None) -> None:
+        """Public entry: load the DFlash drafter for spec decode.
+
+        ``ckpt_dir`` falls back to ``FLASHRT_QWEN36_DFLASH_CKPT_DIR``.
+        Must be called before ``generate_own_speculative_DFlash_nvfp4``.
+        """
+        self._load_dflash_drafter(ckpt_dir)
+
     def _load_dflash_drafter(self, ckpt_dir: str | None = None) -> None:
         """Load the z-lab/Qwen3.6-27B-DFlash drafter (NVFP4 W4A16).
 
@@ -11736,8 +11744,167 @@ class Qwen36TorchFrontendRtx:
             self._captured_drafter_graphs_dflash, eff_ctx, g)
         return g
 
+    def _dflash_verify_forward_K(self, token_ids_K, cos_K, sin_K,
+                                 cur_pos: int, K: int, tap_buf):
+        """Arch hook: the S=K verify forward used by DFlash spec decode.
+
+        Default is the BF16-staged KV verify. Subclasses whose K-row
+        layer path requires a different KV mode (Thor: FP8-KV) override
+        this with the matching wrapper; the DFlash orchestration and
+        graph capture above it stay shared.
+        """
+        return self.forward_own_decode_K_nvfp4(
+            token_ids_K, cos_K, sin_K, cur_pos, K, tap_buf=tap_buf)
+
+    def _dflash_prefill_nvfp4(self, input_ids):
+        """Arch hook: prompt prefill for DFlash spec decode.
+
+        Default walks the prompt through the per-position S=1 captured
+        graphs, which writes the BF16 KV cache the default verify
+        forward reads. Subclasses whose verify attends over a different
+        KV store (Thor: FP8-KV) override this with a prefill that
+        populates that store. Returns the (1, 1) first greedy token.
+        """
+        prompt_len = int(input_ids.shape[1])
+        for p in range(prompt_len):
+            self._static_token_id.copy_(input_ids[:, p:p + 1])
+            g_pf = self._ensure_graph_for_pos_nvfp4(p)
+            self._replay_pos_graph(g_pf, p)
+        return self._logits_buf.argmax(dim=-1, keepdim=True).view(1, 1)
+
+    @staticmethod
+    def _dflash_relaxed_matches(logits_K, drafts, all_argmax,
+                                topk: int, delta: float, close_id: int):
+        """Relaxed draft acceptance for the thinking phase.
+
+        A draft row is accepted when its token is inside the verify
+        logits' top-``topk`` AND within ``delta`` of the argmax logit
+        (a raw-logit margin equals a log-prob margin). Rows from the
+        first draft that closes the think block fall back to strict
+        argmax matching so the visible answer stays exact-verified.
+        Returns a 0/1 tensor of shape (K,).
+        """
+        import torch
+
+        K = int(drafts.shape[0])
+        topv, topi = torch.topk(logits_K, topk, dim=-1)
+        ok = (
+            (topi == drafts.view(K, 1))
+            & ((topv[:, :1] - topv) <= delta)
+        ).any(-1).long()
+        close_mask = drafts == close_id
+        if bool(close_mask.any().item()):
+            idx = int(close_mask.nonzero()[0].item())
+            strict = (all_argmax[:K] == drafts).long()
+            ok[idx:] = strict[idx:]
+        return ok
+
+    def _dflash_window_commit(self, N: int) -> None:
+        """Append the committed rows' features to the per-token window.
+
+        Tap rows 0..N are the state-advanced verify rows
+        [tok, drafts[:N]], oldest first. Callers must invoke this
+        BEFORE the end-of-cycle taps[:, 0] shuffle, which overwrites
+        row 0 with row N.
+        """
+        from flash_rt.frontends.torch._qwen36_rtx_dflash_forward import (
+            pertoken_window_append,
+        )
+
+        R = N + 1
+        rows = self._dflash_buf['pt_taps_rows'][:R]
+        rows.copy_(self._dflash_taps_buf[:, :R].permute(1, 0, 2))
+        pertoken_window_append(self, rows)
+
+    def _dflash_snap_state(self, cur_pos: int, Kv: int) -> None:
+        """Arch hook: snapshot state the partial-accept rollback needs.
+
+        Runs on the snap stream, overlapped with the drafter forward.
+        Subclasses whose rollback reads per-step state checkpoints
+        written during the verify itself (Thor) override this with a
+        no-op.
+        """
+        self._snap_lin_buf.copy_(self._lin_state)
+        self._snap_conv_buf.copy_(self._lin_conv_state)
+        self._snap_K_buf[:, :Kv].copy_(
+            self._attn.K_cache[:, cur_pos:cur_pos + Kv])
+        self._snap_V_buf[:, :Kv].copy_(
+            self._attn.V_cache[:, cur_pos:cur_pos + Kv])
+
+    def _dflash_partial_rollback(self, cur_pos: int, N: int, Kv: int,
+                                 tok, drafts, cos_KN, sin_KN) -> None:
+        """Arch hook: fix up state after a partial accept of N drafts.
+
+        On exit the recurrent/conv state and KV must reflect exactly
+        the N+1 committed rows [tok, drafts[:N]] at
+        [cur_pos, cur_pos+N+1), and ``_dflash_taps_buf[:, N]`` must
+        hold the taps of the last committed row.
+
+        Default: restore the pre-verify snapshot, then re-advance with
+        the committed rows via a tapped verify at K=N+1 (a second
+        main-model forward). Subclasses with per-step state saves in
+        the verify K-row (Thor) override this with constant-time state
+        copies instead.
+        """
+        import torch
+
+        self._lin_state.copy_(self._snap_lin_buf)
+        self._lin_conv_state.copy_(self._snap_conv_buf)
+        self._attn.K_cache[:, cur_pos:cur_pos + Kv].copy_(
+            self._snap_K_buf[:, :Kv])
+        self._attn.V_cache[:, cur_pos:cur_pos + Kv].copy_(
+            self._snap_V_buf[:, :Kv])
+
+        Kr = N + 1
+        self._verify_static_tokens[:, 0:1].copy_(tok)
+        if N > 0:
+            self._verify_static_tokens[:, 1:Kr].copy_(
+                drafts[:N].view(1, N))
+        self._verify_static_cos[:, :Kr].copy_(cos_KN[:, :Kr])
+        self._verify_static_sin[:, :Kr].copy_(sin_KN[:, :Kr])
+        rg = self._ensure_verify_graph_dflash_nvfp4(cur_pos, Kr)
+        gs = self._graph_stream
+        gs.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(gs):
+            rg.replay()
+        torch.cuda.current_stream().wait_stream(gs)
+
+    def _ensure_drafter_graph_dflash_pertoken(self):
+        """Lazy CUDA Graph for the per-token-window drafter forward.
+
+        The forward is read-only over the window (updates happen
+        outside the graph via ``pertoken_window_append``), so capture
+        needs no state snapshot/restore. One graph per frontend — the
+        window length is fixed at alloc time.
+        """
+        import torch
+
+        from flash_rt.frontends.torch._qwen36_rtx_dflash_forward import (
+            dflash_drafter_forward_pertoken,
+        )
+
+        g = getattr(self, '_captured_drafter_graph_pertoken', None)
+        if g is not None:
+            return g
+
+        gs = self._graph_stream
+        gs.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(gs), torch.no_grad():
+            for _ in range(2):
+                dflash_drafter_forward_pertoken(self)
+        gs.synchronize()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(
+                g, stream=gs, pool=self._graph_mempool,
+        ), torch.no_grad():
+            dflash_drafter_forward_pertoken(self)
+        gs.synchronize()
+        torch.cuda.current_stream().wait_stream(gs)
+        self._captured_drafter_graph_pertoken = g
+        return g
+
     def _ensure_verify_graph_dflash_nvfp4(self, cur_pos: int, K: int):
-        """Lazy CUDA Graph for forward_own_decode_K_nvfp4 WITH tap_buf.
+        """Lazy CUDA Graph for the DFlash verify forward WITH tap_buf.
 
         Mirror of ``_ensure_verify_graph_nvfp4`` but binds
         ``tap_buf=self._dflash_taps_buf`` at capture time so the 5
@@ -11777,9 +11944,9 @@ class Qwen36TorchFrontendRtx:
             sin_K = self._verify_static_sin[:, :K]
             tap_buf = self._dflash_taps_buf
             for _ in range(2):
-                self.forward_own_decode_K_nvfp4(
-                    tokens_K, cos_K, sin_K, cur_pos, K=K,
-                    tap_buf=tap_buf)
+                self._dflash_verify_forward_K(
+                    tokens_K, cos_K, sin_K, cur_pos, K,
+                    tap_buf)
                 _restore()
 
         gs.synchronize()
@@ -11787,9 +11954,9 @@ class Qwen36TorchFrontendRtx:
         with torch.cuda.graph(
                 g, stream=gs, pool=self._graph_mempool,
         ), torch.no_grad():
-            self.forward_own_decode_K_nvfp4(
-                tokens_K, cos_K, sin_K, cur_pos, K=K,
-                tap_buf=tap_buf)
+            self._dflash_verify_forward_K(
+                tokens_K, cos_K, sin_K, cur_pos, K,
+                tap_buf)
         with torch.cuda.stream(gs), torch.no_grad():
             _restore()
         gs.synchronize()
@@ -11849,20 +12016,55 @@ class Qwen36TorchFrontendRtx:
         eff_ctx = int(getattr(self, '_dflash_eff_ctx', 16))
         alloc_drafter_capture_window(self, eff_ctx)
         reset_drafter_capture_state(self)
+        # Per-token window mode: the drafter attends to fc-projected
+        # features of every committed token instead of one entry per
+        # spec cycle. The prefill hook may seed the window from the
+        # prompt tail.
+        pertoken = bool(getattr(self, '_dflash_pertoken_window', False))
+        if pertoken:
+            from flash_rt.frontends.torch._qwen36_rtx_dflash_forward import (  # noqa: E501
+                alloc_pertoken_window,
+                reset_pertoken_window,
+            )
+            alloc_pertoken_window(
+                self, int(getattr(self, '_dflash_pertoken_win', 128)))
+            reset_pertoken_window(self)
+        # Relaxed acceptance for the thinking phase (opt-in; mirrors
+        # the TensorRT-LLM MTP policy): inside a <think> block a draft
+        # is accepted when it is in the verify logits' top-k AND within
+        # a logit margin of the argmax; the accepted token is then the
+        # DRAFT (rows already condition on drafts, so state/KV stay
+        # consistent). Rows from the first draft that closes the think
+        # block fall back to strict argmax matching. Default off — the
+        # strict path is byte-identical with this disabled.
+        relaxed = None
+        if os.environ.get(
+                'FLASHRT_QWEN36_DFLASH_RELAXED_THINKING', '0',
+        ).strip().lower() in ('1', 'true', 'on'):
+            think_open = self._tokenizer.convert_tokens_to_ids('<think>')
+            think_close = self._tokenizer.convert_tokens_to_ids('</think>')
+            if isinstance(think_open, int) and think_open >= 0:
+                relaxed = {
+                    'topk': max(1, int(os.environ.get(
+                        'FLASHRT_QWEN36_DFLASH_RELAXED_TOPK', '3'))),
+                    'delta': float(os.environ.get(
+                        'FLASHRT_QWEN36_DFLASH_RELAXED_DELTA', '1.0')),
+                    'open': int(think_open),
+                    'close': int(think_close),
+                }
+        # The chat template opens the think block at the end of the
+        # generation prompt, so the phase can start active.
+        in_think = bool(
+            relaxed is not None
+            and relaxed['open'] in input_ids[0, -8:].tolist())
         # Initialize taps to zero — first drafter call gets no real
         # signal; AL on cycle 0 will be lower than steady-state.
         self._dflash_taps_buf.zero_()
 
         with torch.no_grad():
-            # 1) Prefill (same as MTP path) — sequential S=1 forwards
-            # via the per-cur_pos captured S=1 graph.
-            gs_pf = self._graph_stream
-            for p in range(prompt_len):
-                self._static_token_id.copy_(input_ids[:, p:p + 1])
-                g_pf = self._ensure_graph_for_pos_nvfp4(p)
-                self._replay_pos_graph(g_pf, p)
-            tok = self._logits_buf.argmax(
-                dim=-1, keepdim=True).view(1, 1)
+            # 1) Prefill via the arch hook (default: sequential S=1
+            # forwards through the per-cur_pos captured graphs).
+            tok = self._dflash_prefill_nvfp4(input_ids)
             generated = [tok]
             cur_pos = prompt_len
 
@@ -11879,14 +12081,7 @@ class Qwen36TorchFrontendRtx:
                 snap_stream = self._snap_stream
                 snap_stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(snap_stream):
-                    self._snap_lin_buf.copy_(self._lin_state)
-                    self._snap_conv_buf.copy_(self._lin_conv_state)
-                    self._snap_K_buf[:, :Kv].copy_(
-                        self._attn.K_cache[
-                            :, cur_pos:cur_pos + Kv])
-                    self._snap_V_buf[:, :Kv].copy_(
-                        self._attn.V_cache[
-                            :, cur_pos:cur_pos + Kv])
+                    self._dflash_snap_state(cur_pos, Kv)
 
                 # 2b) Drafter forward (P7).
                 # Caller writes static inputs (prev_token + hidden_taps).
@@ -11896,15 +12091,29 @@ class Qwen36TorchFrontendRtx:
                 # (avoids zero-dilution that hurts AL). Once the window
                 # is full, replay the captured graph.
                 self._dflash_buf['ids_static'][0:1].copy_(tok.view(1))
-                self._dflash_buf['hidden_taps_static'].copy_(
-                    self._dflash_taps_buf[:, 0])
-                if self._spec_attempts < eff_ctx:
+                if pertoken:
+                    valid = int(self._dflash_buf['pt_valid'])
+                    if valid < int(self._dflash_buf['pt_win']):
+                        from flash_rt.frontends.torch._qwen36_rtx_dflash_forward import (  # noqa: E501
+                            dflash_drafter_forward_pertoken,
+                        )
+                        dflash_drafter_forward_pertoken(
+                            self, max(1, valid))
+                    else:
+                        drafter_g = (
+                            self._ensure_drafter_graph_dflash_pertoken())
+                        drafter_g.replay()
+                elif self._spec_attempts < eff_ctx:
                     from flash_rt.frontends.torch._qwen36_rtx_dflash_forward import (  # noqa: E501
                         dflash_drafter_forward_capture_eager,
                     )
+                    self._dflash_buf['hidden_taps_static'].copy_(
+                        self._dflash_taps_buf[:, 0])
                     valid_ctx = self._spec_attempts + 1
                     dflash_drafter_forward_capture_eager(self, valid_ctx)
                 else:
+                    self._dflash_buf['hidden_taps_static'].copy_(
+                        self._dflash_taps_buf[:, 0])
                     drafter_g = self._ensure_drafter_graph_dflash_nvfp4(
                         eff_ctx)
                     drafter_g.replay()
@@ -11940,7 +12149,14 @@ class Qwen36TorchFrontendRtx:
 
                 # 2d) Argmax + accept-prefix
                 all_argmax = logits_KN.argmax(dim=-1)        # (Kv,) long
-                matches = (all_argmax[:K] == drafts).long()
+                relaxed_cycle = relaxed is not None and in_think
+                if relaxed_cycle:
+                    matches = self._dflash_relaxed_matches(
+                        logits_KN[:K], drafts, all_argmax,
+                        relaxed['topk'], relaxed['delta'],
+                        relaxed['close'])
+                else:
+                    matches = (all_argmax[:K] == drafts).long()
                 matches_pad = torch.cat([
                     matches,
                     torch.zeros(1, device=matches.device,
@@ -11951,53 +12167,48 @@ class Qwen36TorchFrontendRtx:
                 self._spec_accepts += N
 
                 argmax_at = (lambda j: all_argmax[j:j + 1].view(1, 1))
+                if relaxed_cycle:
+                    # Accepted rows commit the DRAFT token (the verify
+                    # rows and per-step state condition on the drafts);
+                    # the bonus row commits the argmax as usual.
+                    commit_at = (lambda j: (
+                        drafts[j:j + 1].view(1, 1) if j < N
+                        else argmax_at(j)))
+                else:
+                    commit_at = argmax_at
 
                 if N == K:
                     self._spec_full += 1
                     for j in range(Kv):
                         if len(generated) < max_new_tokens:
-                            generated.append(argmax_at(j))
+                            generated.append(commit_at(j))
                     tok = argmax_at(K)
-                    # Move taps[K] -> taps[0] for next cycle
-                    self._dflash_taps_buf[:, 0].copy_(
-                        self._dflash_taps_buf[:, K])
                     cur_pos += Kv
                 else:
                     for j in range(N + 1):
                         if len(generated) < max_new_tokens:
-                            generated.append(argmax_at(j))
-                    # Restore pre-verify state.
-                    self._lin_state.copy_(self._snap_lin_buf)
-                    self._lin_conv_state.copy_(self._snap_conv_buf)
-                    self._attn.K_cache[
-                        :, cur_pos:cur_pos + Kv].copy_(
-                            self._snap_K_buf[:, :Kv])
-                    self._attn.V_cache[
-                        :, cur_pos:cur_pos + Kv].copy_(
-                            self._snap_V_buf[:, :Kv])
-
-                    # Re-advance with N+1 valid inputs via tapped verify
-                    # at K=N+1 (always — including N=0; same code path
-                    # as N>0). Re-uses the dflash verify graph cache.
-                    Kr = N + 1
-                    rec_cos = cos_KN[:, :Kr]
-                    rec_sin = sin_KN[:, :Kr]
-                    self._verify_static_tokens[:, 0:1].copy_(tok)
-                    if N > 0:
-                        self._verify_static_tokens[:, 1:Kr].copy_(
-                            drafts[:N].view(1, N))
-                    self._verify_static_cos[:, :Kr].copy_(rec_cos)
-                    self._verify_static_sin[:, :Kr].copy_(rec_sin)
-                    rg = self._ensure_verify_graph_dflash_nvfp4(
-                        cur_pos, Kr)
-                    gs.wait_stream(torch.cuda.current_stream())
-                    with torch.cuda.stream(gs):
-                        rg.replay()
-                    torch.cuda.current_stream().wait_stream(gs)
+                            generated.append(commit_at(j))
+                    self._dflash_partial_rollback(
+                        cur_pos, N, Kv, tok, drafts, cos_KN, sin_KN)
                     tok = argmax_at(N)
-                    self._dflash_taps_buf[:, 0].copy_(
-                        self._dflash_taps_buf[:, N])
-                    cur_pos += Kr
+                    cur_pos += N + 1
+                if relaxed is not None:
+                    ids = (drafts[:N].tolist() if N else [])
+                    ids.append(int(all_argmax[N].item()))
+                    for t in ids:
+                        if t == relaxed['open']:
+                            in_think = True
+                        elif t == relaxed['close']:
+                            in_think = False
+                if pertoken:
+                    # Must precede the taps[:, 0] shuffle below — it
+                    # reads tap rows 0..N and the shuffle overwrites
+                    # row 0.
+                    self._dflash_window_commit(N)
+                # Move taps[N] -> taps[0] as the next drafter input
+                # (N == K on a full accept).
+                self._dflash_taps_buf[:, 0].copy_(
+                    self._dflash_taps_buf[:, N])
 
             if len(generated) > max_new_tokens:
                 generated = generated[:max_new_tokens]

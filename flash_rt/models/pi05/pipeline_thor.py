@@ -23,6 +23,7 @@ Classes:
     Pi05ThorPipeline           — B=1 facade for SigLIP + enc_ae replay
 """
 
+import ctypes
 import math
 
 from flash_rt.hardware.thor.shared_primitives import (
@@ -55,8 +56,20 @@ def _action_update_fp16(ctx, fvk, xn, aow, aob, noise, rows, cols, dim,
 # Decoder (18 layers, 10 diffusion steps, static FP8)
 # ══════════════════════════════════════════════════════════════════
 
+def _copy_rtc_prefix(bufs, dims, stream: int, prefix_len: int) -> None:
+    if prefix_len <= 0:
+        return
+    if prefix_len > int(dims["S"]):
+        raise ValueError(
+            f"rtc prefix_len {prefix_len} exceeds chunk_size {dims['S']}")
+    prev = bufs.get("rtc_prev_action_chunk")
+    if not prev:
+        raise ValueError("rtc_prev_action_chunk buffer is required")
+    _gpu_copy(bufs["noise"], prev, int(prefix_len) * 32 * 2, stream)
+
+
 def decoder_forward(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None,
-                    use_fp8=True):
+                    use_fp8=True, rtc_prefix_len: int = 0):
     """Full AE decoder forward pass ≡ pi05 ae_forward_static.
 
     Args:
@@ -77,10 +90,15 @@ def decoder_forward(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None,
             FP8 norm/quantize kernels are split into their FP16
             equivalents (``adarms_fp16``, ``gate_res_fp16``,
             ``gate_geglu_merged_fp16``). Used for FP16 baseline runs.
+        rtc_prefix_len: Optional prefix length for RTC prefix-lock action
+            graphs. When non-zero, the prefix rows of ``noise`` are restored
+            from ``bufs['rtc_prev_action_chunk']`` before each denoise step and
+            after each action update.
     """
     if not use_fp8:
         return _decoder_forward_fp16(ctx, fvk, bufs, weights, dims, stream,
-                                      attn=attn)
+                                      attn=attn,
+                                      rtc_prefix_len=rtc_prefix_len)
     S = dims['S']
     D = dims['D']
     H = dims['H']
@@ -132,8 +150,10 @@ def decoder_forward(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None,
     rope = weights['rope']
     w_scales = weights['w_scales']
     act_scales = weights['act_scales']
+    rtc_prefix_len = int(rtc_prefix_len or 0)
 
     for s in range(steps):
+        _copy_rtc_prefix(bufs, dims, stream, rtc_prefix_len)
         step_scale_base = s * layers * 4
         # ── Action input: noise → x ──
         fvk.gmm_fp16(ctx, noise, ain_w, x, S, D, 32, 0.0, stream)
@@ -225,13 +245,15 @@ def decoder_forward(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None,
 
         _action_update_fp16(ctx, fvk, xn, aow, aob, noise, S, 32, D,
                             stream, dt, action_f32, aob_dt)
+        _copy_rtc_prefix(bufs, dims, stream, rtc_prefix_len)
 
 
 # ══════════════════════════════════════════════════════════════════
 # FP16 decoder path (no quantization, FP16 weights, baseline only)
 # ══════════════════════════════════════════════════════════════════
 
-def _decoder_forward_fp16(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None):
+def _decoder_forward_fp16(ctx, fvk, bufs, weights, dims, stream=0, *,
+                          attn=None, rtc_prefix_len: int = 0):
     """FP16-only decoder forward. Structure mirrors the FP8 path; every
     GEMM is ``fvk.gmm_fp16`` and the fused FP8 norm kernels are split.
 
@@ -265,8 +287,10 @@ def _decoder_forward_fp16(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None)
     aob_dt = weights.get('aob_dt')
     dt = weights.get('dt')
     fs = weights['fs']; rope = weights['rope']
+    rtc_prefix_len = int(rtc_prefix_len or 0)
 
     for s in range(steps):
+        _copy_rtc_prefix(bufs, dims, stream, rtc_prefix_len)
         fvk.gmm_fp16(ctx, noise, ain_w, x, S, D, 32, 0.0, stream)
         fvk.add_bias_fp16(x, ain_b, S, D, stream)
 
@@ -335,6 +359,7 @@ def _decoder_forward_fp16(ctx, fvk, bufs, weights, dims, stream=0, *, attn=None)
         fvk.adarms_fp16(x, fs_ptr, xn, gate, S, D, stream)
         _action_update_fp16(ctx, fvk, xn, aow, aob, noise, S, 32, D,
                             stream, dt, action_f32, aob_dt)
+        _copy_rtc_prefix(bufs, dims, stream, rtc_prefix_len)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -530,6 +555,7 @@ class Pi05ThorPipeline:
                 f"Pi05ThorPipeline base class supports only B=1; got "
                 f"B={batch_size}. Use Pi05ThorBatchedPipeline for B>1.")
         self.batch_size = int(batch_size)
+        self._runtime_owner = None
 
     def run_pipeline(self, *, replay_siglip, replay_enc_ae) -> None:
         """Replay the captured SigLIP graph followed by enc_ae graph.
@@ -543,3 +569,117 @@ class Pi05ThorPipeline:
         """
         replay_siglip()
         replay_enc_ae()
+
+    def bind_runtime_owner(self, owner: object) -> None:
+        """Attach the frontend that owns Thor buffers and graph capture."""
+        self._runtime_owner = owner
+
+    def bind_runtime_export(
+            self, *, graph: object, graph_stream: object, bufs: dict,
+            decoder_only_graph: object | None = None,
+            num_views: int, max_prompt_len: int, chunk_size: int,
+            norm_stats=None, use_fp8: bool = True,
+            tensor_dtype: str = "f16", hardware: str = "thor_sm110") -> None:
+        """Bind the standard Pi0.5 runtime-export surface.
+
+        Thor frontends own the actual storage/capture. This facade exposes the
+        same producer attributes as the RTX pipeline so the shared
+        ``runtime_export.py`` contract can lower either hardware path without
+        hardware branches in C++ or Nexus.
+        """
+        self._graph = graph
+        self._decoder_only_graph = decoder_only_graph
+        self._graph_stream = graph_stream
+        self.bufs = dict(bufs)
+        self.num_views = int(num_views)
+        self.max_prompt_len = int(max_prompt_len)
+        self.chunk_size = int(chunk_size)
+        self.norm_stats = norm_stats or {}
+        self.use_fp8 = bool(use_fp8)
+        self.use_int8_decoder = False
+        self.tensor_dtype = str(tensor_dtype)
+        self.hardware = str(hardware)
+        self._cudart = ctypes.CDLL("libcudart.so")
+        from flash_rt.subgraphs.capture import run_capture_hooks
+        run_capture_hooks(
+            self, self._graph_stream,
+            int(getattr(self._graph_stream, "value", self._graph_stream) or 0))
+
+    def _ensure_runtime_export_ready(self) -> None:
+        owner = getattr(self, "_runtime_owner", None)
+        if owner is not None and hasattr(owner, "_ensure_model_runtime_export"):
+            owner._ensure_model_runtime_export()
+        if getattr(self, "_graph", None) is None:
+            raise RuntimeError(
+                "Pi05 Thor runtime export requires a captured full graph; "
+                "call set_prompt()/predict() before export")
+
+    @property
+    def input_images_buf(self):
+        return self.bufs["observation_images_normalized"]
+
+    @property
+    def input_noise_buf(self):
+        return self.bufs["diffusion_noise"]
+
+    @property
+    def input_encoder_x_buf(self):
+        return self.bufs["encoder_x"]
+
+    @property
+    def input_rtc_prev_action_chunk_buf(self):
+        return self.bufs["rtc_prev_action_chunk"]
+
+    @property
+    def input_rtc_prefix_weights_buf(self):
+        return self.bufs["rtc_prefix_weights"]
+
+    @property
+    def input_rtc_guidance_weight_buf(self):
+        return self.bufs["rtc_guidance_weight"]
+
+    def capture_context_action_graphs(self, stream_handle, stream_int) -> None:
+        owner = getattr(self, "_runtime_owner", None)
+        if owner is None or not hasattr(
+                owner, "_capture_model_runtime_context_action_graphs"):
+            raise RuntimeError("Pi05 Thor owner cannot capture context_action")
+        owner._capture_model_runtime_context_action_graphs(
+            self, stream_handle, stream_int)
+
+    def capture_rtc_prefix_graph(self, stream_handle, stream_int,
+                                 prefix_len: int) -> None:
+        owner = getattr(self, "_runtime_owner", None)
+        if owner is None or not hasattr(
+                owner, "_capture_model_runtime_rtc_prefix_graph"):
+            raise RuntimeError("Pi05 Thor owner cannot capture rtc_prefix")
+        owner._capture_model_runtime_rtc_prefix_graph(
+            self, stream_handle, stream_int, prefix_len)
+
+    def forward(self) -> int:
+        self._ensure_runtime_export_ready()
+        if getattr(self, "_use_exec", False):
+            rc = self._exec_full.replay(0, self._exec_gs_id)
+            if rc != 0:
+                raise RuntimeError(f"frt pi05 thor infer replay rc={rc}")
+        else:
+            self._graph.replay(self._graph_stream)
+        self._cudart.cudaStreamSynchronize(self._graph_stream)
+        return self.bufs["diffusion_noise"].ptr.value
+
+    def export_runtime(self, identity=None, extra_regions=None):
+        """Package the captured Thor pipeline as ``frt_runtime_export_v1``."""
+        self._ensure_runtime_export_ready()
+        from flash_rt.models.pi05.runtime_export import export_runtime
+        return export_runtime(self, identity=identity,
+                              extra_regions=extra_regions)
+
+    def export_model_runtime(self, identity=None, extra_regions=None,
+                             stage_plan="full", io="python",
+                             stage_plan_kwargs=None):
+        """Package the captured Thor pipeline as ``frt_model_runtime_v1``."""
+        self._ensure_runtime_export_ready()
+        from flash_rt.models.pi05.runtime_export import export_model_runtime
+        return export_model_runtime(self, identity=identity,
+                                    extra_regions=extra_regions,
+                                    stage_plan=stage_plan, io=io,
+                                    stage_plan_kwargs=stage_plan_kwargs)

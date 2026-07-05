@@ -90,6 +90,21 @@ void causal_conv1d_qwen36_update_chunk_bf16(
     bool apply_silu,
     cudaStream_t stream);
 
+// Chunk variant with per-step state checkpoints: dumps the post-step
+// conv state to state_steps + s * step_stride for every step s, for
+// the spec-decode partial-accept rollback.
+void causal_conv1d_qwen36_update_chunk_saves_bf16(
+    const void* x,
+    const void* w,
+    const void* bias,
+    void*       out,
+    void*       state,
+    void*       state_steps,
+    int64_t     step_stride,
+    int B, int S, int conv_dim, int k,
+    bool apply_silu,
+    cudaStream_t stream);
+
 // Parallel prefill variant: computes each (S, channel) output
 // independently, then updates the final state in a second tiny kernel.
 // This trades extra global loads for much higher S-dimension

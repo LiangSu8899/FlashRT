@@ -5,10 +5,10 @@
 > **TL;DR**:
 > - The library ships **~120 pybind entries across three modules** — `flash_rt_kernels` (98 memory-bound / fp8 / cuBLAS-wrapper / FMHA entries), `flash_rt_fp4` (23 NVFP4 entries), and `flash_rt_fa2` (2 FA2 forward entries). Counts can drift ±a handful between releases; treat the number as "about 100", not exact. `flash_rt_kernels` is organized into 10 groups by purpose (see §2 below).
 > - Fusion is not free: **any rewrite that changes the kernel launch sequence carries Myelin tactic risk**. All 4 historical regressions (see §5) were caused by this.
-> - Current production fusion shape: see [`optimization-details.md`](../optimization-details.md) §1.1; this doc complements it with **how to choose / whether a new model can reuse** the existing kernels.
+> - Current production fusion shape: see [`optimization-details.md`](optimization-details.md) §1.1; this doc complements it with **how to choose / whether a new model can reuse** the existing kernels.
 > - Adding a brand-new fused kernel requires editing `csrc/` and rebuilding the `.so` (out of scope for this round; separate CUDA dev workflow).
 
-**Read first**: [`docs/optimization-details.md`](../optimization-details.md) has the full Pi0.5 optimization accounting (where the 44ms vs 70ms gap comes from). This doc is not about "why Pi0.5 is fast" — it's about "**how you wire kernels together in forward when adding a new model**".
+**Read first**: [`docs/optimization-details.md`](optimization-details.md) has the full Pi0.5 optimization accounting (where the 44ms vs 70ms gap comes from). This doc is not about "why Pi0.5 is fast" — it's about "**how you wire kernels together in forward when adding a new model**".
 
 ---
 
@@ -376,8 +376,8 @@ For contrast, successful optimizations:
 
 ## 9. Related documents
 
-- [`optimization-details.md`](../optimization-details.md) — full Pi0.5 optimization accounting + fusion comparison vs Myelin
+- [`optimization-details.md`](optimization-details.md) — full Pi0.5 optimization accounting + fusion comparison vs Myelin
 - [`adding_new_model.md`](adding_new_model.md) — top-level guide for adding a new model
 - [`calibration.md`](calibration.md) — FP8 scale and alpha mechanics
-- [`stable_api.md`](../stable_api.md) — `AttentionBackend`, `WEIGHT_SPEC` public interfaces
+- [`stable_api.md`](stable_api.md) — `AttentionBackend`, `WEIGHT_SPEC` public interfaces
 - §5 of this document — all known failed optimizations, captured as project lessons

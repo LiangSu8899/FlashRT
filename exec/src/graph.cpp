@@ -74,6 +74,28 @@ int frt_graph_adopt(frt_graph g, frt_shape_key key, void* external_graph_exec) {
     return FRT_OK;
 }
 
+int frt_graph_evict(frt_graph g, frt_shape_key key) {
+    if (!g) return FRT_ERR_INVALID;
+    auto it = g->variants.find(key);
+    if (it == g->variants.end()) return FRT_ERR_NO_VARIANT;
+    if (it->second.owned) frt::be::graph_exec_destroy(it->second.exec);
+    g->variants.erase(it);
+    for (auto lit = g->lru.begin(); lit != g->lru.end(); ++lit)
+        if (*lit == key) { g->lru.erase(lit); break; }
+    return FRT_OK;
+}
+
+int frt_graph_evict_lru(frt_graph g) {
+    if (!g) return FRT_ERR_INVALID;
+    if (g->lru.empty()) return FRT_ERR_NO_VARIANT;
+    g->evict_one();
+    return FRT_OK;
+}
+
+size_t frt_graph_variant_count(frt_graph g) {
+    return g ? g->variants.size() : 0;
+}
+
 int frt_graph_bind(frt_graph g, const char* port, frt_buffer b) {
     if (!g || !port || !b) return FRT_ERR_INVALID;
     g->bindings[port] = b;  // bookkeeping + lifetime ref; pointers were baked at capture

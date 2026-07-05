@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Motus RTC-lite execution demo.
+"""Motus legacy async chunk runner execution demo.
 
 This script keeps the Motus model path unchanged and wraps it with
 ``AsyncChunkRunner``. It is an offline timing harness for deployment-style
@@ -49,7 +49,7 @@ class MotusBundleAdapter:
 def _build_motus(args):
     import torch
 
-    assert torch.cuda.is_available(), "Motus RTC-lite requires CUDA"
+    assert torch.cuda.is_available(), "Motus legacy async chunk runner requires CUDA"
     mq._install_deepspeed_stub()
     mq._install_optional_import_stubs(pathlib.Path(args.motus_root))
     mq._install_wan_config_filter()
@@ -88,7 +88,7 @@ def main() -> None:
             return None
         return str(env_motus_root_path.joinpath(*parts))
 
-    parser = argparse.ArgumentParser(description="Motus RTC-lite timing harness")
+    parser = argparse.ArgumentParser(description="Motus legacy async chunk runner timing harness")
     parser.add_argument("--checkpoint", default=os.environ.get("MOTUS_CHECKPOINT")
                         or _default_from_root("pretrained_models", "Motus_robotwin2"))
     parser.add_argument("--motus-root", default=env_motus_root)

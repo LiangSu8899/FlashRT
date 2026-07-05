@@ -39,6 +39,86 @@ NVIDIA Isaac GR00T reports **GR00T-N1.6-3B** with 4 denoising steps.
 | T=50, 2-view, **13.08 ms** | RTX 5090 | torch.compile | 37 ms | **2.83x** |
 | T=50, 2-view, **13.08 ms** | RTX 5090 | TensorRT | 31 ms | **2.37x** |
 
+### Local RTX 4090 Baselines
+
+Local FlashRT measurements below were taken on **July 2-3, 2026** on one
+idle **RTX 4090 (SM89)** using the in-repo RTX frontends, not TensorRT.
+Unless noted otherwise, the latency number of interest is the
+**steady-state** replay path (capture / graph-build cost excluded). Do not
+compare these rows directly with the RTX 5090 / TensorRT table above
+unless the model, harness, and warmup path match.
+
+`groot` is the repo config name for the current **GR00T-N1.6-3B** path.
+There is no separate third local checkpoint beyond `GR00T-N1.6-3B` and
+`GR00T-N1.7-3B`.
+
+| Config / Checkpoint | Hardware | Harness | Init | set_prompt | First infer | Steady-state | Notes | Output |
+|---|---|---|---:|---:|---:|---:|---|---|
+| `groot` | RTX 4090 (SM89) | repo config name for `GR00T-N1.6-3B`; 2-view, synthetic obs, `T=50`, FP8, `fp8_layout=nk` | 6182.18 ms | 2847.41 ms | 1070.17 ms | **18.39 ms p50** / 18.50 ms mean | July 2 local baseline; warm replay only | `(50, 128)` finite |
+| `GR00T-N1.6-3B` | RTX 4090 (SM89) | same runtime path as `groot`; 2-view, synthetic obs, `T=50`, FP8, `fp8_layout=nk` | 6182.18 ms | 2847.41 ms | 1070.17 ms | **18.39 ms p50** / 18.50 ms mean | Alias row for the same local baseline | `(50, 128)` finite |
+| `GR00T-N1.6-3B` | RTX 4090 (SM89) | local re-check; 2-view `FlashRT.png` duplicated to `image` + `wrist_image`, prompt=`pick up the red block`, `state=zeros(128)`, FP8, `fp8_layout=nk` | - | - | first call excluded | **18.60 ms mean** over 5 steady-state replays | July 3 local steady-state-only re-check; samples: 19.53 / 18.86 / 18.25 / 18.18 / 18.20 ms | `(50, 128)` finite |
+| `groot_n17` / `GR00T-N1.7-3B` | RTX 4090 (SM89) | real 2-view fixture, `T=40`, FP8, `fp8_layout=nk`, `use_dit_graph=False` | 7689.45 ms | 910.33 ms | 31.92 ms | **32.60 ms p50** / 33.50 ms mean | July 2 local eager baseline | `(1, 40, 132)` finite |
+| `groot_n17` / `GR00T-N1.7-3B` | RTX 4090 (SM89) | same real 2-view fixture, `T=40`, FP8, fixed SM89 DiT graph path, `use_dit_graph=True` | - | - | first graph capture excluded (`252.98 ms`) | **9.98 ms mean** over steady-state replays | July 3 local graph hot path before extra fusion; measured replays: 10.06 / 9.89 ms after capture | `(1, 40, 132)` finite |
+| `groot_n17` / `GR00T-N1.7-3B` | RTX 4090 (SM89) | same real 2-view fixture, `T=40`, FP8, same graph path plus existing fused `bias_gelu_quantize_fp8_static_bf16` on the DiT FFN up->down handoff | - | - | first graph capture excluded | **9.69 ms mean** over steady-state replays | July 3 local fused re-check; measured replays: 9.74 / 9.68 / 9.67 / 9.67 ms | `(1, 40, 132)` finite |
+
+### N1.7 SM89 Steady-State Hot Replay Profile
+
+Local Nsight Systems capture on **July 3, 2026** used the same real
+2-view N1.7 fixture as the steady-state row above and captured exactly
+one hot replay after graph build with
+`--capture-range=cudaProfilerApi --cuda-graph-trace=node`. The summed GPU
+kernel time inside that replay was **10.404 ms**, slightly above the
+**9.98 ms** CUDA-event steady-state mean because of profiler overhead.
+
+| Category | Share of summed kernel time | Notes |
+|---|---:|---|
+| FP8 GEMM (+ split-K reduce) | **44.05%** | dominant `sm89_xmma_gemm_e4m3...` cuBLASLt kernels plus split-K reduction |
+| Elementwise / layout / norm | **21.86%** | `add_bias_bf16`, residual add, layout copy, layer norm, GELU, AdaLN |
+| BF16 CUTLASS GEMM+ReLU | **19.06%** | `cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_64x64_32x6_nn_align8` |
+| FA2 attention | **9.12%** | vendored `flash_fwd_kernel` |
+| FP8 quantize | **3.00%** | `quantize_fp8_kernel_generic` |
+| BF16 cuBLAS GEMM | **2.51%** | remaining non-FP8 GEMM work |
+
+Top individual kernels from that hot replay:
+
+| Kernel | Share | Instances | Avg |
+|---|---:|---:|---:|
+| `sm89_xmma_gemm_e4m3bf16_e4m3f32_f32_tn_n_tilesize64x64x64_stage4...` | **31.63%** | 256 | 12.85 us |
+| `cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_64x64_32x6_nn_align8` | **19.06%** | 212 | 9.35 us |
+| `flash_fwd_kernel` | **9.12%** | 128 | 7.41 us |
+| `add_bias_bf16_kernel` | **8.11%** | 570 | 1.48 us |
+| `sm89_xmma_gemm_e4m3bf16_e4m3f32_f32_tn_n_tilesize32x64x64_stage5...` | **6.48%** | 64 | 10.53 us |
+| `quantize_fp8_kernel_generic` | **3.00%** | 256 | 1.22 us |
+
+### N1.7 SM89 Steady-State Hot Replay Profile After Reusing Existing Fused Kernel
+
+After replacing the DiT FP8 FFN handoff chain
+`add_bias_bf16 + gelu_inplace + quantize_fp8_static` with the existing
+`bias_gelu_quantize_fp8_static_bf16` kernel, the same hot-replay-only
+Nsight Systems capture reported **10.115 ms** summed GPU kernel time.
+Local CUDA-event timing over the same graph steady state was
+**9.69 ms mean**.
+
+| Category | Share of summed kernel time | Notes |
+|---|---:|---|
+| FP8 GEMM (+ split-K reduce) | **45.32%** | essentially unchanged; still the main cost |
+| Elementwise / layout / norm | **21.41%** | now includes the fused `bias_gelu_quantize_fp8_static_bf16` kernel |
+| BF16 CUTLASS GEMM+ReLU | **19.56%** | unchanged FFN / projector GEMM family |
+| FA2 attention | **9.31%** | unchanged attention share |
+| BF16 cuBLAS GEMM | **2.59%** | unchanged |
+| FP8 quantize | **1.40%** | reduced after fusing the FFN up-output quantize |
+
+Top individual kernels after this reuse:
+
+| Kernel | Share | Instances | Avg |
+|---|---:|---:|---:|
+| `sm89_xmma_gemm_e4m3bf16_e4m3f32_f32_tn_n_tilesize64x64x64_stage4...` | **32.56%** | 256 | 12.86 us |
+| `cutlass_80_tensorop_bf16_s16816gemm_relu_bf16_64x64_32x6_nn_align8` | **19.56%** | 212 | 9.33 us |
+| `flash_fwd_kernel` | **9.31%** | 128 | 7.36 us |
+| `sm89_xmma_gemm_e4m3bf16_e4m3f32_f32_tn_n_tilesize32x64x64_stage5...` | **6.63%** | 64 | 10.48 us |
+| `add_bias_bf16_kernel` | **5.97%** | 442 | 1.37 us |
+| `bias_gelu_quantize_fp8_static_bf16_kernel` | **3.15%** | 128 | 2.49 us |
+
 ## LingBot-VLA
 
 LingBot model cleanup baseline:

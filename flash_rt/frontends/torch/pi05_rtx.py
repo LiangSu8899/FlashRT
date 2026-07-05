@@ -33,6 +33,7 @@ import torch
 import torch.nn.functional as F
 
 from flash_rt.core.utils.actions import unnormalize_actions, LIBERO_ACTION_DIM
+from flash_rt.frontends._fp8_layout import select_fp8_layout
 from flash_rt.hardware.rtx.attn_backend import RtxFlashAttnBackend
 from flash_rt.models.pi05.pipeline_rtx import (
     Pi05Pipeline,
@@ -349,31 +350,6 @@ def _quantize_fp8_e4m3(w_bf16: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor
     return w_fp8, scale_tensor
 
 
-def _select_fp8_layout(hardware: Optional[str], fp8_layout: Optional[str]) -> str:
-    """Choose the Pi0.5 FP8 weight layout.
-
-    ``kn`` is the existing SM120 path: weights are stored as [K,N] and use
-    ``fp8_nn_dev``. ``nk`` is the SM89-compatible path: weights are stored
-    as [N,K] and use ``fp8_nt_dev``.
-    """
-    if fp8_layout is not None:
-        if fp8_layout not in ("kn", "nk"):
-            raise ValueError(f"fp8_layout must be 'kn' or 'nk', got {fp8_layout!r}")
-        return fp8_layout
-    if hardware == "rtx_sm89":
-        return "nk"
-    if hardware == "rtx_sm120":
-        return "kn"
-    try:
-        if torch.cuda.is_available():
-            major, minor = torch.cuda.get_device_capability()
-            if major == 8 and minor == 9:
-                return "nk"
-    except Exception:
-        pass
-    return "kn"
-
-
 def _resolve_effective_hardware(hardware: Optional[str]) -> Optional[str]:
     """Resolve the RTX hardware tag used by lower-level policy decisions."""
     if hardware is not None:
@@ -542,7 +518,7 @@ class Pi05TorchFrontendRtx:
         # _use_int8_vision_static is set after _force_int8_decoder below
         self.use_fp8 = bool(use_fp8)
         self.hardware = _resolve_effective_hardware(hardware)
-        self.fp8_layout = _select_fp8_layout(hardware, fp8_layout)
+        self.fp8_layout = select_fp8_layout(hardware, fp8_layout)
 
         self.latency_records: list[float] = []
         self.calibrated = False
@@ -1406,6 +1382,8 @@ class Pi05TorchFrontendRtx:
                     "(~0.96 vs dynamic 0.991 on test sequence). Set "
                     "FVK_PI05_RTX_INT8_ENCODER_STATIC=0 to disable.")
             self.pipeline.autotune_gemms()
+            from flash_rt.subgraphs.capture import apply_frontend_capture_hooks
+            apply_frontend_capture_hooks(self)
             self.pipeline.record_infer_graph(external_stream_int=stream_int)
 
         self.calibrated = True
@@ -1471,6 +1449,8 @@ class Pi05TorchFrontendRtx:
 
             self.pipeline.fp8_calibrated = True
             self.pipeline.autotune_gemms()
+            from flash_rt.subgraphs.capture import apply_frontend_capture_hooks
+            apply_frontend_capture_hooks(self)
             self.pipeline.record_infer_graph(external_stream_int=stream_int)
 
         self.calibrated = True
@@ -1837,6 +1817,8 @@ class Pi05TorchFrontendRtx:
                 noise, self.pipeline.input_noise_buf, stream_int)
             self.pipeline.calibrate_fp8()
             self.pipeline.autotune_gemms()
+            from flash_rt.subgraphs.capture import apply_frontend_capture_hooks
+            apply_frontend_capture_hooks(self)
             self.pipeline.record_infer_graph(external_stream_int=stream_int)
         self.calibrated = True
         self.graph_recorded = True

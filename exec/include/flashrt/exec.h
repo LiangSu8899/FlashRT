@@ -154,6 +154,18 @@ int frt_graph_replay(frt_graph, frt_shape_key key, int stream_id);
 /* Introspection (for warmup / host policy deciding what to capture). */
 int frt_graph_has_variant(frt_graph, frt_shape_key key); /* 1 yes, 0 no */
 
+/* Cache management — MECHANISM only; when/what to evict is host policy
+ * (a budget manager, an LRU horizon, a per-model quota all live above).
+ * Discipline: evict only at a safe point — never while the variant may be
+ * in flight on some stream (sync or wait its event first). Evicting an
+ * ADOPTED exec unregisters it but never frees it (the external owner does).
+ * frt_graph_evict: drop one key -> FRT_OK, or FRT_ERR_NO_VARIANT.
+ * frt_graph_evict_lru: drop the least-recently-replayed variant.
+ * frt_graph_variant_count: current table size (for budget accounting). */
+int    frt_graph_evict(frt_graph, frt_shape_key key);
+int    frt_graph_evict_lru(frt_graph);
+size_t frt_graph_variant_count(frt_graph);
+
 /* ------------------------------------------------------------------ */
 /* Plan — dumb DAG. Data dependencies only: NO priority/deadline/preempt.  */
 /*   For the static inner DAG of one inference (vision->encoder->action).     */

@@ -4,7 +4,7 @@ This document is the handoff path for Motus algorithm testing on the
 FlashRT RTX backend inside FlashVLA. It covers the current E2E inference
 contract, build steps, the supported precision profiles, and the
 optional training-free TeaCache step-caching.
-It also documents the RTC-lite execution wrapper, which converts the
+It also documents the legacy async chunk runner execution wrapper, which converts the
 chunked Motus output into a fixed-rate action stream without changing
 model numerics.
 
@@ -323,14 +323,14 @@ fast profile.
 
 ---
 
-## 7. RTC-lite action streaming
+## 7. legacy async chunk runner action streaming
 
-RTC-lite is an execution-layer wrapper for chunked action policies. It
+legacy async chunk runner is an execution-layer wrapper for chunked action policies. It
 does **not** make a single Motus model call faster. Instead, it pre-fills
 an initial action chunk, then consumes actions at a fixed controller
 rate while a background worker generates the next chunk.
 
-Use RTC-lite when you care about action supply frequency / controller
+Use legacy async chunk runner when you care about action supply frequency / controller
 continuity, not kernel latency.
 
 Properties:
@@ -351,7 +351,7 @@ profile fast latency ~= 167 ms
 profile fast + TeaCache latency ~= 100 ms
 ```
 
-### 50 Hz RTC-lite smoke test
+### 50 Hz legacy async chunk runner smoke test
 
 Strict profile:
 
@@ -427,9 +427,9 @@ Keep `blend_steps=0` by default. Blending is an execution-layer action
 edit; it should be enabled only after evaluating jerk / task success in
 the target controller.
 
-### What RTC-lite proves and does not prove
+### What legacy async chunk runner proves and does not prove
 
-RTC-lite proves that the Motus Stage3 chunk output can supply a 50 Hz
+legacy async chunk runner proves that the Motus Stage3 chunk output can supply a 50 Hz
 foreground action stream under the measured latency, provided the first
 chunk is prefetched before the loop starts.
 
@@ -688,4 +688,4 @@ precision and graph-capture defaults for that run.
 | OOM during testing | The Stage3 `fast` profile fits in ~28.2 GB peak allocated on the reference 5090. Do not run two Motus full-graph processes in parallel on a 32 GB card, and do not feed inputs larger than the model's trained resolution without expanding the GPU. |
 | Cosine changes after editing inputs | Confirm the input bundle follows the upstream Motus E2E contract and uses matching `instruction`, `t5_embed`, `vlm_inputs`, `first_frame`, and `state`. |
 | TeaCache wall not dropping | Confirm `FLASH_RT_MOTUS_USE_TEACACHE=1` is set **before** `python` starts; the schedule is baked at install time and cannot be flipped per replay. |
-| RTC-lite misses deadlines | Confirm the first chunk is prefetched before starting the controller loop. For the strict `fast` profile at 50 Hz, use the default latency-derived trigger or set `--start-next-at 6`; `--start-next-at 8` is too late on the reference 5090. |
+| legacy async chunk runner misses deadlines | Confirm the first chunk is prefetched before starting the controller loop. For the strict `fast` profile at 50 Hz, use the default latency-derived trigger or set `--start-next-at 6`; `--start-next-at 8` is too late on the reference 5090. |

@@ -49,7 +49,9 @@ PYBIND11_MODULE(_flashrt_exec, m) {
     py::class_<PyBuffer>(m, "Buffer")
         .def("dptr",  [](PyBuffer& b) { return reinterpret_cast<std::uintptr_t>(frt_buffer_dptr(b.h)); })
         .def("nbytes",[](PyBuffer& b) { return frt_buffer_bytes(b.h); })
-        .def("name",  [](PyBuffer& b) { return std::string(frt_buffer_name(b.h)); });
+        .def("name",  [](PyBuffer& b) { return std::string(frt_buffer_name(b.h)); })
+        .def("raw",   [](PyBuffer& b) { return reinterpret_cast<std::uintptr_t>(b.h); },
+             "Opaque frt_buffer handle (uintptr) — for the runtime-export builder.");
 
     py::class_<PyEvent>(m, "Event")
         .def("record", [](PyEvent& e, int stream_id) { check(frt_event_record(e.h, stream_id), "event_record"); });
@@ -68,7 +70,13 @@ PYBIND11_MODULE(_flashrt_exec, m) {
         .def("replay", [](PyGraph& g, std::uint64_t key, int stream_id) {
             return frt_graph_replay(g.h, key, stream_id);  // return rc (e.g. NO_VARIANT) to caller
         }, py::arg("key"), py::arg("stream_id") = 0)
-        .def("has_variant", [](PyGraph& g, std::uint64_t key) { return frt_graph_has_variant(g.h, key) != 0; });
+        .def("has_variant", [](PyGraph& g, std::uint64_t key) { return frt_graph_has_variant(g.h, key) != 0; })
+        .def("evict", [](PyGraph& g, std::uint64_t key) { return frt_graph_evict(g.h, key); },
+             "Drop one variant (host eviction policy; evict at a safe point only).")
+        .def("evict_lru", [](PyGraph& g) { return frt_graph_evict_lru(g.h); })
+        .def("variant_count", [](PyGraph& g) { return frt_graph_variant_count(g.h); })
+        .def("raw", [](PyGraph& g) { return reinterpret_cast<std::uintptr_t>(g.h); },
+             "Opaque frt_graph handle (uintptr) — for the runtime-export builder.");
 
     py::class_<PyPlan>(m, "Plan")
         .def("add", [](PyPlan& p, PyGraph& g, std::uint64_t key, int stream_id) {
@@ -103,7 +111,9 @@ PYBIND11_MODULE(_flashrt_exec, m) {
             PyGraph g; g.h = frt_graph_create(c.h, name.c_str(), max_variants);
             if (!g.h) throw std::runtime_error("graph_create failed"); return g;
         }, py::arg("name"), py::arg("max_variants") = 0)
-        .def("plan", [](PyCtx& c) { PyPlan p; p.h = frt_plan_create(c.h); if (!p.h) throw std::runtime_error("plan_create failed"); return p; });
+        .def("plan", [](PyCtx& c) { PyPlan p; p.h = frt_plan_create(c.h); if (!p.h) throw std::runtime_error("plan_create failed"); return p; })
+        .def("raw", [](PyCtx& c) { return reinterpret_cast<std::uintptr_t>(c.h); },
+             "Opaque frt_ctx handle (uintptr) — for the runtime-export builder.");
 
     // --- dev/test helpers: allocation-free, capture-safe ops on a raw stream
     //     (an integer cudaStream_t). Used by record callbacks in tests so we

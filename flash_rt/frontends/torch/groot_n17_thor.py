@@ -25,6 +25,8 @@ from typing import Optional
 
 import torch
 
+from flash_rt.frontends._fp8_layout import select_fp8_layout
+
 
 class GrootN17TorchFrontendThor:
     """N1.7 Thor inference frontend.
@@ -621,7 +623,11 @@ class GrootN17TorchFrontendThor:
                 act_fc2[li] = max(act_fc2[li], float(ff_t[:Sa].abs().max().item()))
             post_fwd(step, 0)
 
-        # Quantize FFN weights to FP8 (per-tensor) + compose alphas/act-scales.
+        fp8_layout = select_fp8_layout(getattr(self, "hardware", None), None)
+
+        # Quantize FFN weights to FP8 (per-tensor). The SM120-safe path keeps
+        # the legacy descale+epilogue contract; the SM89 path carries explicit
+        # act/weight scales and dispatches the GEMM by layout.
         FP8_MAX = 448.0
         f8 = torch.float8_e4m3fn
         self._k_xn_fp8 = torch.empty(Sa, 1536, dtype=f8, device=dev)
@@ -633,15 +639,19 @@ class GrootN17TorchFrontendThor:
         proj_fp8, down_fp8, projb16 = [], [], []
         proj_ws, down_fp8_nt, down_ws = [], [], []
         a_fc1, a_fc2, s_fc1, s_fc2 = [], [], [], []
+        w_fc1, w_fc2 = [], []
         for li in range(32):
             pw = self._dit_ff_proj_w[li].float()
             dw = self._dit_ff_down_w[li].float()
             ws_p = pw.abs().max().item() / FP8_MAX
             ws_d = dw.abs().max().item() / FP8_MAX
+            if (not use_sm120_safe) and fp8_layout == "nk":
+                pw = pw.t().contiguous()
+                dw = dw.t().contiguous()
             pf = (pw / ws_p).to(f8).contiguous()
             df = (dw / ws_d).to(f8).contiguous()
-            # fp8_nn_gelu_bias outputs fp16 → its bias must be fp16.
-            pb = self._dit_ff_proj_b[li].half().contiguous()
+            pb = (self._dit_ff_proj_b[li].half().contiguous() if use_sm120_safe
+                  else self._dit_ff_proj_b[li].bfloat16().contiguous())
             sf1 = torch.tensor([act_fc1[li] / FP8_MAX], dtype=torch.float32, device=dev)
             sf2 = torch.tensor([act_fc2[li] / FP8_MAX], dtype=torch.float32, device=dev)
             self._dit_ff_fp8_keep += [pf, df, pb, sf1, sf2]
@@ -656,6 +666,13 @@ class GrootN17TorchFrontendThor:
                 proj_ws.append(sw_p.data_ptr())
                 down_fp8_nt.append(df_nt.data_ptr())
                 down_ws.append(sw_d.data_ptr())
+            else:
+                self._dit_ff_fp8_keep += [
+                    torch.tensor([ws_p], dtype=torch.float32, device=dev),
+                    torch.tensor([ws_d], dtype=torch.float32, device=dev),
+                ]
+                w_fc1.append(self._dit_ff_fp8_keep[-2].data_ptr())
+                w_fc2.append(self._dit_ff_fp8_keep[-1].data_ptr())
             a_fc1.append((act_fc1[li] / FP8_MAX) * ws_p)
             a_fc2.append((act_fc2[li] / FP8_MAX) * ws_d)
         # Fused FP8 QKV for the 16 self-attn layers: concat q/k/v ([D,D] each)
@@ -663,11 +680,14 @@ class GrootN17TorchFrontendThor:
         self._k_qkv_buf = torch.empty(Sa, 3 * 1536, dtype=torch.bfloat16, device=dev)
         self._k_qkv_xn_fp8 = torch.empty(Sa, 1536, dtype=f8, device=dev)
         qkv_fp8, qkv_fp8_nt, qkv_b, a_qkv, s_qkv, qkv_ws = [], [], [], [], [], []
+        w_qkv = []
         for j in range(16):
             li = 2 * j + 1
             qw = torch.cat([self._dit_q_w[li], self._dit_k_w[li], self._dit_v_w[li]], dim=1).float()
             qb = torch.cat([self._dit_q_b[li], self._dit_k_b[li], self._dit_v_b[li]]).to(torch.bfloat16).contiguous()
             ws_q = qw.abs().max().item() / FP8_MAX
+            if (not use_sm120_safe) and fp8_layout == "nk":
+                qw = qw.t().contiguous()
             qf = (qw / ws_q).to(f8).contiguous()
             sq = torch.tensor([act_qkv[j] / FP8_MAX], dtype=torch.float32, device=dev)
             self._dit_ff_fp8_keep += [qf, qb, sq]
@@ -678,6 +698,10 @@ class GrootN17TorchFrontendThor:
                 self._dit_ff_fp8_keep += [qf_nt, sw_q]
                 qkv_fp8_nt.append(qf_nt.data_ptr())
                 qkv_ws.append(sw_q.data_ptr())
+            else:
+                wq = torch.tensor([ws_q], dtype=torch.float32, device=dev)
+                self._dit_ff_fp8_keep.append(wq)
+                w_qkv.append(wq.data_ptr())
             a_qkv.append((act_qkv[j] / FP8_MAX) * ws_q)
         for step in range(num_inference_timesteps):
             if use_sm120_safe:
@@ -696,11 +720,13 @@ class GrootN17TorchFrontendThor:
             else:
                 step_weights[step].update(
                     ff_proj_w_fp8=proj_fp8, ff_down_w_fp8=down_fp8,
-                    ff_proj_b=projb16,  # fp16 bias for the GELU epilogue
-                    alpha_fc1=a_fc1, alpha_fc2=a_fc2,
+                    ff_proj_b=projb16,
                     act_fc1_scale=s_fc1, act_fc2_scale=s_fc2,
+                    w_fc1_scale=w_fc1, w_fc2_scale=w_fc2,
+                    ff_fp8_layout=fp8_layout,
                     qkv_w_fp8=qkv_fp8, qkv_b=qkv_b,
-                    alpha_qkv=a_qkv, act_qkv_scale=s_qkv)
+                    act_qkv_scale=s_qkv, w_qkv_scale=w_qkv,
+                    qkv_fp8_layout=fp8_layout)
         bp.update(xn_fp8=self._k_xn_fp8.data_ptr(),
                   ff_fp16=self._k_ff_fp16.data_ptr(),
                   ff_fp8=self._k_ff_fp8.data_ptr(),
@@ -1437,10 +1463,10 @@ class GrootN17TorchFrontendThor:
         S = self.Se
         nt, ni = self._ck_nt, self._ck_ni
         K.cast_fp16_to_bf16(self._ck_bb_src.data_ptr(), self._ck_bb.data_ptr(), S * 2048, s)
-        K.qwen36_embedding_lookup_bf16(
+        K.embedding_lookup_bf16(
             self._ck_text_idx.data_ptr(), self._ck_bb.data_ptr(),
             self._ck_text_src.data_ptr(), nt, 2048, s)
-        K.qwen36_embedding_lookup_bf16(
+        K.embedding_lookup_bf16(
             self._ck_image_idx.data_ptr(), self._ck_bb.data_ptr(),
             self._ck_image_src.data_ptr(), ni, 2048, s)
         for j in range(16):

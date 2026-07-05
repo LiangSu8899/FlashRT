@@ -193,6 +193,84 @@ __global__ void causal_conv1d_update_chunk_kernel(
   }
 }
 
+// Per-step-checkpoint variant of the chunk kernel above: identical
+// math (the carried window values are bf16-exact in fp32 registers),
+// plus a bf16 dump of the post-shift state after every step into
+// ``state_steps`` (step s at state_steps + s * step_stride). Slot s
+// byte-matches the committed state of an S = s + 1 run, which is what
+// the spec-decode partial-accept rollback copies.
+__global__ void causal_conv1d_update_chunk_saves_kernel(
+    const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ w,
+    const __nv_bfloat16* __restrict__ bias,
+    __nv_bfloat16* __restrict__ out,
+    __nv_bfloat16* __restrict__ state,
+    __nv_bfloat16* __restrict__ state_steps,
+    int64_t step_stride,
+    int B, int S, int conv_dim, int k,
+    bool apply_silu)
+{
+  const int c = blockIdx.x * kThreadsX + threadIdx.x;
+  const int b = blockIdx.y;
+  if (c >= conv_dim) return;
+
+  const int sk = k - 1;
+  const int state_base = (b * conv_dim + c) * sk;
+
+  float wv[kMaxK];
+  #pragma unroll
+  for (int i = 0; i < kMaxK; ++i) {
+    wv[i] = (i < k) ? static_cast<float>(w[c * k + i]) : 0.0f;
+  }
+
+  float sv[kMaxK];
+  #pragma unroll
+  for (int i = 0; i < kMaxK; ++i) {
+    sv[i] = (i < sk)
+        ? static_cast<float>(state[state_base + i])
+        : 0.0f;
+  }
+
+  for (int s = 0; s < S; ++s) {
+    const float x_v = static_cast<float>(
+        x[(size_t)b * S * conv_dim + (size_t)s * conv_dim + c]);
+
+    float acc = (bias != nullptr) ? static_cast<float>(bias[c]) : 0.0f;
+    #pragma unroll
+    for (int i = 0; i < kMaxK; ++i) {
+      if (i < sk) acc = fmaf(sv[i], wv[i], acc);
+    }
+    acc = fmaf(x_v, wv[sk], acc);
+
+    if (apply_silu) acc = silu(acc);
+    out[(size_t)b * S * conv_dim + (size_t)s * conv_dim + c] =
+        __float2bfloat16(acc);
+
+    #pragma unroll
+    for (int i = 0; i < kMaxK - 1; ++i) {
+      if (i < sk - 1) sv[i] = sv[i + 1];
+    }
+    if (sk >= 1) {
+      sv[sk - 1] = x_v;
+    }
+
+    #pragma unroll
+    for (int i = 0; i < kMaxK; ++i) {
+      if (i < sk) {
+        state_steps[(size_t)s * step_stride + state_base + i] =
+            __float2bfloat16(sv[i]);
+      }
+    }
+  }
+
+  #pragma unroll
+  for (int i = 0; i < kMaxK; ++i) {
+    if (i < sk) {
+      state[state_base + i] = __float2bfloat16(sv[i]);
+    }
+  }
+}
+
 __global__ void causal_conv1d_update_chunk_parallel_kernel(
     const __nv_bfloat16* __restrict__ x,
     const __nv_bfloat16* __restrict__ w,
@@ -357,6 +435,27 @@ void causal_conv1d_qwen36_update_chunk_bf16(
       reinterpret_cast<const __nv_bfloat16*>(bias),
       reinterpret_cast<__nv_bfloat16*>(out),
       reinterpret_cast<__nv_bfloat16*>(state),
+      B, S, conv_dim, k, apply_silu);
+}
+
+void causal_conv1d_qwen36_update_chunk_saves_bf16(
+    const void* x, const void* w, const void* bias,
+    void* out, void* state,
+    void* state_steps, int64_t step_stride,
+    int B, int S, int conv_dim, int k,
+    bool apply_silu,
+    cudaStream_t stream)
+{
+  dim3 grid((conv_dim + kThreadsX - 1) / kThreadsX, B);
+  dim3 block(kThreadsX);
+  causal_conv1d_update_chunk_saves_kernel<<<grid, block, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(x),
+      reinterpret_cast<const __nv_bfloat16*>(w),
+      reinterpret_cast<const __nv_bfloat16*>(bias),
+      reinterpret_cast<__nv_bfloat16*>(out),
+      reinterpret_cast<__nv_bfloat16*>(state),
+      reinterpret_cast<__nv_bfloat16*>(state_steps),
+      step_stride,
       B, S, conv_dim, k, apply_silu);
 }
 

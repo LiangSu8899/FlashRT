@@ -184,6 +184,47 @@ live in [`docs/exec_contract.md`](docs/exec_contract.md) §9; the essentials:
 `serving/qwen36_agent` is the reference example that satisfies every item above;
 use it as the comparison point when adding a new serving host.
 
+### Runtime Export And Model Runtime
+
+The `runtime/` hand-off ABI and the `cpp/` native runtime layers follow the
+same mechanism-not-policy rule. Design:
+[`docs/cpp_runtime_design.md`](docs/cpp_runtime_design.md); interface:
+[`docs/model_runtime_api.md`](docs/model_runtime_api.md); norms:
+[`docs/runtime_contract.md`](docs/runtime_contract.md). The essentials
+reviewers hold every PR to:
+
+- `runtime/` headers are the ONLY frozen surface and are additive-only after
+  v1: append fields (bump ABI version + struct_size), append enum values,
+  never reorder or remove. Nothing under `cpp/` is ABI.
+- The contract is data first, verbs as sugar: ports (with update class) and
+  the stage DAG are the standard face; `step` is convenience, never the
+  center. Do not add scenario fields, model names, or scheduling concepts to
+  the structs.
+- `STAGED` is a promise: the port accepts hot updates. A producer that cannot
+  hot-update an input declares `SETUP` or omits the port — never
+  advertise-and-refuse.
+- Hot-path discipline is testable, not aspirational: SWAP writes, `set_input`
+  / `get_output`, and the tick never `cudaMalloc`/`cudaFree`, never
+  recapture, never rebind graph pointers. Staging uses fixed-capacity pools
+  created with the runtime; over-capacity input is a hard error, not a
+  fallback allocation.
+- Identity is computed once, by the builder: producer pairs + graph names +
+  region layout + port schema + bound windows. A change to any of these must
+  change the fingerprint; the advisory cadence hint must not.
+- Graph-cache mechanism (`frt_graph_evict` / `evict_lru` / `variant_count`)
+  lives in `exec/`; eviction and budget policy live in the host. Evict only
+  at a safe point — never while a variant may be in flight.
+- `cpp/` altitude rule: `modalities/` knows pixels and tensors, never models;
+  `families/` knows a model class's IO shape, never buffer names;
+  `models/<m>/` binds names and constants, never re-implements a transform.
+- Subgraph cuts are producer-authored: capture hooks register under
+  `flash_rt/subgraphs/` and leave pipeline logic untouched; the C++ runtime
+  consumes the declared `stages[]` and never assumes graph names (the verb
+  override path). Rules and examples:
+  [`docs/subgraph_stage_plans.md`](docs/subgraph_stage_plans.md). A structural
+  cut is a re-ordering, not an approximation — split-vs-full replay must stay
+  bit-exact (`cpp/tests/gate_pi05_model_runtime_export.py` is the gate).
+
 ### Calibration And Precision
 
 FP8/NVFP4 changes must preserve the calibration cache contract described in
@@ -281,6 +322,9 @@ Open the pull request from:
 
 Before requesting review:
 
+- Read the full public review standard in
+  [`docs/pr_review_checklist.md`](docs/pr_review_checklist.md) for the
+  long-term maintenance rules reviewers will apply.
 - Rebase or fast-forward onto the latest `main`.
 - Keep the change scoped to one behavior or model path.
 - Update docs when the user-facing API, build flow, supported hardware, or

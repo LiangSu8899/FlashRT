@@ -998,7 +998,7 @@ class Qwen3TorchFrontendRtx:
         # BW saving justifies. Reverted to BF16. A future NVFP4
         # lm_head with FP8 per-row calibration could potentially
         # recover the gap.
-        fvk.bf16_matmul_qwen36_bf16(
+        fvk.bf16_matmul_bf16(
             x_norm.data_ptr(),
             int(self._weights.ptrs['lm_head_w']),
             self._logits_buf[:1].data_ptr(),
@@ -1461,7 +1461,7 @@ class Qwen3TorchFrontendRtx:
                 self._lmhead_act_scale.data_ptr(), w_descale, s,
             )
         else:
-            fvk.bf16_matmul_qwen36_bf16(
+            fvk.bf16_matmul_bf16(
                 last_row.contiguous().data_ptr(),
                 int(self._weights.ptrs['lm_head_w']),
                 self._logits_buf[:1].data_ptr(), 1, vocab, hidden, s,
@@ -1523,7 +1523,7 @@ class Qwen3TorchFrontendRtx:
         # 0) Embed S tokens via the kernel gather (no torch indexing).
         embed_t = self._weights.anchors[0]
         h = self._embed_h_buf[:S]
-        fvk.qwen36_embedding_lookup_bf16(
+        fvk.embedding_lookup_bf16(
             prompt_ids.view(-1).data_ptr(), embed_t.data_ptr(),
             h.data_ptr(), S, hidden, s,
         )
@@ -1584,7 +1584,7 @@ class Qwen3TorchFrontendRtx:
 
         # 4) lm_head BF16. M=1 (last row, default) or M=S (full_logits).
         if full_logits:
-            fvk.bf16_matmul_qwen36_bf16(
+            fvk.bf16_matmul_bf16(
                 x_norm.contiguous().data_ptr(),
                 int(self._weights.ptrs['lm_head_w']),
                 self._logits_buf[:S].data_ptr(),
@@ -1711,7 +1711,7 @@ class Qwen3TorchFrontendRtx:
 
         embed_t = self._weights.anchors[0]
         h = self._embed_h_buf[:S]
-        fvk.qwen36_embedding_lookup_bf16(
+        fvk.embedding_lookup_bf16(
             prompt_ids.view(-1).data_ptr(), embed_t.data_ptr(),
             h.data_ptr(), S, hidden, s,
         )
