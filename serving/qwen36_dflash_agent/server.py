@@ -69,12 +69,15 @@ def _build_frontend(args):
 
 
 def _chat_ids(fe, messages: List[Dict[str, Any]], enable_thinking: bool):
-    return fe._tokenizer.apply_chat_template(
+    from flash_rt.frontends.torch.spec_session import as_input_ids_tensor
+
+    encoded = fe._tokenizer.apply_chat_template(
         messages,
         add_generation_prompt=True,
         enable_thinking=enable_thinking,
         return_tensors='pt',
-    ).to(fe.device)
+    )
+    return as_input_ids_tensor(encoded, device=fe.device)
 
 
 def create_app(args):
