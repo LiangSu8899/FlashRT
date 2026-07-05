@@ -369,11 +369,11 @@ class Qwen3TorchFrontendRtx:
         self._prefill_gemm_residual = getattr(
             self._fvk, 'fp4_w4a16_gemm_residual_sm120_bf16out', None)
         # The fused residual is added in FP32 inside the GEMM epilogue (vs bf16
-        # in the separate norm kernel) — slightly MORE accurate but a small
-        # behavioural change (S=512 argmax unchanged, logits cos ~0.992 vs the
-        # unfused path). Default ON; FLASH_RT_QWEN3_NO_RESID_FUSE=1 disables.
+        # in the separate norm kernel). That is a small behavioural change, so
+        # the legacy path remains the default and the fused path is opt-in.
         import os as _os
-        if _os.environ.get('FLASH_RT_QWEN3_NO_RESID_FUSE', '0') == '1':
+        if (_os.environ.get('FLASH_RT_QWEN3_RESID_FUSE', '0') != '1'
+                or _os.environ.get('FLASH_RT_QWEN3_NO_RESID_FUSE', '0') == '1'):
             self._prefill_gemm_residual = None
         self._prefill_silu_merged = getattr(
             self._fvk, 'silu_mul_merged_to_nvfp4_swizzled_grouped32_bf16',
@@ -416,15 +416,14 @@ class Qwen3TorchFrontendRtx:
         # SwiGLU epilogue fold (prefill): fuse silu(gate)*up into the gate_up
         # GEMM epilogue (interleaved gate|up weight, FP4 out, SF32) + an even-
         # column compaction, replacing the [gate_up GEMM bf16 + silu_mul]
-        # 2-launch chain. Graph-validated −0.438 ms/prefill (S=512: 10.95→10.52),
-        # HF red line holds (argmax-vs-HF fold == base 2/4, cos(fold,HF)≥base).
-        # DEFAULT-ON; only activates when the interleaved weight + fused-kernel
-        # symbols exist (guards below), and FLASH_RT_QWEN3_SWIGLU_FOLD=0 disables.
+        # 2-launch chain. Graph-validated speedups are useful, but this is a
+        # non-bit-exact path, so it stays opt-in until covered by a reproducible
+        # correctness red line.
         import os as _os
         inter0 = int(layers0['intermediate']) if 'intermediate' in layers0 \
             else int(self._cfg['intermediate'])
         self._enable_swiglu_fold_prefill = (
-            _os.environ.get('FLASH_RT_QWEN3_SWIGLU_FOLD', '1') != '0'
+            _os.environ.get('FLASH_RT_QWEN3_SWIGLU_FOLD', '0') == '1'
             and 'gate_up_il_packed' in layers0
             and hasattr(self._fvk, 'fp4_w4a16_dual_gemm_silu_fp4out_sm120')
             and hasattr(self._fvk, 'fp4_swiglu_even_col_compact'))

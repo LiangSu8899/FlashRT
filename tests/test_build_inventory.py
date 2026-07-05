@@ -45,11 +45,11 @@ SLIM_SM89_KERNELS_TU = 33
 COMPAT_KERNELS_CATEGORIES = {
     "generic_shared": 15,
     "qwen36_linear_attention": 12,
-    "sm120_nvfp4_named": 7,
+    "sm120_nvfp4_named": 8,
     "motus_video_fp8_history": 7,
     "dit_video": 2,
     "qwen3_family": 2,
-    "other": 10,
+    "other": 9,
 }
 SLIM_SM89_KERNELS_CATEGORIES = {
     "generic_shared": 15,

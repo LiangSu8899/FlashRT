@@ -168,6 +168,8 @@ option(FLASHRT_ENABLE_MELBAND_ROFORMER
 # Enable explicitly on a Blackwell (sm_120) build.
 option(FLASHRT_ENABLE_OMNIVOICE
        "Build OmniVoice TTS RTX SM120 fused kernels in flash_rt_omnivoice" OFF)
+option(FLASHRT_ENABLE_SM120_DEV_KERNELS
+       "Build SM120 probe/tilesweep tuning kernels and public bindings" OFF)
 # ── Slim build for VLA deployments ──
 # OFF by default: the standard build keeps the broad, compatibility-oriented
 # kernel set it has today. Turn ON (-DFLASHRT_SLIM_BUILD=ON) to drop
@@ -529,9 +531,7 @@ if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121")
     csrc/gemm/fp4/cutlass_nvfp4_gemm_bias_gelu_bf16out_sm120.cu
     csrc/gemm/fp4/cutlass_nvfp4_gemm_bias_gelu_fp4out_sm120.cu
     csrc/gemm/fp4/cutlass_nvfp4_gemm_dn_streamk_bias_sm120.cu
-    csrc/gemm/fp4/cutlass_nvfp4_dual_gemm_silu_fp4out_sm120.cu
-    csrc/gemm/fp4/cutlass_nvfp4_w4a16_tilesweep_sm120.cu
-    csrc/gemm/fp4/normfold/cutlass_nvfp4_normfold_probe_sm120.cu)
+    csrc/gemm/fp4/cutlass_nvfp4_dual_gemm_silu_fp4out_sm120.cu)
   set_target_properties(sm120_nvfp4_ffn_obj PROPERTIES
     CUDA_STANDARD 17
     POSITION_INDEPENDENT_CODE ON
@@ -543,6 +543,33 @@ if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121")
     ${CUTLASS_DIR}/tools/util/include
   )
   target_compile_options(sm120_nvfp4_ffn_obj PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr -O3 --use_fast_math
+      ${GPU_GENCODE}
+    >
+  )
+endif()
+
+# ── SM120a NVFP4 development probes ──
+# These are tuning/proof kernels, not runtime dependencies. Keep them behind an
+# explicit developer option so the public pybind module does not grow research
+# symbols by default.
+if(FLASHRT_ENABLE_SM120_DEV_KERNELS AND
+   (GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121"))
+  add_library(sm120_nvfp4_dev_obj OBJECT
+    csrc/gemm/fp4/cutlass_nvfp4_w4a16_tilesweep_sm120.cu
+    csrc/gemm/fp4/normfold/cutlass_nvfp4_normfold_probe_sm120.cu)
+  set_target_properties(sm120_nvfp4_dev_obj PROPERTIES
+    CUDA_STANDARD 17
+    POSITION_INDEPENDENT_CODE ON
+  )
+  target_include_directories(sm120_nvfp4_dev_obj PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm/fp4
+    ${CUTLASS_INCLUDE}
+    ${CUTLASS_DIR}/tools/util/include
+  )
+  target_compile_options(sm120_nvfp4_dev_obj PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:
       --expt-relaxed-constexpr -O3 --use_fast_math
       ${GPU_GENCODE}
@@ -607,6 +634,32 @@ if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121" OR
   )
 endif()
 
+# ── Qwen3 SM120 fp8 prefill attention ──
+# Shared low-level sage2 fp8 code is compiled from a neutral Qwen3 object so
+# Qwen3 does not depend on FLASHRT_ENABLE_MOTUS. Runtime remains env-gated.
+if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121")
+  add_library(qwen3_prefill_sm120_obj OBJECT
+    csrc/attention/sage2/sage2_attn_f8_raw.cu
+    csrc/attention/fmha_fp8_causal_gqa_sm120.cu)
+  set_target_properties(qwen3_prefill_sm120_obj PROPERTIES
+    CUDA_STANDARD 17
+    POSITION_INDEPENDENT_CODE ON
+  )
+  target_include_directories(qwen3_prefill_sm120_obj PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/sage2
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/sage2/qattn
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/quantize
+  )
+  target_compile_options(qwen3_prefill_sm120_obj PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr -O3 --use_fast_math
+      ${GPU_GENCODE}
+    >
+  )
+endif()
+
 # ── Motus beta SM120 kernels ──
 # These are model-specific RTX kernels and must remain additive. They are
 # compiled into flash_rt_kernels so Motus does not depend on separate
@@ -614,8 +667,6 @@ endif()
 if(FLASHRT_ENABLE_MOTUS AND GPU_ARCH STREQUAL "120")
   add_library(motus_aux_sm120_obj OBJECT
     csrc/attention/sage2/sage2_attn_raw.cu
-    csrc/attention/sage2/sage2_attn_f8_raw.cu
-    csrc/attention/fmha_fp8_causal_gqa_sm120.cu
     csrc/conv/fp8_conv2d_3x3_sm120_v1.cu
     csrc/conv/fp8_conv3d_sm120_v17.cu
     csrc/conv/fp8_conv3d_sm120_v18.cu
@@ -1117,9 +1168,6 @@ pybind11_add_module(flash_rt_kernels
   csrc/quantize/rope_apply_bf16.cu
   csrc/gemm/fp8_block128_gemm.cu
   csrc/kernels/silu_mul_qwen36.cu
-  csrc/kernels/silu_mul_to_nvfp4_swizzled.cu
-  csrc/kernels/fp4_swiglu_compact_sm120.cu
-  csrc/kernels/qwen36_misc.cu
   csrc/kernels/embedding_lookup_bf16.cu
   # qwen3_5_moe-family RTX SM120 kernels are NOT listed here -- they are
   # gated into the module below (FLASHRT_ENABLE_QWEN35MOE), so SM89/87/110
@@ -1232,7 +1280,8 @@ if(NOT FLASHRT_SLIM_BUILD OR ENABLE_NVFP4)
   target_sources(flash_rt_kernels PRIVATE
     csrc/quantize/fp8_block128_to_nvfp4_swizzled.cu
     csrc/quantize/bf16_weight_to_nvfp4_swizzled.cu
-    csrc/kernels/silu_mul_to_nvfp4_swizzled.cu)
+    csrc/kernels/silu_mul_to_nvfp4_swizzled.cu
+    csrc/kernels/fp4_swiglu_compact_sm120.cu)
   target_compile_definitions(flash_rt_kernels PRIVATE FLASHRT_HAVE_NVFP4_SWIZZLE=1)
   message(STATUS "NVFP4 swizzle/quantize kernels: ENABLED")
 else()
@@ -1325,6 +1374,14 @@ if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121" OR
     ENABLE_DECODE_GEMV_M1=1)
 endif()
 
+if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121")
+  target_sources(flash_rt_kernels PRIVATE
+    $<TARGET_OBJECTS:qwen3_prefill_sm120_obj>)
+  target_compile_definitions(flash_rt_kernels PRIVATE
+    ENABLE_SAGE2_F8_RAW=1
+    ENABLE_QWEN3_FP8_PREFILL_ATTN=1)
+endif()
+
 # SM120a CUTLASS NVFP4 W4A16 GEMM (Qwen3.6 NVFP4 ckpt path).
 if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121")
   target_sources(flash_rt_kernels PRIVATE
@@ -1333,6 +1390,12 @@ if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121")
     csrc/quantize/nvfp4_sf_reshape_sm120.cu)
   target_compile_definitions(flash_rt_kernels PRIVATE
     ENABLE_CUTLASS_SM120_NVFP4_W4A16=1)
+  if(FLASHRT_ENABLE_SM120_DEV_KERNELS)
+    target_sources(flash_rt_kernels PRIVATE
+      $<TARGET_OBJECTS:sm120_nvfp4_dev_obj>)
+    target_compile_definitions(flash_rt_kernels PRIVATE
+      FLASHRT_HAVE_SM120_NVFP4_DEV=1)
+  endif()
 endif()
 
 # SM100 CUTLASS NVFP4 W4A16 GEMM (Qwen3.6 NVFP4 ckpt on Thor).

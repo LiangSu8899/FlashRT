@@ -43,7 +43,7 @@ struct Sm120SiluMulBlockScaleFactorRowStore {
   static_assert(size<1>(EpilogueTile{}) % SFVecSize == 0, "EpilogueTileN should be divisible by SFVecSize");
   static_assert(size<1>(EpilogueTile{}) / SFVecSize == 1 or
                 size<1>(EpilogueTile{}) / SFVecSize == 2 or
-                size<1>(EpilogueTile{}) / SFVecSize == 4 or 
+                size<1>(EpilogueTile{}) / SFVecSize == 4 or
                 size<1>(EpilogueTile{}) / SFVecSize == 8,
                 "Possible store in interleaved 4B aligned format");
 
@@ -299,7 +299,7 @@ struct Sm120SiluMulBlockScaleFactorRowStore {
 
       cutlass::maximum_absolute_value_reduction<ElementCompute, true> amax_op;
       cutlass::multiplies<ElementCompute> mul;
-      
+
       Tensor tC_rSFD_flt = filter_zeros(tC_rSFD);
 
       auto synchronize = [&] () {
@@ -364,7 +364,7 @@ struct Sm120SiluMulBlockScaleFactorRowStore {
               amax = amax_op(amax, amax_other2);
               amax = amax_op(amax, amax_other4);
               amax = amax_op(amax, amax_other6);
-            } 
+            }
             else {
               static_assert(cutlass::detail::dependent_false<TiledCopy_>, "Unsupported warp layout.");
             }

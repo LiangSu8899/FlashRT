@@ -58,21 +58,9 @@
 // construction). The stock fp4 consumer (copy_kblock + gemm_kblock) reads sA UNCHANGED
 // = roofline, zero MMA risk.
 //
-// INTEGRATION CHECKLIST (this file = identity fork copy; tag renamed PQ; INERT):
-//   [done] quantize helpers + quantize_tile_natural() (below — the core IP).
-//   [TODO] TensorStorage: ADD smem_A_bf16 staging (bf16, per-stage). BLK_K=128 (smem).
-//   [TODO] Params/Arguments: ptr_A = bf16; bf16 staging SmemLayout + a bf16 load path
-//          (TMA or cp.async) in load(); REMOVE the fp4-A TMA and SFA TMA; tx-bytes =
-//          staging_bf16 + B + SFB.
-//   [TODO] load(): bf16 A tile → smem_A_bf16[stage] (+ B + SFB stock).
-//   [TODO] mma(): after EACH consumer_wait, call quantize_tile_natural(sA_bf16[stage]
-//          → sA[stage], sSFA[stage]); __syncthreads; then the stock copy_kblock loop
-//          reads sA[stage] (fp4) verbatim. (sA is now consumer-written scratch, not
-//          TMA'd; sSFA likewise.)
-//   [TODO] NormFoldBuilderPQ (builder) = identity NormFoldBuilder + PQ tag + bf16 A
-//          gmem; probe binding fp4_normfold_pq_probe_sm120(...); CMake.
-//   [TODO] test_normfold_pq_e2e.py (clone bf16a test): cos=1 vs quantize(A)+prod-GEMM;
-//          bench vs separate (beat 26.9us o_proj; ≈GEMM-only gate_up).
+// Development note: this producer-quant fork is compiled only when the explicit
+// SM120 developer-probe CMake option is enabled. The default runtime build does
+// not expose the probe bindings or link this translation unit.
 //
 // INTEGRATION SPECIFICS (worked out 2026-06-27 — edit sites + the tricky bits):
 //   • bf16 staging types (add after SmemLayoutB ~L316):

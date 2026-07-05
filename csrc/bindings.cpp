@@ -25,9 +25,11 @@
 #include "gemm/fp4/cutlass_nvfp4_gemm_bias_gelu_bf16out_sm120.cuh"
 #include "gemm/fp4/cutlass_nvfp4_gemm_bias_gelu_fp4out_sm120.cuh"
 #include "gemm/fp4/cutlass_nvfp4_dual_gemm_silu_fp4out_sm120.cuh"
-#include "gemm/fp4/cutlass_nvfp4_w4a16_tilesweep_sm120.cuh"
 #include "gemm/fp4/cutlass_nvfp4_gemm_dn_streamk_bias_sm120.cuh"
+#ifdef FLASHRT_HAVE_SM120_NVFP4_DEV
+#include "gemm/fp4/cutlass_nvfp4_w4a16_tilesweep_sm120.cuh"
 #include "gemm/fp4/normfold/cutlass_nvfp4_normfold_probe_sm120.cuh"
+#endif
 #endif
 #ifdef ENABLE_CUTLASS_SM100_NVFP4_W4A16
 #include "gemm/fp4/cutlass_nvfp4_w4a16_gemm_sm100.cuh"
@@ -201,7 +203,11 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #include "attention/fmha_dispatch.h"
 #ifdef ENABLE_MOTUS_SAGE2_RAW
 #include "attention/sage2/sage2_attn_raw.cuh"
+#endif
+#ifdef ENABLE_SAGE2_F8_RAW
 #include "attention/sage2/sage2_attn_f8_raw.cuh"
+#endif
+#ifdef ENABLE_QWEN3_FP8_PREFILL_ATTN
 #include "attention/fmha_fp8_causal_gqa_sm120.cuh"
 #endif
 
@@ -3816,7 +3822,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("x"), py::arg("out"), py::arg("scale"),
         py::arg("B"), py::arg("L"), py::arg("H"), py::arg("stream") = 0);
 
-#ifdef ENABLE_MOTUS_SAGE2_RAW
+#if defined(ENABLE_MOTUS_SAGE2_RAW) && defined(ENABLE_SAGE2_F8_RAW)
     m.def("sage2_qk_int8_sv_f8_bf16_nhd_d128",
         [](uintptr_t q_int8, uintptr_t k_int8, uintptr_t v_fp8,
            uintptr_t out_bf16, uintptr_t q_scale, uintptr_t k_scale,
@@ -3833,7 +3839,9 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("v_scale"), py::arg("B"), py::arg("Lq"),
         py::arg("Lk"), py::arg("H"), py::arg("softmax_scale"),
         py::arg("stream") = 0);
+#endif
 
+#ifdef ENABLE_MOTUS_SAGE2_RAW
     m.def("sage2_qk_int8_sv_f16_bf16_nhd_d128",
         [](uintptr_t q_int8, uintptr_t k_int8, uintptr_t v_half,
            uintptr_t out_bf16, uintptr_t q_scale, uintptr_t k_scale,
@@ -3864,7 +3872,9 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("B"), py::arg("Lq"), py::arg("Lk"),
         py::arg("Hq"), py::arg("Hkv"), py::arg("softmax_scale"),
         py::arg("stream") = 0);
+#endif
 
+#if defined(ENABLE_MOTUS_SAGE2_RAW) && defined(ENABLE_SAGE2_F8_RAW)
     m.def("sage2_qk_int8_sv_f8_bf16_gqa_nhd_d256",
         [](uintptr_t q_int8, uintptr_t k_int8, uintptr_t v_fp8,
            uintptr_t out_bf16, uintptr_t q_scale, uintptr_t k_scale,
@@ -3881,7 +3891,9 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("v_scale"), py::arg("B"), py::arg("Lq"),
         py::arg("Lk"), py::arg("Hq"), py::arg("Hkv"),
         py::arg("softmax_scale"), py::arg("stream") = 0);
+#endif
 
+#ifdef ENABLE_QWEN3_FP8_PREFILL_ATTN
     // Additive fp8-QK / fp16-PV causal GQA attention (qwen3 prefill).
     m.def("sage2_qk_f8_sv_f16_bf16_gqa_nhd_d128_causal",
         [](uintptr_t q_fp8, uintptr_t k_fp8, uintptr_t v_fp16,
@@ -6270,6 +6282,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("in_packed"), py::arg("out_packed"),
         py::arg("M"), py::arg("inter"), py::arg("stream") = 0);
 
+#ifdef FLASHRT_HAVE_SM120_NVFP4_DEV
     // Tile-shape sweep over the production SM120 fp4 GEMM family (BF16 out),
     // for measuring per-tile efficiency (e.g. the 128x64 dual-accumulator
     // tile) and tuning narrow-N shapes. Returns 0 on success.
@@ -6341,6 +6354,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("A"), py::arg("B"), py::arg("D"),
         py::arg("M"), py::arg("N"), py::arg("K"), py::arg("SFB"),
         py::arg("alpha") = 1.0f, py::arg("stream") = 0);
+#endif
 
     // Recipe C step 3: NVFP4 W4A16 GEMM_dn + per-col bias epilogue, BF16
     // output, **StreamK scheduler**. Replaces (GEMM_dn + add_bias_bf16)
