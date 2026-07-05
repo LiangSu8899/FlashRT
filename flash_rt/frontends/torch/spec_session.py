@@ -36,6 +36,24 @@ import os
 from typing import Any, Dict, List, Optional
 
 
+def as_input_ids_tensor(input_ids, *, device=None):
+    """Return the ``input_ids`` tensor from tokenizer output or a tensor.
+
+    Hugging Face tokenizers can return either a tensor directly or a
+    BatchEncoding/dict containing ``input_ids``. The speculative session
+    consumes the tensor form; normalizing it here keeps hosts and Nexus
+    examples from depending on tokenizer return-type details.
+    """
+    try:
+        if 'input_ids' in input_ids:
+            input_ids = input_ids['input_ids']
+    except (KeyError, TypeError, RuntimeError):
+        pass
+    if device is not None:
+        input_ids = input_ids.to(device)
+    return input_ids
+
+
 class StrictArgmax:
     """Exact greedy acceptance: a draft row matches iff it equals the
     verify argmax; committed tokens are the argmax rows."""
@@ -251,13 +269,20 @@ class SpecSession:
         out: Dict[str, Any] = {
             'cur_pos': self.cur_pos,
             'tokens_generated': len(self.generated),
+            'spec_attempts': int(getattr(fe, '_spec_attempts', 0)),
+            'spec_accepts': int(getattr(fe, '_spec_accepts', 0)),
+            'spec_full': int(getattr(fe, '_spec_full', 0)),
             'lin_state': fe._lin_state,
             'lin_conv_state': fe._lin_conv_state,
         }
+        if hasattr(self.policy, 'in_think'):
+            out['policy_in_think'] = bool(self.policy.in_think)
         if hasattr(fe, '_fp8_K_cache'):
             out['fp8_k_cache'] = fe._fp8_K_cache
             out['fp8_v_cache'] = fe._fp8_V_cache
         buf = getattr(fe, '_dflash_buf', None) or {}
+        if buf.get('target_feat_window') is not None:
+            out['drafter_shift_window'] = buf['target_feat_window']
         if buf.get('pt_window') is not None:
             out['drafter_window'] = buf['pt_window']
             out['drafter_window_valid'] = buf['pt_valid']
@@ -270,6 +295,8 @@ class SpecSession:
         import torch
 
         fe = self.fe
+        input_ids = as_input_ids_tensor(
+            input_ids, device=getattr(fe, 'device', None))
         self.prompt_len = int(input_ids.shape[1])
         fe.reset_state()
         if not hasattr(fe, '_rope_cos_table'):

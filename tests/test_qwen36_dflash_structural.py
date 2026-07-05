@@ -253,13 +253,52 @@ def test_session_boundary_names():
     fe._lin_state = torch.zeros(2)
     fe._lin_conv_state = torch.zeros(2)
     fe._dflash_taps_buf = torch.zeros(5, 4, HIDDEN)
-    fe._dflash_buf = {"pt_window": torch.zeros(4, HIDDEN),
+    fe._spec_attempts = 3
+    fe._spec_accepts = 7
+    fe._spec_full = 1
+    fe._dflash_buf = {"target_feat_window": torch.zeros(2, HIDDEN),
+                      "pt_window": torch.zeros(4, HIDDEN),
                       "pt_valid": 4}
     session = fe.make_dflash_session(max_new_tokens=8, K=15)
     b = session.boundary()
-    for key in ("cur_pos", "lin_state", "lin_conv_state",
-                "drafter_window", "taps_row0"):
+    for key in ("cur_pos", "tokens_generated", "spec_attempts",
+                "spec_accepts", "spec_full", "lin_state",
+                "lin_conv_state", "drafter_shift_window",
+                "drafter_window", "drafter_window_valid", "taps_row0"):
         assert key in b
+    assert b["spec_attempts"] == 3
+    assert b["spec_accepts"] == 7
+    assert b["spec_full"] == 1
+
+
+def test_session_boundary_includes_relaxed_policy_state(monkeypatch):
+    monkeypatch.setenv("FLASHRT_QWEN36_DFLASH_RELAXED_THINKING", "1")
+    fe = _session_stub()
+    fe._lin_state = torch.zeros(2)
+    fe._lin_conv_state = torch.zeros(2)
+    fe._dflash_taps_buf = torch.zeros(5, 4, HIDDEN)
+    fe._dflash_buf = {}
+    session = fe.make_dflash_session(max_new_tokens=8, K=15)
+    session.policy.in_think = True
+    assert session.boundary()["policy_in_think"] is True
+
+
+def test_as_input_ids_tensor_accepts_batch_encoding_like():
+    from flash_rt.frontends.torch.spec_session import as_input_ids_tensor
+
+    ids = torch.tensor([[1, 2, 3]])
+
+    class _BatchLike:
+        def __contains__(self, key):
+            return key == "input_ids"
+
+        def __getitem__(self, key):
+            assert key == "input_ids"
+            return ids
+
+    assert as_input_ids_tensor(_BatchLike()) is ids
+    assert as_input_ids_tensor({"input_ids": ids}) is ids
+    assert as_input_ids_tensor(ids) is ids
 
 
 def test_session_interrupt_stops_before_step(monkeypatch):
