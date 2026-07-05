@@ -28,7 +28,8 @@ import torch
 
 
 ROOT = Path(__file__).resolve().parents[2]
-for rel in ("", "exec/build", "runtime/build"):
+for rel in ("", "exec/build-container", "runtime/build-container",
+            "exec/build", "runtime/build"):
     p = str(ROOT / rel) if rel else str(ROOT)
     if p not in sys.path:
         sys.path.insert(0, p)
@@ -125,15 +126,32 @@ def _upload_bytes(buf, data: np.ndarray) -> None:
     buf.upload(data)
 
 
-def _dtype_from_frontend(pipe) -> tuple[int, torch.dtype]:
-    dtype = getattr(pipe, "_noise_out").dtype
+def _dtype_from_value(dtype) -> tuple[int, torch.dtype]:
+    text = str(dtype).lower()
     if dtype == torch.bfloat16:
         return FRT_PI05_DTYPE_BFLOAT16, torch.bfloat16
     if dtype == torch.float16:
         return FRT_PI05_DTYPE_FLOAT16, torch.float16
     if dtype == torch.float32:
         return FRT_PI05_DTYPE_FLOAT32, torch.float32
+    if text in ("bf16", "bfloat16"):
+        return FRT_PI05_DTYPE_BFLOAT16, torch.bfloat16
+    if text in ("f16", "float16", "fp16"):
+        return FRT_PI05_DTYPE_FLOAT16, torch.float16
+    if text in ("f32", "float32", "fp32"):
+        return FRT_PI05_DTYPE_FLOAT32, torch.float32
     raise RuntimeError(f"unsupported Pi05 action dtype: {dtype}")
+
+
+def _dtype_from_producer(pipe, pl) -> tuple[int, torch.dtype]:
+    dtype = getattr(pl, "tensor_dtype", None)
+    if dtype is not None:
+        return _dtype_from_value(dtype)
+    for attr in ("_noise_out", "_g_noise"):
+        tensor = getattr(pipe, attr, None)
+        if tensor is not None:
+            return _dtype_from_value(tensor.dtype)
+    raise RuntimeError("producer does not expose a Pi05 action dtype")
 
 
 def _raw_to_float(raw: np.ndarray, dtype: torch.dtype) -> np.ndarray:
@@ -177,6 +195,48 @@ def _make_frames(images: list[np.ndarray]) -> tuple[ctypes.Array, list[bytes]]:
     return frames, keepalive
 
 
+def _obs_images(pipe, obs) -> list[np.ndarray]:
+    nv = int(getattr(pipe, "num_views", len(obs.get("images", [])) or 1))
+    if "images" in obs:
+        return list(obs["images"][:nv])
+    images = [obs["image"]]
+    if nv >= 2:
+        images.append(obs.get("wrist_image", obs["image"]))
+    if nv >= 3:
+        images.append(obs.get("wrist_image_right", images[-1]))
+    return images[:nv]
+
+
+def _normalize_images_fp16(pipe, obs) -> np.ndarray:
+    frames = []
+    for im in _obs_images(pipe, obs):
+        if isinstance(im, torch.Tensor):
+            frames.append(im.to(dtype=torch.float16).cpu().numpy())
+        elif getattr(im, "dtype", None) == np.float16:
+            frames.append(np.asarray(im))
+        else:
+            frames.append((np.asarray(im).astype(np.float32) / 127.5 - 1.0)
+                          .astype(np.float16))
+    return np.ascontiguousarray(np.stack(frames))
+
+
+def _noise_bytes(nbytes: int, dtype: torch.dtype, seed: int) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    if dtype == torch.float32:
+        data = rng.standard_normal(nbytes // 4).astype(np.float32).tobytes()
+    elif dtype == torch.bfloat16:
+        values = rng.standard_normal(nbytes // 2).astype(np.float32)
+        try:
+            import ml_dtypes  # noqa: WPS433
+
+            data = values.astype(ml_dtypes.bfloat16).tobytes()
+        except Exception:  # noqa: BLE001
+            data = (values.view(np.uint32) >> 16).astype(np.uint16).tobytes()
+    else:
+        data = rng.standard_normal(nbytes // 2).astype(np.float16).tobytes()
+    return np.frombuffer(data, dtype=np.uint8).copy()
+
+
 def _action_affine(norm_stats) -> tuple[np.ndarray, np.ndarray]:
     q01 = np.asarray(norm_stats["actions"]["q01"], dtype=np.float32)
     q99 = np.asarray(norm_stats["actions"]["q99"], dtype=np.float32)
@@ -186,6 +246,9 @@ def _action_affine(norm_stats) -> tuple[np.ndarray, np.ndarray]:
 
 
 def _python_stage_images(pipe, pl, obs) -> np.ndarray:
+    if not hasattr(pipe, "_graph_torch_stream"):
+        pl.input_images_buf.upload(_normalize_images_fp16(pipe, obs))
+        return _read(pl.input_images_buf)
     with torch.cuda.stream(pipe._graph_torch_stream):
         stream_int = pipe._graph_torch_stream.cuda_stream
         pipe._fill_img_buf(obs)
@@ -196,7 +259,11 @@ def _python_stage_images(pipe, pl, obs) -> np.ndarray:
     return _read(pl.input_images_buf)
 
 
-def _seed_noise(pipe, pl, seed: int) -> np.ndarray:
+def _seed_noise(pipe, pl, seed: int, dtype: torch.dtype) -> np.ndarray:
+    if not hasattr(pipe, "_graph_torch_stream"):
+        data = _noise_bytes(pl.input_noise_buf.nbytes, dtype, seed)
+        _upload_bytes(pl.input_noise_buf, data)
+        return _read(pl.input_noise_buf)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     with torch.cuda.stream(pipe._graph_torch_stream):
@@ -211,6 +278,10 @@ def _seed_noise(pipe, pl, seed: int) -> np.ndarray:
 
 def _python_replay(pipe, pl, obs, start_noise: np.ndarray) -> np.ndarray:
     _upload_bytes(pl.input_noise_buf, start_noise)
+    if not hasattr(pipe, "_graph_torch_stream"):
+        pl.input_images_buf.upload(_normalize_images_fp16(pipe, obs))
+        pl.forward()
+        return _read(pl.input_noise_buf)
     with torch.cuda.stream(pipe._graph_torch_stream):
         stream_int = pipe._graph_torch_stream.cuda_stream
         pipe._fill_img_buf(obs)
@@ -274,11 +345,10 @@ def main() -> None:
     model.predict(images, prompt=args.prompt)
     pipe = model._pipe
     pl = pipe.pipeline
-    assert getattr(pl, "_graph", None) is not None, "Pi05 graph was not captured"
 
     export = pl.export_runtime(identity={"gate": "cpp_pi05_c_api"})
     lib = _load_lib(args.lib)
-    dtype_id, torch_dtype = _dtype_from_frontend(pipe)
+    dtype_id, torch_dtype = _dtype_from_producer(pipe, pl)
     action_mean, action_stddev = _action_affine(pipe.norm_stats)
 
     cfg = Pi05RuntimeConfig()
@@ -314,7 +384,7 @@ def main() -> None:
             _raw_to_float(py_img, torch_dtype) -
             _raw_to_float(cxx_img, torch_dtype))))
 
-        start_noise = _seed_noise(pipe, pl, args.seed + 1009)
+        start_noise = _seed_noise(pipe, pl, args.seed + 1009, torch_dtype)
         py_raw = _python_replay(pipe, pl, obs, start_noise)
         _upload_bytes(pl.input_noise_buf, start_noise)
         _cxx_prepare(lib, rt, frames)
