@@ -18,12 +18,12 @@ Scope (v1):
 Usage:
     pip install fastapi uvicorn
 
-    export FLASHRT_QWEN36_MTP_CKPT_DIR=/models/Qwen3.6-27B-FP8
-    export FLASHRT_QWEN36_DFLASH_CKPT_DIR=/models/Qwen3.6-27B-DFlash
+    export FLASHRT_QWEN36_MTP_CKPT_DIR=$QWEN36_MTP_CKPT
+    export FLASHRT_QWEN36_DFLASH_CKPT_DIR=$QWEN36_DFLASH_CKPT
     export FLASHRT_QWEN36_LONG_KV_CACHE=fp8
 
     python -m serving.qwen36_dflash_agent.server \\
-        --checkpoint /models/Qwen3.6-27B-NVFP4 \\
+        --checkpoint $QWEN36_NVFP4_CKPT \\
         --max-seq 32768 --K 15 --port 8000
 """
 from __future__ import annotations

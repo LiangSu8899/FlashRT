@@ -30,19 +30,19 @@ MTP checkpoint (frontend construction requires it), and the DFlash
 drafter checkpoint:
 
 ```bash
-hf download z-lab/Qwen3.6-27B-DFlash --local-dir /models/Qwen3.6-27B-DFlash
+hf download z-lab/Qwen3.6-27B-DFlash --local-dir "$QWEN36_DFLASH_CKPT"
 pip install fastapi uvicorn
 ```
 
 **1. Start the server**
 
 ```bash
-export FLASHRT_QWEN36_MTP_CKPT_DIR=/models/Qwen3.6-27B-FP8
-export FLASHRT_QWEN36_DFLASH_CKPT_DIR=/models/Qwen3.6-27B-DFlash
+export FLASHRT_QWEN36_MTP_CKPT_DIR=$QWEN36_MTP_CKPT
+export FLASHRT_QWEN36_DFLASH_CKPT_DIR=$QWEN36_DFLASH_CKPT
 export FLASHRT_QWEN36_LONG_KV_CACHE=fp8
 
 python -m serving.qwen36_dflash_agent.server \
-  --checkpoint /models/Qwen3.6-27B-NVFP4 \
+  --checkpoint $QWEN36_NVFP4_CKPT \
   --max-seq 32768 --K 15 \
   --host 127.0.0.1 --port 8000
 ```

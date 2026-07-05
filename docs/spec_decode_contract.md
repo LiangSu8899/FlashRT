@@ -54,7 +54,10 @@ session.boundary()                   # named buffers of the committed
 `step()` boundaries are quiescent points: state reflects exactly the
 committed tokens, which makes them the legal grid for host-level
 snapshot/restore/fork and for preemption by a co-scheduled real-time
-workload. `boundary()` enumerates what such a snapshot must carry.
+workload. `boundary()` enumerates the live device buffers and counters
+that such a snapshot must copy. The host/capsule layer still owns the
+token journal and next-token cursor needed for a complete request-level
+restore or fork.
 
 `generate_own_speculative_DFlash_nvfp4` remains the stable public
 wrapper; existing callers are unaffected.

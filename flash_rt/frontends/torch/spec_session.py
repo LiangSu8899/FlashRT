@@ -260,10 +260,12 @@ class SpecSession:
         self._interrupt = True
 
     def boundary(self) -> Dict[str, Any]:
-        """Named buffers of the committed boundary (restorable set).
+        """Named live buffers at the committed device boundary.
 
-        Enumerates the state a capsule needs to snapshot/restore this
-        session between cycles. Tensors are live views, not copies.
+        Enumerates the device-side state a capsule needs to copy when
+        snapshotting this session between cycles. Tensors are live
+        views, not copies. A complete host snapshot also needs the
+        token journal and next-token cursor owned by the caller.
         """
         fe = self.fe
         out: Dict[str, Any] = {
