@@ -138,6 +138,9 @@ def alloc_drafter_scratch(frontend, device: str = 'cuda:0') -> dict:
     # P5: ctx-row activation buf for wk/wv on target_feat. Sized for
     # max_ctx so we can quantize all past target_feat in one launch.
     buf['act_Mctx_K5120'] = _alloc_act(max_ctx, hidden)
+    # Per-token window append quantizes R rows of concatenated target
+    # taps (R, 5 * hidden) before the shared fc projection.
+    buf['act_Mctx_K25600'] = _alloc_act(max_ctx, fc_in)
 
     # ---- output buffers (bf16) --------------------------------------
     # Per-layer GEMM outputs:
@@ -869,7 +872,7 @@ def pertoken_window_append(frontend, taps_rows) -> None:
         R = W
 
     x = taps_rows.reshape(R, FC_IN).contiguous()
-    ap_t, sf_t = buf['act_Mctx_K5120']
+    ap_t, sf_t = buf['act_Mctx_K25600']
     _quant_act(fvk, x, ap_t, sf_t, R, FC_IN, s)
     _gemm_nvfp4(fvk, ap_t.data_ptr(), sf_t.data_ptr(),
                 d['fc_packed'], d['fc_sf'], d['fc_alpha'],
