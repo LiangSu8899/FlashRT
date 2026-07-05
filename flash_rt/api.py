@@ -369,7 +369,7 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         use_fp8: Enable FP8 execution where the selected frontend supports
             an FP8/BF16 switch. Defaults to True to preserve existing
             performance-oriented behavior.
-        use_fp16: Opt-in non-quantized full-FP16 path for Pi0.5 on RTX
+        use_fp16: Opt-in non-quantized full-FP16 path for Pi0.5 on Thor/RTX
             SM120/SM89, GROOT N1.6 on Thor/RTX SM120, and GROOT N1.7 on
             Thor/RTX SM120/SM89. Only valid with ``use_fp8=False``; an A/B
             reference against the quantized default. On GROOT N1.7 the
@@ -487,6 +487,7 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         if use_fp8:
             raise ValueError("use_fp16=True requires use_fp8=False")
         if (config, framework, arch) not in {
+            ("pi05", "torch", "thor"),
             ("pi05", "torch", "rtx_sm120"),
             ("pi05", "torch", "rtx_sm89"),
             ("groot", "torch", "thor"),
@@ -497,7 +498,7 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         }:
             raise ValueError(
                 "use_fp16=True is currently experimental and only supports "
-                "('pi05', 'torch', 'rtx_sm120'/'rtx_sm89'), "
+                "('pi05', 'torch', 'thor'/'rtx_sm120'/'rtx_sm89'), "
                 "('groot', 'torch', 'thor'/'rtx_sm120'), and "
                 "('groot_n17', 'torch', 'thor'/'rtx_sm120'/'rtx_sm89')")
 
@@ -532,10 +533,14 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             "use_fp16=True together with use_fp8=False.")
 
     if use_fp16:
-        # GROOT N1.6 Thor full-FP16 reference: the same fully-kernelized,
-        # CUDA-graph pipeline as the FP8 production frontend, with the GEMMs run
-        # in FP16 instead of per-tensor FP8 (an A/B accuracy baseline).
-        if config == "groot" and framework == "torch" and arch == "thor":
+        if config == "pi05" and framework == "torch" and arch == "thor":
+            # Pi0.5 Thor keeps FP8 and full-FP16 in the same frontend; the
+            # use_fp8=False kwarg below selects the FP16 kernel path.
+            pass
+        elif config == "groot" and framework == "torch" and arch == "thor":
+            # GROOT N1.6 Thor full-FP16 reference: the same fully-kernelized,
+            # CUDA-graph pipeline as the FP8 production frontend, with the
+            # GEMMs run in FP16 instead of per-tensor FP8.
             from flash_rt.frontends.torch.groot_thor_fp16 import (
                 GrootTorchFrontendThorFP16,
             )
