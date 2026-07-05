@@ -13,11 +13,13 @@ def _read(path: str) -> str:
     return (REPO_ROOT / path).read_text(encoding="utf-8")
 
 
-def test_qwen3_non_bit_exact_prefill_paths_are_opt_in():
+def test_qwen3_fast_prefill_paths_are_default_with_escape_hatches():
     src = _read("flash_rt/frontends/torch/qwen3_rtx.py")
+    attn = _read("flash_rt/hardware/rtx/attn_backend_qwen3.py")
 
-    assert "FLASH_RT_QWEN3_RESID_FUSE', '0'" in src
-    assert "FLASH_RT_QWEN3_SWIGLU_FOLD', '0'" in src
+    assert "FLASH_RT_QWEN3_RESID_FUSE', '1'" in src
+    assert "FLASH_RT_QWEN3_SWIGLU_FOLD', '1'" in src
+    assert 'FLASH_RT_QWEN3_FP8_FMHA", "1"' in attn
     assert "FLASH_RT_QWEN3_NO_RESID_FUSE" in src
 
 

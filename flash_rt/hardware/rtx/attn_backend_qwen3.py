@@ -173,7 +173,7 @@ class RtxFlashAttnBackendQwen3:
         # per-token scales — post-norm Q/K sit inside e4m3's dynamic range).
         # Takes precedence over FLASH_RT_QWEN3_FP8_ATTN when both are set.
         self._fp8_direct = False
-        if (os.environ.get("FLASH_RT_QWEN3_FP8_FMHA", "0") == "1"
+        if (os.environ.get("FLASH_RT_QWEN3_FP8_FMHA", "1") == "1"
                 and self._max_q_seq >= 128):
             from flash_rt import flash_rt_kernels as _fvk
             fn = getattr(_fvk, "fmha_fp8_causal_gqa_nhd_d128", None)
