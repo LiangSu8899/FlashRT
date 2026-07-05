@@ -58,10 +58,34 @@ def _input_ids(fe: Any, case: Case):
         case.prompt, return_tensors="pt").input_ids.to(fe.device)
 
 
-def _frontend(args):
-    from flash_rt.frontends.torch.qwen36_rtx import Qwen36TorchFrontendRtx
+def _resolve_frontend_name(name: str) -> str:
+    if name == "auto":
+        import torch
 
-    return Qwen36TorchFrontendRtx(
+        cap = torch.cuda.get_device_capability(0)
+        return "thor" if cap == (11, 0) else "rtx"
+    return name
+
+
+def _frontend_cls(name: str):
+    name = _resolve_frontend_name(name)
+    if name == "thor":
+        from flash_rt.frontends.torch.qwen36_thor import (
+            Qwen36TorchFrontendThor,
+        )
+
+        return Qwen36TorchFrontendThor
+    if name == "rtx":
+        from flash_rt.frontends.torch.qwen36_rtx import (
+            Qwen36TorchFrontendRtx,
+        )
+
+        return Qwen36TorchFrontendRtx
+    raise ValueError(f"unknown frontend {name!r}")
+
+
+def _frontend(args):
+    return _frontend_cls(args.frontend)(
         args.checkpoint, quant="nvfp4", max_seq=args.max_seq)
 
 
@@ -181,6 +205,9 @@ def main() -> int:
     parser.add_argument("--max-seq", type=int, default=2048)
     parser.add_argument("--dflash-k", type=int, default=15)
     parser.add_argument(
+        "--frontend", choices=("auto", "thor", "rtx"), default="auto",
+        help="frontend implementation; auto selects Thor on SM110")
+    parser.add_argument(
         "--dflash-without-mtp", action="store_true",
         help=(
             "Temporarily unset FLASHRT_QWEN36_MTP_CKPT_DIR while loading "
@@ -231,6 +258,8 @@ def main() -> int:
     print(json.dumps({
         "device": torch.cuda.get_device_name(0),
         "capability": torch.cuda.get_device_capability(0),
+        "frontend": args.frontend,
+        "resolved_frontend": _resolve_frontend_name(args.frontend),
         "results": results,
     }, indent=2, ensure_ascii=False))
     return 0
