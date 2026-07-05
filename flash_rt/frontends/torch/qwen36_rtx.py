@@ -2183,6 +2183,10 @@ class Qwen36TorchFrontendRtx:
         conv_state = self._lin_conv_state[lin_rank]
         qkv_K_view = out_qkv_K  # (K, 10240)
         save_steps = K if K <= self._K_save_max else 0
+        use_dflash_chunk_saves = (
+            save_steps > 0
+            and getattr(self, '_dflash_verify_active', False)
+            and self._dflash_chunk_saves_enabled())
         gdn_backend = _qwen36_tq_prefill_gdn_backend()
         use_wy_chunk = (
             K > self._K_save_max
@@ -2196,7 +2200,18 @@ class Qwen36TorchFrontendRtx:
         )
         conv_gqa_ready = False
 
-        if save_steps > 0:
+        if use_dflash_chunk_saves:
+            conv_steps = self._K_lin_conv_state_per_step
+            fvk.causal_conv1d_qwen36_update_chunk_saves_bf16(
+                qkv_K_view.data_ptr(), int(lw['conv1d_w']),
+                int(lw['conv1d_b']),
+                self._K_lin_conv_out[:K].data_ptr(),
+                conv_state.data_ptr(),
+                conv_steps[0, lin_rank].data_ptr(),
+                conv_steps.stride(0),
+                1, K, 10240, 4, True, s,
+            )
+        elif save_steps > 0:
             for k in range(K):
                 qkv_row = qkv_K_view[k:k + 1]
                 conv_out_row = self._K_lin_conv_out[k:k + 1]
@@ -2278,7 +2293,7 @@ class Qwen36TorchFrontendRtx:
         conv_K = None if conv_gqa_ready else self._K_lin_conv_out[:K]
         use_direct_gdn = (
             not conv_gqa_ready
-            and K > self._K_save_max
+            and (K > self._K_save_max or use_dflash_chunk_saves)
             and os.environ.get(
                 'FVK_QWEN36_CHUNK_GDN_PREFILL', '1') == '1'
             and hasattr(fvk, 'qwen36_gdn_chunk_from_conv_smem_bf16')
@@ -2392,8 +2407,24 @@ class Qwen36TorchFrontendRtx:
             and os.environ.get(
                 'FLASHRT_QWEN36_TQ_PREFILL_GDN_CHUNK_H_CUBLASLT_REF',
                 '0').strip().lower() not in ('1', 'true', 'on'))
-        use_inout = K <= self._K_save_max
-        if use_wy_chunk:
+        use_inout = K <= self._K_save_max and not use_dflash_chunk_saves
+        if use_dflash_chunk_saves:
+            lin_steps = self._K_lin_state_per_step
+            a_stride = a_vec_K.stride(0)
+            b_stride = b_vec_K.stride(0)
+            fvk.qwen36_gdn_chunk_from_conv_smem_strided_saves_bf16(
+                conv_K.data_ptr(),
+                a_vec_K.data_ptr(), b_vec_K.data_ptr(),
+                lw['neg_A_log_exp_fp32_t'].data_ptr(),
+                lw['dt_bias_fp32_t'].data_ptr(),
+                rec_state_view.data_ptr(),
+                lin_steps[0, lin_rank].data_ptr(),
+                lin_steps.stride(0),
+                attn_out_K_buf.data_ptr(),
+                K, 48, a_stride, b_stride, True, s,
+            )
+            attn_out_K = attn_out_K_buf.view(1, K, 48, 128)
+        elif use_wy_chunk:
             if conv_gqa_ready:
                 q16_K = self._K_lin_q16[:K]
                 k16_K = self._K_lin_k16[:K]
@@ -2659,11 +2690,11 @@ class Qwen36TorchFrontendRtx:
                     and os.environ.get(
                         'FLASHRT_QWEN36_TQ_PREFILL_GDN_OUTPUT_RAWK',
                         '1').strip().lower() not in ('0', 'false', 'off'))
-                # NOTE: recompute_wu_mma_fla is shipped but DISABLED in
+                # NOTE: recompute_wu_mma_fla is shipped but disabled in
                 # dispatch because cublasLt packed_rhs is already highly
-                # tuned for this small (64,128,64) GEMM and our hand-tuned
-                # kernel currently regresses (~+5 ms). Kept as a draft for
-                # future optimization (warp specialization, tile re-tuning).
+                # tuned for this small (64,128,64) GEMM and the current
+                # custom kernel regresses (~+5 ms). Keep it unavailable
+                # until the tile schedule is retuned.
                 if use_wy_lt_packed_wu and use_wy_lt_ai_pack_from_solve:
                     fvk.linear_attn_gdn_wy_recompute_wu_b64_bf16_cublaslt_packed_rhs(
                         self._K_fla_k16_l2[:, :K].data_ptr(),
@@ -7632,7 +7663,7 @@ class Qwen36TorchFrontendRtx:
         True speculative decoding requires S=K main forward (Phase 6
         D4) so that one main pass predicts K+1 tokens given a draft
         chain of K. The architecture is in place (forward_mtp_head
-        works at smoke level, MTP prefill populates the KV cache,
+        works at basic validation level, MTP prefill populates the KV cache,
         accept rate >0.85 once warmed) but the speedup will only
         materialize once D4 lands.
 
@@ -11622,6 +11653,98 @@ class Qwen36TorchFrontendRtx:
         """
         self._load_dflash_drafter(ckpt_dir)
 
+    def _dflash_pertoken_default_enabled(self) -> bool:
+        """Architecture default for the DFlash per-token window."""
+        return False
+
+    def _configure_dflash_pertoken_window(self) -> None:
+        """Read shared DFlash per-token-window env knobs.
+
+        RTX keeps the legacy shift-window default for compatibility,
+        while subclasses can override the architecture default. An
+        explicit FLASHRT_QWEN36_DFLASH_PERTOKEN value wins everywhere.
+        """
+        import os
+
+        if hasattr(self, '_dflash_pertoken_window'):
+            return
+        default = '1' if self._dflash_pertoken_default_enabled() else '0'
+        self._dflash_pertoken_window = os.environ.get(
+            'FLASHRT_QWEN36_DFLASH_PERTOKEN', default,
+        ).strip().lower() not in ('0', 'false', 'off')
+        self._dflash_pertoken_win = int(os.environ.get(
+            'FLASHRT_QWEN36_DFLASH_WINDOW', '128') or '128')
+
+    def _dflash_step_saves_default_enabled(self) -> bool:
+        """Architecture default for DFlash verify step-save rollback."""
+        return False
+
+    def _dflash_step_saves_enabled(self) -> bool:
+        import os
+
+        default = '1' if self._dflash_step_saves_default_enabled() else '0'
+        return os.environ.get(
+            'FLASHRT_QWEN36_DFLASH_STEP_SAVES', default,
+        ).strip().lower() not in ('0', 'false', 'off')
+
+    def _dflash_chunk_saves_default_enabled(self) -> bool:
+        """Architecture default for DFlash chunk kernels with save slots."""
+        return False
+
+    def _dflash_chunk_saves_enabled(self) -> bool:
+        cached = getattr(self, '_dflash_chunk_saves_flag', None)
+        if cached is None:
+            from flash_rt import flash_rt_kernels as fvk
+
+            default = (
+                '1' if self._dflash_chunk_saves_default_enabled() else '0')
+            cached = (
+                hasattr(fvk, 'causal_conv1d_qwen36_update_chunk_saves_bf16')
+                and hasattr(
+                    fvk,
+                    'qwen36_gdn_chunk_from_conv_smem_strided_saves_bf16')
+                and os.environ.get(
+                    'FLASHRT_QWEN36_DFLASH_CHUNK_SAVES', default,
+                ).strip().lower() not in ('0', 'false', 'off'))
+            self._dflash_chunk_saves_flag = cached
+        return cached
+
+    def _ensure_dflash_verify_step_saves(self) -> None:
+        """Size K-row per-step checkpoints for DFlash verify rollback.
+
+        The MTP short-spec path already uses these checkpoints to avoid
+        recovery forwards after a partial accept. DFlash verifies at
+        q_seq = K + 1 (default 16), so extend the same buffers when the
+        drafter is loaded and drop graphs that captured the smaller
+        pointers.
+        """
+        import torch
+
+        if not self._dflash_step_saves_enabled():
+            return
+        needed = self._MAX_PUBLIC_SPEC_K + 1
+        if self._K_save_max >= needed:
+            return
+        self._K_save_max = needed
+        self._K_lin_state_per_step = torch.empty(
+            needed, *self._lin_state.shape,
+            device=self._lin_state.device,
+            dtype=self._lin_state.dtype)
+        self._K_lin_conv_state_per_step = torch.empty(
+            needed, *self._lin_conv_state.shape,
+            device=self._lin_conv_state.device,
+            dtype=self._lin_conv_state.dtype)
+        for cache_name in (
+                '_captured_verify_graphs_fp8kv',
+                '_captured_prefill_graphs_fp8kv',
+                '_captured_verify_graphs_tq',
+                '_captured_prefill_graphs_tq',
+                '_captured_verify_graphs_dflash',
+        ):
+            cache = getattr(self, cache_name, None)
+            if cache:
+                cache.clear()
+
     def _load_dflash_drafter(self, ckpt_dir: str | None = None) -> None:
         """Load the z-lab/Qwen3.6-27B-DFlash drafter (NVFP4 W4A16).
 
@@ -11693,6 +11816,8 @@ class Qwen36TorchFrontendRtx:
             self._captured_drafter_graphs_dflash: collections.OrderedDict[
                 int, torch.cuda.CUDAGraph,
             ] = collections.OrderedDict()
+        self._ensure_dflash_verify_step_saves()
+        self._configure_dflash_pertoken_window()
 
     def _ensure_drafter_graph_dflash_nvfp4(self, eff_ctx: int):
         """P7: Lazy CUDA Graph capture for the entire drafter forward.
@@ -11753,8 +11878,13 @@ class Qwen36TorchFrontendRtx:
         this with the matching wrapper; the DFlash orchestration and
         graph capture above it stay shared.
         """
-        return self.forward_own_decode_K_nvfp4(
-            token_ids_K, cos_K, sin_K, cur_pos, K, tap_buf=tap_buf)
+        prev = getattr(self, '_dflash_verify_active', False)
+        self._dflash_verify_active = True
+        try:
+            return self.forward_own_decode_K_nvfp4(
+                token_ids_K, cos_K, sin_K, cur_pos, K, tap_buf=tap_buf)
+        finally:
+            self._dflash_verify_active = prev
 
     def _dflash_prefill_nvfp4(self, input_ids):
         """Arch hook: prompt prefill for DFlash spec decode.
@@ -11766,11 +11896,46 @@ class Qwen36TorchFrontendRtx:
         populates that store. Returns the (1, 1) first greedy token.
         """
         prompt_len = int(input_ids.shape[1])
-        for p in range(prompt_len):
+        seed_window = (
+            getattr(self, '_dflash_pertoken_window', False)
+            and os.environ.get(
+                'FLASHRT_QWEN36_DFLASH_WINDOW_SEED', '1',
+            ).strip().lower() not in ('0', 'false', 'off'))
+        if not seed_window:
+            for p in range(prompt_len):
+                self._static_token_id.copy_(input_ids[:, p:p + 1])
+                g_pf = self._ensure_graph_for_pos_nvfp4(p)
+                self._replay_pos_graph(g_pf, p)
+            return self._logits_buf.argmax(dim=-1, keepdim=True).view(1, 1)
+
+        from flash_rt.frontends.torch._qwen36_rtx_dflash_forward import (
+            alloc_pertoken_window,
+            pertoken_window_append,
+        )
+
+        alloc_pertoken_window(
+            self, int(getattr(self, '_dflash_pertoken_win', 128)))
+        buf = self._dflash_buf
+        tail = min(int(buf['pt_win']), prompt_len)
+        prefix = prompt_len - tail
+        for p in range(prefix):
             self._static_token_id.copy_(input_ids[:, p:p + 1])
             g_pf = self._ensure_graph_for_pos_nvfp4(p)
             self._replay_pos_graph(g_pf, p)
-        return self._logits_buf.argmax(dim=-1, keepdim=True).view(1, 1)
+
+        d = self._rope_dim
+        seed = buf['pt_seed_taps']
+        logits = None
+        for j, p in enumerate(range(prefix, prompt_len)):
+            cos_1 = self._rope_cos_table[p:p + 1].view(1, 1, d)
+            sin_1 = self._rope_sin_table[p:p + 1].view(1, 1, d)
+            logits = self.forward_own_decode_K_nvfp4(
+                input_ids[:, p:p + 1], cos_1, sin_1, p, 1,
+                tap_buf=seed[:, j:j + 1], logits_mode='last')
+        rows = buf['pt_taps_rows'][:tail]
+        rows.copy_(seed[:, :tail].permute(1, 0, 2))
+        pertoken_window_append(self, rows)
+        return logits.argmax(dim=-1, keepdim=True).view(1, 1)
 
     @staticmethod
     def _dflash_relaxed_matches(logits_K, drafts, all_argmax,
@@ -11807,6 +11972,8 @@ class Qwen36TorchFrontendRtx:
         written during the verify itself (Thor) override this with a
         no-op.
         """
+        if self._dflash_step_saves_enabled() and Kv <= self._K_save_max:
+            return
         self._snap_lin_buf.copy_(self._lin_state)
         self._snap_conv_buf.copy_(self._lin_conv_state)
         self._snap_K_buf[:, :Kv].copy_(
@@ -11830,6 +11997,22 @@ class Qwen36TorchFrontendRtx:
         copies instead.
         """
         import torch
+
+        if self._dflash_step_saves_enabled() and Kv <= self._K_save_max:
+            from flash_rt import flash_rt_kernels as fvk
+
+            s = torch.cuda.current_stream().cuda_stream
+            fvk.gpu_copy(
+                self._lin_state.data_ptr(),
+                self._K_lin_state_per_step[N].data_ptr(),
+                self._lin_state.numel() * 2, s,
+            )
+            fvk.gpu_copy(
+                self._lin_conv_state.data_ptr(),
+                self._K_lin_conv_state_per_step[N].data_ptr(),
+                self._lin_conv_state.numel() * 2, s,
+            )
+            return
 
         self._lin_state.copy_(self._snap_lin_buf)
         self._lin_conv_state.copy_(self._snap_conv_buf)

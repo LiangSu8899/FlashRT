@@ -84,13 +84,29 @@ committed context. Two window modes exist:
 
 Steady-state decode at short context against the FP8-KV MTP spec path
 (`generate_own_speculative_KN_nvfp4`, K=6) in the same process, greedy
-decoding, 64/256-token delta method:
+decoding, 64/256-token delta method. The reproducible benchmark is
+[`benchmarks/qwen36_dflash_scenario_bench.py`](../benchmarks/qwen36_dflash_scenario_bench.py):
+
+```bash
+python benchmarks/qwen36_dflash_scenario_bench.py \
+  --frontend thor \
+  --checkpoint "$QWEN36_NVFP4_CKPT" \
+  --max-seq 32768 \
+  --short-new 64 --long-new 256 \
+  --repeats 3
+```
 
 | prompt | MTP AL / tok/s | DFlash AL / tok/s |
 |---|---:|---:|
 | robot task -> JSON plan | 2.87 / 33.7 | **4.57 / 48.9** |
 | robot navigation plan | 2.59 / 30.5 | 3.25 / 34.8 |
 | prose explanation | 2.43 / 28.5 | 3.00 / 31.7 |
+
+The shorter
+[`benchmarks/qwen36_dflash_decode_bench.py`](../benchmarks/qwen36_dflash_decode_bench.py)
+is a regression/parity probe. Its 32-token compact-chat case can hit
+the K=15 accept-length ceiling in two speculation cycles, so it should
+not be used as a steady-state throughput claim.
 
 Cycle anatomy on Thor: one S=16 verify (~86 ms, weight-read bound) +
 one drafter graph replay (~7 ms). A partial accept costs two
@@ -130,7 +146,7 @@ neutral). The thinking stream is no longer token-identical to the
 strict run — enable this only where the product gates on the final
 answer, not the reasoning transcript.
 
-## Opt-in chunk-saves verify kernels (Thor)
+## Opt-in chunk-saves verify kernels
 
 `FLASHRT_QWEN36_THOR_LIN_CHUNK_SAVES=1` routes the DFlash verify's
 linear-attention layers to chunk kernels that emit the per-step
@@ -138,6 +154,55 @@ rollback checkpoints in one pass (~5% lower cycle time). This moves
 the verify off the kernel family that the MTP reference path uses, so
 greedy output is no longer token-identical to that reference — same
 tradeoff class as relaxed acceptance. Default off.
+
+On RTX, the matching experimental path is
+`FLASHRT_QWEN36_DFLASH_STEP_SAVES=1` plus
+`FLASHRT_QWEN36_DFLASH_CHUNK_SAVES=1`. The step-save buffers require
+additional VRAM and do not fit on a 31 GB RTX 5090 when the MTP head and
+DFlash drafter are resident together; use this only when the MTP head is
+not resident or after freeing it.
+
+To reproduce the RTX scenario comparison, run the MTP baseline with the
+MTP head resident:
+
+```bash
+export FLASHRT_QWEN36_MTP_CKPT_DIR="$QWEN36_MTP_CKPT"
+
+python benchmarks/qwen36_dflash_scenario_bench.py \
+  --frontend rtx \
+  --path mtp \
+  --checkpoint "$QWEN36_NVFP4_CKPT" \
+  --max-seq 2048 \
+  --short-new 64 --long-new 256 \
+  --repeats 1
+```
+
+Then run the optimized DFlash path without the MTP head resident:
+
+```bash
+unset FLASHRT_QWEN36_MTP_CKPT_DIR
+export FLASHRT_QWEN36_DFLASH_CKPT_DIR="$QWEN36_DFLASH_CKPT"
+export FLASHRT_QWEN36_DFLASH_PERTOKEN=1
+export FLASHRT_QWEN36_DFLASH_WINDOW=128
+export FLASHRT_QWEN36_DFLASH_STEP_SAVES=1
+export FLASHRT_QWEN36_DFLASH_CHUNK_SAVES=1
+
+python benchmarks/qwen36_dflash_scenario_bench.py \
+  --frontend rtx \
+  --path dflash \
+  --checkpoint "$QWEN36_NVFP4_CKPT" \
+  --max-seq 2048 \
+  --short-new 64 --long-new 256 \
+  --repeats 1
+```
+
+The 64/256-token delta decode results measured on RTX 5090 were:
+
+| scenario | MTP K=6 | DFlash K=15 |
+|---|---:|---:|
+| robot JSON plan | 135.9 tok/s | 176.3 tok/s |
+| robot navigation plan | 104.3 tok/s | 140.7 tok/s |
+| prose explanation | 88.4 tok/s | 98.8 tok/s |
 
 ## Serving
 

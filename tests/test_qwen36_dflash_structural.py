@@ -11,7 +11,9 @@ contracts that hardware benchmarks cannot guard cheaply —
   * the public ``init_dflash_drafter`` wrapper delegates to the
     loader;
   * Thor's per-token window env routing (default on, opt-out, window
-    length override).
+    length override);
+  * DFlash rollback checkpoint env defaults stay architecture-specific;
+  * opt-in DFlash chunk-saves kernel routing remains off by default.
 
 GPU/end-to-end evidence for this path lives in the hardware-gated
 benchmarks; see docs/qwen36_dflash.md.
@@ -119,6 +121,24 @@ def test_public_drafter_init_delegates(monkeypatch):
     assert calls == ["/tmp/ckpt"]
 
 
+def test_rtx_pertoken_default_off(monkeypatch):
+    monkeypatch.delenv("FLASHRT_QWEN36_DFLASH_PERTOKEN", raising=False)
+    monkeypatch.delenv("FLASHRT_QWEN36_DFLASH_WINDOW", raising=False)
+    fe = Qwen36TorchFrontendRtx.__new__(Qwen36TorchFrontendRtx)
+    fe._configure_dflash_pertoken_window()
+    assert fe._dflash_pertoken_window is False
+    assert fe._dflash_pertoken_win == 128
+
+
+def test_rtx_pertoken_env_opt_in(monkeypatch):
+    monkeypatch.setenv("FLASHRT_QWEN36_DFLASH_PERTOKEN", "1")
+    monkeypatch.setenv("FLASHRT_QWEN36_DFLASH_WINDOW", "64")
+    fe = Qwen36TorchFrontendRtx.__new__(Qwen36TorchFrontendRtx)
+    fe._configure_dflash_pertoken_window()
+    assert fe._dflash_pertoken_window is True
+    assert fe._dflash_pertoken_win == 64
+
+
 def _thor_drafter_load(monkeypatch):
     """Run Thor's _load_dflash_drafter with the base loader stubbed."""
     monkeypatch.setattr(
@@ -151,6 +171,42 @@ def test_thor_pertoken_window_env_override(monkeypatch):
     monkeypatch.setenv("FLASHRT_QWEN36_DFLASH_WINDOW", "64")
     fe = _thor_drafter_load(monkeypatch)
     assert fe._dflash_pertoken_win == 64
+
+
+def test_rtx_step_saves_default_off(monkeypatch):
+    monkeypatch.delenv("FLASHRT_QWEN36_DFLASH_STEP_SAVES", raising=False)
+    fe = Qwen36TorchFrontendRtx.__new__(Qwen36TorchFrontendRtx)
+    assert fe._dflash_step_saves_enabled() is False
+
+
+def test_rtx_step_saves_env_opt_in(monkeypatch):
+    monkeypatch.setenv("FLASHRT_QWEN36_DFLASH_STEP_SAVES", "1")
+    fe = Qwen36TorchFrontendRtx.__new__(Qwen36TorchFrontendRtx)
+    assert fe._dflash_step_saves_enabled() is True
+
+
+def test_thor_step_saves_default_on(monkeypatch):
+    monkeypatch.delenv("FLASHRT_QWEN36_DFLASH_STEP_SAVES", raising=False)
+    fe = Qwen36TorchFrontendThor.__new__(Qwen36TorchFrontendThor)
+    assert fe._dflash_step_saves_enabled() is True
+
+
+def test_thor_step_saves_env_opt_out(monkeypatch):
+    monkeypatch.setenv("FLASHRT_QWEN36_DFLASH_STEP_SAVES", "0")
+    fe = Qwen36TorchFrontendThor.__new__(Qwen36TorchFrontendThor)
+    assert fe._dflash_step_saves_enabled() is False
+
+
+def test_rtx_chunk_saves_default_off(monkeypatch):
+    monkeypatch.delenv("FLASHRT_QWEN36_DFLASH_CHUNK_SAVES", raising=False)
+    fe = Qwen36TorchFrontendRtx.__new__(Qwen36TorchFrontendRtx)
+    assert fe._dflash_chunk_saves_enabled() is False
+
+
+def test_rtx_chunk_saves_env_opt_in(monkeypatch):
+    monkeypatch.setenv("FLASHRT_QWEN36_DFLASH_CHUNK_SAVES", "1")
+    fe = Qwen36TorchFrontendRtx.__new__(Qwen36TorchFrontendRtx)
+    assert fe._dflash_chunk_saves_enabled() is True
 
 
 def _relaxed(logits, drafts, topk=3, delta=1.0, close_id=99):
