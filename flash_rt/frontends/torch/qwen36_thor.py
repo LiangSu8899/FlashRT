@@ -108,6 +108,14 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
     process env.
     """
 
+    def _dflash_pertoken_default_enabled(self) -> bool:
+        """Thor defaults to the higher-AL per-token DFlash window."""
+        return True
+
+    def _dflash_step_saves_default_enabled(self) -> bool:
+        """Thor defaults to constant-time DFlash rollback checkpoints."""
+        return True
+
     # K-row layer dispatch threshold on Thor.
     #
     # At K ≤ 7 (spec-verify chain length) parent's K-row enters the
@@ -1218,12 +1226,7 @@ class Qwen36TorchFrontendThor(Qwen36TorchFrontendRtx):
         # attends to fc-projected features of every committed token.
         # Measured on Thor at ctx=128: steady AL 2.53 -> 3.49 vs the
         # one-entry-per-cycle shift window.
-        if not hasattr(self, '_dflash_pertoken_window'):
-            self._dflash_pertoken_window = os.environ.get(
-                'FLASHRT_QWEN36_DFLASH_PERTOKEN', '1',
-            ).strip().lower() not in ('0', 'false', 'off')
-            self._dflash_pertoken_win = int(os.environ.get(
-                'FLASHRT_QWEN36_DFLASH_WINDOW', '128') or '128')
+        self._configure_dflash_pertoken_window()
 
     def _dflash_prefill_nvfp4(self, input_ids):
         """Thor override: chunked FP8-KV prompt prefill.
