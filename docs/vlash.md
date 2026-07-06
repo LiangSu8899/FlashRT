@@ -19,6 +19,11 @@ prompt before the context graph runs. When the background chunk is ready, VLASh
 activates it from action index zero. There is no temporal fusion and no
 latency-based index skip.
 
+Background submissions snapshot mapping, list, tuple, and NumPy-array
+observation values before state injection. Deployments that own immutable or
+device-resident buffers can pass a custom `observation_snapshotter` to
+`AsyncVLAShRunner`.
+
 ## Basic use
 
 The adapter boundary matches the existing action-chunk runtime: it receives an

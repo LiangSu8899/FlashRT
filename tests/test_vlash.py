@@ -1,3 +1,4 @@
+import threading
 import time
 
 import numpy as np
@@ -175,6 +176,140 @@ def test_async_vlash_conditions_next_prediction_and_switches_at_zero():
         assert np.array_equal(original_observation["state"], [-1.0])
         assert runner.current_chunk.projected_action_count == 2
     finally:
+        runner.close()
+
+
+def test_async_vlash_close_waits_for_running_worker_by_default():
+    class BlockingAdapter:
+        def __init__(self):
+            self.calls = 0
+            self.started = threading.Event()
+            self.release = threading.Event()
+
+        def infer_actions(self, observation):
+            call = self.calls
+            self.calls += 1
+            if call == 0:
+                return np.array([[1.0], [2.0]])
+            self.started.set()
+            self.release.wait(timeout=2.0)
+            return np.array([[10.0], [11.0]])
+
+    adapter = BlockingAdapter()
+    runner = AsyncVLAShRunner(
+        adapter,
+        VLAShConfig(action_hz=20, lookahead_steps=1, start_next_at=0),
+    )
+    try:
+        runner.reset({"state": np.array([0.0])}, state=[0.0])
+        assert runner.next_action({"state": np.array([0.0])}, state=[0.0]).item() == 1
+        assert adapter.started.wait(timeout=1.0)
+
+        close_done = threading.Event()
+
+        def close_runner():
+            runner.close()
+            close_done.set()
+
+        close_thread = threading.Thread(target=close_runner)
+        close_thread.start()
+        assert not close_done.wait(timeout=0.05)
+        adapter.release.set()
+        close_thread.join(timeout=1.0)
+        assert close_done.is_set()
+    finally:
+        adapter.release.set()
+        runner.close(wait=False)
+
+
+def test_async_vlash_clears_failed_pending_future_and_can_resubmit():
+    class FlakyAdapter:
+        def __init__(self):
+            self.calls = 0
+
+        def infer_actions(self, observation):
+            call = self.calls
+            self.calls += 1
+            if call == 0:
+                return np.array([[1.0], [2.0]])
+            if call == 1:
+                raise RuntimeError("worker failed")
+            return np.array([[10.0], [11.0]])
+
+    adapter = FlakyAdapter()
+    runner = AsyncVLAShRunner(
+        adapter,
+        VLAShConfig(action_hz=20, lookahead_steps=1, start_next_at=0),
+    )
+    try:
+        runner.reset({"state": np.array([0.0])}, state=[0.0])
+        assert runner.next_action({"state": np.array([0.0])}, state=[0.0]).item() == 1
+        assert runner._pending is not None
+        for _ in range(100):
+            if runner._pending.done():
+                break
+            time.sleep(0.001)
+        assert runner._pending.done()
+
+        with pytest.raises(RuntimeError, match="worker failed"):
+            runner.next_action({"state": np.array([0.0])}, state=[0.0])
+        assert runner._pending is None
+
+        assert runner.next_action({"state": np.array([0.0])}, state=[0.0]).item() == 2
+        assert runner._pending is not None
+    finally:
+        runner.close()
+
+
+def test_async_vlash_snapshots_background_observation_before_mutation():
+    class SnapshotAdapter:
+        def __init__(self):
+            self.calls = 0
+            self.started = threading.Event()
+            self.read_allowed = threading.Event()
+            self.images = []
+            self.tags = []
+
+        def infer_actions(self, observation):
+            call = self.calls
+            self.calls += 1
+            if call == 0:
+                return np.array([[1.0], [2.0]])
+            self.started.set()
+            self.read_allowed.wait(timeout=2.0)
+            self.images.append(observation["images"][0].copy())
+            self.tags.append(observation["meta"]["tags"][0])
+            return np.array([[10.0], [11.0]])
+
+    adapter = SnapshotAdapter()
+    image = np.array([[1.0, 2.0]], dtype=np.float32)
+    observation = {
+        "state": np.array([0.0]),
+        "images": [image],
+        "meta": {"tags": ["original"]},
+    }
+    runner = AsyncVLAShRunner(
+        adapter,
+        VLAShConfig(action_hz=20, lookahead_steps=1, start_next_at=0),
+    )
+    try:
+        runner.reset(observation, state=[0.0])
+        assert runner.next_action(observation, state=[0.0]).item() == 1
+        assert adapter.started.wait(timeout=1.0)
+
+        image[...] = 99.0
+        observation["images"].append(np.array([[5.0]], dtype=np.float32))
+        observation["meta"]["tags"][0] = "mutated"
+        adapter.read_allowed.set()
+
+        for _ in range(100):
+            if adapter.images:
+                break
+            time.sleep(0.001)
+        assert np.array_equal(adapter.images[0], [[1.0, 2.0]])
+        assert adapter.tags == ["original"]
+    finally:
+        adapter.read_allowed.set()
         runner.close()
 
 

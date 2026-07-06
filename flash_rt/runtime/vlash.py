@@ -24,11 +24,12 @@ aggregation rule instead.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 import threading
 import time
-from typing import Any, Callable, Mapping
+from typing import Any, Callable
 
 import numpy as np
 
@@ -36,6 +37,20 @@ from .rtc import ActionChunkAdapter
 
 
 StateSetter = Callable[[Any, np.ndarray], Any]
+ObservationSnapshotter = Callable[[Any], Any]
+
+
+def _snapshot_observation(value: Any) -> Any:
+    if isinstance(value, np.ndarray):
+        return value.copy()
+    if isinstance(value, Mapping):
+        return {key: _snapshot_observation(item)
+                for key, item in value.items()}
+    if isinstance(value, list):
+        return [_snapshot_observation(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_snapshot_observation(item) for item in value)
+    return value
 
 
 @dataclass(frozen=True)
@@ -126,11 +141,14 @@ class AsyncVLAShRunner:
 
     def __init__(self, adapter: ActionChunkAdapter, config: VLAShConfig, *,
                  state_setter: StateSetter | None = None,
+                 observation_snapshotter: ObservationSnapshotter | None = None,
                  clock: Callable[[], float] = time.monotonic):
         self.adapter = adapter
         self.config = config
         self.stats = VLAShStats()
         self._state_setter = state_setter or self._set_state_on_mapping
+        self._observation_snapshotter = (
+            observation_snapshotter or _snapshot_observation)
         self._clock = clock
         self._executor = ThreadPoolExecutor(max_workers=1)
         self._lock = threading.RLock()
@@ -140,10 +158,10 @@ class AsyncVLAShRunner:
         self._last_action: np.ndarray | None = None
         self._closed = False
 
-    def close(self) -> None:
+    def close(self, *, wait: bool = True) -> None:
         with self._lock:
             self._closed = True
-        self._executor.shutdown(wait=False, cancel_futures=True)
+        self._executor.shutdown(wait=wait, cancel_futures=True)
 
     def __enter__(self) -> "AsyncVLAShRunner":
         return self
@@ -207,7 +225,8 @@ class AsyncVLAShRunner:
             raise RuntimeError("cannot project state without an active chunk")
         projected, count = self.project_state(
             state, current.actions, start_index=self._idx)
-        prepared = self._state_setter(observation, projected)
+        snapshot = self._observation_snapshotter(observation)
+        prepared = self._state_setter(snapshot, projected)
         self.stats.chunks_started += 1
         self.stats.state_projections += 1
         self._pending = self._executor.submit(
@@ -291,15 +310,7 @@ class AsyncVLAShRunner:
     def _promote_ready_locked(self) -> bool:
         if self._pending is None or not self._pending.done():
             return False
-        result = self._pending.result()
-        self._pending = None
-        self._current = result
-        self._idx = 0  # VLASh trajectory starts at prediction completion.
-        self.stats.chunks_completed += 1
-        self.stats.swaps += 1
-        self.stats.last_latency_s = result.latency_s
-        self.stats.max_latency_s = max(
-            self.stats.max_latency_s, result.latency_s)
+        self._activate_pending_result_locked()
         return True
 
     def _handle_exhausted_locked(self, observation: Any,
@@ -311,12 +322,7 @@ class AsyncVLAShRunner:
             self._submit_locked(observation, state)
             if self._pending is None:
                 raise RuntimeError("failed to submit recovery chunk")
-            result = self._pending.result()
-            self._pending = None
-            self._current = result
-            self._idx = 0
-            self.stats.chunks_completed += 1
-            self.stats.swaps += 1
+            self._activate_pending_result_locked()
             return
         if self._last_action is None:
             raise RuntimeError("cannot hold before any action was served")
@@ -328,6 +334,27 @@ class AsyncVLAShRunner:
             start_state=state.copy(), projected_state=state.copy(),
             projected_action_count=0, metadata={"held": True})
         self._idx = 0
+
+    def _activate_pending_result_locked(self) -> None:
+        result = self._consume_pending_result_locked()
+        self._current = result
+        self._idx = 0  # VLASh trajectory starts at prediction completion.
+        self.stats.chunks_completed += 1
+        self.stats.swaps += 1
+        self.stats.last_latency_s = result.latency_s
+        self.stats.max_latency_s = max(
+            self.stats.max_latency_s, result.latency_s)
+
+    def _consume_pending_result_locked(self) -> VLAShChunkResult:
+        if self._pending is None:
+            raise RuntimeError("VLASh runner has no pending chunk")
+        try:
+            result = self._pending.result()
+        except BaseException:
+            self._pending = None
+            raise
+        self._pending = None
+        return result
 
     def _state_deltas(self, actions: np.ndarray,
                       state_dim: int) -> np.ndarray:
@@ -385,6 +412,7 @@ class AsyncVLAShRunner:
 
 __all__ = [
     "AsyncVLAShRunner",
+    "ObservationSnapshotter",
     "StateSetter",
     "VLAShChunkResult",
     "VLAShConfig",
