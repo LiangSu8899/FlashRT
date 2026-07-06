@@ -160,22 +160,26 @@ PYTHONPATH=. python -m pytest \
   tests/test_rtc_temporal_fusion_pi05.py -q -s
 ```
 
-On the FlashRT 4090 validation machine this was run with the same environment
-as `/home/yzb/flashrt/run_pi05_4090.sh`:
+For a clean local SM89 validation environment, keep the current checkout first
+on `PYTHONPATH` and point `PI05_CKPT` at a local Pi0.5 PyTorch checkpoint:
 
 ```bash
-source /data/home/yzb/.bashrc
-conda activate flashrt-cu124-clean
-export CUDA_VISIBLE_DEVICES=7
-export PI05_CKPT=/data/home/yzb/yzh/pytorch_pi05_libero
-export LD_LIBRARY_PATH=/data/home/yzb/.conda/envs/pi0_env/lib:/usr/local/cuda-12.4/lib64:${LD_LIBRARY_PATH}
-PYTHONPATH=/home/yzb/flashrt/FlashRT:/home/yzb/flashrt/FlashRT-pr93 \
+cd "$FLASHRT_CHECKOUT"
+export PYTHONNOUSERSITE=1
+unset PYTHONPATH
+export CUDA_VISIBLE_DEVICES=0
+export PI05_CKPT=/path/to/pi05_libero_pytorch
+export CUDA_HOME=/path/to/cuda-12.x
+export CUDA_PATH="$CUDA_HOME"
+export LD_LIBRARY_PATH="$CUDA_HOME/lib64:$CUDA_HOME/targets/x86_64-linux/lib:$CONDA_PREFIX/lib"
+export FLASHRT_CUDART_PATH="$CUDA_HOME/lib64/libcudart.so.12"
+PYTHONPATH=$PWD \
   python -m pytest tests/test_rtc_temporal_fusion_pi05.py -q -s
 ```
 
-The `FlashRT-pr93` entry is only used to reuse the already-built FA2 extension
-in that local environment; the temporal-fusion runtime itself is pure Python and
-is imported from the current checkout first.
+This command imports FlashRT from the current checkout only. Build or install
+the required CUDA extensions in the active Conda environment before running the
+gate.
 
 The test skips when CUDA or `PI05_CKPT` is unavailable. `RTC_PI05_AUTOTUNE`
 controls Pi0.5 autotune trials and defaults to `0` for a fast gate.
