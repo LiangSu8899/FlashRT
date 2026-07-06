@@ -8,6 +8,16 @@ from .rtc import (
     RTCConfig,
     RTCStats,
 )
+from .rtc_temporal_fusion import (
+    AsyncTemporalFusionRunner,
+    FusedChunk,
+    ObservationSnapshotter,
+    PredictionTicket,
+    TemporalFusionBuffer,
+    TemporalFusionConfig,
+    TemporalFusionStats,
+    TimedActionChunk,
+)
 
 __all__ = [
     "ActionChunkAdapter",
@@ -16,4 +26,12 @@ __all__ = [
     "ChunkResult",
     "RTCConfig",
     "RTCStats",
+    "AsyncTemporalFusionRunner",
+    "FusedChunk",
+    "ObservationSnapshotter",
+    "PredictionTicket",
+    "TemporalFusionBuffer",
+    "TemporalFusionConfig",
+    "TemporalFusionStats",
+    "TimedActionChunk",
 ]
