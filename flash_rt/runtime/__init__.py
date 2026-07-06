@@ -8,6 +8,12 @@ from .rtc import (
     RTCConfig,
     RTCStats,
 )
+from .vlash import (
+    AsyncVLAShRunner,
+    VLAShChunkResult,
+    VLAShConfig,
+    VLAShStats,
+)
 
 __all__ = [
     "ActionChunkAdapter",
@@ -16,4 +22,8 @@ __all__ = [
     "ChunkResult",
     "RTCConfig",
     "RTCStats",
+    "AsyncVLAShRunner",
+    "VLAShChunkResult",
+    "VLAShConfig",
+    "VLAShStats",
 ]

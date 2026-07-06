@@ -52,6 +52,23 @@ def context_rtc_vjp_guided_action(**_) -> StagePlan:
     })
 
 
+def vlash(*, lookahead_steps: int = 1, **_) -> StagePlan:
+    """Context/action cut conditioned on an upper-runtime projected state."""
+    steps = int(lookahead_steps)
+    if steps < 0:
+        raise ValueError("lookahead_steps must be >= 0")
+    return StagePlan((
+        Stage("context", graph="context"),
+        Stage("action", graph="decode_only", after=("context",)),
+    ), name="vlash", metadata={
+        "granularity": "context/vlash_action",
+        "context": "prompt_copy+vision_encoder+transformer_encoder",
+        "action": "transformer_decoder",
+        "state_projection": "start_state+sum(next_actions)",
+        "lookahead_steps": steps,
+    })
+
+
 register_stage_plan("full", full, model="pi05", replace=True)
 register_stage_plan("context_action", context_action, model="pi05",
                     replace=True)
@@ -60,6 +77,7 @@ register_stage_plan("context_rtc_prefix_action", context_rtc_prefix_action,
 register_stage_plan("context_rtc_vjp_guided_action",
                     context_rtc_vjp_guided_action, model="pi05",
                     replace=True)
+register_stage_plan("vlash", vlash, model="pi05", replace=True)
 
 
 __all__ = [
@@ -67,4 +85,5 @@ __all__ = [
     "context_action",
     "context_rtc_prefix_action",
     "context_rtc_vjp_guided_action",
+    "vlash",
 ]
