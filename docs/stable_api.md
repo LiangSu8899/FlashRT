@@ -376,12 +376,23 @@ from flash_rt.runtime.rtc import (
     AsyncChunkRunner,
     RTCStats,
 )
+from flash_rt.runtime.vlash import (
+    AsyncVLAShRunner,
+    VLAShChunkResult,
+    VLAShConfig,
+    VLAShStats,
+)
 ```
 
 The legacy async chunk runner is a beta inference scheduling utility for action-chunk
 policies. It does not change model numerics or calibration; it only
 serves action chunks at a fixed controller rate while a background worker
 prepares the next chunk. See `docs/rtc_lite_design.md`.
+
+`AsyncVLAShRunner` is an optional host-side runtime for projected-state
+action-chunk scheduling. It estimates a future robot state from the active
+chunk, injects that state into the next observation, and activates the completed
+chunk from index zero. See `docs/vlash.md`.
 
 ### `flash_rt.flash_rt_fa2`
 
