@@ -381,12 +381,15 @@ class AsyncTemporalFusionRunner:
         with self._lock:
             return self._pending is not None and self._pending.done()
 
-    def close(self) -> None:
+    def close(self, *, wait: bool = True) -> None:
         with self._lock:
             self._closed = True
             if self._pending is not None and not self._pending.done():
+                ticket = getattr(self._pending, "ticket", None)
+                if ticket is not None:
+                    self.buffer.cancel_prediction(ticket)
                 self._pending.cancel()
-        self._executor.shutdown(wait=False, cancel_futures=True)
+        self._executor.shutdown(wait=wait, cancel_futures=True)
 
     def __enter__(self) -> "AsyncTemporalFusionRunner":
         return self
@@ -449,12 +452,12 @@ class AsyncTemporalFusionRunner:
         self.stats.predictions_started += 1
         snapshot = self._observation_snapshotter(observation)
         self._pending = self._executor.submit(self._run, ticket, snapshot)
+        self._pending.ticket = ticket
 
     def _promote_ready(self, state: Any | None) -> bool:
         if self._pending is None or not self._pending.done():
             return False
-        output = self._pending.result()
-        self._pending = None
+        output = self._consume_pending_result_locked()
         fused = self.buffer.complete_prediction(
             output.ticket, output.actions,
             ready_at=output.ready_time_s, switch_at=self._clock(),
@@ -470,8 +473,7 @@ class AsyncTemporalFusionRunner:
         if self.config.miss_policy == "block":
             self._submit(observation, state)
             assert self._pending is not None
-            output = self._pending.result()
-            self._pending = None
+            output = self._consume_pending_result_locked()
             fused = self.buffer.complete_prediction(
                 output.ticket, output.actions,
                 ready_at=output.ready_time_s, switch_at=self._clock(),
@@ -488,6 +490,20 @@ class AsyncTemporalFusionRunner:
         self._active = FusedChunk(-1, held, self.buffer.step_at(now),
                                   np.asarray([now]), np.asarray([0]), 0, now, now)
         self._index = 0
+
+    def _consume_pending_result_locked(self) -> _PredictionOutput:
+        if self._pending is None:
+            raise RuntimeError("temporal fusion runner has no pending prediction")
+        try:
+            output = self._pending.result()
+        except BaseException:
+            ticket = getattr(self._pending, "ticket", None)
+            if ticket is not None:
+                self.buffer.cancel_prediction(ticket)
+            self._pending = None
+            raise
+        self._pending = None
+        return output
 
     def _activate(self, fused: FusedChunk) -> None:
         self._active = fused

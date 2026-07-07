@@ -3,6 +3,7 @@ import threading
 import time
 
 import numpy as np
+import pytest
 
 from flash_rt.runtime.rtc_temporal_fusion import (
     AsyncTemporalFusionRunner,
@@ -176,4 +177,81 @@ def test_async_runner_snapshots_mutable_observation():
         assert np.array_equal(seen[0][1], [1.0, 2.0])
     finally:
         release.set()
+        runner.close()
+
+
+def test_async_runner_close_waits_for_running_worker_by_default():
+    class Adapter:
+        def __init__(self):
+            self.calls = 0
+            self.started = threading.Event()
+            self.release = threading.Event()
+
+        def infer_actions(self, observation):
+            call = self.calls
+            self.calls += 1
+            if call == 0:
+                return np.arange(2, dtype=np.float32)[:, None]
+            self.started.set()
+            self.release.wait(timeout=2.0)
+            return np.arange(10, 12, dtype=np.float32)[:, None]
+
+    adapter = Adapter()
+    runner = AsyncTemporalFusionRunner(
+        adapter, TemporalFusionConfig(action_hz=10, start_next_at=0))
+    try:
+        runner.reset({"chunk": 0})
+        assert runner.next_action({"chunk": 1}).item() == 0
+        assert adapter.started.wait(timeout=1.0)
+
+        close_done = threading.Event()
+
+        def close_runner():
+            runner.close()
+            close_done.set()
+
+        close_thread = threading.Thread(target=close_runner)
+        close_thread.start()
+        assert not close_done.wait(timeout=0.05)
+        adapter.release.set()
+        close_thread.join(timeout=1.0)
+        assert close_done.is_set()
+    finally:
+        adapter.release.set()
+        runner.close(wait=False)
+
+
+def test_async_runner_clears_failed_pending_future_and_ticket():
+    class Adapter:
+        def __init__(self):
+            self.calls = 0
+
+        def infer_actions(self, observation):
+            call = self.calls
+            self.calls += 1
+            if call == 0:
+                return np.arange(2, dtype=np.float32)[:, None]
+            if call == 1:
+                raise RuntimeError("worker failed")
+            return np.arange(10, 12, dtype=np.float32)[:, None]
+
+    runner = AsyncTemporalFusionRunner(
+        Adapter(), TemporalFusionConfig(action_hz=10, start_next_at=0))
+    try:
+        runner.reset({"chunk": 0})
+        assert runner.next_action({"chunk": 1}).item() == 0
+        assert runner.prediction_pending
+        deadline = time.monotonic() + 1.0
+        while not runner.prediction_ready and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert runner.prediction_ready
+
+        with pytest.raises(RuntimeError, match="worker failed"):
+            runner.next_action({"chunk": 2})
+        assert not runner.prediction_pending
+        assert not runner.buffer._pending
+
+        assert runner.next_action({"chunk": 3}).item() == 1
+        assert runner.prediction_pending
+    finally:
         runner.close()
