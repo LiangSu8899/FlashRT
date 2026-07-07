@@ -376,6 +376,18 @@ from flash_rt.runtime.rtc import (
     AsyncChunkRunner,
     RTCStats,
 )
+
+from flash_rt.runtime import (
+    AsyncTemporalFusionRunner,
+    FusedChunk,
+    ObservationSnapshotter,
+    PredictionTicket,
+    TemporalFusionBuffer,
+    TemporalFusionConfig,
+    TemporalFusionStats,
+    TimedActionChunk,
+)
+
 from flash_rt.runtime.vlash import (
     AsyncVLAShRunner,
     VLAShChunkResult,
@@ -388,6 +400,14 @@ The legacy async chunk runner is a beta inference scheduling utility for action-
 policies. It does not change model numerics or calibration; it only
 serves action chunks at a fixed controller rate while a background worker
 prepares the next chunk. See `docs/rtc_lite_design.md`.
+
+The temporal-fusion runner is an opt-in scheduling policy that retains raw
+predicted chunks, aligns them on the controller-step timeline, and fuses up to
+`TemporalFusionConfig.max_chunks` overlapping predictions with exponential
+position-difference weights. It supports latency- and state-based chunk
+switching without changing model kernels or calibration. See
+`docs/rtc_temporal_fusion.md` for the adapter contract, configuration, deadline
+behavior, and real Pi0.5 checkpoint gate.
 
 `AsyncVLAShRunner` is an optional host-side runtime for projected-state
 action-chunk scheduling. It estimates a future robot state from the active

@@ -8,6 +8,16 @@ from .rtc import (
     RTCConfig,
     RTCStats,
 )
+from .rtc_temporal_fusion import (
+    AsyncTemporalFusionRunner,
+    FusedChunk,
+    ObservationSnapshotter,
+    PredictionTicket,
+    TemporalFusionBuffer,
+    TemporalFusionConfig,
+    TemporalFusionStats,
+    TimedActionChunk,
+)
 from .vlash import (
     AsyncVLAShRunner,
     VLAShChunkResult,
@@ -22,6 +32,14 @@ __all__ = [
     "ChunkResult",
     "RTCConfig",
     "RTCStats",
+    "AsyncTemporalFusionRunner",
+    "FusedChunk",
+    "ObservationSnapshotter",
+    "PredictionTicket",
+    "TemporalFusionBuffer",
+    "TemporalFusionConfig",
+    "TemporalFusionStats",
+    "TimedActionChunk",
     "AsyncVLAShRunner",
     "VLAShChunkResult",
     "VLAShConfig",
