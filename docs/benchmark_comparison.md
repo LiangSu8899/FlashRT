@@ -160,14 +160,17 @@ speedup.
 | Metric | FlashRT FP8 | FlashRT BF16 | SGLang |
 |---|---:|---:|---:|
 | RTF | **0.095-0.11** | **0.15** | 0.16-0.19 |
-| TTFA | **~94 ms** | **~138 ms** | 0.36-0.63 s |
-| Per-frame | **~3.2 ms** | **~6.1 ms** | ~6.4 ms |
+| TTFA | **~94 ms** | **~127 ms** | 0.36-0.63 s |
+| Per-frame | **~3.2 ms** | **~6.0 ms** | ~6.4 ms |
 | VRAM | **6.6 GB** | **9.6 GB** | 28.3 GB reserved |
 
 | Mode | FlashRT | Unoptimized PyTorch reference | Speedup |
 |---|---:|---:|---:|
 | FP8 AR decode | **3.2 ms/frame** | 10.8 ms/frame | **3.3x** |
-| BF16 AR decode | **6.1 ms/frame** | 10.8 ms/frame | **1.8x** |
+| BF16 AR decode | **6.0 ms/frame** | 10.8 ms/frame | **1.8x** |
+
+BF16 prefill-only latency improves from **8.42 → 6.79 ms** at P=6 and
+**11.74 → 6.86 ms** at P=13 in the same single-stream frontend benchmark.
 
 ## Video
 

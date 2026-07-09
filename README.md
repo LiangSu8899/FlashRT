@@ -142,7 +142,7 @@ DGX Spark / GB10:
 | Hardware | Mode | Latency | Throughput | Source |
 |---|---|---:|---:|---|
 | RTX 5090 | FP8 AR decode | **3.2 ms/frame** | RTF **0.095-0.11** | [Higgs performance](docs/higgs_audio_v3.md#performance) |
-| RTX 5090 | BF16 AR decode | **6.1 ms/frame** | RTF **0.15** | [Higgs performance](docs/higgs_audio_v3.md#performance) |
+| RTX 5090 | BF16 AR decode | **6.0 ms/frame** | RTF **0.151** | [Higgs performance](docs/higgs_audio_v3.md#performance) |
 
 #### Motus Stage3
 

@@ -28,9 +28,9 @@ also the auto-selection on non-FP8 builds):
 | Metric | **FP8** (default) | **BF16** (`fp8=False`) |
 |---|---|---|
 | Real-time factor (RTF) | **0.095 – 0.11** (≈ 9–10× real time) | **0.15** (≈ 6.5× real time) |
-| Time to first audio (TTFA) | **≈ 94 ms** | **≈ 138 ms** |
-| Autoregressive decode | **≈ 3.2 ms/frame** | **≈ 6.1 ms/frame** (at the BF16 bandwidth wall) |
-| Prompt prefill | **≈ 1.0 ms/token** | **≈ 0.9 ms/token** (cuBLAS, weight-once) |
+| Time to first audio (TTFA) | **≈ 94 ms** | **≈ 127 ms** |
+| Autoregressive decode | **≈ 3.2 ms/frame** | **≈ 6.0 ms/frame** (at the BF16 bandwidth wall) |
+| Prompt prefill | **≈ 1.0 ms/token** | **≈ 0.53 ms/token** at P=13 (≈ 6.9 ms total; weight-once) |
 | Peak VRAM | **6.6 GB** | **9.6 GB** |
 | Fidelity | teacher-forced logits **cos 1.0**; codec **cos 0.99993**; streamed == one-shot **cos 1.0** | same (bit-exact vs eager) |
 | Prefix reuse | shared `system` preamble cuts prefill **~64 %**, output bit-identical | same |
@@ -39,6 +39,12 @@ Both precisions run the **same** fully-kernelised, zero-torch decode path
 (position-agnostic CUDA graph, batched prefill, prefix reuse). BF16 reads 2× the
 weight bytes of FP8, so its per-frame is ~1.7× — the bandwidth floor, not
 overhead.
+
+The BF16 batched prefill path is also fully kernelised. In a same-prompt
+prefill-only comparison, the BF16 path improves from **8.42 → 6.79 ms** at P=6
+and **11.74 → 6.86 ms** at P=13. The short-prompt EOC regression case
+`"Four score."` now exits at **1.20 s** of audio in BF16 instead of running to
+the 40.68 s generation cap.
 
 **Hardware-adaptive**: the precision is auto-selected from the GPU
 (`fp8=None`, the default) — FP8 where its kernels are compiled in, else BF16;
@@ -212,6 +218,20 @@ teacher-forced cosine above, and the codec is bit-faithful on identical codes.
 
 Headline numbers are in [Performance](#performance) above. Methodology:
 
+Public AR decode harness:
+
+```bash
+python examples/higgs_audio_v3_quickstart.py \
+    --checkpoint <checkpoint> \
+    --text "The quick brown fox jumps over the lazy dog." \
+    --benchmark 10
+
+python examples/higgs_audio_v3_quickstart.py \
+    --checkpoint <checkpoint> \
+    --text "The quick brown fox jumps over the lazy dog." \
+    --bf16 --benchmark 10
+```
+
 - **Full pipeline, warm.** RTF / TTFA are end-to-end text→waveform through the
   standardized `generate` / `generate_stream` frontend, FP8 backbone, after a
   warm-up call (lazy FP8 calibration + codec load + CUDA-graph capture happen
@@ -221,9 +241,12 @@ Headline numbers are in [Performance](#performance) above. Methodology:
   HBM-bound (micro-benchmarks that reuse weights report L2-cached fiction). The
   full-pipeline per-frame is slightly higher because attention cost grows with KV
   length over a long generation.
-- **Prefill** is one batched M=P forward (≈ 1 ms/token); a shared `system`
+- **Prefill** is one batched M=P forward (FP8 ≈ 1 ms/token; BF16 ≈ 6.9 ms total
+  for a 13-token prompt in the benchmark sentence); a shared `system`
   preamble reuses its resident KV across requests (only the new text suffix is
-  prefilled — bit-identical to a cold prefill).
+  prefilled — bit-identical to a cold prefill). Prefill-only numbers time
+  `set_prompt(...)` + `prefill()` after one warm-up and report the median of 20
+  iterations.
 - **Codec** runs in fp32 (ConvTranspose is unstable in low precision) as one
   small pass at the end (≤ 50 ms for 40 s of audio); in streaming it is decoded
   in overlapping windows so the streamed waveform matches the one-shot output.
