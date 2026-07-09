@@ -30,15 +30,15 @@ BUILD_DIR = Path(os.environ.get("FLASHRT_BUILD_DIR", REPO_ROOT / "build"))
 # build-mode aware: it reads FLASHRT_SLIM_BUILD from the configured build dir's
 # CMakeCache.txt and asserts the matching surface.
 #
-#   compat default (FLASHRT_SLIM_BUILD=OFF): 55 direct TUs, unchanged.
-#   slim SM89   (FLASHRT_SLIM_BUILD=ON):     33 direct TUs (-22):
+#   compat default (FLASHRT_SLIM_BUILD=OFF): 56 direct TUs, unchanged.
+#   slim SM89   (FLASHRT_SLIM_BUILD=ON):     34 direct TUs (-22):
 #       -5 Motus VAE FP8 (Unit 1), -10 Qwen3.6/linear-attn (Unit 2),
 #       -7 SM120/NVFP4-named (Unit 3).
 # The direct-source breakdowns below are SM89-specific; other arches add/remove
 # arch-owned sources (for example SM120 adds nvfp4_sf_reshape_sm120.cu), so the
 # direct-count/category asserts are limited to SM89.
-COMPAT_KERNELS_TU = 55
-SLIM_SM89_KERNELS_TU = 33
+COMPAT_KERNELS_TU = 56
+SLIM_SM89_KERNELS_TU = 34
 
 # Per-group breakdown of flash_rt_kernels (mirrors AGENTS.md "Current Build
 # Layout"). categorize() drops empty groups, so slim omits sm120_nvfp4_named.
@@ -49,6 +49,7 @@ COMPAT_KERNELS_CATEGORIES = {
     "motus_video_fp8_history": 7,
     "dit_video": 2,
     "qwen3_family": 2,
+    "audio_codebook": 1,
     "other": 10,
 }
 SLIM_SM89_KERNELS_CATEGORIES = {
@@ -57,6 +58,7 @@ SLIM_SM89_KERNELS_CATEGORIES = {
     "motus_video_fp8_history": 2,
     "dit_video": 2,
     "qwen3_family": 2,
+    "audio_codebook": 1,
     "other": 10,
 }
 
@@ -90,12 +92,21 @@ def _is_sm89() -> bool:
     return (_cache_value("GPU_ARCH") or "").strip() == "89"
 
 
+def _audio_codebook_enabled() -> bool:
+    return _cache_bool("FLASHRT_ENABLE_AUDIO_CODEBOOK")
+
+
 def _expected_tu() -> int:
-    return SLIM_SM89_KERNELS_TU if _is_slim() else COMPAT_KERNELS_TU
+    expected = SLIM_SM89_KERNELS_TU if _is_slim() else COMPAT_KERNELS_TU
+    return expected if _audio_codebook_enabled() else expected - 1
 
 
 def _expected_categories() -> dict:
-    return SLIM_SM89_KERNELS_CATEGORIES if _is_slim() else COMPAT_KERNELS_CATEGORIES
+    expected = dict(SLIM_SM89_KERNELS_CATEGORIES if _is_slim()
+                    else COMPAT_KERNELS_CATEGORIES)
+    if not _audio_codebook_enabled():
+        expected.pop("audio_codebook", None)
+    return expected
 
 
 def _load_inventory():

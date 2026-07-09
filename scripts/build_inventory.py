@@ -105,6 +105,9 @@ CATEGORIES: dict[str, tuple[str, ...]] = {
         "csrc/kernels/rope_qwen3.cu",
         "csrc/kernels/qwen3_qkv_post_proc.cu",
     ),
+    "audio_codebook": (
+        "csrc/kernels/delayed_codebook_kernels.cu",
+    ),
 }
 
 _SRC_RE = re.compile(r"csrc/[A-Za-z0-9_/]+\.(?:cu|cpp)")

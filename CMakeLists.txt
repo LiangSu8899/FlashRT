@@ -168,6 +168,11 @@ option(FLASHRT_ENABLE_MELBAND_ROFORMER
 # Enable explicitly on a Blackwell (sm_120) build.
 option(FLASHRT_ENABLE_OMNIVOICE
        "Build OmniVoice TTS RTX SM120 fused kernels in flash_rt_omnivoice" OFF)
+# Shared delayed-codebook helper used by discrete-audio paths. Kept behind an
+# explicit option so deployment builds that do not serve audio can remove the
+# TU and its binding in lockstep.
+option(FLASHRT_ENABLE_AUDIO_CODEBOOK
+       "Build shared delayed-codebook helper kernels into flash_rt_kernels" ON)
 # ── Slim build for VLA deployments ──
 # OFF by default: the standard build keeps the broad, compatibility-oriented
 # kernel set it has today. Turn ON (-DFLASHRT_SLIM_BUILD=ON) to drop
@@ -1113,7 +1118,6 @@ pybind11_add_module(flash_rt_kernels
   csrc/gemm/fp8_block128_gemm.cu
   csrc/kernels/silu_mul_qwen36.cu
   csrc/kernels/embedding_lookup_bf16.cu
-  csrc/kernels/higgs_audio_v3_kernels.cu
   # qwen3_5_moe-family RTX SM120 kernels are NOT listed here -- they are
   # gated into the module below (FLASHRT_ENABLE_QWEN35MOE), so SM89/87/110
   # and non-Nex-N2 builds never compile them. See the gated block after the
@@ -1127,6 +1131,15 @@ pybind11_add_module(flash_rt_kernels
 set_target_properties(flash_rt_kernels PROPERTIES
   LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
+
+if(FLASHRT_ENABLE_AUDIO_CODEBOOK)
+  target_sources(flash_rt_kernels PRIVATE
+    csrc/kernels/delayed_codebook_kernels.cu)
+  target_compile_definitions(flash_rt_kernels PRIVATE FLASHRT_HAVE_AUDIO_CODEBOOK=1)
+  message(STATUS "Delayed audio-codebook kernels: ENABLED")
+else()
+  message(STATUS "Delayed audio-codebook kernels: DISABLED")
+endif()
 
 # ── Motus VAE FP8 quantize kernels (slim-gated) ──
 # These 5 TUs are used only by the Motus VAE FP8 path (the *_ncdhw* /

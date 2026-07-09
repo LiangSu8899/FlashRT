@@ -1,4 +1,4 @@
-#include "higgs_audio_v3_kernels.cuh"
+#include "delayed_codebook_kernels.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -7,7 +7,7 @@
 namespace flash_rt::kernels {
 namespace {
 
-__global__ void higgs_argmax_delay_kernel(
+__global__ void delayed_codebook_argmax_kernel(
     const __nv_bfloat16* logits,
     int64_t* codes,
     int num_codebooks,
@@ -54,7 +54,7 @@ __global__ void higgs_argmax_delay_kernel(
   if (tid == 0) codes[cb] = static_cast<int64_t>(idxs[0]);
 }
 
-__global__ void higgs_embed_sum_kernel(
+__global__ void delayed_codebook_embed_sum_kernel(
     const int64_t* codes,
     const __nv_bfloat16* codebook,
     __nv_bfloat16* embed,
@@ -74,7 +74,7 @@ __global__ void higgs_embed_sum_kernel(
 
 }  // namespace
 
-void higgs_audio_v3_argmax_delay_embed_bf16(
+void delayed_codebook_argmax_embed_bf16(
     const __nv_bfloat16* logits,
     const __nv_bfloat16* codebook,
     int64_t* codes_out,
@@ -88,11 +88,11 @@ void higgs_audio_v3_argmax_delay_embed_bf16(
   if (num_codebooks <= 0 || codebook_vocab <= 0 || hidden <= 0) return;
   const int arg_threads = 1024;
   const size_t smem = arg_threads * (sizeof(float) + sizeof(int));
-  higgs_argmax_delay_kernel<<<num_codebooks, arg_threads, smem, stream>>>(
+  delayed_codebook_argmax_kernel<<<num_codebooks, arg_threads, smem, stream>>>(
       logits, codes_out, num_codebooks, codebook_vocab, delay, boc);
   const int emb_threads = 256;
   const int emb_blocks = (hidden + emb_threads - 1) / emb_threads;
-  higgs_embed_sum_kernel<<<emb_blocks, emb_threads, 0, stream>>>(
+  delayed_codebook_embed_sum_kernel<<<emb_blocks, emb_threads, 0, stream>>>(
       codes_out, codebook, embed_out, num_codebooks, codebook_vocab, hidden);
 }
 

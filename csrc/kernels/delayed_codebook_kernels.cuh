@@ -6,7 +6,7 @@
 
 namespace flash_rt::kernels {
 
-void higgs_audio_v3_argmax_delay_embed_bf16(
+void delayed_codebook_argmax_embed_bf16(
     const __nv_bfloat16* logits,
     const __nv_bfloat16* codebook,
     int64_t* codes_out,

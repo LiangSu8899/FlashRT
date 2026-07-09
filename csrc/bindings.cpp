@@ -146,7 +146,9 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #endif
 #include "kernels/silu_mul_qwen36.cuh"
 #include "kernels/embedding_lookup_bf16.cuh"
-#include "kernels/higgs_audio_v3_kernels.cuh"
+#ifdef FLASHRT_HAVE_AUDIO_CODEBOOK
+#include "kernels/delayed_codebook_kernels.cuh"
+#endif
 #ifdef FLASHRT_HAVE_QWEN36_KERNELS
 #include "kernels/qwen36_misc.cuh"
 #endif
@@ -4353,11 +4355,12 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("token_ids"), py::arg("embed"), py::arg("out"),
         py::arg("rows"), py::arg("hidden"), py::arg("stream") = 0);
 
-    m.def("higgs_audio_v3_argmax_delay_embed_bf16",
+#ifdef FLASHRT_HAVE_AUDIO_CODEBOOK
+    m.def("delayed_codebook_argmax_embed_bf16",
         [](uintptr_t logits, uintptr_t codebook, uintptr_t codes_out,
            uintptr_t embed_out, int num_codebooks, int codebook_vocab,
            int hidden, int delay, int boc, uintptr_t stream) {
-            flash_rt::kernels::higgs_audio_v3_argmax_delay_embed_bf16(
+            flash_rt::kernels::delayed_codebook_argmax_embed_bf16(
                 reinterpret_cast<const __nv_bfloat16*>(logits),
                 reinterpret_cast<const __nv_bfloat16*>(codebook),
                 reinterpret_cast<int64_t*>(codes_out),
@@ -4369,6 +4372,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("embed_out"), py::arg("num_codebooks"),
         py::arg("codebook_vocab"), py::arg("hidden"), py::arg("delay"),
         py::arg("boc"), py::arg("stream") = 0);
+#endif
 
 #ifdef FLASHRT_HAVE_QWEN36_KERNELS
     m.def("qwen36_embedding_lookup_bf16",

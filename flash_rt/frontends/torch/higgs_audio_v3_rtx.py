@@ -126,6 +126,10 @@ class HiggsAudioV3TorchFrontendRtx:
             get_gpu_sm_version,
         )
         log = logging.getLogger(__name__)
+        if not hasattr(fvk, "delayed_codebook_argmax_embed_bf16"):
+            raise RuntimeError(
+                "Higgs Audio v3: delayed codebook decode helper is not in this "
+                "build; rebuild with FLASHRT_ENABLE_AUDIO_CODEBOOK=ON.")
         fp8_ok = (hasattr(fvk, "ht_gemv_fp8_m1_w8")
                   and hasattr(fvk, "ht_fp8_gemm_16x192x128_w8"))
         bf16_ok = hasattr(fvk, "ht_gemv_bf16_m1_w4")
@@ -424,7 +428,7 @@ class HiggsAudioV3TorchFrontendRtx:
         repeat_key, repeat_count = None, 0
         window: list[torch.Tensor] = []
         for j in range(self.max_new_frames):
-            fvk.higgs_audio_v3_argmax_delay_embed_bf16(
+            fvk.delayed_codebook_argmax_embed_bf16(
                 logits.data_ptr(), self._weights["codebook"].data_ptr(),
                 self._codes_dev.data_ptr(), self._embed_buf.data_ptr(),
                 nc, self._cfg["codebook_vocab"], self._cfg["hidden"],

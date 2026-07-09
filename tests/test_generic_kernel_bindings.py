@@ -85,6 +85,10 @@ def _is_slim_build() -> bool:
     return _cache_bool("FLASHRT_SLIM_BUILD")
 
 
+def _audio_codebook_enabled() -> bool:
+    return _cache_bool("FLASHRT_ENABLE_AUDIO_CODEBOOK")
+
+
 def test_legacy_matmul_bindings_exist():
     """Compat build: legacy name present. Slim build: gated out by design."""
     m = _import_kernels()
@@ -129,8 +133,8 @@ def test_legacy_cublaslt_binding_exists_on_vl_module():
     m = _import_vl_kernels()
     if not hasattr(m, "fp8_block128_gemm_blockscaled_sm89_bf16out"):
         pytest.skip(
-            "bf16_matmul_cublaslt_bf16 is part of the SM89 Qwen3-VL module; "
-            "SM120 builds use the SM120 path instead"
+            "Qwen3-VL bf16_matmul_cublaslt_bf16 is present only on the SM89 "
+            "VL module path; SM120 builds use the SM120 path instead"
         )
     assert hasattr(m, "bf16_matmul_cublaslt_bf16")
 
@@ -141,7 +145,22 @@ def test_neutral_matmul_binding_exists():
     assert hasattr(m, "bf16_matmul_bf16")
 
 
+def test_neutral_cublaslt_matmul_binding_exists():
+    """cuBLASLt BF16 GEMM helper is exported by the core kernel module."""
+    m = _import_kernels()
+    assert hasattr(m, "bf16_matmul_cublaslt_bf16")
+
+
 def test_neutral_embedding_binding_exists():
     """Neutral helper must exist in every build mode (never gated)."""
     m = _import_kernels()
     assert hasattr(m, "embedding_lookup_bf16")
+
+
+def test_delayed_codebook_binding_exists():
+    """Delayed codebook argmax/embed helper is exported by the core module."""
+    m = _import_kernels()
+    if _audio_codebook_enabled():
+        assert hasattr(m, "delayed_codebook_argmax_embed_bf16")
+    else:
+        assert not hasattr(m, "delayed_codebook_argmax_embed_bf16")
