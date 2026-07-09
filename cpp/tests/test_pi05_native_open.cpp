@@ -56,14 +56,65 @@ void append_f32(std::string* out, float value) {
 }
 
 void write_safetensors(const std::string& path) {
-    const uint64_t bytes = 1001ull * 2048ull * 2ull;
-    write_raw_safetensors(
-        path,
-        "{\"paligemma_with_expert.paligemma.lm_head.weight\":{"
-        "\"dtype\":\"BF16\",\"shape\":[1001,2048],"
-        "\"data_offsets\":[0," + std::to_string(bytes) + "]},"
-        "\"__metadata__\":{\"format\":\"pt\"}}",
-        bytes);
+    struct Entry {
+        const char* key;
+        const char* dtype;
+        const char* shape;
+        uint64_t bytes;
+    };
+    const Entry entries[] = {
+        {"paligemma_with_expert.paligemma.lm_head.weight", "BF16",
+         "[1001,2048]", 1001ull * 2048ull * 2ull},
+        {"paligemma_with_expert.paligemma.model.vision_tower.vision_model"
+         ".embeddings.patch_embedding.weight",
+         "F32", "[1152,3,14,14]", 1152ull * 3ull * 14ull * 14ull * 4ull},
+        {"paligemma_with_expert.paligemma.model.vision_tower.vision_model"
+         ".embeddings.patch_embedding.bias",
+         "F32", "[1152]", 1152ull * 4ull},
+        {"paligemma_with_expert.paligemma.model.vision_tower.vision_model"
+         ".embeddings.position_embedding.weight",
+         "F32", "[256,1152]", 256ull * 1152ull * 4ull},
+        {"paligemma_with_expert.paligemma.model.multi_modal_projector.linear"
+         ".weight",
+         "F32", "[2048,1152]", 2048ull * 1152ull * 4ull},
+        {"paligemma_with_expert.paligemma.model.multi_modal_projector.linear"
+         ".bias",
+         "F32", "[2048]", 2048ull * 4ull},
+        {"action_in_proj.weight", "F32", "[1024,32]", 1024ull * 32ull * 4ull},
+        {"action_in_proj.bias", "F32", "[1024]", 1024ull * 4ull},
+        {"action_out_proj.weight", "F32", "[32,1024]", 32ull * 1024ull * 4ull},
+        {"action_out_proj.bias", "F32", "[32]", 32ull * 4ull},
+        {"time_mlp_in.weight", "F32", "[1024,1024]", 1024ull * 1024ull * 4ull},
+        {"time_mlp_in.bias", "F32", "[1024]", 1024ull * 4ull},
+        {"time_mlp_out.weight", "F32", "[1024,1024]", 1024ull * 1024ull * 4ull},
+        {"time_mlp_out.bias", "F32", "[1024]", 1024ull * 4ull},
+        {"paligemma_with_expert.paligemma.model.language_model.layers.0"
+         ".self_attn.q_proj.weight",
+         "F32", "[2048,2048]", 2048ull * 2048ull * 4ull},
+        {"paligemma_with_expert.gemma_expert.model.layers.0.self_attn"
+         ".q_proj.weight",
+         "F32", "[2048,1024]", 2048ull * 1024ull * 4ull},
+    };
+    std::string header = "{";
+    uint64_t offset = 0;
+    for (size_t i = 0; i < sizeof(entries) / sizeof(entries[0]); ++i) {
+        const Entry& e = entries[i];
+        if (i) header += ",";
+        header += "\"";
+        header += e.key;
+        header += "\":{\"dtype\":\"";
+        header += e.dtype;
+        header += "\",\"shape\":";
+        header += e.shape;
+        header += ",\"data_offsets\":[";
+        header += std::to_string(offset);
+        header += ",";
+        offset += e.bytes;
+        header += std::to_string(offset);
+        header += "]}";
+    }
+    header += ",\"__metadata__\":{\"format\":\"pt\"}}";
+    write_raw_safetensors(path, header, offset);
 }
 
 void write_bad_safetensors(const std::string& path) {

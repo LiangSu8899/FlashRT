@@ -33,6 +33,13 @@ struct TensorMeta {
     uint64_t data_end = 0;
 };
 
+struct TensorRequirement {
+    const char* key;
+    const char* dtype;
+    uint64_t rank;
+    uint64_t dims[4];
+};
+
 class JsonParser {
 public:
     explicit JsonParser(const char* src) : cur_(src ? src : "") {}
@@ -709,36 +716,84 @@ bool validate_pi05_safetensors(const std::string& checkpoint_path) {
         return false;
     }
 
-    const char* embedding_keys[] = {
-        "paligemma_with_expert.paligemma.lm_head.weight",
-        "model.paligemma_with_expert.paligemma.lm_head.weight",
+    const TensorRequirement requirements[] = {
+        {"paligemma_with_expert.paligemma.lm_head.weight",
+         nullptr, 2, {0, 2048, 0, 0}},
+        {"paligemma_with_expert.paligemma.model.vision_tower.vision_model"
+         ".embeddings.patch_embedding.weight",
+         nullptr, 4, {1152, 3, 14, 14}},
+        {"paligemma_with_expert.paligemma.model.vision_tower.vision_model"
+         ".embeddings.patch_embedding.bias",
+         nullptr, 1, {1152, 0, 0, 0}},
+        {"paligemma_with_expert.paligemma.model.vision_tower.vision_model"
+         ".embeddings.position_embedding.weight",
+         nullptr, 2, {256, 1152, 0, 0}},
+        {"paligemma_with_expert.paligemma.model.multi_modal_projector.linear"
+         ".weight",
+         nullptr, 2, {2048, 1152, 0, 0}},
+        {"paligemma_with_expert.paligemma.model.multi_modal_projector.linear"
+         ".bias",
+         nullptr, 1, {2048, 0, 0, 0}},
+        {"action_in_proj.weight", nullptr, 2, {1024, 32, 0, 0}},
+        {"action_in_proj.bias", nullptr, 1, {1024, 0, 0, 0}},
+        {"action_out_proj.weight", nullptr, 2, {32, 1024, 0, 0}},
+        {"action_out_proj.bias", nullptr, 1, {32, 0, 0, 0}},
+        {"time_mlp_in.weight", nullptr, 2, {1024, 1024, 0, 0}},
+        {"time_mlp_in.bias", nullptr, 1, {1024, 0, 0, 0}},
+        {"time_mlp_out.weight", nullptr, 2, {1024, 1024, 0, 0}},
+        {"time_mlp_out.bias", nullptr, 1, {1024, 0, 0, 0}},
+        {"paligemma_with_expert.paligemma.model.language_model.layers.0"
+         ".self_attn.q_proj.weight",
+         nullptr, 2, {2048, 2048, 0, 0}},
+        {"paligemma_with_expert.gemma_expert.model.layers.0.self_attn"
+         ".q_proj.weight",
+         nullptr, 2, {2048, 1024, 0, 0}},
     };
-    TensorMeta embedding;
-    bool found = false;
-    for (const char* key : embedding_keys) {
-        if (tensor_meta(header, key, &embedding)) {
-            found = true;
-            break;
+
+    for (const auto& req : requirements) {
+        TensorMeta meta;
+        std::string key = req.key;
+        if (!tensor_meta(header, key, &meta)) {
+            key = std::string("model.") + req.key;
+            if (!tensor_meta(header, key, &meta)) {
+                g_last_error = std::string("model.safetensors is missing ") +
+                               req.key;
+                return false;
+            }
         }
-    }
-    if (!found) {
-        if (g_last_error.empty()) {
-            g_last_error = "model.safetensors is missing Pi0.5 embedding";
+        if (req.dtype && meta.dtype != req.dtype) {
+            g_last_error = std::string("Pi0.5 tensor dtype mismatch: ") +
+                           req.key;
+            return false;
         }
-        return false;
-    }
-    if (embedding.dtype != "BF16" && embedding.dtype != "F16" &&
-        embedding.dtype != "F32") {
-        g_last_error = "Pi0.5 embedding dtype is unsupported";
-        return false;
-    }
-    if (embedding.shape.size() != 2 || embedding.shape[1] != 2048 ||
-        embedding.shape[0] < 1000) {
-        g_last_error = "Pi0.5 embedding shape is invalid";
-        return false;
-    }
-    if (!tensor_payload_valid(embedding, data_start, total_bytes)) {
-        return false;
+        if (meta.dtype != "BF16" && meta.dtype != "F16" &&
+            meta.dtype != "F32") {
+            g_last_error = std::string("Pi0.5 tensor dtype is unsupported: ") +
+                           req.key;
+            return false;
+        }
+        if (meta.shape.size() != req.rank) {
+            g_last_error = std::string("Pi0.5 tensor rank mismatch: ") +
+                           req.key;
+            return false;
+        }
+        for (uint64_t i = 0; i < req.rank; ++i) {
+            if (req.dims[i] && meta.shape[static_cast<size_t>(i)] !=
+                                   req.dims[i]) {
+                g_last_error = std::string("Pi0.5 tensor shape mismatch: ") +
+                               req.key;
+                return false;
+            }
+        }
+        if (std::string(req.key) ==
+                "paligemma_with_expert.paligemma.lm_head.weight" &&
+            meta.shape[0] < 1000) {
+            g_last_error = "Pi0.5 embedding vocab size is invalid";
+            return false;
+        }
+        if (!tensor_payload_valid(meta, data_start, total_bytes)) {
+            return false;
+        }
     }
     g_last_error.clear();
     return true;
