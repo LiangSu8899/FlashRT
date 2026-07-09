@@ -122,6 +122,7 @@ target_link_libraries(flashrt_cpp_vla
 add_library(flashrt_cpp_pi05 STATIC
   models/pi05/src/spec.cpp
   models/pi05/src/prompt_format.cpp
+  models/pi05/src/prompt_embed.cpp
   models/pi05/src/io.cpp
   models/pi05/src/runtime.cpp)
 target_include_directories(flashrt_cpp_pi05
@@ -159,6 +160,10 @@ if(BUILD_TESTING)
   add_executable(test_pi05_prompt_format tests/test_pi05_prompt_format.cpp)
   target_link_libraries(test_pi05_prompt_format PRIVATE flashrt_cpp_pi05)
   add_test(NAME pi05_prompt_format COMMAND test_pi05_prompt_format)
+
+  add_executable(test_pi05_prompt_embed tests/test_pi05_prompt_embed.cpp)
+  target_link_libraries(test_pi05_prompt_embed PRIVATE flashrt_cpp_pi05)
+  add_test(NAME pi05_prompt_embed COMMAND test_pi05_prompt_embed)
 
   if(FLASHRT_CPP_WITH_CUDA_STAGING)
     add_executable(test_device_staging tests/test_device_staging.cpp)
