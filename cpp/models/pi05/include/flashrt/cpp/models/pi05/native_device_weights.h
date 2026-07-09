@@ -1,0 +1,42 @@
+#ifndef FLASHRT_CPP_MODELS_PI05_NATIVE_DEVICE_WEIGHTS_H
+#define FLASHRT_CPP_MODELS_PI05_NATIVE_DEVICE_WEIGHTS_H
+
+#include "flashrt/cpp/models/pi05/native_weight_ops.h"
+#include "flashrt/exec.h"
+
+#include <cstddef>
+#include <map>
+#include <string>
+#include <vector>
+
+namespace flashrt {
+namespace models {
+namespace pi05 {
+
+struct NativeDeviceWeight {
+    frt_buffer buffer = nullptr;
+    std::vector<std::uint64_t> shape;
+};
+
+class NativeDeviceWeightStore {
+public:
+    explicit NativeDeviceWeightStore(frt_ctx ctx) : ctx_(ctx) {}
+
+    NativeDeviceWeightStore(const NativeDeviceWeightStore&) = delete;
+    NativeDeviceWeightStore& operator=(const NativeDeviceWeightStore&) = delete;
+
+    modalities::Status upload(const std::string& name,
+                              const NativeBf16Tensor& tensor);
+    const NativeDeviceWeight* find(const std::string& name) const;
+    std::size_t size() const { return weights_.size(); }
+
+private:
+    frt_ctx ctx_ = nullptr;  // borrowed; the context owns every buffer
+    std::map<std::string, NativeDeviceWeight> weights_;
+};
+
+}  // namespace pi05
+}  // namespace models
+}  // namespace flashrt
+
+#endif  // FLASHRT_CPP_MODELS_PI05_NATIVE_DEVICE_WEIGHTS_H
