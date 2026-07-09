@@ -170,6 +170,20 @@ modalities::Status NativeBf16Forward::encoder_layer(
         frt_buffer_dptr(x->buffer), frt_buffer_dptr(x_norm->buffer),
         static_cast<std::size_t>(sequence) * 2048, stream);
 }
+
+modalities::Status NativeBf16Forward::encoder(
+    const NativeDeviceWeightStore& weights,
+    NativeWorkspace* workspace,
+    NativeRtxAttentionWorkspace* attention,
+    const NativeRtxAttentionDriver* attention_driver,
+    std::uintptr_t stream) const {
+    for (int layer = 0; layer < 18; ++layer) {
+        modalities::Status st = encoder_layer(
+            layer, weights, workspace, attention, attention_driver, stream);
+        if (!st.ok_status()) return st;
+    }
+    return modalities::Status::ok();
+}
 #endif
 
 }  // namespace pi05

@@ -329,6 +329,13 @@ replayed 100 times remains a single variant and reaches cosine 0.999992 versus
 the original PyTorch path on both checkpoint layouts. Layer 17 keeps the
 intentional cache-only early exit described above.
 
+The native encoder composes all 18 layers into one captured graph while
+preserving that final cache-only behavior. Restoring the input before each of
+100 replays produces one graph variant. On both OpenPI and LeRobot checkpoint
+layouts, the final encoder state and layer-17 Q/K/V each reach cosine 0.9999 or
+better against the layer-by-layer PyTorch reference. This composition owns no
+state object: activations and K/V remain context-backed buffers.
+
 RTX attention owns a separate context-backed buffer set rather than borrowing
 Torch tensors: SigLIP Q/K/V, encoder Q and 18-layer shared K/V cache, decoder
 Q, fixed-shape `seqused/devpos` int32 values, FA2 outputs/LSE, and split-KV
@@ -340,7 +347,7 @@ decoder `seqused` split-KV. Its graph gate changes the prompt length after
 capture, replays 100 times with one variant, and verifies the new device-side
 valid length is observed. `flash_rt_fa2` remains a thin Python adapter over the
 same `libflashrt_fa2_raw` kernel owner. The remaining native producer task is
-assembling these primitives into the complete model forward and capture.
+assembling vision, decoder, and diffusion around the completed encoder graph.
 
 CUDA graph execs are process-local objects. They are not serialized as a
 portable artifact. Removing Python from setup requires a native producer that
