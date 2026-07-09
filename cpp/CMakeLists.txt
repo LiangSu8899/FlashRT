@@ -181,7 +181,12 @@ if(FLASHRT_CPP_WITH_CUDA_KERNELS)
     models/pi05/src/native_kernel_driver.cu
     models/pi05/src/native_style_precompute.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/../csrc/gemm/gemm_runner.cu
-    ${CMAKE_CURRENT_SOURCE_DIR}/../csrc/kernels/dit_bf16.cu)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../csrc/kernels/activation.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/../csrc/kernels/dit_bf16.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/../csrc/kernels/elementwise.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/../csrc/kernels/norm.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/../csrc/kernels/patch_embed.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/../csrc/kernels/rope.cu)
   target_include_directories(flashrt_cpp_pi05_kernels
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/include
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../csrc/gemm
@@ -276,6 +281,13 @@ if(BUILD_TESTING)
       PRIVATE flashrt_cpp_pi05_kernels flashrt_exec CUDA::cudart)
     add_test(NAME pi05_native_kernel_driver
       COMMAND test_pi05_native_kernel_driver)
+
+    add_executable(test_pi05_native_forward_primitives
+      tests/test_pi05_native_forward_primitives.cpp)
+    target_link_libraries(test_pi05_native_forward_primitives
+      PRIVATE flashrt_cpp_pi05_kernels flashrt_exec CUDA::cudart)
+    add_test(NAME pi05_native_forward_primitives
+      COMMAND test_pi05_native_forward_primitives)
 
     add_executable(test_pi05_native_style_precompute
       tests/test_pi05_native_style_precompute.cpp)
