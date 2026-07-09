@@ -314,6 +314,14 @@ RoPE, patch im2col, and vision pooling. These are direct typed calls to the
 existing CUDA implementations, with CPU-reference and captured-replay gates;
 they do not route through pybind or introduce a second kernel implementation.
 
+The native vision graph composes patch im2col/embedding, all 27 SigLIP layers,
+per-view FA2, optional fixed-factor spatial pooling, final LayerNorm, and the
+1152-to-2048 multimodal projector. Position embedding expansion remains setup
+work. With inputs restored before each of 100 replays, the graph keeps one
+variant; final SigLIP and projected encoder tokens reach cosine 0.9999 or
+better against the layer-by-layer PyTorch reference on both supported
+checkpoint layouts.
+
 The first composed BF16 forward segment is the encoder QKV path:
 RMSNorm, the folded QKV projection, RoPE split, and writes into the selected
 layer of the shared K/V cache. Layer 17 is also the complete final encoder
@@ -347,7 +355,8 @@ decoder `seqused` split-KV. Its graph gate changes the prompt length after
 capture, replays 100 times with one variant, and verifies the new device-side
 valid length is observed. `flash_rt_fa2` remains a thin Python adapter over the
 same `libflashrt_fa2_raw` kernel owner. The remaining native producer task is
-assembling vision, decoder, and diffusion around the completed encoder graph.
+assembling decoder and diffusion around the completed vision and encoder
+graphs.
 
 CUDA graph execs are process-local objects. They are not serialized as a
 portable artifact. Removing Python from setup requires a native producer that
