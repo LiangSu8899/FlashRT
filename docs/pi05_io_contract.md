@@ -307,6 +307,14 @@ temporary device allocation. The GEMM, explicit BF16 bias round-trip, and
 float-SiLU sequence is BF16 bit-exact with the PyTorch producer on both
 supported checkpoint layouts.
 
+RTX attention owns a separate context-backed buffer set rather than borrowing
+Torch tensors: SigLIP Q/K/V, encoder Q and 18-layer shared K/V cache, decoder
+Q, fixed-shape `seqused/devpos` int32 values, FA2 outputs/LSE, and split-KV
+accumulators. Layer K/V pointers are stable offsets into one cache allocation.
+Updating a fixed prompt length writes the same three scalar buffers without
+allocation or rebinding. The remaining attention task is wiring these buffers
+to the vendored FA2 C++ entry points and validating captured outputs.
+
 CUDA graph execs are process-local objects. They are not serialized as a
 portable artifact. Removing Python from setup requires a native producer that
 loads assets and captures graphs in the replay process.
