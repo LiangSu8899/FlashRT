@@ -247,9 +247,9 @@ int build_native_model_runtime(const NativeOpenConfig& config,
     std::vector<float> action_mean(config.action_q01.size());
     std::vector<float> action_stddev(config.action_q01.size());
     for (std::size_t i = 0; i < action_mean.size(); ++i) {
-        action_mean[i] = (config.action_q01[i] + config.action_q99[i]) * 0.5f;
         action_stddev[i] =
-            (config.action_q99[i] - config.action_q01[i]) * 0.5f;
+            (config.action_q99[i] - config.action_q01[i] + 1e-6f) * 0.5f;
+        action_mean[i] = config.action_q01[i] + action_stddev[i];
     }
     frt_pi05_runtime_config runtime_config{};
     runtime_config.struct_size = sizeof(runtime_config);
