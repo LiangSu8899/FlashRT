@@ -169,6 +169,11 @@ int main() {
     view.height = 2;
     CHECK(m->verbs.set_input(m->self, 0, &view, sizeof(view), -1) == 0,
           "set_input(images) accepts frt_image_view[]");
+    frt_image_view bgr_view = view;
+    bgr_view.pixel_format = FRT_RT_PIXEL_BGR8;
+    CHECK(m->verbs.set_input(m->self, 0, &bgr_view, sizeof(bgr_view), -1)
+              == -4,
+          "set_input(images) rejects non-RGB image formats");
     std::vector<std::uint16_t> img_host(image_bytes / 2);
     cudaMemcpy(img_host.data(), frt_buffer_dptr(image), image_bytes,
                cudaMemcpyDeviceToHost);

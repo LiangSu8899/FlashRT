@@ -3,6 +3,31 @@
 namespace flashrt {
 namespace models {
 namespace pi05 {
+namespace {
+
+modalities::Status validate_pi05_frame_contract(
+        const modalities::VisionFrame& frame) {
+    if (frame.format != modalities::PixelFormat::kRGB8) {
+        return modalities::Status::error(
+            modalities::StatusCode::kShapeMismatch,
+            "Pi05 image input must be RGB8");
+    }
+    if (frame.image.dtype != modalities::DType::kUInt8 ||
+        frame.image.layout != modalities::Layout::kHWC) {
+        return modalities::Status::error(
+            modalities::StatusCode::kShapeMismatch,
+            "Pi05 image input must be u8 HWC");
+    }
+    if (frame.image.place != modalities::MemoryPlace::kHost &&
+        frame.image.place != modalities::MemoryPlace::kHostPinned) {
+        return modalities::Status::error(
+            modalities::StatusCode::kUnsupported,
+            "Pi05 image input must be host memory");
+    }
+    return modalities::Status::ok();
+}
+
+}  // namespace
 
 RuntimeIo::RuntimeIo(int num_views,
                      modalities::TensorView image_input,
@@ -27,6 +52,10 @@ RuntimeIo::RuntimeIo(int num_views,
 
 modalities::Status RuntimeIo::prepare_vision(
     const std::vector<modalities::VisionFrame>& frames) const {
+    for (const auto& frame : frames) {
+        auto st = validate_pi05_frame_contract(frame);
+        if (!st.ok_status()) return st;
+    }
     return modalities::preprocess_vision(vision_spec_, frames, image_input_,
                                          stream_, staging_);
 }
