@@ -126,7 +126,7 @@ add_library(flashrt_cpp_loader STATIC
 target_include_directories(flashrt_cpp_loader
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/loader/include)
 
-add_library(flashrt_cpp_pi05 STATIC
+set(FLASHRT_CPP_PI05_SRCS
   models/pi05/src/spec.cpp
   models/pi05/src/native_weights.cpp
   models/pi05/src/native_weight_ops.cpp
@@ -136,6 +136,15 @@ add_library(flashrt_cpp_pi05 STATIC
   models/pi05/src/prompt_embed.cpp
   models/pi05/src/io.cpp
   models/pi05/src/runtime.cpp)
+if(FLASHRT_CPP_WITH_CUDA_KERNELS)
+  list(APPEND FLASHRT_CPP_PI05_SRCS
+    models/pi05/src/native_quantization.cu)
+else()
+  list(APPEND FLASHRT_CPP_PI05_SRCS
+    models/pi05/src/native_quantization_unavailable.cpp)
+endif()
+
+add_library(flashrt_cpp_pi05 STATIC ${FLASHRT_CPP_PI05_SRCS})
 target_include_directories(flashrt_cpp_pi05
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/include)
 target_link_libraries(flashrt_cpp_pi05
@@ -181,6 +190,18 @@ if(BUILD_TESTING)
   add_executable(pi05_native_weight_probe
     tests/pi05_native_weight_probe.cpp)
   target_link_libraries(pi05_native_weight_probe PRIVATE flashrt_cpp_pi05)
+
+  if(FLASHRT_CPP_WITH_CUDA_KERNELS)
+    add_executable(test_pi05_native_quantization
+      tests/test_pi05_native_quantization.cpp)
+    target_link_libraries(test_pi05_native_quantization PRIVATE flashrt_cpp_pi05)
+    add_test(NAME pi05_native_quantization
+      COMMAND test_pi05_native_quantization)
+
+    add_executable(pi05_native_quant_probe
+      tests/pi05_native_quant_probe.cpp)
+    target_link_libraries(pi05_native_quant_probe PRIVATE flashrt_cpp_pi05)
+  endif()
 
   add_executable(test_pi05_prompt_format tests/test_pi05_prompt_format.cpp)
   target_link_libraries(test_pi05_prompt_format PRIVATE flashrt_cpp_pi05)
