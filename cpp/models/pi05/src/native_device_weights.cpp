@@ -31,27 +31,47 @@ bool element_count(const std::vector<std::uint64_t>& shape,
     return true;
 }
 
+std::size_t element_bytes(NativeWeightDType dtype) {
+    switch (dtype) {
+        case NativeWeightDType::kBf16: return sizeof(std::uint16_t);
+        case NativeWeightDType::kFp8E4M3: return sizeof(std::uint8_t);
+        case NativeWeightDType::kInt8: return sizeof(std::int8_t);
+        case NativeWeightDType::kFloat32: return sizeof(float);
+    }
+    return 0;
+}
+
 }  // namespace
 
 modalities::Status NativeDeviceWeightStore::upload(
     const std::string& name,
     const NativeBf16Tensor& tensor) {
+    return upload_bytes(name, tensor.shape, NativeWeightDType::kBf16,
+                        tensor.values.data(),
+                        tensor.values.size() * sizeof(std::uint16_t));
+}
+
+modalities::Status NativeDeviceWeightStore::upload_bytes(
+    const std::string& name,
+    const std::vector<std::uint64_t>& shape,
+    NativeWeightDType dtype,
+    const void* data,
+    std::size_t bytes) {
     if (!ctx_ || name.empty()) return invalid("invalid device weight store");
     if (weights_.find(name) != weights_.end()) {
         return invalid("duplicate device weight name");
     }
     std::size_t elements = 0;
-    if (!element_count(tensor.shape, &elements) ||
-        elements != tensor.values.size() ||
-        elements > std::numeric_limits<std::size_t>::max() /
-                       sizeof(std::uint16_t)) {
-        return invalid("device weight shape does not match BF16 payload");
+    const std::size_t width = element_bytes(dtype);
+    if (!data || !width || !element_count(shape, &elements) ||
+        elements > std::numeric_limits<std::size_t>::max() / width ||
+        elements * width != bytes) {
+        return invalid("device weight shape does not match typed payload");
     }
-    const std::size_t bytes = elements * sizeof(std::uint16_t);
     if (!bytes) return invalid("device weight payload is empty");
 
 #ifndef FLASHRT_CPP_WITH_CUDA_STAGING
-    (void)tensor;
+    (void)data;
     return modalities::Status::error(
         modalities::StatusCode::kUnsupported,
         "device weight upload requires the CUDA build");
@@ -62,7 +82,7 @@ modalities::Status NativeDeviceWeightStore::upload(
                                          "device weight allocation failed");
     }
     const cudaError_t rc = cudaMemcpy(frt_buffer_dptr(buffer),
-                                      tensor.values.data(), bytes,
+                                      data, bytes,
                                       cudaMemcpyHostToDevice);
     if (rc != cudaSuccess) {
         return modalities::Status::error(
@@ -70,7 +90,7 @@ modalities::Status NativeDeviceWeightStore::upload(
             std::string("device weight upload failed: ") +
                 cudaGetErrorString(rc));
     }
-    weights_.emplace(name, NativeDeviceWeight{buffer, tensor.shape});
+    weights_.emplace(name, NativeDeviceWeight{buffer, shape, dtype});
     return modalities::Status::ok();
 #endif
 }
