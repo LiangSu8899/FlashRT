@@ -66,7 +66,32 @@ extern "C" int frt_pi05_runtime_set_prompt(frt_pi05_runtime* h,
                                            const char* text) {
     if (!h || !h->runtime) return -1;
     int rc = h->runtime->set_prompt(text);
-    if (rc != 0) h->last_error = "prompt updates are not supported by adopted-export Pi05 runtime";
+    if (rc != 0) {
+        const auto& st = h->runtime->prompt_status();
+        h->last_error = st.message.empty()
+                            ? "prompt updates are not supported by this Pi05 runtime"
+                            : st.message;
+    } else {
+        h->last_error.clear();
+    }
+    return rc;
+}
+
+extern "C" int frt_pi05_runtime_set_prompt_state(
+    frt_pi05_runtime* h,
+    const char* text,
+    const float* state,
+    uint64_t n_state) {
+    if (!h || !h->runtime || (!state && n_state)) return -1;
+    int rc = h->runtime->set_prompt_state(text, state, n_state);
+    if (rc != 0) {
+        const auto& st = h->runtime->prompt_status();
+        h->last_error = st.message.empty()
+                            ? "prompt updates are not supported by this Pi05 runtime"
+                            : st.message;
+    } else {
+        h->last_error.clear();
+    }
     return rc;
 }
 

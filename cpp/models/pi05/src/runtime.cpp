@@ -1,5 +1,6 @@
 #include "flashrt/cpp/models/pi05/runtime.h"
 
+#include <cmath>
 #include <cstring>
 
 namespace flashrt {
@@ -170,14 +171,29 @@ modalities::Status Runtime::bind() {
                     config_.action_stddev, find_native_stream(exp_, stream_id_),
                     config_.chunk, config_.model_action_dim,
                     config_.robot_action_dim, config_.image_dtype, staging);
-    return modalities::Status::ok();
+    return bind_prompt_staging();
 }
 
 int Runtime::set_prompt(const char* text) {
-    /* The adopted-export path assumes prompt/token embedding was prepared by
-     * the producer before capture/export. A native Pi0.5 producer will replace
-     * this with tokenizer + prompt-region binding without changing Nexus. */
-    return (text == nullptr || text[0] == '\0') ? 0 : -1;
+    return set_prompt_state(text, nullptr, 0);
+}
+
+int Runtime::set_prompt_state(const char* text, const float* state,
+                              std::uint64_t n_state) {
+    if (!prompt_staging_enabled_) {
+        return (text == nullptr || text[0] == '\0') ? 0 : -1;
+    }
+    if (!text) {
+        prompt_status_ = modalities::Status::error(
+            modalities::StatusCode::kInvalidArgument,
+            "prompt text is null");
+        return -1;
+    }
+    prompt_status_ = embed_prompt_cpu(
+        prompt_tokenizer_, prompt_spec_, text, state, n_state,
+        prompt_embedding_table_, prompt_embedding_output_, &prompt_token_ids_,
+        &current_prompt_len_);
+    return prompt_status_.ok_status() ? 0 : -1;
 }
 
 modalities::Status Runtime::prepare_vision(
@@ -201,6 +217,43 @@ int Runtime::default_replay(frt_graph graph, frt_shape_key key,
                             int stream_id, void* user) {
     (void)user;
     return frt_graph_replay(graph, key, stream_id);
+}
+
+modalities::Status Runtime::bind_prompt_staging() {
+    const bool any =
+        !config_.prompt_tokenizer_model_path.empty() ||
+        config_.prompt_embedding_table.data ||
+        config_.prompt_embedding_output.data ||
+        config_.prompt_vocab_size || config_.prompt_hidden_dim ||
+        config_.prompt_max_tokens;
+    if (!any) {
+        prompt_status_ = modalities::Status::ok();
+        return modalities::Status::ok();
+    }
+    if (config_.prompt_tokenizer_model_path.empty() ||
+        !config_.prompt_embedding_table.data ||
+        !config_.prompt_embedding_output.data ||
+        !config_.prompt_vocab_size || !config_.prompt_hidden_dim ||
+        !config_.prompt_max_tokens) {
+        return modalities::Status::error(
+            modalities::StatusCode::kInvalidArgument,
+            "incomplete Pi05 prompt staging config");
+    }
+    prompt_status_ =
+        prompt_tokenizer_.load_model(config_.prompt_tokenizer_model_path);
+    if (!prompt_status_.ok_status()) return prompt_status_;
+
+    prompt_embedding_table_ = config_.prompt_embedding_table;
+    prompt_embedding_output_ = config_.prompt_embedding_output;
+    prompt_spec_.vocab_size = config_.prompt_vocab_size;
+    prompt_spec_.hidden_dim = config_.prompt_hidden_dim;
+    prompt_spec_.max_tokens = config_.prompt_max_tokens;
+    prompt_spec_.scale = config_.prompt_embedding_scale > 0.0f
+                             ? config_.prompt_embedding_scale
+                             : std::sqrt(static_cast<float>(
+                                   config_.prompt_hidden_dim));
+    prompt_staging_enabled_ = true;
+    return modalities::Status::ok();
 }
 
 }  // namespace pi05

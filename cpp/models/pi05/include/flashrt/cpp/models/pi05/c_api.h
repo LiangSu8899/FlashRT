@@ -55,6 +55,23 @@ typedef struct frt_pi05_runtime_config {
      * capacity is a per-call error, never a fallback allocation. */
     int max_frame_width;
     int max_frame_height;
+
+    /* Optional ABI extension: native prompt staging source. When all fields
+     * below are present, frt_pi05_runtime_set_prompt* tokenizes text/state and
+     * writes embeddings into prompt_embedding_data. The captured graph must
+     * already copy from this stable source buffer into encoder_x; the model
+     * runtime does not rebind graph pointers. */
+    const char* prompt_tokenizer_model_path;
+    const void* prompt_embedding_table_data;
+    uint64_t prompt_embedding_table_bytes;
+    int prompt_embedding_table_dtype;
+    uint64_t prompt_embedding_vocab_size;
+    uint64_t prompt_embedding_hidden_dim;
+    void* prompt_embedding_data;
+    uint64_t prompt_embedding_bytes;
+    int prompt_embedding_dtype;
+    uint64_t max_prompt_tokens;
+    float prompt_embedding_scale;
 } frt_pi05_runtime_config;
 
 typedef struct frt_pi05_vision_frame {
@@ -75,6 +92,8 @@ int frt_pi05_runtime_create(const frt_runtime_export_v1* exp,
 void frt_pi05_runtime_destroy(frt_pi05_runtime*);
 
 int frt_pi05_runtime_set_prompt(frt_pi05_runtime*, const char* text);
+int frt_pi05_runtime_set_prompt_state(frt_pi05_runtime*, const char* text,
+                                      const float* state, uint64_t n_state);
 int frt_pi05_runtime_prepare_vision(frt_pi05_runtime*,
                                     const frt_pi05_vision_frame* frames,
                                     uint64_t n_frames);
