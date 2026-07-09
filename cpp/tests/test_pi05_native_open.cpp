@@ -66,10 +66,20 @@ void write_safetensors(const std::string& path) {
         bytes);
 }
 
-void write_lerobot_policy_stats(const std::string& root) {
+void write_bad_safetensors(const std::string& path) {
+    const uint64_t bytes = 1001ull * 2048ull * 2ull;
+    write_raw_safetensors(
+        path,
+        "{\"paligemma_with_expert.paligemma.lm_head.weight\":{"
+        "\"dtype\":\"BF16\",\"shape\":[1001,2048],"
+        "\"data_offsets\":[0," + std::to_string(bytes) + "]}}",
+        1024);
+}
+
+void write_lerobot_policy_stats(const std::string& root, bool valid = true) {
     std::string state_payload;
     for (int i = 0; i < 8; ++i) append_f32(&state_payload, 0.0f);
-    for (int i = 0; i < 8; ++i) append_f32(&state_payload, 1.0f);
+    for (int i = 0; i < 8; ++i) append_f32(&state_payload, valid ? 1.0f : 0.0f);
     write_raw_safetensors(
         root + "/policy_preprocessor_step_2_normalizer_processor.safetensors",
         "{\"observation.state.q01\":{\"dtype\":\"F32\",\"shape\":[8],"
@@ -79,7 +89,7 @@ void write_lerobot_policy_stats(const std::string& root) {
         state_payload);
     std::string action_payload;
     for (int i = 0; i < 7; ++i) append_f32(&action_payload, 0.0f);
-    for (int i = 0; i < 7; ++i) append_f32(&action_payload, 1.0f);
+    for (int i = 0; i < 7; ++i) append_f32(&action_payload, valid ? 1.0f : 0.0f);
     write_raw_safetensors(
         root + "/policy_postprocessor_step_0_unnormalizer_processor.safetensors",
         "{\"action.q01\":{\"dtype\":\"F32\",\"shape\":[7],"
@@ -89,14 +99,16 @@ void write_lerobot_policy_stats(const std::string& root) {
         action_payload);
 }
 
-void write_norm_stats(const std::string& path) {
+void write_norm_stats(const std::string& path, bool valid = true) {
     std::ofstream f(path);
     f << "{"
       << "\"norm_stats\":{"
       << "\"state\":{\"q01\":[0,0,0,0,0,0,0,0],"
-      << "\"q99\":[1,1,1,1,1,1,1,1]},"
+      << (valid ? "\"q99\":[1,1,1,1,1,1,1,1]},"
+                : "\"q99\":[0,0,0,0,0,0,0,0]},")
       << "\"actions\":{\"q01\":[0,0,0,0,0,0,0],"
-      << "\"q99\":[1,1,1,1,1,1,1]}"
+      << (valid ? "\"q99\":[1,1,1,1,1,1,1]}"
+                : "\"q99\":[0,0,0,0,0,0,0]}")
       << "}}";
     assert(f.good());
 }
@@ -153,12 +165,26 @@ int main() {
     assert(std::strstr(frt_pi05_native_open_last_error(),
                        "model.safetensors"));
 
+    write_bad_safetensors(root + "/model.safetensors");
+    out = reinterpret_cast<frt_model_runtime_v1*>(0x1);
+    rc = frt_model_runtime_open_v1(config(root, tokenizer).c_str(), &out);
+    assert(rc == -2);
+    assert(out == nullptr);
+    assert(std::strstr(frt_pi05_native_open_last_error(), "byte range"));
+
     write_safetensors(root + "/model.safetensors");
     out = reinterpret_cast<frt_model_runtime_v1*>(0x1);
     rc = frt_model_runtime_open_v1(config(root, tokenizer).c_str(), &out);
     assert(rc == -2);
     assert(out == nullptr);
     assert(std::strstr(frt_pi05_native_open_last_error(), "norm_stats"));
+
+    write_norm_stats(root + "/norm_stats.json", false);
+    out = reinterpret_cast<frt_model_runtime_v1*>(0x1);
+    rc = frt_model_runtime_open_v1(config(root, tokenizer).c_str(), &out);
+    assert(rc == -2);
+    assert(out == nullptr);
+    assert(std::strstr(frt_pi05_native_open_last_error(), "q01/q99"));
 
     write_norm_stats(root + "/norm_stats.json");
     const std::string good = config(root, tokenizer);
@@ -183,6 +209,13 @@ int main() {
 
     const std::string lerobot_root = make_temp_dir();
     write_safetensors(lerobot_root + "/model.safetensors");
+    write_lerobot_policy_stats(lerobot_root, false);
+    out = reinterpret_cast<frt_model_runtime_v1*>(0x1);
+    rc = frt_model_runtime_open_v1(
+        config(lerobot_root, tokenizer).c_str(), &out);
+    assert(rc == -2);
+    assert(out == nullptr);
+
     write_lerobot_policy_stats(lerobot_root);
     out = reinterpret_cast<frt_model_runtime_v1*>(0x1);
     rc = frt_model_runtime_open_v1(
