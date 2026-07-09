@@ -1,4 +1,5 @@
 #include "flashrt/model_runtime.h"
+#include "flashrt/cpp/loader/safetensors.h"
 
 #include <cerrno>
 #include <cctype>
@@ -24,13 +25,6 @@ struct JsonValue {
     std::string text;
     int64_t integer = 0;
     bool boolean = false;
-};
-
-struct TensorMeta {
-    std::string dtype;
-    std::vector<uint64_t> shape;
-    uint64_t data_begin = 0;
-    uint64_t data_end = 0;
 };
 
 struct TensorRequirement {
@@ -191,57 +185,9 @@ bool regular_file_exists(const std::string& path) {
            S_ISREG(st.st_mode);
 }
 
-uint64_t file_size(const std::string& path) {
-    struct stat st {};
-    if (path.empty() || ::stat(path.c_str(), &st) != 0 || st.st_size < 0) {
-        return 0;
-    }
-    return static_cast<uint64_t>(st.st_size);
-}
-
 std::string join_path(const std::string& dir, const char* leaf) {
     if (dir.empty() || dir.back() == '/') return dir + leaf;
     return dir + "/" + leaf;
-}
-
-bool read_safetensors_header(const std::string& path, std::string* header,
-                             uint64_t* data_start = nullptr,
-                             uint64_t* total_bytes = nullptr) {
-    if (!header) return false;
-    std::ifstream f(path, std::ios::binary);
-    if (!f) {
-        g_last_error = "unable to open safetensors file";
-        return false;
-    }
-    unsigned char len_bytes[8] = {};
-    f.read(reinterpret_cast<char*>(len_bytes), sizeof(len_bytes));
-    if (f.gcount() != static_cast<std::streamsize>(sizeof(len_bytes))) {
-        g_last_error = "safetensors file is too small";
-        return false;
-    }
-    uint64_t header_len = 0;
-    for (int i = 7; i >= 0; --i) {
-        header_len = (header_len << 8) | len_bytes[i];
-    }
-    if (header_len == 0 || header_len > (128ull << 20)) {
-        g_last_error = "safetensors header length is invalid";
-        return false;
-    }
-    const uint64_t start = 8ull + header_len;
-    const uint64_t size = file_size(path);
-    if (size < start) {
-        g_last_error = "safetensors header exceeds file size";
-        return false;
-    }
-    header->assign(static_cast<size_t>(header_len), '\0');
-    f.read(&(*header)[0], static_cast<std::streamsize>(header_len));
-    if (f.gcount() != static_cast<std::streamsize>(header_len)) {
-        g_last_error = "safetensors header is truncated";
-        return false;
-    }
-    if (data_start) *data_start = start;
-    if (total_bytes) *total_bytes = size;
-    return true;
 }
 
 std::string quoted_key(const std::string& key) {
@@ -306,76 +252,6 @@ bool object_for_key(const std::string& json,
     return false;
 }
 
-bool parse_string_property(const std::string& object,
-                           const char* name,
-                           std::string* out) {
-    const std::string q = quoted_key(name);
-    size_t p = object.find(q);
-    if (p == std::string::npos) return false;
-    p += q.size();
-    while (p < object.size() &&
-           std::isspace(static_cast<unsigned char>(object[p]))) ++p;
-    if (p >= object.size() || object[p++] != ':') return false;
-    while (p < object.size() &&
-           std::isspace(static_cast<unsigned char>(object[p]))) ++p;
-    if (p >= object.size() || object[p++] != '"') return false;
-    std::string value;
-    while (p < object.size() && object[p] != '"') {
-        if (object[p] == '\\') return false;
-        value.push_back(object[p++]);
-    }
-    if (p >= object.size()) return false;
-    if (out) *out = value;
-    return true;
-}
-
-bool parse_u64_array_property(const std::string& object,
-                              const char* name,
-                              std::vector<uint64_t>* out) {
-    const std::string q = quoted_key(name);
-    size_t p = object.find(q);
-    if (p == std::string::npos) return false;
-    p += q.size();
-    while (p < object.size() &&
-           std::isspace(static_cast<unsigned char>(object[p]))) ++p;
-    if (p >= object.size() || object[p++] != ':') return false;
-    while (p < object.size() &&
-           std::isspace(static_cast<unsigned char>(object[p]))) ++p;
-    if (p >= object.size() || object[p++] != '[') return false;
-    std::vector<uint64_t> values;
-    while (p < object.size()) {
-        while (p < object.size() &&
-               std::isspace(static_cast<unsigned char>(object[p]))) ++p;
-        if (p < object.size() && object[p] == ']') {
-            ++p;
-            if (out) *out = std::move(values);
-            return true;
-        }
-        if (p >= object.size() ||
-            !std::isdigit(static_cast<unsigned char>(object[p]))) {
-            return false;
-        }
-        uint64_t value = 0;
-        while (p < object.size() &&
-               std::isdigit(static_cast<unsigned char>(object[p]))) {
-            const uint64_t digit = static_cast<uint64_t>(object[p] - '0');
-            if (value > (UINT64_MAX - digit) / 10ull) return false;
-            value = value * 10ull + digit;
-            ++p;
-        }
-        values.push_back(value);
-        while (p < object.size() &&
-               std::isspace(static_cast<unsigned char>(object[p]))) ++p;
-        if (p < object.size() && object[p] == ',') {
-            ++p;
-            continue;
-        }
-        if (p < object.size() && object[p] == ']') continue;
-        return false;
-    }
-    return false;
-}
-
 bool parse_f64_array_property(const std::string& object,
                               const char* name,
                               std::vector<double>* out) {
@@ -416,107 +292,28 @@ bool parse_f64_array_property(const std::string& object,
     return false;
 }
 
-bool tensor_meta(const std::string& header,
-                 const std::string& key,
-                 TensorMeta* meta) {
-    std::string object;
-    if (!object_for_key(header, key, &object)) return false;
-    std::string dtype;
-    std::vector<uint64_t> shape;
-    std::vector<uint64_t> offsets;
-    if (!parse_string_property(object, "dtype", &dtype) ||
-        !parse_u64_array_property(object, "shape", &shape) ||
-        !parse_u64_array_property(object, "data_offsets", &offsets) ||
-        offsets.size() != 2 || offsets[1] < offsets[0]) {
-        g_last_error = "safetensors tensor metadata is malformed";
-        return false;
-    }
-    if (meta) {
-        meta->dtype = std::move(dtype);
-        meta->shape = std::move(shape);
-        meta->data_begin = offsets[0];
-        meta->data_end = offsets[1];
-    }
-    return true;
-}
-
-uint64_t dtype_bytes(const std::string& dtype) {
-    if (dtype == "F32" || dtype == "I32" || dtype == "U32") return 4;
-    if (dtype == "BF16" || dtype == "F16" || dtype == "I16" ||
-        dtype == "U16") {
-        return 2;
-    }
-    if (dtype == "I64" || dtype == "U64" || dtype == "F64") return 8;
-    if (dtype == "I8" || dtype == "U8" || dtype == "BOOL") return 1;
-    return 0;
-}
-
-bool tensor_nbytes(const TensorMeta& meta, uint64_t* out) {
-    const uint64_t elem = dtype_bytes(meta.dtype);
-    if (!elem) return false;
-    uint64_t n = elem;
-    for (uint64_t dim : meta.shape) {
-        if (dim == 0 || n > UINT64_MAX / dim) return false;
-        n *= dim;
-    }
-    if (out) *out = n;
-    return true;
-}
-
-bool tensor_payload_valid(const TensorMeta& meta,
-                          uint64_t data_start,
-                          uint64_t total_bytes) {
-    uint64_t expected = 0;
-    if (!tensor_nbytes(meta, &expected)) {
-        g_last_error = "safetensors tensor dtype/shape is unsupported";
-        return false;
-    }
-    if (meta.data_end < meta.data_begin ||
-        meta.data_end - meta.data_begin != expected ||
-        data_start > total_bytes ||
-        meta.data_end > total_bytes - data_start) {
-        g_last_error = "safetensors tensor byte range is invalid";
-        return false;
-    }
-    return true;
-}
-
 bool read_safetensors_f32_vector(const std::string& path,
                                  const char* key,
                                  std::vector<float>* out) {
     if (!out) return false;
-    std::string header;
-    uint64_t data_start = 0;
-    uint64_t total_bytes = 0;
-    if (!read_safetensors_header(path, &header, &data_start, &total_bytes)) {
+    flashrt::loader::SafetensorsFile file;
+    if (!file.open(path)) {
+        g_last_error = file.error();
         return false;
     }
-    TensorMeta meta;
-    if (!tensor_meta(header, key, &meta)) return false;
-    if (meta.dtype != "F32" || meta.shape.size() != 1 ||
-        !tensor_payload_valid(meta, data_start, total_bytes)) {
+    const auto* tensor = file.find(key);
+    if (!tensor || tensor->dtype != "F32" || tensor->shape.size() != 1) {
         g_last_error = "safetensors F32 vector metadata is invalid";
         return false;
     }
-    const uint64_t n = meta.shape[0];
+    const uint64_t n = tensor->shape[0];
     if (n > (1ull << 20)) {
         g_last_error = "safetensors vector is too large";
         return false;
     }
-    std::ifstream f(path, std::ios::binary);
-    if (!f) {
-        g_last_error = "unable to open safetensors file";
-        return false;
-    }
-    f.seekg(static_cast<std::streamoff>(data_start + meta.data_begin),
-            std::ios::beg);
     std::vector<float> values(static_cast<size_t>(n));
-    f.read(reinterpret_cast<char*>(values.data()),
-           static_cast<std::streamsize>(n * sizeof(float)));
-    if (f.gcount() != static_cast<std::streamsize>(n * sizeof(float))) {
-        g_last_error = "safetensors vector payload is truncated";
-        return false;
-    }
+    std::memcpy(values.data(), file.data(*tensor),
+                static_cast<size_t>(tensor->bytes));
     *out = std::move(values);
     return true;
 }
@@ -637,12 +434,6 @@ bool validate_lerobot_policy_norm_stats(const std::string& checkpoint_path,
         "_unnormalizer_processor.safetensors");
     if (pre.empty() || post.empty()) return false;
 
-    std::string pre_header;
-    std::string post_header;
-    if (!read_safetensors_header(pre, &pre_header) ||
-        !read_safetensors_header(post, &post_header)) {
-        return false;
-    }
     std::vector<float> state_q01;
     std::vector<float> state_q99;
     std::vector<float> action_q01;
@@ -709,10 +500,9 @@ bool validate_pi05_safetensors(const std::string& checkpoint_path) {
         g_last_error = "checkpoint_path must contain model.safetensors";
         return false;
     }
-    std::string header;
-    uint64_t data_start = 0;
-    uint64_t total_bytes = 0;
-    if (!read_safetensors_header(path, &header, &data_start, &total_bytes)) {
+    flashrt::loader::SafetensorsFile file;
+    if (!file.open(path)) {
+        g_last_error = file.error();
         return false;
     }
 
@@ -751,34 +541,35 @@ bool validate_pi05_safetensors(const std::string& checkpoint_path) {
     };
 
     for (const auto& req : requirements) {
-        TensorMeta meta;
         std::string key = req.key;
-        if (!tensor_meta(header, key, &meta)) {
+        const flashrt::loader::SafetensorInfo* meta = file.find(key);
+        if (!meta) {
             key = std::string("model.") + req.key;
-            if (!tensor_meta(header, key, &meta)) {
+            meta = file.find(key);
+            if (!meta) {
                 g_last_error = std::string("model.safetensors is missing ") +
                                req.key;
                 return false;
             }
         }
-        if (req.dtype && meta.dtype != req.dtype) {
+        if (req.dtype && meta->dtype != req.dtype) {
             g_last_error = std::string("Pi0.5 tensor dtype mismatch: ") +
                            req.key;
             return false;
         }
-        if (meta.dtype != "BF16" && meta.dtype != "F16" &&
-            meta.dtype != "F32") {
+        if (meta->dtype != "BF16" && meta->dtype != "F16" &&
+            meta->dtype != "F32") {
             g_last_error = std::string("Pi0.5 tensor dtype is unsupported: ") +
                            req.key;
             return false;
         }
-        if (meta.shape.size() != req.rank) {
+        if (meta->shape.size() != req.rank) {
             g_last_error = std::string("Pi0.5 tensor rank mismatch: ") +
                            req.key;
             return false;
         }
         for (uint64_t i = 0; i < req.rank; ++i) {
-            if (req.dims[i] && meta.shape[static_cast<size_t>(i)] !=
+            if (req.dims[i] && meta->shape[static_cast<size_t>(i)] !=
                                    req.dims[i]) {
                 g_last_error = std::string("Pi0.5 tensor shape mismatch: ") +
                                req.key;
@@ -787,11 +578,8 @@ bool validate_pi05_safetensors(const std::string& checkpoint_path) {
         }
         if (std::string(req.key) ==
                 "paligemma_with_expert.paligemma.lm_head.weight" &&
-            meta.shape[0] < 1000) {
+            meta->shape[0] < 1000) {
             g_last_error = "Pi0.5 embedding vocab size is invalid";
-            return false;
-        }
-        if (!tensor_payload_valid(meta, data_start, total_bytes)) {
             return false;
         }
     }
