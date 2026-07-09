@@ -72,6 +72,14 @@ typedef struct frt_pi05_runtime_config {
     int prompt_embedding_dtype;
     uint64_t max_prompt_tokens;
     float prompt_embedding_scale;
+
+    /* Optional ABI extension: raw proprioception normalization for STATE
+     * STAGED ports. If present, state is mapped with q01/q99 into [-1, 1]
+     * before Pi0.5 prompt discretization. */
+    const float* state_q01;
+    uint64_t n_state_q01;
+    const float* state_q99;
+    uint64_t n_state_q99;
 } frt_pi05_runtime_config;
 
 typedef struct frt_pi05_vision_frame {

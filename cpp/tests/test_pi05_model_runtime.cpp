@@ -11,6 +11,7 @@
 
 #include <cuda_runtime_api.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -313,6 +314,28 @@ int main() {
               prompt_over == nullptr,
           "prompt port is refused without prompt staging config");
 
+    frt_runtime_port_desc state_ports[5] = {};
+    for (int i = 0; i < 4; ++i) state_ports[i] = prompt_ports[i];
+    const int64_t state_shape[1] = {3};
+    state_ports[4].name = "state";
+    state_ports[4].modality = FRT_RT_MOD_STATE;
+    state_ports[4].dtype = FRT_RT_DTYPE_F32;
+    state_ports[4].layout = FRT_RT_LAYOUT_FLAT;
+    state_ports[4].direction = FRT_RT_PORT_IN;
+    state_ports[4].update = FRT_RT_PORT_STAGED;
+    state_ports[4].required = 1;
+    state_ports[4].shape = state_shape;
+    state_ports[4].rank = 1;
+    frt_model_runtime_v1* state_producer = frt_model_runtime_wrap(
+        &exp, state_ports, 5, stages, 2, nullptr, nullptr, nullptr, nullptr);
+    CHECK(state_producer != nullptr,
+          "producer declaration with prompt and state ports");
+    frt_model_runtime_v1* state_over = nullptr;
+    CHECK(frt_pi05_model_runtime_create_over(state_producer, &cfg,
+                                             &state_over) == -2 &&
+              state_over == nullptr,
+          "state port is refused without state normalization config");
+
 #ifdef FLASHRT_CPP_HAS_SENTENCEPIECE
     const char* tokenizer = std::getenv("FLASH_RT_PALIGEMMA_TOKENIZER");
     if (tokenizer && tokenizer[0] != '\0') {
@@ -338,6 +361,12 @@ int main() {
         prompt_cfg.prompt_embedding_dtype = FRT_PI05_DTYPE_FLOAT32;
         prompt_cfg.max_prompt_tokens = max_tokens;
         prompt_cfg.prompt_embedding_scale = 0.5f;
+        const float state_q01[3] = {0.0f, 0.0f, 0.0f};
+        const float state_q99[3] = {2.0f, 2.0f, 2.0f};
+        prompt_cfg.state_q01 = state_q01;
+        prompt_cfg.n_state_q01 = 3;
+        prompt_cfg.state_q99 = state_q99;
+        prompt_cfg.n_state_q99 = 3;
 
         CHECK(frt_pi05_model_runtime_create_over(prompt_producer,
                                                  &prompt_cfg,
@@ -353,10 +382,30 @@ int main() {
                   std::fabs(prompt_out[1] + 1.0f) < 0.001f,
               "prompt staging wrote the BOS embedding row");
         prompt_over->release(prompt_over->owner);
+
+        std::fill(prompt_out.begin(), prompt_out.end(), 9.0f);
+        CHECK(frt_pi05_model_runtime_create_over(state_producer,
+                                                 &prompt_cfg,
+                                                 &state_over) == 0 &&
+                  state_over,
+              "state port accepted with prompt staging and norm stats");
+        const float raw_state[3] = {1.0f, 2.0f, 0.0f};
+        CHECK(state_over->verbs.set_input(
+                  state_over->self, 4, raw_state, sizeof(raw_state), -1) == 0,
+              "set_input(state) accepts f32 state before prompt");
+        CHECK(state_over->verbs.set_input(
+                  state_over->self, 3, prompt_text,
+                  sizeof(prompt_text) - 1, -1) == 0,
+              "set_input(prompt) renders cached state");
+        CHECK(std::fabs(prompt_out[0] - 1.0f) < 0.001f &&
+                  std::fabs(prompt_out[1] + 1.0f) < 0.001f,
+              "state prompt staging wrote embeddings");
+        state_over->release(state_over->owner);
     } else {
         std::printf("SKIP - FLASH_RT_PALIGEMMA_TOKENIZER not set\n");
     }
 #endif
+    state_producer->release(state_producer->owner);
     prompt_producer->release(prompt_producer->owner);
 
     frt_graph_destroy(graph);
