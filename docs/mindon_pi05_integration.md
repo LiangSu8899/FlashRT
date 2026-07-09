@@ -80,7 +80,8 @@ switching between Lane A and Lane C.
 The current C++ shared object exports this symbol as a native-v2 configuration
 gate. It validates `io`, checkpoint path, tokenizer model path, fixed prompt
 mode, prompt capacity, state dimension, and the Pi0.5 embedding metadata in
-`model.safetensors`, plus the native builder's minimum required weight set. A
+`model.safetensors`, plus the native builder's complete 812-tensor weight
+inventory across vision, language encoder, and action expert. A
 read-only mmap loader owns the checkpoint mapping and exposes bounded tensor
 views for the later device materialization step.
 It also verifies action/state q01/q99 metadata from openpi `norm_stats.json` or
