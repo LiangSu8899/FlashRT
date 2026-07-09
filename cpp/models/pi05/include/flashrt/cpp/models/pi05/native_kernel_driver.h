@@ -3,6 +3,7 @@
 
 #include "flashrt/cpp/modalities/types.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -23,6 +24,11 @@ public:
     modalities::Status bf16_nn(void* a, void* b, void* output,
                                int m, int n, int k,
                                std::uintptr_t stream) const;
+    modalities::Status add_bias_bf16(void* values, const void* bias,
+                                     int rows, int columns,
+                                     std::uintptr_t stream) const;
+    modalities::Status silu_bf16(void* values, std::size_t elements,
+                                 std::uintptr_t stream) const;
 
 private:
     struct Impl;
