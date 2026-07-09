@@ -437,6 +437,31 @@ modalities::Status NativeWeightMaterializer::materialize_embedding() {
         "embedding_weight");
 }
 
+modalities::Status NativeWeightMaterializer::materialize_all(
+    const NativeMaterializationOptions& options) {
+    if (!destination_ || options.num_steps <= 0) {
+        return invalid("Pi0.5 materialization options are invalid");
+    }
+    modalities::Status st = materialize_vision_globals();
+    if (!st.ok_status()) return st;
+    for (int layer = 0; layer < 27; ++layer) {
+        st = materialize_vision_layer(layer);
+        if (!st.ok_status()) return st;
+    }
+    for (int layer = 0; layer < 18; ++layer) {
+        st = materialize_encoder_layer(layer);
+        if (!st.ok_status()) return st;
+    }
+    for (int layer = 0; layer < 18; ++layer) {
+        st = materialize_decoder_layer(
+            layer, options.merge_decoder_gate_up);
+        if (!st.ok_status()) return st;
+    }
+    st = materialize_decoder_globals(options.num_steps);
+    if (!st.ok_status() || !options.include_embedding) return st;
+    return materialize_embedding();
+}
+
 }  // namespace pi05
 }  // namespace models
 }  // namespace flashrt

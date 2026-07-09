@@ -292,6 +292,30 @@ int main() {
                    std::vector<std::uint64_t>({2560, 1024}));
         }
         frt_ctx_destroy(real_ctx);
+
+        const char* full = std::getenv("FLASH_RT_PI05_FULL_MATERIALIZE");
+        if (full && std::strcmp(full, "1") == 0) {
+            frt_ctx full_ctx = frt_ctx_create();
+            assert(full_ctx);
+            {
+                flashrt::models::pi05::NativeDeviceWeightStore destination(
+                    full_ctx);
+                flashrt::models::pi05::NativeWeightMaterializer materializer(
+                    real_source, &destination);
+                flashrt::models::pi05::NativeMaterializationOptions options;
+                assert(materializer.materialize_all(options).ok_status());
+                assert(destination.size() == 613);
+                assert(destination.find("vision_attn_qkv_w_26")->shape ==
+                       std::vector<std::uint64_t>({1152, 3456}));
+                assert(destination.find("encoder_ffn_down_w_17")->shape ==
+                       std::vector<std::uint64_t>({16384, 2048}));
+                assert(destination.find("decoder_ffn_gate_up_w_17")->shape ==
+                       std::vector<std::uint64_t>({1024, 8192}));
+                assert(destination.find("embedding_weight")->shape ==
+                       std::vector<std::uint64_t>({257152, 2048}));
+            }
+            frt_ctx_destroy(full_ctx);
+        }
     }
     std::printf("PASS - Pi0.5 native layer materializer\n");
     return 0;

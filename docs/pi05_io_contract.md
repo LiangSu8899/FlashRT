@@ -261,6 +261,13 @@ fallback, so both paths share exactly the same transformed source bytes. It
 stores packed weights under `fp8.*` or `int8.*` names and their typed FP32
 scales under the matching `.scale` names in the same context-owned store.
 
+Full BF16 assembly has one ordered setup path: vision globals and 27 layers,
+18 language-encoder layers, 18 action-expert layers, decoder globals, then the
+prompt embedding table. With merged decoder gate/up buffers enabled this owns
+613 logical device buffers. Assembly options make `num_steps`, merged gate/up,
+and the large embedding allocation explicit; they are producer configuration,
+not ABI fields.
+
 CUDA graph execs are process-local objects. They are not serialized as a
 portable artifact. Removing Python from setup requires a native producer that
 loads assets and captures graphs in the replay process.
