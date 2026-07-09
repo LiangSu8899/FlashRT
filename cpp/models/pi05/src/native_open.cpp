@@ -4,9 +4,11 @@
 #include <cctype>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <map>
 #include <string>
 #include <sys/stat.h>
+#include <vector>
 
 namespace {
 
@@ -18,6 +20,13 @@ struct JsonValue {
     std::string text;
     int64_t integer = 0;
     bool boolean = false;
+};
+
+struct TensorMeta {
+    std::string dtype;
+    std::vector<uint64_t> shape;
+    uint64_t data_begin = 0;
+    uint64_t data_end = 0;
 };
 
 class JsonParser {
@@ -171,6 +180,238 @@ bool regular_file_exists(const std::string& path) {
            S_ISREG(st.st_mode);
 }
 
+std::string join_path(const std::string& dir, const char* leaf) {
+    if (dir.empty() || dir.back() == '/') return dir + leaf;
+    return dir + "/" + leaf;
+}
+
+bool read_safetensors_header(const std::string& path, std::string* header) {
+    if (!header) return false;
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        g_last_error = "unable to open safetensors file";
+        return false;
+    }
+    unsigned char len_bytes[8] = {};
+    f.read(reinterpret_cast<char*>(len_bytes), sizeof(len_bytes));
+    if (f.gcount() != static_cast<std::streamsize>(sizeof(len_bytes))) {
+        g_last_error = "safetensors file is too small";
+        return false;
+    }
+    uint64_t header_len = 0;
+    for (int i = 7; i >= 0; --i) {
+        header_len = (header_len << 8) | len_bytes[i];
+    }
+    if (header_len == 0 || header_len > (128ull << 20)) {
+        g_last_error = "safetensors header length is invalid";
+        return false;
+    }
+    header->assign(static_cast<size_t>(header_len), '\0');
+    f.read(&(*header)[0], static_cast<std::streamsize>(header_len));
+    if (f.gcount() != static_cast<std::streamsize>(header_len)) {
+        g_last_error = "safetensors header is truncated";
+        return false;
+    }
+    return true;
+}
+
+std::string quoted_key(const std::string& key) {
+    std::string out = "\"";
+    for (char c : key) {
+        if (c == '"' || c == '\\') out.push_back('\\');
+        out.push_back(c);
+    }
+    out.push_back('"');
+    return out;
+}
+
+bool object_for_key(const std::string& json,
+                    const std::string& key,
+                    std::string* object) {
+    const std::string q = quoted_key(key);
+    size_t pos = json.find(q);
+    while (pos != std::string::npos) {
+        size_t p = pos + q.size();
+        while (p < json.size() &&
+               std::isspace(static_cast<unsigned char>(json[p]))) {
+            ++p;
+        }
+        if (p < json.size() && json[p] == ':') {
+            ++p;
+            while (p < json.size() &&
+                   std::isspace(static_cast<unsigned char>(json[p]))) {
+                ++p;
+            }
+            if (p < json.size() && json[p] == '{') {
+                int depth = 0;
+                bool in_string = false;
+                bool escaped = false;
+                for (size_t i = p; i < json.size(); ++i) {
+                    const char c = json[i];
+                    if (in_string) {
+                        if (escaped) {
+                            escaped = false;
+                        } else if (c == '\\') {
+                            escaped = true;
+                        } else if (c == '"') {
+                            in_string = false;
+                        }
+                        continue;
+                    }
+                    if (c == '"') {
+                        in_string = true;
+                    } else if (c == '{') {
+                        ++depth;
+                    } else if (c == '}') {
+                        --depth;
+                        if (depth == 0) {
+                            if (object) *object = json.substr(p, i - p + 1);
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        pos = json.find(q, pos + 1);
+    }
+    return false;
+}
+
+bool parse_string_property(const std::string& object,
+                           const char* name,
+                           std::string* out) {
+    const std::string q = quoted_key(name);
+    size_t p = object.find(q);
+    if (p == std::string::npos) return false;
+    p += q.size();
+    while (p < object.size() &&
+           std::isspace(static_cast<unsigned char>(object[p]))) ++p;
+    if (p >= object.size() || object[p++] != ':') return false;
+    while (p < object.size() &&
+           std::isspace(static_cast<unsigned char>(object[p]))) ++p;
+    if (p >= object.size() || object[p++] != '"') return false;
+    std::string value;
+    while (p < object.size() && object[p] != '"') {
+        if (object[p] == '\\') return false;
+        value.push_back(object[p++]);
+    }
+    if (p >= object.size()) return false;
+    if (out) *out = value;
+    return true;
+}
+
+bool parse_u64_array_property(const std::string& object,
+                              const char* name,
+                              std::vector<uint64_t>* out) {
+    const std::string q = quoted_key(name);
+    size_t p = object.find(q);
+    if (p == std::string::npos) return false;
+    p += q.size();
+    while (p < object.size() &&
+           std::isspace(static_cast<unsigned char>(object[p]))) ++p;
+    if (p >= object.size() || object[p++] != ':') return false;
+    while (p < object.size() &&
+           std::isspace(static_cast<unsigned char>(object[p]))) ++p;
+    if (p >= object.size() || object[p++] != '[') return false;
+    std::vector<uint64_t> values;
+    while (p < object.size()) {
+        while (p < object.size() &&
+               std::isspace(static_cast<unsigned char>(object[p]))) ++p;
+        if (p < object.size() && object[p] == ']') {
+            ++p;
+            if (out) *out = std::move(values);
+            return true;
+        }
+        if (p >= object.size() ||
+            !std::isdigit(static_cast<unsigned char>(object[p]))) {
+            return false;
+        }
+        uint64_t value = 0;
+        while (p < object.size() &&
+               std::isdigit(static_cast<unsigned char>(object[p]))) {
+            const uint64_t digit = static_cast<uint64_t>(object[p] - '0');
+            if (value > (UINT64_MAX - digit) / 10ull) return false;
+            value = value * 10ull + digit;
+            ++p;
+        }
+        values.push_back(value);
+        while (p < object.size() &&
+               std::isspace(static_cast<unsigned char>(object[p]))) ++p;
+        if (p < object.size() && object[p] == ',') {
+            ++p;
+            continue;
+        }
+        if (p < object.size() && object[p] == ']') continue;
+        return false;
+    }
+    return false;
+}
+
+bool tensor_meta(const std::string& header,
+                 const std::string& key,
+                 TensorMeta* meta) {
+    std::string object;
+    if (!object_for_key(header, key, &object)) return false;
+    std::string dtype;
+    std::vector<uint64_t> shape;
+    std::vector<uint64_t> offsets;
+    if (!parse_string_property(object, "dtype", &dtype) ||
+        !parse_u64_array_property(object, "shape", &shape) ||
+        !parse_u64_array_property(object, "data_offsets", &offsets) ||
+        offsets.size() != 2 || offsets[1] < offsets[0]) {
+        g_last_error = "safetensors tensor metadata is malformed";
+        return false;
+    }
+    if (meta) {
+        meta->dtype = std::move(dtype);
+        meta->shape = std::move(shape);
+        meta->data_begin = offsets[0];
+        meta->data_end = offsets[1];
+    }
+    return true;
+}
+
+bool validate_pi05_safetensors(const std::string& checkpoint_path) {
+    const std::string path = join_path(checkpoint_path, "model.safetensors");
+    if (!regular_file_exists(path)) {
+        g_last_error = "checkpoint_path must contain model.safetensors";
+        return false;
+    }
+    std::string header;
+    if (!read_safetensors_header(path, &header)) return false;
+
+    const char* embedding_keys[] = {
+        "paligemma_with_expert.paligemma.lm_head.weight",
+        "model.paligemma_with_expert.paligemma.lm_head.weight",
+    };
+    TensorMeta embedding;
+    bool found = false;
+    for (const char* key : embedding_keys) {
+        if (tensor_meta(header, key, &embedding)) {
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        if (g_last_error.empty()) {
+            g_last_error = "model.safetensors is missing Pi0.5 embedding";
+        }
+        return false;
+    }
+    if (embedding.dtype != "BF16" && embedding.dtype != "F16" &&
+        embedding.dtype != "F32") {
+        g_last_error = "Pi0.5 embedding dtype is unsupported";
+        return false;
+    }
+    if (embedding.shape.size() != 2 || embedding.shape[1] != 2048 ||
+        embedding.shape[0] < 1000) {
+        g_last_error = "Pi0.5 embedding shape is invalid";
+        return false;
+    }
+    g_last_error.clear();
+    return true;
+}
+
 bool string_field(const std::map<std::string, JsonValue>& obj,
                   const char* key,
                   std::string* out,
@@ -241,6 +482,9 @@ int validate_config(const char* config_json) {
     }
     if (!regular_file_exists(tokenizer_model_path)) {
         g_last_error = "tokenizer_model_path does not name a file";
+        return -2;
+    }
+    if (!validate_pi05_safetensors(checkpoint_path)) {
         return -2;
     }
 
