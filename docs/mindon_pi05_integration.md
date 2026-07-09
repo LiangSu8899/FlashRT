@@ -154,8 +154,9 @@ matched by declared position, not by runtime graph names.
 
 The current Pi0.5 native producer stages host pixels into the
 `observation_images_normalized` device tensor and normalizes to `[-1, 1]`.
-Use the producer documentation in `docs/pi05_io_contract.md` for accepted
-formats and shape rules.
+Pass `u8` `RGB8` frames in HWC layout. BGR/RGBA/GRAY, CHW, and non-`u8` inputs
+are rejected instead of silently reinterpreted. Use the producer documentation
+in `docs/pi05_io_contract.md` for accepted formats and shape rules.
 
 ## Action Output
 

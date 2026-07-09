@@ -129,6 +129,11 @@ void test_adopted_export_runtime_flow() {
 
         auto st = runtime.prepare_vision({image});
         assert(st.ok_status());
+        VisionFrame bgr = image;
+        bgr.format = PixelFormat::kBGR8;
+        st = runtime.prepare_vision({bgr});
+        assert(!st.ok_status());
+        assert(st.code == flashrt::modalities::StatusCode::kShapeMismatch);
         assert(runtime.replay_tick() == 0);
         assert(probe.calls == 1);
 

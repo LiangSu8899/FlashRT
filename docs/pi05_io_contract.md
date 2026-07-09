@@ -88,18 +88,18 @@ data into the device `observation_images_normalized` buffer before replay.
 Producer-owned preprocessing:
 
 - view count is checked against the exported `images` port shape;
-- frame payloads are host pixels;
+- frame payloads are host `u8` pixels in `RGB8`/`HWC` layout;
 - target tensor is `(num_views, 224, 224, 3)`;
 - output layout is `NHWC`;
 - output dtype is the exported tensor dtype, normally BF16 for the FP8 path;
 - normalization is `x / 127.5 - 1.0`;
 - resizing to 224x224 is producer-owned.
 
-The producer contract should reject unsupported input shape, dtype, layout, or
-view count with a shape/status error. It should not silently reinterpret camera
-formats in a way that changes model semantics. If a deployment supports more
-pixel formats, the supported set must be documented by the producer and tested
-against the CPU reference path.
+The Pi0.5 native face rejects unsupported input shape, dtype, layout, pixel
+format, or view count with a shape/status error. BGR, grayscale, RGBA, CHW, and
+non-`u8` frames are not silently converted at the Pi0.5 contract boundary. If a
+deployment supports more pixel formats, the supported set must be documented by
+the producer and tested against the CPU reference path.
 
 ## Noise Input
 
