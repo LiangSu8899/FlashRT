@@ -295,6 +295,30 @@ modalities::Status native_concat_columns(
     return modalities::Status::ok();
 }
 
+modalities::Status native_concat_vectors(
+    const std::vector<const NativeFloatTensor*>& inputs,
+    NativeFloatTensor* out) {
+    if (!out || inputs.empty()) return invalid("vector concat has no inputs");
+    std::size_t total = 0;
+    for (const NativeFloatTensor* input : inputs) {
+        if (!input || !valid_tensor(*input) || input->shape.size() != 1 ||
+            input->values.size() >
+                std::numeric_limits<std::size_t>::max() - total) {
+            return invalid("vector concat tensors have incompatible shapes");
+        }
+        total += input->values.size();
+    }
+    NativeFloatTensor joined;
+    joined.shape = {static_cast<std::uint64_t>(total)};
+    joined.values.reserve(total);
+    for (const NativeFloatTensor* input : inputs) {
+        joined.values.insert(joined.values.end(), input->values.begin(),
+                             input->values.end());
+    }
+    *out = std::move(joined);
+    return modalities::Status::ok();
+}
+
 modalities::Status native_scale(const NativeFloatTensor& input,
                                 float scale,
                                 NativeFloatTensor* out) {
