@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <dirent.h>
+#include <cmath>
 #include <fstream>
 #include <iterator>
 #include <map>
@@ -183,12 +184,22 @@ bool regular_file_exists(const std::string& path) {
            S_ISREG(st.st_mode);
 }
 
+uint64_t file_size(const std::string& path) {
+    struct stat st {};
+    if (path.empty() || ::stat(path.c_str(), &st) != 0 || st.st_size < 0) {
+        return 0;
+    }
+    return static_cast<uint64_t>(st.st_size);
+}
+
 std::string join_path(const std::string& dir, const char* leaf) {
     if (dir.empty() || dir.back() == '/') return dir + leaf;
     return dir + "/" + leaf;
 }
 
-bool read_safetensors_header(const std::string& path, std::string* header) {
+bool read_safetensors_header(const std::string& path, std::string* header,
+                             uint64_t* data_start = nullptr,
+                             uint64_t* total_bytes = nullptr) {
     if (!header) return false;
     std::ifstream f(path, std::ios::binary);
     if (!f) {
@@ -209,12 +220,20 @@ bool read_safetensors_header(const std::string& path, std::string* header) {
         g_last_error = "safetensors header length is invalid";
         return false;
     }
+    const uint64_t start = 8ull + header_len;
+    const uint64_t size = file_size(path);
+    if (size < start) {
+        g_last_error = "safetensors header exceeds file size";
+        return false;
+    }
     header->assign(static_cast<size_t>(header_len), '\0');
     f.read(&(*header)[0], static_cast<std::streamsize>(header_len));
     if (f.gcount() != static_cast<std::streamsize>(header_len)) {
         g_last_error = "safetensors header is truncated";
         return false;
     }
+    if (data_start) *data_start = start;
+    if (total_bytes) *total_bytes = size;
     return true;
 }
 
@@ -414,6 +433,111 @@ bool tensor_meta(const std::string& header,
     return true;
 }
 
+uint64_t dtype_bytes(const std::string& dtype) {
+    if (dtype == "F32" || dtype == "I32" || dtype == "U32") return 4;
+    if (dtype == "BF16" || dtype == "F16" || dtype == "I16" ||
+        dtype == "U16") {
+        return 2;
+    }
+    if (dtype == "I64" || dtype == "U64" || dtype == "F64") return 8;
+    if (dtype == "I8" || dtype == "U8" || dtype == "BOOL") return 1;
+    return 0;
+}
+
+bool tensor_nbytes(const TensorMeta& meta, uint64_t* out) {
+    const uint64_t elem = dtype_bytes(meta.dtype);
+    if (!elem) return false;
+    uint64_t n = elem;
+    for (uint64_t dim : meta.shape) {
+        if (dim == 0 || n > UINT64_MAX / dim) return false;
+        n *= dim;
+    }
+    if (out) *out = n;
+    return true;
+}
+
+bool tensor_payload_valid(const TensorMeta& meta,
+                          uint64_t data_start,
+                          uint64_t total_bytes) {
+    uint64_t expected = 0;
+    if (!tensor_nbytes(meta, &expected)) {
+        g_last_error = "safetensors tensor dtype/shape is unsupported";
+        return false;
+    }
+    if (meta.data_end < meta.data_begin ||
+        meta.data_end - meta.data_begin != expected ||
+        data_start > total_bytes ||
+        meta.data_end > total_bytes - data_start) {
+        g_last_error = "safetensors tensor byte range is invalid";
+        return false;
+    }
+    return true;
+}
+
+bool read_safetensors_f32_vector(const std::string& path,
+                                 const char* key,
+                                 std::vector<float>* out) {
+    if (!out) return false;
+    std::string header;
+    uint64_t data_start = 0;
+    uint64_t total_bytes = 0;
+    if (!read_safetensors_header(path, &header, &data_start, &total_bytes)) {
+        return false;
+    }
+    TensorMeta meta;
+    if (!tensor_meta(header, key, &meta)) return false;
+    if (meta.dtype != "F32" || meta.shape.size() != 1 ||
+        !tensor_payload_valid(meta, data_start, total_bytes)) {
+        g_last_error = "safetensors F32 vector metadata is invalid";
+        return false;
+    }
+    const uint64_t n = meta.shape[0];
+    if (n > (1ull << 20)) {
+        g_last_error = "safetensors vector is too large";
+        return false;
+    }
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        g_last_error = "unable to open safetensors file";
+        return false;
+    }
+    f.seekg(static_cast<std::streamoff>(data_start + meta.data_begin),
+            std::ios::beg);
+    std::vector<float> values(static_cast<size_t>(n));
+    f.read(reinterpret_cast<char*>(values.data()),
+           static_cast<std::streamsize>(n * sizeof(float)));
+    if (f.gcount() != static_cast<std::streamsize>(n * sizeof(float))) {
+        g_last_error = "safetensors vector payload is truncated";
+        return false;
+    }
+    *out = std::move(values);
+    return true;
+}
+
+bool sane_quantile_pair(const std::vector<double>& q01,
+                        const std::vector<double>& q99) {
+    if (q01.empty() || q01.size() != q99.size()) return false;
+    for (size_t i = 0; i < q01.size(); ++i) {
+        if (!std::isfinite(q01[i]) || !std::isfinite(q99[i]) ||
+            q99[i] <= q01[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool sane_quantile_pair(const std::vector<float>& q01,
+                        const std::vector<float>& q99) {
+    if (q01.empty() || q01.size() != q99.size()) return false;
+    for (size_t i = 0; i < q01.size(); ++i) {
+        if (!std::isfinite(q01[i]) || !std::isfinite(q99[i]) ||
+            q99[i] <= q01[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool read_text_file(const std::string& path, std::string* out) {
     if (!out) return false;
     std::ifstream f(path);
@@ -439,7 +563,7 @@ bool norm_block_dims(const std::string& json,
     std::vector<double> q99;
     if (!parse_f64_array_property(block, "q01", &q01) ||
         !parse_f64_array_property(block, "q99", &q99) ||
-        q01.empty() || q01.size() != q99.size()) {
+        !sane_quantile_pair(q01, q99)) {
         return false;
     }
     if (dims) *dims = q01.size();
@@ -496,19 +620,6 @@ std::string find_child(const std::string& dir,
     return found;
 }
 
-bool tensor_1d_dim(const std::string& header,
-                   const char* key,
-                   size_t* dims) {
-    TensorMeta meta;
-    if (!tensor_meta(header, key, &meta)) return false;
-    if (meta.dtype != "F32" || meta.shape.size() != 1 ||
-        meta.shape[0] == 0) {
-        return false;
-    }
-    if (dims) *dims = static_cast<size_t>(meta.shape[0]);
-    return true;
-}
-
 bool validate_lerobot_policy_norm_stats(const std::string& checkpoint_path,
                                         int64_t state_dim) {
     const std::string pre = find_child(
@@ -525,25 +636,28 @@ bool validate_lerobot_policy_norm_stats(const std::string& checkpoint_path,
         !read_safetensors_header(post, &post_header)) {
         return false;
     }
-    size_t state_q01 = 0;
-    size_t state_q99 = 0;
-    size_t action_q01 = 0;
-    size_t action_q99 = 0;
-    if (!tensor_1d_dim(pre_header, "observation.state.q01", &state_q01) ||
-        !tensor_1d_dim(pre_header, "observation.state.q99", &state_q99) ||
-        !tensor_1d_dim(post_header, "action.q01", &action_q01) ||
-        !tensor_1d_dim(post_header, "action.q99", &action_q99)) {
+    std::vector<float> state_q01;
+    std::vector<float> state_q99;
+    std::vector<float> action_q01;
+    std::vector<float> action_q99;
+    if (!read_safetensors_f32_vector(pre, "observation.state.q01",
+                                     &state_q01) ||
+        !read_safetensors_f32_vector(pre, "observation.state.q99",
+                                     &state_q99) ||
+        !read_safetensors_f32_vector(post, "action.q01", &action_q01) ||
+        !read_safetensors_f32_vector(post, "action.q99", &action_q99)) {
         g_last_error =
             "lerobot policy stats are missing action/state q01/q99";
         return false;
     }
-    if (state_q01 != state_q99 ||
-        state_q01 != static_cast<size_t>(state_dim)) {
+    if (state_q01.size() != static_cast<size_t>(state_dim) ||
+        !sane_quantile_pair(state_q01, state_q99)) {
         g_last_error =
             "lerobot policy state dimension does not match config";
         return false;
     }
-    if (action_q01 != action_q99 || action_q01 > 32) {
+    if (action_q01.size() > 32 ||
+        !sane_quantile_pair(action_q01, action_q99)) {
         g_last_error = "lerobot policy action dimension is invalid";
         return false;
     }
@@ -589,7 +703,11 @@ bool validate_pi05_safetensors(const std::string& checkpoint_path) {
         return false;
     }
     std::string header;
-    if (!read_safetensors_header(path, &header)) return false;
+    uint64_t data_start = 0;
+    uint64_t total_bytes = 0;
+    if (!read_safetensors_header(path, &header, &data_start, &total_bytes)) {
+        return false;
+    }
 
     const char* embedding_keys[] = {
         "paligemma_with_expert.paligemma.lm_head.weight",
@@ -617,6 +735,9 @@ bool validate_pi05_safetensors(const std::string& checkpoint_path) {
     if (embedding.shape.size() != 2 || embedding.shape[1] != 2048 ||
         embedding.shape[0] < 1000) {
         g_last_error = "Pi0.5 embedding shape is invalid";
+        return false;
+    }
+    if (!tensor_payload_valid(embedding, data_start, total_bytes)) {
         return false;
     }
     g_last_error.clear();

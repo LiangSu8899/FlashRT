@@ -204,8 +204,10 @@ native-v2 configuration gate. The gate requires `io="native_v2"`,
 `checkpoint_path/model.safetensors` enough to verify the Pi0.5 prompt
 embedding table metadata, and verifies action/state q01/q99 dimensions from
 either openpi `norm_stats.json` or LeRobot policy normalizer/unnormalizer
-safetensors. Valid configuration returns unsupported until native asset
-materialization and graph capture are complete.
+safetensors. Safetensors tensor byte ranges must match dtype/shape, and
+normalization quantiles must be finite ordered pairs. Valid configuration
+returns unsupported until native asset materialization and graph capture are
+complete.
 
 CUDA graph execs are process-local objects. They are not serialized as a
 portable artifact. Removing Python from setup requires a native producer that
