@@ -162,8 +162,9 @@ in `docs/pi05_io_contract.md` for accepted formats and shape rules.
 
 Read the `actions` port shape to determine chunk length and action dimension.
 The output is the host-visible robot action chunk after producer postprocess.
-For raw model action state, use a producer-declared raw `TENSOR/SWAP` output
-such as `actions_raw` when exported by a stage plan.
+For raw model action state, use `actions_raw` when the producer exports it. In
+the Pi0.5 `native_v2` face this is a raw `TENSOR/SWAP` alias of
+`diffusion_noise` with shape `(chunk, 32)`.
 
 ## Capsule Boundaries
 

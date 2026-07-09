@@ -37,17 +37,21 @@ prompt embedding is prepared by the producer before graph capture/export. A
 producer must not declare a `TEXT/STAGED` or `STATE/STAGED` port until the
 native verb can really update that input on the hot path.
 
-## Target Face After Prompt/State Staging
+## Native V2 Face
 
-After the C++ text path exists, the Pi0.5 native face may add the following
-ports. Adding these ports changes the model-runtime identity and therefore the
-fingerprint. Existing capsules from the old face must refuse restore into the
-new face.
+The `io="native_v2"` export adds prompt/state staging and a raw action alias.
+Adding these ports changes the model-runtime identity and therefore the
+fingerprint. Existing capsules from the old face must refuse restore into this
+face.
 
-| port | modality/update | direction | payload | semantics |
+| port | modality/update | direction | dtype/layout/shape | backing |
 |---|---|---|---|---|
-| `prompt` | `TEXT/STAGED` | input | UTF-8 bytes, no trailing NUL required | task text only |
-| `state` | `STATE/STAGED` | input | `F32`, `(state_dim,)` | raw proprioception, normalized/discretized by the producer |
+| `prompt` | `TEXT/STAGED` | input | UTF-8 bytes, `FLAT`, variable length | staged by C++ runtime |
+| `state` | `STATE/STAGED` | input | host `f32`, `FLAT`, `(state_dim,)` | staged by C++ runtime |
+| `images` | `IMAGE/STAGED` | input | device tensor dtype, `NHWC`, `(num_views, 224, 224, 3)` | `observation_images_normalized` |
+| `noise` | `TENSOR/SWAP` | input | device tensor dtype, `FLAT`, `(chunk_length, 32)` | `diffusion_noise` |
+| `actions` | `ACTION/STAGED` | output | host-visible robot action chunk, `FLAT`, `(chunk_length, robot_action_dim)` | `diffusion_noise` |
+| `actions_raw` | `TENSOR/SWAP` | output | device tensor dtype, `FLAT`, `(chunk_length, 32)` | `diffusion_noise` |
 
 For Pi0.5, proprioceptive state is not an independent model tensor. It is
 normalized, discretized into OpenPI-compatible 256-bin state tokens, rendered
@@ -138,8 +142,9 @@ stddev = (q99 - q01) / 2
 
 The C++ postprocess path clamps normalized action values to the configured
 domain before applying the affine transform. Any raw `(chunk_length, 32)` face
-must be exported as a separate `TENSOR/SWAP` output, such as the existing RTC
-`actions_raw` port, not by changing the meaning of `actions`.
+must be exported as a separate `TENSOR/SWAP` output. The Pi0.5 `native_v2`
+face declares this as `actions_raw`; RTC stage plans also use the same port
+name. Nexus must treat it as a declared raw byte window, not model internals.
 
 ## Lifecycle Mapping
 
