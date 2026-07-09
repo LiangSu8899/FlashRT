@@ -365,14 +365,6 @@ def _parts(pl, identity, extra_regions):
         ident["state_prompt_mode"] = "fixed"
         ident["state_dim"] = str(_state_dim(pl))
         ident["tokenizer_sha256"] = _tokenizer_sha256()
-        prompt_bytes = int(getattr(pl, "max_prompt_len", 0) or 0) * 2048 * 2
-        prompt_offset = int(getattr(pl, "num_views", 0) or 0) * 256 * 2048 * 2
-        encoder_x = wrap["encoder_x"]
-        if prompt_bytes <= 0 or prompt_offset + prompt_bytes > encoder_x.nbytes():
-            raise ValueError("Pi05 native_v2 prompt_context window is invalid")
-        regions.append(_rt.RegionSpec(
-            "prompt_context", encoder_x, offset=prompt_offset,
-            nbytes=prompt_bytes))
 
     return {
         "wrap": wrap,

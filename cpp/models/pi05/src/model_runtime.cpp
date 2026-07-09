@@ -258,11 +258,23 @@ int get_output(void* self, uint32_t port, void* out, uint64_t capacity,
 }
 
 int prepare(void* self, uint32_t graph, frt_shape_key key) {
-    (void)graph;
-    (void)key;
     auto* a = static_cast<Adapter*>(self);
-    if (a) a->last_error = "adopted-export Pi05 runtime has fixed variants";
-    return -3;
+    if (!a) return -1;
+    if (!a->source_model || !a->source_model->exp) {
+        a->last_error = "Pi05 fixed graph variants are captured at setup";
+        return -3;
+    }
+    const frt_runtime_export_v1* exp = a->source_model->exp;
+    if (graph >= exp->n_graphs) {
+        a->last_error = "Pi05 prepare graph index is out of range";
+        return -2;
+    }
+    if (!frt_graph_has_variant(exp->graphs[graph].handle, key)) {
+        a->last_error = "Pi05 fixed graph variant was not captured";
+        return -2;
+    }
+    a->last_error.clear();
+    return 0;
 }
 
 int step(void* self) {

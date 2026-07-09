@@ -160,14 +160,33 @@ inline RuntimeConfig make_config(const frt_pi05_runtime_config* in) {
         in->state_q99 && in->n_state_q99) {
         cfg.state_q99.assign(in->state_q99, in->state_q99 + in->n_state_q99);
     }
+    if (has_field(in, offsetof(frt_pi05_runtime_config,
+                               prompt_length_update),
+                  sizeof(in->prompt_length_update))) {
+        cfg.prompt_length_update_fn = in->prompt_length_update;
+    }
+    if (has_field(in, offsetof(frt_pi05_runtime_config,
+                               prompt_length_update_user),
+                  sizeof(in->prompt_length_update_user))) {
+        cfg.prompt_length_update_user = in->prompt_length_update_user;
+    }
+    const bool prompt_on_device =
+        has_field(in, offsetof(frt_pi05_runtime_config,
+                               prompt_embedding_on_device),
+                  sizeof(in->prompt_embedding_on_device)) &&
+        in->prompt_embedding_on_device != 0;
     if (cfg.prompt_vocab_size && cfg.prompt_hidden_dim) {
-        cfg.prompt_embedding_table.place = modalities::MemoryPlace::kHost;
+        cfg.prompt_embedding_table.place =
+            prompt_on_device ? modalities::MemoryPlace::kDevice
+                             : modalities::MemoryPlace::kHost;
         cfg.prompt_embedding_table.layout = modalities::Layout::kFlat;
         cfg.prompt_embedding_table.shape =
             modalities::Shape{cfg.prompt_vocab_size, cfg.prompt_hidden_dim};
     }
     if (cfg.prompt_max_tokens && cfg.prompt_hidden_dim) {
-        cfg.prompt_embedding_output.place = modalities::MemoryPlace::kHost;
+        cfg.prompt_embedding_output.place =
+            prompt_on_device ? modalities::MemoryPlace::kDevice
+                             : modalities::MemoryPlace::kHost;
         cfg.prompt_embedding_output.layout = modalities::Layout::kFlat;
         cfg.prompt_embedding_output.shape =
             modalities::Shape{cfg.prompt_max_tokens, cfg.prompt_hidden_dim};

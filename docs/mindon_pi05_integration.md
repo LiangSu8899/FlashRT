@@ -52,7 +52,7 @@ In Lane A, prompt is setup-time. The current adopted-export face does not
 export hot `prompt` or `state` ports. A request may repeat the setup prompt for
 bookkeeping, but it cannot change the model prompt dynamically.
 
-### Lane B: After Prompt/State Staging
+### Lane B: Adopted Prompt/State Staging
 
 Use the same setup/adopt path as Lane A, but the producer additionally exports
 real hot ports:
@@ -64,7 +64,7 @@ The C++ host updates these ports with `cap_model_set_input` or the embedded
 session equivalent. The producer formats, tokenizes, embeds, and writes the
 fixed prompt window. Nexus remains unchanged.
 
-### Lane C: Future Native Producer
+### Lane C: Native SM120 Producer
 
 Load a native FlashRT shared object and call:
 
@@ -77,19 +77,14 @@ The returned struct must expose the same public model-runtime contract as the
 Python setup producer. The host and Nexus adoption code must not change when
 switching between Lane A and Lane C.
 
-The current C++ shared object exports this symbol as a native-v2 configuration
-gate. It validates `io`, checkpoint path, tokenizer model path, fixed prompt
-mode, prompt capacity, state dimension, and the Pi0.5 embedding metadata in
-`model.safetensors`, plus the native builder's complete 812-tensor weight
-inventory across vision, language encoder, and action expert. A
-read-only mmap loader owns the checkpoint mapping and exposes bounded tensor
-views for the later device materialization step.
-It also verifies action/state q01/q99 metadata from openpi `norm_stats.json` or
-LeRobot policy normalizer/unnormalizer safetensors, including tensor byte
-ranges and finite ordered quantile payloads, then returns unsupported until the
-native checkpoint materialization and CUDA graph capture path are implemented.
-Hosts may use this to wire dynamic loading and error handling, but must keep
-using Lane A or B for execution.
+The current C++ shared object implements this symbol as a complete SM120
+native-v2 producer when built with CUDA kernels, native FA2, and SentencePiece.
+It validates `io`, checkpoint/tokenizer paths, fixed prompt mode, capacities,
+the complete 812-tensor inventory, and OpenPI or LeRobot action/state q01/q99
+metadata. It then hashes the model and tokenizer for deployment identity,
+materializes context-owned weights/workspace, captures one `infer` variant,
+and returns the integrated model runtime. Missing FA2/SentencePiece support or
+non-SM120 hardware returns unsupported instead of publishing unusable ports.
 
 ## No-HTTP C++ Host Shape
 
@@ -155,10 +150,9 @@ raw proprioception -> normalize -> 256-bin discretize -> prompt string
 -> token ids -> embedding gather -> encoder_x prompt window
 ```
 
-Until Lane B lands, prompt and state changes require a setup-time producer
-refresh. After Lane B, Mindon should send task text to the `prompt` port and
-raw proprioception to the `state` port. The producer owns all formatting and
-normalization details.
+Lane A still requires a setup-time producer refresh for prompt/state changes.
+Lanes B and C accept task text through `prompt` and raw proprioception through
+`state`. The producer owns all formatting and normalization details.
 
 ## Image Input
 
@@ -186,9 +180,11 @@ Capsules snapshot exactly the producer-declared regions, in declared order.
 Mindon should treat capsule contents as opaque bytes. A fingerprint mismatch
 on restore is a deployment mismatch and must fail loudly.
 
-If prompt context becomes a region in a future producer face, old capsules
-will not restore into that new face. That is expected and protects state
-safety.
+The native-v2 producer currently declares only `rollout_boundary`. Prompt
+embedding, attention lengths, RoPE, and CPU prompt/state caches are not a
+capsule region because partial restoration would be incorrect. If a future
+face makes the entire prompt context restorable, its added ordered regions and
+new fingerprint will intentionally reject old capsules.
 
 ## Configuration Sketch
 
@@ -204,6 +200,23 @@ model = pipeline.export_model_runtime(
 
 A split or RTC deployment may choose another producer-registered stage plan,
 but the C++ host still sees only the adopted stage array.
+
+Lane C opens the native producer with a setup config such as:
+
+```json
+{
+  "io": "native_v2",
+  "checkpoint_path": "/models/pi05",
+  "tokenizer_model_path": "/models/paligemma/tokenizer.model",
+  "state_prompt_mode": "fixed",
+  "max_prompt_tokens": 200,
+  "state_dim": 8,
+  "num_views": 2,
+  "chunk": 10,
+  "num_steps": 10,
+  "vision_pool_factor": 1
+}
+```
 
 ## Acceptance Checklist
 

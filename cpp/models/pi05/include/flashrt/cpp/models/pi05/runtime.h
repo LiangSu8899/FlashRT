@@ -14,6 +14,7 @@ namespace pi05 {
 
 using ReplayFn = int (*)(frt_graph graph, frt_shape_key key, int stream_id,
                          void* user);
+using PromptLengthUpdateFn = int (*)(void* user, std::uint64_t prompt_len);
 
 struct RuntimeConfig {
     int num_views = 3;
@@ -58,6 +59,8 @@ struct RuntimeConfig {
 
     ReplayFn replay_fn = nullptr;
     void* replay_user = nullptr;
+    PromptLengthUpdateFn prompt_length_update_fn = nullptr;
+    void* prompt_length_update_user = nullptr;
 };
 
 class Runtime final : public families::vla::Runtime {

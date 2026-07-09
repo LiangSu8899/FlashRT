@@ -80,6 +80,12 @@ typedef struct frt_pi05_runtime_config {
     uint64_t n_state_q01;
     const float* state_q99;
     uint64_t n_state_q99;
+
+    /* Optional ABI tail: notify an integrated native graph owner after a
+     * prompt/state update has produced a new valid token count. */
+    int (*prompt_length_update)(void* user, uint64_t prompt_len);
+    void* prompt_length_update_user;
+    int prompt_embedding_on_device;
 } frt_pi05_runtime_config;
 
 typedef struct frt_pi05_vision_frame {

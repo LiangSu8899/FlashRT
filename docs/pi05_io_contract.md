@@ -184,11 +184,13 @@ The following are not deployment identity changes:
 - editing `manifest_json`;
 - changing `cadence_hint_hz`.
 
-Prompt/state staging should normally add a restorable prompt context region
-only after the bytes that define that context are explicit. A valid region
-could include the language rows of `encoder_x` plus the fixed-prompt valid
-length scalar. Region layout and order are fingerprinted; old capsules should
-not restore into the new layout.
+Prompt/state staging does not by itself make prompt context a capsule region.
+A restorable prompt context would have to include the embedding, attention
+lengths, decoder position/RoPE, and the CPU semantic cache used by later
+independent prompt/state updates. The current face can rebuild those values
+from its declared inputs, so it does not advertise partial prompt restoration.
+Region layout and order are fingerprinted; adding a complete prompt region in
+a later face will intentionally invalidate old capsules.
 
 ## Current Integration Lanes
 
@@ -196,26 +198,28 @@ There are three supported integration lanes:
 
 - Lane A, current: Python setup/capture/export stays resident in the process;
   the hot loop adopts `frt_model_runtime_v1` and runs through C++/Nexus.
-- Lane B, after prompt/state staging: same as Lane A, plus hot
-  `prompt`/`state` STAGED ports.
-- Lane C, future native producer: a C++ shared object implements
+- Lane B: an adopted setup producer exposes real hot `prompt`/`state` STAGED
+  ports and the C++ overlay owns their transforms.
+- Lane C, current on RTX SM120: a C++ shared object implements
   `frt_model_runtime_open_v1(config_json, &out)` and produces the same public
   struct without Python setup.
 
-The Pi0.5 C++ shared object now exports `frt_model_runtime_open_v1` as a
-native-v2 configuration gate. The gate requires `io="native_v2"`,
+The Pi0.5 C++ shared object exports `frt_model_runtime_open_v1` as a complete
+native-v2 producer when built with CUDA kernels, native FA2, and SentencePiece.
+Execution currently requires RTX SM120. The factory requires `io="native_v2"`,
 `checkpoint_path`, `tokenizer_model_path`, `state_prompt_mode="fixed"`,
-`max_prompt_tokens >= 200`, and a positive `state_dim`. It also parses
+`max_prompt_tokens >= 200`, and a positive `state_dim`; `num_views`, `chunk`,
+`num_steps`, and `vision_pool_factor` are optional fixed setup values. It parses
 `checkpoint_path/model.safetensors` through the native read-only mmap loader to
 verify the complete 812-tensor Pi0.5 inventory: all 27 vision layers, all 18
 language encoder layers, all 18 action-expert layers, embeddings/final norms,
 projectors, action projections, and time MLP. It also verifies action/state q01/q99
 dimensions from either openpi `norm_stats.json` or LeRobot policy
 normalizer/unnormalizer safetensors. Safetensors tensor byte ranges must match
-dtype/shape, and normalization quantiles must be finite ordered pairs. Valid
-configuration returns unsupported until device weight materialization and graph
-capture are complete. The mmap and parsed tensor views are setup-side assets;
-they never enter the model-runtime ABI or the hot path.
+dtype/shape, and normalization quantiles must be finite ordered pairs. Builds
+without native FA2 or SentencePiece validate the config and return unsupported;
+they do not advertise a runtime they cannot execute. The mmap and parsed tensor
+views are setup-side assets; they never enter the model-runtime ABI or hot path.
 
 The native setup layer also carries CPU reference transforms matching the
 existing PyTorch producer: source BF16 rounding for vision/decoder weights,
@@ -246,8 +250,8 @@ producer. The prompt embedding table is materialized separately to keep its
 approximately 1 GiB allocation explicit. These paths have been exercised
 against the two supported real checkpoint layouts. The checkpoint inventory
 also validates the language final norm and expert LM head even though the
-current Pi0.5 pipeline does not consume them. Full-model precision-store
-assembly and graph capture remain incomplete, so `open_v1` stays unsupported.
+current Pi0.5 pipeline does not consume them. The native producer materializes
+the full BF16 store before capture and keeps it under the graph context lifetime.
 
 Native setup quantization reproduces the PyTorch producer's per-tensor FP8
 E4M3 weights in either `kn` or `nk` layout and per-output-channel INT8 weights
@@ -275,12 +279,9 @@ setup. INT8 packing remains independently selectable for vision, encoder, and
 decoder and preserves their existing four/five/five weights-per-layer policy.
 
 The native kernel layer is CPython-independent and links the existing
-`GemmRunner` implementation directly. A capture gate warms a BF16 GEMM shape,
-records it through `frt_graph_capture`, binds context-owned input/output
-buffers, and replays the owned graph exec 100 times without adding variants.
-This establishes the 4b kernel/capture ownership path; it does not yet
-constitute the complete Pi0.5 forward graph, so the native open gate remains
-unsupported.
+`GemmRunner` implementation directly. Setup warms required BF16 GEMM shapes,
+captures the complete `infer` graph through `frt_graph_capture`, and exports
+exactly one shape-key variant (`0`).
 
 The native core workspace maps every vision, encoder, decoder, style, action,
 RTC, and reusable scratch allocation to a context-owned `frt_buffer`. There is
@@ -288,9 +289,8 @@ no model-level State object. With vision pooling disabled, `vision_x_pooled`
 is an explicit alias of `vision_x` (34 logical names, 33 allocations); pooled
 deployments allocate it separately. Buffer shapes are fixed from `num_views`,
 `max_prompt_tokens`, `chunk_size`, `num_steps`, and `vision_pool_factor` before
-capture, and BF16 RMS-one constants are initialized during setup. Attention
-backend buffers and generated decoder style contents are the remaining
-workspace subsystems before the complete forward can be captured.
+capture, and BF16 RMS-one constants, attention backend storage, and generated
+decoder style contents are initialized during setup.
 
 Native RoPE setup uses the same float64 frequency/phase computation and BF16
 interleaved `[cos, sin]` layout as the Python producer. Encoder and
@@ -372,13 +372,24 @@ FA2 raw C entries directly for SigLIP, fixed-shape encoder `seqused`, and
 decoder `seqused` split-KV. Its graph gate changes the prompt length after
 capture, replays 100 times with one variant, and verifies the new device-side
 valid length is observed. `flash_rt_fa2` remains a thin Python adapter over the
-same `libflashrt_fa2_raw` kernel owner. The remaining native producer task is
-combining the completed vision, encoder, and diffusion graphs with the native
-builder and producer lifetime.
+same `libflashrt_fa2_raw` kernel owner.
+
+The native builder publishes one `infer` graph/stage and the ordered ports
+`prompt`, `state`, `images`, `noise`, `actions`, and `actions_raw`. Identity
+includes SM120, model/tokenizer SHA-256 values, prompt mode, fixed shapes, and
+schedule parameters. The only capsule region is `rollout_boundary` over the
+diffusion/action buffer. Prompt embeddings, encoder/decoder caches, attention
+lengths, and RoPE remain context-owned `frt_buffer` workspace that each infer
+rebuilds; they are not falsely advertised as independently restorable state.
+
+The returned verb override retains the builder-produced base model, which
+retains the export and graph owner. Releasing the final public model releases
+the overlay, export, captured graph, buffers, stream, and context in ownership
+order without a second lifecycle owner.
 
 CUDA graph execs are process-local objects. They are not serialized as a
-portable artifact. Removing Python from setup requires a native producer that
-loads assets and captures graphs in the replay process.
+portable artifact. The native producer therefore loads assets and captures the
+graph in the replay process.
 
 ## Validation
 
@@ -404,6 +415,17 @@ python cpp/tests/gate_pi05_model_runtime_export.py ...
 python cpp/tests/gate_pi05_c_api_export.py ...
 ```
 
-For prompt/state staging, add token-exact, formatter string-exact, embedding
-bit-exact, fixed-vs-exact E2E cosine, and hot-contract tests before declaring
-the new STAGED ports.
+Prompt/state STAGED ports require token-exact, formatter string-exact,
+embedding bit-exact, fixed-vs-exact E2E cosine, and hot-contract coverage; a
+producer must not retain the declarations if any required verb is unavailable.
+
+The native factory lifecycle gate is:
+
+```
+cpp/build-sm120-spm-debug/pi05_native_open_probe \
+  <checkpoint> <tokenizer.model>
+```
+
+Run it against both OpenPI and LeRobot checkpoint layouts. It validates the
+public schema, one captured variant, prompt/state/image staging, direct SWAP
+noise input, finite action output, and retain/release teardown.

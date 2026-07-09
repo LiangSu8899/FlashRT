@@ -1,9 +1,11 @@
 #include "flashrt/model_runtime.h"
 #include "flashrt/cpp/loader/safetensors.h"
 #include "flashrt/cpp/models/pi05/native_weights.h"
+#include "native_open_internal.h"
 
 #include <cerrno>
 #include <cctype>
+#include <climits>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -352,9 +354,10 @@ std::string dirname(const std::string& path) {
     return path.substr(0, p);
 }
 
-bool norm_block_dims(const std::string& json,
-                     const char* block_name,
-                     size_t* dims) {
+bool norm_block_values(const std::string& json,
+                       const char* block_name,
+                       std::vector<float>* q01_out,
+                       std::vector<float>* q99_out) {
     std::string block;
     if (!object_for_key(json, block_name, &block)) return false;
     std::vector<double> q01;
@@ -364,28 +367,38 @@ bool norm_block_dims(const std::string& json,
         !sane_quantile_pair(q01, q99)) {
         return false;
     }
-    if (dims) *dims = q01.size();
+    if (q01_out) q01_out->assign(q01.begin(), q01.end());
+    if (q99_out) q99_out->assign(q99.begin(), q99.end());
     return true;
 }
 
 bool validate_norm_stats_file(const std::string& path,
-                              int64_t state_dim) {
+                              int64_t state_dim,
+                              flashrt::models::pi05::NativeOpenConfig* config) {
     std::string json;
     if (!read_text_file(path, &json)) return false;
-    size_t action_dims = 0;
-    size_t state_dims = 0;
-    if (!norm_block_dims(json, "actions", &action_dims) ||
-        !norm_block_dims(json, "state", &state_dims)) {
+    std::vector<float> action_q01;
+    std::vector<float> action_q99;
+    std::vector<float> state_q01;
+    std::vector<float> state_q99;
+    if (!norm_block_values(json, "actions", &action_q01, &action_q99) ||
+        !norm_block_values(json, "state", &state_q01, &state_q99)) {
         g_last_error = "norm_stats.json is missing actions/state q01/q99";
         return false;
     }
-    if (action_dims == 0 || action_dims > 32) {
+    if (action_q01.empty() || action_q01.size() > 32) {
         g_last_error = "norm_stats action dimension is invalid";
         return false;
     }
-    if (state_dims != static_cast<size_t>(state_dim)) {
+    if (state_q01.size() != static_cast<size_t>(state_dim)) {
         g_last_error = "norm_stats state dimension does not match config";
         return false;
+    }
+    if (config) {
+        config->state_q01 = std::move(state_q01);
+        config->state_q99 = std::move(state_q99);
+        config->action_q01 = std::move(action_q01);
+        config->action_q99 = std::move(action_q99);
     }
     g_last_error.clear();
     return true;
@@ -419,7 +432,9 @@ std::string find_child(const std::string& dir,
 }
 
 bool validate_lerobot_policy_norm_stats(const std::string& checkpoint_path,
-                                        int64_t state_dim) {
+                                        int64_t state_dim,
+                                        flashrt::models::pi05::NativeOpenConfig*
+                                            config) {
     const std::string pre = find_child(
         checkpoint_path, "policy_preprocessor_step_",
         "_normalizer_processor.safetensors");
@@ -453,12 +468,19 @@ bool validate_lerobot_policy_norm_stats(const std::string& checkpoint_path,
         g_last_error = "lerobot policy action dimension is invalid";
         return false;
     }
+    if (config) {
+        config->state_q01 = std::move(state_q01);
+        config->state_q99 = std::move(state_q99);
+        config->action_q01 = std::move(action_q01);
+        config->action_q99 = std::move(action_q99);
+    }
     g_last_error.clear();
     return true;
 }
 
 bool validate_norm_stats(const std::string& checkpoint_path,
-                         int64_t state_dim) {
+                         int64_t state_dim,
+                         flashrt::models::pi05::NativeOpenConfig* config) {
     const std::string parent = dirname(checkpoint_path);
     const std::string candidates[] = {
         join_path(checkpoint_path,
@@ -475,11 +497,12 @@ bool validate_norm_stats(const std::string& checkpoint_path,
     std::string malformed_error;
     for (const std::string& path : candidates) {
         if (!regular_file_exists(path)) continue;
-        if (validate_norm_stats_file(path, state_dim)) return true;
+        if (validate_norm_stats_file(path, state_dim, config)) return true;
         saw_malformed = true;
         malformed_error = g_last_error;
     }
-    if (validate_lerobot_policy_norm_stats(checkpoint_path, state_dim)) {
+    if (validate_lerobot_policy_norm_stats(checkpoint_path, state_dim,
+                                           config)) {
         return true;
     }
     g_last_error = saw_malformed
@@ -561,7 +584,9 @@ bool integer_field(const std::map<std::string, JsonValue>& obj,
     return true;
 }
 
-int validate_config(const char* config_json) {
+int validate_config(
+    const char* config_json,
+    flashrt::models::pi05::NativeOpenConfig* parsed) {
     if (!config_json) {
         g_last_error = "config_json is null";
         return -1;
@@ -609,36 +634,57 @@ int validate_config(const char* config_json) {
     int64_t state_dim = 0;
     int64_t num_views = 0;
     int64_t chunk = 0;
+    int64_t num_steps = 10;
+    int64_t vision_pool_factor = 1;
     if (!integer_field(obj, "max_prompt_tokens", &max_prompt_tokens) ||
         !integer_field(obj, "state_dim", &state_dim) ||
         !integer_field(obj, "num_views", &num_views) ||
-        !integer_field(obj, "chunk", &chunk)) {
+        !integer_field(obj, "chunk", &chunk) ||
+        !integer_field(obj, "num_steps", &num_steps) ||
+        !integer_field(obj, "vision_pool_factor", &vision_pool_factor)) {
         return -1;
     }
-    if (max_prompt_tokens < 200) {
-        g_last_error = "max_prompt_tokens must be at least 200";
+    if (max_prompt_tokens < 200 || max_prompt_tokens > INT_MAX) {
+        g_last_error = "max_prompt_tokens must be in [200, INT_MAX]";
         return -1;
     }
-    if (state_dim <= 0) {
-        g_last_error = "state_dim must be positive";
+    if (state_dim <= 0 || state_dim > INT_MAX) {
+        g_last_error = "state_dim must be in [1, INT_MAX]";
         return -1;
     }
     if (num_views && (num_views < 1 || num_views > 3)) {
         g_last_error = "num_views must be in [1, 3]";
         return -1;
     }
-    if (chunk && chunk <= 0) {
-        g_last_error = "chunk must be positive";
+    if (chunk && (chunk <= 0 || chunk > INT_MAX)) {
+        g_last_error = "chunk must be in [1, INT_MAX]";
         return -1;
     }
-    if (!validate_norm_stats(checkpoint_path, state_dim)) {
+    if (num_steps <= 0 || num_steps > INT_MAX) {
+        g_last_error = "num_steps must be in [1, INT_MAX]";
+        return -1;
+    }
+    if (vision_pool_factor != 1 && vision_pool_factor != 2 &&
+        vision_pool_factor != 4) {
+        g_last_error = "vision_pool_factor must be one of 1, 2, or 4";
+        return -1;
+    }
+    flashrt::models::pi05::NativeOpenConfig config;
+    config.checkpoint_path = checkpoint_path;
+    config.tokenizer_model_path = tokenizer_model_path;
+    config.max_prompt_tokens = static_cast<int>(max_prompt_tokens);
+    config.state_dim = static_cast<int>(state_dim);
+    config.num_views = static_cast<int>(num_views ? num_views : 2);
+    config.chunk = static_cast<int>(chunk ? chunk : 10);
+    config.num_steps = static_cast<int>(num_steps);
+    config.vision_pool_factor = static_cast<int>(vision_pool_factor);
+    if (!validate_norm_stats(checkpoint_path, state_dim, &config)) {
         return -2;
     }
 
-    g_last_error =
-        "Pi0.5 native open validated config; native graph capture is not "
-        "implemented yet";
-    return -3;
+    if (parsed) *parsed = std::move(config);
+    g_last_error.clear();
+    return 0;
 }
 
 }  // namespace
@@ -650,7 +696,18 @@ extern "C" int frt_model_runtime_open_v1(const char* config_json,
         return -1;
     }
     *out = nullptr;
-    return validate_config(config_json);
+    flashrt::models::pi05::NativeOpenConfig config;
+    const int rc = validate_config(config_json, &config);
+    if (rc != 0) return rc;
+#if defined(FLASHRT_CPP_WITH_FA2) && defined(FLASHRT_CPP_HAS_SENTENCEPIECE)
+    return flashrt::models::pi05::build_native_model_runtime(
+        config, out, &g_last_error);
+#else
+    g_last_error =
+        "Pi0.5 native open validated config; this build requires native "
+        "FA2 and SentencePiece for graph capture";
+    return -3;
+#endif
 }
 
 extern "C" const char* frt_pi05_native_open_last_error() {

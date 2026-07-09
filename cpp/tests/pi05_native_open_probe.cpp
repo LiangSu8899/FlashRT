@@ -1,0 +1,149 @@
+#include "flashrt/model_runtime.h"
+#include "flashrt/cpp/modalities/types.h"
+
+#include <cuda_runtime_api.h>
+
+#include <cmath>
+#include <cstring>
+#include <iostream>
+#include <sstream>
+#include <string>
+#include <vector>
+
+extern "C" int frt_model_runtime_open_v1(const char* config_json,
+                                          frt_model_runtime_v1** out);
+extern "C" const char* frt_pi05_native_open_last_error();
+
+int main(int argc, char** argv) {
+    if (argc != 3) {
+        std::cerr << "usage: pi05_native_open_probe CHECKPOINT TOKENIZER\n";
+        return 2;
+    }
+    std::ostringstream json;
+    json << "{\"io\":\"native_v2\",\"checkpoint_path\":\""
+         << argv[1] << "\",\"tokenizer_model_path\":\"" << argv[2]
+         << "\",\"state_prompt_mode\":\"fixed\","
+         << "\"max_prompt_tokens\":200,\"state_dim\":8,"
+         << "\"num_views\":2,\"chunk\":10,\"num_steps\":10,"
+         << "\"vision_pool_factor\":1}";
+    frt_model_runtime_v1* model = nullptr;
+    const int open_rc = frt_model_runtime_open_v1(json.str().c_str(), &model);
+    if (open_rc != 0 || !model) {
+        std::cerr << "native open failed: rc=" << open_rc << " error="
+                  << frt_pi05_native_open_last_error() << '\n';
+        return 1;
+    }
+    const char* port_names[] = {
+        "prompt", "state", "images", "noise", "actions", "actions_raw"};
+    const frt_runtime_export_v1* exp = model->exp;
+    bool ok = model->abi_version == FRT_MODEL_RUNTIME_ABI_VERSION &&
+              model->struct_size == sizeof(frt_model_runtime_v1) && exp &&
+              exp->abi_version == FRT_RUNTIME_ABI_VERSION &&
+              exp->struct_size == sizeof(frt_runtime_export_v1) &&
+              model->n_ports == 6 && model->n_stages == 1 &&
+              exp->n_graphs == 1 && exp->n_streams == 1 &&
+              exp->n_capsule_regions == 1 && exp->n_buffers == 7 &&
+              exp->fingerprint != 0 && exp->identity &&
+              std::strstr(exp->identity, "producer=native") &&
+              std::strstr(exp->identity, "weights_sha256=") &&
+              std::strstr(exp->identity, "tokenizer_sha256=") &&
+              model->stages[0].graph == 0 &&
+              frt_graph_variant_count(exp->graphs[0].handle) == 1;
+    for (std::uint64_t i = 0; i < model->n_ports; ++i) {
+        ok = ok && std::strcmp(model->ports[i].name, port_names[i]) == 0;
+    }
+    ok = ok &&
+         std::strcmp(exp->capsule_regions[0].name, "rollout_boundary") == 0 &&
+         model->ports[0].modality == FRT_RT_MOD_TEXT &&
+         model->ports[0].update == FRT_RT_PORT_STAGED &&
+         model->ports[1].modality == FRT_RT_MOD_STATE &&
+         model->ports[2].modality == FRT_RT_MOD_IMAGE &&
+         model->ports[3].update == FRT_RT_PORT_SWAP &&
+         model->ports[4].direction == FRT_RT_PORT_OUT &&
+         model->ports[5].update == FRT_RT_PORT_SWAP;
+    if (!ok) {
+        std::cerr << "native schema validation failed\n";
+        model->release(model->owner);
+        return 1;
+    }
+    if (model->verbs.prepare(model->self, 0, 0) != 0 ||
+        model->verbs.prepare(model->self, 0, 1) != -2) {
+        std::cerr << "native prepare validation failed\n";
+        model->release(model->owner);
+        return 1;
+    }
+
+    const std::string prompt = "pick up the black bowl";
+    const float state[8] = {0.1f, -0.2f, 0.3f, -0.4f,
+                            0.5f, -0.6f, 0.7f, -0.8f};
+    if (model->verbs.set_input(model->self, 0, prompt.data(), prompt.size(),
+                               -1) != 0 ||
+        model->verbs.set_input(model->self, 1, state, sizeof(state), -1) != 0) {
+        std::cerr << "native prompt/state staging failed: "
+                  << model->verbs.last_error(model->self) << '\n';
+        model->release(model->owner);
+        return 1;
+    }
+    std::vector<std::uint8_t> rgb0(224 * 224 * 3);
+    std::vector<std::uint8_t> rgb1(rgb0.size());
+    for (std::size_t i = 0; i < rgb0.size(); ++i) {
+        rgb0[i] = static_cast<std::uint8_t>(i % 251);
+        rgb1[i] = static_cast<std::uint8_t>((3 * i + 17) % 251);
+    }
+    frt_image_view views[2]{};
+    for (int i = 0; i < 2; ++i) {
+        views[i].struct_size = sizeof(frt_image_view);
+        views[i].pixel_format = FRT_RT_PIXEL_RGB8;
+        views[i].data = i ? static_cast<const void*>(rgb1.data())
+                          : static_cast<const void*>(rgb0.data());
+        views[i].bytes = rgb0.size();
+        views[i].width = 224;
+        views[i].height = 224;
+        views[i].stride_bytes = 224 * 3;
+    }
+    if (model->verbs.set_input(model->self, 2, views, sizeof(views), -1) != 0) {
+        std::cerr << "native image staging failed: "
+                  << model->verbs.last_error(model->self) << '\n';
+        model->release(model->owner);
+        return 1;
+    }
+    frt_buffer noise = model->ports[3].buffer;
+    std::vector<std::uint16_t> host_noise(10 * 32);
+    for (std::size_t i = 0; i < host_noise.size(); ++i) {
+        host_noise[i] = flashrt::modalities::float_to_bfloat16(
+            static_cast<float>(static_cast<int>(i % 23) - 11) / 12.0f);
+    }
+    if (!noise || model->verbs.set_input(model->self, 3, host_noise.data(),
+                                         host_noise.size() * 2, -1) != -3 ||
+        cudaMemcpy(frt_buffer_dptr(noise), host_noise.data(),
+                   host_noise.size() * sizeof(std::uint16_t),
+                   cudaMemcpyHostToDevice) != cudaSuccess ||
+        model->verbs.step(model->self) != 0) {
+        std::cerr << "native step failed: "
+                  << model->verbs.last_error(model->self) << '\n';
+        model->release(model->owner);
+        return 1;
+    }
+    float actions[10 * 7]{};
+    std::uint64_t written = 0;
+    if (model->verbs.get_output(model->self, 4, actions, sizeof(actions),
+                                &written, -1) != 0 ||
+        written != sizeof(actions)) {
+        std::cerr << "native action output failed: "
+                  << model->verbs.last_error(model->self) << '\n';
+        model->release(model->owner);
+        return 1;
+    }
+    for (float value : actions) {
+        if (!std::isfinite(value)) {
+            std::cerr << "native action output is not finite\n";
+            model->release(model->owner);
+            return 1;
+        }
+    }
+    model->retain(model->owner);
+    model->release(model->owner);
+    model->release(model->owner);
+    std::cout << "PASS native open_v1 full lifecycle\n";
+    return 0;
+}
