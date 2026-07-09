@@ -50,6 +50,7 @@ endif()
 set(FLASHRT_CPP_MODALITY_SRCS
   modalities/src/types.cpp
   modalities/src/vision_cpu.cpp
+  modalities/src/text_cpu.cpp
   modalities/src/action_cpu.cpp)
 if(FLASHRT_CPP_WITH_CUDA_KERNELS)
   list(APPEND FLASHRT_CPP_MODALITY_SRCS modalities/src/vision_cuda.cu)
@@ -101,6 +102,10 @@ if(BUILD_TESTING)
   target_link_libraries(test_cpp_modalities
     PRIVATE flashrt_cpp_pi05 flashrt_cpp_modalities)
   add_test(NAME cpp_modalities COMMAND test_cpp_modalities)
+
+  add_executable(test_text_modalities tests/test_text_modalities.cpp)
+  target_link_libraries(test_text_modalities PRIVATE flashrt_cpp_modalities)
+  add_test(NAME text_modalities COMMAND test_text_modalities)
 
   add_executable(test_pi05_runtime tests/test_pi05_runtime.cpp)
   target_link_libraries(test_pi05_runtime
