@@ -155,12 +155,15 @@ target_link_libraries(flashrt_cpp_pi05
 if(FLASHRT_CPP_WITH_CUDA_KERNELS)
   add_library(flashrt_cpp_pi05_kernels STATIC
     models/pi05/src/native_kernel_driver.cu
-    ${CMAKE_CURRENT_SOURCE_DIR}/../csrc/gemm/gemm_runner.cu)
+    models/pi05/src/native_style_precompute.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/../csrc/gemm/gemm_runner.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/../csrc/kernels/dit_bf16.cu)
   target_include_directories(flashrt_cpp_pi05_kernels
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/include
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../csrc/gemm)
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../csrc/gemm
+            ${CMAKE_CURRENT_SOURCE_DIR}/../csrc/kernels)
   target_link_libraries(flashrt_cpp_pi05_kernels
-    PUBLIC flashrt_cpp_modalities CUDA::cublas CUDA::cublasLt CUDA::cudart)
+    PUBLIC flashrt_cpp_pi05 CUDA::cublas CUDA::cublasLt CUDA::cudart)
   set_target_properties(flashrt_cpp_pi05_kernels PROPERTIES
     CUDA_STANDARD 17
     CUDA_STANDARD_REQUIRED ON)
@@ -239,6 +242,18 @@ if(BUILD_TESTING)
       PRIVATE flashrt_cpp_pi05_kernels flashrt_exec CUDA::cudart)
     add_test(NAME pi05_native_kernel_driver
       COMMAND test_pi05_native_kernel_driver)
+
+    add_executable(test_pi05_native_style_precompute
+      tests/test_pi05_native_style_precompute.cpp)
+    target_link_libraries(test_pi05_native_style_precompute
+      PRIVATE flashrt_cpp_pi05_kernels flashrt_exec CUDA::cudart)
+    add_test(NAME pi05_native_style_precompute
+      COMMAND test_pi05_native_style_precompute)
+
+    add_executable(pi05_native_style_probe
+      tests/pi05_native_style_probe.cpp)
+    target_link_libraries(pi05_native_style_probe
+      PRIVATE flashrt_cpp_pi05_kernels flashrt_exec CUDA::cudart)
 
     add_executable(test_pi05_native_workspace
       tests/test_pi05_native_workspace.cpp)

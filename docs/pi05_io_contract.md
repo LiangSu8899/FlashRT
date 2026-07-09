@@ -299,6 +299,14 @@ pooled and unpooled configurations. Decoder slice updates reuse one stable
 buffer across prompt lengths; vision position embeddings are expanded per view
 with setup-side D2D copies from the typed weight store.
 
+Decoder time/style precompute is also native setup work. It consumes the
+generated time embeddings, time-MLP weights, 18 layers of AdaRMS modulation,
+and final modulation from the typed store; it reuses existing workspace
+buffers as scratch and writes the four persistent style buffers without a
+temporary device allocation. The GEMM, explicit BF16 bias round-trip, and
+float-SiLU sequence is BF16 bit-exact with the PyTorch producer on both
+supported checkpoint layouts.
+
 CUDA graph execs are process-local objects. They are not serialized as a
 portable artifact. Removing Python from setup requires a native producer that
 loads assets and captures graphs in the replay process.
