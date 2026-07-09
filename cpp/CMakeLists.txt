@@ -134,6 +134,7 @@ set(FLASHRT_CPP_PI05_SRCS
   models/pi05/src/native_weight_packer.cpp
   models/pi05/src/native_weight_materializer.cpp
   models/pi05/src/native_workspace.cpp
+  models/pi05/src/native_rtx_attention.cpp
   models/pi05/src/prompt_format.cpp
   models/pi05/src/prompt_embed.cpp
   models/pi05/src/io.cpp
@@ -261,6 +262,13 @@ if(BUILD_TESTING)
       PRIVATE flashrt_cpp_pi05 flashrt_exec CUDA::cudart)
     add_test(NAME pi05_native_workspace
       COMMAND test_pi05_native_workspace)
+
+    add_executable(test_pi05_native_rtx_attention
+      tests/test_pi05_native_rtx_attention.cpp)
+    target_link_libraries(test_pi05_native_rtx_attention
+      PRIVATE flashrt_cpp_pi05 flashrt_exec CUDA::cudart)
+    add_test(NAME pi05_native_rtx_attention
+      COMMAND test_pi05_native_rtx_attention)
 
     add_executable(pi05_native_rope_probe
       tests/pi05_native_rope_probe.cpp)
