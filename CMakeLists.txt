@@ -709,8 +709,8 @@ if(ENABLE_NVFP4)
 endif()
 
 # ── Flash-Attention 2 vendored kernels (fp16 + bf16 fwd SM80) ──
-# Built as an object library and linked into a SEPARATE pybind module
-# flash_rt_fa2.so — same isolation pattern as flash_rt_fp4.so. The
+# Built as an object library and linked into a Python-free raw library;
+# flash_rt_fa2.so is a thin pybind adapter over that library. The
 # main flash_rt_kernels.so stays small (~3.6 MB) and its rebuild no
 # longer waits on FA2's heavy CUTLASS 3.x template codegen (~8 min).
 #
@@ -773,9 +773,9 @@ if(ENABLE_FA2)
       csrc/attention/fa2_causal_inst/flash_fwd_split_hdim256_bf16_sm80_causal.cu
     )
   endif()
-  if("bf16" IN_LIST FA2_DTYPES AND ("128" IN_LIST FA2_HDIMS OR "256" IN_LIST FA2_HDIMS))
-    list(APPEND FA2_SRCS csrc/attention/fa2_wrapper_causal.cu)
-  endif()
+  # Always emit the causal C entry. Builds without a causal hdim retain a
+  # stable raw-library symbol that fails clearly instead of an unresolved ABI.
+  list(APPEND FA2_SRCS csrc/attention/fa2_wrapper_causal.cu)
 
   add_library(fa2_vendor_obj OBJECT ${FA2_SRCS})
   set_target_properties(fa2_vendor_obj PROPERTIES
@@ -896,6 +896,21 @@ if(ENABLE_FA2)
   math(EXPR _FA2_NKERN "${_FA2_NSRC} - 1")
   message(STATUS "FA2 vendor instantiations: hdim={${_FA2_H}} x dtype={${_FA2_D}} x {split,no-split} = ${_FA2_NKERN} kernel .cu files")
 
+  # Keep the raw C entries in a Python-free library. The native C++ runtime
+  # links this target directly; the pybind module below is only an adapter.
+  add_library(flashrt_fa2_raw SHARED)
+  target_sources(flashrt_fa2_raw PRIVATE $<TARGET_OBJECTS:fa2_vendor_obj>)
+  target_link_libraries(flashrt_fa2_raw PRIVATE CUDA::cudart)
+  if(NOT MSVC)
+    target_link_options(flashrt_fa2_raw PRIVATE
+      "LINKER:--no-undefined" -static-libstdc++ -static-libgcc)
+  endif()
+  set_target_properties(flashrt_fa2_raw PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt
+    BUILD_RPATH "$ORIGIN"
+    INSTALL_RPATH "$ORIGIN")
+
   # Independent pybind module. Caller side:
   #     from flash_rt import flash_rt_fa2 as fa2
   #     fa2.fwd_fp16(...)  /  fa2.fwd_bf16(...)
@@ -903,12 +918,16 @@ if(ENABLE_FA2)
   set_target_properties(flash_rt_fa2 PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
-  target_sources(flash_rt_fa2 PRIVATE $<TARGET_OBJECTS:fa2_vendor_obj>)
   target_include_directories(flash_rt_fa2 PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc
   )
-  target_link_libraries(flash_rt_fa2 PRIVATE CUDA::cudart)
-  install(TARGETS flash_rt_fa2 DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
+  target_link_libraries(flash_rt_fa2 PRIVATE flashrt_fa2_raw CUDA::cudart)
+  set_target_properties(flash_rt_fa2 PROPERTIES
+    BUILD_RPATH "$ORIGIN"
+    INSTALL_RPATH "$ORIGIN"
+    BUILD_WITH_INSTALL_RPATH ON)
+  install(TARGETS flash_rt_fa2 flashrt_fa2_raw
+    DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
   message(STATUS "FA2 pybind module: flash_rt_fa2 (separate .so)")
 endif()
 
@@ -1363,8 +1382,8 @@ if(FLASHRT_ENABLE_MOTUS AND GPU_ARCH STREQUAL "120")
     ENABLE_TINYFP8_KERNELS=1)
 endif()
 
-# (ENABLE_FA2 object-lib is linked into flash_rt_fa2.so only — see
-# the dedicated pybind11_add_module(flash_rt_fa2 ...) above. The main
+# (ENABLE_FA2 object-lib is linked into libflashrt_fa2_raw.so only; the
+# dedicated pybind module and native C++ runtime both consume it. The main
 # flash_rt_kernels.so deliberately does NOT pull FA2 in, so rebuilds
 # of our hand-written kernels don't re-trigger the FA2 codegen tax.)
 

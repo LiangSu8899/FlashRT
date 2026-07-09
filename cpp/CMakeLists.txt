@@ -23,12 +23,35 @@ option(FLASHRT_CPP_WITH_EXEC "Build/link the exec layer for native replay" ON)
 option(FLASHRT_CPP_WITH_CUDA_STAGING "Enable conservative CUDA H2D/D2H modality staging" ON)
 option(FLASHRT_CPP_WITH_CUDA_KERNELS "Enable CUDA modality kernels" ON)
 option(FLASHRT_CPP_WITH_SENTENCEPIECE "Enable native SentencePiece text tokenization" OFF)
+option(FLASHRT_CPP_WITH_FA2 "Enable the Python-free vendored FA2 driver" OFF)
+set(FLASHRT_CPP_FA2_LIBRARY "" CACHE FILEPATH
+    "Path to the Python-free libflashrt_fa2_raw shared library")
 if(FLASHRT_CPP_WITH_CUDA_STAGING)
   find_package(CUDAToolkit REQUIRED)
 endif()
 if(FLASHRT_CPP_WITH_CUDA_KERNELS)
   enable_language(CUDA)
   find_package(CUDAToolkit REQUIRED)
+endif()
+if(FLASHRT_CPP_WITH_FA2)
+  if(NOT FLASHRT_CPP_WITH_CUDA_KERNELS)
+    message(FATAL_ERROR "FLASHRT_CPP_WITH_FA2 requires CUDA kernels")
+  endif()
+  if(NOT FLASHRT_CPP_FA2_LIBRARY)
+    unset(FLASHRT_CPP_FA2_LIBRARY CACHE)
+    find_library(FLASHRT_CPP_FA2_LIBRARY
+      NAMES flashrt_fa2_raw
+      PATHS ${CMAKE_CURRENT_SOURCE_DIR}/../flash_rt
+      NO_DEFAULT_PATH)
+  endif()
+  if(NOT FLASHRT_CPP_FA2_LIBRARY)
+    message(FATAL_ERROR
+      "FLASHRT_CPP_WITH_FA2 requires libflashrt_fa2_raw; build the root "
+      "flashrt_fa2_raw target or set FLASHRT_CPP_FA2_LIBRARY")
+  endif()
+  add_library(flashrt_cpp_fa2_external SHARED IMPORTED GLOBAL)
+  set_target_properties(flashrt_cpp_fa2_external PROPERTIES
+    IMPORTED_LOCATION ${FLASHRT_CPP_FA2_LIBRARY})
 endif()
 if(FLASHRT_CPP_WITH_SENTENCEPIECE)
   find_path(FLASHRT_SENTENCEPIECE_INCLUDE_DIR sentencepiece_processor.h)
@@ -172,6 +195,16 @@ if(FLASHRT_CPP_WITH_CUDA_KERNELS)
     $<$<COMPILE_LANGUAGE:CUDA>:
       --expt-relaxed-constexpr -O3
       --ftz=true --prec-div=false --prec-sqrt=false>)
+  if(FLASHRT_CPP_WITH_FA2)
+    target_sources(flashrt_cpp_pi05_kernels PRIVATE
+      models/pi05/src/native_rtx_attention_driver.cu)
+    target_include_directories(flashrt_cpp_pi05_kernels PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/../csrc)
+    target_link_libraries(flashrt_cpp_pi05_kernels
+      PUBLIC flashrt_cpp_fa2_external)
+    target_compile_definitions(flashrt_cpp_pi05_kernels
+      PUBLIC FLASHRT_CPP_WITH_FA2=1)
+  endif()
 endif()
 
 add_library(flashrt_cpp_pi05_c SHARED
@@ -269,6 +302,15 @@ if(BUILD_TESTING)
       PRIVATE flashrt_cpp_pi05 flashrt_exec CUDA::cudart)
     add_test(NAME pi05_native_rtx_attention
       COMMAND test_pi05_native_rtx_attention)
+
+    if(FLASHRT_CPP_WITH_FA2)
+      add_executable(test_pi05_native_rtx_attention_driver
+        tests/test_pi05_native_rtx_attention_driver.cpp)
+      target_link_libraries(test_pi05_native_rtx_attention_driver
+        PRIVATE flashrt_cpp_pi05_kernels flashrt_exec CUDA::cudart)
+      add_test(NAME pi05_native_rtx_attention_driver
+        COMMAND test_pi05_native_rtx_attention_driver)
+    endif()
 
     add_executable(pi05_native_rope_probe
       tests/pi05_native_rope_probe.cpp)

@@ -312,8 +312,13 @@ Torch tensors: SigLIP Q/K/V, encoder Q and 18-layer shared K/V cache, decoder
 Q, fixed-shape `seqused/devpos` int32 values, FA2 outputs/LSE, and split-KV
 accumulators. Layer K/V pointers are stable offsets into one cache allocation.
 Updating a fixed prompt length writes the same three scalar buffers without
-allocation or rebinding. The remaining attention task is wiring these buffers
-to the vendored FA2 C++ entry points and validating captured outputs.
+allocation or rebinding. The Python-free attention driver calls the vendored
+FA2 raw C entries directly for SigLIP, fixed-shape encoder `seqused`, and
+decoder `seqused` split-KV. Its graph gate changes the prompt length after
+capture, replays 100 times with one variant, and verifies the new device-side
+valid length is observed. `flash_rt_fa2` remains a thin Python adapter over the
+same `libflashrt_fa2_raw` kernel owner. The remaining native producer task is
+assembling these primitives into the complete model forward and capture.
 
 CUDA graph execs are process-local objects. They are not serialized as a
 portable artifact. Removing Python from setup requires a native producer that

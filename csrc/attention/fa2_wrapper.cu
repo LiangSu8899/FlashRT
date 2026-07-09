@@ -24,6 +24,7 @@
 
 #include "flash_attn_2_src/flash_attn/namespace_config.h"
 #include "flash_attn_2_src/flash_attn/flash.h"
+#include "attention/fa2_wrapper.h"
 
 namespace FLASH_NAMESPACE {
 template<typename elem_type, int kHeadDim, bool Is_causal>
