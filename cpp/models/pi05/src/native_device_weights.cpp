@@ -5,6 +5,7 @@
 #endif
 
 #include <limits>
+#include <utility>
 
 namespace flashrt {
 namespace models {
@@ -99,6 +100,41 @@ const NativeDeviceWeight* NativeDeviceWeightStore::find(
     const std::string& name) const {
     const auto it = weights_.find(name);
     return it == weights_.end() ? nullptr : &it->second;
+}
+
+modalities::Status NativeDeviceWeightStore::download_bf16(
+    const std::string& name,
+    NativeBf16Tensor* out) const {
+    if (!out) return invalid("BF16 download destination is null");
+    const NativeDeviceWeight* weight = find(name);
+    if (!weight || !weight->buffer ||
+        weight->dtype != NativeWeightDType::kBf16) {
+        return invalid("BF16 device weight was not found");
+    }
+#ifndef FLASHRT_CPP_WITH_CUDA_STAGING
+    return modalities::Status::error(
+        modalities::StatusCode::kUnsupported,
+        "device weight download requires the CUDA build");
+#else
+    const std::size_t bytes = frt_buffer_bytes(weight->buffer);
+    if (!bytes || bytes % sizeof(std::uint16_t) != 0) {
+        return invalid("BF16 device weight has an invalid byte size");
+    }
+    NativeBf16Tensor result;
+    result.shape = weight->shape;
+    result.values.resize(bytes / sizeof(std::uint16_t));
+    const cudaError_t rc = cudaMemcpy(result.values.data(),
+                                      frt_buffer_dptr(weight->buffer), bytes,
+                                      cudaMemcpyDeviceToHost);
+    if (rc != cudaSuccess) {
+        return modalities::Status::error(
+            modalities::StatusCode::kBackend,
+            std::string("device weight download failed: ") +
+                cudaGetErrorString(rc));
+    }
+    *out = std::move(result);
+    return modalities::Status::ok();
+#endif
 }
 
 }  // namespace pi05

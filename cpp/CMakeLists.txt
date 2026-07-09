@@ -131,6 +131,7 @@ set(FLASHRT_CPP_PI05_SRCS
   models/pi05/src/native_weights.cpp
   models/pi05/src/native_weight_ops.cpp
   models/pi05/src/native_device_weights.cpp
+  models/pi05/src/native_weight_packer.cpp
   models/pi05/src/native_weight_materializer.cpp
   models/pi05/src/prompt_format.cpp
   models/pi05/src/prompt_embed.cpp
@@ -201,6 +202,13 @@ if(BUILD_TESTING)
     add_executable(pi05_native_quant_probe
       tests/pi05_native_quant_probe.cpp)
     target_link_libraries(pi05_native_quant_probe PRIVATE flashrt_cpp_pi05)
+
+    add_executable(test_pi05_native_weight_packer
+      tests/test_pi05_native_weight_packer.cpp)
+    target_link_libraries(test_pi05_native_weight_packer
+      PRIVATE flashrt_cpp_pi05 flashrt_exec CUDA::cudart)
+    add_test(NAME pi05_native_weight_packer
+      COMMAND test_pi05_native_weight_packer)
   endif()
 
   add_executable(test_pi05_prompt_format tests/test_pi05_prompt_format.cpp)

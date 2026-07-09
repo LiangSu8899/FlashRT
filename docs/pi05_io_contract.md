@@ -256,6 +256,11 @@ buffers. Real-checkpoint gates compare both quantized bytes and scale bytes;
 the precision choice remains producer setup policy and does not alter ports,
 regions, or the exec mechanism.
 
+The setup packer derives low-precision buffers from the already uploaded BF16
+fallback, so both paths share exactly the same transformed source bytes. It
+stores packed weights under `fp8.*` or `int8.*` names and their typed FP32
+scales under the matching `.scale` names in the same context-owned store.
+
 CUDA graph execs are process-local objects. They are not serialized as a
 portable artifact. Removing Python from setup requires a native producer that
 loads assets and captures graphs in the replay process.
