@@ -31,6 +31,7 @@ struct Adapter {
     uint32_t images_port = kPortImages;
     uint32_t noise_port = kPortNoise;
     uint32_t actions_port = kPortActions;
+    uint32_t prompt_port = kNoPort;
 
     int64_t image_shape[4] = {0, 0, 0, 3};
     int64_t noise_shape[2] = {0, 0};
@@ -158,6 +159,24 @@ int set_input(void* self, uint32_t port, const void* data, uint64_t bytes,
         a->last_error =
             "noise is a SWAP port: write its buffer window directly";
         return -3;
+    }
+    if (port == a->prompt_port) {
+        if (!data && bytes) {
+            a->last_error = "prompt payload is null";
+            return -1;
+        }
+        const char* begin = static_cast<const char*>(data);
+        const std::string prompt(begin, begin + bytes);
+        const int rc = a->runtime->set_prompt(prompt.c_str());
+        if (rc != 0) {
+            const auto& st = a->runtime->prompt_status();
+            a->last_error = st.message.empty()
+                                ? "prompt staging is not configured"
+                                : st.message;
+            return -1;
+        }
+        a->last_error.clear();
+        return 0;
     }
     a->last_error = "unknown or non-input port";
     return -1;
@@ -393,6 +412,7 @@ extern "C" int frt_pi05_model_runtime_create_over(
     const uint32_t images = find_port_index(model, "images");
     const uint32_t noise = find_port_index(model, "noise");
     const uint32_t actions = find_port_index(model, "actions");
+    const uint32_t prompt = find_port_index(model, "prompt");
     if (!compatible_port(model, images, FRT_RT_MOD_IMAGE, FRT_RT_PORT_IN,
                          FRT_RT_PORT_STAGED) ||
         !compatible_port(model, actions, FRT_RT_MOD_ACTION, FRT_RT_PORT_OUT,
@@ -402,6 +422,11 @@ extern "C" int frt_pi05_model_runtime_create_over(
     if (noise != kNoPort &&
         !compatible_port(model, noise, FRT_RT_MOD_TENSOR, FRT_RT_PORT_IN,
                          FRT_RT_PORT_SWAP)) {
+        return -2;
+    }
+    if (prompt != kNoPort &&
+        !compatible_port(model, prompt, FRT_RT_MOD_TEXT, FRT_RT_PORT_IN,
+                         FRT_RT_PORT_STAGED)) {
         return -2;
     }
 
@@ -420,10 +445,14 @@ extern "C" int frt_pi05_model_runtime_create_over(
                          flashrt::models::pi05::Runtime(model->exp, cfg));
     if (!a->runtime) return -5;
     if (!a->runtime->ok()) return status_code(a->runtime->status());
+    if (prompt != kNoPort && !a->runtime->prompt_staging_enabled()) {
+        return -2;
+    }
     a->source_model = model;
     a->images_port = images;
     a->noise_port = noise;
     a->actions_port = actions;
+    a->prompt_port = prompt;
     a->view_order = a->runtime->manifest().vision.view_order;
 
     frt_model_runtime_verbs verbs{};
