@@ -95,9 +95,13 @@ void test_paligemma_prompt_embedding_when_configured() {
     const float state[] = {0.0f, 1.0f, -1.0f};
     PromptEmbeddingSpec spec{vocab, hidden, max_tokens, 0.5f};
     std::vector<std::int32_t> ids;
+    ids.reserve(max_tokens + 1);
+    tokenizer.reserve(max_tokens);
+    std::string formatted;
+    formatted.reserve(512);
     std::uint64_t prompt_len = 0;
-    st = embed_prompt_cpu(tokenizer, spec, "pick_up_cube", state, 3, src, dst,
-                          &ids, &prompt_len);
+    st = embed_prompt(tokenizer, spec, "pick_up_cube", state, 3, src, dst,
+                      &ids, &prompt_len, nullptr, nullptr, &formatted);
     assert(st.ok_status());
     const std::vector<std::int32_t> expected_ids = {
         2, 7071, 235292, 4788, 908, 28660, 235269, 3040, 235292,
@@ -113,6 +117,17 @@ void test_paligemma_prompt_embedding_when_configured() {
     }
     for (std::uint64_t i = prompt_len * hidden; i < out.size(); ++i) {
         assert(out[i] == 0.0f);
+    }
+    const std::size_t id_capacity = ids.capacity();
+    const std::size_t formatted_capacity = formatted.capacity();
+    const std::uint64_t tokenizer_capacity = tokenizer.workspace_capacity();
+    for (int round = 0; round < 1000; ++round) {
+        st = embed_prompt(tokenizer, spec, "pick_up_cube", state, 3, src, dst,
+                          &ids, &prompt_len, nullptr, nullptr, &formatted);
+        assert(st.ok_status());
+        assert(ids.capacity() == id_capacity);
+        assert(formatted.capacity() == formatted_capacity);
+        assert(tokenizer.workspace_capacity() == tokenizer_capacity);
     }
 #endif
 }

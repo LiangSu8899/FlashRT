@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <limits>
 
 namespace flashrt {
 namespace models {
@@ -72,6 +73,7 @@ Runtime::Runtime(const frt_runtime_export_v1* exp, RuntimeConfig config)
 
 Runtime::~Runtime() {
     modalities::text_embedding_staging_destroy(&prompt_embedding_staging_);
+    modalities::action_staging_destroy(&action_staging_);
     modalities::vision_staging_destroy(&staging_);
     release_export();
 }
@@ -168,10 +170,24 @@ modalities::Status Runtime::bind() {
         staging = &staging_;
     }
 
+    modalities::ActionStaging* action_staging = nullptr;
+    if (action.place == modalities::MemoryPlace::kDevice) {
+        modalities::ActionPostprocessSpec action_spec = action_postprocess_spec(
+            config_.action_mean, config_.action_stddev, config_.chunk,
+            config_.model_action_dim, config_.robot_action_dim);
+        modalities::Status st = modalities::action_staging_create(
+            &action_staging_,
+            modalities::required_action_output_bytes(action_spec,
+                                                       action.dtype));
+        if (!st.ok_status()) return st;
+        action_staging = &action_staging_;
+    }
+
     io_ = RuntimeIo(config_.num_views, image, action, config_.action_mean,
                     config_.action_stddev, find_native_stream(exp_, stream_id_),
                     config_.chunk, config_.model_action_dim,
-                    config_.robot_action_dim, config_.image_dtype, staging);
+                    config_.robot_action_dim, config_.image_dtype, staging,
+                    action_staging);
     return bind_prompt_staging();
 }
 
@@ -190,6 +206,14 @@ int Runtime::set_prompt_state(const char* text, const float* state,
             "prompt text is null");
         return -1;
     }
+    const std::size_t text_bytes = std::strlen(text);
+    if (text_bytes > task_prompt_workspace_.capacity()) {
+        prompt_status_ = modalities::Status::error(
+            modalities::StatusCode::kShapeMismatch,
+            "prompt text exceeds the configured hot-path capacity");
+        return -1;
+    }
+    task_prompt_workspace_.assign(text, text_bytes);
     const float* state_for_prompt = state;
     if (state && state_normalization_enabled()) {
         if (n_state != config_.state_q01.size()) {
@@ -198,7 +222,6 @@ int Runtime::set_prompt_state(const char* text, const float* state,
                 "state dimension does not match norm stats");
             return -1;
         }
-        normalized_state_.resize(n_state);
         for (std::uint64_t i = 0; i < n_state; ++i) {
             const float lo = config_.state_q01[i];
             const float hi = config_.state_q99[i];
@@ -208,12 +231,14 @@ int Runtime::set_prompt_state(const char* text, const float* state,
         state_for_prompt = normalized_state_.data();
     }
     prompt_status_ = embed_prompt(
-        prompt_tokenizer_, prompt_spec_, text, state_for_prompt, n_state,
+        prompt_tokenizer_, prompt_spec_, task_prompt_workspace_,
+        state_for_prompt, n_state,
         prompt_embedding_table_, prompt_embedding_output_, &prompt_token_ids_,
         &current_prompt_len_, find_native_stream(exp_, stream_id_),
         prompt_embedding_output_.place == modalities::MemoryPlace::kDevice
             ? &prompt_embedding_staging_
-            : nullptr);
+            : nullptr,
+        &formatted_prompt_workspace_);
     return prompt_status_.ok_status() ? 0 : -1;
 }
 
@@ -273,6 +298,27 @@ modalities::Status Runtime::bind_prompt_staging() {
                              ? config_.prompt_embedding_scale
                              : std::sqrt(static_cast<float>(
                                    config_.prompt_hidden_dim));
+    if (config_.state_q01.size() >
+        (std::numeric_limits<std::size_t>::max() - 32ull) / 5ull) {
+        return modalities::Status::error(
+            modalities::StatusCode::kInvalidArgument,
+            "state workspace capacity overflows size_t");
+    }
+    const std::size_t state_bytes = config_.state_q01.size() * 5ull + 32ull;
+    if (config_.prompt_max_tokens >
+        (std::numeric_limits<std::size_t>::max() - state_bytes) / 8ull) {
+        return modalities::Status::error(
+            modalities::StatusCode::kInvalidArgument,
+            "prompt workspace capacity overflows size_t");
+    }
+    const std::size_t max_prompt_bytes =
+        static_cast<std::size_t>(config_.prompt_max_tokens * 8ull);
+    task_prompt_workspace_.reserve(max_prompt_bytes);
+    formatted_prompt_workspace_.reserve(max_prompt_bytes + state_bytes);
+    prompt_token_ids_.reserve(static_cast<std::size_t>(
+        config_.prompt_max_tokens + 1ull));
+    normalized_state_.resize(config_.state_q01.size());
+    prompt_tokenizer_.reserve(config_.prompt_max_tokens);
     if (prompt_embedding_output_.place == modalities::MemoryPlace::kDevice) {
         prompt_status_ = modalities::text_embedding_staging_create(
             &prompt_embedding_staging_, config_.prompt_max_tokens);

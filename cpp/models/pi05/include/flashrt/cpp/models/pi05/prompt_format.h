@@ -20,6 +20,11 @@ std::string format_state_prompt(const std::string& prompt,
                                 const float* state,
                                 std::uint64_t n_state);
 
+void format_state_prompt_into(const std::string& prompt,
+                              const float* state,
+                              std::uint64_t n_state,
+                              std::string* out);
+
 }  // namespace pi05
 }  // namespace models
 }  // namespace flashrt

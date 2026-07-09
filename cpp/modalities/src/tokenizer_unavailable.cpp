@@ -26,7 +26,7 @@ Status SentencePieceTokenizer::load_model(const std::string& model_path) {
 Status SentencePieceTokenizer::encode(
         const std::string& text,
         const SentencePieceEncodeOptions& options,
-        std::vector<std::int32_t>* token_ids) const {
+        std::vector<std::int32_t>* token_ids) {
     (void)text;
     (void)options;
     if (token_ids) token_ids->clear();
@@ -34,6 +34,12 @@ Status SentencePieceTokenizer::encode(
         StatusCode::kUnsupported,
         "native SentencePiece support is not enabled in this build");
 }
+
+void SentencePieceTokenizer::reserve(std::uint64_t max_tokens) {
+    (void)max_tokens;
+}
+
+std::uint64_t SentencePieceTokenizer::workspace_capacity() const { return 0; }
 
 std::int32_t SentencePieceTokenizer::bos_id() const { return -1; }
 std::int32_t SentencePieceTokenizer::eos_id() const { return -1; }

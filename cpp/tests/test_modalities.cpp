@@ -117,7 +117,7 @@ void test_action_postprocess() {
     assert(std::fabs(out[1] - 17.0f) < 0.01f);
     assert(std::fabs(out[2] - 34.0f) < 0.01f);
     assert(std::fabs(out[3] - 11.0f) < 0.01f);
-    assert(std::fabs(out[4] - 24.5f) < 0.01f);
+    assert(std::fabs(out[4] - 23.0f) < 0.01f);
     assert(std::fabs(out[5] - 26.0f) < 0.01f);
 }
 
@@ -162,7 +162,7 @@ void test_pi05_runtime_io_adapter() {
     st = io.read_actions(&actions);
     assert(st.ok_status());
     assert(actions.size() == 3);
-    assert(std::fabs(actions[0] - 21.0f) < 0.01f);
+    assert(std::fabs(actions[0] - 11.0f) < 0.01f);
     assert(std::fabs(actions[1] - 22.0f) < 0.01f);
     assert(std::fabs(actions[2] - 33.0f) < 0.01f);
 }

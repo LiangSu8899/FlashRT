@@ -12,6 +12,7 @@
 #include <vector>
 
 using flashrt::modalities::DType;
+using flashrt::modalities::ActionStaging;
 using flashrt::modalities::Layout;
 using flashrt::modalities::MemoryPlace;
 using flashrt::modalities::PixelFormat;
@@ -140,6 +141,24 @@ void test_action_d2h_staging() {
     assert(std::fabs(actions[0] - 12.0f) < 0.01f);
     assert(std::fabs(actions[1] - 17.0f) < 0.01f);
     assert(std::fabs(actions[2] - 34.0f) < 0.01f);
+    ActionStaging staging;
+    st = flashrt::modalities::action_staging_create(&staging, bytes);
+    assert(st.ok_status() && staging.host_pinned && staging.bytes == bytes);
+    const std::size_t action_capacity = actions.capacity();
+    for (int round = 0; round < 1000; ++round) {
+        st = postprocess_action(spec, src, &actions, nullptr, &staging);
+        assert(st.ok_status());
+        assert(actions.capacity() == action_capacity);
+    }
+    ActionStaging too_small;
+    st = flashrt::modalities::action_staging_create(&too_small, bytes - 1);
+    assert(st.ok_status());
+    st = postprocess_action(spec, src, &actions, nullptr, &too_small);
+    assert(!st.ok_status());
+    assert(st.code == flashrt::modalities::StatusCode::kInsufficientStorage);
+    flashrt::modalities::action_staging_destroy(&too_small);
+    flashrt::modalities::action_staging_destroy(&staging);
+    assert(staging.host_pinned == nullptr && staging.bytes == 0);
     cudaFree(device);
 }
 

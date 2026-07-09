@@ -161,6 +161,11 @@ API family for the same phases.
 
 `prepare` is the only place a shape-bucket miss may capture or materialize a
 variant. A hot tick must not recapture, allocate, or rebind graph pointers.
+The Pi0.5 C++ face fixes its vision frames, action D2H staging, task/formatted
+prompt strings, tokenizer ids, and normalized-state storage during setup.
+Payloads that would grow those workspaces return a shape/capacity error; there
+is no larger-allocation fallback in the hot path. These workspace changes do
+not alter the port schema or deployment fingerprint.
 
 ## Identity and Capsule Regions
 

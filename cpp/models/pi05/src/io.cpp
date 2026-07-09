@@ -39,11 +39,13 @@ RuntimeIo::RuntimeIo(int num_views,
                      int model_action_dim,
                      int robot_action_dim,
                      modalities::DType image_dtype,
-                     modalities::VisionStaging* staging)
+                     modalities::VisionStaging* staging,
+                     modalities::ActionStaging* action_staging)
     : image_input_(image_input),
       action_output_(action_output),
       stream_(stream),
       staging_(staging),
+      action_staging_(action_staging),
       vision_spec_(vision_preprocess_spec(num_views)),
       action_spec_(action_postprocess_spec(action_mean, action_stddev, chunk,
                                            model_action_dim, robot_action_dim)) {
@@ -63,7 +65,8 @@ modalities::Status RuntimeIo::prepare_vision(
 modalities::Status RuntimeIo::read_actions(
     std::vector<float>* robot_actions) const {
     return modalities::postprocess_action(action_spec_, action_output_,
-                                          robot_actions, stream_);
+                                          robot_actions, stream_,
+                                          action_staging_);
 }
 
 }  // namespace pi05

@@ -10,6 +10,7 @@ namespace modalities {
 
 struct SentencePieceTokenizer::Impl {
     sentencepiece::SentencePieceProcessor processor;
+    std::vector<int> encoded;
     bool loaded = false;
 };
 
@@ -37,7 +38,7 @@ Status SentencePieceTokenizer::load_model(const std::string& model_path) {
 Status SentencePieceTokenizer::encode(
         const std::string& text,
         const SentencePieceEncodeOptions& options,
-        std::vector<std::int32_t>* token_ids) const {
+        std::vector<std::int32_t>* token_ids) {
     if (!token_ids) {
         return Status::error(StatusCode::kInvalidArgument,
                              "token_ids output is null");
@@ -48,14 +49,19 @@ Status SentencePieceTokenizer::encode(
                              "SentencePiece model is not loaded");
     }
 
-    std::vector<int> encoded;
-    auto status = impl_->processor.Encode(text, &encoded);
+    impl_->encoded.clear();
+    auto status = impl_->processor.Encode(text, &impl_->encoded);
     if (!status.ok()) {
         return Status::error(StatusCode::kBackend, status.ToString());
     }
     const std::uint64_t extra =
         (options.add_bos ? 1u : 0u) + (options.add_eos ? 1u : 0u);
-    if (encoded.size() + extra >
+    if (options.max_tokens && impl_->encoded.size() + extra >
+                                  options.max_tokens) {
+        return Status::error(StatusCode::kShapeMismatch,
+                             "encoded token sequence exceeds max_tokens");
+    }
+    if (impl_->encoded.size() + extra >
         static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
         return Status::error(StatusCode::kInsufficientStorage,
                              "encoded token sequence is too large");
@@ -69,8 +75,8 @@ Status SentencePieceTokenizer::encode(
         }
         token_ids->push_back(static_cast<std::int32_t>(bos));
     }
-    token_ids->reserve(encoded.size() + extra);
-    for (int id : encoded) {
+    token_ids->reserve(impl_->encoded.size() + extra);
+    for (int id : impl_->encoded) {
         token_ids->push_back(static_cast<std::int32_t>(id));
     }
     if (options.add_eos) {
@@ -83,10 +89,6 @@ Status SentencePieceTokenizer::encode(
     }
 
     if (options.max_tokens) {
-        if (token_ids->size() > options.max_tokens) {
-            return Status::error(StatusCode::kShapeMismatch,
-                                 "encoded token sequence exceeds max_tokens");
-        }
         if (options.pad_to_max_tokens) {
             token_ids->resize(options.max_tokens, options.pad_id);
         }
@@ -95,6 +97,14 @@ Status SentencePieceTokenizer::encode(
                              "pad_to_max_tokens requires max_tokens");
     }
     return Status::ok();
+}
+
+void SentencePieceTokenizer::reserve(std::uint64_t max_tokens) {
+    impl_->encoded.reserve(static_cast<std::size_t>(max_tokens));
+}
+
+std::uint64_t SentencePieceTokenizer::workspace_capacity() const {
+    return static_cast<std::uint64_t>(impl_->encoded.capacity());
 }
 
 std::int32_t SentencePieceTokenizer::bos_id() const {

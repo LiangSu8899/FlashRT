@@ -22,7 +22,7 @@ struct PromptEmbeddingSpec {
 };
 
 modalities::Status embed_prompt(
-    const modalities::SentencePieceTokenizer& tokenizer,
+    modalities::SentencePieceTokenizer& tokenizer,
     const PromptEmbeddingSpec& spec,
     const std::string& prompt,
     const float* state,
@@ -32,10 +32,11 @@ modalities::Status embed_prompt(
     std::vector<std::int32_t>* token_ids,
     std::uint64_t* prompt_len,
     void* stream = nullptr,
-    modalities::TextEmbeddingStaging* staging = nullptr);
+    modalities::TextEmbeddingStaging* staging = nullptr,
+    std::string* formatted_workspace = nullptr);
 
 modalities::Status embed_prompt_cpu(
-    const modalities::SentencePieceTokenizer& tokenizer,
+    modalities::SentencePieceTokenizer& tokenizer,
     const PromptEmbeddingSpec& spec,
     const std::string& prompt,
     const float* state,
