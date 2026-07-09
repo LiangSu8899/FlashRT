@@ -41,6 +41,9 @@ public:
         NativeWeightDType dtype,
         const void* data,
         std::size_t bytes);
+    modalities::Status download_bf16(
+        const std::string& name,
+        NativeBf16Tensor* out) const;
     const NativeDeviceWeight* find(const std::string& name) const;
     std::size_t size() const { return weights_.size(); }
 

@@ -1,4 +1,5 @@
 #include "flashrt/cpp/models/pi05/native_weight_materializer.h"
+#include "flashrt/cpp/models/pi05/native_weight_packer.h"
 
 #include <cuda_runtime_api.h>
 
@@ -227,6 +228,14 @@ int main() {
         assert(destination.size() == 46);
         assert(destination.find("embedding_weight")->shape ==
                std::vector<std::uint64_t>({4, 2}));
+        flashrt::models::pi05::NativeWeightPacker packer(&destination);
+        assert(packer.pack_fp8("decoder_attn_qkv_w_0", false).ok_status());
+        assert(packer.pack_int8("decoder_attn_qkv_w_0").ok_status());
+        assert(destination.size() == 50);
+        assert(destination.find("fp8.decoder_attn_qkv_w_0")->shape ==
+               std::vector<std::uint64_t>({4, 24}));
+        assert(destination.find("int8.decoder_attn_qkv_w_0")->shape ==
+               std::vector<std::uint64_t>({24, 4}));
     }
     frt_ctx_destroy(ctx);
     assert(::unlink(path.c_str()) == 0);
@@ -272,6 +281,15 @@ int main() {
                    std::vector<std::uint64_t>({32, 1024}));
             assert(destination.find("decoder_action_out_proj_w")->shape ==
                    std::vector<std::uint64_t>({1024, 32}));
+            flashrt::models::pi05::NativeWeightPacker packer(&destination);
+            assert(packer.pack_fp8("decoder_attn_qkv_w_0", false)
+                       .ok_status());
+            assert(packer.pack_int8("decoder_attn_qkv_w_0").ok_status());
+            assert(destination.size() == 49);
+            assert(destination.find("fp8.decoder_attn_qkv_w_0")->shape ==
+                   std::vector<std::uint64_t>({1024, 2560}));
+            assert(destination.find("int8.decoder_attn_qkv_w_0")->shape ==
+                   std::vector<std::uint64_t>({2560, 1024}));
         }
         frt_ctx_destroy(real_ctx);
     }
