@@ -40,6 +40,21 @@ public:
         NativeRtxAttentionWorkspace* attention,
         const NativeRtxAttentionDriver* attention_driver,
         std::uintptr_t stream) const;
+    modalities::Status decoder_layer(
+        int layer, int step, const NativeDeviceWeightStore& weights,
+        NativeWorkspace* workspace, NativeRtxAttentionWorkspace* attention,
+        const NativeRtxAttentionDriver* attention_driver,
+        std::uintptr_t stream) const;
+    modalities::Status diffusion_step(
+        int step, const NativeDeviceWeightStore& weights,
+        NativeWorkspace* workspace, NativeRtxAttentionWorkspace* attention,
+        const NativeRtxAttentionDriver* attention_driver,
+        std::uintptr_t stream) const;
+    modalities::Status diffusion(
+        const NativeDeviceWeightStore& weights, NativeWorkspace* workspace,
+        NativeRtxAttentionWorkspace* attention,
+        const NativeRtxAttentionDriver* attention_driver,
+        std::uintptr_t stream) const;
 #endif
 
 private:
