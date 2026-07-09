@@ -71,6 +71,7 @@ Runtime::Runtime(const frt_runtime_export_v1* exp, RuntimeConfig config)
 }
 
 Runtime::~Runtime() {
+    modalities::text_embedding_staging_destroy(&prompt_embedding_staging_);
     modalities::vision_staging_destroy(&staging_);
     release_export();
 }
@@ -189,10 +190,13 @@ int Runtime::set_prompt_state(const char* text, const float* state,
             "prompt text is null");
         return -1;
     }
-    prompt_status_ = embed_prompt_cpu(
+    prompt_status_ = embed_prompt(
         prompt_tokenizer_, prompt_spec_, text, state, n_state,
         prompt_embedding_table_, prompt_embedding_output_, &prompt_token_ids_,
-        &current_prompt_len_);
+        &current_prompt_len_, find_native_stream(exp_, stream_id_),
+        prompt_embedding_output_.place == modalities::MemoryPlace::kDevice
+            ? &prompt_embedding_staging_
+            : nullptr);
     return prompt_status_.ok_status() ? 0 : -1;
 }
 
@@ -252,6 +256,11 @@ modalities::Status Runtime::bind_prompt_staging() {
                              ? config_.prompt_embedding_scale
                              : std::sqrt(static_cast<float>(
                                    config_.prompt_hidden_dim));
+    if (prompt_embedding_output_.place == modalities::MemoryPlace::kDevice) {
+        prompt_status_ = modalities::text_embedding_staging_create(
+            &prompt_embedding_staging_, config_.prompt_max_tokens);
+        if (!prompt_status_.ok_status()) return prompt_status_;
+    }
     prompt_staging_enabled_ = true;
     return modalities::Status::ok();
 }

@@ -1,4 +1,5 @@
 #include "flashrt/cpp/modalities/action.h"
+#include "flashrt/cpp/modalities/text.h"
 #include "flashrt/cpp/modalities/vision.h"
 #include "flashrt/cpp/models/pi05/spec.h"
 
@@ -16,9 +17,13 @@ using flashrt::modalities::MemoryPlace;
 using flashrt::modalities::PixelFormat;
 using flashrt::modalities::Shape;
 using flashrt::modalities::TensorView;
+using flashrt::modalities::EmbeddingGatherSpec;
+using flashrt::modalities::TextEmbeddingStaging;
 using flashrt::modalities::VisionFrame;
 using flashrt::modalities::bfloat16_to_float;
 using flashrt::modalities::float_to_bfloat16;
+using flashrt::modalities::gather_token_embeddings;
+using flashrt::modalities::gather_token_embeddings_cpu;
 using flashrt::modalities::postprocess_action;
 using flashrt::modalities::preprocess_vision_cpu;
 using flashrt::modalities::preprocess_vision;
@@ -138,6 +143,62 @@ void test_action_d2h_staging() {
     cudaFree(device);
 }
 
+void test_text_embedding_device_gather() {
+    const std::vector<float> table = {
+        1.0f, 2.0f, 3.0f, 4.0f,
+        5.0f, 6.0f, 7.0f, 8.0f,
+        9.0f, 10.0f, 11.0f, 12.0f,
+    };
+    const std::int32_t ids[] = {2, 0};
+    std::vector<float> ref(2 * 4, 0.0f);
+    TensorView host_table{const_cast<float*>(table.data()),
+                          static_cast<std::uint64_t>(table.size() * 4),
+                          DType::kFloat32, MemoryPlace::kHost, Layout::kFlat,
+                          Shape{3, 4}};
+    TensorView host_out{ref.data(), static_cast<std::uint64_t>(ref.size() * 4),
+                        DType::kFloat32, MemoryPlace::kHost, Layout::kFlat,
+                        Shape{2, 4}};
+    EmbeddingGatherSpec spec{3, 4, 2.0f};
+    auto st = gather_token_embeddings_cpu(spec, ids, 2, host_table, host_out);
+    assert(st.ok_status());
+
+    void* d_table = nullptr;
+    void* d_out = nullptr;
+    assert(cudaMalloc(&d_table, table.size() * sizeof(float)) == cudaSuccess);
+    assert(cudaMalloc(&d_out, ref.size() * sizeof(float)) == cudaSuccess);
+    assert(cudaMemcpy(d_table, table.data(), table.size() * sizeof(float),
+                      cudaMemcpyHostToDevice) == cudaSuccess);
+    TensorView device_table{d_table,
+                            static_cast<std::uint64_t>(table.size() * 4),
+                            DType::kFloat32, MemoryPlace::kDevice,
+                            Layout::kFlat, Shape{3, 4}};
+    TensorView device_out{d_out, static_cast<std::uint64_t>(ref.size() * 4),
+                          DType::kFloat32, MemoryPlace::kDevice,
+                          Layout::kFlat, Shape{2, 4}};
+
+    TextEmbeddingStaging staging;
+    st = flashrt::modalities::text_embedding_staging_create(&staging, 2);
+    assert(st.ok_status());
+    std::vector<float> got(ref.size(), 0.0f);
+    for (int round = 0; round < 3; ++round) {
+        assert(cudaMemset(d_out, 0, ref.size() * sizeof(float)) == cudaSuccess);
+        st = gather_token_embeddings(spec, ids, 2, device_table, device_out,
+                                     nullptr, &staging);
+        assert(st.ok_status());
+        assert(cudaMemcpy(got.data(), d_out, got.size() * sizeof(float),
+                          cudaMemcpyDeviceToHost) == cudaSuccess);
+        assert(got == ref);
+    }
+    st = gather_token_embeddings(spec, ids, 3, device_table, device_out,
+                                 nullptr, &staging);
+    assert(!st.ok_status());
+    assert(st.code == flashrt::modalities::StatusCode::kInsufficientStorage);
+    flashrt::modalities::text_embedding_staging_destroy(&staging);
+    assert(staging.device_token_ids == nullptr);
+    cudaFree(d_out);
+    cudaFree(d_table);
+}
+
 }  // namespace
 
 int main() {
@@ -147,6 +208,7 @@ int main() {
     }
     test_vision_h2d_staging();
     test_action_d2h_staging();
+    test_text_embedding_device_gather();
     std::cout << "PASS - CUDA modality kernels/staging\n";
     return 0;
 }

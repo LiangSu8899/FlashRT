@@ -1,9 +1,25 @@
 #include "flashrt/cpp/modalities/text.h"
 
+#ifdef FLASHRT_CPP_WITH_CUDA_STAGING
+#include <cuda_runtime_api.h>
+#endif
+
 #include <string>
+#include <vector>
 
 namespace flashrt {
 namespace modalities {
+
+#ifdef FLASHRT_CPP_WITH_CUDA_KERNELS
+Status gather_token_embeddings_cuda(const EmbeddingGatherSpec& spec,
+                                    const std::int32_t* token_ids,
+                                    std::uint64_t n_tokens,
+                                    TensorView embedding_table,
+                                    TensorView output,
+                                    void* stream,
+                                    TextEmbeddingStaging* staging);
+#endif
+
 namespace {
 
 float load_scalar(const void* base, std::uint64_t index, DType dtype) {
@@ -55,6 +71,54 @@ Status validate_matrix(const TensorView& tensor, const char* name,
 
 }  // namespace
 
+#ifdef FLASHRT_CPP_WITH_CUDA_STAGING
+Status text_embedding_staging_create(TextEmbeddingStaging* out,
+                                     std::uint64_t max_tokens) {
+    if (!out || !max_tokens) {
+        return Status::error(StatusCode::kInvalidArgument,
+                             "invalid text embedding staging capacity");
+    }
+    *out = TextEmbeddingStaging{};
+    cudaError_t rc = cudaMalloc(&out->device_token_ids,
+                                max_tokens * sizeof(std::int32_t));
+    if (rc != cudaSuccess) {
+        return Status::error(
+            StatusCode::kBackend,
+            std::string("text token staging cudaMalloc failed: ") +
+                cudaGetErrorString(rc));
+    }
+    rc = cudaMalloc(&out->device_status, sizeof(int));
+    if (rc != cudaSuccess) {
+        cudaFree(out->device_token_ids);
+        *out = TextEmbeddingStaging{};
+        return Status::error(
+            StatusCode::kBackend,
+            std::string("text status staging cudaMalloc failed: ") +
+                cudaGetErrorString(rc));
+    }
+    out->max_tokens = max_tokens;
+    return Status::ok();
+}
+
+void text_embedding_staging_destroy(TextEmbeddingStaging* s) {
+    if (!s) return;
+    if (s->device_token_ids) cudaFree(s->device_token_ids);
+    if (s->device_status) cudaFree(s->device_status);
+    *s = TextEmbeddingStaging{};
+}
+#else
+Status text_embedding_staging_create(TextEmbeddingStaging* out,
+                                     std::uint64_t) {
+    if (out) *out = TextEmbeddingStaging{};
+    return Status::error(StatusCode::kUnsupported,
+                         "text embedding staging requires the CUDA build");
+}
+
+void text_embedding_staging_destroy(TextEmbeddingStaging* s) {
+    if (s) *s = TextEmbeddingStaging{};
+}
+#endif
+
 Status gather_token_embeddings_cpu(const EmbeddingGatherSpec& spec,
                                    const std::int32_t* token_ids,
                                    std::uint64_t n_tokens,
@@ -93,6 +157,75 @@ Status gather_token_embeddings_cpu(const EmbeddingGatherSpec& spec,
         }
     }
     return Status::ok();
+}
+
+Status gather_token_embeddings(const EmbeddingGatherSpec& spec,
+                               const std::int32_t* token_ids,
+                               std::uint64_t n_tokens,
+                               TensorView embedding_table,
+                               TensorView output,
+                               void* stream,
+                               TextEmbeddingStaging* staging) {
+    if (output.place == MemoryPlace::kHost ||
+        output.place == MemoryPlace::kHostPinned) {
+        (void)stream;
+        (void)staging;
+        return gather_token_embeddings_cpu(spec, token_ids, n_tokens,
+                                           embedding_table, output);
+    }
+    if (output.place != MemoryPlace::kDevice ||
+        embedding_table.place != MemoryPlace::kDevice) {
+        return Status::error(StatusCode::kUnsupported,
+                             "device text embedding requires device tensors");
+    }
+#ifndef FLASHRT_CPP_WITH_CUDA_STAGING
+    (void)stream;
+    (void)staging;
+    return Status::error(StatusCode::kUnsupported,
+                         "device text embedding was not enabled at build time");
+#else
+    if (!token_ids && n_tokens) {
+        return Status::error(StatusCode::kInvalidArgument,
+                             "token_ids is null");
+    }
+    if (staging && staging->max_tokens < n_tokens) {
+        return Status::error(StatusCode::kInsufficientStorage,
+                             "text token staging capacity is too small");
+    }
+#ifdef FLASHRT_CPP_WITH_CUDA_KERNELS
+    return gather_token_embeddings_cuda(spec, token_ids, n_tokens,
+                                        embedding_table, output, stream,
+                                        staging);
+#else
+    std::vector<std::uint8_t> host_bytes(
+        static_cast<std::size_t>(n_tokens * spec.hidden_dim *
+                                 dtype_size(output.dtype)));
+    TensorView host_output{host_bytes.data(),
+                           static_cast<std::uint64_t>(host_bytes.size()),
+                           output.dtype, MemoryPlace::kHost, output.layout,
+                           Shape{n_tokens, spec.hidden_dim}};
+    TensorView host_table = embedding_table;
+    if (embedding_table.place != MemoryPlace::kHost &&
+        embedding_table.place != MemoryPlace::kHostPinned) {
+        return Status::error(StatusCode::kUnsupported,
+                             "CUDA kernel build is required for device embedding tables");
+    }
+    Status st = gather_token_embeddings_cpu(spec, token_ids, n_tokens,
+                                            host_table, host_output);
+    if (!st.ok_status()) return st;
+    cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    cudaError_t rc = cudaMemcpyAsync(output.data, host_bytes.data(),
+                                     host_bytes.size(), cudaMemcpyHostToDevice,
+                                     cuda_stream);
+    if (rc == cudaSuccess) rc = cudaStreamSynchronize(cuda_stream);
+    if (rc != cudaSuccess) {
+        return Status::error(StatusCode::kBackend,
+                             std::string("cuda H2D text embedding failed: ") +
+                                 cudaGetErrorString(rc));
+    }
+    return Status::ok();
+#endif
+#endif
 }
 
 }  // namespace modalities
