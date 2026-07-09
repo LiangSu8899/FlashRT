@@ -33,7 +33,9 @@ public:
     Status load_model(const std::string& model_path);
     Status encode(const std::string& text,
                   const SentencePieceEncodeOptions& options,
-                  std::vector<std::int32_t>* token_ids) const;
+                  std::vector<std::int32_t>* token_ids);
+    void reserve(std::uint64_t max_tokens);
+    std::uint64_t workspace_capacity() const;
 
     std::int32_t bos_id() const;
     std::int32_t eos_id() const;

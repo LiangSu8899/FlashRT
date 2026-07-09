@@ -37,6 +37,8 @@ struct Adapter {
     bool has_state = false;
     std::string prompt_text;
     std::vector<float> state_values;
+    std::vector<flashrt::modalities::VisionFrame> vision_frames;
+    std::vector<float> action_values;
 
     int64_t image_shape[4] = {0, 0, 0, 3};
     int64_t noise_shape[2] = {0, 0};
@@ -125,18 +127,17 @@ int set_input(void* self, uint32_t port, const void* data, uint64_t bytes,
             }
             const auto* views = static_cast<const frt_image_view*>(data);
             const uint64_t n = bytes / sizeof(frt_image_view);
-            std::vector<flashrt::modalities::VisionFrame> frames;
-            frames.reserve(n);
+            if (n != a->vision_frames.size()) {
+                a->last_error = "image view count does not match the runtime";
+                return -4;
+            }
             for (uint64_t i = 0; i < n; ++i) {
                 const frt_image_view& in = views[i];
                 if (in.struct_size < sizeof(frt_image_view) || !in.data) {
                     a->last_error = "invalid image view";
                     return -1;
                 }
-                flashrt::modalities::VisionFrame f;
-                /* generic views carry no names: positional, declared order */
-                f.name = i < a->view_order.size() ? a->view_order[i]
-                                                  : "view" + std::to_string(i);
+                auto& f = a->vision_frames[static_cast<std::size_t>(i)];
                 f.image.data = const_cast<void*>(in.data);
                 f.image.bytes = in.bytes;
                 f.image.dtype = flashrt::modalities::DType::kUInt8;
@@ -150,9 +151,8 @@ int set_input(void* self, uint32_t port, const void* data, uint64_t bytes,
                 f.height = in.height;
                 f.stride_bytes = in.stride_bytes;
                 f.timestamp_ns = in.timestamp_ns;
-                frames.push_back(std::move(f));
             }
-            Status st = a->runtime->prepare_vision(frames);
+            Status st = a->runtime->prepare_vision(a->vision_frames);
             if (!st.ok_status()) {
                 a->last_error = st.message;
                 return status_code(st);
@@ -170,8 +170,16 @@ int set_input(void* self, uint32_t port, const void* data, uint64_t bytes,
             a->last_error = "prompt payload is null";
             return -1;
         }
+        if (bytes > a->prompt_text.capacity()) {
+            a->last_error = "prompt payload exceeds the hot-path capacity";
+            return -4;
+        }
         const char* begin = static_cast<const char*>(data);
-        a->prompt_text.assign(begin, begin + bytes);
+        if (bytes) {
+            a->prompt_text.assign(begin, begin + bytes);
+        } else {
+            a->prompt_text.clear();
+        }
         a->has_prompt_text = true;
         const int rc = a->has_state
                            ? a->runtime->set_prompt_state(
@@ -184,7 +192,7 @@ int set_input(void* self, uint32_t port, const void* data, uint64_t bytes,
             a->last_error = st.message.empty()
                                 ? "prompt staging is not configured"
                                 : st.message;
-            return -1;
+            return status_code(st);
         }
         a->last_error.clear();
         return 0;
@@ -194,8 +202,14 @@ int set_input(void* self, uint32_t port, const void* data, uint64_t bytes,
             a->last_error = "state payload must be f32[]";
             return -1;
         }
+        const uint64_t n = bytes / sizeof(float);
+        if (n != a->state_values.size()) {
+            a->last_error = "state dimension does not match the runtime";
+            return -4;
+        }
         const auto* values = static_cast<const float*>(data);
-        a->state_values.assign(values, values + bytes / sizeof(float));
+        std::memcpy(a->state_values.data(), values,
+                    static_cast<std::size_t>(bytes));
         a->has_state = true;
         if (!a->has_prompt_text) {
             a->last_error.clear();
@@ -209,7 +223,7 @@ int set_input(void* self, uint32_t port, const void* data, uint64_t bytes,
             a->last_error = st.message.empty()
                                 ? "state staging failed"
                                 : st.message;
-            return -1;
+            return status_code(st);
         }
         a->last_error.clear();
         return 0;
@@ -227,19 +241,18 @@ int get_output(void* self, uint32_t port, void* out, uint64_t capacity,
         a->last_error = "unknown or non-output port";
         return -1;
     }
-    std::vector<float> actions;
-    Status st = a->runtime->read_actions(&actions);
+    Status st = a->runtime->read_actions(&a->action_values);
     if (!st.ok_status()) {
         a->last_error = st.message;
         return status_code(st);
     }
-    const uint64_t need = actions.size() * sizeof(float);
+    const uint64_t need = a->action_values.size() * sizeof(float);
     if (written) *written = need;
     if (capacity < need) {
         a->last_error = "action output buffer is too small";
         return -5;
     }
-    std::memcpy(out, actions.data(), need);
+    std::memcpy(out, a->action_values.data(), need);
     a->last_error.clear();
     return 0;
 }
@@ -361,6 +374,12 @@ extern "C" int frt_pi05_model_runtime_create(
 
     const auto& manifest = a->runtime->manifest();
     a->view_order = manifest.vision.view_order;
+    a->vision_frames.resize(a->view_order.size());
+    for (std::size_t i = 0; i < a->view_order.size(); ++i) {
+        a->vision_frames[i].name = a->view_order[i];
+    }
+    a->action_values.resize(static_cast<std::size_t>(
+        manifest.action.chunk * manifest.action.robot_dim));
     a->image_shape[0] = static_cast<int64_t>(a->view_order.size());
     a->image_shape[1] = manifest.vision.target_height;
     a->image_shape[2] = manifest.vision.target_width;
@@ -502,6 +521,20 @@ extern "C" int frt_pi05_model_runtime_create_over(
     a->prompt_port = prompt;
     a->state_port = state;
     a->view_order = a->runtime->manifest().vision.view_order;
+    a->vision_frames.resize(a->view_order.size());
+    for (std::size_t i = 0; i < a->view_order.size(); ++i) {
+        a->vision_frames[i].name = a->view_order[i];
+    }
+    const auto& action = a->runtime->manifest().action;
+    a->action_values.resize(static_cast<std::size_t>(action.chunk *
+                                                     action.robot_dim));
+    if (cfg.prompt_max_tokens) {
+        a->prompt_text.reserve(static_cast<std::size_t>(
+            cfg.prompt_max_tokens * 8ull));
+    }
+    if (state != kNoPort) {
+        a->state_values.resize(cfg.state_q01.size());
+    }
 
     frt_model_runtime_verbs verbs{};
     verbs.struct_size = sizeof(verbs);

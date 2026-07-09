@@ -110,6 +110,7 @@ private:
     families::vla::Manifest manifest_;
     modalities::Status status_;
     modalities::VisionStaging staging_;
+    modalities::ActionStaging action_staging_;
     RuntimeIo io_;
     modalities::SentencePieceTokenizer prompt_tokenizer_;
     modalities::TextEmbeddingStaging prompt_embedding_staging_;
@@ -119,6 +120,8 @@ private:
     modalities::Status prompt_status_;
     std::vector<std::int32_t> prompt_token_ids_;
     std::vector<float> normalized_state_;
+    std::string task_prompt_workspace_;
+    std::string formatted_prompt_workspace_;
     std::uint64_t current_prompt_len_ = 0;
     bool prompt_staging_enabled_ = false;
     frt_graph graph_ = nullptr;

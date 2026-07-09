@@ -2,7 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
-#include <sstream>
+#include <charconv>
 
 namespace flashrt {
 namespace models {
@@ -52,18 +52,42 @@ std::string clean_task_prompt(const std::string& prompt) {
 std::string format_state_prompt(const std::string& prompt,
                                 const float* state,
                                 std::uint64_t n_state) {
-    const std::string cleaned = clean_task_prompt(prompt);
-    if (!state) return cleaned;
+    std::string out;
+    out.reserve(prompt.size() + static_cast<std::size_t>(n_state) * 5 + 32);
+    format_state_prompt_into(prompt, state, n_state, &out);
+    return out;
+}
 
-    const auto tokens = discretize_state_prompt_bins(state, n_state);
-    std::ostringstream oss;
-    oss << "Task: " << cleaned << ", State: ";
-    for (std::size_t i = 0; i < tokens.size(); ++i) {
-        if (i) oss << ' ';
-        oss << tokens[i];
+void format_state_prompt_into(const std::string& prompt,
+                              const float* state,
+                              std::uint64_t n_state,
+                              std::string* out) {
+    if (!out) return;
+    out->clear();
+    auto begin = prompt.begin();
+    auto end = prompt.end();
+    while (begin != end && ascii_space(*begin)) ++begin;
+    while (begin != end && ascii_space(*(end - 1))) --end;
+
+    if (state) out->append("Task: ");
+    for (auto it = begin; it != end; ++it) {
+        out->push_back(*it == '_' || *it == '\n' ? ' ' : *it);
     }
-    oss << ";\nAction: ";
-    return oss.str();
+    if (!state) return;
+
+    static const std::vector<float> bins = make_openpi_bins();
+    out->append(", State: ");
+    char number[24];
+    for (std::uint64_t i = 0; i < n_state; ++i) {
+        if (i) out->push_back(' ');
+        const auto bin = static_cast<std::int64_t>(
+                             std::upper_bound(bins.begin(), bins.end(), state[i]) -
+                             bins.begin()) -
+                         1;
+        const auto result = std::to_chars(number, number + sizeof(number), bin);
+        out->append(number, result.ptr);
+    }
+    out->append(";\nAction: ");
 }
 
 }  // namespace pi05

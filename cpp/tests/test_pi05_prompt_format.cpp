@@ -24,6 +24,15 @@ void test_prompt_format_matches_python_reference() {
         "pick_up\nred", state, 5);
     assert(out ==
            "Task: pick up red, State: 0 128 255 255 -1;\nAction: ");
+    std::string workspace;
+    workspace.reserve(128);
+    const std::size_t capacity = workspace.capacity();
+    for (int i = 0; i < 1000; ++i) {
+        flashrt::models::pi05::format_state_prompt_into(
+            "pick_up\nred", state, 5, &workspace);
+        assert(workspace == out);
+        assert(workspace.capacity() == capacity);
+    }
 }
 
 void test_prompt_without_state_keeps_text_only_format() {

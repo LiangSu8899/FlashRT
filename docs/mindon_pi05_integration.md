@@ -211,5 +211,7 @@ but the C++ host still sees only the adopted stage array.
 - `actions` capacity is computed from the declared output shape and dtype.
 - The warm phase finishes before the first control tick.
 - The hot loop performs no graph capture, allocation, or graph rebinding.
+- Prompt/state/image/action staging capacities are fixed at setup; oversized
+  payloads fail instead of growing a hot-path workspace.
 - Snapshot/restore is tested within one live capture.
 - Nexus core code remains unchanged for model-specific semantics.

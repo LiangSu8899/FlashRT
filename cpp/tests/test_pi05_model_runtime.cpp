@@ -405,6 +405,27 @@ int main() {
         CHECK(std::fabs(prompt_out[0] - 1.0f) < 0.001f &&
                   std::fabs(prompt_out[1] + 1.0f) < 0.001f,
               "state prompt staging wrote embeddings");
+        const std::size_t variants_before = frt_graph_variant_count(graph);
+        for (int tick = 0; tick < 1000; ++tick) {
+            const float changing_state[3] = {
+                static_cast<float>(tick % 3), 2.0f, 0.0f};
+            CHECK(state_over->verbs.set_input(
+                      state_over->self, 4, changing_state,
+                      sizeof(changing_state), -1) == 0,
+                  "state hot update remains available");
+        }
+        CHECK(frt_graph_variant_count(graph) == variants_before,
+              "state hot updates do not recapture graph variants");
+        const float wrong_state[2] = {0.0f, 0.0f};
+        CHECK(state_over->verbs.set_input(
+                  state_over->self, 4, wrong_state, sizeof(wrong_state), -1) ==
+                  -4,
+              "state hot update rejects dimension changes");
+        const std::string oversized_prompt(max_tokens * 8 + 1, 'x');
+        CHECK(state_over->verbs.set_input(
+                  state_over->self, 3, oversized_prompt.data(),
+                  oversized_prompt.size(), -1) == -4,
+              "prompt hot update rejects capacity growth");
         state_over->release(state_over->owner);
     } else {
         std::printf("SKIP - FLASH_RT_PALIGEMMA_TOKENIZER not set\n");

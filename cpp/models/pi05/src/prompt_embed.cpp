@@ -82,7 +82,7 @@ modalities::Status zero_prompt_output(const modalities::TensorView& output,
 }  // namespace
 
 modalities::Status embed_prompt(
-        const modalities::SentencePieceTokenizer& tokenizer,
+        modalities::SentencePieceTokenizer& tokenizer,
         const PromptEmbeddingSpec& spec,
         const std::string& prompt,
         const float* state,
@@ -92,7 +92,8 @@ modalities::Status embed_prompt(
         std::vector<std::int32_t>* token_ids,
         std::uint64_t* prompt_len,
         void* stream,
-        modalities::TextEmbeddingStaging* staging) {
+        modalities::TextEmbeddingStaging* staging,
+        std::string* formatted_workspace) {
     if (!token_ids || !prompt_len) {
         return modalities::Status::error(
             modalities::StatusCode::kInvalidArgument,
@@ -110,10 +111,13 @@ modalities::Status embed_prompt(
 
     modalities::SentencePieceEncodeOptions options;
     options.add_bos = true;
+    options.max_tokens = spec.max_tokens;
     if (state) {
-        const std::string formatted = format_state_prompt(prompt, state,
-                                                          n_state);
-        st = tokenizer.encode(formatted, options, token_ids);
+        std::string local;
+        std::string* formatted = formatted_workspace ? formatted_workspace
+                                                     : &local;
+        format_state_prompt_into(prompt, state, n_state, formatted);
+        st = tokenizer.encode(*formatted, options, token_ids);
     } else {
         st = tokenizer.encode(prompt, options, token_ids);
         if (st.ok_status() && spec.no_state_suffix_token_id >= 0) {
@@ -149,7 +153,7 @@ modalities::Status embed_prompt(
 }
 
 modalities::Status embed_prompt_cpu(
-        const modalities::SentencePieceTokenizer& tokenizer,
+        modalities::SentencePieceTokenizer& tokenizer,
         const PromptEmbeddingSpec& spec,
         const std::string& prompt,
         const float* state,
