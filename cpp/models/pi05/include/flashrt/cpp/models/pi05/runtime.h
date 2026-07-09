@@ -6,6 +6,7 @@
 #include "flashrt/cpp/models/pi05/prompt_embed.h"
 
 #include <string>
+#include <vector>
 
 namespace flashrt {
 namespace models {
@@ -52,6 +53,8 @@ struct RuntimeConfig {
     std::uint64_t prompt_hidden_dim = 0;
     std::uint64_t prompt_max_tokens = 0;
     float prompt_embedding_scale = 0.0f;
+    std::vector<float> state_q01;
+    std::vector<float> state_q99;
 
     ReplayFn replay_fn = nullptr;
     void* replay_user = nullptr;
@@ -82,6 +85,10 @@ public:
         return prompt_status_;
     }
     bool prompt_staging_enabled() const { return prompt_staging_enabled_; }
+    bool state_normalization_enabled() const {
+        return !config_.state_q01.empty() &&
+               config_.state_q01.size() == config_.state_q99.size();
+    }
     std::uint64_t current_prompt_len() const { return current_prompt_len_; }
 
     modalities::Status prepare_vision(
@@ -111,6 +118,7 @@ private:
     modalities::TensorView prompt_embedding_output_;
     modalities::Status prompt_status_;
     std::vector<std::int32_t> prompt_token_ids_;
+    std::vector<float> normalized_state_;
     std::uint64_t current_prompt_len_ = 0;
     bool prompt_staging_enabled_ = false;
     frt_graph graph_ = nullptr;

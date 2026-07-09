@@ -32,6 +32,11 @@ struct Adapter {
     uint32_t noise_port = kPortNoise;
     uint32_t actions_port = kPortActions;
     uint32_t prompt_port = kNoPort;
+    uint32_t state_port = kNoPort;
+    bool has_prompt_text = false;
+    bool has_state = false;
+    std::string prompt_text;
+    std::vector<float> state_values;
 
     int64_t image_shape[4] = {0, 0, 0, 3};
     int64_t noise_shape[2] = {0, 0};
@@ -166,12 +171,43 @@ int set_input(void* self, uint32_t port, const void* data, uint64_t bytes,
             return -1;
         }
         const char* begin = static_cast<const char*>(data);
-        const std::string prompt(begin, begin + bytes);
-        const int rc = a->runtime->set_prompt(prompt.c_str());
+        a->prompt_text.assign(begin, begin + bytes);
+        a->has_prompt_text = true;
+        const int rc = a->has_state
+                           ? a->runtime->set_prompt_state(
+                                 a->prompt_text.c_str(),
+                                 a->state_values.data(),
+                                 a->state_values.size())
+                           : a->runtime->set_prompt(a->prompt_text.c_str());
         if (rc != 0) {
             const auto& st = a->runtime->prompt_status();
             a->last_error = st.message.empty()
                                 ? "prompt staging is not configured"
+                                : st.message;
+            return -1;
+        }
+        a->last_error.clear();
+        return 0;
+    }
+    if (port == a->state_port) {
+        if (!data || !bytes || bytes % sizeof(float)) {
+            a->last_error = "state payload must be f32[]";
+            return -1;
+        }
+        const auto* values = static_cast<const float*>(data);
+        a->state_values.assign(values, values + bytes / sizeof(float));
+        a->has_state = true;
+        if (!a->has_prompt_text) {
+            a->last_error.clear();
+            return 0;
+        }
+        const int rc = a->runtime->set_prompt_state(
+            a->prompt_text.c_str(), a->state_values.data(),
+            a->state_values.size());
+        if (rc != 0) {
+            const auto& st = a->runtime->prompt_status();
+            a->last_error = st.message.empty()
+                                ? "state staging failed"
                                 : st.message;
             return -1;
         }
@@ -413,6 +449,7 @@ extern "C" int frt_pi05_model_runtime_create_over(
     const uint32_t noise = find_port_index(model, "noise");
     const uint32_t actions = find_port_index(model, "actions");
     const uint32_t prompt = find_port_index(model, "prompt");
+    const uint32_t state = find_port_index(model, "state");
     if (!compatible_port(model, images, FRT_RT_MOD_IMAGE, FRT_RT_PORT_IN,
                          FRT_RT_PORT_STAGED) ||
         !compatible_port(model, actions, FRT_RT_MOD_ACTION, FRT_RT_PORT_OUT,
@@ -426,6 +463,11 @@ extern "C" int frt_pi05_model_runtime_create_over(
     }
     if (prompt != kNoPort &&
         !compatible_port(model, prompt, FRT_RT_MOD_TEXT, FRT_RT_PORT_IN,
+                         FRT_RT_PORT_STAGED)) {
+        return -2;
+    }
+    if (state != kNoPort &&
+        !compatible_port(model, state, FRT_RT_MOD_STATE, FRT_RT_PORT_IN,
                          FRT_RT_PORT_STAGED)) {
         return -2;
     }
@@ -448,11 +490,17 @@ extern "C" int frt_pi05_model_runtime_create_over(
     if (prompt != kNoPort && !a->runtime->prompt_staging_enabled()) {
         return -2;
     }
+    if (state != kNoPort &&
+        (!a->runtime->prompt_staging_enabled() ||
+         !a->runtime->state_normalization_enabled())) {
+        return -2;
+    }
     a->source_model = model;
     a->images_port = images;
     a->noise_port = noise;
     a->actions_port = actions;
     a->prompt_port = prompt;
+    a->state_port = state;
     a->view_order = a->runtime->manifest().vision.view_order;
 
     frt_model_runtime_verbs verbs{};

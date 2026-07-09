@@ -190,8 +190,25 @@ int Runtime::set_prompt_state(const char* text, const float* state,
             "prompt text is null");
         return -1;
     }
+    const float* state_for_prompt = state;
+    if (state && state_normalization_enabled()) {
+        if (n_state != config_.state_q01.size()) {
+            prompt_status_ = modalities::Status::error(
+                modalities::StatusCode::kShapeMismatch,
+                "state dimension does not match norm stats");
+            return -1;
+        }
+        normalized_state_.resize(n_state);
+        for (std::uint64_t i = 0; i < n_state; ++i) {
+            const float lo = config_.state_q01[i];
+            const float hi = config_.state_q99[i];
+            normalized_state_[i] =
+                ((state[i] - lo) / (hi - lo + 1e-6f)) * 2.0f - 1.0f;
+        }
+        state_for_prompt = normalized_state_.data();
+    }
     prompt_status_ = embed_prompt(
-        prompt_tokenizer_, prompt_spec_, text, state, n_state,
+        prompt_tokenizer_, prompt_spec_, text, state_for_prompt, n_state,
         prompt_embedding_table_, prompt_embedding_output_, &prompt_token_ids_,
         &current_prompt_len_, find_native_stream(exp_, stream_id_),
         prompt_embedding_output_.place == modalities::MemoryPlace::kDevice

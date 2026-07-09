@@ -146,6 +146,20 @@ inline RuntimeConfig make_config(const frt_pi05_runtime_config* in) {
                   sizeof(in->prompt_embedding_scale))) {
         cfg.prompt_embedding_scale = in->prompt_embedding_scale;
     }
+    if (has_field(in, offsetof(frt_pi05_runtime_config, state_q01),
+                  sizeof(in->state_q01)) &&
+        has_field(in, offsetof(frt_pi05_runtime_config, n_state_q01),
+                  sizeof(in->n_state_q01)) &&
+        in->state_q01 && in->n_state_q01) {
+        cfg.state_q01.assign(in->state_q01, in->state_q01 + in->n_state_q01);
+    }
+    if (has_field(in, offsetof(frt_pi05_runtime_config, state_q99),
+                  sizeof(in->state_q99)) &&
+        has_field(in, offsetof(frt_pi05_runtime_config, n_state_q99),
+                  sizeof(in->n_state_q99)) &&
+        in->state_q99 && in->n_state_q99) {
+        cfg.state_q99.assign(in->state_q99, in->state_q99 + in->n_state_q99);
+    }
     if (cfg.prompt_vocab_size && cfg.prompt_hidden_dim) {
         cfg.prompt_embedding_table.place = modalities::MemoryPlace::kHost;
         cfg.prompt_embedding_table.layout = modalities::Layout::kFlat;
