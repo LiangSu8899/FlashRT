@@ -24,6 +24,8 @@ import torch
 from flash_rt.models.higgs_audio_v3.pipeline_rtx import HiggsAudioV3Dims
 
 _SPECIALS = ("<|tts|>", "<|text|>", "<|audio|>")
+_FP8_CALIBRATION_TEXT = "Four score."
+_REPEAT_STOP_FRAMES = 32
 
 
 def _delayed_eoc_countdown(codes: torch.Tensor, nc: int, eoc: int) -> int | None:
@@ -33,6 +35,13 @@ def _delayed_eoc_countdown(codes: torch.Tensor, nc: int, eoc: int) -> int | None
         return None
     first_eoc_cb = int(eoc_pos[0])
     return max(1, nc - 1 - first_eoc_cb)
+
+
+def _repeat_code_run(codes: torch.Tensor,
+                     prev_key: tuple[int, ...] | None,
+                     count: int) -> tuple[tuple[int, ...], int]:
+    key = tuple(int(x) for x in codes.tolist())
+    return key, count + 1 if key == prev_key else 1
 
 
 class HiggsAudioV3TorchFrontendRtx:
@@ -303,7 +312,7 @@ class HiggsAudioV3TorchFrontendRtx:
                 HiggsAudioV3Fp8Decoder,
             )
             dec = HiggsAudioV3Fp8Decoder(self)
-            dec.calibrate(self._prompt_ids)   # static activation scales (once)
+            dec.calibrate(self.build_prompt(_FP8_CALIBRATION_TEXT))
         else:
             from flash_rt.frontends.torch._higgs_audio_v3_bf16 import (
                 HiggsAudioV3Bf16Decoder,
@@ -412,6 +421,7 @@ class HiggsAudioV3TorchFrontendRtx:
         boc, eoc = self.DIMS.boc_id, self.DIMS.eoc_id
         P, logits = self._gen_pos, self._gen_logits
         delay, eoc_countdown, done = 0, None, False
+        repeat_key, repeat_count = None, 0
         window: list[torch.Tensor] = []
         for j in range(self.max_new_frames):
             fvk.higgs_audio_v3_argmax_delay_embed_bf16(
@@ -428,6 +438,11 @@ class HiggsAudioV3TorchFrontendRtx:
                     done = True
             else:
                 eoc_countdown = _delayed_eoc_countdown(codes, nc, eoc)
+                if eoc_countdown is None:
+                    repeat_key, repeat_count = _repeat_code_run(
+                        codes, repeat_key, repeat_count)
+                    if repeat_count >= _REPEAT_STOP_FRAMES:
+                        done = True
             if done:
                 break
             window.append(codes.clone())

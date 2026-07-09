@@ -27,10 +27,10 @@ also the auto-selection on non-FP8 builds):
 
 | Metric | **FP8** (default) | **BF16** (`fp8=False`) |
 |---|---|---|
-| Real-time factor (RTF) | **0.095 – 0.11** (≈ 9–10× real time) | **0.15** (≈ 6.5× real time) |
-| Time to first audio (TTFA) | **≈ 94 ms** | **≈ 127 ms** |
-| Autoregressive decode | **≈ 3.2 ms/frame** | **≈ 6.0 ms/frame** (at the BF16 bandwidth wall) |
-| Prompt prefill | **≈ 1.0 ms/token** | **≈ 0.53 ms/token** at P=13 (≈ 6.9 ms total; weight-once) |
+| Real-time factor (RTF) | **≈ 0.09** (≈ 11× real time) | **0.15** (≈ 6.5× real time) |
+| Time to first audio (TTFA) | **≈ 79 ms** | **≈ 127 ms** |
+| Autoregressive decode | **≈ 3.6 ms/frame** | **≈ 6.0 ms/frame** (at the BF16 bandwidth wall) |
+| Prompt prefill | **≈ 0.42 ms/token** at P=13 (≈ 5.5 ms total) | **≈ 0.52 ms/token** at P=13 (≈ 6.8 ms total; weight-once) |
 | Peak VRAM | **6.6 GB** | **9.6 GB** |
 | Fidelity | teacher-forced logits **cos 1.0**; codec **cos 0.99993**; streamed == one-shot **cos 1.0** | same (bit-exact vs eager) |
 | Prefix reuse | shared `system` preamble cuts prefill **~64 %**, output bit-identical | same |
@@ -41,10 +41,16 @@ weight bytes of FP8, so its per-frame is ~1.7× — the bandwidth floor, not
 overhead.
 
 The BF16 batched prefill path is also fully kernelised. In a same-prompt
-prefill-only comparison, the BF16 path improves from **8.42 → 6.79 ms** at P=6
-and **11.74 → 6.86 ms** at P=13. The short-prompt EOC regression case
-`"Four score."` now exits at **1.20 s** of audio in BF16 instead of running to
-the 40.68 s generation cap.
+prefill-only comparison, the BF16 path improves from **8.42 → 6.73 ms** at P=6
+and **11.74 → 6.82 ms** at P=13. The short-prompt EOC regression case
+`"Four score."` now exits in about **1 s** of audio in BF16 instead of running
+to the 40.68 s generation cap.
+
+FP8 activation calibration is fixed to a built-in short calibration prompt
+rather than the user's first request, so startup order no longer changes the
+scale set used for later prompts. A deterministic repeated-code stop guard also
+terminates pathological no-EOC loops before the generation cap; normal EOC
+termination remains unchanged.
 
 **Hardware-adaptive**: the precision is auto-selected from the GPU
 (`fp8=None`, the default) — FP8 where its kernels are compiled in, else BF16;
@@ -61,8 +67,8 @@ eager backbone):
 
 | Stage | PyTorch eager | FlashRT FP8 | |
 |---|---|---|---|
-| Autoregressive decode (no codec) | 10.8 ms/frame | **3.2 ms/frame** | **3.3× faster** |
-| Prompt prefill | 3.7 ms/token | **1.0 ms/token** | **3.7× faster** |
+| Autoregressive decode (no codec) | 10.8 ms/frame | **3.6 ms/frame** | **3.0× faster** |
+| Prompt prefill | 3.7 ms/token | **0.42 ms/token** | **8.8× faster** |
 | Backbone weight VRAM | 7.3 GB (bf16) | **3.6 GB (FP8)** | **2× smaller** |
 
 The decode math path is fully kernelised (RMSNorm + quant, dedicated M=1 GEMV
@@ -120,15 +126,15 @@ Expected output on a 5090 (numbers vary with text length and clocks):
 
 ```
 [FP8 W8A8] 'The quick brown fox jumps over the lazy dog.'
-  -> fox.wav  (~3.0s audio, ~4.5s wall incl 1st-call setup)
-  bench 1: AR decode ~290 ms (~3.8 ms/frame)
-  bench 2: AR decode ~290 ms (~3.8 ms/frame)
+  -> fox.wav  (~4.0s audio, ~3s wall incl 1st-call setup)
+  bench 1: AR decode ~355 ms (~3.6 ms/frame)
+  bench 2: AR decode ~355 ms (~3.6 ms/frame)
   ...
 ```
 
 First call pays a one-time cost: FP8 activation-scale **calibration** (a short
-BF16 free-run) and **codec load**. Subsequent calls are warm. Add `--bf16` to
-run the BF16 backbone instead of FP8.
+BF16 free-run on a built-in calibration prompt) and **codec load**. Subsequent
+calls are warm. Add `--bf16` to run the BF16 backbone instead of FP8.
 
 ---
 
@@ -236,12 +242,12 @@ python examples/higgs_audio_v3_quickstart.py \
   standardized `generate` / `generate_stream` frontend, FP8 backbone, after a
   warm-up call (lazy FP8 calibration + codec load + CUDA-graph capture happen
   once on the first call and are excluded).
-- **Decode floor 3.2 ms/frame** is the clean single-position CUDA-graph replay;
+- **Decode floor 3.6 ms/frame** is the clean single-position CUDA-graph replay;
   the per-token GEMMs read 3.6 GB of distinct FP8 weights, so this is genuinely
   HBM-bound (micro-benchmarks that reuse weights report L2-cached fiction). The
   full-pipeline per-frame is slightly higher because attention cost grows with KV
   length over a long generation.
-- **Prefill** is one batched M=P forward (FP8 ≈ 1 ms/token; BF16 ≈ 6.9 ms total
+- **Prefill** is one batched M=P forward (FP8 ≈ 5.5 ms total; BF16 ≈ 6.8 ms total
   for a 13-token prompt in the benchmark sentence); a shared `system`
   preamble reuses its resident KV across requests (only the new text suffix is
   prefilled — bit-identical to a cold prefill). Prefill-only numbers time
@@ -258,8 +264,8 @@ python examples/higgs_audio_v3_quickstart.py \
 ## 8. Notes & limitations
 
 - **FP8 calibration** is per-tensor static (activation `amax/448`), measured
-  once from a short BF16 free-run of the first prompt and reused. Activation
-  ranges are stable across prompts; re-instantiate the frontend to recalibrate.
+  once from a short BF16 free-run of a built-in calibration prompt and reused.
+  This keeps activation scales independent of the first user request.
 - The BF16 projection weights are freed after calibration (the FP8 backbone is
   the active path); pass `fp8=False` for the BF16 backbone, which keeps them.
 - **GPU support / precision auto-selection.** The build auto-detects the GPU
