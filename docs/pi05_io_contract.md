@@ -236,10 +236,16 @@ weights. Encoder layers emit the five pipeline groups (`attn_qkv`, `attn_o`,
 those groups plus the four AdaRMS modulation tensors and the optional merged
 gate/up buffer used by the FP16 path. Vision setup emits patch/position/final
 norm and multimodal-projector globals plus the twelve per-layer attention,
-FFN, and normalization buffers. These paths have been exercised against the
-two supported real checkpoint layouts. Remaining global language/action/time
-weights, precision-specific packing, and graph capture are incomplete, so
-`open_v1` stays unsupported.
+FFN, and normalization buffers. Decoder globals include final AdaRMS
+modulation, time MLP, generated time embeddings, and action projections. The
+action output projection is pre-scaled by `-1/num_steps` after source BF16
+rounding; 5-step and 10-step schedules are byte-exact with the PyTorch
+producer. The prompt embedding table is materialized separately to keep its
+approximately 1 GiB allocation explicit. These paths have been exercised
+against the two supported real checkpoint layouts. The checkpoint inventory
+also validates the language final norm and expert LM head even though the
+current Pi0.5 pipeline does not consume them. Precision-specific packing and
+graph capture remain incomplete, so `open_v1` stays unsupported.
 
 CUDA graph execs are process-local objects. They are not serialized as a
 portable artifact. Removing Python from setup requires a native producer that

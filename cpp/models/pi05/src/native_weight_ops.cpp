@@ -1,5 +1,6 @@
 #include "flashrt/cpp/models/pi05/native_weight_ops.h"
 
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <utility>
@@ -326,6 +327,43 @@ modalities::Status native_scale(const NativeFloatTensor& input,
     NativeFloatTensor scaled = input;
     for (float& value : scaled.values) value *= scale;
     *out = std::move(scaled);
+    return modalities::Status::ok();
+}
+
+modalities::Status native_pi05_time_embeddings(
+    int num_steps,
+    std::uint64_t embedding_dim,
+    NativeFloatTensor* out) {
+    if (!out || num_steps <= 0 || embedding_dim < 2 ||
+        embedding_dim % 2 != 0) {
+        return invalid("Pi0.5 time embedding shape is invalid");
+    }
+    const std::uint64_t half = embedding_dim / 2;
+    NativeFloatTensor result;
+    result.shape = {static_cast<std::uint64_t>(num_steps), embedding_dim};
+    result.values.resize(static_cast<std::size_t>(num_steps) * embedding_dim);
+    const float dt = -1.0f / static_cast<float>(num_steps);
+    const float min_period = 4.0e-3f;
+    const float period_ratio = 1000.0f;
+    const float pi = static_cast<float>(3.14159265358979323846);
+    const float fraction_step =
+        half == 1 ? 0.0f : 1.0f / static_cast<float>(half - 1);
+    float t = 1.0f;
+    for (int step = 0; step < num_steps; ++step) {
+        const std::size_t row = static_cast<std::size_t>(step) * embedding_dim;
+        for (std::uint64_t i = 0; i < half; ++i) {
+            const float fraction = static_cast<float>(i) * fraction_step;
+            const float period =
+                min_period * std::pow(period_ratio, fraction);
+            float angle = t * (1.0f / period);
+            angle *= 2.0f;
+            angle *= pi;
+            result.values[row + i] = std::sin(angle);
+            result.values[row + half + i] = std::cos(angle);
+        }
+        t += dt;
+    }
+    *out = std::move(result);
     return modalities::Status::ok();
 }
 

@@ -115,6 +115,12 @@ int main() {
     expect(result, {2, 3}, {-0.1f, -0.2f, -0.3f,
                             -0.4f, -0.5f, -0.6f});
 
+    assert(native_pi05_time_embeddings(2, 4, &result).ok_status());
+    assert(result.shape == std::vector<std::uint64_t>({2, 4}));
+    assert(result.values.size() == 8);
+    assert(!native_pi05_time_embeddings(0, 4, &result).ok_status());
+    assert(!native_pi05_time_embeddings(2, 3, &result).ok_status());
+
     NativeFloatTensor unrounded{{2}, {1.003f, -1.003f}};
     assert(native_round_to_bf16_float(unrounded, &result).ok_status());
     assert(result.values[0] == flashrt::modalities::bfloat16_to_float(
