@@ -246,6 +246,11 @@ if(BUILD_TESTING)
       PRIVATE flashrt_cpp_pi05 flashrt_exec CUDA::cudart)
     add_test(NAME pi05_native_workspace
       COMMAND test_pi05_native_workspace)
+
+    add_executable(pi05_native_rope_probe
+      tests/pi05_native_rope_probe.cpp)
+    target_link_libraries(pi05_native_rope_probe
+      PRIVATE flashrt_cpp_pi05 flashrt_exec CUDA::cudart)
   endif()
 
   add_executable(test_pi05_prompt_format tests/test_pi05_prompt_format.cpp)

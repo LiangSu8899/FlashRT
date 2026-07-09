@@ -2,6 +2,7 @@
 #define FLASHRT_CPP_MODELS_PI05_NATIVE_WORKSPACE_H
 
 #include "flashrt/cpp/modalities/types.h"
+#include "flashrt/cpp/models/pi05/native_device_weights.h"
 #include "flashrt/exec.h"
 
 #include <cstddef>
@@ -37,6 +38,9 @@ public:
     NativeWorkspace& operator=(const NativeWorkspace&) = delete;
 
     modalities::Status allocate(const NativeWorkspaceConfig& config);
+    modalities::Status update_decoder_rope(int prompt_tokens);
+    modalities::Status expand_vision_position_embedding(
+        const NativeDeviceWeightStore& weights);
     const NativeWorkspaceBuffer* find(const std::string& name) const;
 
     std::size_t logical_size() const { return buffers_.size(); }
@@ -54,6 +58,7 @@ private:
                                  const std::string& source_name,
                                  std::initializer_list<std::uint64_t> shape);
     modalities::Status initialize_rms_ones();
+    modalities::Status initialize_rope();
 
     frt_ctx ctx_ = nullptr;
     std::map<std::string, NativeWorkspaceBuffer> buffers_;
@@ -62,6 +67,10 @@ private:
     int vision_sequence_ = 0;
     int encoder_vision_sequence_ = 0;
     int encoder_sequence_ = 0;
+    int num_views_ = 0;
+    int max_prompt_tokens_ = 0;
+    int chunk_size_ = 0;
+    std::vector<std::uint16_t> rope_table_;
 };
 
 }  // namespace pi05

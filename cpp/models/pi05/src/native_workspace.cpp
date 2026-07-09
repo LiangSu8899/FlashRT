@@ -5,6 +5,7 @@
 #endif
 
 #include <limits>
+#include <cmath>
 
 namespace flashrt {
 namespace models {
@@ -108,6 +109,109 @@ modalities::Status NativeWorkspace::initialize_rms_ones() {
 #endif
 }
 
+modalities::Status NativeWorkspace::initialize_rope() {
+#ifndef FLASHRT_CPP_WITH_CUDA_STAGING
+    return modalities::Status::error(
+        modalities::StatusCode::kUnsupported,
+        "native RoPE initialization requires the CUDA build");
+#else
+    const int max_positions = encoder_sequence_ + chunk_size_;
+    rope_table_.resize(static_cast<std::size_t>(max_positions) * 256);
+    for (int position = 0; position < max_positions; ++position) {
+        const std::size_t row = static_cast<std::size_t>(position) * 256;
+        for (int i = 0; i < 128; ++i) {
+            const double exponent = static_cast<double>(2 * i) / 256.0;
+            const double inverse_frequency =
+                1.0 / std::pow(10000.0, exponent);
+            const double phase =
+                static_cast<double>(position) * inverse_frequency;
+            rope_table_[row + 2 * i] =
+                modalities::float_to_bfloat16(
+                    static_cast<float>(std::cos(phase)));
+            rope_table_[row + 2 * i + 1] =
+                modalities::float_to_bfloat16(
+                    static_cast<float>(std::sin(phase)));
+        }
+    }
+    const NativeWorkspaceBuffer* encoder = find("encoder_rope_weights");
+    if (!encoder) return invalid("encoder RoPE buffer was not allocated");
+    const std::size_t encoder_bytes =
+        static_cast<std::size_t>(encoder_sequence_) * 256 *
+        sizeof(std::uint16_t);
+    const cudaError_t rc = cudaMemcpy(
+        frt_buffer_dptr(encoder->buffer), rope_table_.data(), encoder_bytes,
+        cudaMemcpyHostToDevice);
+    if (rc != cudaSuccess) return backend("encoder RoPE upload failed");
+    return update_decoder_rope(0);
+#endif
+}
+
+modalities::Status NativeWorkspace::update_decoder_rope(int prompt_tokens) {
+    if (prompt_tokens < 0 || prompt_tokens > max_prompt_tokens_ ||
+        rope_table_.empty()) {
+        return invalid("Pi0.5 decoder RoPE prompt length is invalid");
+    }
+#ifndef FLASHRT_CPP_WITH_CUDA_STAGING
+    return modalities::Status::error(
+        modalities::StatusCode::kUnsupported,
+        "decoder RoPE update requires the CUDA build");
+#else
+    const NativeWorkspaceBuffer* decoder = find("decoder_rope_weights");
+    if (!decoder) return invalid("decoder RoPE buffer was not allocated");
+    const std::size_t start =
+        static_cast<std::size_t>(encoder_vision_sequence_ + prompt_tokens) *
+        256;
+    const std::size_t elements =
+        static_cast<std::size_t>(chunk_size_) * 256;
+    if (start > rope_table_.size() ||
+        elements > rope_table_.size() - start) {
+        return invalid("decoder RoPE slice exceeds the generated table");
+    }
+    const cudaError_t rc = cudaMemcpy(
+        frt_buffer_dptr(decoder->buffer), rope_table_.data() + start,
+        elements * sizeof(std::uint16_t), cudaMemcpyHostToDevice);
+    return rc == cudaSuccess
+               ? modalities::Status::ok()
+               : backend("decoder RoPE upload failed");
+#endif
+}
+
+modalities::Status NativeWorkspace::expand_vision_position_embedding(
+    const NativeDeviceWeightStore& weights) {
+    const NativeDeviceWeight* source =
+        weights.find("vision_position_embedding");
+    const NativeWorkspaceBuffer* destination =
+        find("vision_pos_embed_expanded");
+    if (!source || !destination ||
+        source->dtype != NativeWeightDType::kBf16 ||
+        source->shape != std::vector<std::uint64_t>({256, 1152})) {
+        return invalid("vision position embedding source is invalid");
+    }
+#ifndef FLASHRT_CPP_WITH_CUDA_STAGING
+    return modalities::Status::error(
+        modalities::StatusCode::kUnsupported,
+        "position embedding expansion requires the CUDA build");
+#else
+    const std::size_t view_bytes = 256 * 1152 * sizeof(std::uint16_t);
+    if (frt_buffer_bytes(destination->buffer) !=
+        static_cast<std::size_t>(num_views_) * view_bytes) {
+        return invalid("expanded position embedding buffer size is invalid");
+    }
+    for (int view = 0; view < num_views_; ++view) {
+        auto* target = static_cast<unsigned char*>(
+                           frt_buffer_dptr(destination->buffer)) +
+                       static_cast<std::size_t>(view) * view_bytes;
+        const cudaError_t rc = cudaMemcpy(
+            target, frt_buffer_dptr(source->buffer), view_bytes,
+            cudaMemcpyDeviceToDevice);
+        if (rc != cudaSuccess) {
+            return backend("vision position embedding expansion failed");
+        }
+    }
+    return modalities::Status::ok();
+#endif
+}
+
 modalities::Status NativeWorkspace::allocate(
     const NativeWorkspaceConfig& config) {
     if (!ctx_ || !buffers_.empty() || config.num_views < 1 ||
@@ -121,6 +225,9 @@ modalities::Status NativeWorkspace::allocate(
     }
     const int pool_area =
         config.vision_pool_factor * config.vision_pool_factor;
+    num_views_ = config.num_views;
+    max_prompt_tokens_ = config.max_prompt_tokens;
+    chunk_size_ = config.chunk_size;
     vision_sequence_ = config.num_views * 256;
     encoder_vision_sequence_ = vision_sequence_ / pool_area;
     encoder_sequence_ =
@@ -194,7 +301,9 @@ modalities::Status NativeWorkspace::allocate(
     FRT_ADD("gate_buf", {ds, 1024}, modalities::DType::kBFloat16);
     FRT_ADD("decoder_rms_ones", {1024}, modalities::DType::kBFloat16);
 #undef FRT_ADD
-    return initialize_rms_ones();
+    st = initialize_rms_ones();
+    if (!st.ok_status()) return st;
+    return initialize_rope();
 }
 
 const NativeWorkspaceBuffer* NativeWorkspace::find(
