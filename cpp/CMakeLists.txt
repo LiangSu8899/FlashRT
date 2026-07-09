@@ -128,6 +128,7 @@ target_include_directories(flashrt_cpp_loader
 
 add_library(flashrt_cpp_pi05 STATIC
   models/pi05/src/spec.cpp
+  models/pi05/src/native_weights.cpp
   models/pi05/src/prompt_format.cpp
   models/pi05/src/prompt_embed.cpp
   models/pi05/src/io.cpp

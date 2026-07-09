@@ -1,5 +1,7 @@
 #include "flashrt/model_runtime.h"
+#include "flashrt/cpp/models/pi05/native_weights.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cstdio>
 #include <cstring>
@@ -44,9 +46,19 @@ void write_raw_safetensors(const std::string& path,
 void write_raw_safetensors(const std::string& path,
                            const std::string& header,
                            uint64_t payload_bytes) {
-    write_raw_safetensors(path, header,
-                          std::string(static_cast<size_t>(payload_bytes),
-                                      '\0'));
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    uint64_t n = header.size();
+    for (int i = 0; i < 8; ++i) {
+        const char b = static_cast<char>((n >> (8 * i)) & 0xffu);
+        f.write(&b, 1);
+    }
+    f.write(header.data(), static_cast<std::streamsize>(header.size()));
+    if (payload_bytes) {
+        f.seekp(static_cast<std::streamoff>(payload_bytes - 1), std::ios::cur);
+        const char zero = 0;
+        f.write(&zero, 1);
+    }
+    assert(f.good());
 }
 
 void append_f32(std::string* out, float value) {
@@ -55,61 +67,32 @@ void append_f32(std::string* out, float value) {
     out->append(bytes, sizeof(bytes));
 }
 
-void write_safetensors(const std::string& path) {
-    struct Entry {
-        const char* key;
-        const char* dtype;
-        const char* shape;
-        uint64_t bytes;
-    };
-    const Entry entries[] = {
-        {"paligemma_with_expert.paligemma.lm_head.weight", "BF16",
-         "[1001,2048]", 1001ull * 2048ull * 2ull},
-        {"paligemma_with_expert.paligemma.model.vision_tower.vision_model"
-         ".embeddings.patch_embedding.weight",
-         "F32", "[1152,3,14,14]", 1152ull * 3ull * 14ull * 14ull * 4ull},
-        {"paligemma_with_expert.paligemma.model.vision_tower.vision_model"
-         ".embeddings.patch_embedding.bias",
-         "F32", "[1152]", 1152ull * 4ull},
-        {"paligemma_with_expert.paligemma.model.vision_tower.vision_model"
-         ".embeddings.position_embedding.weight",
-         "F32", "[256,1152]", 256ull * 1152ull * 4ull},
-        {"paligemma_with_expert.paligemma.model.multi_modal_projector.linear"
-         ".weight",
-         "F32", "[2048,1152]", 2048ull * 1152ull * 4ull},
-        {"paligemma_with_expert.paligemma.model.multi_modal_projector.linear"
-         ".bias",
-         "F32", "[2048]", 2048ull * 4ull},
-        {"action_in_proj.weight", "F32", "[1024,32]", 1024ull * 32ull * 4ull},
-        {"action_in_proj.bias", "F32", "[1024]", 1024ull * 4ull},
-        {"action_out_proj.weight", "F32", "[32,1024]", 32ull * 1024ull * 4ull},
-        {"action_out_proj.bias", "F32", "[32]", 32ull * 4ull},
-        {"time_mlp_in.weight", "F32", "[1024,1024]", 1024ull * 1024ull * 4ull},
-        {"time_mlp_in.bias", "F32", "[1024]", 1024ull * 4ull},
-        {"time_mlp_out.weight", "F32", "[1024,1024]", 1024ull * 1024ull * 4ull},
-        {"time_mlp_out.bias", "F32", "[1024]", 1024ull * 4ull},
-        {"paligemma_with_expert.paligemma.model.language_model.layers.0"
-         ".self_attn.q_proj.weight",
-         "F32", "[2048,2048]", 2048ull * 2048ull * 4ull},
-        {"paligemma_with_expert.gemma_expert.model.layers.0.self_attn"
-         ".q_proj.weight",
-         "F32", "[2048,1024]", 2048ull * 1024ull * 4ull},
-    };
+void write_safetensors(const std::string& path,
+                       const std::string& omit = "") {
+    const auto& entries =
+        flashrt::models::pi05::native_tensor_requirements();
     std::string header = "{";
     uint64_t offset = 0;
-    for (size_t i = 0; i < sizeof(entries) / sizeof(entries[0]); ++i) {
-        const Entry& e = entries[i];
-        if (i) header += ",";
+    bool first = true;
+    for (size_t i = 0; i < entries.size(); ++i) {
+        const auto& e = entries[i];
+        if (e.key == omit) continue;
+        if (!first) header += ",";
+        first = false;
         header += "\"";
         header += e.key;
-        header += "\":{\"dtype\":\"";
-        header += e.dtype;
-        header += "\",\"shape\":";
-        header += e.shape;
+        header += "\":{\"dtype\":\"F32\",\"shape\":[";
+        uint64_t elements = 1;
+        for (size_t dim = 0; dim < e.shape.size(); ++dim) {
+            if (dim) header += ",";
+            header += std::to_string(e.shape[dim]);
+            elements *= e.shape[dim];
+        }
+        header += "]";
         header += ",\"data_offsets\":[";
         header += std::to_string(offset);
         header += ",";
-        offset += e.bytes;
+        offset += elements * sizeof(float);
         header += std::to_string(offset);
         header += "]}";
     }
@@ -182,6 +165,23 @@ std::string config(const std::string& ckpt,
 }  // namespace
 
 int main() {
+    const auto& inventory =
+        flashrt::models::pi05::native_tensor_requirements();
+    assert(inventory.size() == 812);
+    const auto has_key = [&inventory](const char* key) {
+        return std::any_of(inventory.begin(), inventory.end(),
+                           [key](const auto& item) { return item.key == key; });
+    };
+    assert(has_key(
+        "paligemma_with_expert.paligemma.model.vision_tower.vision_model."
+        "encoder.layers.26.mlp.fc2.weight"));
+    assert(has_key(
+        "paligemma_with_expert.paligemma.model.language_model.layers.17."
+        "mlp.down_proj.weight"));
+    assert(has_key(
+        "paligemma_with_expert.gemma_expert.model.layers.17."
+        "post_attention_layernorm.dense.bias"));
+
     frt_model_runtime_v1* out = reinterpret_cast<frt_model_runtime_v1*>(0x1);
     int rc = frt_model_runtime_open_v1(nullptr, &out);
     assert(rc == -1);
@@ -222,6 +222,16 @@ int main() {
     assert(rc == -2);
     assert(out == nullptr);
     assert(std::strstr(frt_pi05_native_open_last_error(), "byte range"));
+
+    const std::string missing_key =
+        flashrt::models::pi05::native_tensor_requirements().back().key;
+    write_safetensors(root + "/model.safetensors", missing_key);
+    out = reinterpret_cast<frt_model_runtime_v1*>(0x1);
+    rc = frt_model_runtime_open_v1(config(root, tokenizer).c_str(), &out);
+    assert(rc == -2);
+    assert(out == nullptr);
+    assert(std::strstr(frt_pi05_native_open_last_error(),
+                       missing_key.c_str()));
 
     write_safetensors(root + "/model.safetensors");
     out = reinterpret_cast<frt_model_runtime_v1*>(0x1);

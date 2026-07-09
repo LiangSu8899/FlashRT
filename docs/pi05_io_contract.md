@@ -207,10 +207,9 @@ native-v2 configuration gate. The gate requires `io="native_v2"`,
 `checkpoint_path`, `tokenizer_model_path`, `state_prompt_mode="fixed"`,
 `max_prompt_tokens >= 200`, and a positive `state_dim`. It also parses
 `checkpoint_path/model.safetensors` through the native read-only mmap loader to
-verify the Pi0.5 prompt embedding table and the native builder's minimum
-required weight set
-(vision patch/position/projector, action projections, time MLP, and first
-encoder/decoder layer sentinels). It also verifies action/state q01/q99
+verify the complete 812-tensor Pi0.5 inventory: all 27 vision layers, all 18
+language encoder layers, all 18 action-expert layers, embeddings/final norms,
+projectors, action projections, and time MLP. It also verifies action/state q01/q99
 dimensions from either openpi `norm_stats.json` or LeRobot policy
 normalizer/unnormalizer safetensors. Safetensors tensor byte ranges must match
 dtype/shape, and normalization quantiles must be finite ordered pairs. Valid
