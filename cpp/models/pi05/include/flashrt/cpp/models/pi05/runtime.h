@@ -3,6 +3,7 @@
 
 #include "flashrt/cpp/families/vla/runtime.h"
 #include "flashrt/cpp/models/pi05/io.h"
+#include "flashrt/cpp/models/pi05/prompt_embed.h"
 
 #include <string>
 
@@ -41,6 +42,17 @@ struct RuntimeConfig {
     modalities::TensorView image_input_override;
     modalities::TensorView action_output_override;
 
+    /* Optional native prompt staging. When configured, set_prompt* writes
+     * token embeddings into prompt_embedding_output. The graph must consume
+     * this stable source buffer through its own captured copy/update path. */
+    std::string prompt_tokenizer_model_path;
+    modalities::TensorView prompt_embedding_table;
+    modalities::TensorView prompt_embedding_output;
+    std::uint64_t prompt_vocab_size = 0;
+    std::uint64_t prompt_hidden_dim = 0;
+    std::uint64_t prompt_max_tokens = 0;
+    float prompt_embedding_scale = 0.0f;
+
     ReplayFn replay_fn = nullptr;
     void* replay_user = nullptr;
 };
@@ -64,6 +76,13 @@ public:
     }
 
     int set_prompt(const char* text) override;
+    int set_prompt_state(const char* text, const float* state,
+                         std::uint64_t n_state);
+    const modalities::Status& prompt_status() const {
+        return prompt_status_;
+    }
+    std::uint64_t current_prompt_len() const { return current_prompt_len_; }
+
     modalities::Status prepare_vision(
         const std::vector<modalities::VisionFrame>& frames) override;
     int replay_tick() override;
@@ -73,6 +92,7 @@ private:
     void retain_export();
     void release_export();
     modalities::Status bind();
+    modalities::Status bind_prompt_staging();
 
     static int default_replay(frt_graph graph, frt_shape_key key,
                               int stream_id, void* user);
@@ -83,6 +103,14 @@ private:
     modalities::Status status_;
     modalities::VisionStaging staging_;
     RuntimeIo io_;
+    modalities::SentencePieceTokenizer prompt_tokenizer_;
+    PromptEmbeddingSpec prompt_spec_;
+    modalities::TensorView prompt_embedding_table_;
+    modalities::TensorView prompt_embedding_output_;
+    modalities::Status prompt_status_;
+    std::vector<std::int32_t> prompt_token_ids_;
+    std::uint64_t current_prompt_len_ = 0;
+    bool prompt_staging_enabled_ = false;
     frt_graph graph_ = nullptr;
     frt_shape_key graph_key_ = 0;
     int stream_id_ = -1;

@@ -90,6 +90,74 @@ inline RuntimeConfig make_config(const frt_pi05_runtime_config* in) {
                   sizeof(in->max_frame_height)) && in->max_frame_height > 0) {
         cfg.max_frame_height = in->max_frame_height;
     }
+    if (has_field(in, offsetof(frt_pi05_runtime_config,
+                               prompt_tokenizer_model_path),
+                  sizeof(in->prompt_tokenizer_model_path)) &&
+        in->prompt_tokenizer_model_path) {
+        cfg.prompt_tokenizer_model_path = in->prompt_tokenizer_model_path;
+    }
+    if (has_field(in, offsetof(frt_pi05_runtime_config,
+                               prompt_embedding_table_data),
+                  sizeof(in->prompt_embedding_table_data)) &&
+        in->prompt_embedding_table_data) {
+        cfg.prompt_embedding_table.data =
+            const_cast<void*>(in->prompt_embedding_table_data);
+    }
+    if (has_field(in, offsetof(frt_pi05_runtime_config,
+                               prompt_embedding_table_bytes),
+                  sizeof(in->prompt_embedding_table_bytes))) {
+        cfg.prompt_embedding_table.bytes = in->prompt_embedding_table_bytes;
+    }
+    if (has_field(in, offsetof(frt_pi05_runtime_config,
+                               prompt_embedding_table_dtype),
+                  sizeof(in->prompt_embedding_table_dtype))) {
+        cfg.prompt_embedding_table.dtype =
+            dtype(in->prompt_embedding_table_dtype);
+    }
+    if (has_field(in, offsetof(frt_pi05_runtime_config,
+                               prompt_embedding_vocab_size),
+                  sizeof(in->prompt_embedding_vocab_size))) {
+        cfg.prompt_vocab_size = in->prompt_embedding_vocab_size;
+    }
+    if (has_field(in, offsetof(frt_pi05_runtime_config,
+                               prompt_embedding_hidden_dim),
+                  sizeof(in->prompt_embedding_hidden_dim))) {
+        cfg.prompt_hidden_dim = in->prompt_embedding_hidden_dim;
+    }
+    if (has_field(in, offsetof(frt_pi05_runtime_config, prompt_embedding_data),
+                  sizeof(in->prompt_embedding_data)) &&
+        in->prompt_embedding_data) {
+        cfg.prompt_embedding_output.data = in->prompt_embedding_data;
+    }
+    if (has_field(in, offsetof(frt_pi05_runtime_config, prompt_embedding_bytes),
+                  sizeof(in->prompt_embedding_bytes))) {
+        cfg.prompt_embedding_output.bytes = in->prompt_embedding_bytes;
+    }
+    if (has_field(in, offsetof(frt_pi05_runtime_config, prompt_embedding_dtype),
+                  sizeof(in->prompt_embedding_dtype))) {
+        cfg.prompt_embedding_output.dtype = dtype(in->prompt_embedding_dtype);
+    }
+    if (has_field(in, offsetof(frt_pi05_runtime_config, max_prompt_tokens),
+                  sizeof(in->max_prompt_tokens))) {
+        cfg.prompt_max_tokens = in->max_prompt_tokens;
+    }
+    if (has_field(in, offsetof(frt_pi05_runtime_config,
+                               prompt_embedding_scale),
+                  sizeof(in->prompt_embedding_scale))) {
+        cfg.prompt_embedding_scale = in->prompt_embedding_scale;
+    }
+    if (cfg.prompt_vocab_size && cfg.prompt_hidden_dim) {
+        cfg.prompt_embedding_table.place = modalities::MemoryPlace::kHost;
+        cfg.prompt_embedding_table.layout = modalities::Layout::kFlat;
+        cfg.prompt_embedding_table.shape =
+            modalities::Shape{cfg.prompt_vocab_size, cfg.prompt_hidden_dim};
+    }
+    if (cfg.prompt_max_tokens && cfg.prompt_hidden_dim) {
+        cfg.prompt_embedding_output.place = modalities::MemoryPlace::kHost;
+        cfg.prompt_embedding_output.layout = modalities::Layout::kFlat;
+        cfg.prompt_embedding_output.shape =
+            modalities::Shape{cfg.prompt_max_tokens, cfg.prompt_hidden_dim};
+    }
     return cfg;
 }
 
