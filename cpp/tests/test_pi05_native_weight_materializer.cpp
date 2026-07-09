@@ -313,6 +313,24 @@ int main() {
                        std::vector<std::uint64_t>({1024, 8192}));
                 assert(destination.find("embedding_weight")->shape ==
                        std::vector<std::uint64_t>({257152, 2048}));
+                const char* pack =
+                    std::getenv("FLASH_RT_PI05_FULL_PACK_FP8");
+                if (pack && std::strcmp(pack, "1") == 0) {
+                    flashrt::models::pi05::NativeWeightPacker packer(
+                        &destination);
+                    assert(packer.pack_all_fp8(false).ok_status());
+                    assert(destination.size() == 1137);
+                    assert(destination.find(
+                               "fp8.vision_attn_qkv_w_26")->dtype ==
+                           flashrt::models::pi05::NativeWeightDType::
+                               kFp8E4M3);
+                    assert(destination.find(
+                               "fp8.encoder_ffn_gate_up_w_17")->shape ==
+                           std::vector<std::uint64_t>({2048, 32768}));
+                    assert(destination.find(
+                               "fp8.decoder_ffn_down_w_17.scale")->dtype ==
+                           flashrt::models::pi05::NativeWeightDType::kFloat32);
+                }
             }
             frt_ctx_destroy(full_ctx);
         }

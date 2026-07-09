@@ -268,6 +268,12 @@ prompt embedding table. With merged decoder gate/up buffers enabled this owns
 and the large embedding allocation explicit; they are producer configuration,
 not ABI fields.
 
+Full FP8 packing follows the producer's exact site inventory: four GEMM
+weights for each vision layer plus the projector, four for each encoder layer,
+and four for each decoder layer. Encoder gate/up columns are merged during
+setup. INT8 packing remains independently selectable for vision, encoder, and
+decoder and preserves their existing four/five/five weights-per-layer policy.
+
 CUDA graph execs are process-local objects. They are not serialized as a
 portable artifact. Removing Python from setup requires a native producer that
 loads assets and captures graphs in the replay process.

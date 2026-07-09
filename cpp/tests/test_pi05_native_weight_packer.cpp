@@ -4,6 +4,7 @@
 
 #include <cassert>
 #include <cstdio>
+#include <string>
 #include <vector>
 
 namespace {
@@ -25,6 +26,12 @@ std::vector<T> download(const flashrt::models::pi05::NativeDeviceWeight& weight)
                       result.size() * sizeof(T), cudaMemcpyDeviceToHost) ==
            cudaSuccess);
     return result;
+}
+
+void upload(flashrt::models::pi05::NativeDeviceWeightStore* store,
+            const std::string& name,
+            const flashrt::models::pi05::NativeBf16Tensor& tensor) {
+    assert(store->upload(name, tensor).ok_status());
 }
 
 }  // namespace
@@ -74,6 +81,59 @@ int main() {
         assert(download<float>(*store.find("int8.weight.scale")) ==
                expected_int8.scales);
         assert(!packer.pack_int8("missing").ok_status());
+    }
+    frt_ctx_destroy(ctx);
+
+    ctx = frt_ctx_create();
+    assert(ctx);
+    {
+        NativeDeviceWeightStore store(ctx);
+        NativeBf16Tensor tiny;
+        tiny.shape = {1, 1};
+        tiny.values = {flashrt::modalities::float_to_bfloat16(1.0f)};
+        for (int layer = 0; layer < 27; ++layer) {
+            for (const char* stem : {
+                     "vision_attn_qkv_w_", "vision_attn_o_w_",
+                     "vision_ffn_up_w_", "vision_ffn_down_w_"}) {
+                upload(&store, std::string(stem) + std::to_string(layer),
+                       tiny);
+            }
+        }
+        upload(&store, "encoder_multi_modal_projector_w", tiny);
+        for (int layer = 0; layer < 18; ++layer) {
+            const std::string suffix = std::to_string(layer);
+            for (const std::string& name : {
+                     "encoder_attn_qkv_w_" + suffix,
+                     "encoder_attn_o_w_" + suffix,
+                     "encoder_ffn_gate_w_" + suffix,
+                     "encoder_ffn_up_w_" + suffix,
+                     "encoder_ffn_down_w_" + suffix,
+                     "decoder_attn_qkv_w_" + suffix,
+                     "decoder_attn_o_w_" + suffix,
+                     "decoder_ffn_gate_w_" + suffix,
+                     "decoder_ffn_up_w_" + suffix,
+                     "decoder_ffn_gate_up_w_" + suffix,
+                     "decoder_ffn_down_w_" + suffix}) {
+                upload(&store, name, tiny);
+            }
+        }
+        assert(store.size() == 307);
+        NativeWeightPacker packer(&store);
+        assert(packer.pack_all_fp8(false).ok_status());
+        assert(packer.pack_vision_int8().ok_status());
+        assert(packer.pack_encoder_int8().ok_status());
+        assert(packer.pack_decoder_int8().ok_status());
+        assert(store.size() == 1407);
+        assert(store.find("fp8.vision_projector_w")->dtype ==
+               NativeWeightDType::kFp8E4M3);
+        assert(store.find("fp8.encoder_ffn_gate_up_w_17")->shape ==
+               std::vector<std::uint64_t>({1, 2}));
+        assert(store.find("int8.vision_ffn_down_w_26.scale")->dtype ==
+               NativeWeightDType::kFloat32);
+        assert(store.find("int8.encoder_ffn_up_w_17")->dtype ==
+               NativeWeightDType::kInt8);
+        assert(store.find("int8.decoder_ffn_down_w_17")->dtype ==
+               NativeWeightDType::kInt8);
     }
     frt_ctx_destroy(ctx);
     std::printf("PASS - Pi0.5 native weight packer\n");
