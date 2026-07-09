@@ -12,6 +12,7 @@
 #include <cuda_runtime_api.h>
 
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <cstdint>
 #include <cstdio>
@@ -289,6 +290,74 @@ int main() {
     over->release(over->owner);
     CHECK(owner.release == owner.retain,
           "create_over releases its native runtime and inherited producer");
+
+    /* A producer may declare prompt only when the native runtime can serve it. */
+    const int64_t prompt_shape[1] = {-1};
+    frt_runtime_port_desc prompt_ports[4] = {};
+    for (int i = 0; i < 3; ++i) prompt_ports[i] = ports[i];
+    prompt_ports[3].name = "prompt";
+    prompt_ports[3].modality = FRT_RT_MOD_TEXT;
+    prompt_ports[3].dtype = FRT_RT_DTYPE_U8;
+    prompt_ports[3].layout = FRT_RT_LAYOUT_FLAT;
+    prompt_ports[3].direction = FRT_RT_PORT_IN;
+    prompt_ports[3].update = FRT_RT_PORT_STAGED;
+    prompt_ports[3].shape = prompt_shape;
+    prompt_ports[3].rank = 1;
+    frt_model_runtime_v1* prompt_producer = frt_model_runtime_wrap(
+        &exp, prompt_ports, 4, stages, 2, nullptr, nullptr, nullptr, nullptr);
+    CHECK(prompt_producer != nullptr,
+          "producer declaration with prompt port");
+    frt_model_runtime_v1* prompt_over = nullptr;
+    CHECK(frt_pi05_model_runtime_create_over(prompt_producer, &cfg,
+                                             &prompt_over) == -2 &&
+              prompt_over == nullptr,
+          "prompt port is refused without prompt staging config");
+
+#ifdef FLASHRT_CPP_HAS_SENTENCEPIECE
+    const char* tokenizer = std::getenv("FLASH_RT_PALIGEMMA_TOKENIZER");
+    if (tokenizer && tokenizer[0] != '\0') {
+        constexpr std::uint64_t vocab = 257152;
+        constexpr std::uint64_t hidden = 2;
+        constexpr std::uint64_t max_tokens = 32;
+        std::vector<float> table(vocab * hidden);
+        for (std::uint64_t i = 0; i < vocab; ++i) {
+            table[i * hidden + 0] = static_cast<float>(i);
+            table[i * hidden + 1] = -static_cast<float>(i);
+        }
+        std::vector<float> prompt_out(max_tokens * hidden, 9.0f);
+        frt_pi05_runtime_config prompt_cfg = cfg;
+        prompt_cfg.prompt_tokenizer_model_path = tokenizer;
+        prompt_cfg.prompt_embedding_table_data = table.data();
+        prompt_cfg.prompt_embedding_table_bytes = table.size() * sizeof(float);
+        prompt_cfg.prompt_embedding_table_dtype = FRT_PI05_DTYPE_FLOAT32;
+        prompt_cfg.prompt_embedding_vocab_size = vocab;
+        prompt_cfg.prompt_embedding_hidden_dim = hidden;
+        prompt_cfg.prompt_embedding_data = prompt_out.data();
+        prompt_cfg.prompt_embedding_bytes =
+            prompt_out.size() * sizeof(float);
+        prompt_cfg.prompt_embedding_dtype = FRT_PI05_DTYPE_FLOAT32;
+        prompt_cfg.max_prompt_tokens = max_tokens;
+        prompt_cfg.prompt_embedding_scale = 0.5f;
+
+        CHECK(frt_pi05_model_runtime_create_over(prompt_producer,
+                                                 &prompt_cfg,
+                                                 &prompt_over) == 0 &&
+                  prompt_over,
+              "prompt port accepted with prompt staging config");
+        const char prompt_text[] = "pick up cube";
+        CHECK(prompt_over->verbs.set_input(
+                  prompt_over->self, 3, prompt_text,
+                  sizeof(prompt_text) - 1, -1) == 0,
+              "set_input(prompt) writes staged embeddings");
+        CHECK(std::fabs(prompt_out[0] - 1.0f) < 0.001f &&
+                  std::fabs(prompt_out[1] + 1.0f) < 0.001f,
+              "prompt staging wrote the BOS embedding row");
+        prompt_over->release(prompt_over->owner);
+    } else {
+        std::printf("SKIP - FLASH_RT_PALIGEMMA_TOKENIZER not set\n");
+    }
+#endif
+    prompt_producer->release(prompt_producer->owner);
 
     frt_graph_destroy(graph);
     frt_ctx_destroy(ctx);

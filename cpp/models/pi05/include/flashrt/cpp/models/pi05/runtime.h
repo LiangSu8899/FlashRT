@@ -81,6 +81,7 @@ public:
     const modalities::Status& prompt_status() const {
         return prompt_status_;
     }
+    bool prompt_staging_enabled() const { return prompt_staging_enabled_; }
     std::uint64_t current_prompt_len() const { return current_prompt_len_; }
 
     modalities::Status prepare_vision(
