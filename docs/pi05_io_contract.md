@@ -227,8 +227,10 @@ keys and LeRobot `model.`-prefixed keys.
 Materialized device weights use `frt_buffer` allocations owned by the native
 producer's `frt_ctx`. They are internal setup assets, not model ports and not
 capsule regions. Upload is complete before capture; duplicate logical names or
-shape/payload mismatches fail setup. Destroying the context releases the device
-weights after graphs and plans, preserving the exec ownership order.
+typed shape/payload mismatches fail setup. The same store carries BF16, FP8
+E4M3, INT8, and FP32 scale buffers without introducing a model-level state
+object. Destroying the context releases the device weights after graphs and
+plans, preserving the exec ownership order.
 
 The composed materializer covers language-encoder, action-expert, and vision
 weights. Encoder layers emit the five pipeline groups (`attn_qkv`, `attn_o`,
