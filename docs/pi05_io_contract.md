@@ -217,6 +217,13 @@ configuration returns unsupported until device weight materialization and graph
 capture are complete. The mmap and parsed tensor views are setup-side assets;
 they never enter the model-runtime ABI or the hot path.
 
+The native setup layer also carries CPU reference transforms matching the
+existing PyTorch producer: source BF16 rounding for vision/decoder weights,
+`OIHW -> HWIO` patch permutation, Q/K head interleave, QKV and gate/up fusion,
+and FP32 encoder RMSNorm fold before the final BF16 rounding. Real-checkpoint
+gates compare the resulting BF16 bytes against PyTorch for both bare OpenPI
+keys and LeRobot `model.`-prefixed keys.
+
 CUDA graph execs are process-local objects. They are not serialized as a
 portable artifact. Removing Python from setup requires a native producer that
 loads assets and captures graphs in the replay process.
@@ -233,6 +240,12 @@ ctest --test-dir cpp/build --output-on-failure
 ```
 
 Real-checkpoint gates:
+
+```
+python cpp/tests/gate_pi05_native_weight_ops.py \
+  --checkpoint <pi05 checkpoint> \
+  --probe cpp/build/pi05_native_weight_probe
+```
 
 ```
 python cpp/tests/gate_pi05_model_runtime_export.py ...

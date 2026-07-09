@@ -129,6 +129,7 @@ target_include_directories(flashrt_cpp_loader
 add_library(flashrt_cpp_pi05 STATIC
   models/pi05/src/spec.cpp
   models/pi05/src/native_weights.cpp
+  models/pi05/src/native_weight_ops.cpp
   models/pi05/src/prompt_format.cpp
   models/pi05/src/prompt_embed.cpp
   models/pi05/src/io.cpp
@@ -136,14 +137,14 @@ add_library(flashrt_cpp_pi05 STATIC
 target_include_directories(flashrt_cpp_pi05
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/include)
 target_link_libraries(flashrt_cpp_pi05
-  PUBLIC flashrt_cpp_modalities flashrt_cpp_vla)
+  PUBLIC flashrt_cpp_modalities flashrt_cpp_vla flashrt_cpp_loader)
 
 add_library(flashrt_cpp_pi05_c SHARED
   models/pi05/src/c_api.cpp
   models/pi05/src/model_runtime.cpp
   models/pi05/src/native_open.cpp)
 target_link_libraries(flashrt_cpp_pi05_c
-  PUBLIC flashrt_cpp_pi05 flashrt_cpp_loader flashrt_runtime)
+  PUBLIC flashrt_cpp_pi05 flashrt_runtime)
 target_include_directories(flashrt_cpp_pi05_c
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/include)
 
@@ -169,6 +170,15 @@ if(BUILD_TESTING)
   target_link_libraries(test_pi05_runtime
     PRIVATE flashrt_cpp_pi05 flashrt_cpp_modalities)
   add_test(NAME pi05_runtime COMMAND test_pi05_runtime)
+
+  add_executable(test_pi05_native_weight_ops
+    tests/test_pi05_native_weight_ops.cpp)
+  target_link_libraries(test_pi05_native_weight_ops PRIVATE flashrt_cpp_pi05)
+  add_test(NAME pi05_native_weight_ops COMMAND test_pi05_native_weight_ops)
+
+  add_executable(pi05_native_weight_probe
+    tests/pi05_native_weight_probe.cpp)
+  target_link_libraries(pi05_native_weight_probe PRIVATE flashrt_cpp_pi05)
 
   add_executable(test_pi05_prompt_format tests/test_pi05_prompt_format.cpp)
   target_link_libraries(test_pi05_prompt_format PRIVATE flashrt_cpp_pi05)
