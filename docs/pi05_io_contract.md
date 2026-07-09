@@ -314,6 +314,14 @@ RoPE, patch im2col, and vision pooling. These are direct typed calls to the
 existing CUDA implementations, with CPU-reference and captured-replay gates;
 they do not route through pybind or introduce a second kernel implementation.
 
+The first composed BF16 forward segment is the encoder QKV path:
+RMSNorm, the folded QKV projection, RoPE split, and writes into the selected
+layer of the shared K/V cache. Layer 17 is also the complete final encoder
+layer behavior because the producer intentionally stops after populating its
+cache. Its outputs are bit-exact (`cos=1`, `max=0`) against the PyTorch
+checkpoint path for both OpenPI and LeRobot layouts, and the segment captures
+and replays with one graph variant.
+
 RTX attention owns a separate context-backed buffer set rather than borrowing
 Torch tensors: SigLIP Q/K/V, encoder Q and 18-layer shared K/V cache, decoder
 Q, fixed-shape `seqused/devpos` int32 values, FA2 outputs/LSE, and split-KV
