@@ -172,6 +172,11 @@ def export_model_runtime(pl, identity=None, extra_regions=None,
                 _rt.PortSpec("state", "state", "f32", "flat", "in", "staged",
                              required=True, shape=(state_dim,)),
             ] + ports
+            if not (uses_rtc_prefix or uses_rtc_vjp):
+                ports.append(
+                    _rt.PortSpec("actions_raw", "tensor", tensor_dtype,
+                                 "flat", "out", "swap", shape=(chunk, 32),
+                                 buffer=wrap["diffusion_noise"]))
         if uses_rtc_prefix or uses_rtc_vjp:
             ports.extend([
                 _rt.PortSpec("prev_action_chunk", "tensor", tensor_dtype,
