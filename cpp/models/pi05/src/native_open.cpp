@@ -3,8 +3,11 @@
 #include <cerrno>
 #include <cctype>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <dirent.h>
 #include <fstream>
+#include <iterator>
 #include <map>
 #include <string>
 #include <sys/stat.h>
@@ -347,6 +350,46 @@ bool parse_u64_array_property(const std::string& object,
     return false;
 }
 
+bool parse_f64_array_property(const std::string& object,
+                              const char* name,
+                              std::vector<double>* out) {
+    const std::string q = quoted_key(name);
+    size_t p = object.find(q);
+    if (p == std::string::npos) return false;
+    p += q.size();
+    while (p < object.size() &&
+           std::isspace(static_cast<unsigned char>(object[p]))) ++p;
+    if (p >= object.size() || object[p++] != ':') return false;
+    while (p < object.size() &&
+           std::isspace(static_cast<unsigned char>(object[p]))) ++p;
+    if (p >= object.size() || object[p++] != '[') return false;
+    std::vector<double> values;
+    while (p < object.size()) {
+        while (p < object.size() &&
+               std::isspace(static_cast<unsigned char>(object[p]))) ++p;
+        if (p < object.size() && object[p] == ']') {
+            ++p;
+            if (out) *out = std::move(values);
+            return true;
+        }
+        errno = 0;
+        char* end = nullptr;
+        const double value = std::strtod(object.c_str() + p, &end);
+        if (errno || end == object.c_str() + p) return false;
+        values.push_back(value);
+        p = static_cast<size_t>(end - object.c_str());
+        while (p < object.size() &&
+               std::isspace(static_cast<unsigned char>(object[p]))) ++p;
+        if (p < object.size() && object[p] == ',') {
+            ++p;
+            continue;
+        }
+        if (p < object.size() && object[p] == ']') continue;
+        return false;
+    }
+    return false;
+}
+
 bool tensor_meta(const std::string& header,
                  const std::string& key,
                  TensorMeta* meta) {
@@ -369,6 +412,174 @@ bool tensor_meta(const std::string& header,
         meta->data_end = offsets[1];
     }
     return true;
+}
+
+bool read_text_file(const std::string& path, std::string* out) {
+    if (!out) return false;
+    std::ifstream f(path);
+    if (!f) return false;
+    out->assign((std::istreambuf_iterator<char>(f)),
+                std::istreambuf_iterator<char>());
+    return f.good() || f.eof();
+}
+
+std::string dirname(const std::string& path) {
+    const size_t p = path.find_last_of('/');
+    if (p == std::string::npos) return ".";
+    if (p == 0) return "/";
+    return path.substr(0, p);
+}
+
+bool norm_block_dims(const std::string& json,
+                     const char* block_name,
+                     size_t* dims) {
+    std::string block;
+    if (!object_for_key(json, block_name, &block)) return false;
+    std::vector<double> q01;
+    std::vector<double> q99;
+    if (!parse_f64_array_property(block, "q01", &q01) ||
+        !parse_f64_array_property(block, "q99", &q99) ||
+        q01.empty() || q01.size() != q99.size()) {
+        return false;
+    }
+    if (dims) *dims = q01.size();
+    return true;
+}
+
+bool validate_norm_stats_file(const std::string& path,
+                              int64_t state_dim) {
+    std::string json;
+    if (!read_text_file(path, &json)) return false;
+    size_t action_dims = 0;
+    size_t state_dims = 0;
+    if (!norm_block_dims(json, "actions", &action_dims) ||
+        !norm_block_dims(json, "state", &state_dims)) {
+        g_last_error = "norm_stats.json is missing actions/state q01/q99";
+        return false;
+    }
+    if (action_dims == 0 || action_dims > 32) {
+        g_last_error = "norm_stats action dimension is invalid";
+        return false;
+    }
+    if (state_dims != static_cast<size_t>(state_dim)) {
+        g_last_error = "norm_stats state dimension does not match config";
+        return false;
+    }
+    g_last_error.clear();
+    return true;
+}
+
+bool has_prefix(const std::string& s, const char* prefix) {
+    const size_t n = std::strlen(prefix);
+    return s.size() >= n && s.compare(0, n, prefix) == 0;
+}
+
+bool has_suffix(const std::string& s, const char* suffix) {
+    const size_t n = std::strlen(suffix);
+    return s.size() >= n && s.compare(s.size() - n, n, suffix) == 0;
+}
+
+std::string find_child(const std::string& dir,
+                       const char* prefix,
+                       const char* suffix) {
+    DIR* d = ::opendir(dir.c_str());
+    if (!d) return "";
+    std::string found;
+    while (dirent* ent = ::readdir(d)) {
+        const std::string name = ent->d_name;
+        if (has_prefix(name, prefix) && has_suffix(name, suffix)) {
+            found = join_path(dir, name.c_str());
+            break;
+        }
+    }
+    ::closedir(d);
+    return found;
+}
+
+bool tensor_1d_dim(const std::string& header,
+                   const char* key,
+                   size_t* dims) {
+    TensorMeta meta;
+    if (!tensor_meta(header, key, &meta)) return false;
+    if (meta.dtype != "F32" || meta.shape.size() != 1 ||
+        meta.shape[0] == 0) {
+        return false;
+    }
+    if (dims) *dims = static_cast<size_t>(meta.shape[0]);
+    return true;
+}
+
+bool validate_lerobot_policy_norm_stats(const std::string& checkpoint_path,
+                                        int64_t state_dim) {
+    const std::string pre = find_child(
+        checkpoint_path, "policy_preprocessor_step_",
+        "_normalizer_processor.safetensors");
+    const std::string post = find_child(
+        checkpoint_path, "policy_postprocessor_step_",
+        "_unnormalizer_processor.safetensors");
+    if (pre.empty() || post.empty()) return false;
+
+    std::string pre_header;
+    std::string post_header;
+    if (!read_safetensors_header(pre, &pre_header) ||
+        !read_safetensors_header(post, &post_header)) {
+        return false;
+    }
+    size_t state_q01 = 0;
+    size_t state_q99 = 0;
+    size_t action_q01 = 0;
+    size_t action_q99 = 0;
+    if (!tensor_1d_dim(pre_header, "observation.state.q01", &state_q01) ||
+        !tensor_1d_dim(pre_header, "observation.state.q99", &state_q99) ||
+        !tensor_1d_dim(post_header, "action.q01", &action_q01) ||
+        !tensor_1d_dim(post_header, "action.q99", &action_q99)) {
+        g_last_error =
+            "lerobot policy stats are missing action/state q01/q99";
+        return false;
+    }
+    if (state_q01 != state_q99 ||
+        state_q01 != static_cast<size_t>(state_dim)) {
+        g_last_error =
+            "lerobot policy state dimension does not match config";
+        return false;
+    }
+    if (action_q01 != action_q99 || action_q01 > 32) {
+        g_last_error = "lerobot policy action dimension is invalid";
+        return false;
+    }
+    g_last_error.clear();
+    return true;
+}
+
+bool validate_norm_stats(const std::string& checkpoint_path,
+                         int64_t state_dim) {
+    const std::string parent = dirname(checkpoint_path);
+    const std::string candidates[] = {
+        join_path(checkpoint_path,
+                  "assets/physical-intelligence/libero/norm_stats.json"),
+        join_path(checkpoint_path, "assets/droid/norm_stats.json"),
+        join_path(checkpoint_path, "norm_stats.json"),
+        join_path(parent,
+                  "pi05_libero/assets/physical-intelligence/libero/"
+                  "norm_stats.json"),
+        join_path(parent, "pi05_droid/assets/droid/norm_stats.json"),
+        join_path(parent, "pi05_droid_pytorch/assets/droid/norm_stats.json"),
+    };
+    bool saw_malformed = false;
+    std::string malformed_error;
+    for (const std::string& path : candidates) {
+        if (!regular_file_exists(path)) continue;
+        if (validate_norm_stats_file(path, state_dim)) return true;
+        saw_malformed = true;
+        malformed_error = g_last_error;
+    }
+    if (validate_lerobot_policy_norm_stats(checkpoint_path, state_dim)) {
+        return true;
+    }
+    g_last_error = saw_malformed
+                       ? malformed_error
+                       : "norm_stats.json not found for Pi0.5 native_v2";
+    return false;
 }
 
 bool validate_pi05_safetensors(const std::string& checkpoint_path) {
@@ -513,6 +724,9 @@ int validate_config(const char* config_json) {
     if (chunk && chunk <= 0) {
         g_last_error = "chunk must be positive";
         return -1;
+    }
+    if (!validate_norm_stats(checkpoint_path, state_dim)) {
+        return -2;
     }
 
     g_last_error =
