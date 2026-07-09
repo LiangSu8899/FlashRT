@@ -20,6 +20,16 @@ public:
         NativeWorkspace* workspace, NativeRtxAttentionWorkspace* attention,
         std::uintptr_t stream) const;
 #ifdef FLASHRT_CPP_WITH_FA2
+    modalities::Status vision_layer(
+        int layer, const NativeDeviceWeightStore& weights,
+        NativeWorkspace* workspace, NativeRtxAttentionWorkspace* attention,
+        const NativeRtxAttentionDriver* attention_driver,
+        std::uintptr_t stream) const;
+    modalities::Status vision(
+        const NativeDeviceWeightStore& weights, NativeWorkspace* workspace,
+        NativeRtxAttentionWorkspace* attention,
+        const NativeRtxAttentionDriver* attention_driver,
+        std::uintptr_t stream) const;
     modalities::Status encoder_layer(
         int layer, const NativeDeviceWeightStore& weights,
         NativeWorkspace* workspace, NativeRtxAttentionWorkspace* attention,
