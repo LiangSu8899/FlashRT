@@ -22,12 +22,37 @@ include(CTest)
 option(FLASHRT_CPP_WITH_EXEC "Build/link the exec layer for native replay" ON)
 option(FLASHRT_CPP_WITH_CUDA_STAGING "Enable conservative CUDA H2D/D2H modality staging" ON)
 option(FLASHRT_CPP_WITH_CUDA_KERNELS "Enable CUDA modality kernels" ON)
+option(FLASHRT_CPP_WITH_SENTENCEPIECE "Enable native SentencePiece text tokenization" OFF)
 if(FLASHRT_CPP_WITH_CUDA_STAGING)
   find_package(CUDAToolkit REQUIRED)
 endif()
 if(FLASHRT_CPP_WITH_CUDA_KERNELS)
   enable_language(CUDA)
   find_package(CUDAToolkit REQUIRED)
+endif()
+if(FLASHRT_CPP_WITH_SENTENCEPIECE)
+  find_path(FLASHRT_SENTENCEPIECE_INCLUDE_DIR sentencepiece_processor.h)
+  find_library(FLASHRT_SENTENCEPIECE_LIBRARY sentencepiece)
+  if(FLASHRT_SENTENCEPIECE_INCLUDE_DIR AND FLASHRT_SENTENCEPIECE_LIBRARY)
+    add_library(flashrt_sentencepiece_external INTERFACE)
+    target_include_directories(flashrt_sentencepiece_external
+      INTERFACE ${FLASHRT_SENTENCEPIECE_INCLUDE_DIR})
+    target_link_libraries(flashrt_sentencepiece_external
+      INTERFACE ${FLASHRT_SENTENCEPIECE_LIBRARY})
+    set(FLASHRT_CPP_SENTENCEPIECE_TARGET flashrt_sentencepiece_external)
+  else()
+    include(FetchContent)
+    set(SPM_ENABLE_SHARED OFF CACHE BOOL "" FORCE)
+    set(SPM_BUILD_TEST OFF CACHE BOOL "" FORCE)
+    set(SPM_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    FetchContent_Declare(
+      sentencepiece
+      GIT_REPOSITORY https://github.com/google/sentencepiece.git
+      GIT_TAG v0.2.1)
+    FetchContent_MakeAvailable(sentencepiece)
+    set(FLASHRT_SENTENCEPIECE_INCLUDE_DIR ${sentencepiece_SOURCE_DIR}/src)
+    set(FLASHRT_CPP_SENTENCEPIECE_TARGET sentencepiece-static)
+  endif()
 endif()
 if(FLASHRT_CPP_WITH_EXEC AND NOT TARGET flashrt_exec)
   add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../exec
@@ -52,6 +77,13 @@ set(FLASHRT_CPP_MODALITY_SRCS
   modalities/src/vision_cpu.cpp
   modalities/src/text_cpu.cpp
   modalities/src/action_cpu.cpp)
+if(FLASHRT_CPP_WITH_SENTENCEPIECE)
+  list(APPEND FLASHRT_CPP_MODALITY_SRCS
+    modalities/src/sentencepiece_tokenizer.cpp)
+else()
+  list(APPEND FLASHRT_CPP_MODALITY_SRCS
+    modalities/src/tokenizer_unavailable.cpp)
+endif()
 if(FLASHRT_CPP_WITH_CUDA_KERNELS)
   list(APPEND FLASHRT_CPP_MODALITY_SRCS modalities/src/vision_cuda.cu)
 endif()
@@ -63,6 +95,14 @@ if(FLASHRT_CPP_WITH_CUDA_STAGING)
   target_compile_definitions(flashrt_cpp_modalities
     PUBLIC FLASHRT_CPP_WITH_CUDA_STAGING=1)
   target_link_libraries(flashrt_cpp_modalities PUBLIC CUDA::cudart)
+endif()
+if(FLASHRT_CPP_WITH_SENTENCEPIECE)
+  target_compile_definitions(flashrt_cpp_modalities
+    PUBLIC FLASHRT_CPP_HAS_SENTENCEPIECE=1)
+  target_include_directories(flashrt_cpp_modalities
+    PUBLIC ${FLASHRT_SENTENCEPIECE_INCLUDE_DIR})
+  target_link_libraries(flashrt_cpp_modalities
+    PUBLIC ${FLASHRT_CPP_SENTENCEPIECE_TARGET})
 endif()
 if(FLASHRT_CPP_WITH_CUDA_KERNELS)
   target_compile_definitions(flashrt_cpp_modalities
@@ -106,6 +146,10 @@ if(BUILD_TESTING)
   add_executable(test_text_modalities tests/test_text_modalities.cpp)
   target_link_libraries(test_text_modalities PRIVATE flashrt_cpp_modalities)
   add_test(NAME text_modalities COMMAND test_text_modalities)
+
+  add_executable(test_text_tokenizer tests/test_text_tokenizer.cpp)
+  target_link_libraries(test_text_tokenizer PRIVATE flashrt_cpp_modalities)
+  add_test(NAME text_tokenizer COMMAND test_text_tokenizer)
 
   add_executable(test_pi05_runtime tests/test_pi05_runtime.cpp)
   target_link_libraries(test_pi05_runtime
