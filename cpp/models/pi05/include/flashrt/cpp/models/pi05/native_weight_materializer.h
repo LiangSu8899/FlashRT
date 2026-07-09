@@ -15,12 +15,17 @@ public:
         : source_(source), destination_(destination) {}
 
     modalities::Status materialize_encoder_layer(int layer);
+    modalities::Status materialize_decoder_layer(int layer,
+                                                  bool merge_gate_up);
 
 private:
     modalities::Status load(const std::string& key, NativeFloatTensor* out);
     modalities::Status upload(const std::string& name,
                               const NativeFloatTensor& tensor);
     modalities::Status upload_rounded_transpose(
+        const std::string& source_key,
+        const std::string& destination_name);
+    modalities::Status upload_rounded_copy(
         const std::string& source_key,
         const std::string& destination_name);
     modalities::Status upload_folded_transpose(

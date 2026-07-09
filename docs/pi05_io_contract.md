@@ -230,13 +230,13 @@ capsule regions. Upload is complete before capture; duplicate logical names or
 shape/payload mismatches fail setup. Destroying the context releases the device
 weights after graphs and plans, preserving the exec ownership order.
 
-The first composed materializer covers one language-encoder layer and emits
-the five names consumed by the existing pipeline (`attn_qkv`, `attn_o`,
-`ffn_gate`, `ffn_up`, and `ffn_down`). It performs FP32 RMS folds before BF16
-upload and has been exercised against both supported real checkpoint layouts.
-Vision, decoder, global weights, and precision-specific packing remain setup
-work; `open_v1` stays unsupported until that inventory and graph capture are
-complete.
+The composed layer materializer covers language-encoder and action-expert
+layers. Encoder layers emit the five pipeline groups (`attn_qkv`, `attn_o`,
+`ffn_gate`, `ffn_up`, and `ffn_down`) with FP32 RMS folds. Decoder layers emit
+those groups plus the four AdaRMS modulation tensors and the optional merged
+gate/up buffer used by the FP16 path. Both have been exercised against the two
+supported real checkpoint layouts. Vision, global weights, precision-specific
+packing, and graph capture remain incomplete, so `open_v1` stays unsupported.
 
 CUDA graph execs are process-local objects. They are not serialized as a
 portable artifact. Removing Python from setup requires a native producer that
