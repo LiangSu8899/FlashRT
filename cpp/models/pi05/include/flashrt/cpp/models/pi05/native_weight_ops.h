@@ -68,6 +68,11 @@ modalities::Status native_scale(const NativeFloatTensor& input,
                                 float scale,
                                 NativeFloatTensor* out);
 
+modalities::Status native_pi05_time_embeddings(
+    int num_steps,
+    std::uint64_t embedding_dim,
+    NativeFloatTensor* out);
+
 }  // namespace pi05
 }  // namespace models
 }  // namespace flashrt

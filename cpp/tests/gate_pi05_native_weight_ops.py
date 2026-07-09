@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import math
 import subprocess
 
 import torch
@@ -81,6 +82,33 @@ def main() -> None:
     gate = bf16(f"{DECODER}.mlp.gate_proj.weight").t()
     up = bf16(f"{DECODER}.mlp.up_proj.weight").t()
     expected["decoder_gate_up0"] = torch.cat([gate, up], dim=1).contiguous()
+
+    def time_embeds(num_steps: int) -> torch.Tensor:
+        fraction = torch.linspace(0.0, 1.0, 512)
+        period = 4e-3 * (4.0 / 4e-3) ** fraction
+        t = torch.tensor(1.0, dtype=torch.float32)
+        rows = []
+        for _ in range(num_steps):
+            angle = (
+                t.unsqueeze(-1)
+                * (1.0 / period).unsqueeze(0)
+                * 2
+                * math.pi
+            )
+            rows.append(
+                torch.cat([torch.sin(angle), torch.cos(angle)], dim=-1).to(
+                    torch.bfloat16
+                )
+            )
+            t = t - 1.0 / num_steps
+        return torch.cat(rows, dim=0).contiguous()
+
+    action_out = bf16("action_out_proj.weight").t().to(torch.bfloat16)
+    for num_steps in (10, 5):
+        expected[f"action_out{num_steps}"] = (
+            action_out * (-1.0 / num_steps)
+        ).contiguous()
+        expected[f"time_embeds{num_steps}"] = time_embeds(num_steps)
 
     for operation, tensor in expected.items():
         output = subprocess.check_output(

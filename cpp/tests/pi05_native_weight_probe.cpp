@@ -128,6 +128,30 @@ bool gate_up(const SafetensorsFile& file, NativeBf16Tensor* out) {
            finish(joined, out);
 }
 
+bool action_out(const SafetensorsFile& file, int num_steps,
+                NativeBf16Tensor* out) {
+    NativeFloatTensor source;
+    NativeFloatTensor rounded;
+    NativeFloatTensor transposed;
+    NativeFloatTensor scaled;
+    return load(file, "action_out_proj.weight", &source) &&
+           round_bf16(source, &rounded) &&
+           flashrt::models::pi05::native_transpose_2d(rounded, &transposed)
+               .ok_status() &&
+           flashrt::models::pi05::native_scale(
+               transposed, -1.0f / static_cast<float>(num_steps), &scaled)
+               .ok_status() &&
+           finish(scaled, out);
+}
+
+bool time_embeds(int num_steps, NativeBf16Tensor* out) {
+    NativeFloatTensor generated;
+    return flashrt::models::pi05::native_pi05_time_embeddings(num_steps, 1024,
+                                                              &generated)
+               .ok_status() &&
+           finish(generated, out);
+}
+
 std::uint64_t fnv1a(const std::vector<std::uint16_t>& values) {
     std::uint64_t hash = 14695981039346656037ull;
     const auto* bytes = reinterpret_cast<const unsigned char*>(values.data());
@@ -161,6 +185,14 @@ int main(int argc, char** argv) {
         ok = qkv(file, kDecoder, false, &output);
     } else if (op == "decoder_gate_up0") {
         ok = gate_up(file, &output);
+    } else if (op == "action_out10") {
+        ok = action_out(file, 10, &output);
+    } else if (op == "action_out5") {
+        ok = action_out(file, 5, &output);
+    } else if (op == "time_embeds10") {
+        ok = time_embeds(10, &output);
+    } else if (op == "time_embeds5") {
+        ok = time_embeds(5, &output);
     }
     if (!ok) {
         std::cerr << "weight probe operation failed: " << op << '\n';

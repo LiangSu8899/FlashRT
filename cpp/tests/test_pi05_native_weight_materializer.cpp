@@ -154,6 +154,20 @@ int main() {
         {vision_layer + ".layer_norm1.bias", {2}, sequence(2, 38.0f)},
         {vision_layer + ".layer_norm2.weight", {2}, sequence(2, 39.0f)},
         {vision_layer + ".layer_norm2.bias", {2}, sequence(2, 40.0f)},
+        {"paligemma_with_expert.gemma_expert.model.norm.dense.weight",
+         {3, 2}, sequence(6, 41.0f)},
+        {"paligemma_with_expert.gemma_expert.model.norm.dense.bias",
+         {3}, sequence(3, 42.0f)},
+        {"time_mlp_in.weight", {2, 2}, sequence(4, 43.0f)},
+        {"time_mlp_in.bias", {2}, sequence(2, 44.0f)},
+        {"time_mlp_out.weight", {2, 2}, sequence(4, 45.0f)},
+        {"time_mlp_out.bias", {2}, sequence(2, 46.0f)},
+        {"action_in_proj.weight", {2, 1}, sequence(2, 47.0f)},
+        {"action_in_proj.bias", {2}, sequence(2, 48.0f)},
+        {"action_out_proj.weight", {1, 2}, sequence(2, 49.0f)},
+        {"action_out_proj.bias", {1}, sequence(1, 50.0f)},
+        {"paligemma_with_expert.paligemma.lm_head.weight",
+         {4, 2}, sequence(8, 51.0f)},
     };
     const std::string path = temp_path();
     write_checkpoint(path, entries);
@@ -200,6 +214,19 @@ int main() {
         assert(vision_qkv &&
                vision_qkv->shape == std::vector<std::uint64_t>({2, 6}));
         assert(!materializer.materialize_vision_layer(27).ok_status());
+        assert(!materializer.materialize_decoder_globals(0).ok_status());
+        assert(materializer.materialize_decoder_globals(10).ok_status());
+        assert(destination.size() == 45);
+        assert(destination.find("decoder_final_norm_mod_w")->shape ==
+               std::vector<std::uint64_t>({2, 3}));
+        assert(destination.find("decoder_time_embeds")->shape ==
+               std::vector<std::uint64_t>({10, 1024}));
+        assert(destination.find("decoder_action_out_proj_w")->shape ==
+               std::vector<std::uint64_t>({2, 1}));
+        assert(materializer.materialize_embedding().ok_status());
+        assert(destination.size() == 46);
+        assert(destination.find("embedding_weight")->shape ==
+               std::vector<std::uint64_t>({4, 2}));
     }
     frt_ctx_destroy(ctx);
     assert(::unlink(path.c_str()) == 0);
@@ -235,6 +262,16 @@ int main() {
                    std::vector<std::uint64_t>({14, 14, 3, 1152}));
             assert(destination.find("vision_attn_qkv_w_0")->shape ==
                    std::vector<std::uint64_t>({1152, 3456}));
+            assert(materializer.materialize_decoder_globals(10).ok_status());
+            assert(destination.size() == 45);
+            assert(destination.find("decoder_final_norm_mod_w")->shape ==
+                   std::vector<std::uint64_t>({1024, 3072}));
+            assert(destination.find("decoder_time_embeds")->shape ==
+                   std::vector<std::uint64_t>({10, 1024}));
+            assert(destination.find("decoder_action_in_proj_w")->shape ==
+                   std::vector<std::uint64_t>({32, 1024}));
+            assert(destination.find("decoder_action_out_proj_w")->shape ==
+                   std::vector<std::uint64_t>({1024, 32}));
         }
         frt_ctx_destroy(real_ctx);
     }

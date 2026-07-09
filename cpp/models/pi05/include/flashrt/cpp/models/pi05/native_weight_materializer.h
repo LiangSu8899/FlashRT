@@ -19,6 +19,8 @@ public:
                                                   bool merge_gate_up);
     modalities::Status materialize_vision_layer(int layer);
     modalities::Status materialize_vision_globals();
+    modalities::Status materialize_decoder_globals(int num_steps);
+    modalities::Status materialize_embedding();
 
 private:
     modalities::Status load(const std::string& key, NativeFloatTensor* out);
@@ -34,6 +36,11 @@ private:
         const std::string& source_key,
         const NativeFloatTensor& norm,
         const std::string& destination_name);
+    modalities::Status upload_rounded_scaled(
+        const std::string& source_key,
+        const std::string& destination_name,
+        float scale,
+        bool transpose);
 
     const loader::SafetensorsFile& source_;
     NativeDeviceWeightStore* destination_ = nullptr;

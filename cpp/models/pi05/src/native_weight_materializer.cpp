@@ -93,6 +93,30 @@ modalities::Status NativeWeightMaterializer::upload_folded_transpose(
     return upload(destination_name, transposed);
 }
 
+modalities::Status NativeWeightMaterializer::upload_rounded_scaled(
+    const std::string& source_key,
+    const std::string& destination_name,
+    float scale,
+    bool transpose) {
+    NativeFloatTensor source;
+    NativeFloatTensor rounded;
+    NativeFloatTensor arranged;
+    NativeFloatTensor scaled;
+    modalities::Status st = load(source_key, &source);
+    if (!st.ok_status()) return st;
+    st = native_round_to_bf16_float(source, &rounded);
+    if (!st.ok_status()) return st;
+    if (transpose) {
+        st = native_transpose_2d(rounded, &arranged);
+        if (!st.ok_status()) return st;
+    } else {
+        arranged = std::move(rounded);
+    }
+    st = native_scale(arranged, scale, &scaled);
+    if (!st.ok_status()) return st;
+    return upload(destination_name, scaled);
+}
+
 modalities::Status NativeWeightMaterializer::materialize_encoder_layer(
     int layer) {
     if (layer < 0 || layer >= 18 || !destination_) {
@@ -358,6 +382,59 @@ modalities::Status NativeWeightMaterializer::materialize_vision_globals() {
     if (!st.ok_status()) return st;
     return upload_rounded_copy(projector + ".bias",
                                "encoder_multi_modal_projector_b");
+}
+
+modalities::Status NativeWeightMaterializer::materialize_decoder_globals(
+    int num_steps) {
+    if (!destination_ || num_steps <= 0) {
+        return invalid("Pi0.5 decoder global configuration is invalid");
+    }
+    const struct {
+        const char* source;
+        const char* destination;
+        bool transpose;
+    } entries[] = {
+        {"paligemma_with_expert.gemma_expert.model.norm.dense.weight",
+         "decoder_final_norm_mod_w", true},
+        {"paligemma_with_expert.gemma_expert.model.norm.dense.bias",
+         "decoder_final_norm_mod_b", false},
+        {"time_mlp_in.weight", "decoder_time_mlp_in_w", true},
+        {"time_mlp_in.bias", "decoder_time_mlp_in_b", false},
+        {"time_mlp_out.weight", "decoder_time_mlp_out_w", true},
+        {"time_mlp_out.bias", "decoder_time_mlp_out_b", false},
+        {"action_in_proj.weight", "decoder_action_in_proj_w", true},
+        {"action_in_proj.bias", "decoder_action_in_proj_b", false},
+    };
+    for (const auto& entry : entries) {
+        const modalities::Status st =
+            entry.transpose
+                ? upload_rounded_transpose(entry.source, entry.destination)
+                : upload_rounded_copy(entry.source, entry.destination);
+        if (!st.ok_status()) return st;
+    }
+
+    NativeFloatTensor time_embeddings;
+    modalities::Status st =
+        native_pi05_time_embeddings(num_steps, 1024, &time_embeddings);
+    if (!st.ok_status()) return st;
+    st = upload("decoder_time_embeds", time_embeddings);
+    if (!st.ok_status()) return st;
+
+    const float step_scale = -1.0f / static_cast<float>(num_steps);
+    st = upload_rounded_scaled(
+        "action_out_proj.weight", "decoder_action_out_proj_w", step_scale,
+        true);
+    if (!st.ok_status()) return st;
+    return upload_rounded_scaled(
+        "action_out_proj.bias", "decoder_action_out_proj_b", step_scale,
+        false);
+}
+
+modalities::Status NativeWeightMaterializer::materialize_embedding() {
+    if (!destination_) return invalid("native weight destination is null");
+    return upload_rounded_copy(
+        "paligemma_with_expert.paligemma.lm_head.weight",
+        "embedding_weight");
 }
 
 }  // namespace pi05
