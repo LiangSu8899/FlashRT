@@ -2,6 +2,10 @@
 
 #include "flashrt/cpp/models/pi05/prompt_format.h"
 
+#ifdef FLASHRT_CPP_WITH_CUDA_STAGING
+#include <cuda_runtime_api.h>
+#endif
+
 #include <cstring>
 #include <string>
 
@@ -18,8 +22,18 @@ modalities::Status validate_output_capacity(
             modalities::StatusCode::kInvalidArgument,
             "invalid prompt embedding dimensions");
     }
-    auto st = modalities::validate_host_tensor(output, "prompt_embedding");
-    if (!st.ok_status()) return st;
+    if (!output.data) {
+        return modalities::Status::error(
+            modalities::StatusCode::kInvalidArgument,
+            "prompt_embedding has null data");
+    }
+    if (output.place != modalities::MemoryPlace::kHost &&
+        output.place != modalities::MemoryPlace::kHostPinned &&
+        output.place != modalities::MemoryPlace::kDevice) {
+        return modalities::Status::error(
+            modalities::StatusCode::kUnsupported,
+            "prompt_embedding memory place is unsupported");
+    }
     if (output.layout != modalities::Layout::kFlat ||
         output.shape.rank != 2 ||
         output.shape.dims[0] != spec.max_tokens ||
@@ -28,12 +42,46 @@ modalities::Status validate_output_capacity(
             modalities::StatusCode::kShapeMismatch,
             "prompt_embedding shape mismatch");
     }
+    const std::uint64_t need =
+        spec.max_tokens * spec.hidden_dim * modalities::dtype_size(output.dtype);
+    if (output.bytes < need) {
+        return modalities::Status::error(
+            modalities::StatusCode::kInsufficientStorage,
+            "prompt_embedding storage is too small");
+    }
     return modalities::Status::ok();
+}
+
+modalities::Status zero_prompt_output(const modalities::TensorView& output,
+                                      void* stream) {
+    if (output.place == modalities::MemoryPlace::kHost ||
+        output.place == modalities::MemoryPlace::kHostPinned) {
+        std::memset(output.data, 0, static_cast<std::size_t>(output.bytes));
+        return modalities::Status::ok();
+    }
+#ifndef FLASHRT_CPP_WITH_CUDA_STAGING
+    (void)stream;
+    return modalities::Status::error(
+        modalities::StatusCode::kUnsupported,
+        "device prompt zeroing requires the CUDA build");
+#else
+    cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    cudaError_t rc = cudaMemsetAsync(output.data, 0, output.bytes,
+                                     cuda_stream);
+    if (rc == cudaSuccess) rc = cudaStreamSynchronize(cuda_stream);
+    if (rc != cudaSuccess) {
+        return modalities::Status::error(
+            modalities::StatusCode::kBackend,
+            std::string("cuda prompt zeroing failed: ") +
+                cudaGetErrorString(rc));
+    }
+    return modalities::Status::ok();
+#endif
 }
 
 }  // namespace
 
-modalities::Status embed_prompt_cpu(
+modalities::Status embed_prompt(
         const modalities::SentencePieceTokenizer& tokenizer,
         const PromptEmbeddingSpec& spec,
         const std::string& prompt,
@@ -42,7 +90,9 @@ modalities::Status embed_prompt_cpu(
         modalities::TensorView embedding_table,
         modalities::TensorView output,
         std::vector<std::int32_t>* token_ids,
-        std::uint64_t* prompt_len) {
+        std::uint64_t* prompt_len,
+        void* stream,
+        modalities::TextEmbeddingStaging* staging) {
     if (!token_ids || !prompt_len) {
         return modalities::Status::error(
             modalities::StatusCode::kInvalidArgument,
@@ -78,7 +128,8 @@ modalities::Status embed_prompt_cpu(
     }
 
     if (spec.zero_pad_output) {
-        std::memset(output.data, 0, static_cast<std::size_t>(output.bytes));
+        st = zero_prompt_output(output, stream);
+        if (!st.ok_status()) return st;
     }
     modalities::TensorView prefix = output;
     prefix.shape = modalities::Shape{static_cast<std::uint64_t>(
@@ -89,11 +140,26 @@ modalities::Status embed_prompt_cpu(
 
     modalities::EmbeddingGatherSpec gather{spec.vocab_size, spec.hidden_dim,
                                            spec.scale};
-    st = modalities::gather_token_embeddings_cpu(
-        gather, token_ids->data(), token_ids->size(), embedding_table, prefix);
+    st = modalities::gather_token_embeddings(
+        gather, token_ids->data(), token_ids->size(), embedding_table, prefix,
+        stream, staging);
     if (!st.ok_status()) return st;
     *prompt_len = static_cast<std::uint64_t>(token_ids->size());
     return modalities::Status::ok();
+}
+
+modalities::Status embed_prompt_cpu(
+        const modalities::SentencePieceTokenizer& tokenizer,
+        const PromptEmbeddingSpec& spec,
+        const std::string& prompt,
+        const float* state,
+        std::uint64_t n_state,
+        modalities::TensorView embedding_table,
+        modalities::TensorView output,
+        std::vector<std::int32_t>* token_ids,
+        std::uint64_t* prompt_len) {
+    return embed_prompt(tokenizer, spec, prompt, state, n_state,
+                        embedding_table, output, token_ids, prompt_len);
 }
 
 }  // namespace pi05

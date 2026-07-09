@@ -105,6 +105,7 @@ private:
     modalities::VisionStaging staging_;
     RuntimeIo io_;
     modalities::SentencePieceTokenizer prompt_tokenizer_;
+    modalities::TextEmbeddingStaging prompt_embedding_staging_;
     PromptEmbeddingSpec prompt_spec_;
     modalities::TensorView prompt_embedding_table_;
     modalities::TensorView prompt_embedding_output_;

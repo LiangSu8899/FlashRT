@@ -21,6 +21,19 @@ struct PromptEmbeddingSpec {
     bool zero_pad_output = true;
 };
 
+modalities::Status embed_prompt(
+    const modalities::SentencePieceTokenizer& tokenizer,
+    const PromptEmbeddingSpec& spec,
+    const std::string& prompt,
+    const float* state,
+    std::uint64_t n_state,
+    modalities::TensorView embedding_table,
+    modalities::TensorView output,
+    std::vector<std::int32_t>* token_ids,
+    std::uint64_t* prompt_len,
+    void* stream = nullptr,
+    modalities::TextEmbeddingStaging* staging = nullptr);
+
 modalities::Status embed_prompt_cpu(
     const modalities::SentencePieceTokenizer& tokenizer,
     const PromptEmbeddingSpec& spec,

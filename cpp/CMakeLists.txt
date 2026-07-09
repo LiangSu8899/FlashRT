@@ -85,7 +85,9 @@ else()
     modalities/src/tokenizer_unavailable.cpp)
 endif()
 if(FLASHRT_CPP_WITH_CUDA_KERNELS)
-  list(APPEND FLASHRT_CPP_MODALITY_SRCS modalities/src/vision_cuda.cu)
+  list(APPEND FLASHRT_CPP_MODALITY_SRCS
+    modalities/src/vision_cuda.cu
+    modalities/src/text_cuda.cu)
 endif()
 
 add_library(flashrt_cpp_modalities STATIC ${FLASHRT_CPP_MODALITY_SRCS})
