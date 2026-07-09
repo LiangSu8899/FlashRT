@@ -307,6 +307,13 @@ temporary device allocation. The GEMM, explicit BF16 bias round-trip, and
 float-SiLU sequence is BF16 bit-exact with the PyTorch producer on both
 supported checkpoint layouts.
 
+The native kernel driver also owns the BF16 forward primitives used around
+GEMM and attention: RMS/Layer/AdaRMS normalization, residual and gated
+residual updates, GELU/gated GELU, QKV split with fixed or device-position
+RoPE, patch im2col, and vision pooling. These are direct typed calls to the
+existing CUDA implementations, with CPU-reference and captured-replay gates;
+they do not route through pybind or introduce a second kernel implementation.
+
 RTX attention owns a separate context-backed buffer set rather than borrowing
 Torch tensors: SigLIP Q/K/V, encoder Q and 18-layer shared K/V cache, decoder
 Q, fixed-shape `seqused/devpos` int32 values, FA2 outputs/LSE, and split-KV
