@@ -86,6 +86,8 @@ int main() {
     }
     const std::string prefix =
         "paligemma_with_expert.paligemma.model.language_model.layers.0";
+    const std::string decoder =
+        "paligemma_with_expert.gemma_expert.model.layers.0";
     const std::vector<Entry> entries = {
         {prefix + ".input_layernorm.weight", {4}, {-0.5f, 0.0f, 0.5f, 1.0f}},
         {prefix + ".self_attn.q_proj.weight", {16, 4}, sequence(64, 0.1f)},
@@ -97,6 +99,20 @@ int main() {
         {prefix + ".mlp.gate_proj.weight", {6, 4}, sequence(24, 4.0f)},
         {prefix + ".mlp.up_proj.weight", {6, 4}, sequence(24, 5.0f)},
         {prefix + ".mlp.down_proj.weight", {4, 6}, sequence(24, 6.0f)},
+        {decoder + ".self_attn.q_proj.weight", {16, 4}, sequence(64, 7.0f)},
+        {decoder + ".self_attn.k_proj.weight", {4, 4}, sequence(16, 8.0f)},
+        {decoder + ".self_attn.v_proj.weight", {4, 4}, sequence(16, 9.0f)},
+        {decoder + ".self_attn.o_proj.weight", {4, 16}, sequence(64, 10.0f)},
+        {decoder + ".mlp.gate_proj.weight", {6, 4}, sequence(24, 11.0f)},
+        {decoder + ".mlp.up_proj.weight", {6, 4}, sequence(24, 12.0f)},
+        {decoder + ".mlp.down_proj.weight", {4, 6}, sequence(24, 13.0f)},
+        {decoder + ".input_layernorm.dense.weight", {12, 4},
+         sequence(48, 14.0f)},
+        {decoder + ".input_layernorm.dense.bias", {12}, sequence(12, 15.0f)},
+        {decoder + ".post_attention_layernorm.dense.weight", {12, 4},
+         sequence(48, 16.0f)},
+        {decoder + ".post_attention_layernorm.dense.bias", {12},
+         sequence(12, 17.0f)},
     };
     const std::string path = temp_path();
     write_checkpoint(path, entries);
@@ -119,6 +135,20 @@ int main() {
         assert(down && down->shape == std::vector<std::uint64_t>({6, 4}));
         assert(!materializer.materialize_encoder_layer(0).ok_status());
         assert(!materializer.materialize_encoder_layer(18).ok_status());
+        assert(materializer.materialize_decoder_layer(0, true).ok_status());
+        assert(destination.size() == 15);
+        const auto* decoder_qkv = destination.find("decoder_attn_qkv_w_0");
+        assert(decoder_qkv &&
+               decoder_qkv->shape == std::vector<std::uint64_t>({4, 24}));
+        const auto* gate_up = destination.find("decoder_ffn_gate_up_w_0");
+        assert(gate_up &&
+               gate_up->shape == std::vector<std::uint64_t>({4, 12}));
+        const auto* attn_mod =
+            destination.find("decoder_pre_attn_norm_mod_w_0");
+        assert(attn_mod &&
+               attn_mod->shape == std::vector<std::uint64_t>({4, 12}));
+        assert(!materializer.materialize_decoder_layer(0, true).ok_status());
+        assert(!materializer.materialize_decoder_layer(18, true).ok_status());
     }
     frt_ctx_destroy(ctx);
     assert(::unlink(path.c_str()) == 0);
@@ -141,9 +171,15 @@ int main() {
                    std::vector<std::uint64_t>({2048, 2560}));
             assert(destination.find("encoder_ffn_gate_w_0")->shape ==
                    std::vector<std::uint64_t>({2048, 16384}));
+            assert(materializer.materialize_decoder_layer(0, true).ok_status());
+            assert(destination.size() == 15);
+            assert(destination.find("decoder_attn_qkv_w_0")->shape ==
+                   std::vector<std::uint64_t>({1024, 2560}));
+            assert(destination.find("decoder_ffn_gate_up_w_0")->shape ==
+                   std::vector<std::uint64_t>({1024, 8192}));
         }
         frt_ctx_destroy(real_ctx);
     }
-    std::printf("PASS - Pi0.5 encoder weight materializer\n");
+    std::printf("PASS - Pi0.5 native layer materializer\n");
     return 0;
 }
