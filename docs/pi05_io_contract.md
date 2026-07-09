@@ -322,6 +322,13 @@ cache. Its outputs are bit-exact (`cos=1`, `max=0`) against the PyTorch
 checkpoint path for both OpenPI and LeRobot layouts, and the segment captures
 and replays with one graph variant.
 
+Encoder layers 0-16 extend that segment through fixed-shape FA2, output
+projection, residual/RMS normalization, the separate gate/up projections,
+gated GELU, down projection, and the final residual update. A captured layer 0
+replayed 100 times remains a single variant and reaches cosine 0.999992 versus
+the original PyTorch path on both checkpoint layouts. Layer 17 keeps the
+intentional cache-only early exit described above.
+
 RTX attention owns a separate context-backed buffer set rather than borrowing
 Torch tensors: SigLIP Q/K/V, encoder Q and 18-layer shared K/V cache, decoder
 Q, fixed-shape `seqused/devpos` int32 values, FA2 outputs/LSE, and split-KV
