@@ -353,6 +353,15 @@ schedule steps reach cosine 0.9999 or better against PyTorch; the accumulated
 endpoint gate remains part of the real-episode end-to-end validation because
 synthetic random K/V amplifies SDPA-versus-FA2 rounding across steps.
 
+The native graph owner now assembles the completed segments into one `infer`
+capture: prompt copy, vision, encoder, then diffusion. Prompt embeddings live
+in a separate persistent buffer because `encoder_x` is an in-place residual
+stream; each replay captures a D2D copy into its language window. Both
+checkpoint layouts complete 100 full replays with one variant, bit-identical
+outputs for restored inputs, and a constant workspace allocation count. The
+persistent prompt source, not the overwritten encoder rows, is the primary
+prompt-context capsule candidate.
+
 RTX attention owns a separate context-backed buffer set rather than borrowing
 Torch tensors: SigLIP Q/K/V, encoder Q and 18-layer shared K/V cache, decoder
 Q, fixed-shape `seqused/devpos` int32 values, FA2 outputs/LSE, and split-KV

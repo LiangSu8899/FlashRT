@@ -264,6 +264,9 @@ modalities::Status NativeWorkspace::allocate(
 
     FRT_ADD("encoder_rope_weights", {es, 256},
             modalities::DType::kBFloat16);
+    FRT_ADD("prompt_embedding",
+            {static_cast<std::uint64_t>(max_prompt_tokens_), 2048},
+            modalities::DType::kBFloat16);
     FRT_ADD("encoder_x", {es, 2048}, modalities::DType::kBFloat16);
     FRT_ADD("encoder_x_norm", {es, 2048}, modalities::DType::kBFloat16);
     FRT_ADD("encoder_QKV", {es, 2560}, modalities::DType::kBFloat16);

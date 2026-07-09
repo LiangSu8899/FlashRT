@@ -45,12 +45,14 @@ int main() {
         assert(!workspace.allocate(invalid).ok_status());
         NativeWorkspaceConfig config;
         assert(workspace.allocate(config).ok_status());
-        assert(workspace.logical_size() == 34);
-        assert(workspace.allocation_count() == 33);
+        assert(workspace.logical_size() == 35);
+        assert(workspace.allocation_count() == 34);
         assert(workspace.allocated_bytes() > 0);
         assert(workspace.vision_sequence() == 512);
         assert(workspace.encoder_vision_sequence() == 512);
         assert(workspace.encoder_sequence() == 712);
+        assert(workspace.find("prompt_embedding")->shape ==
+               std::vector<std::uint64_t>({200, 2048}));
         const auto* vision_x = workspace.find("vision_x");
         const auto* pooled = workspace.find("vision_x_pooled");
         assert(vision_x && pooled && pooled->alias);
@@ -116,8 +118,8 @@ int main() {
         config.num_steps = 5;
         config.vision_pool_factor = 2;
         assert(workspace.allocate(config).ok_status());
-        assert(workspace.logical_size() == 34);
-        assert(workspace.allocation_count() == 34);
+        assert(workspace.logical_size() == 35);
+        assert(workspace.allocation_count() == 35);
         assert(workspace.vision_sequence() == 768);
         assert(workspace.encoder_vision_sequence() == 192);
         assert(workspace.encoder_sequence() == 448);

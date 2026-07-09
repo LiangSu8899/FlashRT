@@ -203,6 +203,7 @@ if(FLASHRT_CPP_WITH_CUDA_KERNELS)
       --ftz=true --prec-div=false --prec-sqrt=false>)
   if(FLASHRT_CPP_WITH_FA2)
     target_sources(flashrt_cpp_pi05_kernels PRIVATE
+      models/pi05/src/native_graph_owner.cpp
       models/pi05/src/native_rtx_attention_driver.cu)
     target_include_directories(flashrt_cpp_pi05_kernels PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/../csrc)
@@ -347,6 +348,11 @@ if(BUILD_TESTING)
       add_executable(pi05_native_diffusion_probe
         tests/pi05_native_diffusion_probe.cpp)
       target_link_libraries(pi05_native_diffusion_probe
+        PRIVATE flashrt_cpp_pi05_kernels flashrt_exec CUDA::cudart)
+
+      add_executable(pi05_native_graph_probe
+        tests/pi05_native_graph_probe.cpp)
+      target_link_libraries(pi05_native_graph_probe
         PRIVATE flashrt_cpp_pi05_kernels flashrt_exec CUDA::cudart)
 
       add_executable(test_pi05_native_rtx_attention_driver
