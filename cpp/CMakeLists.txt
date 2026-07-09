@@ -121,6 +121,11 @@ target_include_directories(flashrt_cpp_vla
 target_link_libraries(flashrt_cpp_vla
   INTERFACE flashrt_cpp_modalities flashrt_cpp)
 
+add_library(flashrt_cpp_loader STATIC
+  loader/src/safetensors.cpp)
+target_include_directories(flashrt_cpp_loader
+  PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/loader/include)
+
 add_library(flashrt_cpp_pi05 STATIC
   models/pi05/src/spec.cpp
   models/pi05/src/prompt_format.cpp
@@ -137,11 +142,15 @@ add_library(flashrt_cpp_pi05_c SHARED
   models/pi05/src/model_runtime.cpp
   models/pi05/src/native_open.cpp)
 target_link_libraries(flashrt_cpp_pi05_c
-  PUBLIC flashrt_cpp_pi05 flashrt_runtime)
+  PUBLIC flashrt_cpp_pi05 flashrt_cpp_loader flashrt_runtime)
 target_include_directories(flashrt_cpp_pi05_c
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/include)
 
 if(BUILD_TESTING)
+  add_executable(test_safetensors_loader tests/test_safetensors_loader.cpp)
+  target_link_libraries(test_safetensors_loader PRIVATE flashrt_cpp_loader)
+  add_test(NAME safetensors_loader COMMAND test_safetensors_loader)
+
   add_executable(test_cpp_modalities tests/test_modalities.cpp)
   target_link_libraries(test_cpp_modalities
     PRIVATE flashrt_cpp_pi05 flashrt_cpp_modalities)

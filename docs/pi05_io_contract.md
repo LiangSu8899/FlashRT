@@ -201,15 +201,17 @@ The Pi0.5 C++ shared object now exports `frt_model_runtime_open_v1` as a
 native-v2 configuration gate. The gate requires `io="native_v2"`,
 `checkpoint_path`, `tokenizer_model_path`, `state_prompt_mode="fixed"`,
 `max_prompt_tokens >= 200`, and a positive `state_dim`. It also parses
-`checkpoint_path/model.safetensors` enough to verify the Pi0.5 prompt
-embedding table and the native builder's minimum required weight set
+`checkpoint_path/model.safetensors` through the native read-only mmap loader to
+verify the Pi0.5 prompt embedding table and the native builder's minimum
+required weight set
 (vision patch/position/projector, action projections, time MLP, and first
 encoder/decoder layer sentinels). It also verifies action/state q01/q99
 dimensions from either openpi `norm_stats.json` or LeRobot policy
 normalizer/unnormalizer safetensors. Safetensors tensor byte ranges must match
 dtype/shape, and normalization quantiles must be finite ordered pairs. Valid
-configuration returns unsupported until native asset materialization and graph
-capture are complete.
+configuration returns unsupported until device weight materialization and graph
+capture are complete. The mmap and parsed tensor views are setup-side assets;
+they never enter the model-runtime ABI or the hot path.
 
 CUDA graph execs are process-local objects. They are not serialized as a
 portable artifact. Removing Python from setup requires a native producer that
