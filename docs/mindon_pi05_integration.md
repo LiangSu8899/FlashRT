@@ -77,6 +77,13 @@ The returned struct must expose the same public model-runtime contract as the
 Python setup producer. The host and Nexus adoption code must not change when
 switching between Lane A and Lane C.
 
+The current C++ shared object exports this symbol as a native-v2 configuration
+gate. It validates `io`, checkpoint path, tokenizer model path, fixed prompt
+mode, prompt capacity, and state dimension, then returns unsupported until the
+native checkpoint loader and CUDA graph capture path are implemented. Hosts may
+use this to wire dynamic loading and error handling, but must keep using Lane A
+or B for execution.
+
 ## No-HTTP C++ Host Shape
 
 For same-process control loops, prefer Nexus embedded/session APIs over HTTP.

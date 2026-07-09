@@ -197,6 +197,12 @@ There are three supported integration lanes:
   `frt_model_runtime_open_v1(config_json, &out)` and produces the same public
   struct without Python setup.
 
+The Pi0.5 C++ shared object now exports `frt_model_runtime_open_v1` as a
+native-v2 configuration gate. The gate requires `io="native_v2"`,
+`checkpoint_path`, `tokenizer_model_path`, `state_prompt_mode="fixed"`,
+`max_prompt_tokens >= 200`, and a positive `state_dim`; valid configuration
+returns unsupported until native asset loading and graph capture are complete.
+
 CUDA graph execs are process-local objects. They are not serialized as a
 portable artifact. Removing Python from setup requires a native producer that
 loads assets and captures graphs in the replay process.
