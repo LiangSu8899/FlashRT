@@ -329,6 +329,11 @@ if(BUILD_TESTING)
       COMMAND test_pi05_native_rtx_attention)
 
     if(FLASHRT_CPP_WITH_FA2)
+      add_executable(pi05_native_encoder_layer_probe
+        tests/pi05_native_encoder_layer_probe.cpp)
+      target_link_libraries(pi05_native_encoder_layer_probe
+        PRIVATE flashrt_cpp_pi05_kernels flashrt_exec CUDA::cudart)
+
       add_executable(test_pi05_native_rtx_attention_driver
         tests/test_pi05_native_rtx_attention_driver.cpp)
       target_link_libraries(test_pi05_native_rtx_attention_driver
