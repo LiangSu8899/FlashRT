@@ -61,6 +61,46 @@ int main() {
                flashrt::modalities::DType::kFloat32);
         check_ones(*workspace.find("encoder_rms_ones"));
         check_ones(*workspace.find("decoder_rms_ones"));
+        assert(workspace.update_decoder_rope(37).ok_status());
+        assert(!workspace.update_decoder_rope(201).ok_status());
+        void* decoder_rope_ptr =
+            frt_buffer_dptr(workspace.find("decoder_rope_weights")->buffer);
+        const std::size_t allocation_count = workspace.allocation_count();
+        const std::size_t allocated_bytes = workspace.allocated_bytes();
+        for (int i = 0; i < 1000; ++i) {
+            assert(workspace.update_decoder_rope(i % 201).ok_status());
+            assert(frt_buffer_dptr(
+                       workspace.find("decoder_rope_weights")->buffer) ==
+                   decoder_rope_ptr);
+            assert(workspace.allocation_count() == allocation_count);
+            assert(workspace.allocated_bytes() == allocated_bytes);
+        }
+
+        NativeDeviceWeightStore weights(ctx);
+        NativeBf16Tensor position;
+        position.shape = {256, 1152};
+        position.values.resize(256 * 1152);
+        for (std::size_t i = 0; i < position.values.size(); ++i) {
+            position.values[i] = flashrt::modalities::float_to_bfloat16(
+                static_cast<float>(i % 97) / 97.0f);
+        }
+        assert(weights.upload("vision_position_embedding", position)
+                   .ok_status());
+        assert(workspace.expand_vision_position_embedding(weights)
+                   .ok_status());
+        const auto* expanded = workspace.find("vision_pos_embed_expanded");
+        std::vector<std::uint16_t> expanded_values(position.values.size() * 2);
+        assert(cudaMemcpy(expanded_values.data(),
+                          frt_buffer_dptr(expanded->buffer),
+                          expanded_values.size() * sizeof(std::uint16_t),
+                          cudaMemcpyDeviceToHost) == cudaSuccess);
+        assert(std::vector<std::uint16_t>(expanded_values.begin(),
+                                         expanded_values.begin() +
+                                             position.values.size()) ==
+               position.values);
+        assert(std::vector<std::uint16_t>(
+                   expanded_values.begin() + position.values.size(),
+                   expanded_values.end()) == position.values);
         assert(!workspace.allocate(config).ok_status());
     }
     frt_ctx_destroy(ctx);

@@ -289,8 +289,15 @@ is an explicit alias of `vision_x` (34 logical names, 33 allocations); pooled
 deployments allocate it separately. Buffer shapes are fixed from `num_views`,
 `max_prompt_tokens`, `chunk_size`, `num_steps`, and `vision_pool_factor` before
 capture, and BF16 RMS-one constants are initialized during setup. Attention
-backend buffers and generated RoPE/style contents are the remaining workspace
-subsystems before the complete forward can be captured.
+backend buffers and generated decoder style contents are the remaining
+workspace subsystems before the complete forward can be captured.
+
+Native RoPE setup uses the same float64 frequency/phase computation and BF16
+interleaved `[cos, sin]` layout as the Python producer. Encoder and
+prompt-relative decoder slices are byte-exact against NumPy/ml_dtypes for
+pooled and unpooled configurations. Decoder slice updates reuse one stable
+buffer across prompt lengths; vision position embeddings are expanded per view
+with setup-side D2D copies from the typed weight store.
 
 CUDA graph execs are process-local objects. They are not serialized as a
 portable artifact. Removing Python from setup requires a native producer that
