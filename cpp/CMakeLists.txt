@@ -151,6 +151,24 @@ target_include_directories(flashrt_cpp_pi05
 target_link_libraries(flashrt_cpp_pi05
   PUBLIC flashrt_cpp_modalities flashrt_cpp_vla flashrt_cpp_loader)
 
+if(FLASHRT_CPP_WITH_CUDA_KERNELS)
+  add_library(flashrt_cpp_pi05_kernels STATIC
+    models/pi05/src/native_kernel_driver.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/../csrc/gemm/gemm_runner.cu)
+  target_include_directories(flashrt_cpp_pi05_kernels
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/include
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../csrc/gemm)
+  target_link_libraries(flashrt_cpp_pi05_kernels
+    PUBLIC flashrt_cpp_modalities CUDA::cublas CUDA::cublasLt CUDA::cudart)
+  set_target_properties(flashrt_cpp_pi05_kernels PROPERTIES
+    CUDA_STANDARD 17
+    CUDA_STANDARD_REQUIRED ON)
+  target_compile_options(flashrt_cpp_pi05_kernels PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr -O3
+      --ftz=true --prec-div=false --prec-sqrt=false>)
+endif()
+
 add_library(flashrt_cpp_pi05_c SHARED
   models/pi05/src/c_api.cpp
   models/pi05/src/model_runtime.cpp
@@ -159,6 +177,10 @@ target_link_libraries(flashrt_cpp_pi05_c
   PUBLIC flashrt_cpp_pi05 flashrt_runtime)
 target_include_directories(flashrt_cpp_pi05_c
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/include)
+if(FLASHRT_CPP_WITH_CUDA_KERNELS)
+  target_link_libraries(flashrt_cpp_pi05_c
+    PRIVATE flashrt_cpp_pi05_kernels)
+endif()
 
 if(BUILD_TESTING)
   add_executable(test_safetensors_loader tests/test_safetensors_loader.cpp)
@@ -209,6 +231,13 @@ if(BUILD_TESTING)
       PRIVATE flashrt_cpp_pi05 flashrt_exec CUDA::cudart)
     add_test(NAME pi05_native_weight_packer
       COMMAND test_pi05_native_weight_packer)
+
+    add_executable(test_pi05_native_kernel_driver
+      tests/test_pi05_native_kernel_driver.cpp)
+    target_link_libraries(test_pi05_native_kernel_driver
+      PRIVATE flashrt_cpp_pi05_kernels flashrt_exec CUDA::cudart)
+    add_test(NAME pi05_native_kernel_driver
+      COMMAND test_pi05_native_kernel_driver)
   endif()
 
   add_executable(test_pi05_prompt_format tests/test_pi05_prompt_format.cpp)
