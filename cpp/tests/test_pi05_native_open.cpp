@@ -29,7 +29,7 @@ void write_file(const std::string& path) {
 
 void write_raw_safetensors(const std::string& path,
                            const std::string& header,
-                           uint64_t payload_bytes) {
+                           const std::string& payload) {
     std::ofstream f(path, std::ios::binary);
     uint64_t n = header.size();
     for (int i = 0; i < 8; ++i) {
@@ -37,36 +37,56 @@ void write_raw_safetensors(const std::string& path,
         f.write(&b, 1);
     }
     f.write(header.data(), static_cast<std::streamsize>(header.size()));
-    std::string payload(static_cast<size_t>(payload_bytes), '\0');
     f.write(payload.data(), static_cast<std::streamsize>(payload.size()));
     assert(f.good());
 }
 
+void write_raw_safetensors(const std::string& path,
+                           const std::string& header,
+                           uint64_t payload_bytes) {
+    write_raw_safetensors(path, header,
+                          std::string(static_cast<size_t>(payload_bytes),
+                                      '\0'));
+}
+
+void append_f32(std::string* out, float value) {
+    char bytes[sizeof(float)];
+    std::memcpy(bytes, &value, sizeof(value));
+    out->append(bytes, sizeof(bytes));
+}
+
 void write_safetensors(const std::string& path) {
+    const uint64_t bytes = 1001ull * 2048ull * 2ull;
     write_raw_safetensors(
         path,
         "{\"paligemma_with_expert.paligemma.lm_head.weight\":{"
-        "\"dtype\":\"BF16\",\"shape\":[257216,2048],"
-        "\"data_offsets\":[0,1024]},"
+        "\"dtype\":\"BF16\",\"shape\":[1001,2048],"
+        "\"data_offsets\":[0," + std::to_string(bytes) + "]},"
         "\"__metadata__\":{\"format\":\"pt\"}}",
-        1024);
+        bytes);
 }
 
 void write_lerobot_policy_stats(const std::string& root) {
+    std::string state_payload;
+    for (int i = 0; i < 8; ++i) append_f32(&state_payload, 0.0f);
+    for (int i = 0; i < 8; ++i) append_f32(&state_payload, 1.0f);
     write_raw_safetensors(
         root + "/policy_preprocessor_step_2_normalizer_processor.safetensors",
         "{\"observation.state.q01\":{\"dtype\":\"F32\",\"shape\":[8],"
         "\"data_offsets\":[0,32]},"
         "\"observation.state.q99\":{\"dtype\":\"F32\",\"shape\":[8],"
         "\"data_offsets\":[32,64]}}",
-        64);
+        state_payload);
+    std::string action_payload;
+    for (int i = 0; i < 7; ++i) append_f32(&action_payload, 0.0f);
+    for (int i = 0; i < 7; ++i) append_f32(&action_payload, 1.0f);
     write_raw_safetensors(
         root + "/policy_postprocessor_step_0_unnormalizer_processor.safetensors",
         "{\"action.q01\":{\"dtype\":\"F32\",\"shape\":[7],"
         "\"data_offsets\":[0,28]},"
         "\"action.q99\":{\"dtype\":\"F32\",\"shape\":[7],"
         "\"data_offsets\":[28,56]}}",
-        56);
+        action_payload);
 }
 
 void write_norm_stats(const std::string& path) {

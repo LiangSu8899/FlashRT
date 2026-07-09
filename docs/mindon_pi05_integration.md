@@ -82,10 +82,10 @@ gate. It validates `io`, checkpoint path, tokenizer model path, fixed prompt
 mode, prompt capacity, state dimension, and the Pi0.5 embedding metadata in
 `model.safetensors`. It also verifies action/state q01/q99 metadata from
 openpi `norm_stats.json` or LeRobot policy normalizer/unnormalizer
-safetensors, then returns unsupported until the native checkpoint
-materialization and CUDA graph capture path are implemented. Hosts may use this
-to wire dynamic loading and error handling, but must keep using Lane A or B for
-execution.
+safetensors, including tensor byte ranges and finite ordered quantile payloads,
+then returns unsupported until the native checkpoint materialization and CUDA
+graph capture path are implemented. Hosts may use this to wire dynamic loading
+and error handling, but must keep using Lane A or B for execution.
 
 ## No-HTTP C++ Host Shape
 
