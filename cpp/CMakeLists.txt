@@ -134,7 +134,8 @@ target_link_libraries(flashrt_cpp_pi05
 
 add_library(flashrt_cpp_pi05_c SHARED
   models/pi05/src/c_api.cpp
-  models/pi05/src/model_runtime.cpp)
+  models/pi05/src/model_runtime.cpp
+  models/pi05/src/native_open.cpp)
 target_link_libraries(flashrt_cpp_pi05_c
   PUBLIC flashrt_cpp_pi05 flashrt_runtime)
 target_include_directories(flashrt_cpp_pi05_c
@@ -182,5 +183,10 @@ if(BUILD_TESTING)
     target_link_libraries(test_pi05_model_runtime
       PRIVATE flashrt_cpp_pi05_c flashrt_exec flashrt_runtime CUDA::cudart)
     add_test(NAME pi05_model_runtime COMMAND test_pi05_model_runtime)
+
+    add_executable(test_pi05_native_open tests/test_pi05_native_open.cpp)
+    target_link_libraries(test_pi05_native_open
+      PRIVATE flashrt_cpp_pi05_c flashrt_runtime)
+    add_test(NAME pi05_native_open COMMAND test_pi05_native_open)
   endif()
 endif()
