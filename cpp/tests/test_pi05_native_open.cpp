@@ -27,6 +27,24 @@ void write_file(const std::string& path) {
     assert(f.good());
 }
 
+void write_safetensors(const std::string& path) {
+    const std::string header =
+        "{\"paligemma_with_expert.paligemma.lm_head.weight\":{"
+        "\"dtype\":\"BF16\",\"shape\":[257216,2048],"
+        "\"data_offsets\":[0,1024]},"
+        "\"__metadata__\":{\"format\":\"pt\"}}";
+    std::ofstream f(path, std::ios::binary);
+    uint64_t n = header.size();
+    for (int i = 0; i < 8; ++i) {
+        const char b = static_cast<char>((n >> (8 * i)) & 0xffu);
+        f.write(&b, 1);
+    }
+    f.write(header.data(), static_cast<std::streamsize>(header.size()));
+    std::string payload(1024, '\0');
+    f.write(payload.data(), static_cast<std::streamsize>(payload.size()));
+    assert(f.good());
+}
+
 std::string config(const std::string& ckpt,
                    const std::string& tokenizer,
                    const char* extra = "") {
@@ -72,6 +90,14 @@ int main() {
     const std::string tokenizer = root + "/tokenizer.model";
     write_file(tokenizer);
 
+    out = reinterpret_cast<frt_model_runtime_v1*>(0x1);
+    rc = frt_model_runtime_open_v1(config(root, tokenizer).c_str(), &out);
+    assert(rc == -2);
+    assert(out == nullptr);
+    assert(std::strstr(frt_pi05_native_open_last_error(),
+                       "model.safetensors"));
+
+    write_safetensors(root + "/model.safetensors");
     const std::string good = config(root, tokenizer);
     out = reinterpret_cast<frt_model_runtime_v1*>(0x1);
     rc = frt_model_runtime_open_v1(good.c_str(), &out);
@@ -93,6 +119,7 @@ int main() {
                        "max_prompt_tokens"));
 
     ::unlink(tokenizer.c_str());
+    ::unlink((root + "/model.safetensors").c_str());
     ::rmdir(root.c_str());
     std::printf("PASS - Pi05 native open scaffold\n");
     return 0;
