@@ -60,6 +60,10 @@ modalities::Status native_concat_columns(
     const NativeFloatTensor& right,
     NativeFloatTensor* out);
 
+modalities::Status native_concat_vectors(
+    const std::vector<const NativeFloatTensor*>& inputs,
+    NativeFloatTensor* out);
+
 modalities::Status native_scale(const NativeFloatTensor& input,
                                 float scale,
                                 NativeFloatTensor* out);

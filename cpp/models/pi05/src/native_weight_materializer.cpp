@@ -22,6 +22,12 @@ std::string decoder_prefix(int layer) {
            std::to_string(layer);
 }
 
+const std::string& vision_prefix() {
+    static const std::string prefix =
+        "paligemma_with_expert.paligemma.model.vision_tower.vision_model";
+    return prefix;
+}
+
 std::string layer_name(const char* stem, int layer) {
     return std::string(stem) + std::to_string(layer);
 }
@@ -238,6 +244,120 @@ modalities::Status NativeWeightMaterializer::materialize_decoder_layer(
     return upload_rounded_copy(
         prefix + ".post_attention_layernorm.dense.bias",
         layer_name("decoder_pre_ffn_norm_mod_b_", layer));
+}
+
+modalities::Status NativeWeightMaterializer::materialize_vision_layer(
+    int layer) {
+    if (layer < 0 || layer >= 27 || !destination_) {
+        return invalid("Pi0.5 vision layer index is invalid");
+    }
+    const std::string prefix = vision_prefix() + ".encoder.layers." +
+                               std::to_string(layer);
+    NativeFloatTensor q;
+    NativeFloatTensor k;
+    NativeFloatTensor v;
+    NativeFloatTensor qr;
+    NativeFloatTensor kr;
+    NativeFloatTensor vr;
+    NativeFloatTensor qkv;
+    modalities::Status st = load(prefix + ".self_attn.q_proj.weight", &q);
+    if (!st.ok_status()) return st;
+    st = load(prefix + ".self_attn.k_proj.weight", &k);
+    if (!st.ok_status()) return st;
+    st = load(prefix + ".self_attn.v_proj.weight", &v);
+    if (!st.ok_status()) return st;
+    st = native_round_to_bf16_float(q, &qr);
+    if (!st.ok_status()) return st;
+    st = native_round_to_bf16_float(k, &kr);
+    if (!st.ok_status()) return st;
+    st = native_round_to_bf16_float(v, &vr);
+    if (!st.ok_status()) return st;
+    st = native_concat_rows_transpose({&qr, &kr, &vr}, &qkv);
+    if (!st.ok_status()) return st;
+    st = upload(layer_name("vision_attn_qkv_w_", layer), qkv);
+    if (!st.ok_status()) return st;
+
+    st = load(prefix + ".self_attn.q_proj.bias", &q);
+    if (!st.ok_status()) return st;
+    st = load(prefix + ".self_attn.k_proj.bias", &k);
+    if (!st.ok_status()) return st;
+    st = load(prefix + ".self_attn.v_proj.bias", &v);
+    if (!st.ok_status()) return st;
+    st = native_round_to_bf16_float(q, &qr);
+    if (!st.ok_status()) return st;
+    st = native_round_to_bf16_float(k, &kr);
+    if (!st.ok_status()) return st;
+    st = native_round_to_bf16_float(v, &vr);
+    if (!st.ok_status()) return st;
+    st = native_concat_vectors({&qr, &kr, &vr}, &qkv);
+    if (!st.ok_status()) return st;
+    st = upload(layer_name("vision_attn_qkv_b_", layer), qkv);
+    if (!st.ok_status()) return st;
+
+    const struct {
+        const char* source;
+        const char* destination;
+        bool transpose;
+    } entries[] = {
+        {"self_attn.out_proj.weight", "vision_attn_o_w_", true},
+        {"self_attn.out_proj.bias", "vision_attn_o_b_", false},
+        {"mlp.fc1.weight", "vision_ffn_up_w_", true},
+        {"mlp.fc1.bias", "vision_ffn_up_b_", false},
+        {"mlp.fc2.weight", "vision_ffn_down_w_", true},
+        {"mlp.fc2.bias", "vision_ffn_down_b_", false},
+        {"layer_norm1.weight", "vision_pre_attn_norm_w_", false},
+        {"layer_norm1.bias", "vision_pre_attn_norm_b_", false},
+        {"layer_norm2.weight", "vision_pre_ffn_norm_w_", false},
+        {"layer_norm2.bias", "vision_pre_ffn_norm_b_", false},
+    };
+    for (const auto& entry : entries) {
+        st = entry.transpose
+                 ? upload_rounded_transpose(
+                       prefix + "." + entry.source,
+                       layer_name(entry.destination, layer))
+                 : upload_rounded_copy(
+                       prefix + "." + entry.source,
+                       layer_name(entry.destination, layer));
+        if (!st.ok_status()) return st;
+    }
+    return modalities::Status::ok();
+}
+
+modalities::Status NativeWeightMaterializer::materialize_vision_globals() {
+    if (!destination_) return invalid("native weight destination is null");
+    const std::string prefix = vision_prefix();
+    NativeFloatTensor patch;
+    NativeFloatTensor rounded;
+    NativeFloatTensor permuted;
+    modalities::Status st = load(
+        prefix + ".embeddings.patch_embedding.weight", &patch);
+    if (!st.ok_status()) return st;
+    st = native_round_to_bf16_float(patch, &rounded);
+    if (!st.ok_status()) return st;
+    st = native_patch_oihw_to_hwio(rounded, &permuted);
+    if (!st.ok_status()) return st;
+    st = upload("vision_patch_embedding_w", permuted);
+    if (!st.ok_status()) return st;
+    st = upload_rounded_copy(prefix + ".embeddings.patch_embedding.bias",
+                             "vision_patch_embedding_b");
+    if (!st.ok_status()) return st;
+    st = upload_rounded_copy(prefix + ".embeddings.position_embedding.weight",
+                             "vision_position_embedding");
+    if (!st.ok_status()) return st;
+    st = upload_rounded_copy(prefix + ".post_layernorm.weight",
+                             "vision_final_norm_w");
+    if (!st.ok_status()) return st;
+    st = upload_rounded_copy(prefix + ".post_layernorm.bias",
+                             "vision_final_norm_b");
+    if (!st.ok_status()) return st;
+
+    const std::string projector =
+        "paligemma_with_expert.paligemma.model.multi_modal_projector.linear";
+    st = upload_rounded_transpose(projector + ".weight",
+                                  "encoder_multi_modal_projector_w");
+    if (!st.ok_status()) return st;
+    return upload_rounded_copy(projector + ".bias",
+                               "encoder_multi_modal_projector_b");
 }
 
 }  // namespace pi05

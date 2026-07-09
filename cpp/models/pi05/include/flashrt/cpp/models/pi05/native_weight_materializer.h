@@ -17,6 +17,8 @@ public:
     modalities::Status materialize_encoder_layer(int layer);
     modalities::Status materialize_decoder_layer(int layer,
                                                   bool merge_gate_up);
+    modalities::Status materialize_vision_layer(int layer);
+    modalities::Status materialize_vision_globals();
 
 private:
     modalities::Status load(const std::string& key, NativeFloatTensor* out);

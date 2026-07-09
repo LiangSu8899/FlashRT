@@ -88,6 +88,9 @@ int main() {
         "paligemma_with_expert.paligemma.model.language_model.layers.0";
     const std::string decoder =
         "paligemma_with_expert.gemma_expert.model.layers.0";
+    const std::string vision =
+        "paligemma_with_expert.paligemma.model.vision_tower.vision_model";
+    const std::string vision_layer = vision + ".encoder.layers.0";
     const std::vector<Entry> entries = {
         {prefix + ".input_layernorm.weight", {4}, {-0.5f, 0.0f, 0.5f, 1.0f}},
         {prefix + ".self_attn.q_proj.weight", {16, 4}, sequence(64, 0.1f)},
@@ -113,6 +116,44 @@ int main() {
          sequence(48, 16.0f)},
         {decoder + ".post_attention_layernorm.dense.bias", {12},
          sequence(12, 17.0f)},
+        {vision + ".embeddings.patch_embedding.weight", {2, 2, 2, 1},
+         sequence(8, 18.0f)},
+        {vision + ".embeddings.patch_embedding.bias", {2},
+         sequence(2, 19.0f)},
+        {vision + ".embeddings.position_embedding.weight", {3, 2},
+         sequence(6, 20.0f)},
+        {vision + ".post_layernorm.weight", {2}, sequence(2, 21.0f)},
+        {vision + ".post_layernorm.bias", {2}, sequence(2, 22.0f)},
+        {"paligemma_with_expert.paligemma.model.multi_modal_projector.linear."
+         "weight", {4, 2}, sequence(8, 23.0f)},
+        {"paligemma_with_expert.paligemma.model.multi_modal_projector.linear."
+         "bias", {4}, sequence(4, 24.0f)},
+        {vision_layer + ".self_attn.q_proj.weight", {2, 2},
+         sequence(4, 25.0f)},
+        {vision_layer + ".self_attn.q_proj.bias", {2},
+         sequence(2, 26.0f)},
+        {vision_layer + ".self_attn.k_proj.weight", {2, 2},
+         sequence(4, 27.0f)},
+        {vision_layer + ".self_attn.k_proj.bias", {2},
+         sequence(2, 28.0f)},
+        {vision_layer + ".self_attn.v_proj.weight", {2, 2},
+         sequence(4, 29.0f)},
+        {vision_layer + ".self_attn.v_proj.bias", {2},
+         sequence(2, 30.0f)},
+        {vision_layer + ".self_attn.out_proj.weight", {2, 2},
+         sequence(4, 31.0f)},
+        {vision_layer + ".self_attn.out_proj.bias", {2},
+         sequence(2, 32.0f)},
+        {vision_layer + ".mlp.fc1.weight", {3, 2},
+         sequence(6, 33.0f)},
+        {vision_layer + ".mlp.fc1.bias", {3}, sequence(3, 34.0f)},
+        {vision_layer + ".mlp.fc2.weight", {2, 3},
+         sequence(6, 35.0f)},
+        {vision_layer + ".mlp.fc2.bias", {2}, sequence(2, 36.0f)},
+        {vision_layer + ".layer_norm1.weight", {2}, sequence(2, 37.0f)},
+        {vision_layer + ".layer_norm1.bias", {2}, sequence(2, 38.0f)},
+        {vision_layer + ".layer_norm2.weight", {2}, sequence(2, 39.0f)},
+        {vision_layer + ".layer_norm2.bias", {2}, sequence(2, 40.0f)},
     };
     const std::string path = temp_path();
     write_checkpoint(path, entries);
@@ -149,6 +190,16 @@ int main() {
                attn_mod->shape == std::vector<std::uint64_t>({4, 12}));
         assert(!materializer.materialize_decoder_layer(0, true).ok_status());
         assert(!materializer.materialize_decoder_layer(18, true).ok_status());
+        assert(materializer.materialize_vision_globals().ok_status());
+        assert(materializer.materialize_vision_layer(0).ok_status());
+        assert(destination.size() == 34);
+        const auto* patch = destination.find("vision_patch_embedding_w");
+        assert(patch && patch->shape ==
+                            std::vector<std::uint64_t>({2, 1, 2, 2}));
+        const auto* vision_qkv = destination.find("vision_attn_qkv_w_0");
+        assert(vision_qkv &&
+               vision_qkv->shape == std::vector<std::uint64_t>({2, 6}));
+        assert(!materializer.materialize_vision_layer(27).ok_status());
     }
     frt_ctx_destroy(ctx);
     assert(::unlink(path.c_str()) == 0);
@@ -177,6 +228,13 @@ int main() {
                    std::vector<std::uint64_t>({1024, 2560}));
             assert(destination.find("decoder_ffn_gate_up_w_0")->shape ==
                    std::vector<std::uint64_t>({1024, 8192}));
+            assert(materializer.materialize_vision_globals().ok_status());
+            assert(materializer.materialize_vision_layer(0).ok_status());
+            assert(destination.size() == 34);
+            assert(destination.find("vision_patch_embedding_w")->shape ==
+                   std::vector<std::uint64_t>({14, 14, 3, 1152}));
+            assert(destination.find("vision_attn_qkv_w_0")->shape ==
+                   std::vector<std::uint64_t>({1152, 3456}));
         }
         frt_ctx_destroy(real_ctx);
     }

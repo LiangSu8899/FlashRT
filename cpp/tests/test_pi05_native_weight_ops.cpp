@@ -106,6 +106,11 @@ int main() {
     assert(native_concat_columns(left, right, &result).ok_status());
     expect(result, {2, 4}, {1, 2, 5, 6, 3, 4, 7, 8});
 
+    NativeFloatTensor a{{2}, {1, 2}};
+    NativeFloatTensor b{{3}, {3, 4, 5}};
+    assert(native_concat_vectors({&a, &b}, &result).ok_status());
+    expect(result, {5}, {1, 2, 3, 4, 5});
+
     assert(native_scale(matrix, -0.1f, &result).ok_status());
     expect(result, {2, 3}, {-0.1f, -0.2f, -0.3f,
                             -0.4f, -0.5f, -0.6f});
