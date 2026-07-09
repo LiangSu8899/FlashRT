@@ -282,6 +282,16 @@ This establishes the 4b kernel/capture ownership path; it does not yet
 constitute the complete Pi0.5 forward graph, so the native open gate remains
 unsupported.
 
+The native core workspace maps every vision, encoder, decoder, style, action,
+RTC, and reusable scratch allocation to a context-owned `frt_buffer`. There is
+no model-level State object. With vision pooling disabled, `vision_x_pooled`
+is an explicit alias of `vision_x` (34 logical names, 33 allocations); pooled
+deployments allocate it separately. Buffer shapes are fixed from `num_views`,
+`max_prompt_tokens`, `chunk_size`, `num_steps`, and `vision_pool_factor` before
+capture, and BF16 RMS-one constants are initialized during setup. Attention
+backend buffers and generated RoPE/style contents are the remaining workspace
+subsystems before the complete forward can be captured.
+
 CUDA graph execs are process-local objects. They are not serialized as a
 portable artifact. Removing Python from setup requires a native producer that
 loads assets and captures graphs in the replay process.

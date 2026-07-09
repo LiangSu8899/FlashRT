@@ -133,6 +133,7 @@ set(FLASHRT_CPP_PI05_SRCS
   models/pi05/src/native_device_weights.cpp
   models/pi05/src/native_weight_packer.cpp
   models/pi05/src/native_weight_materializer.cpp
+  models/pi05/src/native_workspace.cpp
   models/pi05/src/prompt_format.cpp
   models/pi05/src/prompt_embed.cpp
   models/pi05/src/io.cpp
@@ -238,6 +239,13 @@ if(BUILD_TESTING)
       PRIVATE flashrt_cpp_pi05_kernels flashrt_exec CUDA::cudart)
     add_test(NAME pi05_native_kernel_driver
       COMMAND test_pi05_native_kernel_driver)
+
+    add_executable(test_pi05_native_workspace
+      tests/test_pi05_native_workspace.cpp)
+    target_link_libraries(test_pi05_native_workspace
+      PRIVATE flashrt_cpp_pi05 flashrt_exec CUDA::cudart)
+    add_test(NAME pi05_native_workspace
+      COMMAND test_pi05_native_workspace)
   endif()
 
   add_executable(test_pi05_prompt_format tests/test_pi05_prompt_format.cpp)
