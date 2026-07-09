@@ -20,11 +20,19 @@ import os
 from typing import Any
 
 import torch
-import torch.nn.functional as F
 
 from flash_rt.models.higgs_audio_v3.pipeline_rtx import HiggsAudioV3Dims
 
 _SPECIALS = ("<|tts|>", "<|text|>", "<|audio|>")
+
+
+def _delayed_eoc_countdown(codes: torch.Tensor, nc: int, eoc: int) -> int | None:
+    """Remaining delayed rows to flush once any codebook emits EOC."""
+    eoc_pos = (codes == eoc).nonzero(as_tuple=False)
+    if not eoc_pos.numel():
+        return None
+    first_eoc_cb = int(eoc_pos[0])
+    return max(1, nc - 1 - first_eoc_cb)
 
 
 class HiggsAudioV3TorchFrontendRtx:
@@ -84,6 +92,8 @@ class HiggsAudioV3TorchFrontendRtx:
         self._dec: Any = None                          # active decode engine
         self._fp8_decoder: Any = None                  # back-compat alias
         self._codec: Any = None
+        self._codes_dev = None
+        self._embed_buf = None
         self.latency_records: list[float] = []
 
         self._load_weights()
@@ -242,6 +252,9 @@ class HiggsAudioV3TorchFrontendRtx:
         nc = self._cfg["num_codebooks"]
         self._cb_offsets = (
             torch.arange(nc, device=self.device) * self._cfg["codebook_vocab"])
+        self._codes_dev = torch.empty(nc, device=self.device, dtype=torch.long)
+        self._embed_buf = torch.empty(
+            1, self._cfg["hidden"], device=self.device, dtype=torch.bfloat16)
 
     def _build_rope_table(self) -> None:
         hd = self._cfg["head_dim"]
@@ -252,11 +265,6 @@ class HiggsAudioV3TorchFrontendRtx:
         f = torch.outer(pos, inv)  # [max_seq, hd/2]
         self._rope_cos = f.cos().to(torch.bfloat16).contiguous()
         self._rope_sin = f.sin().to(torch.bfloat16).contiguous()
-
-    def _embed_codes(self, codes):
-        cb = self._weights["codebook"]
-        ids = codes.to(self.device).long() + self._cb_offsets
-        return F.embedding(ids, cb).sum(0, keepdim=True)
 
     # ── Public API ──
 
@@ -384,7 +392,13 @@ class HiggsAudioV3TorchFrontendRtx:
         else:
             te = self._weights["text_embed"]
             for t, tok in enumerate(self._prompt_ids):
-                row = F.embedding(torch.tensor([tok], device=self.device), te)
+                tok_t = torch.tensor([tok], device=self.device)
+                row = torch.empty(1, self._cfg["hidden"], device=self.device,
+                                  dtype=torch.bfloat16)
+                fvk.embedding_lookup_bf16(tok_t.data_ptr(), te.data_ptr(),
+                                          row.data_ptr(), 1,
+                                          self._cfg["hidden"],
+                                          torch.cuda.current_stream().cuda_stream)
                 self._gen_logits = self._frame_logits(fvk, row, t)
         self._gen_pos = P
         self._resident_ids = list(self._prompt_ids)
@@ -400,17 +414,20 @@ class HiggsAudioV3TorchFrontendRtx:
         delay, eoc_countdown, done = 0, None, False
         window: list[torch.Tensor] = []
         for j in range(self.max_new_frames):
-            codes = logits.argmax(-1).clone()
+            fvk.higgs_audio_v3_argmax_delay_embed_bf16(
+                logits.data_ptr(), self._weights["codebook"].data_ptr(),
+                self._codes_dev.data_ptr(), self._embed_buf.data_ptr(),
+                nc, self._cfg["codebook_vocab"], self._cfg["hidden"],
+                delay, boc, torch.cuda.current_stream().cuda_stream)
+            codes = self._codes_dev.cpu()
             if delay < nc:
-                if delay + 1 < nc:
-                    codes[delay + 1:] = boc
                 delay += 1
             elif eoc_countdown is not None:
                 eoc_countdown -= 1
                 if eoc_countdown <= 0:
                     done = True
-            elif int(codes[0]) == eoc:
-                eoc_countdown = nc - 2
+            else:
+                eoc_countdown = _delayed_eoc_countdown(codes, nc, eoc)
             if done:
                 break
             window.append(codes.clone())
@@ -418,7 +435,7 @@ class HiggsAudioV3TorchFrontendRtx:
                 base = len(window) - nc
                 yield torch.stack(
                     [window[base + i][i] for i in range(nc)]).cpu()
-            logits = self._decode_logits(fvk, self._embed_codes(codes), P + j)
+            logits = self._decode_logits(fvk, self._embed_buf, P + j)
 
     @torch.no_grad()
     def predict(self, text: str | None = None) -> torch.Tensor:

@@ -146,6 +146,7 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #endif
 #include "kernels/silu_mul_qwen36.cuh"
 #include "kernels/embedding_lookup_bf16.cuh"
+#include "kernels/higgs_audio_v3_kernels.cuh"
 #ifdef FLASHRT_HAVE_QWEN36_KERNELS
 #include "kernels/qwen36_misc.cuh"
 #endif
@@ -4246,6 +4247,18 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("x"), py::arg("W"), py::arg("out"),
         py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0);
 
+    m.def("bf16_matmul_cublaslt_bf16",
+        [](uintptr_t x, uintptr_t W, uintptr_t out,
+           int M, int N, int K, uintptr_t stream) {
+            flash_rt::kernels::bf16_matmul_cublaslt_bf16(
+                reinterpret_cast<const __nv_bfloat16*>(x),
+                reinterpret_cast<const __nv_bfloat16*>(W),
+                reinterpret_cast<__nv_bfloat16*>(out),
+                M, N, K, to_stream(stream));
+        },
+        py::arg("x"), py::arg("W"), py::arg("out"),
+        py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0);
+
 #ifdef FLASHRT_HAVE_QWEN36_KERNELS
     m.def("bf16_matmul_qwen36_bf16",
         [](uintptr_t x, uintptr_t W, uintptr_t out,
@@ -4339,6 +4352,23 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         },
         py::arg("token_ids"), py::arg("embed"), py::arg("out"),
         py::arg("rows"), py::arg("hidden"), py::arg("stream") = 0);
+
+    m.def("higgs_audio_v3_argmax_delay_embed_bf16",
+        [](uintptr_t logits, uintptr_t codebook, uintptr_t codes_out,
+           uintptr_t embed_out, int num_codebooks, int codebook_vocab,
+           int hidden, int delay, int boc, uintptr_t stream) {
+            flash_rt::kernels::higgs_audio_v3_argmax_delay_embed_bf16(
+                reinterpret_cast<const __nv_bfloat16*>(logits),
+                reinterpret_cast<const __nv_bfloat16*>(codebook),
+                reinterpret_cast<int64_t*>(codes_out),
+                reinterpret_cast<__nv_bfloat16*>(embed_out),
+                num_codebooks, codebook_vocab, hidden, delay, boc,
+                to_stream(stream));
+        },
+        py::arg("logits"), py::arg("codebook"), py::arg("codes_out"),
+        py::arg("embed_out"), py::arg("num_codebooks"),
+        py::arg("codebook_vocab"), py::arg("hidden"), py::arg("delay"),
+        py::arg("boc"), py::arg("stream") = 0);
 
 #ifdef FLASHRT_HAVE_QWEN36_KERNELS
     m.def("qwen36_embedding_lookup_bf16",

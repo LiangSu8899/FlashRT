@@ -18,10 +18,8 @@ Used by :class:`HiggsAudioV3TorchFrontendRtx` when ``fp8=False``.
 """
 from __future__ import annotations
 
-from typing import Any
-
 import torch
-import torch.nn.functional as F
+from typing import Any
 
 BF16 = torch.bfloat16
 
@@ -177,17 +175,16 @@ class HiggsAudioV3Bf16Decoder:
         H, NQ, NKV, HD, INTER = self.H, self.NQ, self.NKV, self.HD, self.INTER
         NQK, KV, EPS = self.NQK, self.KV, self.EPS
         s = torch.cuda.current_stream().cuda_stream
-        # One-time eager prefill GEMM: cuBLAS (torch.matmul) reads each weight
-        # ONCE across the P prompt rows (5-14x the warp-per-row bf16_matmul,
-        # which re-reads W per row -> 11%/5% effective BW at P=13/33). This is
-        # the one-time setup path, not the per-frame decode graph (which stays
-        # the hand-written bf16 GEMV); the norms/qk-norm+RoPE/silu/attention all
-        # stay kernelised. mv is the M=1 head GEMV.
+        # Keep the prompt path in FlashRT-owned kernels. GEMMs use the cuBLASLt
+        # binding for throughput; q/k norm + RoPE + KV write use the batched
+        # prefill kernels so the prompt KV is produced by one consistent path
+        # instead of a Python loop over strided slices.
         mv = fvk.bf16_matvec_qwen36_bf16
+        fast_gemm = fvk.bf16_matmul_cublaslt_bf16
         rc, rs = fe._rope_cos, fe._rope_sin
 
         ids_t = torch.tensor(ids[start_pos:], device=dev)
-        h = F.embedding(ids_t, fe._weights["text_embed"]).contiguous()  # [S,H]
+        h = torch.empty(S, H, device=dev, dtype=BF16)
         xn = torch.empty(S, H, device=dev, dtype=BF16)
         xn2 = torch.empty(S, H, device=dev, dtype=BF16)
         Dq = torch.empty(S, NQK + 2 * KV, device=dev, dtype=BF16)
@@ -195,42 +192,50 @@ class HiggsAudioV3Bf16Decoder:
         act = torch.empty(S, INTER, device=dev, dtype=BF16)
         tmp = torch.empty(S, H, device=dev, dtype=BF16)
 
+        fvk.embedding_lookup_bf16(ids_t.data_ptr(),
+                                  fe._weights["text_embed"].data_ptr(),
+                                  h.data_ptr(), S, H, s)
         fvk.rms_norm(h.data_ptr(), self.WL[0]["in_norm"].data_ptr(),
                      xn.data_ptr(), S, H, EPS, s)
         for L in range(self.NL):
             w = self.WL[L]
-            torch.matmul(xn, w["qkv"].t(), out=Dq)
-            for j in range(S):
-                pos = start_pos + j
-                qj = Dq[j, :NQK].contiguous()
-                kj = Dq[j, NQK:NQK + KV].contiguous()
-                vj = Dq[j, NQK + KV:].contiguous()
-                fvk.qwen3_q_norm_rope_qstage_bf16(
-                    q_pre=qj.data_ptr(), q_norm_w=w["qn"].data_ptr(),
-                    cos=rc[pos].data_ptr(), sin=rs[pos].data_ptr(),
-                    q_buf_dst=be.Q_buf[:, j].data_ptr(), n_q_heads=NQ, eps=EPS,
-                    stream=s)
-                fvk.qwen3_k_norm_rope_kvwrite_bf16(
-                    k_pre=kj.data_ptr(), v_pre=vj.data_ptr(),
-                    k_norm_w=w["kn"].data_ptr(),
-                    cos=rc[pos].data_ptr(), sin=rs[pos].data_ptr(),
-                    k_cache_dst=be.K_cache[L, pos].data_ptr(),
-                    v_cache_dst=be.V_cache[L, pos].data_ptr(),
-                    n_kv_heads=NKV, eps=EPS, stream=s)
+            fast_gemm(xn.data_ptr(), w["qkv"].data_ptr(), Dq.data_ptr(),
+                      S, NQK + 2 * KV, H, s)
+            q = Dq[:, :NQK]
+            k = Dq[:, NQK:NQK + KV]
+            v = Dq[:, NQK + KV:]
+            fvk.qwen3_q_norm_rope_qstage_prefill_bf16(
+                q.data_ptr(), w["qn"].data_ptr(),
+                rc[start_pos:start_pos + S].data_ptr(),
+                rs[start_pos:start_pos + S].data_ptr(),
+                be.Q_buf[:, :S].data_ptr(), NQ, S, int(q.stride(0)),
+                int(be.Q_buf[:, :S].stride(1)), EPS, s)
+            fvk.qwen3_k_norm_rope_kvwrite_prefill_bf16(
+                k.data_ptr(), v.data_ptr(), w["kn"].data_ptr(),
+                rc[start_pos:start_pos + S].data_ptr(),
+                rs[start_pos:start_pos + S].data_ptr(),
+                be.K_cache[L, start_pos:start_pos + S].data_ptr(),
+                be.V_cache[L, start_pos:start_pos + S].data_ptr(),
+                NKV, S, int(k.stride(0)),
+                int(be.K_cache[L, start_pos:start_pos + S].stride(0)),
+                EPS, s)
             be.O_buf[:, :S].zero_()
             be.run("full", L, S, kv_seq=P, causal=True, stream=s,
                    softmax_scale=HD ** -0.5)
             ao = be.O_buf[:, :S].reshape(S, NQK).contiguous()
-            torch.matmul(ao, w["o"].t(), out=tmp)
+            fast_gemm(ao.data_ptr(), w["o"].data_ptr(), tmp.data_ptr(),
+                      S, H, NQK, s)
             fvk.residual_add_rms_norm(h.data_ptr(), tmp.data_ptr(),
                                       w["post_norm"].data_ptr(), xn2.data_ptr(),
                                       S, H, EPS, s)
-            torch.matmul(xn2, w["gu"].t(), out=Dg)
+            fast_gemm(xn2.data_ptr(), w["gu"].data_ptr(), Dg.data_ptr(),
+                      S, 2 * INTER, H, s)
             g = Dg[:, :INTER].contiguous()
             u = Dg[:, INTER:].contiguous()
             fvk.silu_mul_qwen36_bf16(g.data_ptr(), u.data_ptr(), act.data_ptr(),
                                      S * INTER, s)
-            torch.matmul(act, w["down"].t(), out=tmp)
+            fast_gemm(act.data_ptr(), w["down"].data_ptr(), tmp.data_ptr(),
+                      S, H, INTER, s)
             if L < self.NL - 1:
                 fvk.residual_add_rms_norm(
                     h.data_ptr(), tmp.data_ptr(),

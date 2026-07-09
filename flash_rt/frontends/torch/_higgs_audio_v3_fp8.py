@@ -268,7 +268,7 @@ class HiggsAudioV3Fp8Decoder:
         rc, rs = fe._rope_cos, fe._rope_sin
 
         ids_t = torch.tensor(ids[start_pos:], device=dev)
-        h = F.embedding(ids_t, fe._weights["text_embed"]).contiguous()  # [S,H]
+        h = torch.empty(S, H, device=dev, dtype=BF16)
         fp8a = torch.empty(S, H, device=dev, dtype=F8)
         Dq = torch.empty(S, NQK + 2 * KV, device=dev, dtype=BF16)
         Dg = torch.empty(S, 2 * INTER, device=dev, dtype=BF16)
@@ -277,6 +277,9 @@ class HiggsAudioV3Fp8Decoder:
         tmp = torch.empty(S, H, device=dev, dtype=BF16)
         act = torch.empty(S, INTER, device=dev, dtype=BF16)
 
+        fvk.embedding_lookup_bf16(ids_t.data_ptr(),
+                                  fe._weights["text_embed"].data_ptr(),
+                                  h.data_ptr(), S, H, s)
         for L in range(self.NL):
             w = self.WL[L]
             fvk.rms_norm_fp8(h.data_ptr(), w["in_norm"].data_ptr(),
@@ -284,23 +287,24 @@ class HiggsAudioV3Fp8Decoder:
                              self.DS[L][0].data_ptr(), s)
             gemm(fp8a.data_ptr(), w["qkvq"].data_ptr(), Dq.data_ptr(),
                  S, NQK + 2 * KV, H, self.ALP[L][0] * w["qkvs"], s)
-            for j in range(S):
-                pos = start_pos + j
-                qj = Dq[j, :NQK].contiguous()
-                kj = Dq[j, NQK:NQK + KV].contiguous()
-                vj = Dq[j, NQK + KV:].contiguous()
-                fvk.qwen3_q_norm_rope_qstage_bf16(
-                    q_pre=qj.data_ptr(), q_norm_w=w["qn"].data_ptr(),
-                    cos=rc[pos].data_ptr(), sin=rs[pos].data_ptr(),
-                    q_buf_dst=be.Q_buf[:, j].data_ptr(), n_q_heads=NQ,
-                    eps=EPS, stream=s)
-                fvk.qwen3_k_norm_rope_kvwrite_bf16(
-                    k_pre=kj.data_ptr(), v_pre=vj.data_ptr(),
-                    k_norm_w=w["kn"].data_ptr(),
-                    cos=rc[pos].data_ptr(), sin=rs[pos].data_ptr(),
-                    k_cache_dst=be.K_cache[L, pos].data_ptr(),
-                    v_cache_dst=be.V_cache[L, pos].data_ptr(),
-                    n_kv_heads=NKV, eps=EPS, stream=s)
+            q = Dq[:, :NQK]
+            k = Dq[:, NQK:NQK + KV]
+            v = Dq[:, NQK + KV:]
+            fvk.qwen3_q_norm_rope_qstage_prefill_bf16(
+                q.data_ptr(), w["qn"].data_ptr(),
+                rc[start_pos:start_pos + S].data_ptr(),
+                rs[start_pos:start_pos + S].data_ptr(),
+                be.Q_buf[:, :S].data_ptr(), NQ, S, int(q.stride(0)),
+                int(be.Q_buf[:, :S].stride(1)), EPS, s)
+            fvk.qwen3_k_norm_rope_kvwrite_prefill_bf16(
+                k.data_ptr(), v.data_ptr(), w["kn"].data_ptr(),
+                rc[start_pos:start_pos + S].data_ptr(),
+                rs[start_pos:start_pos + S].data_ptr(),
+                be.K_cache[L, start_pos:start_pos + S].data_ptr(),
+                be.V_cache[L, start_pos:start_pos + S].data_ptr(),
+                NKV, S, int(k.stride(0)),
+                int(be.K_cache[L, start_pos:start_pos + S].stride(0)),
+                EPS, s)
             # Pre-zero the query slots: the causal FA2 path can leave a partial
             # query-tile slot unwritten, and reading stale O_buf makes the
             # prefill non-deterministic run-to-run (frame-0 near-tie argmax
@@ -314,7 +318,7 @@ class HiggsAudioV3Fp8Decoder:
                                     self.DS[L][1].data_ptr(), S * NQK, s)
             gemm(fp8o.data_ptr(), w["oq"].data_ptr(), tmp.data_ptr(),
                  S, H, NQK, self.ALP[L][1] * w["os"], s)
-            h = (h.float() + tmp.float()).to(BF16)
+            fvk.residual_add(h.data_ptr(), tmp.data_ptr(), S * H, s)
             fvk.rms_norm_fp8(h.data_ptr(), w["post_norm"].data_ptr(),
                              fp8a.data_ptr(), S, H, EPS,
                              self.DS[L][2].data_ptr(), s)
@@ -328,7 +332,7 @@ class HiggsAudioV3Fp8Decoder:
                                     self.DS[L][3].data_ptr(), S * INTER, s)
             gemm(fp8d.data_ptr(), w["dnq"].data_ptr(), tmp.data_ptr(),
                  S, H, INTER, self.ALP[L][3] * w["dns"], s)
-            h = (h.float() + tmp.float()).to(BF16)
+            fvk.residual_add(h.data_ptr(), tmp.data_ptr(), S * H, s)
 
         hlast = h[S - 1:S].contiguous()
         fvk.rms_norm(hlast.data_ptr(), fe._weights["final_norm"].data_ptr(),
