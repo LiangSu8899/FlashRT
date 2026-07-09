@@ -244,6 +244,33 @@ PYBIND11_MODULE(flash_rt_qwen3_vl_kernels, m) {
         py::arg("output_scale"), py::arg("M"), py::arg("K"),
         py::arg("stream") = 0);
 
+    // BF16-output norm variants: skip the FP8 quant pass, emit BF16 activations
+    // for the bf16in GEMV path (qkv / gate_up in decode).
+    m.def("rms_norm_bf16_out",
+        [](uintptr_t input, uintptr_t weight, uintptr_t output,
+           int M, int K, float eps, uintptr_t stream) {
+            flash_rt::quantize::rms_norm_bf16_out(
+                to_ptr(input), to_ptr(weight), to_ptr(output),
+                M, K, eps, to_stream(stream));
+        },
+        py::arg("input"), py::arg("weight"), py::arg("output"),
+        py::arg("M"), py::arg("K"), py::arg("eps") = 1e-6f,
+        py::arg("stream") = 0);
+
+    m.def("residual_add_rms_norm_bf16_out",
+        [](uintptr_t residual, uintptr_t x, uintptr_t residual_out,
+           uintptr_t weight, uintptr_t output,
+           int M, int K, float eps, uintptr_t stream) {
+            flash_rt::quantize::residual_add_rms_norm_bf16_out(
+                to_ptr(residual), to_ptr(x), to_ptr(residual_out),
+                to_ptr(weight), to_ptr(output),
+                M, K, eps, to_stream(stream));
+        },
+        py::arg("residual"), py::arg("x"), py::arg("residual_out"),
+        py::arg("weight"), py::arg("output"),
+        py::arg("M"), py::arg("K"), py::arg("eps") = 1e-6f,
+        py::arg("stream") = 0);
+
     m.def("fp8_block128_gemm_blockscaled_sm89_bf16out",
         [](uintptr_t A, uintptr_t B, uintptr_t D,
            int M, int N, int K,
@@ -264,6 +291,22 @@ PYBIND11_MODULE(flash_rt_qwen3_vl_kernels, m) {
         py::arg("M"), py::arg("N"), py::arg("K"),
         py::arg("act_block_scale"), py::arg("w_block_scale"),
         py::arg("stream") = 0);
+
+    // Bench-only tile-variant bindings for prefill GEMM tuning. Not used by
+    // the frontend; exposed only for explicit Qwen3-VL dev builds so the
+    // production pybind surface stays runtime-only.
+#ifdef ENABLE_QWEN3_VL_DEV_KERNELS
+#define BIND_GEMM_TILE(NAME)                                                        m.def("bench_" #NAME,                                                               [](uintptr_t A, uintptr_t B, uintptr_t D, int M, int N, int K,                     uintptr_t act_scale, uintptr_t w_scale, uintptr_t stream) {                      return flash_rt::gemm::block128_sm89::NAME(                                         to_ptr(A), to_ptr(B), to_ptr(D), M, N, K,                                      reinterpret_cast<const float*>(act_scale),                                      reinterpret_cast<const float*>(w_scale), to_stream(stream));            },                                                                              py::arg("A"), py::arg("B"), py::arg("D"),                                      py::arg("M"), py::arg("N"), py::arg("K"),                                      py::arg("act_block_scale"), py::arg("w_block_scale"),                          py::arg("stream") = 0)
+    BIND_GEMM_TILE(fp8_block128_gemm_bs_sm89_16x64x128_w4);
+    BIND_GEMM_TILE(fp8_block128_gemm_bs_sm89_32x64x128_w4);
+    BIND_GEMM_TILE(fp8_block128_gemm_bs_sm89_64x64x128_w4);
+    BIND_GEMM_TILE(fp8_block128_gemm_bs_sm89_64x64x128_w4_s1);
+    BIND_GEMM_TILE(fp8_block128_gemm_bs_sm89_128x128x128_w8_s1);
+    BIND_GEMM_TILE(fp8_block128_gemm_bs_sm89_32x128x128_w4);
+    BIND_GEMM_TILE(fp8_block128_gemm_bs_sm89_64x128x128_w8);
+    BIND_GEMM_TILE(fp8_block128_gemm_bs_sm89_128x128x128_w8);
+#undef BIND_GEMM_TILE
+#endif
 
     m.def("qwen3_qk_norm_rope_kvwrite_bf16",
         [](uintptr_t q_pre, uintptr_t k_pre, uintptr_t v_pre,
@@ -342,6 +385,27 @@ PYBIND11_MODULE(flash_rt_qwen3_vl_kernels, m) {
     BIND_BLOCK128_GEMV_M1(gemv_fp8_block128_m1_w4);
     BIND_BLOCK128_GEMV_M1(gemv_fp8_block128_m1_w8);
     BIND_BLOCK128_GEMV_M1(gemv_fp8_block128_m1_w16);
+
+    // BF16-input GEMV: A is BF16, B is FP8 with block-128 weight scale.
+    // Eliminates standalone FP8 activation quantization before O-proj.
+#define BIND_BLOCK128_GEMV_M1_BF16IN(NAME)                                     \
+    m.def("ht_" #NAME,                                                         \
+        [](uintptr_t A, uintptr_t B, uintptr_t D,                              \
+           int M, int N, int K, uintptr_t w_scale, uintptr_t stream) {         \
+            return flash_rt::gemm::gemv_m1_sm89::NAME(                          \
+                to_ptr(A), to_ptr(B), to_ptr(D),                               \
+                M, N, K, reinterpret_cast<const float*>(w_scale),              \
+                to_stream(stream));                                            \
+        },                                                                     \
+        py::arg("A"), py::arg("B"), py::arg("D"),                              \
+        py::arg("M"), py::arg("N"), py::arg("K"),                              \
+        py::arg("w_scale"), py::arg("stream") = 0)
+
+    BIND_BLOCK128_GEMV_M1_BF16IN(gemv_fp8_block128_m1_bf16in_w8);
+    BIND_BLOCK128_GEMV_M1_BF16IN(gemv_fp8_block128_m1_bf16in_w16);
+
+#undef BIND_BLOCK128_GEMV_M1_BF16IN
+
 #endif  // ENABLE_SM89_BLOCK_FP8_GEMM
 
 #ifdef ENABLE_QWEN3_VL_BF16_CUBLASLT

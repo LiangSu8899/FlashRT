@@ -497,6 +497,35 @@ def extract_weights_qwen3_nvfp4(
         else:
             ld['gate_up_homogeneous_alpha'] = False
 
+        # ── Interleaved gate|up weight for the SwiGLU epilogue-fold prefill ──
+        # gate row i -> output col 2i, up row i -> 2i+1, so the fused SwiGLU
+        # GEMM's adjacent accumulator columns are (gate[i], up[i]). Interleave
+        # the row-major weight_packed and the LINEAR weight_scale on dim 0, then
+        # swizzle. Works for any alpha (gate/up scales are applied separately in
+        # the epilogue). Additive: the split + concat-fused weights stay.
+        g_pk = _get_tensor(handles_d, wmap, mp + 'gate_proj.weight_packed').to(device).contiguous()
+        u_pk = _get_tensor(handles_d, wmap, mp + 'up_proj.weight_packed').to(device).contiguous()
+        g_sl = _get_tensor(handles_d, wmap, mp + 'gate_proj.weight_scale').to(device).contiguous()
+        u_sl = _get_tensor(handles_d, wmap, mp + 'up_proj.weight_scale').to(device).contiguous()
+        il_N = 2 * g_pk.shape[0]
+        il_pk = torch.empty(il_N, g_pk.shape[1], dtype=g_pk.dtype, device=device)
+        il_pk[0::2] = g_pk
+        il_pk[1::2] = u_pk
+        il_sl = torch.empty(il_N, g_sl.shape[1], dtype=g_sl.dtype, device=device)
+        il_sl[0::2] = g_sl
+        il_sl[1::2] = u_sl
+        il_K = il_sl.shape[1] * 16
+        il_sf_swz = torch.zeros(
+            ((il_N + 127) // 128) * ((il_K // 16 + 3) // 4) * 512,
+            dtype=torch.uint8, device=device)
+        fvk.nvfp4_sf_linear_to_swizzled(
+            int(il_sl.contiguous().data_ptr()), int(il_sf_swz.data_ptr()),
+            il_N, il_K, False, 0)
+        del g_pk, u_pk, g_sl, u_sl, il_sl
+        ld['gate_up_il_packed'] = _anchor(handles, il_pk.contiguous())
+        ld['gate_up_il_sf'] = _anchor(handles, il_sf_swz)
+        ld['gate_up_il_N'] = il_N
+
         per_layer[L] = ld
         if debug and (L < 4 or L % 9 == 0):
             torch.cuda.synchronize()

@@ -47,21 +47,20 @@ cmake -S . -B build -DGPU_ARCH=89 -DFLASHRT_BUILD_QWEN3_VL=ON
 cmake --build build -j --target flash_rt_kernels flash_rt_fa2 flash_rt_qwen3_vl_kernels
 ```
 
-## lm_head: optional FP8 mode for 2B
+## lm_head default
 
-The frontend default is BF16 `lm_head` (shared with the 8B path). For
-throughput-sensitive local validation, pass `use_fp8_lm_head=True` or
-`--fp8-lm-head`. The 152k-vocab projection is a large decode-time weight read,
-so FP8 `lm_head` can reduce bandwidth pressure on 2B. Treat it as a performance
-mode: validate logits and generation quality against the default BF16 head on
-the target checkpoint before using it in production.
+The frontend default is FP8 `lm_head` (shared with the 8B path). The
+152k-vocab projection is a large decode-time weight read, so FP8 `lm_head`
+reduces bandwidth pressure on 2B. For BF16 reference validation or deployment
+comparisons, construct the frontend with `use_fp8_lm_head=False` or pass
+`--no-fp8-lm-head` to `scripts/smoke_qwen3_vl_fp8_sm89.py`.
 
 ## Quickstart
 
 ```bash
 python scripts/smoke_qwen3_vl_fp8_sm89.py \
   --checkpoint /path/to/Qwen3-VL-2B-Instruct-FP8 \
-  --multimodal --fp8-lm-head --iters 10 --generate-tokens 32
+  --multimodal --iters 10 --generate-tokens 32
 ```
 
 ## RTX 4090 Validation
@@ -69,28 +68,38 @@ python scripts/smoke_qwen3_vl_fp8_sm89.py \
 Environment: NVIDIA GeForce RTX 4090 (SM89); checkpoint
 `Qwen3-VL-2B-Instruct-FP8` (quantized as above); FP8 `lm_head`.
 
-Text-only (S=79 prefill, decode at cache_pos=63):
+Text-only (S=79 prefill, decode at cache_pos=63, iters=30, median):
 
 ```text
-S=79 prefill median=8.489 ms
-prefill_speedup=52.09x logit_cos=0.999426 top_prefill=198 top_loop=198
-graph_decode_pos=63 median=2.653 ms (377 tok/s) top=19564 finite=True
+S=79 prefill median=6.586 ms
+prefill_speedup=63.68x logit_cos=0.999504 top_prefill=198 top_loop=198
+graph_decode_pos=63 median=2.361 ms (423 tok/s) cos_vs_eager=1.000000 top=19564 finite=True
 ```
 
-Multimodal (`FlashRT.png`, `Describe this image in one sentence.`, S=1581):
+2B text decode 2.653 → 2.361 ms (377 → 423 tok/s) vs the initial PR #111
+number, from the decode-path work on this branch (BF16-input GEMV, BF16-output
+RMSNorm, gate/up GEMV fusion, FP8 lm_head).
+
+Multimodal (`FlashRT.png`, `Describe this image in one sentence.`, S=1581,
+iters=30, median):
 
 ```text
 S=1581 pixel_shape=(6256, 1536) spans=[(4, 1568)]
-vision_only median=69.670 ms
-language_only_no_mm_scatter median=29.827 ms
-prefill median=102.991 ms top=32 finite=True
-prefill_graph median=99.743 ms cos_vs_eager=0.997508 top=32 finite=True
-graph_decode_cache_pos=1581 median=2.966 ms (337 tok/s) cos_vs_eager=1.000000
+vision_only median=53.682 ms
+language_only_no_mm_scatter median=26.402 ms
+prefill median=81.548 ms top=32 finite=True
+prefill_graph median=81.129 ms cos_vs_eager=1.000000 top=32 finite=True
+graph_decode_cache_pos=1581 median=2.669 ms (375 tok/s) cos_vs_eager=1.000000
   top_eager=3691 top_graph=3691
 generate_tokens=32 text='A black background features the "FlashRT" logo, with
   an orange lightning bolt symbol next to the stylized text "FlashRT" in white
   and orange.'
 ```
+
+2B multimodal `prefill_graph` 99.743 → 81.129 ms (**-18.6%**), `graph_decode`
+2.966 → 2.669 ms (**-10.0%**), `vision_only` 69.670 → 53.682 ms (-23%),
+`language_only_no_mm_scatter` 29.827 → 26.402 ms (-11.4%) vs the initial PR
+#111 numbers.
 
 These numbers are local validation points, not CI guarantees. Re-benchmark on
 the target GPU, driver, and build flags before treating them as deployment

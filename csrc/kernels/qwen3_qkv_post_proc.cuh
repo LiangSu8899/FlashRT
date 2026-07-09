@@ -156,6 +156,53 @@ int qwen3_k_norm_rope_kvwrite_prefill_bf16(
     float       eps,
     cudaStream_t stream);
 
+// v3: warp-per-row (32 threads) with vectorized contiguous-4 (uint2) access —
+// one 256B coalesced transaction per warp. Same semantics; NOT bit-identical
+// (~1 ULP). head_dim=128 only.
+int qwen3_q_norm_rope_qstage_prefill_v3_bf16(
+    const void* q_pre, const void* q_norm_w, const void* cos, const void* sin,
+    void* q_buf_dst, int n_q_heads, int S, int in_row_stride,
+    int out_row_stride, float eps, cudaStream_t stream);
+
+int qwen3_k_norm_rope_kvwrite_prefill_v3_bf16(
+    const void* k_pre, const void* v_pre, const void* k_norm_w,
+    const void* cos, const void* sin, void* k_cache_dst, void* v_cache_dst,
+    int n_kv_heads, int S, int in_row_stride, int cache_row_stride,
+    float eps, cudaStream_t stream);
+
+// v3 + FOLDED per-token e4m3 emit (STEP D fp8 prefill attention). Same RMS+RoPE
+// as v3_bf16, but also writes e4m3 Q/K (NHD [S,H,128]) + per-(token,head) scale
+// ([H,S] head-major), with no extra HBM round-trip. The K variant also casts V
+// to fp16 (NHD [S,Hkv,128]), folding the prefill V cast. bf16 dst still written.
+int qwen3_q_norm_rope_qstage_prefill_v3_fp8(
+    const void* q_pre, const void* q_norm_w, const void* cos, const void* sin,
+    void* q_buf_dst, void* q8_dst, void* q_scale_dst,
+    int n_q_heads, int S, int in_row_stride, int out_row_stride, float eps,
+    cudaStream_t stream);
+
+int qwen3_k_norm_rope_kvwrite_prefill_v3_fp8(
+    const void* k_pre, const void* v_pre, const void* k_norm_w,
+    const void* cos, const void* sin, void* k_cache_dst, void* v_cache_dst,
+    void* k8_dst, void* k_scale_dst, void* v_fp16_dst,
+    int n_kv_heads, int S, int in_row_stride, int cache_row_stride, float eps,
+    cudaStream_t stream);
+
+// Direct-e4m3 variants: no per-token scale (post-norm Q/K sit inside e4m3's
+// dynamic range, so the cast is direct) and V is emitted as e4m3 too — the
+// operand set of the all-fp8 attention (fmha_fp8_causal_gqa_nhd_d128).
+int qwen3_q_norm_rope_qstage_prefill_v3_fp8_direct(
+    const void* q_pre, const void* q_norm_w, const void* cos, const void* sin,
+    void* q_buf_dst, void* q8_dst,
+    int n_q_heads, int S, int in_row_stride, int out_row_stride, float eps,
+    cudaStream_t stream);
+
+int qwen3_k_norm_rope_kvwrite_prefill_v3_fp8_direct(
+    const void* k_pre, const void* v_pre, const void* k_norm_w,
+    const void* cos, const void* sin, void* k_cache_dst, void* v_cache_dst,
+    void* k8_dst, void* v8_dst,
+    int n_kv_heads, int S, int in_row_stride, int cache_row_stride, float eps,
+    cudaStream_t stream);
+
 // Device-position variant: cache slot = K_cache_base + (*cur_pos) * row_elems,
 // so one captured graph serves every decode position (host bumps *cur_pos
 // before each replay). row_elems = n_kv * 128. Returns 0 on success.

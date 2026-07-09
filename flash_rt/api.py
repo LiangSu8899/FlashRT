@@ -419,6 +419,19 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
     Returns:
         VLAModel instance with .predict() method.
     """
+    # Qwen3-VL is a chat-style VLM, not a VLA predict(images, ...) model. It
+    # is registered in _PIPELINE_MAP for resolve_pipeline_class/discovery, but
+    # load_model's VLAModel wrapper would expose the wrong runtime surface.
+    if config == "qwen3_vl":
+        raise NotImplementedError(
+            "config='qwen3_vl' is a chat-style VLM and is not served through "
+            "load_model's VLA wrapper. Construct the target frontend directly:\n"
+            "    from flash_rt.frontends.torch.qwen3_vl_fp8_sm89_multimodal "
+            "import Qwen3VlFp8Sm89Frontend\n"
+            "    from flash_rt.frontends.torch.qwen3_vl_rtx import "
+            "Qwen3VlTorchFrontendRtx\n"
+            "See docs/qwen3_vl_fp8_sm89.md and docs/qwen3_vl_nvfp4.md.")
+
     if config not in ("pi05", "groot", "groot_n17", "pi0", "pi0fast",
                       "motus", "wan22_ti2v_5b", "cosmos3_video", "nexn2"):
         raise ValueError(

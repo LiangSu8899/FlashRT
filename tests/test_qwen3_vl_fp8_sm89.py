@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+from pathlib import Path
 
 
 def test_frontend_imports():
@@ -44,6 +45,23 @@ def test_default_prefill_limit_matches_max_seq_without_cuda():
 
     assert _resolve_max_prefill_seq(1234, None) == 1234
     assert _resolve_max_prefill_seq(1234, 256) == 256
+
+
+def test_bench_tile_bindings_are_dev_gated():
+    repo = Path(__file__).resolve().parents[1]
+    bindings = (repo / 'csrc' / 'qwen3_vl_bindings.cpp').read_text()
+    cmake = (repo / 'CMakeLists.txt').read_text()
+
+    start = bindings.index('#ifdef ENABLE_QWEN3_VL_DEV_KERNELS')
+    end = bindings.index('#endif', start)
+    dev_block = bindings[start:end]
+    production_surface = bindings[:start] + bindings[end:]
+
+    assert 'm.def("bench_"' in dev_block
+    assert 'BIND_GEMM_TILE(' in dev_block
+    assert 'm.def("bench_"' not in production_surface
+    assert 'option(FLASHRT_ENABLE_QWEN3_VL_DEV_KERNELS' in cmake
+    assert 'ENABLE_QWEN3_VL_DEV_KERNELS=1' in cmake
 
 
 def test_multimodal_prefill_graph_falls_back_to_eager_without_pg_key():

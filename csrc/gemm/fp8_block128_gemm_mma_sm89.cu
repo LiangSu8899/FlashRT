@@ -131,6 +131,20 @@ int fp8_block128_gemm_blockscaled_sm89_bf16out(
     if (N >= 8192 && K == 4096 && M < 1024)
         return fp8_block128_gemm_bs_sm89_128x128x128_w8_s1(
             A, B, D, M, N, K, act_scale, w_scale, stream);
+    // Small-M regime (M<256) for N<8192 linears (qkv/o/down): at M=128 the
+    // 64x64/s1 grid underfills the SMs (8B qkv 64x64_s1 = 192 blocks = 1.5/SM;
+    // 2B qkv = 128 blocks = 1/SM), so achieved occupancy is grid-limited well
+    // below the theoretical cap. The smaller 32x64 tile doubles grid_m (8B qkv
+    // -> 384 blocks = 3/SM; 2B qkv -> 256 = 2/SM) and wins despite a lower
+    // per-block warp cap — ncu shows 8B qkv M=128: 32x64 51.6us vs 64x64_s1
+    // 61.9us (-17%). Graph-captured e2e confirms: 2B S=128 -13.5%, 8B S=128
+    // -12.0%, 2B S=192 -5.5%, 8B S=192 -2.0% (gain shrinks as M approaches the
+    // 256 crossover, beyond which 64x64/s1 wins — see layer-regime micro-bench).
+    // Wide-MLP gate_up keeps its existing s1 tile (8B via 128x128_w8_s1 above;
+    // 2B via the default 64x64_s1 below) — it is best at all M.
+    if (M < 256 && N < 8192)
+        return fp8_block128_gemm_bs_sm89_32x64x128_w4(
+            A, B, D, M, N, K, act_scale, w_scale, stream);
     if (N == 2048 && M < 1024)
         return fp8_block128_gemm_bs_sm89_64x64x128_w4(
             A, B, D, M, N, K, act_scale, w_scale, stream);

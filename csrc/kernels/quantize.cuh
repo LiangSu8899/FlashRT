@@ -80,6 +80,13 @@ void quantize_bf16_to_nvfp4_swizzled(const __nv_bfloat16* input, uint8_t* fp4_da
                                        uint8_t* scale_factors, int rows, int cols,
                                        cudaStream_t stream = 0);
 
+// Bit-identical faster variant (register prefetch + smem cache so input is read
+// once + atomic-free fused per-block amax/SF/pack + branchless e2m1). Falls back
+// to v1 for cols > 4096.
+void quantize_bf16_to_nvfp4_swizzled_v2(const __nv_bfloat16* input, uint8_t* fp4_data,
+                                        uint8_t* scale_factors, int rows, int cols,
+                                        cudaStream_t stream = 0);
+
 // Specialized swizzled NVFP4 quantizer for Motus Wan FFN intermediate
 // activations (cols=14336). Byte-equivalent to the generic swizzled path.
 int quantize_bf16_to_nvfp4_swizzled_k14336(
@@ -234,6 +241,22 @@ void rms_norm_to_nvfp4_swizzled_bf16(
     int rows, int cols, float eps,
     cudaStream_t stream = 0);
 
+// Bit-identical to the above; computes the per-16-block amax without smem
+// atomics (atomic-free reduction). Same args/semantics.
+void rms_norm_to_nvfp4_swizzled_bf16_v2(
+    const __nv_bfloat16* x, const __nv_bfloat16* rms_weight,
+    uint8_t* packed, uint8_t* sf_swz,
+    int rows, int cols, float eps,
+    cudaStream_t stream = 0);
+
+// v3: vectorized memory pipeline (uint4 loads / uint2 packed stores) — same
+// math as v2; falls back to v2 for rows the vector path cannot cover.
+void rms_norm_to_nvfp4_swizzled_bf16_v3(
+    const __nv_bfloat16* x, const __nv_bfloat16* rms_weight,
+    uint8_t* packed, uint8_t* sf_swz,
+    int rows, int cols, float eps,
+    cudaStream_t stream = 0);
+
 // Fused: affine LayerNorm(x, weight, bias) -> nvfp4 packed + swizzled SF.
 // Used by Motus cross-attn norm3 -> Q NVFP4 projection so the BF16
 // normalized activation does not round-trip through global memory.
@@ -255,6 +278,18 @@ void layer_norm_to_nvfp4_swizzled_bf16(
 // Bit-equivalent to the unfused sequence under the same bf16 rounding
 // model (residual sum -> bf16 round -> ssq + amax over bf16 values).
 void residual_add_rms_norm_to_nvfp4_swizzled_bf16(
+    const __nv_bfloat16* h_in,
+    const __nv_bfloat16* attn_proj,
+    __nv_bfloat16* h_post,
+    const __nv_bfloat16* rms_weight,
+    uint8_t* packed, uint8_t* sf_swz,
+    int rows, int cols, float eps,
+    cudaStream_t stream = 0);
+
+// Bit-identical to the above; faster via register prefetch (pipelined loads,
+// no x re-read) + atomic-free fused amax/SF/pack + branchless e2m1. Falls back
+// to v1 for cols > 4096. Same args/semantics.
+void residual_add_rms_norm_to_nvfp4_swizzled_bf16_v2(
     const __nv_bfloat16* h_in,
     const __nv_bfloat16* attn_proj,
     __nv_bfloat16* h_post,

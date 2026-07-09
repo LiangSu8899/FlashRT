@@ -787,6 +787,18 @@ def test_groot_n17_rtx_sm120_rejects_use_fp8_false_without_fp16():
         )
 
 
+def test_load_model_redirects_qwen3_vl_to_direct_frontend():
+    from flash_rt.api import load_model
+
+    with pytest.raises(NotImplementedError, match="chat-style VLM"):
+        load_model(
+            "unused-checkpoint",
+            config="qwen3_vl",
+            framework="torch",
+            hardware="rtx_sm89",
+        )
+
+
 def test_frontend_fp8_layout_selection():
     from flash_rt.frontends._fp8_layout import select_fp8_layout
 

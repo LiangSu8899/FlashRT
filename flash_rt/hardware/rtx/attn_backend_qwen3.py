@@ -136,6 +136,72 @@ class RtxFlashAttnBackendQwen3:
             from flash_attn import flash_attn_func
             self._flash_attn_func = flash_attn_func
 
+        # fp8-QK prefill attention (env-gated, additive). Quantizes Q/K to e4m3
+        # (per-warp / per-block-64) and casts V to fp16, then runs the sage2
+        # fp8-QK / fp16-PV causal-GQA kernel. Only fires for q_seq a multiple of
+        # 128 (the kernel's per-warp scale stride is ceil(Lq/128)*4 — matched by
+        # the quant only at that alignment); FA2 handles every other case.
+        self._fp8_prefill = (
+            os.environ.get("FLASH_RT_QWEN3_FP8_ATTN", "0") == "1"
+            and self._max_q_seq >= 128
+        )
+        self._fp8_attn_fn = None
+        if self._fp8_prefill:
+            from flash_rt import flash_rt_kernels as _fvk
+            fn = getattr(
+                _fvk, "sage2_qk_f8_sv_f16_bf16_gqa_nhd_d128_causal", None)
+            if fn is None or not hasattr(_fvk, "quant_per_token_fp8_bf16_d128"):
+                self._fp8_prefill = False
+            else:
+                self._fvk = _fvk
+                self._fp8_attn_fn = fn
+                sp = ((self._max_q_seq + 127) // 128) * 128
+                self._fp8_sp_max = sp
+                hq, hkv, hd = self.NUM_Q_HEADS, self.NUM_KV_HEADS, self.HEAD_DIM
+                self._fp8_q8 = torch.zeros(
+                    1, sp, hq, hd, dtype=torch.float8_e4m3fn, device=d)
+                self._fp8_k8 = torch.zeros(
+                    1, sp, hkv, hd, dtype=torch.float8_e4m3fn, device=d)
+                self._fp8_vf = torch.zeros(
+                    1, sp, hkv, hd, dtype=torch.float16, device=d)
+                # per-token scales: one per (token, head).
+                self._fp8_qs = torch.zeros(hq * sp, dtype=torch.float32, device=d)
+                self._fp8_ks = torch.zeros(hkv * sp, dtype=torch.float32, device=d)
+
+        # All-fp8 prefill attention (env-gated, additive): raw e4m3 Q/K/V from
+        # the direct-cast norm_rope fold, single all-fp8 causal-GQA kernel (no
+        # per-token scales — post-norm Q/K sit inside e4m3's dynamic range).
+        # Takes precedence over FLASH_RT_QWEN3_FP8_ATTN when both are set.
+        self._fp8_direct = False
+        if (os.environ.get("FLASH_RT_QWEN3_FP8_FMHA", "1") == "1"
+                and self._max_q_seq >= 128):
+            from flash_rt import flash_rt_kernels as _fvk
+            fn = getattr(_fvk, "fmha_fp8_causal_gqa_nhd_d128", None)
+            have_quant = (
+                hasattr(_fvk, "qwen3_q_norm_rope_qstage_prefill_v3_fp8_direct")
+                and hasattr(_fvk, "qwen3_k_norm_rope_kvwrite_prefill_v3_fp8_direct"))
+            if fn is not None and have_quant:
+                self._fvk = _fvk
+                self._fp8_direct = True
+                self._fp8_prefill = True
+                self._fp8_attn_fn = fn
+                # fp4-out epilogue: O emitted directly as the o_proj GEMM's
+                # NVFP4 A-operand (skips the bf16 O + quantize launch). The
+                # frontend hands the packed/SF scratch pointers before run().
+                self._fp8_fp4out_fn = getattr(
+                    _fvk, "fmha_fp8_causal_gqa_nhd_d128_fp4out", None)
+                self._fp8_o_fp4 = 0
+                self._fp8_o_sf = 0
+                sp = ((self._max_q_seq + 127) // 128) * 128
+                self._fp8_sp_max = sp
+                hq, hkv, hd = self.NUM_Q_HEADS, self.NUM_KV_HEADS, self.HEAD_DIM
+                self._fp8_q8 = torch.zeros(
+                    1, sp, hq, hd, dtype=torch.float8_e4m3fn, device=d)
+                self._fp8_k8 = torch.zeros(
+                    1, sp, hkv, hd, dtype=torch.float8_e4m3fn, device=d)
+                self._fp8_v8 = torch.zeros(
+                    1, sp, hkv, hd, dtype=torch.float8_e4m3fn, device=d)
+
     # ── Layer cache pointer math ──
 
     @property
@@ -216,6 +282,15 @@ class RtxFlashAttnBackendQwen3:
         if softmax_scale is None:
             softmax_scale = 1.0 / (self.HEAD_DIM ** 0.5)
 
+        # fp8-QK prefill path (env-gated). q_seq is the captured S-bucket; the
+        # buckets that reach here (>=128) are powers of two, hence multiples of
+        # 128 -> Sp == q_seq, no staging/padding. Causal masking excludes the
+        # prompt's pad tokens (positions >= real_S) for every real query.
+        if (self._fp8_prefill and q_seq > 1 and causal
+                and q_seq % 128 == 0 and q_seq <= self._fp8_sp_max):
+            return self._run_fp8_prefill(
+                layer_idx, q_seq, softmax_scale, stream)
+
         # Decode (q_seq=1): single-query, causal vs non-causal identical,
         # so use the existing non-causal fwd_bf16 (template Is_causal=false).
         # Prefill (q_seq>1, causal=True): use the fwd_bf16_causal
@@ -289,6 +364,47 @@ class RtxFlashAttnBackendQwen3:
             q, k, v, causal=causal, softmax_scale=softmax_scale)
         o.copy_(out)
         return o.data_ptr()
+
+    def _run_fp8_prefill(self, layer_idx: int, q_seq: int,
+                         softmax_scale: float, stream: int) -> int:
+        """fp8-QK / fp16-PV causal-GQA prefill attention. q_seq is a multiple of
+        128, so Sp == q_seq. The per-token e4m3 Q/K (+scale) and fp16 V are ALL
+        produced by the FOLDED norm_rope kernels (q8/k8/vf/qs/ks) — this gate is
+        identical to the prefill fold gate, so they always fire together — so the
+        attention here is a single launch, no quant/cast. Writes O_buf directly.
+        Graph-safe: scratch pre-allocated in __init__, kernel uses `stream`."""
+        Sp = q_seq
+        if self._fp8_direct:
+            # All-fp8 path: raw e4m3 Q/K/V, no scales.
+            if self._fp8_fp4out_fn is not None and self._fp8_o_fp4:
+                rc = self._fp8_fp4out_fn(
+                    q_fp8=self._fp8_q8.data_ptr(),
+                    k_fp8=self._fp8_k8.data_ptr(),
+                    v_fp8=self._fp8_v8.data_ptr(),
+                    out_fp4=self._fp8_o_fp4, out_sf=self._fp8_o_sf,
+                    Lq=Sp, Lk=Sp,
+                    Hq=self.NUM_Q_HEADS, Hkv=self.NUM_KV_HEADS,
+                    softmax_scale=softmax_scale, stream=stream)
+                if rc != 0:
+                    raise RuntimeError(f"qwen3 fp8 prefill attn rc={rc}")
+                return self.O_buf.data_ptr()
+            rc = self._fp8_attn_fn(
+                q_fp8=self._fp8_q8.data_ptr(), k_fp8=self._fp8_k8.data_ptr(),
+                v_fp8=self._fp8_v8.data_ptr(), out_bf16=self.O_buf.data_ptr(),
+                Lq=Sp, Lk=Sp, Hq=self.NUM_Q_HEADS, Hkv=self.NUM_KV_HEADS,
+                softmax_scale=softmax_scale, stream=stream)
+            if rc != 0:
+                raise RuntimeError(f"qwen3 fp8 prefill attn rc={rc}")
+            return self.O_buf.data_ptr()
+        rc = self._fp8_attn_fn(
+            q_fp8=self._fp8_q8.data_ptr(), k_fp8=self._fp8_k8.data_ptr(),
+            v_fp16=self._fp8_vf.data_ptr(), out_bf16=self.O_buf.data_ptr(),
+            q_scale=self._fp8_qs.data_ptr(), k_scale=self._fp8_ks.data_ptr(),
+            B=1, Lq=Sp, Lk=Sp, Hq=self.NUM_Q_HEADS, Hkv=self.NUM_KV_HEADS,
+            softmax_scale=softmax_scale, per_token=True, stream=stream)
+        if rc != 0:
+            raise RuntimeError(f"qwen3 fp8 prefill attn rc={rc}")
+        return self.O_buf.data_ptr()
 
 
 def make_qwen3_8b_attention_spec(*, max_seq: int, max_q_seq: int = 1) -> dict:

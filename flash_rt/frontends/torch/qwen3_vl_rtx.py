@@ -1,10 +1,9 @@
 """FlashRT — PyTorch frontend for Qwen3-VL (multimodal) on RTX SM120.
 
 Class name ``Qwen3VlTorchFrontendRtx`` follows the
-``docs/adding_new_model.md`` §0 naming rule, and the direct-instantiation
-pattern of the text sibling ``qwen3_rtx.Qwen3TorchFrontendRtx`` (the
-Qwen3 LLM paths are not registered in ``_PIPELINE_MAP``; a server or test
-constructs the frontend directly).
+``docs/adding_new_model.md`` §0 naming rule. Registered in
+``_PIPELINE_MAP`` as ``("qwen3_vl", "torch", "rtx_sm120")`` for
+discoverability; direct instantiation is the typical usage pattern.
 
 The language stack is the existing dense-Qwen3 NVFP4 W4A4 path, reused
 unchanged via ``Qwen3TorchFrontendRtx``; this frontend adds the ViT
@@ -139,6 +138,7 @@ class Qwen3VlTorchFrontendRtx:
                 if isinstance(size, dict) and 'longest_edge' in size:
                     size['longest_edge'] = int(max_pixels)
 
+        self.latency_records: list[float] = []
         self._prompt: dict[str, Any] | None = None
         if max_prefill_graphs is None:
             max_prefill_graphs = int(os.environ.get(
@@ -582,7 +582,14 @@ class Qwen3VlTorchFrontendRtx:
         max position while the KV-cache slot advances from the
         image-compressed prompt length. ``use_graph`` replays a per-slot
         captured CUDA Graph for each decode step.
+
+        Wall-clock latency of the full generate call (prefill + all decode
+        steps) is appended to ``self.latency_records`` (ms).
         """
+        import time
+        import torch
+
+        t0 = time.perf_counter()
         self.set_prompt(messages)
         logits = self.prefill_graph()
         llm = self.llm
@@ -604,11 +611,34 @@ class Qwen3VlTorchFrontendRtx:
             tok = int(logits[0].float().argmax())
             out_ids.append(tok)
 
+        torch.cuda.synchronize()
+        self.latency_records.append((time.perf_counter() - t0) * 1000)
+
         eos = [t for t in out_ids if t in self._eos_token_ids]
         if eos:
             out_ids = out_ids[:out_ids.index(eos[0])]
         return self.processor.tokenizer.decode(
             out_ids, skip_special_tokens=True)
+
+    def get_latency_stats(self) -> dict:
+        """Return summary statistics over recorded generate latencies (ms).
+
+        Each ``generate()`` call appends one wall-clock measurement
+        (prefill + all decode steps) to ``self.latency_records``.
+        """
+        if not self.latency_records:
+            return {}
+        import numpy as np
+        lat = np.array(self.latency_records)
+        return {
+            "count": len(lat),
+            "mean_ms": float(np.mean(lat)),
+            "std_ms": float(np.std(lat)),
+            "min_ms": float(np.min(lat)),
+            "max_ms": float(np.max(lat)),
+            "p50_ms": float(np.percentile(lat, 50)),
+            "p95_ms": float(np.percentile(lat, 95)),
+        }
 
     def _decode_step_graph(self, token: int, cache_pos: int, rope_pos: int):
         llm = self.llm

@@ -56,6 +56,24 @@ void residual_add_rms_norm_to_fp8_block128_bf16(
     int M, int K, float eps,
     cudaStream_t stream);
 
+// BF16-output variants (no FP8 quant pass): RMSNorm / residual-add + RMSNorm
+// producing BF16 activations for the bf16in GEMV path. M=1 decode only.
+void rms_norm_bf16_out(
+    const void* input,
+    const void* weight,
+    void*       output,
+    int M, int K, float eps,
+    cudaStream_t stream);
+
+void residual_add_rms_norm_bf16_out(
+    const void* residual,
+    const void* x,
+    void*       residual_out,
+    const void* weight,
+    void*       output,
+    int M, int K, float eps,
+    cudaStream_t stream);
+
 void silu_mul_to_fp8_block128_bf16(
     const void* gate,
     const void* up,

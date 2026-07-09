@@ -23,6 +23,16 @@ DECL_BLOCK128(gemv_fp8_block128_m1_w16);
 
 #undef DECL_BLOCK128
 
+// BF16-input variants: A is BF16, B is FP8. No act_scale, only w_scale.
+#define DECL_BLOCK128_BF16IN(NAME) \
+  int NAME(const void* A, const void* B, void* D, \
+           int M, int N, int K, const float* w_scale, cudaStream_t stream)
+
+DECL_BLOCK128_BF16IN(gemv_fp8_block128_m1_bf16in_w8);
+DECL_BLOCK128_BF16IN(gemv_fp8_block128_m1_bf16in_w16);
+
+#undef DECL_BLOCK128_BF16IN
+
 }  // namespace gemv_m1_sm89
 }  // namespace gemm
 }  // namespace flash_rt

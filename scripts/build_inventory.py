@@ -83,6 +83,7 @@ CATEGORIES: dict[str, tuple[str, ...]] = {
         "csrc/quantize/fp8_block128_to_nvfp4_swizzled.cu",
         "csrc/quantize/bf16_weight_to_nvfp4_swizzled.cu",
         "csrc/kernels/silu_mul_to_nvfp4_swizzled.cu",
+        "csrc/kernels/fp4_swiglu_compact_sm120.cu",
         "csrc/kernels/fp4_w4a4_matvec_sm120.cu",
         "csrc/kernels/fp4_w4a4_mma_sm120.cu",
         "csrc/kernels/fp4_w4a4_mma_warpsplit_sm120.cu",

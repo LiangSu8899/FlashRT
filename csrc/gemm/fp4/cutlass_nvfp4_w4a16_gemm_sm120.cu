@@ -225,7 +225,83 @@ cutlass::Status run_gemm(
   return gemm.run(stream);
 }
 
+// Same default tile, but with a per-element residual C addend folded into the
+// epilogue: D = alpha*(A*B) + C. The epilogue already carries the C operand
+// (ElementC=bf16) — here we just feed C (beta=1) instead of nullptr (beta=0).
+// Lets o_proj/down fuse their residual add, so the following rms_norm reads ONE
+// tensor (D) instead of two (gemm_out + residual). C must be bf16 (M,N) row-major.
+cutlass::Status run_gemm_residual(
+    const void* A_packed, const void* B_packed,
+    const void* C_residual, void* D_bf16,
+    int M, int N, int K,
+    const void* SFA, const void* SFB,
+    float alpha,
+    cudaStream_t stream)
+{
+  using StrideA = typename Gemm::GemmKernel::StrideA;
+  using StrideB = typename Gemm::GemmKernel::StrideB;
+  using StrideC = typename Gemm::GemmKernel::StrideC;
+  using StrideD = typename Gemm::GemmKernel::StrideD;
+
+  StrideA stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(M, K, 1));
+  StrideB stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(N, K, 1));
+  StrideC stride_C = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(M, N, 1));
+  StrideD stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(M, N, 1));
+
+  auto problem_shape_MNKL = cute::make_shape(M, N, K, 1);
+  auto layout_SFA = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(problem_shape_MNKL);
+  auto layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(problem_shape_MNKL);
+
+  using ArrayElementA = typename Gemm::GemmKernel::CollectiveMainloop::ArrayElementA;
+  using ArrayElementB = typename Gemm::GemmKernel::CollectiveMainloop::ArrayElementB;
+
+  typename Gemm::Arguments args{
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      {M, N, K, 1},
+      {
+          reinterpret_cast<ArrayElementA const*>(A_packed), stride_A,
+          reinterpret_cast<ArrayElementB const*>(B_packed), stride_B,
+          reinterpret_cast<ElementSF const*>(SFA), layout_SFA,
+          reinterpret_cast<ElementSF const*>(SFB), layout_SFB
+      },
+      {
+          {alpha, 1.0f},                                       // (alpha, beta=1)
+          reinterpret_cast<ElementC const*>(C_residual), stride_C,
+          reinterpret_cast<ElementD*>(D_bf16), stride_D
+      }
+  };
+
+  Gemm gemm;
+  size_t ws_size = Gemm::get_workspace_size(args);
+  void* ws_ptr = get_workspace(M, N, K, ws_size);
+
+  auto status = gemm.can_implement(args);
+  if (status != cutlass::Status::kSuccess) {
+    std::fprintf(stderr, "[fp4_w4a16_gemm_residual] can_implement FAIL "
+        "M=%d N=%d K=%d (status=%d)\n", M, N, K, static_cast<int>(status));
+    return status;
+  }
+  status = gemm.initialize(args, ws_ptr, stream);
+  if (status != cutlass::Status::kSuccess) return status;
+  return gemm.run(stream);
+}
+
 }  // namespace
+
+void fp4_w4a16_gemm_residual_sm120_bf16out(
+    const void* A_packed, const void* B_packed,
+    const void* C_residual, void* D_bf16,
+    int M, int N, int K,
+    const void* SFA, const void* SFB,
+    float alpha, cudaStream_t stream)
+{
+  cutlass::Status status = run_gemm_residual(
+      A_packed, B_packed, C_residual, D_bf16, M, N, K, SFA, SFB, alpha, stream);
+  if (status != cutlass::Status::kSuccess) {
+    std::fprintf(stderr, "[fp4_w4a16_gemm_residual_sm120_bf16out] run FAIL "
+        "M=%d N=%d K=%d (status=%d)\n", M, N, K, static_cast<int>(status));
+  }
+}
 
 void fp4_w4a16_gemm_sm120_bf16out(
     const void*  A_packed,

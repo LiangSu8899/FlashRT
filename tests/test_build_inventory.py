@@ -30,14 +30,14 @@ BUILD_DIR = Path(os.environ.get("FLASHRT_BUILD_DIR", REPO_ROOT / "build"))
 # build-mode aware: it reads FLASHRT_SLIM_BUILD from the configured build dir's
 # CMakeCache.txt and asserts the matching surface.
 #
-#   compat default (FLASHRT_SLIM_BUILD=OFF): 56 direct TUs, unchanged.
+#   compat default (FLASHRT_SLIM_BUILD=OFF): 57 direct TUs, unchanged.
 #   slim SM89   (FLASHRT_SLIM_BUILD=ON):     34 direct TUs (-22):
 #       -5 Motus VAE FP8 (Unit 1), -10 Qwen3.6/linear-attn (Unit 2),
 #       -7 SM120/NVFP4-named (Unit 3).
 # The direct-source breakdowns below are SM89-specific; other arches add/remove
 # arch-owned sources (for example SM120 adds nvfp4_sf_reshape_sm120.cu), so the
 # direct-count/category asserts are limited to SM89.
-COMPAT_KERNELS_TU = 56
+COMPAT_KERNELS_TU = 57
 SLIM_SM89_KERNELS_TU = 34
 
 # Per-group breakdown of flash_rt_kernels (mirrors AGENTS.md "Current Build
@@ -45,7 +45,7 @@ SLIM_SM89_KERNELS_TU = 34
 COMPAT_KERNELS_CATEGORIES = {
     "generic_shared": 15,
     "qwen36_linear_attention": 12,
-    "sm120_nvfp4_named": 7,
+    "sm120_nvfp4_named": 8,
     "motus_video_fp8_history": 7,
     "dit_video": 2,
     "qwen3_family": 2,

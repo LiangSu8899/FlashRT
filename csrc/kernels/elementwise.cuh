@@ -262,6 +262,29 @@ void quant_per_block_int8_bf16_d128(const __nv_bfloat16* x,
                                     int B, int L, int H,
                                     cudaStream_t stream = 0);
 
+// fp8 (e4m3) quant variants for the qwen3 fp8-QK prefill attention.
+// `out` is __nv_fp8_e4m3* (typed void* to keep this header torch-agnostic).
+// per_warp    -> BLOCK=32 (matches Q kPerWarp, WARP_Q=32)
+// per_block64 -> BLOCK=64 (matches K kPerWarp, WARP_K=CTA_K=64)
+void quant_per_warp_fp8_bf16_d128(const __nv_bfloat16* x,
+                                  void* out,
+                                  float* scale,
+                                  int B, int L, int Lpad, int H,
+                                  cudaStream_t stream = 0);
+
+void quant_per_block64_fp8_bf16_d128(const __nv_bfloat16* x,
+                                     void* out,
+                                     float* scale,
+                                     int B, int L, int Lpad, int H,
+                                     cudaStream_t stream = 0);
+
+// Per-token (BLOCK=1) e4m3 quant. scale layout [B, H, L]. out is __nv_fp8_e4m3*.
+void quant_per_token_fp8_bf16_d128(const __nv_bfloat16* x,
+                                   void* out,
+                                   float* scale,
+                                   int B, int L, int H,
+                                   cudaStream_t stream = 0);
+
 // ── FP16 variants ──
 
 void gate_mul_residual_fp16(__half* residual, const __half* x,

@@ -250,10 +250,12 @@ def main() -> None:
     p.add_argument("--text-token-base", type=int, default=100)
     p.add_argument("--decode-token", type=int, default=100)
     p.add_argument("--decode-pos", type=int, default=63)
-    p.add_argument("--fuse-gate-up", action="store_true")
+    p.add_argument("--fuse-gate-up", action=argparse.BooleanOptionalAction,
+                   default=True)
     p.add_argument("--no-fuse-qk-postproc", action="store_true",
                    help="use the older two-launch Q/K postprocess path")
-    p.add_argument("--fp8-lm-head", action="store_true")
+    p.add_argument("--fp8-lm-head", action=argparse.BooleanOptionalAction,
+                   default=True)
     p.add_argument("--vision-bf16-first-blocks", type=int, default=3)
     p.add_argument("--vision-block2-bf16-linears", default="",
                    help="experimental SM89-only override for vision block 2; "

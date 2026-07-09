@@ -19,16 +19,24 @@ class _MergedKernels:
     Qwen3-VL FP8 kernels live in their own .so (mirroring the SM120 split)
     while frontend call sites keep using a single ``fvk`` handle."""
 
-    __slots__ = ('_vl', '_core')
+    __slots__ = ('_vl', '_core', '_cache')
 
     def __init__(self, vl: Any, core: Any) -> None:
         self._vl = vl
         self._core = core
+        self._cache: dict[str, Any] = {}
 
     def __getattr__(self, name: str) -> Any:
-        if self._vl is not None and hasattr(self._vl, name):
-            return getattr(self._vl, name)
-        return getattr(self._core, name)
+        cache = self._cache
+        if name in cache:
+            return cache[name]
+        vl = self._vl
+        if vl is not None and hasattr(vl, name):
+            fn = getattr(vl, name)
+        else:
+            fn = getattr(self._core, name)
+        cache[name] = fn
+        return fn
 
 
 def _import_fvk() -> Any:
@@ -58,9 +66,9 @@ class Qwen3VlFp8Sm89TextFrontend:
     def __init__(self, checkpoint_path: str, *,
                  device: str = 'cuda:0', max_seq: int = 2048,
                  max_prefill_seq: int | None = None,
-                 fuse_gate_up: bool = False,
+                 fuse_gate_up: bool = True,
                  fuse_qk_postproc: bool = True,
-                 use_fp8_lm_head: bool = False,
+                 use_fp8_lm_head: bool = True,
                  max_decode_graphs: int | None = None) -> None:
         import json
 
@@ -100,9 +108,13 @@ class Qwen3VlFp8Sm89TextFrontend:
             'fp8_block128_gemm_blockscaled_sm89_bf16out',
             'ht_gemv_fp8_block128_m1_w8',
             'ht_gemv_fp8_block128_m1_w16',
+            'ht_gemv_fp8_block128_m1_bf16in_w8',
+            'ht_gemv_fp8_block128_m1_bf16in_w16',
             'fp8_per_token_block128_quant_bf16',
             'rms_norm_to_fp8_block128_bf16',
             'residual_add_rms_norm_to_fp8_block128_bf16',
+            'rms_norm_bf16_out',
+            'residual_add_rms_norm_bf16_out',
             'silu_mul_to_fp8_block128_bf16',
             'silu_mul_merged_to_fp8_block128_bf16',
             'qwen3_qk_norm_rope_kvwrite_bf16',
@@ -306,6 +318,14 @@ class Qwen3VlFp8Sm89TextFrontend:
             scale = torch.empty(1, K // 128, device=device, dtype=fp32)
             out = torch.empty(1, N, device=device, dtype=bf16)
             self._fp8_scratch[(N, K)] = (act, scale, out)
+        # BF16 activation scratch for the bf16in GEMV path (qkv / gate_up in
+        # decode). Keyed by K (activation length); one row each for the qkv
+        # input (K=hidden) and the gate_up input (K=hidden) — both share hidden,
+        # but the cross-layer fusion hands the same buffer to the next layer's
+        # qkv, so a single hidden-length buffer suffices.
+        self._bf16_act_scratch: dict[int, torch.Tensor] = {
+            hidden: torch.empty(1, hidden, device=device, dtype=bf16),
+        }
         self._prefill_fp8_scratch: dict[
             tuple[int, int], tuple[torch.Tensor, ...]] = {}
         for N, K in (
@@ -384,6 +404,17 @@ class Qwen3VlFp8Sm89TextFrontend:
         fn(act.data_ptr(), weight_ptr, out.data_ptr(), 1, N, K,
            scale.data_ptr(), w_scale_ptr, 1.0, s)
 
+    def _gemv_bf16in(self, act_bf16, weight_ptr: int, w_scale_ptr: int,
+                     out, N: int, K: int) -> None:
+        import torch
+        s = torch.cuda.current_stream().cuda_stream
+        if N >= 4096:
+            fn = self._fvk.ht_gemv_fp8_block128_m1_bf16in_w16
+        else:
+            fn = self._fvk.ht_gemv_fp8_block128_m1_bf16in_w8
+        fn(act_bf16.data_ptr(), weight_ptr, out.data_ptr(), 1, N, K,
+           w_scale_ptr, s)
+
     def _prefill_gemm(self, act, scale, weight_ptr: int,
                       w_scale_ptr: int, out, N: int, K: int,
                       S: int) -> None:
@@ -408,10 +439,10 @@ class Qwen3VlFp8Sm89TextFrontend:
         s = torch.cuda.current_stream().cuda_stream
         last_row = last_row.view(1, hidden).contiguous()
         if self.use_fp8_lm_head:
-            ap, sc, _ = self._quant(last_row, (vocab, hidden))
-            self._gemv(ap, sc, int(self._weights.ptrs['lm_head_fp8_w']),
-                       int(self._weights.ptrs['lm_head_fp8_s']),
-                       self._logits_buf, vocab, hidden)
+            self._gemv_bf16in(last_row,
+                              int(self._weights.ptrs['lm_head_fp8_w']),
+                              int(self._weights.ptrs['lm_head_fp8_s']),
+                              self._logits_buf, vocab, hidden)
         else:
             self._fvk.bf16_matmul_bf16(
                 last_row.data_ptr(), int(self._weights.ptrs['lm_head_w']),
@@ -421,9 +452,11 @@ class Qwen3VlFp8Sm89TextFrontend:
     def _layer_forward(self, L: int, h_in, cos, sin, cur_pos: int,
                        *,
                        prequant=None,
-                       next_input_norm_w: int = 0):
+                       next_input_norm_w: int = 0,
+                       final_norm_w: int = 0,
+                       final_norm_out=None):
         import torch
-        fvk = _import_fvk()
+        fvk = self._fvk
 
         cfg = self._cfg
         assert cfg is not None
@@ -437,15 +470,16 @@ class Qwen3VlFp8Sm89TextFrontend:
         lw = self._weights.ptrs['layers'][L]
         h2 = h_in.view(1, hidden).contiguous()
 
+        # qkv input: BF16 normed activation (no FP8 quant) → bf16in GEMV.
         if prequant is None:
-            ap, sc, _ = self._fp8_scratch[(self._qkv_N, hidden)]
-            fvk.rms_norm_to_fp8_block128_bf16(
+            ap_bf = self._bf16_act_scratch[hidden]
+            fvk.rms_norm_bf16_out(
                 h2.data_ptr(), int(lw['input_norm_w']),
-                ap.data_ptr(), sc.data_ptr(), 1, hidden, eps, s)
+                ap_bf.data_ptr(), 1, hidden, eps, s)
         else:
-            ap, sc = prequant
-        self._gemv(ap, sc, int(lw['qkv_proj_w']), int(lw['qkv_proj_s']),
-                   self._qkv_out, int(lw['qkv_proj_N']), hidden)
+            ap_bf = prequant
+        self._gemv_bf16in(ap_bf, int(lw['qkv_proj_w']), int(lw['qkv_proj_s']),
+                          self._qkv_out, int(lw['qkv_proj_N']), hidden)
         Nq = n_q * hd
         Nk = n_kv * hd
         qkv_out = self._qkv_out[:1]
@@ -480,29 +514,35 @@ class Qwen3VlFp8Sm89TextFrontend:
             'full', layer_idx=L, q_seq=1, kv_seq=cur_pos + 1,
             stream=s, causal=True)
         attn_2d = self._attn.O_buf[:, :1].reshape(1, hidden).contiguous()
-        ap, sc, o_out = self._quant(attn_2d, (hidden, hidden))
-        self._gemv(ap, sc, int(lw['o_proj_w']), int(lw['o_proj_s']),
-                   o_out, hidden, hidden)
+        o_out = self._fp8_scratch[(hidden, hidden)][2]
+        self._gemv_bf16in(attn_2d, int(lw['o_proj_w']), int(lw['o_proj_s']),
+                          o_out, hidden, hidden)
 
         attn_proj = o_out.view(1, 1, hidden)
         h_post = self._res_mid[:, :1]
-        ap, sc, gate_out = self._fp8_scratch[(inter, hidden)]
-        fvk.residual_add_rms_norm_to_fp8_block128_bf16(
+        # gate_up input: BF16 normed activation → bf16in GEMV.
+        ap_bf_mlp = self._bf16_act_scratch[hidden]
+        fvk.residual_add_rms_norm_bf16_out(
             h_in.data_ptr(), attn_proj.data_ptr(), h_post.data_ptr(),
             int(lw['post_attn_norm_w']),
-            ap.data_ptr(), sc.data_ptr(), 1, hidden, eps, s)
+            ap_bf_mlp.data_ptr(), 1, hidden, eps, s)
         if self.fuse_gate_up:
-            self._gemv(ap, sc, int(lw['gate_up_w']), int(lw['gate_up_s']),
-                       self._gate_up_out, int(lw['gate_up_N']), hidden)
+            self._gemv_bf16in(ap_bf_mlp, int(lw['gate_up_w']),
+                              int(lw['gate_up_s']), self._gate_up_out,
+                              int(lw['gate_up_N']), hidden)
             gate_out = self._gate_up_out[:, :inter]
             up_out = self._gate_up_out[:, inter:]
         else:
-            self._gemv(ap, sc, int(lw['mlp_gate_w']), int(lw['mlp_gate_s']),
-                       self._gate_out, inter, hidden)
-            self._gemv(ap, sc, int(lw['mlp_up_w']), int(lw['mlp_up_s']),
-                       self._up_out, inter, hidden)
+            self._gemv_bf16in(ap_bf_mlp, int(lw['mlp_gate_w']),
+                              int(lw['mlp_gate_s']), self._gate_out, inter,
+                              hidden)
+            self._gemv_bf16in(ap_bf_mlp, int(lw['mlp_up_w']),
+                              int(lw['mlp_up_s']), self._up_out, inter, hidden)
             gate_out = self._gate_out
             up_out = self._up_out
+        # down_proj stays FP8: silu_mul output is quantized to FP8 (the silu
+        # result has a wide dynamic range and the FP8 path here is already at
+        # roofline; bf16in down-proj would need a separate BF16 silu kernel).
         ap, sc, down_out = self._fp8_scratch[(hidden, inter)]
         fvk.silu_mul_to_fp8_block128_bf16(
             gate_out.data_ptr(), up_out.data_ptr(),
@@ -514,20 +554,31 @@ class Qwen3VlFp8Sm89TextFrontend:
                  else self._layer_out_b)[:, :1]
         mlp_out = down_out.view(1, 1, hidden)
         if next_input_norm_w:
-            next_ap, next_sc, _ = self._fp8_scratch[(self._qkv_N, hidden)]
-            fvk.residual_add_rms_norm_to_fp8_block128_bf16(
+            next_ap_bf = self._bf16_act_scratch[hidden]
+            fvk.residual_add_rms_norm_bf16_out(
                 h_post.data_ptr(), mlp_out.data_ptr(), h_out.data_ptr(),
                 int(next_input_norm_w),
-                next_ap.data_ptr(), next_sc.data_ptr(), 1, hidden, eps, s)
-            return h_out, (next_ap, next_sc)
+                next_ap_bf.data_ptr(), 1, hidden, eps, s)
+            return h_out, next_ap_bf
+        if final_norm_w:
+            fvk.residual_add_rms_norm(
+                h_post.data_ptr(), mlp_out.data_ptr(),
+                final_norm_w, final_norm_out.data_ptr(),
+                1, hidden, eps, s)
+            return final_norm_out, None
         torch.add(h_post, mlp_out, out=h_out)
         return h_out, None
 
     def _layer_forward_prefill_fp8_blockscaled(self, L: int, h_in_S, cos_S,
-                                           sin_S, start_pos: int, S: int):
+                                           sin_S, start_pos: int, S: int,
+                                           *,
+                                           prequant=None,
+                                           next_input_norm_w: int = 0,
+                                           final_norm_w: int = 0,
+                                           final_norm_out=None):
         import torch
 
-        fvk = _import_fvk()
+        fvk = self._fvk
 
         s = torch.cuda.current_stream().cuda_stream
         cfg = self._cfg
@@ -541,10 +592,15 @@ class Qwen3VlFp8Sm89TextFrontend:
         lw = self._weights.ptrs['layers'][L]
         h2 = h_in_S.view(S, hidden)
 
-        ap_h, sc_h, qkv_out = self._prefill_fp8_scratch[(n_q * hd + 2 * n_kv * hd, hidden)]
-        fvk.rms_norm_to_fp8_block128_bf16(
-            h2.data_ptr(), int(lw['input_norm_w']),
-            ap_h.data_ptr(), sc_h.data_ptr(), S, hidden, eps, s)
+        qkv_N = n_q * hd + 2 * n_kv * hd
+        if prequant is None:
+            ap_h, sc_h, qkv_out = self._prefill_fp8_scratch[(qkv_N, hidden)]
+            fvk.rms_norm_to_fp8_block128_bf16(
+                h2.data_ptr(), int(lw['input_norm_w']),
+                ap_h.data_ptr(), sc_h.data_ptr(), S, hidden, eps, s)
+        else:
+            ap_h, sc_h = prequant
+            qkv_out = self._prefill_fp8_scratch[(qkv_N, hidden)][2]
         self._prefill_gemm(
             ap_h, sc_h, int(lw['qkv_proj_w']), int(lw['qkv_proj_s']),
             qkv_out, int(lw['qkv_proj_N']), hidden, S)
@@ -616,10 +672,25 @@ class Qwen3VlFp8Sm89TextFrontend:
             ap_dn, sc_dn, int(lw['mlp_down_w']), int(lw['mlp_down_s']),
             down_out, hidden, inter, S)
 
+        if final_norm_w:
+            fvk.residual_add_rms_norm(
+                h_post.data_ptr(),
+                down_out[:S].view(1, S, hidden).contiguous().data_ptr(),
+                final_norm_w, final_norm_out.data_ptr(),
+                S, hidden, eps, s)
+            return final_norm_out.view(1, S, hidden), None
         h_out = (self._layer_out_a if (L % 2 == 0)
                  else self._layer_out_b)[:, :S]
-        torch.add(h_post, down_out[:S].view(1, S, hidden), out=h_out)
-        return h_out
+        mlp_out = down_out[:S].view(1, S, hidden)
+        if next_input_norm_w:
+            next_ap, next_sc, _ = self._prefill_fp8_scratch[(qkv_N, hidden)]
+            fvk.residual_add_rms_norm_to_fp8_block128_bf16(
+                h_post.data_ptr(), mlp_out.data_ptr(), h_out.data_ptr(),
+                int(next_input_norm_w),
+                next_ap.data_ptr(), next_sc.data_ptr(), S, hidden, eps, s)
+            return h_out, (next_ap, next_sc)
+        torch.add(h_post, mlp_out, out=h_out)
+        return h_out, None
 
     def forward_hidden_prefill_fp8_blockscaled(self, h_S, cos_S, sin_S,
                                            start_pos: int = 0,
@@ -641,23 +712,45 @@ class Qwen3VlFp8Sm89TextFrontend:
         if start_pos + S > self.max_seq:
             raise ValueError(
                 f'prefill end {start_pos + S} > max_seq {self.max_seq}')
+        n_layers = cfg['num_hidden_layers']
+        final_norm_ptr = int(self._weights.ptrs['final_norm_w'])
+        last_has_ds = (deepstack_by_layer is not None
+                       and (n_layers - 1) in deepstack_by_layer)
         h = h_S.view(1, S, hidden).to(torch.bfloat16).contiguous()
-        for L in range(cfg['num_hidden_layers']):
-            h = self._layer_forward_prefill_fp8_blockscaled(
-                L, h, cos_S, sin_S, start_pos, S)
+        prequant = None
+        for L in range(n_layers):
+            next_norm = 0
+            fnw = 0
+            fno = None
+            if L + 1 < n_layers:
+                next_norm = int(
+                    self._weights.ptrs['layers'][L + 1]['input_norm_w'])
+            elif not last_has_ds:
+                fnw = final_norm_ptr
+                fno = self._last_hidden_buf[:, :S].view(S, hidden)
+            h, prequant = self._layer_forward_prefill_fp8_blockscaled(
+                L, h, cos_S, sin_S, start_pos, S,
+                prequant=prequant, next_input_norm_w=next_norm,
+                final_norm_w=fnw, final_norm_out=fno)
             if deepstack_by_layer is not None and L in deepstack_by_layer:
                 for a, b, ds in deepstack_by_layer[L]:
                     self._fvk.residual_add(
                         h[0, a:b].data_ptr(), ds.data_ptr(),
                         (b - a) * hidden, s)
+                prequant = None
 
+        self._cur_pos = start_pos + S
+        if not last_has_ds:
+            if not run_lm_head:
+                return self._last_hidden_buf[:, :S]
+            return self._write_logits_from_hidden(
+                self._last_hidden_buf[0, S - 1:S])
         h2 = h.view(S, hidden).contiguous()
         x_norm = self._h_b[:S].view(S, hidden)
         self._fvk.rms_norm(
-            h2.data_ptr(), int(self._weights.ptrs['final_norm_w']),
+            h2.data_ptr(), final_norm_ptr,
             x_norm.data_ptr(), S, hidden, eps, s)
         self._last_hidden_buf[:, :S].copy_(x_norm.view(1, S, hidden))
-        self._cur_pos = start_pos + S
         if not run_lm_head:
             return self._last_hidden_buf[:, :S]
         return self._write_logits_from_hidden(
@@ -670,28 +763,39 @@ class Qwen3VlFp8Sm89TextFrontend:
         cfg = self._cfg
         assert cfg is not None
         hidden = cfg['hidden_size']
-        vocab = cfg['vocab_size']
         eps = float(cfg['rms_norm_eps'])
         s = torch.cuda.current_stream().cuda_stream
+        n_layers = cfg['num_hidden_layers']
+        final_norm_ptr = int(self._weights.ptrs['final_norm_w'])
+        last_has_ds = (deepstack_by_layer is not None
+                       and (n_layers - 1) in deepstack_by_layer)
         h = h.view(1, 1, hidden).contiguous()
         prequant = None
-        for L in range(cfg['num_hidden_layers']):
+        for L in range(n_layers):
             next_norm = 0
-            if L + 1 < cfg['num_hidden_layers']:
+            fnw = 0
+            fno = None
+            if L + 1 < n_layers:
                 next_norm = int(self._weights.ptrs['layers'][L + 1]
                                 ['input_norm_w'])
+            elif not last_has_ds:
+                fnw = final_norm_ptr
+                fno = self._last_hidden_buf[0, :1].view(1, hidden)
             h, prequant = self._layer_forward(
                 L, h, cos_pos, sin_pos, cur_pos,
-                prequant=prequant, next_input_norm_w=next_norm)
+                prequant=prequant, next_input_norm_w=next_norm,
+                final_norm_w=fnw, final_norm_out=fno)
             if deepstack_by_layer is not None and L in deepstack_by_layer:
-                h = h.clone()
-                torch.add(h, deepstack_by_layer[L].view(1, 1, hidden), out=h)
+                h.add_(deepstack_by_layer[L].view(1, 1, hidden))
                 prequant = None
 
+        if not last_has_ds:
+            return self._write_logits_from_hidden(
+                self._last_hidden_buf[0, :1].view(1, hidden))
         x_norm = self._h_b[:1].view(1, hidden)
         self._fvk.rms_norm(
             h.view(1, hidden).contiguous().data_ptr(),
-            int(self._weights.ptrs['final_norm_w']), x_norm.data_ptr(),
+            final_norm_ptr, x_norm.data_ptr(),
             1, hidden, eps, s)
         self._last_hidden_buf[:, :1].copy_(x_norm.view(1, 1, hidden))
         return self._write_logits_from_hidden(x_norm)

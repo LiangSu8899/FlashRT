@@ -362,10 +362,78 @@ class Qwen3TorchFrontendRtx:
         # CUTLASS W4A16 kernel beats the pingpong variant for the
         # short buckets and is tied at the largest bucket.
         self._prefill_gemm = self._fvk.fp4_w4a16_gemm_sm120_bf16out
+        # Residual-fused NVFP4 GEMM (D = alpha*A*B + C): folds the o_proj/down
+        # residual add into the epilogue so the following rms_norm reads ONE
+        # tensor. None unless the variant is built (additive; falls back to the
+        # separate residual_add path).
+        self._prefill_gemm_residual = getattr(
+            self._fvk, 'fp4_w4a16_gemm_residual_sm120_bf16out', None)
+        # The fused residual is added in FP32 inside the GEMM epilogue (vs bf16
+        # in the separate norm kernel). It is the default fast path; set
+        # FLASH_RT_QWEN3_RESID_FUSE=0 or FLASH_RT_QWEN3_NO_RESID_FUSE=1 to
+        # restore the separate-add path for A/B checks.
+        import os as _os
+        if (_os.environ.get('FLASH_RT_QWEN3_RESID_FUSE', '1') != '1'
+                or _os.environ.get('FLASH_RT_QWEN3_NO_RESID_FUSE', '0') == '1'):
+            self._prefill_gemm_residual = None
         self._prefill_silu_merged = getattr(
             self._fvk, 'silu_mul_merged_to_nvfp4_swizzled_grouped32_bf16',
             self._fvk.silu_mul_merged_to_nvfp4_swizzled_bf16,
         )
+        # Faster bit-identical norm+quant kernels (register prefetch + fused
+        # atomic-free back-phase + branchless e2m1); fall back to v1 (and to v1
+        # for cols>4096 internally). Used at every norm→nvfp4 site.
+        self._resnorm_q = getattr(
+            self._fvk, 'residual_add_rms_norm_to_nvfp4_swizzled_bf16_v2',
+            self._fvk.residual_add_rms_norm_to_nvfp4_swizzled_bf16)
+        self._rmsnorm_q = getattr(
+            self._fvk, 'rms_norm_to_nvfp4_swizzled_bf16_v3',
+            getattr(self._fvk, 'rms_norm_to_nvfp4_swizzled_bf16_v2',
+                    self._fvk.rms_norm_to_nvfp4_swizzled_bf16))
+        self._quant_q = getattr(
+            self._fvk, 'quantize_bf16_to_nvfp4_swizzled_v2',
+            self._fvk.quantize_bf16_to_nvfp4_swizzled)
+        # q/k norm+RoPE: one-block-per-row warp kernel (2.5x, ~1 ULP) — falls
+        # back to the per-(head,row) kernel if the v3 symbol is absent.
+        self._qnr_q = getattr(
+            self._fvk, 'qwen3_q_norm_rope_qstage_prefill_v3_bf16',
+            self._fvk.qwen3_q_norm_rope_qstage_prefill_bf16)
+        self._knr_q = getattr(
+            self._fvk, 'qwen3_k_norm_rope_kvwrite_prefill_v3_bf16',
+            self._fvk.qwen3_k_norm_rope_kvwrite_prefill_bf16)
+        # STEP D fold: norm_rope variants that ALSO emit per-token e4m3 Q/K (+
+        # scale) and fp16 V, so the fp8 prefill attention needs no separate
+        # quant/cast. None unless both the kernel and the fp8 attn path exist.
+        self._qnr_q_fp8 = getattr(
+            self._fvk, 'qwen3_q_norm_rope_qstage_prefill_v3_fp8', None)
+        self._knr_q_fp8 = getattr(
+            self._fvk, 'qwen3_k_norm_rope_kvwrite_prefill_v3_fp8', None)
+        # Direct-e4m3 fold (no per-token scale; V e4m3 too) for the all-fp8
+        # prefill attention path.
+        self._qnr_q_fp8_direct = getattr(
+            self._fvk, 'qwen3_q_norm_rope_qstage_prefill_v3_fp8_direct', None)
+        self._knr_q_fp8_direct = getattr(
+            self._fvk, 'qwen3_k_norm_rope_kvwrite_prefill_v3_fp8_direct', None)
+        # SwiGLU epilogue fold (prefill): fuse silu(gate)*up into the gate_up
+        # GEMM epilogue (interleaved gate|up weight, FP4 out, SF32) + an even-
+        # column compaction, replacing the [gate_up GEMM bf16 + silu_mul]
+        # 2-launch chain. This is the default fast path; set
+        # FLASH_RT_QWEN3_SWIGLU_FOLD=0 to restore the split GEMM + silu_mul path.
+        import os as _os
+        inter0 = int(layers0['intermediate']) if 'intermediate' in layers0 \
+            else int(self._cfg['intermediate'])
+        self._enable_swiglu_fold_prefill = (
+            _os.environ.get('FLASH_RT_QWEN3_SWIGLU_FOLD', '1') == '1'
+            and 'gate_up_il_packed' in layers0
+            and hasattr(self._fvk, 'fp4_w4a16_dual_gemm_silu_fp4out_sm120')
+            and hasattr(self._fvk, 'fp4_swiglu_even_col_compact'))
+        if self._enable_swiglu_fold_prefill:
+            # Full-width dup'd FP4 output of the fused SwiGLU GEMM: [S, 2*inter]
+            # FP4 = [S, inter] bytes. Compacted into the down-input scratch.
+            self._swiglu_fold_out = torch.empty(
+                Sq_max, inter0, device=device, dtype=torch.uint8)
+        else:
+            self._swiglu_fold_out = None
 
         # CUDA Graph capture state.
         #   _captured_decode_graphs  : dict[cur_pos    -> torch.cuda.CUDAGraph]
@@ -495,7 +563,7 @@ class Qwen3TorchFrontendRtx:
         #    (M=1, K=hidden=4096). Reuse the (4096, 4096) scratch — its
         #    K dim matches.
         ap, sf, _out = self._nvfp4_scratch[(4096, 4096)]
-        fvk.quantize_bf16_to_nvfp4_swizzled(
+        self._quant_q(
             x_norm.data_ptr(), ap.data_ptr(), sf.data_ptr(),
             1, hidden, s,
         )
@@ -618,7 +686,7 @@ class Qwen3TorchFrontendRtx:
             ap_h, sf_h = prequant_ap, prequant_sf
         else:
             ap_h, sf_h, _ = self._nvfp4_scratch[(n_q * hd, hidden)]
-            fvk.rms_norm_to_nvfp4_swizzled_bf16(
+            self._rmsnorm_q(
                 h2.data_ptr(), int(lw['input_norm_w']),
                 ap_h.data_ptr(), sf_h.data_ptr(),
                 1, hidden, eps, s,
@@ -733,7 +801,7 @@ class Qwen3TorchFrontendRtx:
         # 10) o_proj NVFP4: K = n_q*hd = hidden, N = hidden.
         attn_2d = attn_out.reshape(1, n_q * hd).contiguous()
         ap_h2, sf_h2, _ = self._nvfp4_scratch[(hidden, hidden)]   # same shape as q
-        fvk.quantize_bf16_to_nvfp4_swizzled(
+        self._quant_q(
             attn_2d.data_ptr(), ap_h2.data_ptr(), sf_h2.data_ptr(),
             1, n_q * hd, s,
         )
@@ -754,7 +822,7 @@ class Qwen3TorchFrontendRtx:
         attn_proj = out_op_buf[:1].view(1, 1, hidden)
         h_post = self._res_mid[:, :1]
         ap_mlp, sf_mlp, _ = self._nvfp4_scratch[(inter, hidden)]
-        fvk.residual_add_rms_norm_to_nvfp4_swizzled_bf16(
+        self._resnorm_q(
             h_in.data_ptr(), attn_proj.data_ptr(), h_post.data_ptr(),
             int(lw['post_attn_norm_w']),
             ap_mlp.data_ptr(), sf_mlp.data_ptr(),
@@ -795,7 +863,7 @@ class Qwen3TorchFrontendRtx:
                 gate_v.data_ptr(), up_v.data_ptr(),
                 self._mlp_silu_mul_out[:1].data_ptr(), inter, s,
             )
-            fvk.quantize_bf16_to_nvfp4_swizzled(
+            self._quant_q(
                 self._mlp_silu_mul_out[:1].data_ptr(),
                 ap_dn.data_ptr(), sf_dn.data_ptr(),
                 1, inter, s,
@@ -825,7 +893,7 @@ class Qwen3TorchFrontendRtx:
             # qkv GEMM read from it at step 2, by step 16 it's
             # consumer-done so we can safely overwrite for L+1.
             next_ap, next_sf, _ = self._nvfp4_scratch[(n_q * hd, hidden)]
-            fvk.residual_add_rms_norm_to_nvfp4_swizzled_bf16(
+            self._resnorm_q(
                 h_post.data_ptr(),
                 mlp_out.contiguous().data_ptr(),
                 h_out_v.data_ptr(),
@@ -889,7 +957,7 @@ class Qwen3TorchFrontendRtx:
             hd = cfg['head_dim']
             ap0, sf0, _ = self._nvfp4_scratch[(n_q * hd, hidden)]
             h0_v = h.view(1, hidden).contiguous()
-            fvk.rms_norm_to_nvfp4_swizzled_bf16(
+            self._rmsnorm_q(
                 h0_v.data_ptr(),
                 int(layers_ptrs[0]['input_norm_w']),
                 ap0.data_ptr(), sf0.data_ptr(),
@@ -984,7 +1052,7 @@ class Qwen3TorchFrontendRtx:
         if prequant_ap is not None and prequant_sf is not None:
             ap_h, sf_h = prequant_ap, prequant_sf
         else:
-            fvk.rms_norm_to_nvfp4_swizzled_bf16(
+            self._rmsnorm_q(
                 h2.data_ptr(), int(lw['input_norm_w']),
                 ap_h.data_ptr(), sf_h.data_ptr(), S, hidden, eps, s,
             )
@@ -1051,19 +1119,68 @@ class Qwen3TorchFrontendRtx:
                       + start_pos * self._attn.kv_row_stride_bytes)
             k_cache_dst = self._attn.K_cache.data_ptr() + kv_off
             v_cache_dst = self._attn.V_cache.data_ptr() + kv_off
-            fvk.qwen3_q_norm_rope_qstage_prefill_bf16(
-                qkv_out[:, :Nq].data_ptr(), int(lw['q_norm_w']),
-                cos_S.data_ptr(), sin_S.data_ptr(),
-                self._attn.Q_buf[:, :S].data_ptr(),
-                n_q, S, qkv_N, n_q * hd, eps, s,
-            )
-            fvk.qwen3_k_norm_rope_kvwrite_prefill_bf16(
-                qkv_out[:, Nq:Nq + Nk].data_ptr(),
-                qkv_out[:, Nq + Nk:].data_ptr(), int(lw['k_norm_w']),
-                cos_S.data_ptr(), sin_S.data_ptr(),
-                k_cache_dst, v_cache_dst,
-                n_kv, S, qkv_N, kv_row_elems, eps, s,
-            )
+            # STEP D: when the fp8 prefill-attn path is active for this bucket,
+            # fold per-token e4m3 Q/K (+scale) and fp16 V emission into the
+            # norm_rope kernels (no separate quant/cast). Gate MUST match the
+            # backend run() trigger (S a multiple of 128, within sp_max).
+            _fp8_gate = (getattr(self._attn, '_fp8_prefill', False)
+                         and S % 128 == 0
+                         and S <= getattr(self._attn, '_fp8_sp_max', 0))
+            _fp8_direct = (_fp8_gate
+                           and getattr(self._attn, '_fp8_direct', False)
+                           and self._qnr_q_fp8_direct is not None)
+            _fp8 = (_fp8_gate and not _fp8_direct
+                    and self._qnr_q_fp8 is not None)
+            if _fp8_direct:
+                self._qnr_q_fp8_direct(
+                    qkv_out[:, :Nq].data_ptr(), int(lw['q_norm_w']),
+                    cos_S.data_ptr(), sin_S.data_ptr(),
+                    0,                              # skip redundant bf16 Q_buf
+                    self._attn._fp8_q8.data_ptr(),
+                    n_q, S, qkv_N, n_q * hd, eps, s,
+                )
+                self._knr_q_fp8_direct(
+                    qkv_out[:, Nq:Nq + Nk].data_ptr(),
+                    qkv_out[:, Nq + Nk:].data_ptr(), int(lw['k_norm_w']),
+                    cos_S.data_ptr(), sin_S.data_ptr(),
+                    k_cache_dst, v_cache_dst,
+                    self._attn._fp8_k8.data_ptr(),
+                    self._attn._fp8_v8.data_ptr(),
+                    n_kv, S, qkv_N, kv_row_elems, eps, s,
+                )
+            elif _fp8:
+                self._qnr_q_fp8(
+                    qkv_out[:, :Nq].data_ptr(), int(lw['q_norm_w']),
+                    cos_S.data_ptr(), sin_S.data_ptr(),
+                    0,                              # skip redundant bf16 Q_buf
+                    self._attn._fp8_q8.data_ptr(),
+                    self._attn._fp8_qs.data_ptr(),
+                    n_q, S, qkv_N, n_q * hd, eps, s,
+                )
+                self._knr_q_fp8(
+                    qkv_out[:, Nq:Nq + Nk].data_ptr(),
+                    qkv_out[:, Nq + Nk:].data_ptr(), int(lw['k_norm_w']),
+                    cos_S.data_ptr(), sin_S.data_ptr(),
+                    k_cache_dst, v_cache_dst,
+                    self._attn._fp8_k8.data_ptr(),
+                    self._attn._fp8_ks.data_ptr(),
+                    self._attn._fp8_vf.data_ptr(),
+                    n_kv, S, qkv_N, kv_row_elems, eps, s,
+                )
+            else:
+                self._qnr_q(
+                    qkv_out[:, :Nq].data_ptr(), int(lw['q_norm_w']),
+                    cos_S.data_ptr(), sin_S.data_ptr(),
+                    self._attn.Q_buf[:, :S].data_ptr(),
+                    n_q, S, qkv_N, n_q * hd, eps, s,
+                )
+                self._knr_q(
+                    qkv_out[:, Nq:Nq + Nk].data_ptr(),
+                    qkv_out[:, Nq + Nk:].data_ptr(), int(lw['k_norm_w']),
+                    cos_S.data_ptr(), sin_S.data_ptr(),
+                    k_cache_dst, v_cache_dst,
+                    n_kv, S, qkv_N, kv_row_elems, eps, s,
+                )
         else:
             # 4) q/k_norm at (S*n_q, hd) and (S*n_kv, hd) flat views.
             q_pre_flat = q_pre.contiguous().view(S * n_q, hd)
@@ -1114,7 +1231,19 @@ class Qwen3TorchFrontendRtx:
                 v_new = kv_proj_out_buf[:S].view(S, n_kv, hd)
             self._attn.V_cache[L, start_pos:start_pos + S].copy_(v_new)
 
-        # 8) Run FA2 causal: q_seq=S, kv_seq=start_pos+S.
+        # 8) Run FA2 causal: q_seq=S, kv_seq=start_pos+S. On the all-fp8
+        # attention path the kernel's fp4-out epilogue writes O straight into
+        # the o_proj NVFP4 scratch (ap_h2/sf_h2), skipping the bf16 O buffer
+        # and the standalone quantize launch below (byte-identical output).
+        ap_h2, sf_h2, _ = self._nvfp4_scratch[(hidden, hidden)]
+        _fp8_fp4out = (
+            getattr(self._attn, '_fp8_direct', False)
+            and getattr(self._attn, '_fp8_fp4out_fn', None) is not None
+            and S % 128 == 0
+            and S <= getattr(self._attn, '_fp8_sp_max', 0))
+        if _fp8_fp4out:
+            self._attn._fp8_o_fp4 = ap_h2.data_ptr()
+            self._attn._fp8_o_sf = sf_h2.data_ptr()
         kv_seq = start_pos + S
         self._attn.run(
             'full', layer_idx=L, q_seq=S, kv_seq=kv_seq,
@@ -1122,38 +1251,81 @@ class Qwen3TorchFrontendRtx:
         )
         attn_out = self._attn.O_buf[:, :S]
 
-        # 9) o_proj NVFP4 at M=S.
-        attn_2d = attn_out.reshape(S, n_q * hd).contiguous()
-        ap_h2, sf_h2, _ = self._nvfp4_scratch[(hidden, hidden)]
-        fvk.quantize_bf16_to_nvfp4_swizzled(
-            attn_2d.data_ptr(), ap_h2.data_ptr(), sf_h2.data_ptr(),
-            S, n_q * hd, s,
-        )
-        out_op_buf = self._nvfp4_scratch[(hidden, hidden)][2]
-        prefill_gemm(
-            ap_h2.data_ptr(), int(lw['o_proj_packed']),
-            out_op_buf.data_ptr(),
-            S, hidden, n_q * hd,
-            sf_h2.data_ptr(), int(lw['o_proj_sf']),
-            float(lw['o_proj_alpha']),
-            s,
-        )
-
-        # 10) Residual 1.
-        attn_proj = out_op_buf[:S].view(1, S, hidden)
+        # 9) o_proj NVFP4 at M=S (already produced in-epilogue on the fp4-out
+        # attention path).
+        if not _fp8_fp4out:
+            attn_2d = attn_out.reshape(S, n_q * hd).contiguous()
+            self._quant_q(
+                attn_2d.data_ptr(), ap_h2.data_ptr(), sf_h2.data_ptr(),
+                S, n_q * hd, s,
+            )
+        # 9b+10) o_proj GEMM + Residual 1. When the residual-fused GEMM variant
+        # is built, fold the residual add (C = h_in_S) into the o_proj epilogue
+        # (D = o_proj + residual = h_post) so the post-attn norm is a plain
+        # rms_norm+quant reading ONE tensor (h_post) instead of two.
         h_post = self._res_mid[:, :S]
         ap_mlp, sf_mlp, _ = self._nvfp4_scratch[(inter, hidden)]
-        fvk.residual_add_rms_norm_to_nvfp4_swizzled_bf16(
-            h_in_S.data_ptr(), attn_proj.data_ptr(), h_post.data_ptr(),
-            int(lw['post_attn_norm_w']),
-            ap_mlp.data_ptr(), sf_mlp.data_ptr(), S, hidden, eps, s,
-        )
+        if self._prefill_gemm_residual is not None:
+            self._prefill_gemm_residual(
+                ap_h2.data_ptr(), int(lw['o_proj_packed']),
+                h_in_S.data_ptr(), h_post.data_ptr(),
+                S, hidden, n_q * hd,
+                sf_h2.data_ptr(), int(lw['o_proj_sf']),
+                float(lw['o_proj_alpha']), s,
+            )
+            self._rmsnorm_q(
+                h_post.data_ptr(), int(lw['post_attn_norm_w']),
+                ap_mlp.data_ptr(), sf_mlp.data_ptr(), S, hidden, eps, s,
+            )
+        else:
+            out_op_buf = self._nvfp4_scratch[(hidden, hidden)][2]
+            prefill_gemm(
+                ap_h2.data_ptr(), int(lw['o_proj_packed']),
+                out_op_buf.data_ptr(),
+                S, hidden, n_q * hd,
+                sf_h2.data_ptr(), int(lw['o_proj_sf']),
+                float(lw['o_proj_alpha']),
+                s,
+            )
+            attn_proj = out_op_buf[:S].view(1, S, hidden)
+            self._resnorm_q(
+                h_in_S.data_ptr(), attn_proj.data_ptr(), h_post.data_ptr(),
+                int(lw['post_attn_norm_w']),
+                ap_mlp.data_ptr(), sf_mlp.data_ptr(), S, hidden, eps, s,
+            )
 
         # 11) MLP gate/up at M=S. Use the packed fused weight when the
         # checkpoint has homogeneous gate/up alpha, then consume the
         # merged [gate|up] output directly in the silu+quant kernel.
         ap_dn, sf_dn, _ = self._nvfp4_scratch[(hidden, inter)]
-        if self._gate_up_prefill_out is not None:
+        if self._enable_swiglu_fold_prefill:
+            # SwiGLU epilogue fold: one fused GEMM on the interleaved gate|up
+            # weight does silu(gate)*up in its FP4 epilogue (SF32 -> per-16-
+            # output SFD written straight into sf_dn), then an even-column
+            # compaction packs the FP4 data into the down-input ap_dn. Replaces
+            # [gate_up GEMM bf16 + silu_mul] with no bf16 round-trip.
+            il_N = int(lw['gate_up_il_N'])
+            # The blockscale-FP4 SFD output requires M aligned to 128 (the SF
+            # swizzle atom row dim). Pad M up; the extra rows are garbage but
+            # down only reads the real S rows, and the SFD swizzle rounds S and
+            # Mp to the same 128-multiple so the layout is identical for 0..S-1.
+            Mp = ((S + 127) // 128) * 128
+            fold_out = self._swiglu_fold_out[:Mp]
+            il_w = int(lw['gate_up_il_packed'])
+            il_sf = int(lw['gate_up_il_sf'])
+            fvk.fp4_w4a16_dual_gemm_silu_fp4out_sm120(
+                ap_mlp.data_ptr(), il_w, il_w,
+                sf_mlp.data_ptr(), il_sf, il_sf,
+                fold_out.data_ptr(), sf_dn.data_ptr(),
+                Mp, il_N, hidden,
+                float(lw['mlp_gate_alpha']), float(lw['mlp_up_alpha']), s,
+            )
+            # Vectorized (16B/8B) compaction when available — bit-identical to the
+            # scalar kernel, 2.5x faster (−0.22ms/prefill at S=512); scalar fallback.
+            _compact = getattr(fvk, 'fp4_swiglu_even_col_compact_v2',
+                               fvk.fp4_swiglu_even_col_compact)
+            _compact(fold_out.data_ptr(), ap_dn.data_ptr(), S, inter, s)
+        elif self._gate_up_prefill_out is not None:
             gate_up_buf = self._gate_up_prefill_out[:S]
             prefill_gemm(
                 ap_mlp.data_ptr(), int(lw['gate_up_packed']),
@@ -1193,7 +1365,27 @@ class Qwen3TorchFrontendRtx:
                 S, inter, s,
             )
 
-        # 12) MLP down at M=S, K=intermediate, N=hidden.
+        # 12) MLP down + 15) Residual 2. For a NON-final layer with the residual-
+        # fused GEMM, fold residual_2 (C = h_post) into the down epilogue
+        # (D = down + h_post = h_out) so the next input-norm reads one tensor.
+        # The final layer keeps the separate residual + final-norm path.
+        if next_input_norm_w and self._prefill_gemm_residual is not None:
+            h_out = self._layer_out_a if (L % 2 == 0) else self._layer_out_b
+            h_out_v = h_out[:, :S]
+            next_ap, next_sf, _ = self._nvfp4_scratch[(n_q * hd, hidden)]
+            self._prefill_gemm_residual(
+                ap_dn.data_ptr(), int(lw['mlp_down_packed']),
+                h_post.data_ptr(), h_out_v.data_ptr(),
+                S, hidden, inter,
+                sf_dn.data_ptr(), int(lw['mlp_down_sf']),
+                float(lw['mlp_down_alpha']), s,
+            )
+            self._rmsnorm_q(
+                h_out_v.data_ptr(), int(next_input_norm_w),
+                next_ap.data_ptr(), next_sf.data_ptr(), S, hidden, eps, s,
+            )
+            return h_out_v
+
         down_out_buf = self._nvfp4_scratch[(hidden, inter)][2]
         prefill_gemm(
             ap_dn.data_ptr(), int(lw['mlp_down_packed']),
@@ -1223,7 +1415,7 @@ class Qwen3TorchFrontendRtx:
             # nvfp4_quant(rms_norm(h_out, next_norm_w)). Reuse the
             # (n_q*hd, hidden) NVFP4 scratch — consumer-done by step 3.
             next_ap, next_sf, _ = self._nvfp4_scratch[(n_q * hd, hidden)]
-            fvk.residual_add_rms_norm_to_nvfp4_swizzled_bf16(
+            self._resnorm_q(
                 h_post.data_ptr(), mlp_out.contiguous().data_ptr(),
                 h_out_v.data_ptr(), int(next_input_norm_w),
                 next_ap.data_ptr(), next_sf.data_ptr(), S, hidden, eps, s,
@@ -1353,7 +1545,7 @@ class Qwen3TorchFrontendRtx:
             hd = cfg['head_dim']
             ap0, sf0, _ = self._nvfp4_scratch[(n_q * hd, hidden)]
             h0_v = h.view(S, hidden).contiguous()
-            fvk.rms_norm_to_nvfp4_swizzled_bf16(
+            self._rmsnorm_q(
                 h0_v.data_ptr(), int(layers_ptrs[0]['input_norm_w']),
                 ap0.data_ptr(), sf0.data_ptr(), S, hidden, eps, s,
             )
@@ -1534,7 +1726,7 @@ class Qwen3TorchFrontendRtx:
             hd = cfg['head_dim']
             ap0, sf0, _ = self._nvfp4_scratch[(n_q * hd, hidden)]
             h0_v = h.view(S, hidden).contiguous()
-            fvk.rms_norm_to_nvfp4_swizzled_bf16(
+            self._rmsnorm_q(
                 h0_v.data_ptr(), int(layers_ptrs[0]['input_norm_w']),
                 ap0.data_ptr(), sf0.data_ptr(), S, hidden, eps, s,
             )
@@ -1947,3 +2139,28 @@ class Qwen3TorchFrontendRtx:
                         self._static_token_id, cos, sin, cur,
                     )
         return torch.tensor([ids_list], device=self.device)
+
+    def get_latency_stats(self) -> dict:
+        """Return summary statistics over recorded latencies (ms).
+
+        ``latency_records`` is populated by external callers (benchmarks,
+        servers) rather than internally, because adding
+        ``torch.cuda.synchronize()`` on every decode step would serialize
+        the pipeline and destroy throughput. Call
+        ``frontend.latency_records.append(dt_ms)`` from your timing loop,
+        then call this method to get the summary.
+        """
+        if not self.latency_records:
+            return {}
+        import numpy as np
+        lat = np.array(self.latency_records)
+        return {
+            "count": len(lat),
+            "mean_ms": float(np.mean(lat)),
+            "std_ms": float(np.std(lat)),
+            "min_ms": float(np.min(lat)),
+            "max_ms": float(np.max(lat)),
+            "p50_ms": float(np.percentile(lat, 50)),
+            "p95_ms": float(np.percentile(lat, 95)),
+            "hz": float(1000 / np.mean(lat)),
+        }
