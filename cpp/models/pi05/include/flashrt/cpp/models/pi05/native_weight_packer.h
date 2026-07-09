@@ -14,7 +14,17 @@ public:
         : weights_(weights) {}
 
     modalities::Status pack_fp8(const std::string& name, bool transpose);
+    modalities::Status pack_fp8_as(const std::string& source_name,
+                                   const std::string& packed_name,
+                                   bool transpose);
     modalities::Status pack_int8(const std::string& name);
+    modalities::Status merge_bf16_columns(const std::string& left_name,
+                                           const std::string& right_name,
+                                           const std::string& output_name);
+    modalities::Status pack_all_fp8(bool transpose);
+    modalities::Status pack_vision_int8();
+    modalities::Status pack_encoder_int8();
+    modalities::Status pack_decoder_int8();
 
 private:
     modalities::Status load_bf16(const std::string& name,
