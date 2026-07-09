@@ -145,7 +145,9 @@ target_link_libraries(flashrt_cpp_vla
   INTERFACE flashrt_cpp_modalities flashrt_cpp)
 
 add_library(flashrt_cpp_loader STATIC
-  loader/src/safetensors.cpp)
+  loader/src/safetensors.cpp
+  loader/src/sha256.cpp)
+set_property(SOURCE loader/src/sha256.cpp APPEND PROPERTY COMPILE_OPTIONS -O2)
 target_include_directories(flashrt_cpp_loader
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/loader/include)
 
@@ -217,6 +219,7 @@ endif()
 add_library(flashrt_cpp_pi05_c SHARED
   models/pi05/src/c_api.cpp
   models/pi05/src/model_runtime.cpp
+  models/pi05/src/native_model_runtime.cpp
   models/pi05/src/native_open.cpp)
 target_link_libraries(flashrt_cpp_pi05_c
   PUBLIC flashrt_cpp_pi05 flashrt_runtime)
@@ -231,6 +234,10 @@ if(BUILD_TESTING)
   add_executable(test_safetensors_loader tests/test_safetensors_loader.cpp)
   target_link_libraries(test_safetensors_loader PRIVATE flashrt_cpp_loader)
   add_test(NAME safetensors_loader COMMAND test_safetensors_loader)
+
+  add_executable(test_sha256 tests/test_sha256.cpp)
+  target_link_libraries(test_sha256 PRIVATE flashrt_cpp_loader)
+  add_test(NAME sha256 COMMAND test_sha256)
 
   add_executable(test_cpp_modalities tests/test_modalities.cpp)
   target_link_libraries(test_cpp_modalities
@@ -355,6 +362,13 @@ if(BUILD_TESTING)
       target_link_libraries(pi05_native_graph_probe
         PRIVATE flashrt_cpp_pi05_kernels flashrt_exec CUDA::cudart)
 
+      if(FLASHRT_CPP_WITH_SENTENCEPIECE)
+        add_executable(pi05_native_open_probe
+          tests/pi05_native_open_probe.cpp)
+        target_link_libraries(pi05_native_open_probe
+          PRIVATE flashrt_cpp_pi05_c flashrt_exec CUDA::cudart)
+      endif()
+
       add_executable(test_pi05_native_rtx_attention_driver
         tests/test_pi05_native_rtx_attention_driver.cpp)
       target_link_libraries(test_pi05_native_rtx_attention_driver
@@ -410,6 +424,10 @@ if(BUILD_TESTING)
     add_executable(test_pi05_native_open tests/test_pi05_native_open.cpp)
     target_link_libraries(test_pi05_native_open
       PRIVATE flashrt_cpp_pi05_c flashrt_runtime)
+    if(FLASHRT_CPP_WITH_FA2 AND FLASHRT_CPP_WITH_SENTENCEPIECE)
+      target_compile_definitions(test_pi05_native_open
+        PRIVATE FLASHRT_CPP_PI05_NATIVE_OPEN_ENABLED=1)
+    endif()
     add_test(NAME pi05_native_open COMMAND test_pi05_native_open)
   endif()
 endif()

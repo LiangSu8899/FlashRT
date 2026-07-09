@@ -248,12 +248,14 @@ int main() {
     assert(std::strstr(frt_pi05_native_open_last_error(), "q01/q99"));
 
     write_norm_stats(root + "/norm_stats.json");
+#ifndef FLASHRT_CPP_PI05_NATIVE_OPEN_ENABLED
     const std::string good = config(root, tokenizer);
     out = reinterpret_cast<frt_model_runtime_v1*>(0x1);
     rc = frt_model_runtime_open_v1(good.c_str(), &out);
     assert(rc == -3);
     assert(out == nullptr);
     assert(std::strstr(frt_pi05_native_open_last_error(), "validated"));
+#endif
 
     const std::string short_prompt =
         std::string("{") +
@@ -278,11 +280,13 @@ int main() {
     assert(out == nullptr);
 
     write_lerobot_policy_stats(lerobot_root);
+#ifndef FLASHRT_CPP_PI05_NATIVE_OPEN_ENABLED
     out = reinterpret_cast<frt_model_runtime_v1*>(0x1);
     rc = frt_model_runtime_open_v1(
         config(lerobot_root, tokenizer).c_str(), &out);
     assert(rc == -3);
     assert(out == nullptr);
+#endif
 
     ::unlink((lerobot_root + "/model.safetensors").c_str());
     ::unlink((lerobot_root +

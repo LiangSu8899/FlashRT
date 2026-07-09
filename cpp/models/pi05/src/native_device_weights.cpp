@@ -5,6 +5,7 @@
 #endif
 
 #include <limits>
+#include <sstream>
 #include <utility>
 
 namespace flashrt {
@@ -79,8 +80,15 @@ modalities::Status NativeDeviceWeightStore::upload_bytes(
 #else
     frt_buffer buffer = frt_buffer_alloc(ctx_, name.c_str(), bytes);
     if (!buffer) {
+        std::size_t free_bytes = 0;
+        std::size_t total_bytes = 0;
+        cudaMemGetInfo(&free_bytes, &total_bytes);
+        std::ostringstream message;
+        message << "device weight allocation failed: " << name
+                << " requested=" << bytes << " free=" << free_bytes
+                << " total=" << total_bytes;
         return modalities::Status::error(modalities::StatusCode::kBackend,
-                                         "device weight allocation failed");
+                                         message.str());
     }
     const cudaError_t rc = cudaMemcpy(frt_buffer_dptr(buffer),
                                       data, bytes,

@@ -239,6 +239,15 @@ int Runtime::set_prompt_state(const char* text, const float* state,
             ? &prompt_embedding_staging_
             : nullptr,
         &formatted_prompt_workspace_);
+    if (prompt_status_.ok_status() && config_.prompt_length_update_fn) {
+        const int rc = config_.prompt_length_update_fn(
+            config_.prompt_length_update_user, current_prompt_len_);
+        if (rc != 0) {
+            prompt_status_ = modalities::Status::error(
+                modalities::StatusCode::kBackend,
+                "prompt length device update failed");
+        }
+    }
     return prompt_status_.ok_status() ? 0 : -1;
 }
 
