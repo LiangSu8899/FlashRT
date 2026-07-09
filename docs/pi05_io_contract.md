@@ -274,6 +274,14 @@ and four for each decoder layer. Encoder gate/up columns are merged during
 setup. INT8 packing remains independently selectable for vision, encoder, and
 decoder and preserves their existing four/five/five weights-per-layer policy.
 
+The native kernel layer is CPython-independent and links the existing
+`GemmRunner` implementation directly. A capture gate warms a BF16 GEMM shape,
+records it through `frt_graph_capture`, binds context-owned input/output
+buffers, and replays the owned graph exec 100 times without adding variants.
+This establishes the 4b kernel/capture ownership path; it does not yet
+constitute the complete Pi0.5 forward graph, so the native open gate remains
+unsupported.
+
 CUDA graph execs are process-local objects. They are not serialized as a
 portable artifact. Removing Python from setup requires a native producer that
 loads assets and captures graphs in the replay process.
