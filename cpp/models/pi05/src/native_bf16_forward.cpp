@@ -1,5 +1,6 @@
 #include "flashrt/cpp/models/pi05/native_bf16_forward.h"
 
+#include <climits>
 #include <string>
 #include <vector>
 
@@ -417,6 +418,252 @@ modalities::Status NativeBf16Forward::encoder(
     for (int layer = 0; layer < 18; ++layer) {
         modalities::Status st = encoder_layer(
             layer, weights, workspace, attention, attention_driver, stream);
+        if (!st.ok_status()) return st;
+    }
+    return modalities::Status::ok();
+}
+
+modalities::Status NativeBf16Forward::decoder_layer(
+    int layer,
+    int step,
+    const NativeDeviceWeightStore& weights,
+    NativeWorkspace* workspace,
+    NativeRtxAttentionWorkspace* attention,
+    const NativeRtxAttentionDriver* attention_driver,
+    std::uintptr_t stream) const {
+    if (!driver_ || !workspace || !attention || !attention_driver ||
+        !attention_driver->status().ok_status() || layer < 0 || layer >= 18) {
+        return invalid("native decoder layer owner is invalid");
+    }
+    const NativeWorkspaceBuffer* x = workspace->find("decoder_x");
+    const NativeWorkspaceBuffer* x_norm = workspace->find("x_normed_buf");
+    const NativeWorkspaceBuffer* gate = workspace->find("gate_buf");
+    const NativeWorkspaceBuffer* qkv = workspace->find("decoder_QKV");
+    const NativeWorkspaceBuffer* hidden = workspace->find("decoder_hidden");
+    const NativeWorkspaceBuffer* gate_projection =
+        workspace->find("decoder_gate_merged");
+    const NativeWorkspaceBuffer* rms = workspace->find("decoder_rms_ones");
+    const NativeWorkspaceBuffer* rope =
+        workspace->find("decoder_rope_weights");
+    const NativeWorkspaceBuffer* style_attn =
+        workspace->find("decoder_style_attn");
+    const NativeWorkspaceBuffer* style_ffn =
+        workspace->find("decoder_style_ffn");
+    if (!x || x->shape.size() != 2) {
+        return invalid("native decoder workspace is invalid");
+    }
+    const int sequence = static_cast<int>(x->shape[0]);
+    const NativeAttentionBuffer* query = attention->find("attn_dec_Q");
+    const NativeAttentionBuffer* devpos = attention->find("attn_dec_devpos");
+    const std::string suffix = std::to_string(layer);
+    const NativeDeviceWeight* qkv_weight =
+        weights.find("decoder_attn_qkv_w_" + suffix);
+    const NativeDeviceWeight* output_weight =
+        weights.find("decoder_attn_o_w_" + suffix);
+    const NativeDeviceWeight* gate_weight =
+        weights.find("decoder_ffn_gate_w_" + suffix);
+    const NativeDeviceWeight* up_weight =
+        weights.find("decoder_ffn_up_w_" + suffix);
+    const NativeDeviceWeight* down_weight =
+        weights.find("decoder_ffn_down_w_" + suffix);
+    if (sequence <= 0 || step < 0 ||
+        !shape_is(x, {static_cast<std::uint64_t>(sequence), 1024}) ||
+        !shape_is(x_norm, {static_cast<std::uint64_t>(sequence), 1024}) ||
+        !shape_is(gate, {static_cast<std::uint64_t>(sequence), 1024}) ||
+        !shape_is(qkv, {static_cast<std::uint64_t>(sequence), 2560}) ||
+        !shape_is(hidden, {static_cast<std::uint64_t>(sequence), 4096}) ||
+        !shape_is(gate_projection,
+                  {static_cast<std::uint64_t>(sequence), 8192}) ||
+        !shape_is(rms, {1024}) ||
+        !shape_is(rope, {static_cast<std::uint64_t>(sequence), 256}) ||
+        !style_attn || style_attn->dtype != modalities::DType::kBFloat16 ||
+        style_attn->shape.size() != 4 ||
+        style_attn->shape[0] <= static_cast<std::uint64_t>(step) ||
+        style_attn->shape[1] != 18 ||
+        style_attn->shape[2] != static_cast<std::uint64_t>(sequence) ||
+        style_attn->shape[3] != 3072 || !style_ffn ||
+        style_ffn->dtype != modalities::DType::kBFloat16 ||
+        style_ffn->shape != style_attn->shape ||
+        !shape_is(query, {static_cast<std::uint64_t>(sequence), 8, 256}) ||
+        !devpos || devpos->dtype != NativeAttentionDType::kInt32 ||
+        devpos->shape != std::vector<std::uint64_t>({1}) ||
+        !shape_is(qkv_weight, {1024, 2560}) ||
+        !shape_is(output_weight, {2048, 1024}) ||
+        !shape_is(gate_weight, {1024, 4096}) ||
+        !shape_is(up_weight, {1024, 4096}) ||
+        !shape_is(down_weight, {4096, 1024})) {
+        return invalid("native decoder layer buffers or weights are invalid");
+    }
+    const std::size_t style_offset =
+        (static_cast<std::size_t>(step) * 18 + layer) * sequence * 3072 *
+        sizeof(std::uint16_t);
+    const auto* attn_style =
+        static_cast<const unsigned char*>(frt_buffer_dptr(style_attn->buffer)) +
+        style_offset;
+    const auto* ffn_style =
+        static_cast<const unsigned char*>(frt_buffer_dptr(style_ffn->buffer)) +
+        style_offset;
+    modalities::Status st = driver_->ada_rms_norm_style_bf16(
+        frt_buffer_dptr(x->buffer), frt_buffer_dptr(rms->buffer), attn_style,
+        frt_buffer_dptr(x_norm->buffer), frt_buffer_dptr(gate->buffer),
+        sequence, 1024, 1e-6f, stream);
+    if (!st.ok_status()) return st;
+    st = driver_->bf16_nn(
+        frt_buffer_dptr(x_norm->buffer), frt_buffer_dptr(qkv_weight->buffer),
+        frt_buffer_dptr(qkv->buffer), sequence, 2560, 1024, stream);
+    if (!st.ok_status()) return st;
+    st = driver_->qkv_split_rope_devpos_bf16(
+        frt_buffer_dptr(qkv->buffer), frt_buffer_dptr(rope->buffer),
+        frt_buffer_dptr(query->buffer), attention->encoder_k_layer_dptr(layer),
+        attention->encoder_v_layer_dptr(layer),
+        frt_buffer_dptr(devpos->buffer), sequence, 2048, 256, 256, 256,
+        stream);
+    if (!st.ok_status()) return st;
+    st = attention_driver->decoder(layer, stream);
+    if (!st.ok_status()) return st;
+    st = driver_->bf16_nn(
+        attention_driver->decoder_output(),
+        frt_buffer_dptr(output_weight->buffer), frt_buffer_dptr(x_norm->buffer),
+        sequence, 1024, 2048, stream);
+    if (!st.ok_status()) return st;
+    st = driver_->gate_mul_residual_bf16(
+        frt_buffer_dptr(x->buffer), frt_buffer_dptr(x_norm->buffer),
+        frt_buffer_dptr(gate->buffer),
+        static_cast<std::size_t>(sequence) * 1024, stream);
+    if (!st.ok_status()) return st;
+    st = driver_->ada_rms_norm_style_bf16(
+        frt_buffer_dptr(x->buffer), frt_buffer_dptr(rms->buffer), ffn_style,
+        frt_buffer_dptr(x_norm->buffer), frt_buffer_dptr(gate->buffer),
+        sequence, 1024, 1e-6f, stream);
+    if (!st.ok_status()) return st;
+    st = driver_->bf16_nn(
+        frt_buffer_dptr(x_norm->buffer), frt_buffer_dptr(gate_weight->buffer),
+        frt_buffer_dptr(gate_projection->buffer), sequence, 4096, 1024,
+        stream);
+    if (!st.ok_status()) return st;
+    st = driver_->bf16_nn(
+        frt_buffer_dptr(x_norm->buffer), frt_buffer_dptr(up_weight->buffer),
+        frt_buffer_dptr(hidden->buffer), sequence, 4096, 1024, stream);
+    if (!st.ok_status()) return st;
+    st = driver_->gate_gelu_bf16(
+        frt_buffer_dptr(gate_projection->buffer),
+        frt_buffer_dptr(hidden->buffer), frt_buffer_dptr(hidden->buffer),
+        static_cast<std::size_t>(sequence) * 4096, stream);
+    if (!st.ok_status()) return st;
+    st = driver_->bf16_nn(
+        frt_buffer_dptr(hidden->buffer), frt_buffer_dptr(down_weight->buffer),
+        frt_buffer_dptr(x_norm->buffer), sequence, 1024, 4096, stream);
+    if (!st.ok_status()) return st;
+    return driver_->gate_mul_residual_bf16(
+        frt_buffer_dptr(x->buffer), frt_buffer_dptr(x_norm->buffer),
+        frt_buffer_dptr(gate->buffer),
+        static_cast<std::size_t>(sequence) * 1024, stream);
+}
+
+modalities::Status NativeBf16Forward::diffusion_step(
+    int step,
+    const NativeDeviceWeightStore& weights,
+    NativeWorkspace* workspace,
+    NativeRtxAttentionWorkspace* attention,
+    const NativeRtxAttentionDriver* attention_driver,
+    std::uintptr_t stream) const {
+    if (!driver_ || !workspace || !attention || !attention_driver || step < 0) {
+        return invalid("native diffusion step owner is invalid");
+    }
+    const NativeWorkspaceBuffer* noise = workspace->find("diffusion_noise");
+    const NativeWorkspaceBuffer* x = workspace->find("decoder_x");
+    const NativeWorkspaceBuffer* action =
+        workspace->find("decoder_action_buf");
+    const NativeWorkspaceBuffer* x_norm = workspace->find("x_normed_buf");
+    const NativeWorkspaceBuffer* gate = workspace->find("gate_buf");
+    const NativeWorkspaceBuffer* rms = workspace->find("decoder_rms_ones");
+    const NativeWorkspaceBuffer* style =
+        workspace->find("decoder_style_final");
+    if (!noise || noise->shape.size() != 2) {
+        return invalid("native diffusion workspace is invalid");
+    }
+    const int sequence = static_cast<int>(noise->shape[0]);
+    const NativeDeviceWeight* input_weight =
+        weights.find("decoder_action_in_proj_w");
+    const NativeDeviceWeight* input_bias =
+        weights.find("decoder_action_in_proj_b");
+    const NativeDeviceWeight* output_weight =
+        weights.find("decoder_action_out_proj_w");
+    const NativeDeviceWeight* output_bias =
+        weights.find("decoder_action_out_proj_b");
+    if (sequence <= 0 ||
+        !shape_is(noise, {static_cast<std::uint64_t>(sequence), 32}) ||
+        !shape_is(x, {static_cast<std::uint64_t>(sequence), 1024}) ||
+        !shape_is(action, {static_cast<std::uint64_t>(sequence), 32}) ||
+        !shape_is(x_norm, {static_cast<std::uint64_t>(sequence), 1024}) ||
+        !shape_is(gate, {static_cast<std::uint64_t>(sequence), 1024}) ||
+        !shape_is(rms, {1024}) || !style ||
+        style->dtype != modalities::DType::kBFloat16 ||
+        style->shape.size() != 3 ||
+        style->shape[0] <= static_cast<std::uint64_t>(step) ||
+        style->shape[1] != static_cast<std::uint64_t>(sequence) ||
+        style->shape[2] != 3072 ||
+        !shape_is(input_weight, {32, 1024}) ||
+        !shape_is(input_bias, {1024}) ||
+        !shape_is(output_weight, {1024, 32}) ||
+        !shape_is(output_bias, {32})) {
+        return invalid("native diffusion buffers or weights are invalid");
+    }
+    modalities::Status st = driver_->bf16_nn(
+        frt_buffer_dptr(noise->buffer), frt_buffer_dptr(input_weight->buffer),
+        frt_buffer_dptr(x->buffer), sequence, 1024, 32, stream);
+    if (!st.ok_status()) return st;
+    st = driver_->add_bias_bf16(
+        frt_buffer_dptr(x->buffer), frt_buffer_dptr(input_bias->buffer),
+        sequence, 1024, stream);
+    if (!st.ok_status()) return st;
+    for (int layer = 0; layer < 18; ++layer) {
+        st = decoder_layer(layer, step, weights, workspace, attention,
+                           attention_driver, stream);
+        if (!st.ok_status()) return st;
+    }
+    const std::size_t style_offset =
+        static_cast<std::size_t>(step) * sequence * 3072 *
+        sizeof(std::uint16_t);
+    const auto* final_style =
+        static_cast<const unsigned char*>(frt_buffer_dptr(style->buffer)) +
+        style_offset;
+    st = driver_->ada_rms_norm_style_bf16(
+        frt_buffer_dptr(x->buffer), frt_buffer_dptr(rms->buffer), final_style,
+        frt_buffer_dptr(x_norm->buffer), frt_buffer_dptr(gate->buffer),
+        sequence, 1024, 1e-6f, stream);
+    if (!st.ok_status()) return st;
+    st = driver_->bf16_nn(
+        frt_buffer_dptr(x_norm->buffer),
+        frt_buffer_dptr(output_weight->buffer), frt_buffer_dptr(action->buffer),
+        sequence, 32, 1024, stream);
+    if (!st.ok_status()) return st;
+    st = driver_->add_bias_bf16(
+        frt_buffer_dptr(action->buffer), frt_buffer_dptr(output_bias->buffer),
+        sequence, 32, stream);
+    if (!st.ok_status()) return st;
+    return driver_->residual_add_bf16(
+        frt_buffer_dptr(noise->buffer), frt_buffer_dptr(action->buffer),
+        static_cast<std::size_t>(sequence) * 32, stream);
+}
+
+modalities::Status NativeBf16Forward::diffusion(
+    const NativeDeviceWeightStore& weights,
+    NativeWorkspace* workspace,
+    NativeRtxAttentionWorkspace* attention,
+    const NativeRtxAttentionDriver* attention_driver,
+    std::uintptr_t stream) const {
+    if (!workspace) return invalid("native diffusion workspace is invalid");
+    const NativeWorkspaceBuffer* style =
+        workspace->find("decoder_style_final");
+    if (!style || style->shape.size() != 3 || !style->shape[0] ||
+        style->shape[0] > static_cast<std::uint64_t>(INT_MAX)) {
+        return invalid("native diffusion step count is invalid");
+    }
+    const int steps = static_cast<int>(style->shape[0]);
+    for (int step = 0; step < steps; ++step) {
+        modalities::Status st = diffusion_step(
+            step, weights, workspace, attention, attention_driver, stream);
         if (!st.ok_status()) return st;
     }
     return modalities::Status::ok();
