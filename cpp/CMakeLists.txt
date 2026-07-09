@@ -367,6 +367,11 @@ if(BUILD_TESTING)
           tests/pi05_native_open_probe.cpp)
         target_link_libraries(pi05_native_open_probe
           PRIVATE flashrt_cpp_pi05_c flashrt_exec CUDA::cudart)
+
+        add_executable(pi05_native_e2e_probe
+          tests/pi05_native_e2e_probe.cpp)
+        target_link_libraries(pi05_native_e2e_probe
+          PRIVATE flashrt_cpp_pi05_c flashrt_exec CUDA::cudart)
       endif()
 
       add_executable(test_pi05_native_rtx_attention_driver

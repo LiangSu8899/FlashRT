@@ -429,3 +429,23 @@ cpp/build-sm120-spm-debug/pi05_native_open_probe \
 Run it against both OpenPI and LeRobot checkpoint layouts. It validates the
 public schema, one captured variant, prompt/state/image staging, direct SWAP
 noise input, finite action output, and retain/release teardown.
+
+The real-episode numerical gate compares against the official OpenPI PyTorch
+`PI0Pytorch.sample_actions` path, not another native intermediate:
+
+```
+python cpp/tests/gate_pi05_native_e2e.py \
+  --checkpoint <openpi-pytorch-checkpoint> \
+  --tokenizer <tokenizer.model> \
+  --dataset <libero-lerobot-root> \
+  --probe cpp/build-sm120-spm-debug/pi05_native_e2e_probe \
+  --episode 0 --frame 0
+```
+
+The gate rounds the shared initial noise to the exported BF16 contract before
+both runs. Raw and robot action outputs must each reach cosine 0.9999 against
+the official FP32 residual path. Separately, the STAGED `actions` bytes must
+match q01/q99 postprocess recomputed from the native BF16 `actions_raw` window
+at `rtol=atol=1e-6`; this keeps numerical precision and IO semantics as two
+independent acceptance checks. Set `OPENPI_BASELINE_SITE_PACKAGES` when the
+official OpenPI Transformers replacement is installed in a separate prefix.
