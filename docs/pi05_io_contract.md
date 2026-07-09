@@ -246,8 +246,15 @@ producer. The prompt embedding table is materialized separately to keep its
 approximately 1 GiB allocation explicit. These paths have been exercised
 against the two supported real checkpoint layouts. The checkpoint inventory
 also validates the language final norm and expert LM head even though the
-current Pi0.5 pipeline does not consume them. Precision-specific packing and
-graph capture remain incomplete, so `open_v1` stays unsupported.
+current Pi0.5 pipeline does not consume them. Full-model precision-store
+assembly and graph capture remain incomplete, so `open_v1` stays unsupported.
+
+Native setup quantization reproduces the PyTorch producer's per-tensor FP8
+E4M3 weights in either `kn` or `nk` layout and per-output-channel INT8 weights
+in `[N,K]` layout. FP8 scalar descales and INT8 channel scales are FP32 device
+buffers. Real-checkpoint gates compare both quantized bytes and scale bytes;
+the precision choice remains producer setup policy and does not alter ports,
+regions, or the exec mechanism.
 
 CUDA graph execs are process-local objects. They are not serialized as a
 portable artifact. Removing Python from setup requires a native producer that
