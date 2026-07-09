@@ -130,6 +130,7 @@ add_library(flashrt_cpp_pi05 STATIC
   models/pi05/src/spec.cpp
   models/pi05/src/native_weights.cpp
   models/pi05/src/native_weight_ops.cpp
+  models/pi05/src/native_device_weights.cpp
   models/pi05/src/prompt_format.cpp
   models/pi05/src/prompt_embed.cpp
   models/pi05/src/io.cpp
@@ -193,6 +194,13 @@ if(BUILD_TESTING)
     target_link_libraries(test_device_staging
       PRIVATE flashrt_cpp_pi05 flashrt_cpp_modalities CUDA::cudart)
     add_test(NAME device_staging COMMAND test_device_staging)
+
+    add_executable(test_pi05_native_device_weights
+      tests/test_pi05_native_device_weights.cpp)
+    target_link_libraries(test_pi05_native_device_weights
+      PRIVATE flashrt_cpp_pi05 flashrt_exec CUDA::cudart)
+    add_test(NAME pi05_native_device_weights
+      COMMAND test_pi05_native_device_weights)
 
     add_executable(test_pi05_c_api tests/test_pi05_c_api.cpp)
     target_link_libraries(test_pi05_c_api

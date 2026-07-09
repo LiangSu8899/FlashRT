@@ -224,6 +224,12 @@ and FP32 encoder RMSNorm fold before the final BF16 rounding. Real-checkpoint
 gates compare the resulting BF16 bytes against PyTorch for both bare OpenPI
 keys and LeRobot `model.`-prefixed keys.
 
+Materialized device weights use `frt_buffer` allocations owned by the native
+producer's `frt_ctx`. They are internal setup assets, not model ports and not
+capsule regions. Upload is complete before capture; duplicate logical names or
+shape/payload mismatches fail setup. Destroying the context releases the device
+weights after graphs and plans, preserving the exec ownership order.
+
 CUDA graph execs are process-local objects. They are not serialized as a
 portable artifact. Removing Python from setup requires a native producer that
 loads assets and captures graphs in the replay process.
