@@ -8,6 +8,12 @@ namespace flashrt {
 namespace models {
 namespace pi05 {
 
+struct NativeMaterializationOptions {
+    int num_steps = 10;
+    bool merge_decoder_gate_up = true;
+    bool include_embedding = true;
+};
+
 class NativeWeightMaterializer {
 public:
     NativeWeightMaterializer(const loader::SafetensorsFile& source,
@@ -21,6 +27,8 @@ public:
     modalities::Status materialize_vision_globals();
     modalities::Status materialize_decoder_globals(int num_steps);
     modalities::Status materialize_embedding();
+    modalities::Status materialize_all(
+        const NativeMaterializationOptions& options);
 
 private:
     modalities::Status load(const std::string& key, NativeFloatTensor* out);
