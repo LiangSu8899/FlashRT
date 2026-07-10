@@ -989,6 +989,7 @@ class Pi05TorchFrontendRtxFP16:
                     num_steps=self._num_steps,
                     vision_pool_factor=self._vision_pool_factor,
                     vision_num_layers=self._vision_num_layers,
+                    norm_stats=self.norm_stats,
                     **self._pipeline_precision_kwargs())
                 self._prompt_pipeline_cache[prompt_len] = self.pipeline
                 # Static INT8 vision scales are per-pipeline-instance.

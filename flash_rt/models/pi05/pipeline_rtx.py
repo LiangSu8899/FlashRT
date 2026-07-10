@@ -137,6 +137,7 @@ class Pi05Pipeline:
         use_fp8_decoder: Enable FP8 on decoder branch (else BF16).
         use_int8_decoder: Enable experimental decoder-only INT8 GEMMs.
         num_steps:    Diffusion denoise steps (default 10).
+        norm_stats:   Producer metadata for logical state/action IO contracts.
 
     Expected weights dict keys:
         Vision BF16:
@@ -185,11 +186,13 @@ class Pi05Pipeline:
                  vision_pool_factor: int = 1,
                  vision_num_layers: int = VIS_L,
                  num_steps: int = NUM_STEPS_DEFAULT,
-                 fixed_shape: bool = False):
+                 fixed_shape: bool = False,
+                 norm_stats=None):
         self.gemm = gemm
         self.fvk = fvk
         self.attn = attn_backend
         self.weights = weights
+        self.norm_stats = norm_stats or {}
 
         # Fixed-shape state-prompt mode: one captured graph at the MAX prompt
         # length serves every length via seqused masking + devpos K/V append.

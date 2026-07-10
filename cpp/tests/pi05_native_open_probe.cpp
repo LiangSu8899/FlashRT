@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -110,6 +111,29 @@ int main(int argc, char** argv) {
         std::cerr << "native schema validation failed\n";
         model->release(model->owner);
         return 1;
+    }
+    const char* schema_output = std::getenv("FLASHRT_SCHEMA_OUTPUT");
+    if (schema_output && schema_output[0] != '\0') {
+        std::ofstream output(schema_output);
+        std::istringstream identity(exp->identity ? exp->identity : "");
+        std::string line;
+        while (std::getline(identity, line)) {
+            if (line.compare(0, 7, "region:") == 0 ||
+                line.compare(0, 5, "port:") == 0 ||
+                line.compare(0, 6, "stage:") == 0) {
+                output << line << '\n';
+            }
+        }
+        if (!output) {
+            std::cerr << "native schema output failed\n";
+            model->release(model->owner);
+            return 1;
+        }
+        if (std::getenv("FLASHRT_SCHEMA_ONLY")) {
+            model->release(model->owner);
+            std::cout << "PASS native schema export\n";
+            return 0;
+        }
     }
     if (model->verbs.prepare(model->self, 0, 0) != 0 ||
         model->verbs.prepare(model->self, 0, 1) != -2) {
