@@ -1071,6 +1071,7 @@ class Pi05TorchFrontendRtx:
                 vision_pool_factor=self._vision_pool_factor,
                 vision_num_layers=self._vision_num_layers,
                 fixed_shape=True,
+                norm_stats=self.norm_stats,
                 **self._pipeline_precision_kwargs())
             if self._fixed_pipeline.use_int8_vision_static:
                 self._fixed_pipeline.vis_int8_static_calibrated = False
@@ -1121,6 +1122,7 @@ class Pi05TorchFrontendRtx:
                     num_steps=self._num_steps,
                     vision_pool_factor=self._vision_pool_factor,
                     vision_num_layers=self._vision_num_layers,
+                    norm_stats=self.norm_stats,
                     **self._pipeline_precision_kwargs())
                 self._prompt_pipeline_cache[prompt_len] = self.pipeline
                 # Static INT8 vision scales are per-pipeline-instance.

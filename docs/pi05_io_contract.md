@@ -445,6 +445,18 @@ Run it against both OpenPI and LeRobot checkpoint layouts. It validates the
 public schema, one captured variant, prompt/state/image staging, direct SWAP
 noise input, finite action output, and retain/release teardown.
 
+Python and C++ native-v2 producers must also publish identical canonical
+port/stage/region records (their producer identity and fingerprints remain
+different):
+
+```
+FLASHRT_BUILD_DIR=cpp/build-sm120-debug \
+  python cpp/tests/gate_pi05_native_schema_parity.py \
+  --checkpoint <openpi-pytorch-checkpoint> \
+  --tokenizer <tokenizer.model> \
+  --native-probe cpp/build-sm120-spm-debug/pi05_native_open_probe
+```
+
 The native formatter and tokenizer must also remain token-exact over real
 prompt/state traffic:
 
