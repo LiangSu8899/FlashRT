@@ -145,7 +145,7 @@ class PortSpec:
 
     name: str
     modality: int | str            # MODALITY name or value
-    dtype: int | str = "bf16"      # device-side tensor dtype
+    dtype: int | str = "bf16"      # logical payload/target tensor dtype
     layout: int | str = "flat"
     direction: int | str = "in"
     update: int | str = "swap"

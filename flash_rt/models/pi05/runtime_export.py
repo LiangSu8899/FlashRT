@@ -160,9 +160,9 @@ def export_model_runtime(pl, identity=None, extra_regions=None,
                          buffer=wrap["observation_images_normalized"]),
             _rt.PortSpec("noise", "tensor", tensor_dtype, "flat", "in", "swap",
                          shape=(chunk, 32), buffer=wrap["diffusion_noise"]),
-            _rt.PortSpec("actions", "action", tensor_dtype, "flat", "out",
+            _rt.PortSpec("actions", "action", "f32", "flat", "out",
                          "staged", shape=(chunk, robot_action_dim),
-                         buffer=wrap["diffusion_noise"]),
+                         nbytes=chunk * robot_action_dim * 4),
         ]
         if io == "native_v2":
             state_dim = _state_dim(pl)

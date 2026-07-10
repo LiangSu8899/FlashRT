@@ -155,6 +155,12 @@ int main() {
               m->ports[1].update == FRT_RT_PORT_SWAP &&
               m->ports[1].buffer == action,
           "noise SWAP port exposes the device window");
+    CHECK(std::strcmp(m->ports[2].name, "actions") == 0 &&
+              m->ports[2].dtype == FRT_RT_DTYPE_F32 &&
+              m->ports[2].update == FRT_RT_PORT_STAGED &&
+              m->ports[2].buffer == nullptr &&
+              m->ports[2].bytes == 3 * sizeof(float),
+          "actions port declares the logical F32 payload");
     CHECK(m->stages[0].graph == 0, "stage resolves the infer graph");
 
     /* staged image input lands in the device buffer */
@@ -267,14 +273,13 @@ int main() {
     ports[1].bytes = action_bytes;
     ports[2].name = "actions";
     ports[2].modality = FRT_RT_MOD_ACTION;
-    ports[2].dtype = FRT_RT_DTYPE_BF16;
+    ports[2].dtype = FRT_RT_DTYPE_F32;
     ports[2].layout = FRT_RT_LAYOUT_FLAT;
     ports[2].direction = FRT_RT_PORT_OUT;
     ports[2].update = FRT_RT_PORT_STAGED;
     ports[2].shape = action_shape;
     ports[2].rank = 2;
-    ports[2].buffer = action;
-    ports[2].bytes = action_bytes;
+    ports[2].bytes = 3 * sizeof(float);
     uint32_t after_action[1] = {0};
     frt_runtime_stage_desc stages[2]{};
     stages[0].graph = 0;
@@ -285,6 +290,20 @@ int main() {
     frt_model_runtime_v1* producer = frt_model_runtime_wrap(
         &exp, ports, 3, stages, 2, nullptr, nullptr, nullptr, nullptr);
     CHECK(producer != nullptr, "producer model declaration for create_over");
+
+    frt_runtime_port_desc wrong_action_ports[3] = {};
+    for (int i = 0; i < 3; ++i) wrong_action_ports[i] = ports[i];
+    wrong_action_ports[2].dtype = FRT_RT_DTYPE_BF16;
+    frt_model_runtime_v1* wrong_action_producer = frt_model_runtime_wrap(
+        &exp, wrong_action_ports, 3, stages, 2, nullptr, nullptr, nullptr,
+        nullptr);
+    frt_model_runtime_v1* wrong_action_over = nullptr;
+    CHECK(wrong_action_producer &&
+              frt_pi05_model_runtime_create_over(
+                  wrong_action_producer, &cfg, &wrong_action_over) == -2 &&
+              wrong_action_over == nullptr,
+          "create_over rejects a non-F32 logical action port");
+    wrong_action_producer->release(wrong_action_producer->owner);
 
     frt_model_runtime_v1* over = nullptr;
     CHECK(frt_pi05_model_runtime_create_over(producer, &cfg, &over) == 0 &&
@@ -297,7 +316,7 @@ int main() {
               over->stages[1].after[0] == 0,
           "create_over preserves a producer-declared two-stage DAG");
     producer->release(producer->owner);
-    CHECK(owner.release == retains,
+    CHECK(owner.release < owner.retain,
           "producer declaration stays alive through the override");
 
     CHECK(over->verbs.set_input(over->self, 0, &view, sizeof(view), -1) == 0,
