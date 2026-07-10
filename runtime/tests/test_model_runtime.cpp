@@ -56,16 +56,30 @@ static const int64_t IMG_SHAPE[4] = {3, 224, 224, 3};
 static const int64_t ACT_SHAPE[2] = {50, 32};
 
 static void add_ports_and_stages(frt_runtime_builder b, int64_t img_h = 224,
-                                 uint64_t act_bytes = 3200) {
+                                 uint64_t act_bytes = 3200,
+                                 uint32_t cadence_hz = 30,
+                                 bool add_prompt_state = false) {
     const int64_t img[4] = {3, img_h, 224, 3};
     frt_runtime_builder_add_port(b, "images", FRT_RT_MOD_IMAGE,
                                  FRT_RT_DTYPE_BF16, FRT_RT_LAYOUT_NHWC,
                                  FRT_RT_PORT_IN, FRT_RT_PORT_STAGED, 1,
-                                 img, 4, 30, nullptr, 0, 0);
+                                 img, 4, cadence_hz, nullptr, 0, 0);
     frt_runtime_builder_add_port(b, "actions", FRT_RT_MOD_ACTION,
                                  FRT_RT_DTYPE_BF16, FRT_RT_LAYOUT_FLAT,
                                  FRT_RT_PORT_OUT, FRT_RT_PORT_STAGED, 0,
                                  ACT_SHAPE, 2, 0, FAKE_B0, 0, act_bytes);
+    if (add_prompt_state) {
+        const int64_t text_shape[1] = {-1};
+        const int64_t state_shape[1] = {8};
+        frt_runtime_builder_add_port(
+            b, "prompt", FRT_RT_MOD_TEXT, FRT_RT_DTYPE_U8,
+            FRT_RT_LAYOUT_FLAT, FRT_RT_PORT_IN, FRT_RT_PORT_STAGED, 1,
+            text_shape, 1, 0, nullptr, 0, 0);
+        frt_runtime_builder_add_port(
+            b, "state", FRT_RT_MOD_STATE, FRT_RT_DTYPE_F32,
+            FRT_RT_LAYOUT_FLAT, FRT_RT_PORT_IN, FRT_RT_PORT_STAGED, 1,
+            state_shape, 1, 0, nullptr, 0, 0);
+    }
     const uint32_t after1[1] = {0};
     frt_runtime_builder_add_stage(b, 0, nullptr, 0);
     frt_runtime_builder_add_stage(b, 1, after1, 1);
@@ -178,6 +192,39 @@ int main() {
         CHECK(m4 && m4->exp->fingerprint != m->exp->fingerprint,
               "graph stream change changes the fingerprint");
         m4->release(m4->owner);
+    }
+    /* prompt/state port additions define a new native face */
+    {
+        frt_runtime_builder b5 = make_builder();
+        add_ports_and_stages(b5, 224, 3200, 30, true);
+        frt_model_runtime_v1* m5 = frt_runtime_builder_finish_model(
+            b5, &verbs, &vlog, nullptr, nullptr, nullptr);
+        CHECK(m5 && m5->exp->fingerprint != m->exp->fingerprint,
+              "adding prompt/state ports changes the fingerprint");
+        m5->release(m5->owner);
+    }
+    /* cadence is a scheduling hint, not deployment identity */
+    {
+        frt_runtime_builder b6 = make_builder();
+        add_ports_and_stages(b6, 224, 3200, 60);
+        frt_model_runtime_v1* m6 = frt_runtime_builder_finish_model(
+            b6, &verbs, &vlog, nullptr, nullptr, nullptr);
+        CHECK(m6 && m6->exp->fingerprint == m->exp->fingerprint,
+              "cadence hint does not change the fingerprint");
+        m6->release(m6->owner);
+    }
+    /* manifest is discovery metadata, not deployment identity */
+    {
+        frt_runtime_builder b7 = make_builder();
+        add_ports_and_stages(b7);
+        CHECK(frt_runtime_builder_set_manifest(
+                  b7, "{\"note\":\"discovery-only\"}") == 0,
+              "set manifest metadata");
+        frt_model_runtime_v1* m7 = frt_runtime_builder_finish_model(
+            b7, &verbs, &vlog, nullptr, nullptr, nullptr);
+        CHECK(m7 && m7->exp->fingerprint == m->exp->fingerprint,
+              "manifest does not change the fingerprint");
+        m7->release(m7->owner);
     }
 
     /* verbs plumb through self */
