@@ -204,6 +204,9 @@ int build_native_model_runtime(const NativeOpenConfig& config,
     const int64_t raw_action_shape[] = {config.chunk, 32};
     const int64_t action_shape[] = {
         config.chunk, static_cast<int64_t>(config.action_q01.size())};
+    const std::uint64_t action_bytes =
+        static_cast<std::uint64_t>(config.chunk) *
+        config.action_q01.size() * sizeof(float);
     ok = frt_runtime_builder_add_port(
              builder, "prompt", FRT_RT_MOD_TEXT, FRT_RT_DTYPE_U8,
              FRT_RT_LAYOUT_FLAT, FRT_RT_PORT_IN, FRT_RT_PORT_STAGED, 1,
@@ -223,10 +226,9 @@ int build_native_model_runtime(const NativeOpenConfig& config,
              raw_action_shape, 2, 0, noise->buffer, 0,
              frt_buffer_bytes(noise->buffer)) == 0 &&
          frt_runtime_builder_add_port(
-             builder, "actions", FRT_RT_MOD_ACTION, FRT_RT_DTYPE_BF16,
+             builder, "actions", FRT_RT_MOD_ACTION, FRT_RT_DTYPE_F32,
              FRT_RT_LAYOUT_FLAT, FRT_RT_PORT_OUT, FRT_RT_PORT_STAGED, 0,
-             action_shape, 2, 0, noise->buffer, 0,
-             frt_buffer_bytes(noise->buffer)) == 0 &&
+             action_shape, 2, 0, nullptr, 0, action_bytes) == 0 &&
          frt_runtime_builder_add_port(
              builder, "actions_raw", FRT_RT_MOD_TENSOR, FRT_RT_DTYPE_BF16,
              FRT_RT_LAYOUT_FLAT, FRT_RT_PORT_OUT, FRT_RT_PORT_SWAP, 0,
