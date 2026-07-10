@@ -131,7 +131,7 @@ typedef struct frt_image_view {
 typedef struct frt_runtime_port_desc {
     const char* name;          /* "images", "prompt", "state", "actions"   */
     uint32_t modality;         /* frt_rt_modality                          */
-    uint32_t dtype;            /* frt_rt_dtype (of the DEVICE-side tensor) */
+    uint32_t dtype;            /* frt_rt_dtype of logical payload/target   */
     uint32_t layout;           /* frt_rt_layout                            */
     uint32_t direction;        /* frt_rt_port_direction                    */
     uint32_t update;           /* frt_rt_port_update                       */

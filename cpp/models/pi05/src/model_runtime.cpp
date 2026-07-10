@@ -425,11 +425,12 @@ extern "C" int frt_pi05_model_runtime_create(
                          FRT_RT_PORT_SWAP, 0, a->noise_shape, 2, 0,
                          action_buf ? action_buf->handle : nullptr, 0,
                          action_buf ? action_buf->bytes : 0};
-    ports[kPortActions] = {"actions", FRT_RT_MOD_ACTION, io_dtype,
+    ports[kPortActions] = {"actions", FRT_RT_MOD_ACTION, FRT_RT_DTYPE_F32,
                            FRT_RT_LAYOUT_FLAT, FRT_RT_PORT_OUT,
                            FRT_RT_PORT_STAGED, 0, a->action_shape, 2, 0,
-                           action_buf ? action_buf->handle : nullptr, 0,
-                           action_buf ? action_buf->bytes : 0};
+                           nullptr, 0,
+                           static_cast<uint64_t>(manifest.action.chunk) *
+                               manifest.action.robot_dim * sizeof(float)};
 
     const std::string graph_name =
         config && config->graph_name ? config->graph_name : "infer";
@@ -489,7 +490,8 @@ extern "C" int frt_pi05_model_runtime_create_over(
     if (!compatible_port(model, images, FRT_RT_MOD_IMAGE, FRT_RT_PORT_IN,
                          FRT_RT_PORT_STAGED) ||
         !compatible_port(model, actions, FRT_RT_MOD_ACTION, FRT_RT_PORT_OUT,
-                         FRT_RT_PORT_STAGED)) {
+                         FRT_RT_PORT_STAGED) ||
+        model->ports[actions].dtype != FRT_RT_DTYPE_F32) {
         return -2;
     }
     if (noise != kNoPort &&

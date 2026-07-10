@@ -22,7 +22,7 @@ This is the contract implemented by `frt_pi05_model_runtime_create_over`.
 |---|---|---|---|---|
 | `images` | `IMAGE/STAGED` | input | device tensor dtype, `NHWC`, `(num_views, 224, 224, 3)` | `observation_images_normalized` |
 | `noise` | `TENSOR/SWAP` | input | device tensor dtype, `FLAT`, `(chunk_length, 32)` | `diffusion_noise` |
-| `actions` | `ACTION/STAGED` | output | host-visible robot action chunk, `FLAT`, `(chunk_length, robot_action_dim)` | `diffusion_noise` |
+| `actions` | `ACTION/STAGED` | output | host `f32`, `FLAT`, `(chunk_length, robot_action_dim)` | staged-only; no raw window |
 
 Current source of truth:
 
@@ -50,7 +50,7 @@ face.
 | `state` | `STATE/STAGED` | input | host `f32`, `FLAT`, `(state_dim,)` | staged by C++ runtime |
 | `images` | `IMAGE/STAGED` | input | device tensor dtype, `NHWC`, `(num_views, 224, 224, 3)` | `observation_images_normalized` |
 | `noise` | `TENSOR/SWAP` | input | device tensor dtype, `FLAT`, `(chunk_length, 32)` | `diffusion_noise` |
-| `actions` | `ACTION/STAGED` | output | host-visible robot action chunk, `FLAT`, `(chunk_length, robot_action_dim)` | `diffusion_noise` |
+| `actions` | `ACTION/STAGED` | output | host `f32`, `FLAT`, `(chunk_length, robot_action_dim)` | staged-only; no raw window |
 | `actions_raw` | `TENSOR/SWAP` | output | device tensor dtype, `FLAT`, `(chunk_length, 32)` | `diffusion_noise` |
 
 For Pi0.5, proprioceptive state is not an independent model tensor. It is
@@ -124,7 +124,8 @@ must be read from the port shape; host code must not assume `(10, 32)`.
 ## Action Output
 
 `actions` is the host-visible robot action chunk after producer-owned
-postprocess.
+postprocess. Its declared dtype is F32 because that is the payload returned by
+`get_output`; it does not expose the BF16 diffusion window as backing.
 
 The logical output shape is:
 
@@ -417,9 +418,17 @@ python cpp/tests/gate_pi05_native_weight_ops.py \
 ```
 
 ```
-python cpp/tests/gate_pi05_model_runtime_export.py ...
+FLASHRT_BUILD_DIR=cpp/build-sm120-debug \
+  python cpp/tests/gate_pi05_model_runtime_export.py \
+  --lib cpp/build-sm120-debug/libflashrt_cpp_pi05_c.so ...
 python cpp/tests/gate_pi05_c_api_export.py ...
 ```
+
+The Python-produced overlay gate uses the FA2-enabled, SentencePiece-off SM120
+build because Python already owns prompt/tokenizer setup. Native-v2 factory
+gates use the SentencePiece-enabled SM120 build in a Python-free producer
+process. In either lane, pybind modules and the producer library must come from
+the same build directory; graph and buffer handles cannot cross exec builds.
 
 Prompt/state STAGED ports require token-exact, formatter string-exact,
 embedding bit-exact, fixed-vs-exact E2E cosine, and hot-contract coverage; a

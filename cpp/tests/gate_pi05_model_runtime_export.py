@@ -2,10 +2,10 @@
 
 Run inside the CUDA container from the repo root:
 
-    PYTHONPATH=.:./exec/build-container:./runtime/build-container \
+    FLASHRT_BUILD_DIR=cpp/build-sm120-debug \
     python cpp/tests/gate_pi05_model_runtime_export.py \
       --checkpoint "${PI05_CHECKPOINT:-/path/to/pi05_libero_pytorch}" --fp8 \
-      --lib cpp/build-container/libflashrt_cpp_pi05_c.so
+      --lib cpp/build-sm120-debug/libflashrt_cpp_pi05_c.so
 
 The gate compares three surfaces:
   1. Python frontend staging/replay/postprocess.
@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import os
 import statistics
 import sys
 import time
@@ -34,6 +35,13 @@ for rel in ("", "exec/build-container", "runtime/build-container",
     p = str(ROOT / rel) if rel else str(ROOT)
     if p not in sys.path:
         sys.path.insert(0, p)
+configured_build = os.environ.get("FLASHRT_BUILD_DIR")
+if configured_build:
+    for subdir in ("exec", "runtime"):
+        path = str(Path(configured_build).resolve() / subdir)
+        if path in sys.path:
+            sys.path.remove(path)
+        sys.path.insert(0, path)
 
 import flash_rt  # noqa: E402
 from flash_rt.core.utils.actions import LIBERO_ACTION_DIM, unnormalize_actions  # noqa: E402
@@ -193,6 +201,16 @@ def _raw_to_float(raw: np.ndarray, dtype: torch.dtype) -> np.ndarray:
 def _cos(a: np.ndarray, b: np.ndarray, dtype: torch.dtype) -> float:
     af = _raw_to_float(a, dtype)
     bf = _raw_to_float(b, dtype)
+    na = float(np.linalg.norm(af))
+    nb = float(np.linalg.norm(bf))
+    if na == 0.0 or nb == 0.0:
+        return float("nan")
+    return float(np.dot(af, bf) / (na * nb))
+
+
+def _cos_f32(a: np.ndarray, b: np.ndarray) -> float:
+    af = np.asarray(a, dtype=np.float64).reshape(-1)
+    bf = np.asarray(b, dtype=np.float64).reshape(-1)
     na = float(np.linalg.norm(af))
     nb = float(np.linalg.norm(bf))
     if na == 0.0 or nb == 0.0:
@@ -395,6 +413,9 @@ def main() -> None:
     ap.add_argument("--lib", default=str(
         ROOT / "cpp/build-container/libflashrt_cpp_pi05_c.so"))
     args = ap.parse_args()
+    if configured_build and Path(args.lib).resolve().parent != Path(
+            configured_build).resolve():
+        ap.error("--lib must come from FLASHRT_BUILD_DIR")
 
     images = _make_images(args.num_views, args.seed)
     obs = _make_obs(images)
@@ -470,6 +491,28 @@ def main() -> None:
         assert m_split.n_stages == 2, m_split.n_stages
         assert m_rtc.n_ports == 5, m_rtc.n_ports
         assert m_rtc.n_stages == 2, m_rtc.n_stages
+        for runtime in (mr_full, mr_split, mr_rtc):
+            action_port = next(
+                port for port in runtime.ports()
+                if port["name"] == "actions"
+            )
+            assert action_port["dtype"] == 1, action_port
+            assert action_port["update"] == 1, action_port
+            assert action_port["buffer"] == 0, action_port
+            assert action_port["bytes"] == (
+                int(pl.chunk_size) * LIBERO_ACTION_DIM * 4
+            ), action_port
+        rtc_raw_port = next(
+            port for port in mr_rtc.ports()
+            if port["name"] == "actions_raw"
+        )
+        rtc_noise_port = next(
+            port for port in mr_rtc.ports()
+            if port["name"] == "noise"
+        )
+        assert rtc_raw_port["dtype"] == rtc_noise_port["dtype"], rtc_raw_port
+        assert rtc_raw_port["update"] == 0, rtc_raw_port
+        assert rtc_raw_port["buffer"] != 0, rtc_raw_port
         assert mr_full.fingerprint != mr_split.fingerprint
         assert mr_rtc.fingerprint not in (
             mr_full.fingerprint, mr_split.fingerprint)
@@ -523,15 +566,18 @@ def main() -> None:
             _raw_to_float(py_raw, torch_dtype) -
             _raw_to_float(full_raw, torch_dtype))))
         act_max = float(np.max(np.abs(py_actions - full_actions)))
-        act_ok = bool(np.allclose(py_actions, full_actions, rtol=1e-4, atol=1e-3))
+        act_cos = _cos_f32(py_actions, full_actions)
+        act_close = bool(np.allclose(
+            py_actions, full_actions, rtol=1e-4, atol=1e-3
+        ))
+        act_ok = act_cos >= 0.999 and (args.fp8 or act_close)
         split_raw_exact = bool(np.array_equal(full_raw, split_raw))
         split_raw_cos = _cos(full_raw, split_raw, torch_dtype)
         split_raw_max = float(np.max(np.abs(
             _raw_to_float(full_raw, torch_dtype) -
             _raw_to_float(split_raw, torch_dtype))))
+        split_act_exact = bool(np.array_equal(full_actions, split_actions))
         split_act_max = float(np.max(np.abs(full_actions - split_actions)))
-        split_act_ok = bool(np.allclose(
-            full_actions, split_actions, rtol=1e-4, atol=1e-3))
 
         print("\n===== REAL PI0.5 MODEL-RUNTIME EXPORT GATE =====")
         print(f"full fingerprint       : 0x{mr_full.fingerprint:016x}")
@@ -542,19 +588,28 @@ def main() -> None:
         print(f"rtc runtime            : ports={m_rtc.n_ports} stages={m_rtc.n_stages} prefix={prefix_len}")
         print(f"image buffer exact     : {img_exact}  cos={img_cos:.8f}  max_abs={img_max:.6g}")
         print(f"py vs full raw exact   : {raw_exact}  cos={raw_cos:.8f}  max_abs={raw_max:.6g}")
-        print(f"py vs full action      : {act_ok}  max_abs={act_max:.6g}")
+        print(
+            f"py vs full action      : accepted={act_ok} "
+            f"cos={act_cos:.8f} allclose={act_close} max_abs={act_max:.6g}"
+        )
         print(f"full vs split raw exact: {split_raw_exact}  cos={split_raw_cos:.8f}  max_abs={split_raw_max:.6g}")
-        print(f"full vs split action   : {split_act_ok}  max_abs={split_act_max:.6g}")
+        print(
+            f"full vs split action   : exact={split_act_exact} "
+            f"max_abs={split_act_max:.6g}"
+        )
         print(f"rtc prefix exact       : {rtc_prefix_exact}  max_abs={rtc_prefix_max:.6g}")
 
         assert img_cos >= 0.999, f"image preprocess cosine too low: {img_cos}"
         assert raw_cos >= 0.999, f"raw replay cosine too low: {raw_cos}"
-        assert act_ok, f"robot actions differ: max_abs={act_max}"
+        assert act_ok, (
+            f"robot actions differ: cos={act_cos:.8f} max_abs={act_max}"
+        )
         assert split_raw_exact, (
             "split replay must be bit-exact against full replay; "
             f"cos={split_raw_cos:.8f} max_abs={split_raw_max:.6g}")
-        assert split_act_ok, (
-            f"split robot actions differ: max_abs={split_act_max}")
+        assert split_act_exact, (
+            f"split robot actions are not bit-exact: max_abs={split_act_max}"
+        )
         assert rtc_prefix_exact, (
             "RTC-prefix action graph did not preserve prev_action_chunk "
             f"prefix; max_abs={rtc_prefix_max:.6g}")

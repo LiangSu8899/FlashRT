@@ -30,7 +30,7 @@ port, never advertise-and-refuse.
 ## Descriptors
 
 `frt_runtime_port_desc` — one dynamic input/output:
-`name`, `modality`, `dtype` (device-side tensor), `layout`, `direction`,
+`name`, `modality`, `dtype` (logical payload/target tensor), `layout`, `direction`,
 `update`, `required`, `shape[rank]` (−1 = bucket-variable),
 `cadence_hint_hz` (advisory only), and the SWAP window `buffer`/`offset`/
 `bytes` (null buffer = staged-only). Strings/arrays are owned by the runtime
