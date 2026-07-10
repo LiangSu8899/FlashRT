@@ -1,9 +1,11 @@
 #include "flashrt/model_runtime.h"
 #include "flashrt/cpp/modalities/types.h"
 
+#include <cuda_profiler_api.h>
 #include <cuda_runtime_api.h>
 
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <sstream>
@@ -113,12 +115,23 @@ int main(int argc, char** argv) {
         host_noise[i] = flashrt::modalities::float_to_bfloat16(
             static_cast<float>(static_cast<int>(i % 23) - 11) / 12.0f);
     }
+    const bool profile_range = std::getenv("FLASHRT_PROFILE_RANGE") != nullptr;
     if (!noise || model->verbs.set_input(model->self, 3, host_noise.data(),
                                          host_noise.size() * 2, -1) != -3 ||
         cudaMemcpy(frt_buffer_dptr(noise), host_noise.data(),
                    host_noise.size() * sizeof(std::uint16_t),
                    cudaMemcpyHostToDevice) != cudaSuccess ||
-        model->verbs.step(model->self) != 0) {
+        (profile_range && cudaProfilerStart() != cudaSuccess)) {
+        std::cerr << "native step failed: "
+                  << model->verbs.last_error(model->self) << '\n';
+        model->release(model->owner);
+        return 1;
+    }
+    const int step_rc = model->verbs.step(model->self);
+    const cudaError_t sync_rc = cudaDeviceSynchronize();
+    const cudaError_t profiler_rc =
+        profile_range ? cudaProfilerStop() : cudaSuccess;
+    if (step_rc != 0 || sync_rc != cudaSuccess || profiler_rc != cudaSuccess) {
         std::cerr << "native step failed: "
                   << model->verbs.last_error(model->self) << '\n';
         model->release(model->owner);

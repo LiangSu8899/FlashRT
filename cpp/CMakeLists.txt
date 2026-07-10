@@ -372,6 +372,14 @@ if(BUILD_TESTING)
           tests/pi05_native_e2e_probe.cpp)
         target_link_libraries(pi05_native_e2e_probe
           PRIVATE flashrt_cpp_pi05_c flashrt_exec CUDA::cudart)
+
+        add_executable(pi05_native_dlopen_probe
+          tests/pi05_native_dlopen_probe.cpp)
+        target_include_directories(pi05_native_dlopen_probe
+          PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../runtime/include
+                  ${CMAKE_CURRENT_SOURCE_DIR}/../exec/include)
+        target_link_libraries(pi05_native_dlopen_probe
+          PRIVATE ${CMAKE_DL_LIBS})
       endif()
 
       add_executable(test_pi05_native_rtx_attention_driver
@@ -380,6 +388,13 @@ if(BUILD_TESTING)
         PRIVATE flashrt_cpp_pi05_kernels flashrt_exec CUDA::cudart)
       add_test(NAME pi05_native_rtx_attention_driver
         COMMAND test_pi05_native_rtx_attention_driver)
+    endif()
+
+    if(FLASHRT_CPP_WITH_SENTENCEPIECE)
+      add_executable(pi05_tokenizer_corpus_probe
+        tests/pi05_tokenizer_corpus_probe.cpp)
+      target_link_libraries(pi05_tokenizer_corpus_probe
+        PRIVATE flashrt_cpp_pi05)
     endif()
 
     add_executable(pi05_native_rope_probe

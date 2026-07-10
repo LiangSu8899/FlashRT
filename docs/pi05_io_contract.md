@@ -430,6 +430,23 @@ Run it against both OpenPI and LeRobot checkpoint layouts. It validates the
 public schema, one captured variant, prompt/state/image staging, direct SWAP
 noise input, finite action output, and retain/release teardown.
 
+The native formatter and tokenizer must also remain token-exact over real
+prompt/state traffic:
+
+```
+python cpp/tests/gate_pi05_tokenizer_corpus.py \
+  --dataset <libero-lerobot-root> \
+  --checkpoint <openpi-pytorch-checkpoint> \
+  --tokenizer <tokenizer.model> \
+  --probe cpp/build-sm120-spm-debug/pi05_tokenizer_corpus_probe \
+  --count 10000
+```
+
+This gate normalizes every recorded state with the checkpoint q01/q99 values,
+renders the full state prompt through the native formatter, and compares every
+valid token ID with OpenPI `PaligemmaTokenizer`. The reference SM120 run covered
+10,000 records and 20 token lengths from 43 through 62 with zero mismatches.
+
 The real-episode numerical gate compares against the official OpenPI PyTorch
 `PI0Pytorch.sample_actions` path, not another native intermediate:
 
@@ -449,3 +466,57 @@ match q01/q99 postprocess recomputed from the native BF16 `actions_raw` window
 at `rtol=atol=1e-6`; this keeps numerical precision and IO semantics as two
 independent acceptance checks. Set `OPENPI_BASELINE_SITE_PACKAGES` when the
 official OpenPI Transformers replacement is installed in a separate prefix.
+
+Collect replay-only native and Python BF16 Nsight traces with the same fixed
+shape. Setup, graph capture, prompt/image/noise staging, and output copies must
+remain outside the CUDA profiler range:
+
+```
+FLASHRT_PROFILE_RANGE=1 nsys profile --trace=cuda \
+  --cuda-graph-trace=node \
+  --capture-range=cudaProfilerApi --capture-range-end=stop \
+  -o <native-report> \
+  cpp/build-sm120-spm-debug/pi05_native_open_probe \
+  <checkpoint> <tokenizer.model>
+
+nsys profile --trace=cuda --cuda-graph-trace=node \
+  --capture-range=cudaProfilerApi --capture-range-end=stop \
+  -o <python-report> \
+  python cpp/tests/profile_pi05_python_replay.py \
+  --checkpoint <checkpoint> --num-views 2 --steps 10
+
+nsys stats --report cuda_gpu_trace --format csv \
+  <native-report>.nsys-rep > <native-trace>.csv
+nsys stats --report cuda_gpu_trace --format csv \
+  <python-report>.nsys-rep > <python-trace>.csv
+python cpp/tests/gate_pi05_kernel_sequence.py \
+  --native <native-trace>.csv --python <python-trace>.csv
+```
+
+The comparator rejects unknown kernels and requires equal raw event counts.
+Its explicit equivalence list covers only selected GEMM kernel variants,
+GEMM workspace-init versus split-K reduction helpers, `add_bias` versus the
+equivalent `bias_res` form, and the two negative-infinity fill symbols. On the
+reference RTX 5090 SM120 run both traces contained 3,576 raw events and their
+3,172 logical-kernel sequences were exactly equal.
+
+The unload probe has no static dependency on the Pi0.5 producer. It resolves
+the factory from the shared object, exercises an extra retain/release pair,
+releases the final model reference, and only then unloads the producer:
+
+```
+cpp/build-sm120-spm-debug/pi05_native_dlopen_probe \
+  cpp/build-sm120-spm-debug/libflashrt_cpp_pi05_c.so \
+  <checkpoint> <tokenizer.model> 1
+```
+
+For the ASAN build, instrument the producer, runtime, exec library, and probe,
+not only the executable. CUDA needs `protect_shadow_gap=0` in this environment
+to avoid an address-space collision with ASAN's default shadow gap:
+
+```
+ASAN_OPTIONS=detect_leaks=1:halt_on_error=1:protect_shadow_gap=0 \
+  cpp/build-sm120-spm-asan/pi05_native_dlopen_probe \
+  cpp/build-sm120-spm-asan/libflashrt_cpp_pi05_c.so \
+  <checkpoint> <tokenizer.model> 1
+```
