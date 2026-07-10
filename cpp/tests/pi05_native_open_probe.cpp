@@ -97,7 +97,15 @@ int main(int argc, char** argv) {
          model->ports[2].modality == FRT_RT_MOD_IMAGE &&
          model->ports[3].update == FRT_RT_PORT_SWAP &&
          model->ports[4].direction == FRT_RT_PORT_OUT &&
-         model->ports[5].update == FRT_RT_PORT_SWAP;
+         model->ports[4].dtype == FRT_RT_DTYPE_F32 &&
+         model->ports[4].update == FRT_RT_PORT_STAGED &&
+         model->ports[4].buffer == nullptr &&
+         model->ports[4].bytes == 10 * 7 * sizeof(float) &&
+         model->ports[5].dtype == FRT_RT_DTYPE_BF16 &&
+         model->ports[5].update == FRT_RT_PORT_SWAP &&
+         model->ports[5].buffer == model->ports[3].buffer &&
+         model->ports[5].offset == model->ports[3].offset &&
+         model->ports[5].bytes == model->ports[3].bytes;
     if (!ok) {
         std::cerr << "native schema validation failed\n";
         model->release(model->owner);

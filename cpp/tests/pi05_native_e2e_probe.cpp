@@ -97,6 +97,15 @@ int main(int argc, char** argv) {
             return model_error(model, "unexpected port schema");
         }
     }
+    if (model->ports[4].dtype != FRT_RT_DTYPE_F32 ||
+        model->ports[4].update != FRT_RT_PORT_STAGED ||
+        model->ports[4].buffer != nullptr ||
+        model->ports[4].bytes != 10 * 7 * sizeof(float) ||
+        model->ports[5].dtype != FRT_RT_DTYPE_BF16 ||
+        model->ports[5].update != FRT_RT_PORT_SWAP ||
+        model->ports[5].buffer != model->ports[3].buffer) {
+        return model_error(model, "native action port contract mismatch");
+    }
 
     std::vector<std::uint8_t> prompt;
     std::vector<std::uint8_t> state;

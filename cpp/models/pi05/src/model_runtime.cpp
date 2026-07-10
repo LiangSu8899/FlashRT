@@ -483,6 +483,7 @@ extern "C" int frt_pi05_model_runtime_create_over(
     const uint32_t images = find_port_index(model, "images");
     const uint32_t noise = find_port_index(model, "noise");
     const uint32_t actions = find_port_index(model, "actions");
+    const uint32_t actions_raw = find_port_index(model, "actions_raw");
     const uint32_t prompt = find_port_index(model, "prompt");
     const uint32_t state = find_port_index(model, "state");
     if (!compatible_port(model, images, FRT_RT_MOD_IMAGE, FRT_RT_PORT_IN,
@@ -494,6 +495,11 @@ extern "C" int frt_pi05_model_runtime_create_over(
     if (noise != kNoPort &&
         !compatible_port(model, noise, FRT_RT_MOD_TENSOR, FRT_RT_PORT_IN,
                          FRT_RT_PORT_SWAP)) {
+        return -2;
+    }
+    if (actions_raw != kNoPort &&
+        !compatible_port(model, actions_raw, FRT_RT_MOD_TENSOR,
+                         FRT_RT_PORT_OUT, FRT_RT_PORT_SWAP)) {
         return -2;
     }
     if (prompt != kNoPort &&
@@ -514,7 +520,8 @@ extern "C" int frt_pi05_model_runtime_create_over(
         cfg.graph_name = graph->name;
     }
     cfg.image_input_override = tensor_from_port(model->ports[images]);
-    cfg.action_output_override = tensor_from_port(model->ports[actions]);
+    cfg.action_output_override = tensor_from_port(
+        model->ports[actions_raw != kNoPort ? actions_raw : actions]);
 
     auto a = std::unique_ptr<Adapter>(new (std::nothrow) Adapter());
     if (!a) return -5;
