@@ -99,6 +99,12 @@ Producer-owned preprocessing:
 - normalization is `x / 127.5 - 1.0`;
 - resizing to 224x224 is producer-owned.
 
+`stride_bytes=0` means tightly packed RGB. A positive stride may include row
+padding but must be at least `width * 3`; negative and short strides are shape
+errors. The native CUDA and CPU reference paths are bit-exact in BF16 over the
+validation matrix (`1x1`, odd dimensions, non-4:3 inputs, wide/tall inputs,
+224x224, and padded rows).
+
 The Pi0.5 native face rejects unsupported input shape, dtype, layout, pixel
 format, or view count with a shape/status error. BGR, grayscale, RGBA, CHW, and
 non-`u8` frames are not silently converted at the Pi0.5 contract boundary. If a
@@ -499,6 +505,42 @@ GEMM workspace-init versus split-K reduction helpers, `add_bias` versus the
 equivalent `bias_res` form, and the two negative-infinity fill symbols. On the
 reference RTX 5090 SM120 run both traces contained 3,576 raw events and their
 3,172 logical-kernel sequences were exactly equal.
+
+The separate hot allocator gate profiles 1,000 graph replays without tracing
+individual graph nodes:
+
+```
+FLASHRT_PROFILE_REPLAYS=1000 nsys profile --trace=cuda \
+  --capture-range=cudaProfilerApi --capture-range-end=stop \
+  -o <hot-report> \
+  cpp/build-sm120-spm-debug/pi05_native_open_probe \
+  <checkpoint> <tokenizer.model>
+nsys stats --report cuda_api_trace --format csv \
+  <hot-report>.nsys-rep > <hot-api-trace>.csv
+python cpp/tests/gate_pi05_hot_allocator.py \
+  --trace <hot-api-trace>.csv --expected-replays 1000
+```
+
+The gate requires exactly 1,000 `cudaGraphLaunch` calls and rejects CUDA/driver
+device allocation, host registration, mempool creation, virtual-memory map,
+and corresponding release APIs. The probe independently requires one graph
+variant after the final replay. The reference SM120 run observed zero allocator
+calls across 2,001 CUDA API calls.
+
+The same native probe can gate the complete hot state staging chain
+(normalization, formatting, tokenization, embedding gather, and prompt-length
+device update):
+
+```
+FLASHRT_HOT_STATE_UPDATES=1000 FLASHRT_HOT_STATE_P99_US=1000 \
+  cpp/build-sm120-spm-debug/pi05_native_open_probe \
+  <checkpoint> <tokenizer.model>
+```
+
+The probe varies all eight state dimensions, warms 20 updates, measures 1,000
+updates, and requires the graph variant count to remain one. The reference
+RTX 5090 SM120 run measured p50/p99/max of 39.31/41.70/43.44 microseconds,
+well below the explicit one-millisecond p99 contract.
 
 The unload probe has no static dependency on the Pi0.5 producer. It resolves
 the factory from the shared object, exercises an extra retain/release pair,

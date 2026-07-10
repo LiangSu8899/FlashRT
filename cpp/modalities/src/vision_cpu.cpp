@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 #ifdef FLASHRT_CPP_WITH_CUDA_STAGING
@@ -141,6 +142,13 @@ Status validate_frame(const VisionFrame& frame) {
     if (ch <= 0) {
         return Status::error(StatusCode::kUnsupported,
                              "unsupported pixel format");
+    }
+    if (frame.width > std::numeric_limits<int>::max() / ch ||
+        frame.stride_bytes < 0 ||
+        (frame.stride_bytes > 0 &&
+         frame.stride_bytes < frame.width * ch)) {
+        return Status::error(StatusCode::kShapeMismatch,
+                             "vision frame stride is smaller than one row");
     }
     const int stride = frame.stride_bytes > 0 ? frame.stride_bytes : frame.width * ch;
     const std::uint64_t need =

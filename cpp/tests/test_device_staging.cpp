@@ -5,6 +5,8 @@
 
 #include <cuda_runtime_api.h>
 
+#include <algorithm>
+#include <array>
 #include <cassert>
 #include <cmath>
 #include <cstdint>
@@ -41,6 +43,17 @@ bool has_cuda_device() {
         return false;
     }
     return n > 0;
+}
+
+std::uint32_t ordered_bf16(std::uint16_t bits) {
+    if (bits & 0x8000u) return 0x8000u - (bits & 0x7fffu);
+    return 0x8000u + bits;
+}
+
+std::uint32_t bf16_ulp_distance(std::uint16_t a, std::uint16_t b) {
+    const std::uint32_t ao = ordered_bf16(a);
+    const std::uint32_t bo = ordered_bf16(b);
+    return ao > bo ? ao - bo : bo - ao;
 }
 
 void test_vision_h2d_staging() {
@@ -113,6 +126,105 @@ void test_vision_h2d_staging() {
     flashrt::modalities::vision_staging_destroy(&pool);
     assert(pool.device == nullptr && pool.host_pinned == nullptr);
 
+    cudaFree(device);
+}
+
+void test_vision_resize_matrix() {
+    struct Case { int width; int height; int padding; };
+    const std::array<Case, 7> cases{{
+        {1, 1, 0}, {3, 2, 5}, {17, 19, 1}, {63, 47, 7},
+        {224, 224, 0}, {321, 181, 3}, {181, 321, 9},
+    }};
+    std::uint64_t max_frame_bytes = 0;
+    for (const auto& item : cases) {
+        max_frame_bytes = std::max(
+            max_frame_bytes,
+            static_cast<std::uint64_t>(item.width * 3 + item.padding) *
+                static_cast<std::uint64_t>(item.height));
+    }
+
+    const auto spec = flashrt::models::pi05::vision_preprocess_spec(1);
+    const std::uint64_t output_bytes = required_vision_output_bytes(spec);
+    void* device = nullptr;
+    assert(cudaMalloc(&device, output_bytes) == cudaSuccess);
+    flashrt::modalities::VisionStaging pool;
+    auto st = flashrt::modalities::vision_staging_create(
+        &pool, 1, max_frame_bytes);
+    assert(st.ok_status());
+    std::vector<std::uint16_t> actual(output_bytes / 2);
+    std::vector<std::uint16_t> expected(output_bytes / 2);
+    std::uint32_t matrix_max_ulp = 0;
+    float matrix_max_abs = 0.0f;
+    Case worst_case{};
+    std::size_t worst_index = 0;
+    std::uint16_t worst_actual = 0;
+    std::uint16_t worst_expected = 0;
+
+    for (const auto& item : cases) {
+        const int stride = item.width * 3 + item.padding;
+        std::vector<std::uint8_t> pixels(
+            static_cast<std::size_t>(stride) * item.height, 0xa5);
+        for (int y = 0; y < item.height; ++y) {
+            for (int x = 0; x < item.width; ++x) {
+                for (int c = 0; c < 3; ++c) {
+                    pixels[static_cast<std::size_t>(y) * stride + x * 3 + c] =
+                        static_cast<std::uint8_t>(
+                            (x * 13 + y * 17 + c * 71) & 0xff);
+                }
+            }
+        }
+        VisionFrame frame;
+        frame.name = "image";
+        frame.image = {
+            pixels.data(), pixels.size(), DType::kUInt8, MemoryPlace::kHost,
+            Layout::kHWC,
+            Shape{static_cast<std::uint64_t>(item.height),
+                  static_cast<std::uint64_t>(item.width), 3}};
+        frame.format = PixelFormat::kRGB8;
+        frame.width = item.width;
+        frame.height = item.height;
+        frame.stride_bytes = stride;
+        TensorView device_output{
+            device, output_bytes, DType::kBFloat16, MemoryPlace::kDevice,
+            Layout::kNHWC, Shape{1, 224, 224, 3}};
+        st = preprocess_vision(spec, {frame}, device_output, nullptr, &pool);
+        assert(st.ok_status());
+        assert(cudaMemcpy(actual.data(), device, output_bytes,
+                          cudaMemcpyDeviceToHost) == cudaSuccess);
+        TensorView host_output{
+            expected.data(), output_bytes, DType::kBFloat16,
+            MemoryPlace::kHost, Layout::kNHWC, Shape{1, 224, 224, 3}};
+        st = preprocess_vision_cpu(spec, {frame}, host_output);
+        assert(st.ok_status());
+        for (std::size_t i = 0; i < actual.size(); ++i) {
+            const std::uint32_t ulp =
+                bf16_ulp_distance(actual[i], expected[i]);
+            const float absolute = std::fabs(
+                bfloat16_to_float(actual[i]) -
+                bfloat16_to_float(expected[i]));
+            matrix_max_abs = std::max(matrix_max_abs, absolute);
+            if (ulp > matrix_max_ulp) {
+                matrix_max_ulp = ulp;
+                worst_case = item;
+                worst_index = i;
+                worst_actual = actual[i];
+                worst_expected = expected[i];
+            }
+        }
+    }
+    if (matrix_max_ulp > 1) {
+        std::cerr << "vision resize max_ulp=" << matrix_max_ulp
+                  << " max_abs=" << matrix_max_abs
+                  << " size=" << worst_case.width << 'x'
+                  << worst_case.height << " index=" << worst_index << '\n';
+        std::cerr << "vision resize values actual="
+                  << bfloat16_to_float(worst_actual) << " expected="
+                  << bfloat16_to_float(worst_expected) << '\n';
+    }
+    std::cout << "vision resize matrix max BF16 ULP: "
+              << matrix_max_ulp << '\n';
+    assert(matrix_max_ulp <= 1);
+    flashrt::modalities::vision_staging_destroy(&pool);
     cudaFree(device);
 }
 
@@ -226,6 +338,7 @@ int main() {
         return 0;
     }
     test_vision_h2d_staging();
+    test_vision_resize_matrix();
     test_action_d2h_staging();
     test_text_embedding_device_gather();
     std::cout << "PASS - CUDA modality kernels/staging\n";

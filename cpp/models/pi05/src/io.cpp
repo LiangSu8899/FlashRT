@@ -18,6 +18,15 @@ modalities::Status validate_pi05_frame_contract(
             modalities::StatusCode::kShapeMismatch,
             "Pi05 image input must be u8 HWC");
     }
+    if (frame.width <= 0 || frame.height <= 0 ||
+        frame.image.shape.rank != 3 ||
+        frame.image.shape.dims[0] != static_cast<std::uint64_t>(frame.height) ||
+        frame.image.shape.dims[1] != static_cast<std::uint64_t>(frame.width) ||
+        frame.image.shape.dims[2] != 3) {
+        return modalities::Status::error(
+            modalities::StatusCode::kShapeMismatch,
+            "Pi05 image shape must match HWC dimensions");
+    }
     if (frame.image.place != modalities::MemoryPlace::kHost &&
         frame.image.place != modalities::MemoryPlace::kHostPinned) {
         return modalities::Status::error(
