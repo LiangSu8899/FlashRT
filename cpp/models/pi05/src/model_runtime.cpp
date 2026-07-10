@@ -137,6 +137,10 @@ int set_input(void* self, uint32_t port, const void* data, uint64_t bytes,
                     a->last_error = "invalid image view";
                     return -1;
                 }
+                if (in.pixel_format > FRT_RT_PIXEL_GRAY8) {
+                    a->last_error = "image pixel format is invalid";
+                    return -4;
+                }
                 auto& f = a->vision_frames[static_cast<std::size_t>(i)];
                 f.image.data = const_cast<void*>(in.data);
                 f.image.bytes = in.bytes;

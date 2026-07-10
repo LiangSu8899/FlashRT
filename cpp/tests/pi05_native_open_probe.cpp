@@ -4,6 +4,8 @@
 #include <cuda_profiler_api.h>
 #include <cuda_runtime_api.h>
 
+#include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -20,6 +22,39 @@ int main(int argc, char** argv) {
     if (argc != 3) {
         std::cerr << "usage: pi05_native_open_probe CHECKPOINT TOKENIZER\n";
         return 2;
+    }
+    int replay_count = 1;
+    const char* replay_env = std::getenv("FLASHRT_PROFILE_REPLAYS");
+    if (replay_env) {
+        char* end = nullptr;
+        const long parsed = std::strtol(replay_env, &end, 10);
+        if (!end || *end != '\0' || parsed <= 0 || parsed > 100000) {
+            std::cerr << "FLASHRT_PROFILE_REPLAYS must be in [1, 100000]\n";
+            return 2;
+        }
+        replay_count = static_cast<int>(parsed);
+    }
+    int hot_state_updates = 0;
+    const char* hot_updates_env = std::getenv("FLASHRT_HOT_STATE_UPDATES");
+    if (hot_updates_env) {
+        char* end = nullptr;
+        const long parsed = std::strtol(hot_updates_env, &end, 10);
+        if (!end || *end != '\0' || parsed <= 0 || parsed > 100000) {
+            std::cerr << "FLASHRT_HOT_STATE_UPDATES must be in [1, 100000]\n";
+            return 2;
+        }
+        hot_state_updates = static_cast<int>(parsed);
+    }
+    double hot_state_p99_limit_us = 0.0;
+    const char* hot_limit_env = std::getenv("FLASHRT_HOT_STATE_P99_US");
+    if (hot_limit_env) {
+        char* end = nullptr;
+        hot_state_p99_limit_us = std::strtod(hot_limit_env, &end);
+        if (!end || *end != '\0' || !std::isfinite(hot_state_p99_limit_us) ||
+            hot_state_p99_limit_us <= 0.0) {
+            std::cerr << "FLASHRT_HOT_STATE_P99_US must be positive\n";
+            return 2;
+        }
     }
     std::ostringstream json;
     json << "{\"io\":\"native_v2\",\"checkpoint_path\":\""
@@ -76,8 +111,8 @@ int main(int argc, char** argv) {
     }
 
     const std::string prompt = "pick up the black bowl";
-    const float state[8] = {0.1f, -0.2f, 0.3f, -0.4f,
-                            0.5f, -0.6f, 0.7f, -0.8f};
+    float state[8] = {0.1f, -0.2f, 0.3f, -0.4f,
+                      0.5f, -0.6f, 0.7f, -0.8f};
     if (model->verbs.set_input(model->self, 0, prompt.data(), prompt.size(),
                                -1) != 0 ||
         model->verbs.set_input(model->self, 1, state, sizeof(state), -1) != 0) {
@@ -85,6 +120,49 @@ int main(int argc, char** argv) {
                   << model->verbs.last_error(model->self) << '\n';
         model->release(model->owner);
         return 1;
+    }
+    if (hot_state_updates) {
+        constexpr int kWarmUpdates = 20;
+        std::vector<double> hot_state_latencies;
+        hot_state_latencies.reserve(hot_state_updates);
+        for (int update = -kWarmUpdates; update < hot_state_updates; ++update) {
+            for (int dim = 0; dim < 8; ++dim) {
+                state[dim] = std::sin(
+                    static_cast<float>((update + kWarmUpdates) * 8 + dim) *
+                    0.017f);
+            }
+            const auto begin = std::chrono::steady_clock::now();
+            const int rc = model->verbs.set_input(
+                model->self, 1, state, sizeof(state), -1);
+            const auto end = std::chrono::steady_clock::now();
+            if (rc != 0) {
+                std::cerr << "native hot state update failed: "
+                          << model->verbs.last_error(model->self) << '\n';
+                model->release(model->owner);
+                return 1;
+            }
+            if (update >= 0) {
+                hot_state_latencies.push_back(
+                    std::chrono::duration<double, std::micro>(end - begin)
+                        .count());
+            }
+        }
+        std::sort(hot_state_latencies.begin(), hot_state_latencies.end());
+        const std::size_t p99_index =
+            (hot_state_latencies.size() * 99 + 99) / 100 - 1;
+        const double p50 = hot_state_latencies[hot_state_latencies.size() / 2];
+        const double p99 = hot_state_latencies[p99_index];
+        const double maximum = hot_state_latencies.back();
+        std::cout << "hot state updates: n=" << hot_state_latencies.size()
+                  << " p50_us=" << p50 << " p99_us=" << p99
+                  << " max_us=" << maximum << '\n';
+        if ((hot_state_p99_limit_us > 0.0 &&
+             p99 > hot_state_p99_limit_us) ||
+            frt_graph_variant_count(exp->graphs[0].handle) != 1) {
+            std::cerr << "native hot state update gate failed\n";
+            model->release(model->owner);
+            return 1;
+        }
     }
     std::vector<std::uint8_t> rgb0(224 * 224 * 3);
     std::vector<std::uint8_t> rgb1(rgb0.size());
@@ -115,7 +193,8 @@ int main(int argc, char** argv) {
         host_noise[i] = flashrt::modalities::float_to_bfloat16(
             static_cast<float>(static_cast<int>(i % 23) - 11) / 12.0f);
     }
-    const bool profile_range = std::getenv("FLASHRT_PROFILE_RANGE") != nullptr;
+    const bool profile_range = replay_env ||
+        std::getenv("FLASHRT_PROFILE_RANGE") != nullptr;
     if (!noise || model->verbs.set_input(model->self, 3, host_noise.data(),
                                          host_noise.size() * 2, -1) != -3 ||
         cudaMemcpy(frt_buffer_dptr(noise), host_noise.data(),
@@ -127,11 +206,25 @@ int main(int argc, char** argv) {
         model->release(model->owner);
         return 1;
     }
-    const int step_rc = model->verbs.step(model->self);
+    int step_rc = 0;
+    cudaError_t upload_rc = cudaSuccess;
+    for (int replay = 0; replay < replay_count; ++replay) {
+        if (replay != 0) {
+            upload_rc = cudaMemcpy(
+                frt_buffer_dptr(noise), host_noise.data(),
+                host_noise.size() * sizeof(std::uint16_t),
+                cudaMemcpyHostToDevice);
+            if (upload_rc != cudaSuccess) break;
+        }
+        step_rc = model->verbs.step(model->self);
+        if (step_rc != 0) break;
+    }
     const cudaError_t sync_rc = cudaDeviceSynchronize();
     const cudaError_t profiler_rc =
         profile_range ? cudaProfilerStop() : cudaSuccess;
-    if (step_rc != 0 || sync_rc != cudaSuccess || profiler_rc != cudaSuccess) {
+    if (step_rc != 0 || upload_rc != cudaSuccess || sync_rc != cudaSuccess ||
+        profiler_rc != cudaSuccess ||
+        frt_graph_variant_count(exp->graphs[0].handle) != 1) {
         std::cerr << "native step failed: "
                   << model->verbs.last_error(model->self) << '\n';
         model->release(model->owner);

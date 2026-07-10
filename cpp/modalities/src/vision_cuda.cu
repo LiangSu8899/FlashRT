@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -61,6 +62,13 @@ Status validate_frame_for_cuda(const VisionFrame& frame) {
         return Status::error(StatusCode::kUnsupported,
                              "unsupported pixel format");
     }
+    if (frame.width > std::numeric_limits<int>::max() / ch ||
+        frame.stride_bytes < 0 ||
+        (frame.stride_bytes > 0 &&
+         frame.stride_bytes < frame.width * ch)) {
+        return Status::error(StatusCode::kShapeMismatch,
+                             "vision frame stride is smaller than one row");
+    }
     const int stride = frame.stride_bytes > 0 ? frame.stride_bytes : frame.width * ch;
     const std::uint64_t need =
         static_cast<std::uint64_t>(stride) *
@@ -111,8 +119,11 @@ __device__ __forceinline__ float normalize_value(float raw,
                                                  float shift,
                                                  const float* mean,
                                                  const float* inv_std) {
-    if (norm_mode == 0) return raw * scale + shift;
-    return (raw / 255.0f - mean[c]) * inv_std[c];
+    if (norm_mode == 0) {
+        return __fadd_rn(__fmul_rn(raw, scale), shift);
+    }
+    return __fmul_rn(
+        __fsub_rn(__fdiv_rn(raw, 255.0f), mean[c]), inv_std[c]);
 }
 
 __device__ __forceinline__ void store_value(void* out,
@@ -152,10 +163,18 @@ __global__ void resize_normalize_kernel(const std::uint8_t* src,
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= tw || y >= th) return;
 
-    const float fx = (static_cast<float>(x) + 0.5f) *
-                     static_cast<float>(sw) / static_cast<float>(tw) - 0.5f;
-    const float fy = (static_cast<float>(y) + 0.5f) *
-                     static_cast<float>(sh) / static_cast<float>(th) - 0.5f;
+    const float fx = __fsub_rn(
+        __fdiv_rn(
+            __fmul_rn(static_cast<float>(x) + 0.5f,
+                      static_cast<float>(sw)),
+            static_cast<float>(tw)),
+        0.5f);
+    const float fy = __fsub_rn(
+        __fdiv_rn(
+            __fmul_rn(static_cast<float>(y) + 0.5f,
+                      static_cast<float>(sh)),
+            static_cast<float>(th)),
+        0.5f);
     const int x0 = max(0, min(sw - 1, static_cast<int>(floorf(fx))));
     const int y0 = max(0, min(sh - 1, static_cast<int>(floorf(fy))));
     const int x1 = max(0, min(sw - 1, x0 + 1));
@@ -172,9 +191,15 @@ __global__ void resize_normalize_kernel(const std::uint8_t* src,
     float mean[3] = {mean0, mean1, mean2};
     float inv_std[3] = {inv_std0, inv_std1, inv_std2};
     for (int c = 0; c < 3; ++c) {
-        const float top = p00[c] * (1.0f - wx) + p01[c] * wx;
-        const float bot = p10[c] * (1.0f - wx) + p11[c] * wx;
-        const float raw = top * (1.0f - wy) + bot * wy;
+        const float top = __fadd_rn(
+            __fmul_rn(p00[c], __fsub_rn(1.0f, wx)),
+            __fmul_rn(p01[c], wx));
+        const float bot = __fadd_rn(
+            __fmul_rn(p10[c], __fsub_rn(1.0f, wx)),
+            __fmul_rn(p11[c], wx));
+        const float raw = __fadd_rn(
+            __fmul_rn(top, __fsub_rn(1.0f, wy)),
+            __fmul_rn(bot, wy));
         const float norm = normalize_value(raw, c, norm_mode, scale, shift,
                                            mean, inv_std);
         const std::uint64_t out_idx =

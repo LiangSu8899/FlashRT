@@ -144,6 +144,20 @@ int main() {
     frame.pixel_format = FRT_PI05_PIXEL_RGB8;
     rc = frt_pi05_runtime_prepare_vision(rt, &frame, 1);
     assert(rc == 0);
+    frt_pi05_vision_frame invalid = frame;
+    invalid.pixel_format = 999;
+    rc = frt_pi05_runtime_prepare_vision(rt, &invalid, 1);
+    assert(rc == -4);
+    assert(std::strstr(frt_pi05_runtime_last_error(rt), "pixel format"));
+    invalid = frame;
+    invalid.pixel_format = FRT_PI05_PIXEL_BGR8;
+    rc = frt_pi05_runtime_prepare_vision(rt, &invalid, 1);
+    assert(rc == -4);
+    invalid = frame;
+    invalid.stride_bytes = 5;
+    rc = frt_pi05_runtime_prepare_vision(rt, &invalid, 1);
+    assert(rc == -4);
+    assert(std::strstr(frt_pi05_runtime_last_error(rt), "stride"));
 
     float out[3] = {};
     uint64_t n_written = 0;

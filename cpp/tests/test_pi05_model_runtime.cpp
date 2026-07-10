@@ -174,6 +174,24 @@ int main() {
     CHECK(m->verbs.set_input(m->self, 0, &bgr_view, sizeof(bgr_view), -1)
               == -4,
           "set_input(images) rejects non-RGB image formats");
+    frt_image_view invalid_format = view;
+    invalid_format.pixel_format = 999;
+    CHECK(m->verbs.set_input(m->self, 0, &invalid_format,
+                             sizeof(invalid_format), -1) == -4,
+          "set_input(images) rejects unknown pixel formats");
+    CHECK(std::strstr(m->verbs.last_error(m->self), "pixel format") != nullptr,
+          "unknown image format reports a readable error");
+    frt_image_view two_views[2] = {view, view};
+    CHECK(m->verbs.set_input(m->self, 0, two_views, sizeof(two_views), -1)
+              == -4,
+          "set_input(images) rejects the wrong view count");
+    frt_image_view bad_stride = view;
+    bad_stride.stride_bytes = 5;
+    CHECK(m->verbs.set_input(m->self, 0, &bad_stride, sizeof(bad_stride), -1)
+              == -4,
+          "set_input(images) rejects a short row stride");
+    CHECK(std::strstr(m->verbs.last_error(m->self), "stride") != nullptr,
+          "invalid image stride reports a readable error");
     std::vector<std::uint16_t> img_host(image_bytes / 2);
     cudaMemcpy(img_host.data(), frt_buffer_dptr(image), image_bytes,
                cudaMemcpyDeviceToHost);

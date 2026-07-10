@@ -25,6 +25,7 @@ namespace {
 using flashrt::models::pi05::cface::make_config;
 using flashrt::models::pi05::cface::pixel_format;
 using flashrt::models::pi05::cface::status_code;
+using flashrt::models::pi05::cface::valid_pixel_format;
 
 }  // namespace
 
@@ -123,6 +124,10 @@ extern "C" int frt_pi05_runtime_prepare_vision(
             !in.name || !in.data) {
             h->last_error = "invalid Pi05 vision frame";
             return -1;
+        }
+        if (!valid_pixel_format(in.pixel_format)) {
+            h->last_error = "Pi05 vision pixel format is invalid";
+            return -4;
         }
         std::size_t slot = h->vision_frames.size();
         for (std::size_t j = 0; j < h->vision_frames.size(); ++j) {

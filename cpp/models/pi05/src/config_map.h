@@ -40,6 +40,10 @@ inline modalities::PixelFormat pixel_format(int value) {
     }
 }
 
+inline bool valid_pixel_format(int value) {
+    return value >= FRT_PI05_PIXEL_RGB8 && value <= FRT_PI05_PIXEL_GRAY8;
+}
+
 inline modalities::DType dtype(int value) {
     using modalities::DType;
     switch (value) {
