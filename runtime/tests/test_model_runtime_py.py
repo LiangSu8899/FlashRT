@@ -95,7 +95,10 @@ def make_setup():
 
 def build(setup, img_h=224, verbs=None):
     ctx, sid, src, dst, g = setup
-    verbs = verbs or {}
+    verbs = verbs or {
+        "set_input": lambda port, payload, stream: 0,
+        "get_output": lambda port, stream: b"",
+    }
     return build_model_runtime(
         ctx,
         streams=[StreamSpec("main", sid)],
@@ -142,7 +145,46 @@ def build_split(setup):
         stages=plan.to_stage_specs(export_mod),
         identity={"model": "trivial", "quant": "none"},
         manifest_extra={"stage_plan": plan.manifest()},
+        set_input=lambda port, payload, stream: 0,
+        get_output=lambda port, stream: b"",
     )
+
+
+def check_staged_verb_guards(setup):
+    ctx, sid, src, dst, g = setup
+    common = dict(
+        ctx=ctx,
+        streams=[StreamSpec("main", sid)],
+        graphs=[GraphSpec("infer", g, 0, (0,))],
+        buffers=[BufferSpec("src", src, "input"),
+                 BufferSpec("dst", dst, "output")],
+        stages=[StageSpec("infer")],
+        identity={"model": "verb_guard"},
+    )
+    try:
+        build_model_runtime(
+            **common,
+            ports=[PortSpec("input", "state", "f32", "flat", "in",
+                            "staged", shape=(1,))],
+        )
+    except ValueError as exc:
+        input_rejected = "require set_input" in str(exc)
+    else:
+        input_rejected = False
+    check("STAGED input without set_input is rejected", input_rejected)
+
+    try:
+        build_model_runtime(
+            **common,
+            ports=[PortSpec("output", "action", "f32", "flat", "out",
+                            "staged", shape=(1,))],
+            set_input=lambda port, payload, stream: 0,
+        )
+    except ValueError as exc:
+        output_rejected = "require get_output" in str(exc)
+    else:
+        output_rejected = False
+    check("STAGED output without get_output is rejected", output_rejected)
 
 
 def check_stage_plan_registry():
@@ -333,6 +375,9 @@ def main():
     print("== stage plan registry ==")
     check_stage_plan_registry()
     check_vjp_guided_port_lowering(setup)
+
+    print("== staged verb declarations ==")
+    check_staged_verb_guards(setup)
 
     print("== verbs through the C function pointers ==")
     rc = rt.model_set_input(mr.ptr, 1, b"\xAA\xBB", -1)

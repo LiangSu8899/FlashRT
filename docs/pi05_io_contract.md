@@ -32,6 +32,11 @@ Current source of truth:
 - C++ modality binding: `cpp/models/pi05/src/runtime.cpp`,
   `cpp/models/pi05/src/io.cpp`, `cpp/models/pi05/src/spec.cpp`
 
+`io="native"` and `io="native_v2"` are declaration-only handoffs. Their
+discovery manifest carries `declaration_only: true`; callers must pass them to
+`frt_pi05_model_runtime_create_over` before adoption. Generic Python-produced
+model runtimes reject STAGED ports without matching input/output verbs.
+
 There is deliberately no `prompt` port on the adopted-export path today. The
 prompt embedding is prepared by the producer before graph capture/export. A
 producer must not declare a `TEXT/STAGED` or `STATE/STAGED` port until the

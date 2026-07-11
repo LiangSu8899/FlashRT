@@ -221,6 +221,9 @@ def export_model_runtime(pl, identity=None, extra_regions=None,
         return rc
 
     manifest_extra = {"stage_plan": plan.manifest(), "io": io}
+    declaration_only = io in ("native", "native_v2")
+    if declaration_only:
+        manifest_extra["declaration_only"] = True
     if io == "native_v2":
         manifest_extra["prompt"] = {
             "state_prompt_mode": "fixed",
@@ -239,6 +242,7 @@ def export_model_runtime(pl, identity=None, extra_regions=None,
         manifest_extra=manifest_extra,
         owner=parts["owner"],
         step=step,
+        _allow_incomplete_staged=declaration_only,
     )
 
 

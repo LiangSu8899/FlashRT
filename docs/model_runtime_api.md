@@ -19,6 +19,11 @@ windows are `TENSOR`. A `STAGED` declaration is a promise the port accepts hot
 updates — a producer that cannot deliver that declares `SETUP` or omits the
 port, never advertise-and-refuse.
 
+The Python `build_model_runtime()` helper enforces this mechanically: STAGED
+inputs require `set_input`, and STAGED outputs require `get_output`. Internal
+declaration-only handoffs may bypass that check only while constructing a
+native verb overlay; the declaration is not an adoptable runtime.
+
 ## Payload conventions (STAGED `set_input`)
 
 | modality | `data` points at | `bytes` |
