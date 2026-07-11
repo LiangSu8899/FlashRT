@@ -247,8 +247,10 @@ int frt_runtime_builder_add_stage(frt_runtime_builder, uint32_t graph,
 
 /* Like frt_runtime_builder_finish, but returns the model runtime whose
  * `exp` is the internally-built export (one object, one refcount). `verbs`
- * is copied; entries may be null (the runtime then reports them
- * unsupported). Consumes the builder. */
+ * is copied; entries may be null only when no matching STAGED declaration
+ * requires them (other missing verbs report unsupported). A STAGED input
+ * requires set_input and a STAGED output requires get_output. On validation
+ * failure the builder is not consumed. Consumes the builder on success. */
 frt_model_runtime_v1* frt_runtime_builder_finish_model(
     frt_runtime_builder,
     const frt_model_runtime_verbs* verbs, void* verbs_self,
@@ -262,7 +264,8 @@ frt_model_runtime_v1* frt_runtime_builder_finish_model(
 /* producer builds both. Descriptor arrays are copied. The wrapper     */
 /* takes one export reference and calls `wrapper_release(wrapper_owner)`*/
 /* exactly once when its refcount hits zero (use it to destroy the     */
-/* producer instance behind `verbs_self`).                             */
+/* producer instance behind `verbs_self`). STAGED declarations require */
+/* matching input/output verbs, as on construction path 1.             */
 /* ------------------------------------------------------------------ */
 frt_model_runtime_v1* frt_model_runtime_wrap(
     const frt_runtime_export_v1* exp,
@@ -278,7 +281,8 @@ frt_model_runtime_v1* frt_model_runtime_wrap(
 /* a native runtime owns hot-path transforms. The override retains `in` */
 /* so all inherited descriptor pointers stay valid; consumers release   */
 /* only the returned object. `retain_owner`/`release_owner` manage the  */
-/* native verb object, called once at construction/destruction.         */
+/* native verb object, called once at construction/destruction. The new */
+/* verbs must satisfy every inherited STAGED input/output declaration.   */
 /* ------------------------------------------------------------------ */
 frt_model_runtime_v1* frt_model_runtime_override_verbs(
     const frt_model_runtime_v1* in,

@@ -41,10 +41,26 @@ bool add_identity(frt_runtime_builder builder, const char* key,
     return frt_runtime_builder_add_identity(builder, key, value.c_str()) == 0;
 }
 
+int unpublished_set_input(void*, uint32_t, const void*, uint64_t, int) {
+    return -3;
+}
+int unpublished_get_output(void*, uint32_t, void*, uint64_t, uint64_t*, int) {
+    return -3;
+}
+
+frt_model_runtime_verbs unpublished_verbs() {
+    frt_model_runtime_verbs verbs{};
+    verbs.struct_size = sizeof(verbs);
+    verbs.set_input = unpublished_set_input;
+    verbs.get_output = unpublished_get_output;
+    return verbs;
+}
+
 int fail_builder(frt_runtime_builder builder, std::string* error,
                  const char* message) {
+    frt_model_runtime_verbs discard_verbs = unpublished_verbs();
     frt_model_runtime_v1* discarded = frt_runtime_builder_finish_model(
-        builder, nullptr, nullptr, nullptr, nullptr, nullptr);
+        builder, &discard_verbs, nullptr, nullptr, nullptr, nullptr);
     if (discarded) discarded->release(discarded->owner);
     if (error) *error = message;
     return -6;
@@ -71,6 +87,8 @@ int build_native_model_runtime(const NativeOpenConfig& config,
         if (error) *error = "Pi0.5 native_v2 requires RTX SM120";
         return -3;
     }
+    const std::string hardware_id =
+        "sm" + std::to_string(properties.major * 10 + properties.minor);
 
     std::string weights_sha256;
     std::string tokenizer_sha256;
@@ -169,7 +187,7 @@ int build_native_model_runtime(const NativeOpenConfig& config,
     ok = add_identity(builder, "model", "pi05") &&
          add_identity(builder, "producer", "native") &&
          add_identity(builder, "pipeline", "NativeBf16") &&
-         add_identity(builder, "hardware", "sm120") &&
+         add_identity(builder, "hardware", hardware_id) &&
          add_identity(builder, "tensor_dtype", "bf16") &&
          add_identity(builder, "weights_sha256", weights_sha256) &&
          add_identity(builder, "tokenizer_sha256", tokenizer_sha256) &&
@@ -190,7 +208,8 @@ int build_native_model_runtime(const NativeOpenConfig& config,
 
     std::ostringstream manifest;
     manifest << "{\"model\":\"pi05\",\"producer\":\"native\","
-             << "\"hardware\":\"sm120\",\"io\":\"native_v2\","
+             << "\"hardware\":\"" << hardware_id
+             << "\",\"io\":\"native_v2\","
              << "\"stage_plan\":{\"name\":\"full\","
              << "\"stages\":[{\"name\":\"infer\","
              << "\"graph\":\"infer\",\"after\":[]}]}}";
@@ -238,8 +257,12 @@ int build_native_model_runtime(const NativeOpenConfig& config,
     if (!ok) return fail_builder(builder, error, "native port/stage build failed");
 
     NativeGraphOwner* raw_graph = graph.release();
+    /* This base is retained only by the verb override below and is never
+     * returned to a consumer. The published object always has real verbs. */
+    frt_model_runtime_verbs base_verbs = unpublished_verbs();
     frt_model_runtime_v1* base = frt_runtime_builder_finish_model(
-        builder, nullptr, nullptr, raw_graph, nullptr, release_graph_owner);
+        builder, &base_verbs, nullptr, raw_graph, nullptr,
+        release_graph_owner);
     if (!base) {
         delete raw_graph;
         if (error) *error = "native integrated runtime finish failed";

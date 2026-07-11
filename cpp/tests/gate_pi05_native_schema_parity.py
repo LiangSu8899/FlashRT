@@ -15,6 +15,7 @@ import numpy as np
 
 
 ROOT = Path(__file__).resolve().parents[2]
+GOLDEN = Path(__file__).with_name("data") / "pi05_native_v2_schema.records"
 sys.path.insert(0, str(ROOT))
 configured_build = os.environ.get("FLASHRT_BUILD_DIR")
 if not configured_build:
@@ -32,6 +33,15 @@ def canonical_records(identity: str) -> list[str]:
             if line.startswith(prefixes)]
 
 
+def assert_records(label: str, actual: list[str], expected: list[str]) -> None:
+    if actual == expected:
+        return
+    diff = "\n".join(difflib.unified_diff(
+        expected, actual, fromfile="golden", tofile=label, lineterm="",
+    ))
+    raise AssertionError(f"{label} schema mismatch:\n{diff}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=Path, required=True)
@@ -43,6 +53,10 @@ def main() -> int:
         if not path.exists():
             parser.error(f"--{name.replace('_', '-')} does not exist: {path}")
         setattr(args, name, path)
+    golden_records = GOLDEN.read_text(encoding="utf-8").splitlines()
+    expected_ports = sum(line.startswith("port:") for line in golden_records)
+    expected_stages = sum(line.startswith("stage:") for line in golden_records)
+    expected_regions = sum(line.startswith("region:") for line in golden_records)
 
     rng = np.random.default_rng(20260710)
     images = [
@@ -64,14 +78,16 @@ def main() -> int:
     )
     try:
         counts = dict(runtime_abi.export_counts(producer.export_ptr))
-        if len(producer.ports()) != 6 or len(producer.stages()) != 1 or \
-                counts.get("capsule_regions") != 1:
+        if len(producer.ports()) != expected_ports or \
+                len(producer.stages()) != expected_stages or \
+                counts.get("capsule_regions") != expected_regions:
             raise RuntimeError(
                 f"unexpected Python native-v2 counts: ports="
                 f"{len(producer.ports())} stages={len(producer.stages())} "
                 f"regions={counts.get('capsule_regions')}"
             )
         python_records = canonical_records(producer.identity)
+        assert_records("python-native-v2", python_records, golden_records)
         with tempfile.TemporaryDirectory(prefix="pi05_schema_parity_") as tmp:
             native_path = Path(tmp) / "native.schema"
             env = dict(os.environ)
@@ -84,19 +100,13 @@ def main() -> int:
             )
             native_records = native_path.read_text().splitlines()
 
-        if python_records != native_records:
-            diff = "\n".join(difflib.unified_diff(
-                python_records, native_records,
-                fromfile="python-native-v2", tofile="cpp-native-v2",
-                lineterm="",
-            ))
-            raise AssertionError(f"native-v2 schema mismatch:\n{diff}")
+        assert_records("cpp-native-v2", native_records, golden_records)
 
         print("\n===== PI0.5 NATIVE-V2 SCHEMA PARITY =====")
         print(f"records     : {len(python_records)}")
-        print(f"ports/stage : 6 / 1")
-        print(f"regions     : 1 (rollout_boundary)")
-        print("PASS - Python and C++ native-v2 schemas are canonical-record exact")
+        print(f"ports/stage : {expected_ports} / {expected_stages}")
+        print(f"regions     : {expected_regions}")
+        print("PASS - Python and C++ native-v2 schemas match the golden records")
         return 0
     finally:
         producer.release()

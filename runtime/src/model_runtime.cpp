@@ -21,6 +21,21 @@ bool valid_port_args(const char* name, uint32_t direction, uint32_t update,
     return true;
 }
 
+bool staged_verbs_present(const frt_runtime_port_desc* ports, uint64_t n_ports,
+                          const frt_model_runtime_verbs* verbs) {
+    bool needs_input = false;
+    bool needs_output = false;
+    for (uint64_t i = 0; i < n_ports; ++i) {
+        if (ports[i].update != FRT_RT_PORT_STAGED) continue;
+        needs_input |= ports[i].direction == FRT_RT_PORT_IN;
+        needs_output |= ports[i].direction == FRT_RT_PORT_OUT;
+    }
+    const bool complete =
+        verbs && verbs->struct_size >= sizeof(frt_model_runtime_verbs);
+    return (!needs_input || (complete && verbs->set_input)) &&
+           (!needs_output || (complete && verbs->get_output));
+}
+
 /* Default stubs for verbs a producer does not provide: report unsupported
  * (-3) instead of leaving null function pointers for consumers to crash on. */
 int stub_set_input(void*, uint32_t, const void*, uint64_t, int) { return -3; }
@@ -108,6 +123,8 @@ extern "C" frt_model_runtime_v1* frt_runtime_builder_finish_model(
         void (*release_owner)(void*)) {
     if (!b) return nullptr;
     Holder* h = b->h;
+    if (!staged_verbs_present(h->ports.data(), h->ports.size(), verbs))
+        return nullptr;
     frt_rt::finish_export_into(h, b, owner, retain_owner, release_owner);
 
     frt_model_runtime_v1& m = h->model;
@@ -172,6 +189,7 @@ extern "C" frt_model_runtime_v1* frt_model_runtime_wrap(
         if (!valid_port_args(ports[i].name, ports[i].direction,
                              ports[i].update, ports[i].shape, ports[i].rank))
             return nullptr;
+    if (!staged_verbs_present(ports, n_ports, verbs)) return nullptr;
     for (uint64_t i = 0; i < n_stages; ++i) {
         if (stages[i].graph >= exp->n_graphs) return nullptr;
         if (stages[i].n_after && !stages[i].after) return nullptr;
@@ -255,6 +273,7 @@ extern "C" frt_model_runtime_v1* frt_model_runtime_override_verbs(
         void* owner, void (*retain_owner)(void*),
         void (*release_owner)(void*)) {
     if (!valid_model_runtime(in)) return nullptr;
+    if (!staged_verbs_present(in->ports, in->n_ports, verbs)) return nullptr;
 
     auto* o = new VerbOverride();
     o->base = in;

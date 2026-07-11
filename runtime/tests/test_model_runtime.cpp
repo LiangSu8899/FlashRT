@@ -101,18 +101,32 @@ int main() {
         add_ports_and_stages(b);
         CHECK(frt_runtime_builder_finish(b, nullptr, nullptr, nullptr) == nullptr,
               "plain finish refuses a builder that declared ports/stages");
-        /* the builder survives that refusal — finish_model consumes it */
+        CHECK(frt_runtime_builder_finish_model(
+                  b, nullptr, nullptr, nullptr, nullptr, nullptr) == nullptr,
+              "finish_model rejects STAGED ports without verbs");
+        /* The builder survives both refusals; valid verbs consume it. */
+        frt_model_runtime_verbs staged_verbs{};
+        staged_verbs.struct_size = sizeof(staged_verbs);
+        staged_verbs.set_input = v_set_input;
+        staged_verbs.get_output = v_get_output;
         frt_model_runtime_v1* m = frt_runtime_builder_finish_model(
-            b, nullptr, nullptr, nullptr, nullptr, nullptr);
-        CHECK(m != nullptr, "finish_model after refused finish");
-        /* absent producer verbs become unsupported stubs, never null */
-        CHECK(m->verbs.set_input && m->verbs.step && m->verbs.last_error,
-              "null verbs are stubbed");
-        CHECK(m->verbs.set_input(m->self, 0, nullptr, 0, -1) == -3 &&
-                  m->verbs.step(m->self) == -3 &&
-                  m->verbs.last_error(m->self)[0] != '\0',
-              "stubs report unsupported (-3) with an explanation");
+            b, &staged_verbs, nullptr, nullptr, nullptr, nullptr);
+        CHECK(m != nullptr, "finish_model after refused finishes");
         m->release(m->owner);
+
+        frt_runtime_builder sb = make_builder();
+        const int64_t shape[1] = {16};
+        CHECK(frt_runtime_builder_add_port(
+                  sb, "setup", FRT_RT_MOD_TENSOR, FRT_RT_DTYPE_F32,
+                  FRT_RT_LAYOUT_FLAT, FRT_RT_PORT_IN, FRT_RT_PORT_SETUP, 0,
+                  shape, 1, 0, nullptr, 0, 0) == 0,
+              "add non-staged port");
+        frt_model_runtime_v1* sm = frt_runtime_builder_finish_model(
+            sb, nullptr, nullptr, nullptr, nullptr, nullptr);
+        CHECK(sm && sm->verbs.step(sm->self) == -3 &&
+                  sm->verbs.last_error(sm->self)[0] != '\0',
+              "missing non-staged verbs retain unsupported stubs");
+        sm->release(sm->owner);
     }
 
     /* --- integrated build: struct, identity, fingerprint, verbs --- */
@@ -271,6 +285,9 @@ int main() {
         CHECK(frt_model_runtime_wrap(exp, ports, 1, &bad, 1, &verbs, &vlog,
                                      nullptr, nullptr) == nullptr,
               "wrap rejects a stage over a missing graph");
+        CHECK(frt_model_runtime_wrap(exp, ports, 1, stages, 1, nullptr,
+                                     nullptr, nullptr, nullptr) == nullptr,
+              "wrap rejects STAGED input without set_input");
 
         frt_model_runtime_v1* wm = frt_model_runtime_wrap(
             exp, ports, 1, stages, 1, &verbs, &vlog, &wrapper_freed,
@@ -308,6 +325,14 @@ int main() {
         native_verbs.prepare = v_prepare;
         native_verbs.step = v_step;
         native_verbs.last_error = v_last_error;
+
+        frt_model_runtime_verbs incomplete_verbs = native_verbs;
+        incomplete_verbs.get_output = nullptr;
+        CHECK(frt_model_runtime_override_verbs(
+                  base, &incomplete_verbs, &native_vlog, &native_owner,
+                  owner_retain, owner_release) == nullptr &&
+                  native_owner.retains == 0,
+              "override rejects missing STAGED output verb without retain");
 
         frt_model_runtime_v1* over = frt_model_runtime_override_verbs(
             base, &native_verbs, &native_vlog, &native_owner, owner_retain,

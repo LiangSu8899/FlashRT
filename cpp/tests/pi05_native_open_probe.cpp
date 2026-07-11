@@ -81,6 +81,19 @@ int main(int argc, char** argv) {
     const char* port_names[] = {
         "prompt", "state", "images", "noise", "actions", "actions_raw"};
     const frt_runtime_export_v1* exp = model->exp;
+    int active_device = 0;
+    cudaDeviceProp active_properties{};
+    const bool device_identity_ok =
+        cudaGetDevice(&active_device) == cudaSuccess &&
+        cudaGetDeviceProperties(&active_properties, active_device) ==
+            cudaSuccess;
+    const std::string hardware_id = device_identity_ok
+        ? "sm" + std::to_string(active_properties.major * 10 +
+                                active_properties.minor)
+        : std::string();
+    const std::string hardware_identity = "hardware=" + hardware_id;
+    const std::string hardware_manifest =
+        "\"hardware\":\"" + hardware_id + "\"";
     bool ok = model->abi_version == FRT_MODEL_RUNTIME_ABI_VERSION &&
               model->struct_size == sizeof(frt_model_runtime_v1) && exp &&
               exp->abi_version == FRT_RUNTIME_ABI_VERSION &&
@@ -90,6 +103,10 @@ int main(int argc, char** argv) {
               exp->n_capsule_regions == 1 && exp->n_buffers == 7 &&
               exp->fingerprint != 0 && exp->identity &&
               std::strstr(exp->identity, "producer=native") &&
+              device_identity_ok &&
+              std::strstr(exp->identity, hardware_identity.c_str()) &&
+              exp->manifest_json &&
+              std::strstr(exp->manifest_json, hardware_manifest.c_str()) &&
               std::strstr(exp->identity, "weights_sha256=") &&
               std::strstr(exp->identity, "tokenizer_sha256=") &&
               model->stages[0].graph == 0 &&

@@ -63,6 +63,13 @@ bool has_cuda_device() {
     return n > 0;
 }
 
+int producer_set_input(void*, uint32_t, const void*, uint64_t, int) {
+    return 0;
+}
+int producer_get_output(void*, uint32_t, void*, uint64_t, uint64_t*, int) {
+    return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -286,17 +293,21 @@ int main() {
     stages[1].graph = 1;
     stages[1].after = after_action;
     stages[1].n_after = 1;
+    frt_model_runtime_verbs producer_verbs{};
+    producer_verbs.struct_size = sizeof(producer_verbs);
+    producer_verbs.set_input = producer_set_input;
+    producer_verbs.get_output = producer_get_output;
 
     frt_model_runtime_v1* producer = frt_model_runtime_wrap(
-        &exp, ports, 3, stages, 2, nullptr, nullptr, nullptr, nullptr);
+        &exp, ports, 3, stages, 2, &producer_verbs, nullptr, nullptr, nullptr);
     CHECK(producer != nullptr, "producer model declaration for create_over");
 
     frt_runtime_port_desc wrong_action_ports[3] = {};
     for (int i = 0; i < 3; ++i) wrong_action_ports[i] = ports[i];
     wrong_action_ports[2].dtype = FRT_RT_DTYPE_BF16;
     frt_model_runtime_v1* wrong_action_producer = frt_model_runtime_wrap(
-        &exp, wrong_action_ports, 3, stages, 2, nullptr, nullptr, nullptr,
-        nullptr);
+        &exp, wrong_action_ports, 3, stages, 2, &producer_verbs, nullptr,
+        nullptr, nullptr);
     frt_model_runtime_v1* wrong_action_over = nullptr;
     CHECK(wrong_action_producer &&
               frt_pi05_model_runtime_create_over(
@@ -347,7 +358,8 @@ int main() {
     prompt_ports[3].shape = prompt_shape;
     prompt_ports[3].rank = 1;
     frt_model_runtime_v1* prompt_producer = frt_model_runtime_wrap(
-        &exp, prompt_ports, 4, stages, 2, nullptr, nullptr, nullptr, nullptr);
+        &exp, prompt_ports, 4, stages, 2, &producer_verbs, nullptr, nullptr,
+        nullptr);
     CHECK(prompt_producer != nullptr,
           "producer declaration with prompt port");
     frt_model_runtime_v1* prompt_over = nullptr;
@@ -369,7 +381,8 @@ int main() {
     state_ports[4].shape = state_shape;
     state_ports[4].rank = 1;
     frt_model_runtime_v1* state_producer = frt_model_runtime_wrap(
-        &exp, state_ports, 5, stages, 2, nullptr, nullptr, nullptr, nullptr);
+        &exp, state_ports, 5, stages, 2, &producer_verbs, nullptr, nullptr,
+        nullptr);
     CHECK(state_producer != nullptr,
           "producer declaration with prompt and state ports");
     frt_model_runtime_v1* state_over = nullptr;
