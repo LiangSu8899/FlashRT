@@ -112,6 +112,9 @@ float normalize_value(float raw, int c, const NormalizeSpec& spec) {
     if (spec.mode == NormalizeMode::kScaleShift) {
         return raw * spec.scale + spec.shift;
     }
+    if (spec.mode == NormalizeMode::kDivideShift) {
+        return raw / spec.divisor + spec.shift;
+    }
     return (raw / 255.0f - spec.mean[c]) * spec.inv_std[c];
 }
 

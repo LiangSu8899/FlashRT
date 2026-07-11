@@ -116,11 +116,15 @@ __device__ __forceinline__ float normalize_value(float raw,
                                                  int c,
                                                  int norm_mode,
                                                  float scale,
+                                                 float divisor,
                                                  float shift,
                                                  const float* mean,
                                                  const float* inv_std) {
     if (norm_mode == 0) {
         return __fadd_rn(__fmul_rn(raw, scale), shift);
+    }
+    if (norm_mode == 1) {
+        return __fadd_rn(__fdiv_rn(raw, divisor), shift);
     }
     return __fmul_rn(
         __fsub_rn(__fdiv_rn(raw, 255.0f), mean[c]), inv_std[c]);
@@ -152,6 +156,7 @@ __global__ void resize_normalize_kernel(const std::uint8_t* src,
                                         int th,
                                         int norm_mode,
                                         float scale,
+                                        float divisor,
                                         float shift,
                                         float mean0,
                                         float mean1,
@@ -200,8 +205,8 @@ __global__ void resize_normalize_kernel(const std::uint8_t* src,
         const float raw = __fadd_rn(
             __fmul_rn(top, __fsub_rn(1.0f, wy)),
             __fmul_rn(bot, wy));
-        const float norm = normalize_value(raw, c, norm_mode, scale, shift,
-                                           mean, inv_std);
+        const float norm = normalize_value(
+            raw, c, norm_mode, scale, divisor, shift, mean, inv_std);
         const std::uint64_t out_idx =
             (((static_cast<std::uint64_t>(view) * th + y) * tw + x) * 3ull) +
             static_cast<std::uint64_t>(c);
@@ -330,8 +335,11 @@ Status preprocess_vision_cuda(const VisionPreprocessSpec& spec,
             spec.output_dtype == DType::kFloat32 ? 1 :
             (spec.output_dtype == DType::kFloat16 ? 2 : 0),
             static_cast<int>(v), spec.target_width, spec.target_height,
-            spec.normalize.mode == NormalizeMode::kScaleShift ? 0 : 1,
-            spec.normalize.scale, spec.normalize.shift,
+            spec.normalize.mode == NormalizeMode::kScaleShift
+                ? 0
+                : (spec.normalize.mode == NormalizeMode::kDivideShift ? 1 : 2),
+            spec.normalize.scale, spec.normalize.divisor,
+            spec.normalize.shift,
             spec.normalize.mean[0], spec.normalize.mean[1], spec.normalize.mean[2],
             spec.normalize.inv_std[0], spec.normalize.inv_std[1],
             spec.normalize.inv_std[2]);

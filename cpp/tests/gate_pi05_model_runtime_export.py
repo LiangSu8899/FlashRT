@@ -349,6 +349,13 @@ def _python_replay(pipe, pl, obs, start_noise: np.ndarray) -> np.ndarray:
     return _read(pl.input_noise_buf)
 
 
+def _python_replay_staged(pl, start_noise: np.ndarray) -> np.ndarray:
+    """Replay without touching the already-staged image buffer."""
+    _upload_bytes(pl.input_noise_buf, start_noise)
+    pl.forward()
+    return _read(pl.input_noise_buf)
+
+
 def _python_replay_actions(pipe, pl, obs, start_noise: np.ndarray,
                            dtype: torch.dtype) -> np.ndarray:
     raw = _python_replay(pipe, pl, obs, start_noise)
@@ -527,6 +534,18 @@ def main() -> None:
             _raw_to_float(cxx_img, torch_dtype))))
 
         start_noise = _seed_noise(pipe, pl, args.seed + 1009, torch_dtype)
+
+        # Mechanism lane: hold the exact image/noise bytes fixed and compare
+        # the Python graph entry with the model-runtime graph entry. Numerical
+        # differences from the two image preprocessors do not belong here.
+        _upload_bytes(pl.input_images_buf, cxx_img)
+        mechanism_py_raw = _python_replay_staged(pl, start_noise)
+        _upload_bytes(pl.input_images_buf, cxx_img)
+        _upload_bytes(pl.input_noise_buf, start_noise)
+        mechanism_full_actions = _model_step_get_actions(
+            m_full, int(pl.chunk_size))
+        mechanism_full_raw = _read(pl.input_noise_buf)
+
         py_raw = _python_replay(pipe, pl, obs, start_noise)
 
         _upload_bytes(pl.input_noise_buf, start_noise)
@@ -560,6 +579,23 @@ def main() -> None:
         py_actions = unnormalize_actions(py_raw_f, pipe.norm_stats)[
             :, :LIBERO_ACTION_DIM].astype(np.float32)
 
+        mechanism_raw_exact = bool(np.array_equal(
+            mechanism_py_raw, mechanism_full_raw))
+        mechanism_raw_max = float(np.max(np.abs(
+            _raw_to_float(mechanism_py_raw, torch_dtype) -
+            _raw_to_float(mechanism_full_raw, torch_dtype))))
+        mechanism_py_actions = unnormalize_actions(
+            _raw_to_float(mechanism_py_raw, torch_dtype).reshape(
+                int(pl.chunk_size), 32),
+            pipe.norm_stats,
+        )[:, :LIBERO_ACTION_DIM].astype(np.float32)
+        mechanism_action_max = float(np.max(np.abs(
+            mechanism_py_actions - mechanism_full_actions)))
+        mechanism_action_close = bool(np.allclose(
+            mechanism_py_actions, mechanism_full_actions,
+            rtol=1e-6, atol=1e-6,
+        ))
+
         raw_exact = bool(np.array_equal(py_raw, full_raw))
         raw_cos = _cos(py_raw, full_raw, torch_dtype)
         raw_max = float(np.max(np.abs(
@@ -570,7 +606,7 @@ def main() -> None:
         act_close = bool(np.allclose(
             py_actions, full_actions, rtol=1e-4, atol=1e-3
         ))
-        act_ok = act_cos >= 0.999 and (args.fp8 or act_close)
+        act_ok = act_cos >= 0.999 and act_close
         split_raw_exact = bool(np.array_equal(full_raw, split_raw))
         split_raw_cos = _cos(full_raw, split_raw, torch_dtype)
         split_raw_max = float(np.max(np.abs(
@@ -587,6 +623,15 @@ def main() -> None:
         print(f"split runtime          : ports={m_split.n_ports} stages={m_split.n_stages}")
         print(f"rtc runtime            : ports={m_rtc.n_ports} stages={m_rtc.n_stages} prefix={prefix_len}")
         print(f"image buffer exact     : {img_exact}  cos={img_cos:.8f}  max_abs={img_max:.6g}")
+        print(
+            "same-bytes mechanism raw: "
+            f"exact={mechanism_raw_exact} max_abs={mechanism_raw_max:.6g}"
+        )
+        print(
+            "same-bytes action stage : "
+            f"allclose={mechanism_action_close} "
+            f"max_abs={mechanism_action_max:.6g}"
+        )
         print(f"py vs full raw exact   : {raw_exact}  cos={raw_cos:.8f}  max_abs={raw_max:.6g}")
         print(
             f"py vs full action      : accepted={act_ok} "
@@ -600,7 +645,18 @@ def main() -> None:
         print(f"rtc prefix exact       : {rtc_prefix_exact}  max_abs={rtc_prefix_max:.6g}")
 
         assert img_cos >= 0.999, f"image preprocess cosine too low: {img_cos}"
-        assert raw_cos >= 0.999, f"raw replay cosine too low: {raw_cos}"
+        assert mechanism_raw_exact, (
+            "same image/noise bytes must replay bit-exactly through Python "
+            f"and model-runtime entries; max_abs={mechanism_raw_max:.6g}"
+        )
+        assert mechanism_action_close, (
+            "logical action staging differs for identical raw bytes: "
+            f"max_abs={mechanism_action_max:.6g}"
+        )
+        assert raw_exact, (
+            "Python and model-runtime replay must be bit-exact after image "
+            f"staging; cos={raw_cos:.8f} max_abs={raw_max:.6g}"
+        )
         assert act_ok, (
             f"robot actions differ: cos={act_cos:.8f} max_abs={act_max}"
         )

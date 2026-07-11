@@ -32,6 +32,8 @@ void test_pi05_vision_spec_and_preprocess() {
     assert(spec.view_order[1] == "wrist_image");
     assert(spec.target_width == 224);
     assert(spec.output_dtype == DType::kBFloat16);
+    assert(spec.normalize.mode ==
+           flashrt::modalities::NormalizeMode::kDivideShift);
 
     const std::uint8_t image_rgb[] = {
         0, 127, 255, 255, 127, 0,
@@ -70,6 +72,7 @@ void test_pi05_vision_spec_and_preprocess() {
     assert(std::fabs(first_r - (-1.0f)) < 0.01f);
     assert(std::fabs(first_g - (127.0f / 127.5f - 1.0f)) < 0.01f);
     assert(std::fabs(first_b - 1.0f) < 0.01f);
+    assert(out[1] == float_to_bfloat16(127.0f / 127.5f - 1.0f));
 }
 
 void test_view_order_guard() {
