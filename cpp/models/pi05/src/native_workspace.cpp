@@ -156,8 +156,8 @@ modalities::Status NativeWorkspace::update_decoder_rope(int prompt_tokens) {
         modalities::StatusCode::kUnsupported,
         "decoder RoPE update requires the CUDA build");
 #else
-    const NativeWorkspaceBuffer* decoder = find("decoder_rope_weights");
-    if (!decoder) return invalid("decoder RoPE buffer was not allocated");
+    if (!decoder_rope_buffer_)
+        return invalid("decoder RoPE buffer was not allocated");
     const std::size_t start =
         static_cast<std::size_t>(encoder_vision_sequence_ + prompt_tokens) *
         256;
@@ -168,7 +168,7 @@ modalities::Status NativeWorkspace::update_decoder_rope(int prompt_tokens) {
         return invalid("decoder RoPE slice exceeds the generated table");
     }
     const cudaError_t rc = cudaMemcpy(
-        frt_buffer_dptr(decoder->buffer), rope_table_.data() + start,
+        frt_buffer_dptr(decoder_rope_buffer_), rope_table_.data() + start,
         elements * sizeof(std::uint16_t), cudaMemcpyHostToDevice);
     return rc == cudaSuccess
                ? modalities::Status::ok()
@@ -304,6 +304,9 @@ modalities::Status NativeWorkspace::allocate(
     FRT_ADD("gate_buf", {ds, 1024}, modalities::DType::kBFloat16);
     FRT_ADD("decoder_rms_ones", {1024}, modalities::DType::kBFloat16);
 #undef FRT_ADD
+    const NativeWorkspaceBuffer* decoder = find("decoder_rope_weights");
+    if (!decoder) return invalid("decoder RoPE buffer was not allocated");
+    decoder_rope_buffer_ = decoder->buffer;
     st = initialize_rms_ones();
     if (!st.ok_status()) return st;
     return initialize_rope();

@@ -207,7 +207,7 @@ int Runtime::set_prompt_state(const char* text, const float* state,
         return -1;
     }
     const std::size_t text_bytes = std::strlen(text);
-    if (text_bytes > task_prompt_workspace_.capacity()) {
+    if (text_bytes > max_task_prompt_bytes_) {
         prompt_status_ = modalities::Status::error(
             modalities::StatusCode::kShapeMismatch,
             "prompt text exceeds the configured hot-path capacity");
@@ -322,6 +322,7 @@ modalities::Status Runtime::bind_prompt_staging() {
     }
     const std::size_t max_prompt_bytes =
         static_cast<std::size_t>(config_.prompt_max_tokens * 8ull);
+    max_task_prompt_bytes_ = max_prompt_bytes;
     task_prompt_workspace_.reserve(max_prompt_bytes);
     formatted_prompt_workspace_.reserve(max_prompt_bytes + state_bytes);
     prompt_token_ids_.reserve(static_cast<std::size_t>(

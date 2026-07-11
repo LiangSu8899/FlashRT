@@ -145,6 +145,13 @@ modalities::Status NativeRtxAttentionWorkspace::allocate(
             {static_cast<std::uint64_t>(decoder_splits_), 1, 8, ds, 256},
             NativeAttentionDType::kFloat32);
 #undef FRT_ADD
+    const char* prompt_length_names[] = {
+        "attn_enc_seqused", "attn_dec_seqused", "attn_dec_devpos"};
+    for (int i = 0; i < 3; ++i) {
+        const NativeAttentionBuffer* target = find(prompt_length_names[i]);
+        if (!target) return invalid("prompt length buffer was not allocated");
+        prompt_length_buffers_[i] = target->buffer;
+    }
     return set_fixed_prompt_length(0);
 }
 
@@ -161,12 +168,9 @@ modalities::Status NativeRtxAttentionWorkspace::set_fixed_prompt_length(
 #else
     const std::int32_t valid = encoder_vision_sequence_ + prompt_tokens;
     const std::int32_t values[] = {valid, valid + chunk_size_, valid};
-    const char* names[] = {"attn_enc_seqused", "attn_dec_seqused",
-                           "attn_dec_devpos"};
     for (int i = 0; i < 3; ++i) {
-        const NativeAttentionBuffer* target = find(names[i]);
-        if (!target ||
-            cudaMemcpy(frt_buffer_dptr(target->buffer), &values[i],
+        if (!prompt_length_buffers_[i] ||
+            cudaMemcpy(frt_buffer_dptr(prompt_length_buffers_[i]), &values[i],
                        sizeof(values[i]), cudaMemcpyHostToDevice) !=
                 cudaSuccess) {
             return backend("fixed attention length upload failed");

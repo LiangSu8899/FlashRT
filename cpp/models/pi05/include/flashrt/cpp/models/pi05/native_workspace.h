@@ -70,6 +70,7 @@ private:
     int num_views_ = 0;
     int max_prompt_tokens_ = 0;
     int chunk_size_ = 0;
+    frt_buffer decoder_rope_buffer_ = nullptr;
     std::vector<std::uint16_t> rope_table_;
 };
 

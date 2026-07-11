@@ -66,6 +66,7 @@ private:
     int encoder_layers_ = 0;
     int encoder_splits_ = 0;
     int decoder_splits_ = 0;
+    frt_buffer prompt_length_buffers_[3] = {nullptr, nullptr, nullptr};
 };
 
 }  // namespace pi05

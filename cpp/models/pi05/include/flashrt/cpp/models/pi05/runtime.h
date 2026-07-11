@@ -125,6 +125,7 @@ private:
     std::vector<float> normalized_state_;
     std::string task_prompt_workspace_;
     std::string formatted_prompt_workspace_;
+    std::size_t max_task_prompt_bytes_ = 0;
     std::uint64_t current_prompt_len_ = 0;
     bool prompt_staging_enabled_ = false;
     frt_graph graph_ = nullptr;

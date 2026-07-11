@@ -35,6 +35,7 @@ struct Adapter {
     uint32_t state_port = kNoPort;
     bool has_prompt_text = false;
     bool has_state = false;
+    std::size_t prompt_text_limit = 0;
     std::string prompt_text;
     std::vector<float> state_values;
     std::vector<flashrt::modalities::VisionFrame> vision_frames;
@@ -174,7 +175,7 @@ int set_input(void* self, uint32_t port, const void* data, uint64_t bytes,
             a->last_error = "prompt payload is null";
             return -1;
         }
-        if (bytes > a->prompt_text.capacity()) {
+        if (bytes > a->prompt_text_limit) {
             a->last_error = "prompt payload exceeds the hot-path capacity";
             return -4;
         }
@@ -554,8 +555,9 @@ extern "C" int frt_pi05_model_runtime_create_over(
     a->action_values.resize(static_cast<std::size_t>(action.chunk *
                                                      action.robot_dim));
     if (cfg.prompt_max_tokens) {
-        a->prompt_text.reserve(static_cast<std::size_t>(
-            cfg.prompt_max_tokens * 8ull));
+        a->prompt_text_limit = static_cast<std::size_t>(
+            cfg.prompt_max_tokens * 8ull);
+        a->prompt_text.reserve(a->prompt_text_limit);
     }
     if (state != kNoPort) {
         a->state_values.resize(cfg.state_q01.size());
