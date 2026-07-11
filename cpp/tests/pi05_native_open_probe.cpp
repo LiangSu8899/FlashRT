@@ -35,6 +35,13 @@ int main(int argc, char** argv) {
         }
         replay_count = static_cast<int>(parsed);
     }
+    const bool profile_service_loop =
+        std::getenv("FLASHRT_PROFILE_SERVICE_LOOP") != nullptr;
+    if (profile_service_loop && !replay_env) {
+        std::cerr << "FLASHRT_PROFILE_SERVICE_LOOP requires "
+                     "FLASHRT_PROFILE_REPLAYS\n";
+        return 2;
+    }
     int hot_state_updates = 0;
     const char* hot_updates_env = std::getenv("FLASHRT_HOT_STATE_UPDATES");
     if (hot_updates_env) {
@@ -227,6 +234,8 @@ int main(int argc, char** argv) {
     }
     const bool profile_range = replay_env ||
         std::getenv("FLASHRT_PROFILE_RANGE") != nullptr;
+    float actions[10 * 7]{};
+    std::uint64_t written = 0;
     if (!noise || model->verbs.set_input(model->self, 3, host_noise.data(),
                                          host_noise.size() * 2, -1) != -3 ||
         cudaMemcpy(frt_buffer_dptr(noise), host_noise.data(),
@@ -241,7 +250,26 @@ int main(int argc, char** argv) {
     int step_rc = 0;
     cudaError_t upload_rc = cudaSuccess;
     for (int replay = 0; replay < replay_count; ++replay) {
-        if (replay != 0) {
+        if (profile_service_loop) {
+            for (int dim = 0; dim < 8; ++dim) {
+                state[dim] = std::sin(
+                    static_cast<float>(replay * 8 + dim) * 0.017f);
+            }
+            const char* live_prompt = replay % 2 == 0
+                ? "pick up the black bowl"
+                : "move the black bowl to the plate";
+            if (model->verbs.set_input(
+                    model->self, 0, live_prompt, std::strlen(live_prompt),
+                    -1) != 0 ||
+                model->verbs.set_input(
+                    model->self, 1, state, sizeof(state), -1) != 0 ||
+                model->verbs.set_input(
+                    model->self, 2, views, sizeof(views), -1) != 0) {
+                step_rc = -1;
+                break;
+            }
+        }
+        if (replay != 0 || profile_service_loop) {
             upload_rc = cudaMemcpy(
                 frt_buffer_dptr(noise), host_noise.data(),
                 host_noise.size() * sizeof(std::uint16_t),
@@ -250,6 +278,13 @@ int main(int argc, char** argv) {
         }
         step_rc = model->verbs.step(model->self);
         if (step_rc != 0) break;
+        if (profile_service_loop &&
+            (model->verbs.get_output(
+                 model->self, 4, actions, sizeof(actions), &written, -1) != 0 ||
+             written != sizeof(actions))) {
+            step_rc = -1;
+            break;
+        }
     }
     const cudaError_t sync_rc = cudaDeviceSynchronize();
     const cudaError_t profiler_rc =
@@ -262,8 +297,6 @@ int main(int argc, char** argv) {
         model->release(model->owner);
         return 1;
     }
-    float actions[10 * 7]{};
-    std::uint64_t written = 0;
     if (model->verbs.get_output(model->self, 4, actions, sizeof(actions),
                                 &written, -1) != 0 ||
         written != sizeof(actions)) {

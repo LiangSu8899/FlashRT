@@ -541,11 +541,14 @@ equivalent `bias_res` form, and the two negative-infinity fill symbols. On the
 reference RTX 5090 SM120 run both traces contained 3,576 raw events and their
 3,172 logical-kernel sequences were exactly equal.
 
-The separate hot allocator gate profiles 1,000 graph replays without tracing
-individual graph nodes:
+The separate hot allocator gate profiles 1,000 complete service iterations
+without tracing individual graph nodes. Each measured iteration updates prompt,
+state, image, and noise inputs, launches one graph replay, and reads the logical
+action output:
 
 ```
-FLASHRT_PROFILE_REPLAYS=1000 nsys profile --trace=cuda \
+FLASHRT_PROFILE_REPLAYS=1000 FLASHRT_PROFILE_SERVICE_LOOP=1 \
+nsys profile --trace=cuda \
   --capture-range=cudaProfilerApi --capture-range-end=stop \
   -o <hot-report> \
   <build-dir>/pi05_native_open_probe \
@@ -559,8 +562,12 @@ python cpp/tests/gate_pi05_hot_allocator.py \
 The gate requires exactly 1,000 `cudaGraphLaunch` calls and rejects CUDA/driver
 device allocation, host registration, mempool creation, virtual-memory map,
 and corresponding release APIs. The probe independently requires one graph
-variant after the final replay. The reference SM120 run observed zero allocator
-calls across 2,001 CUDA API calls.
+variant after the final replay. Omitting `FLASHRT_PROFILE_SERVICE_LOOP` retains
+the replay-only diagnostic mode for kernel-sequence comparison.
+This trace proves the absence of CUDA/driver allocation APIs across the full
+service iteration. Host allocation claims are scoped to components with an
+explicit allocation-counter test, such as exec graph-cache LRU maintenance;
+the trace does not infer host allocator behavior from CUDA API events.
 
 The same native probe can gate the complete hot state staging chain
 (normalization, formatting, tokenization, embedding gather, and prompt-length
