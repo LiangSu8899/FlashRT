@@ -1,4 +1,7 @@
-"""Emit one replay-only CUDA profiler range for the Pi0.5 Python frontend."""
+"""Developer profiling tool for one Pi0.5 Python replay CUDA range.
+
+This utility produces diagnostic traces; it is not an acceptance test.
+"""
 
 from __future__ import annotations
 

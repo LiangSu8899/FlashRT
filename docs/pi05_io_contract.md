@@ -429,9 +429,9 @@ python cpp/tests/gate_pi05_native_weight_ops.py \
 ```
 
 ```
-FLASHRT_BUILD_DIR=cpp/build-sm120-debug \
+FLASHRT_BUILD_DIR=<build-dir> \
   python cpp/tests/gate_pi05_model_runtime_export.py \
-  --lib cpp/build-sm120-debug/libflashrt_cpp_pi05_c.so ...
+  --lib <build-dir>/libflashrt_cpp_pi05_c.so ...
 python cpp/tests/gate_pi05_c_api_export.py ...
 ```
 
@@ -448,7 +448,7 @@ producer must not retain the declarations if any required verb is unavailable.
 The native factory lifecycle gate is:
 
 ```
-cpp/build-sm120-spm-debug/pi05_native_open_probe \
+<build-dir>/pi05_native_open_probe \
   <checkpoint> <tokenizer.model>
 ```
 
@@ -461,11 +461,11 @@ port/stage/region records (their producer identity and fingerprints remain
 different):
 
 ```
-FLASHRT_BUILD_DIR=cpp/build-sm120-debug \
+FLASHRT_BUILD_DIR=<build-dir> \
   python cpp/tests/gate_pi05_native_schema_parity.py \
   --checkpoint <openpi-pytorch-checkpoint> \
   --tokenizer <tokenizer.model> \
-  --native-probe cpp/build-sm120-spm-debug/pi05_native_open_probe
+  --native-probe <build-dir>/pi05_native_open_probe
 ```
 
 The native formatter and tokenizer must also remain token-exact over real
@@ -476,14 +476,17 @@ python cpp/tests/gate_pi05_tokenizer_corpus.py \
   --dataset <libero-lerobot-root> \
   --checkpoint <openpi-pytorch-checkpoint> \
   --tokenizer <tokenizer.model> \
-  --probe cpp/build-sm120-spm-debug/pi05_tokenizer_corpus_probe \
+  --probe <build-dir>/pi05_tokenizer_corpus_probe \
   --count 10000
 ```
 
 This gate normalizes every recorded state with the checkpoint q01/q99 values,
 renders the full state prompt through the native formatter, and compares every
-valid token ID with OpenPI `PaligemmaTokenizer`. The reference SM120 run covered
-10,000 records and 20 token lengths from 43 through 62 with zero mismatches.
+valid token ID with OpenPI `PaligemmaTokenizer`. The 10,000-record reference
+run used a lightweight oracle whose tokenizer and formatter logic is kept
+line-equivalent with upstream OpenPI; it covered 20 token lengths from 43
+through 62 with zero mismatches. This source-level oracle is distinct from the
+official-environment end-to-end gate below.
 
 The real-episode numerical gate compares against the official OpenPI PyTorch
 `PI0Pytorch.sample_actions` path, not another native intermediate:
@@ -493,7 +496,7 @@ python cpp/tests/gate_pi05_native_e2e.py \
   --checkpoint <openpi-pytorch-checkpoint> \
   --tokenizer <tokenizer.model> \
   --dataset <libero-lerobot-root> \
-  --probe cpp/build-sm120-spm-debug/pi05_native_e2e_probe \
+  --probe <build-dir>/pi05_native_e2e_probe \
   --episode 0 --frame 0
 ```
 
@@ -514,7 +517,7 @@ FLASHRT_PROFILE_RANGE=1 nsys profile --trace=cuda \
   --cuda-graph-trace=node \
   --capture-range=cudaProfilerApi --capture-range-end=stop \
   -o <native-report> \
-  cpp/build-sm120-spm-debug/pi05_native_open_probe \
+  <build-dir>/pi05_native_open_probe \
   <checkpoint> <tokenizer.model>
 
 nsys profile --trace=cuda --cuda-graph-trace=node \
@@ -545,7 +548,7 @@ individual graph nodes:
 FLASHRT_PROFILE_REPLAYS=1000 nsys profile --trace=cuda \
   --capture-range=cudaProfilerApi --capture-range-end=stop \
   -o <hot-report> \
-  cpp/build-sm120-spm-debug/pi05_native_open_probe \
+  <build-dir>/pi05_native_open_probe \
   <checkpoint> <tokenizer.model>
 nsys stats --report cuda_api_trace --format csv \
   <hot-report>.nsys-rep > <hot-api-trace>.csv
@@ -565,7 +568,7 @@ device update):
 
 ```
 FLASHRT_HOT_STATE_UPDATES=1000 FLASHRT_HOT_STATE_P99_US=1000 \
-  cpp/build-sm120-spm-debug/pi05_native_open_probe \
+  <build-dir>/pi05_native_open_probe \
   <checkpoint> <tokenizer.model>
 ```
 
@@ -579,8 +582,8 @@ the factory from the shared object, exercises an extra retain/release pair,
 releases the final model reference, and only then unloads the producer:
 
 ```
-cpp/build-sm120-spm-debug/pi05_native_dlopen_probe \
-  cpp/build-sm120-spm-debug/libflashrt_cpp_pi05_c.so \
+<build-dir>/pi05_native_dlopen_probe \
+  <build-dir>/libflashrt_cpp_pi05_c.so \
   <checkpoint> <tokenizer.model> 1
 ```
 
@@ -590,7 +593,7 @@ to avoid an address-space collision with ASAN's default shadow gap:
 
 ```
 ASAN_OPTIONS=detect_leaks=1:halt_on_error=1:protect_shadow_gap=0 \
-  cpp/build-sm120-spm-asan/pi05_native_dlopen_probe \
-  cpp/build-sm120-spm-asan/libflashrt_cpp_pi05_c.so \
+  <asan-build-dir>/pi05_native_dlopen_probe \
+  <asan-build-dir>/libflashrt_cpp_pi05_c.so \
   <checkpoint> <tokenizer.model> 1
 ```
