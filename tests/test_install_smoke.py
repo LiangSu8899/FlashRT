@@ -18,7 +18,8 @@ prevented at build / import time, so this file is the regression net:
    torch 2.5.1 / CUDA 12.5 / Py3.12 → 30–60 min sdist compile per
    cold image). The vendored ``flash_rt_fa2.so`` is enough for the
    default path; ``flash-attn`` is only needed for legacy bisection
-   sites.
+   sites. The vendored adapter and ``libflashrt_fa2_raw.so`` form one
+   install unit.
 
 Run:
     PYTHONPATH=. python -m pytest tests/test_install_smoke.py -v
@@ -31,6 +32,20 @@ import pathlib
 import sys
 
 import pytest
+
+
+def test_fa2_install_unit_is_complete():
+    """A built FA2 adapter must be deployed with its Python-free raw library."""
+    import flash_rt
+
+    pkg_dir = pathlib.Path(flash_rt.__file__).parent
+    adapters = list(pkg_dir.glob("flash_rt_fa2*.so")) \
+        + list(pkg_dir.glob("flash_rt_fa2*.pyd"))
+    if not adapters:
+        pytest.skip("vendored FA2 is not configured in this build")
+    raw = list(pkg_dir.glob("libflashrt_fa2_raw.so*")) \
+        + list(pkg_dir.glob("flashrt_fa2_raw*.dll"))
+    assert raw, "flash_rt_fa2 was built without libflashrt_fa2_raw"
 
 
 def test_kernels_so_lives_in_flash_rt():
