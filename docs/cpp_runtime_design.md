@@ -53,6 +53,14 @@ binds names and constants, never re-implements a transform. Nothing under
 
 The model boundary and the hardware boundary are intentionally different.
 
+The FlashRT ABI is linked as one exec implementation per process. It does not
+contain a backend registry and should not gain one. A process that needs
+heterogeneous CUDA, CPU, llama.cpp, or future device instances introduces them
+at the capsule backend boundary: each adopted `cap_backend` is an instance
+vtable. A non-CUDA producer may still represent one invocation as an adopted
+graph and expose the same ports/stages/regions. Consumers must not branch on a
+backend-kind field; no such frozen field is required.
+
 The **model** is selected by the native overlay/factory that the host loads:
 `cpp/models/pi05/` exports `frt_pi05_model_runtime_create_over`, a future
 GROOT runtime would export its own model factory, and so on. That code owns the

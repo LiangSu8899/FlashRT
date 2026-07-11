@@ -688,3 +688,28 @@ Must block:
 - New model path without routing/import/correctness evidence.
 - Kernel names, paths, or pybind symbols that hide model/hardware ownership.
 - `exec/` or common runtime changes that include scenario policy.
+
+## 24. Native Producer And Public Hygiene Checklist
+
+Apply this checklist to `runtime/`, `cpp/`, model-runtime adapters, and schema
+gates:
+
+- [ ] No model/backend kind, model dimension, checkpoint field, or scenario
+      policy was added to the frozen ABI.
+- [ ] Integrated, wrap, and override construction reject STAGED inputs without
+      `set_input` and STAGED outputs without `get_output`.
+- [ ] No declaration-only object can escape a factory or reach consumer
+      adoption.
+- [ ] Hardware identity comes from the active device/backend, not a requested
+      build flag or copied model default.
+- [ ] Shared producer faces compare independently with checked-in canonical
+      records; expected counts are derived rather than repeated.
+- [ ] Producer-private graphs, buffers, manifests, and identity pairs are not
+      incorrectly required to match across backends.
+- [ ] CUDA allocator evidence covers the complete claimed service iteration;
+      host allocation claims use a host-side counter.
+- [ ] A heterogeneous backend enters through an instance backend/capsule seam,
+      not a new backend registry or frozen `backend_kind` field.
+- [ ] Public commands use placeholders and the diff contains no absolute local
+      paths, user/host/container names, tokens, internal URLs, environment
+      dumps, logs, or proprietary asset identifiers.

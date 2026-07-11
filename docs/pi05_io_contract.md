@@ -468,6 +468,11 @@ FLASHRT_BUILD_DIR=<build-dir> \
   --native-probe <build-dir>/pi05_native_open_probe
 ```
 
+Both producers are compared independently against
+`cpp/tests/data/pi05_native_v2_schema.records`. Update that golden file only
+for an intentional public-face change, and review the resulting fingerprint
+and capsule compatibility impact in the same change.
+
 The native formatter and tokenizer must also remain token-exact over real
 prompt/state traffic:
 

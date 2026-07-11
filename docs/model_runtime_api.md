@@ -63,8 +63,10 @@ frt_model_runtime_v1 {
 }
 ```
 
-**Verbs** (`frt_model_runtime_verbs`; every entry is always callable — absent
-producer verbs are filled with unsupported stubs returning `-3`):
+**Verbs** (`frt_model_runtime_verbs`; every entry on a successfully constructed
+object is callable). Construction rejects a STAGED input without `set_input`
+and a STAGED output without `get_output`. Other absent verbs are filled with
+unsupported stubs returning `-3`:
 
 | verb | phase | semantics |
 |---|---|---|
@@ -133,6 +135,11 @@ frt_model_runtime_v1* m = frt_model_runtime_override_verbs(
 The override retains `producer_model`, so inherited port/stage pointers remain
 valid even if the original producer reference is released first. Deployment
 identity is unchanged.
+
+The integrated, adapter, and verb-override C paths enforce the same STAGED
+verb-presence rule before retaining owners or consuming builders. An internal
+intermediate may exist while one factory assembles an override, but it must not
+escape that factory or be independently adoptable.
 
 **Native factory (symbol convention)** — a model-runtime `.so` exports
 `FRT_MODEL_RUNTIME_OPEN_V1_SYMBOL`:
@@ -271,3 +278,6 @@ PYTHONPATH=.:./exec/build:./runtime/build \
 
 The consumer side (adoption, hot-input contract, real-model tick) is
 validated in the FlashRT-Nexus repository.
+
+For producer implementation and review rules, see
+[`native_model_runtime_producer.md`](native_model_runtime_producer.md).

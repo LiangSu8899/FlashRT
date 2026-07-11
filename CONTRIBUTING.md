@@ -18,10 +18,15 @@ Before opening a PR:
    - New model integration: [`docs/adding_new_model.md`](docs/adding_new_model.md)
    - Kernel catalog: [`docs/kernel_catalog.md`](docs/kernel_catalog.md)
    - Calibration contract: [`docs/calibration.md`](docs/calibration.md)
+   - Native model producers:
+     [`docs/native_model_runtime_producer.md`](docs/native_model_runtime_producer.md)
+   - PR review standard: [`docs/pr_review_checklist.md`](docs/pr_review_checklist.md)
 2. Build the extension modules locally.
 3. Run the smallest test set that covers your change.
-4. Include the exact GPU, CUDA, command lines, and latency/precision numbers
-   in the PR description when the change touches runtime behavior.
+4. Include sanitized, reproducible build/test commands and the relevant public
+   hardware capability and latency/precision results when runtime behavior
+   changes. Never include private paths, host names, container names, tokens,
+   checkpoint locations, or internal dataset identifiers.
 
 ## Development Setup
 
@@ -224,6 +229,13 @@ reviewers hold every PR to:
   [`docs/subgraph_stage_plans.md`](docs/subgraph_stage_plans.md). A structural
   cut is a re-ordering, not an approximation — split-vs-full replay must stay
   bit-exact (`cpp/tests/gate_pi05_model_runtime_export.py` is the gate).
+- All three C construction paths mechanically reject a STAGED input without
+  `set_input` or a STAGED output without `get_output`. Do not bypass this with
+  a published declaration-only object.
+- Derive hardware identity from the active runtime device. A requested build
+  target or configuration string is not proof of the executing architecture.
+- Schema shared by multiple producers needs checked-in canonical records;
+  every producer compares independently against that golden face.
 
 ### Calibration And Precision
 
@@ -354,6 +366,8 @@ Before requesting review:
 - Mention unsupported hardware or missing local fixtures explicitly.
 - Avoid committing generated build outputs, local checkpoints, logs, or
   `third_party/cutlass`.
+- Search the diff for private absolute paths, user/host/container names,
+  credentials, internal URLs, and environment dumps before pushing.
 
 ## Reporting Hardware Results
 
