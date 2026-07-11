@@ -36,6 +36,7 @@ struct RuntimeConfig {
      * construction so prepare_vision never allocates on the hot path. */
     int max_frame_width = 1280;
     int max_frame_height = 720;
+    bool strict_rgb8 = true;
 
     /* Optional host/device overrides. If left null, Runtime derives tensor
      * views from the export's named buffers. The current CPU reference

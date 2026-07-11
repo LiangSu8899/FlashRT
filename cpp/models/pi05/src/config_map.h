@@ -44,6 +44,15 @@ inline bool valid_pixel_format(int value) {
     return value >= FRT_PI05_PIXEL_RGB8 && value <= FRT_PI05_PIXEL_GRAY8;
 }
 
+inline std::uint64_t pixel_channels(int value) {
+    switch (value) {
+        case FRT_PI05_PIXEL_RGBA8:
+        case FRT_PI05_PIXEL_BGRA8: return 4;
+        case FRT_PI05_PIXEL_GRAY8: return 1;
+        default: return 3;
+    }
+}
+
 inline modalities::DType dtype(int value) {
     using modalities::DType;
     switch (value) {

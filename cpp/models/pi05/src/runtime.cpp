@@ -187,7 +187,7 @@ modalities::Status Runtime::bind() {
                     config_.action_stddev, find_native_stream(exp_, stream_id_),
                     config_.chunk, config_.model_action_dim,
                     config_.robot_action_dim, config_.image_dtype, staging,
-                    action_staging);
+                    action_staging, config_.strict_rgb8);
     return bind_prompt_staging();
 }
 

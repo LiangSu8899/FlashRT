@@ -116,6 +116,12 @@ non-`u8` frames are not silently converted at the Pi0.5 contract boundary. If a
 deployment supports more pixel formats, the supported set must be documented by
 the producer and tested against the CPU reference path.
 
+Compatibility note: the legacy `frt_pi05_runtime_prepare_vision` C API keeps
+accepting its explicit `BGR8`, `RGBA8`, `BGRA8`, and `GRAY8` enum values and
+converts them through the shared modality implementation. This compatibility
+does not expand the `frt_model_runtime_v1` native face: its `IMAGE/STAGED`
+deployment contract remains strict `RGB8/u8/HWC`.
+
 ## Noise Input
 
 `noise` is a `TENSOR/SWAP` port. The host writes its raw bytes directly into
