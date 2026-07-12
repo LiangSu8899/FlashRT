@@ -81,8 +81,8 @@ A prebuilt HF kernel with the same microbenchmark is published at
 - `int4_global_scale_bf16_sm120` — `amax / (7·448)` reduction.
 - `int4_w4a4_sm120_codebook_canary` — runtime self-check (returns 0 only
   if the running SASS truly decodes E0M3).
-- `extern "C"` wrappers (`int4_*`) for non-C++ backends, e.g. a GGML /
-  llama.cpp custom op.
+- `extern "C"` wrappers (`flashrt_int4_sm120_*`) for non-C++ backends,
+  e.g. a GGML / llama.cpp custom op.
 
 ## The kernel is compiled E2M1 and RUN as E0M3
 
@@ -99,10 +99,25 @@ results, undetectable by the launcher. Always gate module load on
 W-INT4 × A-E2M1 is available with `--operands b` (patch the weight operand
 only).
 
-> **Toolchain note:** these bits are undocumented and invisible to
-> `nvdisasm` / `cuobjdump` (a patched instruction still disassembles as
-> `E2M1.E2M1`). Re-verify the encoding after any CUDA-toolkit upgrade; the
-> canary is the authoritative check.
+**Static verification is asymmetric — the runtime canary is
+authoritative.** These bits are undocumented: an *unpatched* binary
+disassembles normally (the sites are locatable and readable), but once the
+bits are set `cuobjdump`/`nvdisasm` no longer decode the instruction as
+`OMMA.SF` at all, so a *patched* binary cannot be re-located or re-read
+statically. Consequently:
+
+- `patch_int4_omma_sm120.py --verify --expect e2m1` is a reliable
+  **pre-patch** gate (exit 0 iff every site is still E2M1; nonzero
+  otherwise, including "no sites"). Use it in the build to prove the right
+  thing was compiled before patching.
+- `--verify --expect int4` returns 1 on an unpatched binary and 2
+  (inconclusive) on a patched one — it never claims success by guessing.
+- The only authoritative proof that a binary decodes E0M3 is
+  `int4_w4a4_sm120_codebook_canary() == 0` at load.
+
+Patch mode fails loudly (nonzero exit) if it flips zero instructions, so a
+build step cannot silently ship an unpatched or double-run binary.
+Re-verify the encoding after any CUDA-toolkit upgrade.
 
 ## Reproduce
 
@@ -113,8 +128,9 @@ the test uses synthetic data.
 nvcc -std=c++17 -O3 -gencode arch=compute_120a,code=sm_120a \
   csrc/kernels/int4_w4a4_mma_sm120.cu \
   csrc/kernels/test_int4_w4a4_standalone.cu -o <out>/test_int4
-python tools/patch_int4_omma_sm120.py <out>/test_int4
-<out>/test_int4
+python tools/patch_int4_omma_sm120.py <out>/test_int4 --verify --expect e2m1  # pre-patch gate (exit 0)
+python tools/patch_int4_omma_sm120.py <out>/test_int4                          # flip to INT4
+<out>/test_int4                                                                # runtime canary = authoritative
 ```
 
 Expected output:

@@ -380,7 +380,7 @@ int int4_w4a4_mma_sm120_full_n_bf16out(
       reinterpret_cast<const uint8_t*>(SFB),
       reinterpret_cast<__nv_bfloat16*>(D_bf16),
       alpha, N, K);
-  return 0;
+  return (cudaGetLastError() == cudaSuccess) ? 0 : 100;
 }
 
 int int4_quantize_bf16_sm120(
@@ -401,7 +401,7 @@ int int4_quantize_bf16_sm120(
       reinterpret_cast<uint8_t*>(out_sf_swizzled),
       reinterpret_cast<const float*>(global_scale),
       rows, K);
-  return 0;
+  return (cudaGetLastError() == cudaSuccess) ? 0 : 100;
 }
 
 int int4_global_scale_bf16_sm120(
@@ -416,13 +416,14 @@ int int4_global_scale_bf16_sm120(
       reinterpret_cast<const __nv_bfloat16*>(x_bf16),
       reinterpret_cast<float*>(scale_out),
       numel);
-  return 0;
+  return (cudaGetLastError() == cudaSuccess) ? 0 : 100;
 }
 
 int int4_w4a4_sm120_codebook_canary(cudaStream_t stream) {
   int* d_verdict = nullptr;
   if (cudaMalloc(&d_verdict, sizeof(int)) != cudaSuccess) return -1;
   int4_codebook_canary_kernel<<<1, 32, 0, stream>>>(d_verdict);
+  if (cudaGetLastError() != cudaSuccess) { cudaFree(d_verdict); return -1; }
   int verdict = -2;
   cudaError_t err = cudaMemcpyAsync(&verdict, d_verdict, sizeof(int),
                                     cudaMemcpyDeviceToHost, stream);
@@ -436,10 +437,15 @@ int int4_w4a4_sm120_codebook_canary(cudaStream_t stream) {
 }  // namespace flash_rt
 
 // ── extern "C" wrappers (ctypes / non-C++ backends, e.g. GGML) ────
+//
+// Prefixed `flashrt_int4_sm120_` so the unmangled global symbols do not
+// collide with a host application (e.g. llama.cpp / GGML) when this TU is
+// linked into or dlopen'd alongside it. The C++ entry points in the
+// header keep the `flash_rt::gemm` namespace.
 
 extern "C" {
 
-int int4_w4a4_full_n_bf16out(
+int flashrt_int4_sm120_w4a4_full_n_bf16out(
     const void* A, const void* B, void* D, int N, int K,
     const void* SFA, const void* SFB, float alpha, void* stream) {
   return flash_rt::gemm::int4_w4a4_mma_sm120_full_n_bf16out(
@@ -447,7 +453,7 @@ int int4_w4a4_full_n_bf16out(
       reinterpret_cast<cudaStream_t>(stream));
 }
 
-int int4_quantize_bf16(
+int flashrt_int4_sm120_quantize_bf16(
     const void* x, void* out_packed, void* out_sf,
     const void* global_scale, int rows, int K, void* stream) {
   return flash_rt::gemm::int4_quantize_bf16_sm120(
@@ -455,13 +461,13 @@ int int4_quantize_bf16(
       reinterpret_cast<cudaStream_t>(stream));
 }
 
-int int4_global_scale_bf16(
+int flashrt_int4_sm120_global_scale_bf16(
     const void* x, void* scale_out, long long numel, void* stream) {
   return flash_rt::gemm::int4_global_scale_bf16_sm120(
       x, scale_out, numel, reinterpret_cast<cudaStream_t>(stream));
 }
 
-int int4_codebook_canary(void* stream) {
+int flashrt_int4_sm120_codebook_canary(void* stream) {
   return flash_rt::gemm::int4_w4a4_sm120_codebook_canary(
       reinterpret_cast<cudaStream_t>(stream));
 }
