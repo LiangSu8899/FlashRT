@@ -8,6 +8,10 @@
 #include <sstream>
 #include <vector>
 
+#ifdef FLASHRT_CPP_HAS_OPENSSL
+#include <openssl/evp.h>
+#endif
+
 namespace flashrt {
 namespace loader {
 namespace {
@@ -149,20 +153,53 @@ bool sha256_file(const std::string& path, std::string* hex,
         if (error) *error = "unable to open file for SHA-256: " + path;
         return false;
     }
+#ifdef FLASHRT_CPP_HAS_OPENSSL
+    EVP_MD_CTX* context = EVP_MD_CTX_new();
+    if (!context || EVP_DigestInit_ex(context, EVP_sha256(), nullptr) != 1) {
+        if (context) EVP_MD_CTX_free(context);
+        if (error) *error = "unable to initialize SHA-256";
+        return false;
+    }
+#else
     Sha256 hash;
-    std::vector<unsigned char> buffer(1 << 20);
+#endif
+    std::vector<unsigned char> buffer(4 << 20);
     while (file) {
         file.read(reinterpret_cast<char*>(buffer.data()), buffer.size());
         const std::streamsize count = file.gcount();
         if (count > 0) {
+#ifdef FLASHRT_CPP_HAS_OPENSSL
+            if (EVP_DigestUpdate(context, buffer.data(),
+                                 static_cast<std::size_t>(count)) != 1) {
+                EVP_MD_CTX_free(context);
+                if (error) *error = "failed while hashing file: " + path;
+                return false;
+            }
+#else
             hash.update(buffer.data(), static_cast<std::size_t>(count));
+#endif
         }
     }
     if (!file.eof()) {
+#ifdef FLASHRT_CPP_HAS_OPENSSL
+        EVP_MD_CTX_free(context);
+#endif
         if (error) *error = "failed while reading file for SHA-256: " + path;
         return false;
     }
+#ifdef FLASHRT_CPP_HAS_OPENSSL
+    std::array<unsigned char, 32> digest{};
+    unsigned int digest_bytes = 0;
+    if (EVP_DigestFinal_ex(context, digest.data(), &digest_bytes) != 1 ||
+        digest_bytes != digest.size()) {
+        EVP_MD_CTX_free(context);
+        if (error) *error = "unable to finalize SHA-256";
+        return false;
+    }
+    EVP_MD_CTX_free(context);
+#else
     const auto digest = hash.finish();
+#endif
     std::ostringstream output;
     output << std::hex << std::setfill('0');
     for (unsigned char byte : digest) output << std::setw(2) << unsigned(byte);

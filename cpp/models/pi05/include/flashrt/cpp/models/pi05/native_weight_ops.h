@@ -30,6 +30,26 @@ modalities::Status load_native_float_tensor(
 modalities::Status native_to_bf16(const NativeFloatTensor& input,
                                   NativeBf16Tensor* out);
 
+modalities::Status native_f32_to_bf16(
+    const float* input,
+    const std::vector<std::uint64_t>& shape,
+    bool transpose,
+    NativeBf16Tensor* out);
+
+modalities::Status native_f32_fold_rms_columns_transpose(
+    const float* weight,
+    std::uint64_t rows,
+    std::uint64_t cols,
+    const NativeFloatTensor& norm,
+    NativeBf16Tensor* out);
+
+modalities::Status native_f32_round_scale_to_bf16(
+    const float* input,
+    const std::vector<std::uint64_t>& shape,
+    float scale,
+    bool transpose,
+    NativeBf16Tensor* out);
+
 modalities::Status native_round_to_bf16_float(
     const NativeFloatTensor& input,
     NativeFloatTensor* out);

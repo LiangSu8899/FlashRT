@@ -246,6 +246,29 @@ and FP32 encoder RMSNorm fold before the final BF16 rounding. Real-checkpoint
 gates compare the resulting BF16 bytes against PyTorch for both bare OpenPI
 keys and LeRobot `model.`-prefixed keys.
 
+Build native producers with `CMAKE_BUILD_TYPE=Release` for deployment. The
+Pi0.5 checkpoint stores F32 tensors, so setup converts and lays out independent
+weight ranges in parallel and writes the final BF16 payload directly instead
+of creating intermediate rounded and transposed F32 copies. These direct
+transforms are byte-compared with the reference multi-step transforms in the
+weight-op tests. Debug builds intentionally retain unoptimized setup code and
+are not a startup-latency reference.
+
+Checkpoint identity remains a full-file SHA-256, not a path, timestamp, or
+partial-content surrogate. When OpenSSL is available at configure time the
+loader uses its accelerated EVP implementation; the portable in-tree SHA-256
+remains the build fallback. Model hashing runs concurrently with independent
+weight materialization, and both must complete successfully before the runtime
+descriptor is published.
+
+For a 14.47 GB F32 Pi0.5 safetensors checkpoint on RTX 5090 SM120, the Release
+`pi05_native_open_probe` full lifecycle measured 9.47 seconds with a warm file
+cache and 10.91 seconds after evicting that file from the page cache. This
+scope includes identity hashing, weight conversion/upload, workspace setup,
+CUDA graph capture, one inference, and teardown. Compare producer startup
+using this complete scope; a Python `load_model` timer that excludes graph
+capture and identity construction is not the same metric.
+
 Materialized device weights use `frt_buffer` allocations owned by the native
 producer's `frt_ctx`. They are internal setup assets, not model ports and not
 capsule regions. Upload is complete before capture; duplicate logical names or

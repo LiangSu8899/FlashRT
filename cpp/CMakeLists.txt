@@ -150,6 +150,12 @@ add_library(flashrt_cpp_loader STATIC
 set_property(SOURCE loader/src/sha256.cpp APPEND PROPERTY COMPILE_OPTIONS -O2)
 target_include_directories(flashrt_cpp_loader
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/loader/include)
+find_package(OpenSSL QUIET)
+if(OpenSSL_FOUND)
+  target_compile_definitions(flashrt_cpp_loader
+    PRIVATE FLASHRT_CPP_HAS_OPENSSL=1)
+  target_link_libraries(flashrt_cpp_loader PRIVATE OpenSSL::Crypto)
+endif()
 
 set(FLASHRT_CPP_PI05_SRCS
   models/pi05/src/spec.cpp

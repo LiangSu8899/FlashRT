@@ -28,6 +28,24 @@ const std::string& vision_prefix() {
     return prefix;
 }
 
+const loader::SafetensorInfo* source_tensor(
+    const loader::SafetensorsFile& source,
+    const std::string& key) {
+    const loader::SafetensorInfo* tensor = source.find(key);
+    if (!tensor) tensor = source.find(std::string("model.") + key);
+    return tensor;
+}
+
+const float* f32_data(const loader::SafetensorsFile& source,
+                      const loader::SafetensorInfo* tensor) {
+    if (!tensor || tensor->dtype != "F32") return nullptr;
+    const void* data = source.data(*tensor);
+    if (reinterpret_cast<std::uintptr_t>(data) % alignof(float) != 0) {
+        return nullptr;
+    }
+    return static_cast<const float*>(data);
+}
+
 std::string layer_name(const char* stem, int layer) {
     return std::string(stem) + std::to_string(layer);
 }
@@ -53,6 +71,17 @@ modalities::Status NativeWeightMaterializer::upload(
 modalities::Status NativeWeightMaterializer::upload_rounded_transpose(
     const std::string& source_key,
     const std::string& destination_name) {
+    const loader::SafetensorInfo* info = source_tensor(source_, source_key);
+    if (destination_ && info && info->shape.size() == 2) {
+        const float* data = f32_data(source_, info);
+        if (data) {
+            NativeBf16Tensor converted;
+            modalities::Status st = native_f32_to_bf16(
+                data, info->shape, true, &converted);
+            if (!st.ok_status()) return st;
+            return destination_->upload(destination_name, converted);
+        }
+    }
     NativeFloatTensor source;
     NativeFloatTensor rounded;
     NativeFloatTensor transposed;
@@ -68,6 +97,17 @@ modalities::Status NativeWeightMaterializer::upload_rounded_transpose(
 modalities::Status NativeWeightMaterializer::upload_rounded_copy(
     const std::string& source_key,
     const std::string& destination_name) {
+    const loader::SafetensorInfo* info = source_tensor(source_, source_key);
+    if (destination_ && info) {
+        const float* data = f32_data(source_, info);
+        if (data) {
+            NativeBf16Tensor converted;
+            modalities::Status st = native_f32_to_bf16(
+                data, info->shape, false, &converted);
+            if (!st.ok_status()) return st;
+            return destination_->upload(destination_name, converted);
+        }
+    }
     NativeFloatTensor source;
     NativeFloatTensor rounded;
     modalities::Status st = load(source_key, &source);
@@ -81,6 +121,17 @@ modalities::Status NativeWeightMaterializer::upload_folded_transpose(
     const std::string& source_key,
     const NativeFloatTensor& norm,
     const std::string& destination_name) {
+    const loader::SafetensorInfo* info = source_tensor(source_, source_key);
+    if (destination_ && info && info->shape.size() == 2) {
+        const float* data = f32_data(source_, info);
+        if (data) {
+            NativeBf16Tensor converted;
+            modalities::Status st = native_f32_fold_rms_columns_transpose(
+                data, info->shape[0], info->shape[1], norm, &converted);
+            if (!st.ok_status()) return st;
+            return destination_->upload(destination_name, converted);
+        }
+    }
     NativeFloatTensor source;
     NativeFloatTensor folded;
     NativeFloatTensor transposed;
@@ -98,6 +149,17 @@ modalities::Status NativeWeightMaterializer::upload_rounded_scaled(
     const std::string& destination_name,
     float scale,
     bool transpose) {
+    const loader::SafetensorInfo* info = source_tensor(source_, source_key);
+    if (destination_ && info) {
+        const float* data = f32_data(source_, info);
+        if (data) {
+            NativeBf16Tensor converted;
+            modalities::Status st = native_f32_round_scale_to_bf16(
+                data, info->shape, scale, transpose, &converted);
+            if (!st.ok_status()) return st;
+            return destination_->upload(destination_name, converted);
+        }
+    }
     NativeFloatTensor source;
     NativeFloatTensor rounded;
     NativeFloatTensor arranged;

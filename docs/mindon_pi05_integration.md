@@ -86,6 +86,15 @@ materializes context-owned weights/workspace, captures one `infer` variant,
 and returns the integrated model runtime. Missing FA2/SentencePiece support or
 non-SM120 hardware returns unsupported instead of publishing unusable ports.
 
+Use a Release build for MindOn deployment. Native startup includes full-content
+checkpoint hashing and CUDA graph capture in addition to safetensors parsing
+and H2D weight upload, so time the complete `frt_model_runtime_open_v1` call and
+do not compare it directly with a Python weight-load-only timer. OpenSSL is an
+optional configure-time acceleration for SHA-256; builds without it retain the
+portable implementation with identical identity bytes. The model hash and
+weight materialization execute concurrently, but the factory publishes no
+runtime until both have succeeded.
+
 ## No-HTTP C++ Host Shape
 
 For same-process control loops, prefer Nexus embedded/session APIs over HTTP.

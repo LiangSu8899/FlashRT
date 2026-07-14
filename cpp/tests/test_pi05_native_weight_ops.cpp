@@ -138,6 +138,39 @@ int main() {
                flashrt::modalities::float_to_bfloat16(matrix.values[i]));
     }
 
+    NativeBf16Tensor direct;
+    assert(native_f32_to_bf16(matrix.values.data(), matrix.shape, false,
+                              &direct).ok_status());
+    assert(direct.shape == converted.shape &&
+           direct.values == converted.values);
+    assert(native_f32_to_bf16(matrix.values.data(), matrix.shape, true,
+                              &direct).ok_status());
+    NativeFloatTensor transposed;
+    NativeBf16Tensor transposed_bf16;
+    assert(native_transpose_2d(matrix, &transposed).ok_status());
+    assert(native_to_bf16(transposed, &transposed_bf16).ok_status());
+    assert(direct.shape == transposed_bf16.shape &&
+           direct.values == transposed_bf16.values);
+
+    assert(native_f32_fold_rms_columns_transpose(
+               matrix.values.data(), 2, 3, norm, &direct).ok_status());
+    NativeFloatTensor folded;
+    assert(native_fold_rms_columns(matrix, norm, &folded).ok_status());
+    assert(native_transpose_2d(folded, &transposed).ok_status());
+    assert(native_to_bf16(transposed, &transposed_bf16).ok_status());
+    assert(direct.shape == transposed_bf16.shape &&
+           direct.values == transposed_bf16.values);
+
+    constexpr float kScale = -0.1f;
+    assert(native_f32_round_scale_to_bf16(
+               unrounded.values.data(), unrounded.shape, kScale, false,
+               &direct).ok_status());
+    NativeFloatTensor rounded_scaled;
+    assert(native_scale(result, kScale, &rounded_scaled).ok_status());
+    assert(native_to_bf16(rounded_scaled, &converted).ok_status());
+    assert(direct.shape == converted.shape &&
+           direct.values == converted.values);
+
     assert(!native_interleave_qk_rows(matrix, 2, &result).ok_status());
     assert(!native_concat_columns(matrix, k, &result).ok_status());
     std::printf("PASS - Pi0.5 native weight transforms\n");

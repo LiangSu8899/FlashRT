@@ -11,6 +11,7 @@
 
 #include <climits>
 #include <cmath>
+#include <future>
 #include <memory>
 #include <sstream>
 
@@ -90,12 +91,23 @@ int build_native_model_runtime(const NativeOpenConfig& config,
     const std::string hardware_id =
         "sm" + std::to_string(properties.major * 10 + properties.minor);
 
-    std::string weights_sha256;
+    struct HashResult {
+        bool ok = false;
+        std::string digest;
+        std::string error;
+    };
+    const std::string weights_path =
+        config.checkpoint_path + "/model.safetensors";
+    std::future<HashResult> weights_hash = std::async(
+        std::launch::async, [weights_path] {
+            HashResult result;
+            result.ok = loader::sha256_file(
+                weights_path, &result.digest, &result.error);
+            return result;
+        });
     std::string tokenizer_sha256;
     std::string hash_error;
-    if (!loader::sha256_file(config.checkpoint_path + "/model.safetensors",
-                             &weights_sha256, &hash_error) ||
-        !loader::sha256_file(config.tokenizer_model_path, &tokenizer_sha256,
+    if (!loader::sha256_file(config.tokenizer_model_path, &tokenizer_sha256,
                              &hash_error)) {
         if (error) *error = hash_error;
         return -2;
@@ -113,6 +125,11 @@ int build_native_model_runtime(const NativeOpenConfig& config,
     if (!graph) {
         if (error) *error = st.message;
         return cface::status_code(st);
+    }
+    HashResult weights_sha256 = weights_hash.get();
+    if (!weights_sha256.ok) {
+        if (error) *error = weights_sha256.error;
+        return -2;
     }
 
     const NativeWorkspaceBuffer* images =
@@ -189,7 +206,7 @@ int build_native_model_runtime(const NativeOpenConfig& config,
          add_identity(builder, "pipeline", "NativeBf16") &&
          add_identity(builder, "hardware", hardware_id) &&
          add_identity(builder, "tensor_dtype", "bf16") &&
-         add_identity(builder, "weights_sha256", weights_sha256) &&
+         add_identity(builder, "weights_sha256", weights_sha256.digest) &&
          add_identity(builder, "tokenizer_sha256", tokenizer_sha256) &&
          add_identity(builder, "io", "native_v2") &&
          add_identity(builder, "state_prompt_mode", "fixed") &&
