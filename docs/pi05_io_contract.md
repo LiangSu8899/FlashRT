@@ -247,12 +247,15 @@ gates compare the resulting BF16 bytes against PyTorch for both bare OpenPI
 keys and LeRobot `model.`-prefixed keys.
 
 Build native producers with `CMAKE_BUILD_TYPE=Release` for deployment. The
-Pi0.5 checkpoint stores F32 tensors, so setup converts and lays out independent
-weight ranges in parallel and writes the final BF16 payload directly instead
-of creating intermediate rounded and transposed F32 copies. These direct
-transforms are byte-compared with the reference multi-step transforms in the
-weight-op tests. Debug builds intentionally retain unoptimized setup code and
-are not a startup-latency reference.
+native source view accepts F32, BF16, and F16 safetensors without materializing
+a checkpoint-sized float dictionary. Type dispatch occurs once per tensor;
+aligned payloads use typed loops and valid unaligned safetensors ranges use
+safe scalar reads. Plain copy/transpose preserves source BF16 bits. Conversion,
+RMS fold, Q/K interleave, QKV concat/transpose, patch OIHW-to-HWIO layout, and
+action scaling write the final BF16 payload directly. They do not create
+rounded, permuted, or concatenated F32 intermediates. Tests cover every source
+dtype, and real-checkpoint gates byte-compare all fused transform families with
+the PyTorch multi-step reference.
 
 Checkpoint identity remains a full-file SHA-256, not a path, timestamp, or
 partial-content surrogate. When OpenSSL is available at configure time the
@@ -261,13 +264,16 @@ remains the build fallback. Model hashing runs concurrently with independent
 weight materialization, and both must complete successfully before the runtime
 descriptor is published.
 
-For a 14.47 GB F32 Pi0.5 safetensors checkpoint on RTX 5090 SM120, the Release
-`pi05_native_open_probe` full lifecycle measured 9.47 seconds with a warm file
-cache and 10.91 seconds after evicting that file from the page cache. This
-scope includes identity hashing, weight conversion/upload, workspace setup,
-CUDA graph capture, one inference, and teardown. Compare producer startup
-using this complete scope; a Python `load_model` timer that excludes graph
-capture and identity construction is not the same metric.
+For a 14.47 GB F32 Pi0.5 safetensors checkpoint on RTX 5090 SM120, a Release
+validation run measured 3.52 seconds inside native setup and 4.54 seconds for
+the `pi05_native_open_probe` full lifecycle. The setup breakdown was 3.38
+seconds for weight materialization/upload, 91 ms for workspace/style setup,
+and 52 ms for CUDA graph capture. The full lifecycle additionally includes
+identity completion, one inference, output handling, and teardown. These are
+reference measurements, not a latency ABI. Use
+`FLASHRT_PROFILE_NATIVE_SETUP=1` to print the same setup phase breakdown on a
+deployment system. Compare producer startup using the complete scope; a Python
+timer that stops after safetensors conversion is not the same metric.
 
 Materialized device weights use `frt_buffer` allocations owned by the native
 producer's `frt_ctx`. They are internal setup assets, not model ports and not

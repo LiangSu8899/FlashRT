@@ -181,7 +181,12 @@ int main() {
         flashrt::models::pi05::NativeDeviceWeightStore destination(ctx);
         flashrt::models::pi05::NativeWeightMaterializer materializer(
             source, &destination);
-        assert(materializer.materialize_encoder_layer(0).ok_status());
+        const auto encoder_status = materializer.materialize_encoder_layer(0);
+        if (!encoder_status.ok_status()) {
+            std::fprintf(stderr, "encoder materialization failed: %s\n",
+                         encoder_status.message.c_str());
+        }
+        assert(encoder_status.ok_status());
         assert(destination.size() == 5);
         const auto* qkv = destination.find("encoder_attn_qkv_w_0");
         assert(qkv && qkv->shape == std::vector<std::uint64_t>({4, 24}));

@@ -5,6 +5,9 @@
 
 #include <cuda_runtime_api.h>
 
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <new>
 
 namespace flashrt {
@@ -82,11 +85,24 @@ std::unique_ptr<NativeGraphOwner> NativeGraphOwner::create(
 
 modalities::Status NativeGraphOwner::initialize(
     const std::string& checkpoint_path) {
+    const bool profile_setup = std::getenv("FLASHRT_PROFILE_NATIVE_SETUP");
+    const auto setup_begin = std::chrono::steady_clock::now();
+    auto checkpoint = setup_begin;
+    const auto report = [&](const char* phase) {
+        const auto now = std::chrono::steady_clock::now();
+        if (profile_setup) {
+            std::fprintf(stderr, "native_setup %s_ms=%.3f\n", phase,
+                         std::chrono::duration<double, std::milli>(
+                             now - checkpoint).count());
+        }
+        checkpoint = now;
+    };
     loader::SafetensorsFile source;
     if (!source.open(checkpoint_path + "/model.safetensors")) {
         return modalities::Status::error(modalities::StatusCode::kNotFound,
                                          source.error());
     }
+    report("header");
     NativeWeightMaterializer materializer(source, &weights_);
     NativeMaterializationOptions options;
     options.num_steps = config_.num_steps;
@@ -94,6 +110,7 @@ modalities::Status NativeGraphOwner::initialize(
     options.include_embedding = true;
     modalities::Status st = materializer.materialize_all(options);
     if (!st.ok_status()) return st;
+    report("materialize");
 
     NativeWorkspaceConfig workspace_config;
     workspace_config.num_views = config_.num_views;
@@ -127,6 +144,7 @@ modalities::Status NativeGraphOwner::initialize(
     }
     st = attention_driver_->status();
     if (!st.ok_status()) return st;
+    report("workspace_style");
 
     for (const char* name : {"observation_images_normalized",
                              "prompt_embedding", "diffusion_noise"}) {
@@ -140,6 +158,7 @@ modalities::Status NativeGraphOwner::initialize(
     if (cudaDeviceSynchronize() != cudaSuccess) {
         return backend("native graph setup synchronization failed");
     }
+    report("input_init");
 
     infer_graph_ = frt_graph_create(ctx_, "infer", 1);
     const NativeWorkspaceBuffer* images =
@@ -166,6 +185,7 @@ modalities::Status NativeGraphOwner::initialize(
                    ? backend("native full graph variant is missing")
                    : capture_status_;
     }
+    report("capture");
 
     cudaStream_t stream = nullptr;
     if (cudaStreamCreate(&stream) != cudaSuccess) {
@@ -174,6 +194,13 @@ modalities::Status NativeGraphOwner::initialize(
     replay_stream_ = stream;
     stream_id_ = frt_ctx_wrap_stream(ctx_, replay_stream_);
     if (stream_id_ < 0) return backend("native replay stream wrapping failed");
+    report("stream");
+    if (profile_setup) {
+        const auto now = std::chrono::steady_clock::now();
+        std::fprintf(stderr, "native_setup total_ms=%.3f\n",
+                     std::chrono::duration<double, std::milli>(
+                         now - setup_begin).count());
+    }
     return modalities::Status::ok();
 }
 

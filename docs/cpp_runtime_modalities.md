@@ -82,8 +82,10 @@ Current Pi0.5 status:
   resize/normalize/cast directly into export device buffers;
 - conservative action staging path: device action buffer -> D2H -> CPU
   reference postprocess;
-- native checkpoint loader/tokenizer/capture is not implemented yet. It will
-  become a producer for the same `frt_runtime_export_v1`, not a Nexus feature.
+- native SM120 checkpoint loading, tokenizer/prompt staging, weight
+  materialization, and graph capture are implemented by the optional
+  `frt_model_runtime_open_v1` producer. They present the same model-runtime ABI
+  and remain FlashRT responsibilities, not Nexus features.
 
 ## CPU Reference First
 

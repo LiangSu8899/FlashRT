@@ -22,6 +22,61 @@ struct NativeBf16Tensor {
     std::vector<std::uint16_t> values;
 };
 
+enum class NativeSourceDType {
+    kF32,
+    kBf16,
+    kF16,
+};
+
+struct NativeSourceTensorView {
+    const void* data = nullptr;
+    std::vector<std::uint64_t> shape;
+    NativeSourceDType dtype = NativeSourceDType::kF32;
+};
+
+modalities::Status load_native_source_tensor(
+    const loader::SafetensorsFile& file,
+    const std::string& key,
+    NativeSourceTensorView* out);
+
+modalities::Status native_source_to_bf16(
+    const NativeSourceTensorView& input,
+    bool transpose,
+    NativeBf16Tensor* out);
+
+modalities::Status native_source_fold_rms_columns_transpose(
+    const NativeSourceTensorView& weight,
+    const NativeFloatTensor& norm,
+    NativeBf16Tensor* out);
+
+modalities::Status native_source_round_scale_to_bf16(
+    const NativeSourceTensorView& input,
+    float scale,
+    bool transpose,
+    NativeBf16Tensor* out);
+
+modalities::Status native_source_qkv_to_bf16(
+    const NativeSourceTensorView& q,
+    const NativeSourceTensorView& k,
+    const NativeSourceTensorView& v,
+    std::uint64_t q_heads,
+    std::uint64_t k_heads,
+    const NativeFloatTensor* norm,
+    NativeBf16Tensor* out);
+
+modalities::Status native_source_concat_vectors_to_bf16(
+    const std::vector<const NativeSourceTensorView*>& inputs,
+    NativeBf16Tensor* out);
+
+modalities::Status native_source_patch_oihw_to_hwio_bf16(
+    const NativeSourceTensorView& input,
+    NativeBf16Tensor* out);
+
+modalities::Status native_source_pair_transpose_concat_bf16(
+    const NativeSourceTensorView& left,
+    const NativeSourceTensorView& right,
+    NativeBf16Tensor* out);
+
 modalities::Status load_native_float_tensor(
     const loader::SafetensorsFile& file,
     const std::string& key,
@@ -29,26 +84,6 @@ modalities::Status load_native_float_tensor(
 
 modalities::Status native_to_bf16(const NativeFloatTensor& input,
                                   NativeBf16Tensor* out);
-
-modalities::Status native_f32_to_bf16(
-    const float* input,
-    const std::vector<std::uint64_t>& shape,
-    bool transpose,
-    NativeBf16Tensor* out);
-
-modalities::Status native_f32_fold_rms_columns_transpose(
-    const float* weight,
-    std::uint64_t rows,
-    std::uint64_t cols,
-    const NativeFloatTensor& norm,
-    NativeBf16Tensor* out);
-
-modalities::Status native_f32_round_scale_to_bf16(
-    const float* input,
-    const std::vector<std::uint64_t>& shape,
-    float scale,
-    bool transpose,
-    NativeBf16Tensor* out);
 
 modalities::Status native_round_to_bf16_float(
     const NativeFloatTensor& input,

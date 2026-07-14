@@ -212,7 +212,7 @@ model = flash_rt.load_model(
 | `num_views` | `int` | `2` | Number of camera views. LIBERO uses 2 (base + wrist). |
 | `autotune` | `int\|bool` | `3` | CUDA Graph autotune intensity. See [Autotune](#autotune). |
 | `recalibrate` | `bool` | `False` | Force fresh FP8 calibration (and weight cache for JAX), ignoring cache. See [Calibration](#calibration). |
-| `weight_cache` | `bool` | `True` | Cache FP8-quantized weights to disk. **JAX only** — reduces cold start from ~42s to ~6s. Torch loads in ~3s and ignores this. See [Weight Cache](#weight-cache-jax-only). |
+| `weight_cache` | `bool` | `True` | Cache FP8-quantized weights to disk. **JAX only** — reduces cold start from ~42s to ~6s. Torch loads in ~3s and ignores this. See [Python JAX Weight Cache](#python-jax-weight-cache). |
 | `config` | `str` | `"pi05"` | Model architecture config: `"pi05"`, `"pi0"`, `"groot"`, `"groot_n17"`, `"pi0fast"`, `"motus"`, `"wan22_ti2v_5b"`, `"cosmos3_video"`. `"cosmos3_video"` is a non-VLA text2video denoise model — drive it with `set_prompt(ref=...)` + `infer(...)`, not `predict()`. |
 | `decode_cuda_graph` | `bool` | `False` | **Pi0-FAST only.** Capture action-phase decode as CUDA Graph. Trades startup time for per-token speed. See [Pi0-FAST](#pi0-fast). |
 | `decode_graph_steps` | `int` | `80` | **Pi0-FAST only.** Number of action tokens to capture in the decode graph. Should cover your longest expected action sequence. |
@@ -1155,7 +1155,7 @@ actions = model.predict(images=[img3, img4], prompt="task B")  # fresh calibrati
 
 ---
 
-## Weight Cache (JAX only)
+## Python JAX Weight Cache
 
 JAX (Orbax) checkpoint loading takes ~42s due to OCDBT deserialization + weight transform + FP8 quantization. The weight cache saves the final FP8-quantized engine weights to disk after first load, so subsequent loads skip all three steps.
 
@@ -1163,10 +1163,18 @@ JAX (Orbax) checkpoint loading takes ~42s due to OCDBT deserialization + weight 
 
 | Framework | Cold start | Bottleneck |
 |-----------|-----------|------------|
-| **Torch** (safetensors) | ~3s | mmap load — already fast |
+| **Python Torch** (safetensors) | ~3s | mmap-backed conversion and GPU upload |
 | **JAX** (Orbax) | ~42s → **~6s with cache** | OCDBT deserialize + transform + FP8 quant |
 
-Torch uses safetensors which is essentially a flat binary mmap — there's nothing to cache. JAX's Orbax format requires complex deserialization that the weight cache eliminates.
+This cache belongs to the Python JAX producer. Python Torch uses a flat,
+mmap-backed safetensors source and does not write this cache. That does not mean
+that mmap alone completes model startup: layout transforms, dtype conversion,
+GPU upload, identity construction, workspace setup, and graph capture still
+belong to the selected producer. The native C++ producer fuses its safetensors
+conversion and layout transforms and reports complete setup phases with
+`FLASHRT_PROFILE_NATIVE_SETUP=1`; it does not consume the JAX cache format.
+JAX's Orbax format requires the additional deserialization work that this cache
+eliminates.
 
 ### How it works
 

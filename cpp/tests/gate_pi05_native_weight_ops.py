@@ -83,6 +83,20 @@ def main() -> None:
     up = bf16(f"{DECODER}.mlp.up_proj.weight").t()
     expected["decoder_gate_up0"] = torch.cat([gate, up], dim=1).contiguous()
 
+    expected["encoder_o0_fast"] = bf16(
+        f"{ENCODER}.self_attn.o_proj.weight"
+    ).t().contiguous()
+    ffn_norm = 1.0 + raw(
+        f"{ENCODER}.post_attention_layernorm.weight"
+    ).float()
+    expected["encoder_gate0_fast"] = (
+        raw(f"{ENCODER}.mlp.gate_proj.weight").float()
+        * ffn_norm.unsqueeze(0)
+    ).t().to(torch.bfloat16).contiguous()
+    expected["decoder_mod_bias0_fast"] = bf16(
+        f"{DECODER}.input_layernorm.dense.bias"
+    ).contiguous()
+
     def time_embeds(num_steps: int) -> torch.Tensor:
         fraction = torch.linspace(0.0, 1.0, 512)
         period = 4e-3 * (4.0 / 4e-3) ** fraction

@@ -1,5 +1,8 @@
 #include "flashrt/cpp/models/pi05/native_weight_materializer.h"
 
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <string>
 
 namespace flashrt {
@@ -28,24 +31,6 @@ const std::string& vision_prefix() {
     return prefix;
 }
 
-const loader::SafetensorInfo* source_tensor(
-    const loader::SafetensorsFile& source,
-    const std::string& key) {
-    const loader::SafetensorInfo* tensor = source.find(key);
-    if (!tensor) tensor = source.find(std::string("model.") + key);
-    return tensor;
-}
-
-const float* f32_data(const loader::SafetensorsFile& source,
-                      const loader::SafetensorInfo* tensor) {
-    if (!tensor || tensor->dtype != "F32") return nullptr;
-    const void* data = source.data(*tensor);
-    if (reinterpret_cast<std::uintptr_t>(data) % alignof(float) != 0) {
-        return nullptr;
-    }
-    return static_cast<const float*>(data);
-}
-
 std::string layer_name(const char* stem, int layer) {
     return std::string(stem) + std::to_string(layer);
 }
@@ -71,77 +56,44 @@ modalities::Status NativeWeightMaterializer::upload(
 modalities::Status NativeWeightMaterializer::upload_rounded_transpose(
     const std::string& source_key,
     const std::string& destination_name) {
-    const loader::SafetensorInfo* info = source_tensor(source_, source_key);
-    if (destination_ && info && info->shape.size() == 2) {
-        const float* data = f32_data(source_, info);
-        if (data) {
-            NativeBf16Tensor converted;
-            modalities::Status st = native_f32_to_bf16(
-                data, info->shape, true, &converted);
-            if (!st.ok_status()) return st;
-            return destination_->upload(destination_name, converted);
-        }
-    }
-    NativeFloatTensor source;
-    NativeFloatTensor rounded;
-    NativeFloatTensor transposed;
-    modalities::Status st = load(source_key, &source);
+    if (!destination_) return invalid("native weight destination is null");
+    NativeSourceTensorView source;
+    NativeBf16Tensor converted;
+    modalities::Status st =
+        load_native_source_tensor(source_, source_key, &source);
     if (!st.ok_status()) return st;
-    st = native_round_to_bf16_float(source, &rounded);
+    st = native_source_to_bf16(source, true, &converted);
     if (!st.ok_status()) return st;
-    st = native_transpose_2d(rounded, &transposed);
-    if (!st.ok_status()) return st;
-    return upload(destination_name, transposed);
+    return destination_->upload(destination_name, converted);
 }
 
 modalities::Status NativeWeightMaterializer::upload_rounded_copy(
     const std::string& source_key,
     const std::string& destination_name) {
-    const loader::SafetensorInfo* info = source_tensor(source_, source_key);
-    if (destination_ && info) {
-        const float* data = f32_data(source_, info);
-        if (data) {
-            NativeBf16Tensor converted;
-            modalities::Status st = native_f32_to_bf16(
-                data, info->shape, false, &converted);
-            if (!st.ok_status()) return st;
-            return destination_->upload(destination_name, converted);
-        }
-    }
-    NativeFloatTensor source;
-    NativeFloatTensor rounded;
-    modalities::Status st = load(source_key, &source);
+    if (!destination_) return invalid("native weight destination is null");
+    NativeSourceTensorView source;
+    NativeBf16Tensor converted;
+    modalities::Status st =
+        load_native_source_tensor(source_, source_key, &source);
     if (!st.ok_status()) return st;
-    st = native_round_to_bf16_float(source, &rounded);
+    st = native_source_to_bf16(source, false, &converted);
     if (!st.ok_status()) return st;
-    return upload(destination_name, rounded);
+    return destination_->upload(destination_name, converted);
 }
 
 modalities::Status NativeWeightMaterializer::upload_folded_transpose(
     const std::string& source_key,
     const NativeFloatTensor& norm,
     const std::string& destination_name) {
-    const loader::SafetensorInfo* info = source_tensor(source_, source_key);
-    if (destination_ && info && info->shape.size() == 2) {
-        const float* data = f32_data(source_, info);
-        if (data) {
-            NativeBf16Tensor converted;
-            modalities::Status st = native_f32_fold_rms_columns_transpose(
-                data, info->shape[0], info->shape[1], norm, &converted);
-            if (!st.ok_status()) return st;
-            return destination_->upload(destination_name, converted);
-        }
-    }
-    NativeFloatTensor source;
-    NativeFloatTensor folded;
-    NativeFloatTensor transposed;
-    modalities::Status st = load(source_key, &source);
+    if (!destination_) return invalid("native weight destination is null");
+    NativeSourceTensorView source;
+    NativeBf16Tensor converted;
+    modalities::Status st =
+        load_native_source_tensor(source_, source_key, &source);
     if (!st.ok_status()) return st;
-    st = native_fold_rms_columns(source, norm, &folded);
+    st = native_source_fold_rms_columns_transpose(source, norm, &converted);
     if (!st.ok_status()) return st;
-    st = native_transpose_2d(folded, &transposed);
-    if (!st.ok_status()) return st;
-    return upload(destination_name, transposed);
+    return destination_->upload(destination_name, converted);
 }
 
 modalities::Status NativeWeightMaterializer::upload_rounded_scaled(
@@ -149,34 +101,16 @@ modalities::Status NativeWeightMaterializer::upload_rounded_scaled(
     const std::string& destination_name,
     float scale,
     bool transpose) {
-    const loader::SafetensorInfo* info = source_tensor(source_, source_key);
-    if (destination_ && info) {
-        const float* data = f32_data(source_, info);
-        if (data) {
-            NativeBf16Tensor converted;
-            modalities::Status st = native_f32_round_scale_to_bf16(
-                data, info->shape, scale, transpose, &converted);
-            if (!st.ok_status()) return st;
-            return destination_->upload(destination_name, converted);
-        }
-    }
-    NativeFloatTensor source;
-    NativeFloatTensor rounded;
-    NativeFloatTensor arranged;
-    NativeFloatTensor scaled;
-    modalities::Status st = load(source_key, &source);
+    if (!destination_) return invalid("native weight destination is null");
+    NativeSourceTensorView source;
+    NativeBf16Tensor converted;
+    modalities::Status st =
+        load_native_source_tensor(source_, source_key, &source);
     if (!st.ok_status()) return st;
-    st = native_round_to_bf16_float(source, &rounded);
+    st = native_source_round_scale_to_bf16(
+        source, scale, transpose, &converted);
     if (!st.ok_status()) return st;
-    if (transpose) {
-        st = native_transpose_2d(rounded, &arranged);
-        if (!st.ok_status()) return st;
-    } else {
-        arranged = std::move(rounded);
-    }
-    st = native_scale(arranged, scale, &scaled);
-    if (!st.ok_status()) return st;
-    return upload(destination_name, scaled);
+    return destination_->upload(destination_name, converted);
 }
 
 modalities::Status NativeWeightMaterializer::materialize_encoder_layer(
@@ -189,34 +123,22 @@ modalities::Status NativeWeightMaterializer::materialize_encoder_layer(
     modalities::Status st = load(prefix + ".input_layernorm.weight", &norm);
     if (!st.ok_status()) return st;
 
-    NativeFloatTensor q;
-    NativeFloatTensor k;
-    NativeFloatTensor v;
-    NativeFloatTensor qi;
-    NativeFloatTensor ki;
-    NativeFloatTensor qf;
-    NativeFloatTensor kf;
-    NativeFloatTensor vf;
-    NativeFloatTensor qkv;
-    st = load(prefix + ".self_attn.q_proj.weight", &q);
+    NativeSourceTensorView q;
+    NativeSourceTensorView k;
+    NativeSourceTensorView v;
+    NativeBf16Tensor qkv;
+    st = load_native_source_tensor(
+        source_, prefix + ".self_attn.q_proj.weight", &q);
     if (!st.ok_status()) return st;
-    st = load(prefix + ".self_attn.k_proj.weight", &k);
+    st = load_native_source_tensor(
+        source_, prefix + ".self_attn.k_proj.weight", &k);
     if (!st.ok_status()) return st;
-    st = load(prefix + ".self_attn.v_proj.weight", &v);
+    st = load_native_source_tensor(
+        source_, prefix + ".self_attn.v_proj.weight", &v);
     if (!st.ok_status()) return st;
-    st = native_interleave_qk_rows(q, 8, &qi);
+    st = native_source_qkv_to_bf16(q, k, v, 8, 1, &norm, &qkv);
     if (!st.ok_status()) return st;
-    st = native_interleave_qk_rows(k, 1, &ki);
-    if (!st.ok_status()) return st;
-    st = native_fold_rms_columns(qi, norm, &qf);
-    if (!st.ok_status()) return st;
-    st = native_fold_rms_columns(ki, norm, &kf);
-    if (!st.ok_status()) return st;
-    st = native_fold_rms_columns(v, norm, &vf);
-    if (!st.ok_status()) return st;
-    st = native_concat_rows_transpose({&qf, &kf, &vf}, &qkv);
-    if (!st.ok_status()) return st;
-    st = upload(layer_name("encoder_attn_qkv_w_", layer), qkv);
+    st = destination_->upload(layer_name("encoder_attn_qkv_w_", layer), qkv);
     if (!st.ok_status()) return st;
 
     st = upload_rounded_transpose(
@@ -246,34 +168,22 @@ modalities::Status NativeWeightMaterializer::materialize_decoder_layer(
         return invalid("Pi0.5 decoder layer index is invalid");
     }
     const std::string prefix = decoder_prefix(layer);
-    NativeFloatTensor q;
-    NativeFloatTensor k;
-    NativeFloatTensor v;
-    NativeFloatTensor qr;
-    NativeFloatTensor kr;
-    NativeFloatTensor vr;
-    NativeFloatTensor qi;
-    NativeFloatTensor ki;
-    NativeFloatTensor qkv;
-    modalities::Status st = load(prefix + ".self_attn.q_proj.weight", &q);
+    NativeSourceTensorView q;
+    NativeSourceTensorView k;
+    NativeSourceTensorView v;
+    NativeBf16Tensor qkv;
+    modalities::Status st = load_native_source_tensor(
+        source_, prefix + ".self_attn.q_proj.weight", &q);
     if (!st.ok_status()) return st;
-    st = load(prefix + ".self_attn.k_proj.weight", &k);
+    st = load_native_source_tensor(
+        source_, prefix + ".self_attn.k_proj.weight", &k);
     if (!st.ok_status()) return st;
-    st = load(prefix + ".self_attn.v_proj.weight", &v);
+    st = load_native_source_tensor(
+        source_, prefix + ".self_attn.v_proj.weight", &v);
     if (!st.ok_status()) return st;
-    st = native_round_to_bf16_float(q, &qr);
+    st = native_source_qkv_to_bf16(q, k, v, 8, 1, nullptr, &qkv);
     if (!st.ok_status()) return st;
-    st = native_round_to_bf16_float(k, &kr);
-    if (!st.ok_status()) return st;
-    st = native_round_to_bf16_float(v, &vr);
-    if (!st.ok_status()) return st;
-    st = native_interleave_qk_rows(qr, 8, &qi);
-    if (!st.ok_status()) return st;
-    st = native_interleave_qk_rows(kr, 1, &ki);
-    if (!st.ok_status()) return st;
-    st = native_concat_rows_transpose({&qi, &ki, &vr}, &qkv);
-    if (!st.ok_status()) return st;
-    st = upload(layer_name("decoder_attn_qkv_w_", layer), qkv);
+    st = destination_->upload(layer_name("decoder_attn_qkv_w_", layer), qkv);
     if (!st.ok_status()) return st;
 
     st = upload_rounded_transpose(
@@ -281,33 +191,28 @@ modalities::Status NativeWeightMaterializer::materialize_decoder_layer(
         layer_name("decoder_attn_o_w_", layer));
     if (!st.ok_status()) return st;
 
-    NativeFloatTensor gate;
-    NativeFloatTensor up;
-    NativeFloatTensor gate_rounded;
-    NativeFloatTensor up_rounded;
-    NativeFloatTensor gate_t;
-    NativeFloatTensor up_t;
-    st = load(prefix + ".mlp.gate_proj.weight", &gate);
+    st = upload_rounded_transpose(
+        prefix + ".mlp.gate_proj.weight",
+        layer_name("decoder_ffn_gate_w_", layer));
     if (!st.ok_status()) return st;
-    st = load(prefix + ".mlp.up_proj.weight", &up);
-    if (!st.ok_status()) return st;
-    st = native_round_to_bf16_float(gate, &gate_rounded);
-    if (!st.ok_status()) return st;
-    st = native_round_to_bf16_float(up, &up_rounded);
-    if (!st.ok_status()) return st;
-    st = native_transpose_2d(gate_rounded, &gate_t);
-    if (!st.ok_status()) return st;
-    st = native_transpose_2d(up_rounded, &up_t);
-    if (!st.ok_status()) return st;
-    st = upload(layer_name("decoder_ffn_gate_w_", layer), gate_t);
-    if (!st.ok_status()) return st;
-    st = upload(layer_name("decoder_ffn_up_w_", layer), up_t);
+    st = upload_rounded_transpose(
+        prefix + ".mlp.up_proj.weight",
+        layer_name("decoder_ffn_up_w_", layer));
     if (!st.ok_status()) return st;
     if (merge_gate_up) {
-        NativeFloatTensor gate_up;
-        st = native_concat_columns(gate_t, up_t, &gate_up);
+        NativeSourceTensorView gate;
+        NativeSourceTensorView up;
+        NativeBf16Tensor gate_up;
+        st = load_native_source_tensor(
+            source_, prefix + ".mlp.gate_proj.weight", &gate);
         if (!st.ok_status()) return st;
-        st = upload(layer_name("decoder_ffn_gate_up_w_", layer), gate_up);
+        st = load_native_source_tensor(
+            source_, prefix + ".mlp.up_proj.weight", &up);
+        if (!st.ok_status()) return st;
+        st = native_source_pair_transpose_concat_bf16(gate, up, &gate_up);
+        if (!st.ok_status()) return st;
+        st = destination_->upload(
+            layer_name("decoder_ffn_gate_up_w_", layer), gate_up);
         if (!st.ok_status()) return st;
     }
     st = upload_rounded_transpose(
@@ -339,45 +244,36 @@ modalities::Status NativeWeightMaterializer::materialize_vision_layer(
     }
     const std::string prefix = vision_prefix() + ".encoder.layers." +
                                std::to_string(layer);
-    NativeFloatTensor q;
-    NativeFloatTensor k;
-    NativeFloatTensor v;
-    NativeFloatTensor qr;
-    NativeFloatTensor kr;
-    NativeFloatTensor vr;
-    NativeFloatTensor qkv;
-    modalities::Status st = load(prefix + ".self_attn.q_proj.weight", &q);
+    NativeSourceTensorView q;
+    NativeSourceTensorView k;
+    NativeSourceTensorView v;
+    NativeBf16Tensor qkv;
+    modalities::Status st = load_native_source_tensor(
+        source_, prefix + ".self_attn.q_proj.weight", &q);
     if (!st.ok_status()) return st;
-    st = load(prefix + ".self_attn.k_proj.weight", &k);
+    st = load_native_source_tensor(
+        source_, prefix + ".self_attn.k_proj.weight", &k);
     if (!st.ok_status()) return st;
-    st = load(prefix + ".self_attn.v_proj.weight", &v);
+    st = load_native_source_tensor(
+        source_, prefix + ".self_attn.v_proj.weight", &v);
     if (!st.ok_status()) return st;
-    st = native_round_to_bf16_float(q, &qr);
+    st = native_source_qkv_to_bf16(q, k, v, 0, 0, nullptr, &qkv);
     if (!st.ok_status()) return st;
-    st = native_round_to_bf16_float(k, &kr);
-    if (!st.ok_status()) return st;
-    st = native_round_to_bf16_float(v, &vr);
-    if (!st.ok_status()) return st;
-    st = native_concat_rows_transpose({&qr, &kr, &vr}, &qkv);
-    if (!st.ok_status()) return st;
-    st = upload(layer_name("vision_attn_qkv_w_", layer), qkv);
+    st = destination_->upload(layer_name("vision_attn_qkv_w_", layer), qkv);
     if (!st.ok_status()) return st;
 
-    st = load(prefix + ".self_attn.q_proj.bias", &q);
+    st = load_native_source_tensor(
+        source_, prefix + ".self_attn.q_proj.bias", &q);
     if (!st.ok_status()) return st;
-    st = load(prefix + ".self_attn.k_proj.bias", &k);
+    st = load_native_source_tensor(
+        source_, prefix + ".self_attn.k_proj.bias", &k);
     if (!st.ok_status()) return st;
-    st = load(prefix + ".self_attn.v_proj.bias", &v);
+    st = load_native_source_tensor(
+        source_, prefix + ".self_attn.v_proj.bias", &v);
     if (!st.ok_status()) return st;
-    st = native_round_to_bf16_float(q, &qr);
+    st = native_source_concat_vectors_to_bf16({&q, &k, &v}, &qkv);
     if (!st.ok_status()) return st;
-    st = native_round_to_bf16_float(k, &kr);
-    if (!st.ok_status()) return st;
-    st = native_round_to_bf16_float(v, &vr);
-    if (!st.ok_status()) return st;
-    st = native_concat_vectors({&qr, &kr, &vr}, &qkv);
-    if (!st.ok_status()) return st;
-    st = upload(layer_name("vision_attn_qkv_b_", layer), qkv);
+    st = destination_->upload(layer_name("vision_attn_qkv_b_", layer), qkv);
     if (!st.ok_status()) return st;
 
     const struct {
@@ -412,17 +308,14 @@ modalities::Status NativeWeightMaterializer::materialize_vision_layer(
 modalities::Status NativeWeightMaterializer::materialize_vision_globals() {
     if (!destination_) return invalid("native weight destination is null");
     const std::string prefix = vision_prefix();
-    NativeFloatTensor patch;
-    NativeFloatTensor rounded;
-    NativeFloatTensor permuted;
-    modalities::Status st = load(
-        prefix + ".embeddings.patch_embedding.weight", &patch);
+    NativeSourceTensorView patch;
+    NativeBf16Tensor permuted;
+    modalities::Status st = load_native_source_tensor(
+        source_, prefix + ".embeddings.patch_embedding.weight", &patch);
     if (!st.ok_status()) return st;
-    st = native_round_to_bf16_float(patch, &rounded);
+    st = native_source_patch_oihw_to_hwio_bf16(patch, &permuted);
     if (!st.ok_status()) return st;
-    st = native_patch_oihw_to_hwio(rounded, &permuted);
-    if (!st.ok_status()) return st;
-    st = upload("vision_patch_embedding_w", permuted);
+    st = destination_->upload("vision_patch_embedding_w", permuted);
     if (!st.ok_status()) return st;
     st = upload_rounded_copy(prefix + ".embeddings.patch_embedding.bias",
                              "vision_patch_embedding_b");
@@ -504,24 +397,41 @@ modalities::Status NativeWeightMaterializer::materialize_all(
     if (!destination_ || options.num_steps <= 0) {
         return invalid("Pi0.5 materialization options are invalid");
     }
+    const bool profile = std::getenv("FLASHRT_PROFILE_NATIVE_SETUP");
+    auto checkpoint = std::chrono::steady_clock::now();
+    const auto report = [&](const char* phase) {
+        const auto now = std::chrono::steady_clock::now();
+        if (profile) {
+            std::fprintf(stderr, "native_weights %s_ms=%.3f\n", phase,
+                         std::chrono::duration<double, std::milli>(
+                             now - checkpoint).count());
+        }
+        checkpoint = now;
+    };
     modalities::Status st = materialize_vision_globals();
     if (!st.ok_status()) return st;
     for (int layer = 0; layer < 27; ++layer) {
         st = materialize_vision_layer(layer);
         if (!st.ok_status()) return st;
     }
+    report("vision");
     for (int layer = 0; layer < 18; ++layer) {
         st = materialize_encoder_layer(layer);
         if (!st.ok_status()) return st;
     }
+    report("encoder");
     for (int layer = 0; layer < 18; ++layer) {
         st = materialize_decoder_layer(
             layer, options.merge_decoder_gate_up);
         if (!st.ok_status()) return st;
     }
+    report("decoder");
     st = materialize_decoder_globals(options.num_steps);
     if (!st.ok_status() || !options.include_embedding) return st;
-    return materialize_embedding();
+    report("globals");
+    st = materialize_embedding();
+    report("embedding");
+    return st;
 }
 
 }  // namespace pi05

@@ -47,7 +47,7 @@ void parallel_ranges(std::size_t count,
     const std::size_t wanted =
         (count + minimum_items - 1) / minimum_items;
     const std::size_t workers = std::max<std::size_t>(
-        1, std::min<std::size_t>({16, available ? available : 1, wanted}));
+        1, std::min<std::size_t>({32, available ? available : 1, wanted}));
     if (workers == 1) {
         fn(0, count);
         return;
@@ -63,6 +63,45 @@ void parallel_ranges(std::size_t count,
     for (std::thread& thread : threads) thread.join();
 }
 
+template <typename T, typename Fn>
+void tiled_transform_transpose(std::size_t rows,
+                               std::size_t cols,
+                               std::size_t output_rows,
+                               std::size_t output_row_offset,
+                               T* output,
+                               const Fn& transform) {
+    constexpr std::size_t kTile = 32;
+    const std::size_t row_tiles = (rows + kTile - 1) / kTile;
+    parallel_ranges(row_tiles, 2, [&](std::size_t first,
+                                      std::size_t last) {
+        for (std::size_t tile = first; tile < last; ++tile) {
+            const std::size_t row_begin = tile * kTile;
+            const std::size_t row_end = std::min(rows, row_begin + kTile);
+            T scratch[kTile * kTile];
+            for (std::size_t col_begin = 0; col_begin < cols;
+                 col_begin += kTile) {
+                const std::size_t col_end =
+                    std::min(cols, col_begin + kTile);
+                for (std::size_t row = row_begin; row < row_end; ++row) {
+                    for (std::size_t col = col_begin; col < col_end; ++col) {
+                        scratch[(row - row_begin) * kTile +
+                                (col - col_begin)] = transform(row, col);
+                    }
+                }
+                for (std::size_t col = col_begin; col < col_end; ++col) {
+                    T* destination = output + col * output_rows +
+                                     output_row_offset + row_begin;
+                    for (std::size_t row = row_begin; row < row_end; ++row) {
+                        destination[row - row_begin] =
+                            scratch[(row - row_begin) * kTile +
+                                    (col - col_begin)];
+                    }
+                }
+            }
+        }
+    });
+}
+
 const loader::SafetensorInfo* find_source_tensor(
     const loader::SafetensorsFile& file,
     const std::string& key) {
@@ -71,7 +110,436 @@ const loader::SafetensorInfo* find_source_tensor(
     return tensor;
 }
 
+struct F32Reader {
+    const float* data;
+    float operator[](std::size_t index) const { return data[index]; }
+    std::uint16_t bf16(std::size_t index) const {
+        return modalities::float_to_bfloat16(data[index]);
+    }
+};
+
+struct Bf16Reader {
+    const std::uint16_t* data;
+    float operator[](std::size_t index) const {
+        return modalities::bfloat16_to_float(data[index]);
+    }
+    std::uint16_t bf16(std::size_t index) const { return data[index]; }
+};
+
+struct F16Reader {
+    const std::uint16_t* data;
+    float operator[](std::size_t index) const {
+        return modalities::float16_to_float(data[index]);
+    }
+    std::uint16_t bf16(std::size_t index) const {
+        return modalities::float_to_bfloat16(
+            modalities::float16_to_float(data[index]));
+    }
+};
+
+struct UnalignedF32Reader {
+    const unsigned char* data;
+    float operator[](std::size_t index) const {
+        float value = 0.0f;
+        std::memcpy(&value, data + index * sizeof(value), sizeof(value));
+        return value;
+    }
+    std::uint16_t bf16(std::size_t index) const {
+        return modalities::float_to_bfloat16((*this)[index]);
+    }
+};
+
+template <bool IsBf16>
+struct UnalignedU16Reader {
+    const unsigned char* data;
+    std::uint16_t bits(std::size_t index) const {
+        std::uint16_t value = 0;
+        std::memcpy(&value, data + index * sizeof(value), sizeof(value));
+        return value;
+    }
+    float operator[](std::size_t index) const {
+        return IsBf16 ? modalities::bfloat16_to_float(bits(index))
+                      : modalities::float16_to_float(bits(index));
+    }
+    std::uint16_t bf16(std::size_t index) const {
+        return IsBf16 ? bits(index)
+                      : modalities::float_to_bfloat16((*this)[index]);
+    }
+};
+
+template <typename Fn>
+modalities::Status dispatch_source(const NativeSourceTensorView& source,
+                                   const Fn& fn) {
+    if (!source.data) return invalid("native source tensor has no payload");
+    switch (source.dtype) {
+        case NativeSourceDType::kF32:
+            if (reinterpret_cast<std::uintptr_t>(source.data) %
+                    alignof(float) != 0) {
+                return fn(UnalignedF32Reader{
+                    static_cast<const unsigned char*>(source.data)});
+            }
+            return fn(F32Reader{static_cast<const float*>(source.data)});
+        case NativeSourceDType::kBf16:
+            if (reinterpret_cast<std::uintptr_t>(source.data) %
+                    alignof(std::uint16_t) != 0) {
+                return fn(UnalignedU16Reader<true>{
+                    static_cast<const unsigned char*>(source.data)});
+            }
+            return fn(Bf16Reader{
+                static_cast<const std::uint16_t*>(source.data)});
+        case NativeSourceDType::kF16:
+            if (reinterpret_cast<std::uintptr_t>(source.data) %
+                    alignof(std::uint16_t) != 0) {
+                return fn(UnalignedU16Reader<false>{
+                    static_cast<const unsigned char*>(source.data)});
+            }
+            return fn(F16Reader{
+                static_cast<const std::uint16_t*>(source.data)});
+    }
+    return invalid("native source tensor dtype is invalid");
+}
+
+std::size_t interleaved_source_row(std::size_t output_row,
+                                   std::size_t rows,
+                                   std::size_t heads) {
+    const std::size_t head_dim = rows / heads;
+    const std::size_t head = output_row / head_dim;
+    const std::size_t within = output_row % head_dim;
+    const std::size_t pair = within / 2;
+    const std::size_t half = within % 2;
+    return head * head_dim + half * (head_dim / 2) + pair;
+}
+
 }  // namespace
+
+modalities::Status load_native_source_tensor(
+    const loader::SafetensorsFile& file,
+    const std::string& key,
+    NativeSourceTensorView* out) {
+    if (!file.is_open() || !out) return invalid("invalid native tensor view");
+    const loader::SafetensorInfo* tensor = find_source_tensor(file, key);
+    if (!tensor) {
+        return modalities::Status::error(modalities::StatusCode::kNotFound,
+                                         "native tensor not found: " + key);
+    }
+    NativeSourceDType dtype;
+    if (tensor->dtype == "F32") {
+        dtype = NativeSourceDType::kF32;
+    } else if (tensor->dtype == "BF16") {
+        dtype = NativeSourceDType::kBf16;
+    } else if (tensor->dtype == "F16") {
+        dtype = NativeSourceDType::kF16;
+    } else {
+        return modalities::Status::error(
+            modalities::StatusCode::kUnsupported,
+            "native tensor dtype is not a floating-point weight: " +
+                tensor->dtype);
+    }
+    std::size_t count = 0;
+    if (!element_count(tensor->shape, &count)) {
+        return invalid("native tensor shape overflows size_t");
+    }
+    const void* data = file.data(*tensor);
+    if (!data && tensor->bytes) return invalid("native tensor payload is missing");
+    *out = NativeSourceTensorView{data, tensor->shape, dtype};
+    return modalities::Status::ok();
+}
+
+modalities::Status native_source_to_bf16(
+    const NativeSourceTensorView& input,
+    bool transpose,
+    NativeBf16Tensor* out) {
+    std::size_t count = 0;
+    if (!out || !element_count(input.shape, &count) ||
+        (transpose && input.shape.size() != 2)) {
+        return invalid("invalid direct source to BF16 input");
+    }
+    NativeBf16Tensor converted;
+    converted.shape = transpose
+        ? std::vector<std::uint64_t>{input.shape[1], input.shape[0]}
+        : input.shape;
+    converted.values.resize(count);
+    modalities::Status st = dispatch_source(input, [&](const auto& reader) {
+        if (!transpose) {
+            parallel_ranges(count, 1 << 18,
+                            [&](std::size_t begin, std::size_t end) {
+                for (std::size_t i = begin; i < end; ++i) {
+                    converted.values[i] = reader.bf16(i);
+                }
+            });
+        } else {
+            const std::size_t rows = static_cast<std::size_t>(input.shape[0]);
+            const std::size_t cols = static_cast<std::size_t>(input.shape[1]);
+            tiled_transform_transpose(
+                rows, cols, rows, 0, converted.values.data(),
+                [&](std::size_t row, std::size_t col) {
+                    return reader.bf16(row * cols + col);
+                });
+        }
+        return modalities::Status::ok();
+    });
+    if (!st.ok_status()) return st;
+    *out = std::move(converted);
+    return modalities::Status::ok();
+}
+
+modalities::Status native_source_fold_rms_columns_transpose(
+    const NativeSourceTensorView& weight,
+    const NativeFloatTensor& norm,
+    NativeBf16Tensor* out) {
+    std::size_t count = 0;
+    if (!out || weight.shape.size() != 2 ||
+        !element_count(weight.shape, &count) || !valid_tensor(norm) ||
+        norm.shape.size() != 1 || weight.shape[1] != norm.shape[0]) {
+        return invalid("invalid direct source RMS fold input");
+    }
+    const std::size_t rows = static_cast<std::size_t>(weight.shape[0]);
+    const std::size_t cols = static_cast<std::size_t>(weight.shape[1]);
+    NativeBf16Tensor folded;
+    folded.shape = {weight.shape[1], weight.shape[0]};
+    folded.values.resize(count);
+    modalities::Status st = dispatch_source(weight, [&](const auto& reader) {
+        tiled_transform_transpose(
+            rows, cols, rows, 0, folded.values.data(),
+            [&](std::size_t row, std::size_t col) {
+                return modalities::float_to_bfloat16(
+                    reader[row * cols + col] * (1.0f + norm.values[col]));
+            });
+        return modalities::Status::ok();
+    });
+    if (!st.ok_status()) return st;
+    *out = std::move(folded);
+    return modalities::Status::ok();
+}
+
+modalities::Status native_source_round_scale_to_bf16(
+    const NativeSourceTensorView& input,
+    float scale,
+    bool transpose,
+    NativeBf16Tensor* out) {
+    std::size_t count = 0;
+    if (!out || !element_count(input.shape, &count) ||
+        (transpose && input.shape.size() != 2)) {
+        return invalid("invalid direct source scale input");
+    }
+    NativeBf16Tensor scaled;
+    scaled.shape = transpose
+        ? std::vector<std::uint64_t>{input.shape[1], input.shape[0]}
+        : input.shape;
+    scaled.values.resize(count);
+    modalities::Status st = dispatch_source(input, [&](const auto& reader) {
+        const auto convert = [&](std::size_t index) {
+            const float rounded = modalities::bfloat16_to_float(
+                modalities::float_to_bfloat16(reader[index]));
+            return modalities::float_to_bfloat16(rounded * scale);
+        };
+        if (!transpose) {
+            parallel_ranges(count, 1 << 18,
+                            [&](std::size_t begin, std::size_t end) {
+                for (std::size_t i = begin; i < end; ++i) {
+                    scaled.values[i] = convert(i);
+                }
+            });
+        } else {
+            const std::size_t rows = static_cast<std::size_t>(input.shape[0]);
+            const std::size_t cols = static_cast<std::size_t>(input.shape[1]);
+            tiled_transform_transpose(
+                rows, cols, rows, 0, scaled.values.data(),
+                [&](std::size_t row, std::size_t col) {
+                    return convert(row * cols + col);
+                });
+        }
+        return modalities::Status::ok();
+    });
+    if (!st.ok_status()) return st;
+    *out = std::move(scaled);
+    return modalities::Status::ok();
+}
+
+modalities::Status native_source_qkv_to_bf16(
+    const NativeSourceTensorView& q,
+    const NativeSourceTensorView& k,
+    const NativeSourceTensorView& v,
+    std::uint64_t q_heads,
+    std::uint64_t k_heads,
+    const NativeFloatTensor* norm,
+    NativeBf16Tensor* out) {
+    std::size_t q_count = 0;
+    std::size_t k_count = 0;
+    std::size_t v_count = 0;
+    if (!out || q.shape.size() != 2 || k.shape.size() != 2 ||
+        v.shape.size() != 2 || q.shape[1] != k.shape[1] ||
+        q.shape[1] != v.shape[1] ||
+        !element_count(q.shape, &q_count) ||
+        !element_count(k.shape, &k_count) ||
+        !element_count(v.shape, &v_count) ||
+        q.shape[0] > std::numeric_limits<std::uint64_t>::max() - k.shape[0] ||
+        q.shape[0] + k.shape[0] >
+            std::numeric_limits<std::uint64_t>::max() - v.shape[0] ||
+        (q_heads && (q.shape[0] % q_heads ||
+                     (q.shape[0] / q_heads) % 2)) ||
+        (k_heads && (k.shape[0] % k_heads ||
+                     (k.shape[0] / k_heads) % 2)) ||
+        (norm && (!valid_tensor(*norm) || norm->shape.size() != 1 ||
+                  norm->shape[0] != q.shape[1]))) {
+        return invalid("QKV source tensors have incompatible shapes");
+    }
+    const std::size_t cols = static_cast<std::size_t>(q.shape[1]);
+    const std::uint64_t total_rows_u64 =
+        q.shape[0] + k.shape[0] + v.shape[0];
+    if (total_rows_u64 > std::numeric_limits<std::size_t>::max() ||
+        q.shape[1] > std::numeric_limits<std::size_t>::max()) {
+        return invalid("QKV output shape overflows size_t");
+    }
+    const std::size_t total_rows = static_cast<std::size_t>(total_rows_u64);
+    NativeBf16Tensor joined;
+    joined.shape = {q.shape[1], total_rows_u64};
+    std::size_t joined_count = 0;
+    if (!element_count(joined.shape, &joined_count)) {
+        return invalid("QKV output shape overflows size_t");
+    }
+    joined.values.resize(joined_count);
+    const auto write = [&](const NativeSourceTensorView& source,
+                           std::size_t heads, bool interleave,
+                           std::size_t offset) {
+        return dispatch_source(source, [&](const auto& reader) {
+            const std::size_t rows =
+                static_cast<std::size_t>(source.shape[0]);
+            tiled_transform_transpose(
+                rows, cols, total_rows, offset, joined.values.data(),
+                [&](std::size_t output_row, std::size_t col) {
+                    const std::size_t source_row = interleave
+                        ? interleaved_source_row(output_row, rows, heads)
+                        : output_row;
+                    const std::size_t index = source_row * cols + col;
+                    if (!norm) return reader.bf16(index);
+                    return modalities::float_to_bfloat16(
+                        reader[index] * (1.0f + norm->values[col]));
+                });
+            return modalities::Status::ok();
+        });
+    };
+    modalities::Status st = write(q, q_heads, q_heads != 0, 0);
+    if (!st.ok_status()) return st;
+    st = write(k, k_heads, k_heads != 0,
+               static_cast<std::size_t>(q.shape[0]));
+    if (!st.ok_status()) return st;
+    st = write(v, 1, false,
+               static_cast<std::size_t>(q.shape[0] + k.shape[0]));
+    if (!st.ok_status()) return st;
+    *out = std::move(joined);
+    return modalities::Status::ok();
+}
+
+modalities::Status native_source_concat_vectors_to_bf16(
+    const std::vector<const NativeSourceTensorView*>& inputs,
+    NativeBf16Tensor* out) {
+    if (!out || inputs.empty()) return invalid("vector concat has no inputs");
+    std::size_t total = 0;
+    for (const NativeSourceTensorView* input : inputs) {
+        if (!input || input->shape.size() != 1 ||
+            input->shape[0] > std::numeric_limits<std::size_t>::max() ||
+            input->shape[0] > std::numeric_limits<std::size_t>::max() - total) {
+            return invalid("vector concat tensors have incompatible shapes");
+        }
+        total += static_cast<std::size_t>(input->shape[0]);
+    }
+    NativeBf16Tensor joined;
+    joined.shape = {static_cast<std::uint64_t>(total)};
+    joined.values.resize(total);
+    std::size_t offset = 0;
+    for (const NativeSourceTensorView* input : inputs) {
+        const std::size_t count = static_cast<std::size_t>(input->shape[0]);
+        modalities::Status st = dispatch_source(*input, [&](const auto& reader) {
+            parallel_ranges(count, 1 << 18,
+                            [&](std::size_t begin, std::size_t end) {
+                for (std::size_t i = begin; i < end; ++i) {
+                    joined.values[offset + i] = reader.bf16(i);
+                }
+            });
+            return modalities::Status::ok();
+        });
+        if (!st.ok_status()) return st;
+        offset += count;
+    }
+    *out = std::move(joined);
+    return modalities::Status::ok();
+}
+
+modalities::Status native_source_patch_oihw_to_hwio_bf16(
+    const NativeSourceTensorView& input,
+    NativeBf16Tensor* out) {
+    std::size_t count = 0;
+    if (!out || input.shape.size() != 4 ||
+        !element_count(input.shape, &count)) {
+        return invalid("patch permutation requires a rank-4 tensor");
+    }
+    const std::size_t outputs = static_cast<std::size_t>(input.shape[0]);
+    const std::size_t channels = static_cast<std::size_t>(input.shape[1]);
+    const std::size_t height = static_cast<std::size_t>(input.shape[2]);
+    const std::size_t width = static_cast<std::size_t>(input.shape[3]);
+    NativeBf16Tensor result;
+    result.shape = {input.shape[2], input.shape[3], input.shape[1],
+                    input.shape[0]};
+    result.values.resize(count);
+    modalities::Status st = dispatch_source(input, [&](const auto& reader) {
+        parallel_ranges(height * width * channels, 32,
+                        [&](std::size_t begin, std::size_t end) {
+            for (std::size_t hwc = begin; hwc < end; ++hwc) {
+                const std::size_t c = hwc % channels;
+                const std::size_t hw = hwc / channels;
+                const std::size_t h = hw / width;
+                const std::size_t w = hw % width;
+                for (std::size_t o = 0; o < outputs; ++o) {
+                    const std::size_t src =
+                        ((o * channels + c) * height + h) * width + w;
+                    result.values[hwc * outputs + o] = reader.bf16(src);
+                }
+            }
+        });
+        return modalities::Status::ok();
+    });
+    if (!st.ok_status()) return st;
+    *out = std::move(result);
+    return modalities::Status::ok();
+}
+
+modalities::Status native_source_pair_transpose_concat_bf16(
+    const NativeSourceTensorView& left,
+    const NativeSourceTensorView& right,
+    NativeBf16Tensor* out) {
+    std::size_t source_count = 0;
+    if (!out || left.shape.size() != 2 || right.shape.size() != 2 ||
+        left.shape != right.shape ||
+        !element_count(left.shape, &source_count) ||
+        left.shape[0] > std::numeric_limits<std::uint64_t>::max() / 2 ||
+        source_count > std::numeric_limits<std::size_t>::max() / 2) {
+        return invalid("paired transpose tensors have incompatible shapes");
+    }
+    const std::size_t source_rows = static_cast<std::size_t>(left.shape[0]);
+    const std::size_t output_rows = static_cast<std::size_t>(left.shape[1]);
+    NativeBf16Tensor joined;
+    joined.shape = {left.shape[1], left.shape[0] + right.shape[0]};
+    joined.values.resize(source_count * 2);
+    const auto write = [&](const NativeSourceTensorView& source,
+                           std::size_t offset) {
+        return dispatch_source(source, [&](const auto& reader) {
+            tiled_transform_transpose(
+                source_rows, output_rows, source_rows * 2, offset,
+                joined.values.data(),
+                [&](std::size_t row, std::size_t col) {
+                    return reader.bf16(row * output_rows + col);
+                });
+            return modalities::Status::ok();
+        });
+    };
+    modalities::Status st = write(left, 0);
+    if (!st.ok_status()) return st;
+    st = write(right, source_rows);
+    if (!st.ok_status()) return st;
+    *out = std::move(joined);
+    return modalities::Status::ok();
+}
 
 modalities::Status load_native_float_tensor(
     const loader::SafetensorsFile& file,
@@ -138,123 +606,6 @@ modalities::Status native_to_bf16(const NativeFloatTensor& input,
     return modalities::Status::ok();
 }
 
-modalities::Status native_f32_to_bf16(
-    const float* input,
-    const std::vector<std::uint64_t>& shape,
-    bool transpose,
-    NativeBf16Tensor* out) {
-    std::size_t count = 0;
-    if (!input || !out || !element_count(shape, &count) ||
-        (transpose && shape.size() != 2)) {
-        return invalid("invalid direct F32 to BF16 input");
-    }
-    NativeBf16Tensor converted;
-    converted.shape = transpose
-        ? std::vector<std::uint64_t>{shape[1], shape[0]}
-        : shape;
-    converted.values.resize(count);
-    if (!transpose) {
-        parallel_ranges(count, 1 << 18,
-                        [&](std::size_t begin, std::size_t end) {
-            for (std::size_t i = begin; i < end; ++i) {
-                converted.values[i] = modalities::float_to_bfloat16(input[i]);
-            }
-        });
-    } else {
-        const std::size_t rows = static_cast<std::size_t>(shape[0]);
-        const std::size_t cols = static_cast<std::size_t>(shape[1]);
-        parallel_ranges(rows, 16, [&](std::size_t begin, std::size_t end) {
-            for (std::size_t row = begin; row < end; ++row) {
-                for (std::size_t col = 0; col < cols; ++col) {
-                    converted.values[col * rows + row] =
-                        modalities::float_to_bfloat16(
-                            input[row * cols + col]);
-                }
-            }
-        });
-    }
-    *out = std::move(converted);
-    return modalities::Status::ok();
-}
-
-modalities::Status native_f32_fold_rms_columns_transpose(
-    const float* weight,
-    std::uint64_t rows_u64,
-    std::uint64_t cols_u64,
-    const NativeFloatTensor& norm,
-    NativeBf16Tensor* out) {
-    if (!weight || !out || !valid_tensor(norm) || norm.shape.size() != 1 ||
-        norm.shape[0] != cols_u64 ||
-        rows_u64 > std::numeric_limits<std::size_t>::max() ||
-        cols_u64 > std::numeric_limits<std::size_t>::max()) {
-        return invalid("invalid direct F32 RMS fold input");
-    }
-    const std::size_t rows = static_cast<std::size_t>(rows_u64);
-    const std::size_t cols = static_cast<std::size_t>(cols_u64);
-    if (rows && cols > std::numeric_limits<std::size_t>::max() / rows) {
-        return invalid("direct F32 RMS fold shape overflows size_t");
-    }
-    NativeBf16Tensor folded;
-    folded.shape = {cols_u64, rows_u64};
-    folded.values.resize(rows * cols);
-    parallel_ranges(rows, 16, [&](std::size_t begin, std::size_t end) {
-        for (std::size_t row = begin; row < end; ++row) {
-            for (std::size_t col = 0; col < cols; ++col) {
-                folded.values[col * rows + row] =
-                    modalities::float_to_bfloat16(
-                        weight[row * cols + col] *
-                        (1.0f + norm.values[col]));
-            }
-        }
-    });
-    *out = std::move(folded);
-    return modalities::Status::ok();
-}
-
-modalities::Status native_f32_round_scale_to_bf16(
-    const float* input,
-    const std::vector<std::uint64_t>& shape,
-    float scale,
-    bool transpose,
-    NativeBf16Tensor* out) {
-    std::size_t count = 0;
-    if (!input || !out || !element_count(shape, &count) ||
-        (transpose && shape.size() != 2)) {
-        return invalid("invalid direct F32 scale input");
-    }
-    NativeBf16Tensor scaled;
-    scaled.shape = transpose
-        ? std::vector<std::uint64_t>{shape[1], shape[0]}
-        : shape;
-    scaled.values.resize(count);
-    const auto convert = [scale](float value) {
-        const float rounded = modalities::bfloat16_to_float(
-            modalities::float_to_bfloat16(value));
-        return modalities::float_to_bfloat16(rounded * scale);
-    };
-    if (!transpose) {
-        parallel_ranges(count, 1 << 18,
-                        [&](std::size_t begin, std::size_t end) {
-            for (std::size_t i = begin; i < end; ++i) {
-                scaled.values[i] = convert(input[i]);
-            }
-        });
-    } else {
-        const std::size_t rows = static_cast<std::size_t>(shape[0]);
-        const std::size_t cols = static_cast<std::size_t>(shape[1]);
-        parallel_ranges(rows, 16, [&](std::size_t begin, std::size_t end) {
-            for (std::size_t row = begin; row < end; ++row) {
-                for (std::size_t col = 0; col < cols; ++col) {
-                    scaled.values[col * rows + row] =
-                        convert(input[row * cols + col]);
-                }
-            }
-        });
-    }
-    *out = std::move(scaled);
-    return modalities::Status::ok();
-}
-
 modalities::Status native_round_to_bf16_float(
     const NativeFloatTensor& input,
     NativeFloatTensor* out) {
@@ -283,26 +634,11 @@ modalities::Status native_transpose_2d(const NativeFloatTensor& input,
     NativeFloatTensor transposed;
     transposed.shape = {input.shape[1], input.shape[0]};
     transposed.values.resize(input.values.size());
-    constexpr std::size_t kTile = 32;
-    const std::size_t row_tiles = (rows + kTile - 1) / kTile;
-    parallel_ranges(row_tiles, 2, [&](std::size_t first,
-                                      std::size_t last) {
-        for (std::size_t tile = first; tile < last; ++tile) {
-            const std::size_t row_begin = tile * kTile;
-            const std::size_t row_end = std::min(rows, row_begin + kTile);
-            for (std::size_t col_begin = 0; col_begin < cols;
-                 col_begin += kTile) {
-                const std::size_t col_end =
-                    std::min(cols, col_begin + kTile);
-                for (std::size_t col = col_begin; col < col_end; ++col) {
-                    for (std::size_t row = row_begin; row < row_end; ++row) {
-                        transposed.values[col * rows + row] =
-                            input.values[row * cols + col];
-                    }
-                }
-            }
-        }
-    });
+    tiled_transform_transpose(
+        rows, cols, rows, 0, transposed.values.data(),
+        [&](std::size_t row, std::size_t col) {
+            return input.values[row * cols + col];
+        });
     *out = std::move(transposed);
     return modalities::Status::ok();
 }
@@ -423,17 +759,15 @@ modalities::Status native_concat_rows_transpose(
     for (const NativeFloatTensor* input : inputs) {
         const std::uint64_t input_rows = input->shape[0];
         const std::uint64_t output_offset = row_offset;
-        parallel_ranges(static_cast<std::size_t>(input_rows), 32,
-                        [&](std::size_t begin, std::size_t end) {
-            for (std::size_t row = begin; row < end; ++row) {
-                for (std::uint64_t col = 0; col < cols; ++col) {
-                    joined.values[static_cast<std::size_t>(
-                        col * total_rows + output_offset + row)] =
-                        input->values[static_cast<std::size_t>(
-                            row * cols + col)];
-                }
-            }
-        });
+        tiled_transform_transpose(
+            static_cast<std::size_t>(input_rows),
+            static_cast<std::size_t>(cols),
+            static_cast<std::size_t>(total_rows),
+            static_cast<std::size_t>(output_offset), joined.values.data(),
+            [&](std::size_t row, std::size_t col) {
+                return input->values[
+                    row * static_cast<std::size_t>(cols) + col];
+            });
         row_offset += input->shape[0];
     }
     *out = std::move(joined);

@@ -95,6 +95,14 @@ portable implementation with identical identity bytes. The model hash and
 weight materialization execute concurrently, but the factory publishes no
 runtime until both have succeeded.
 
+The native loader maps the checkpoint read-only and directly emits final BF16
+device layouts from F32, BF16, or F16 source tensors. QKV interleave/concat,
+RMS folding, patch permutation, transpose, and output scaling are fused into
+that pass; there is no checkpoint-sized Python dictionary or chain of float
+intermediates. `FLASHRT_PROFILE_NATIVE_SETUP=1` reports header, materialization,
+workspace/style, input initialization, capture, stream, and total setup time.
+This diagnostic is setup-only and does not change the runtime contract.
+
 ## No-HTTP C++ Host Shape
 
 For same-process control loops, prefer Nexus embedded/session APIs over HTTP.

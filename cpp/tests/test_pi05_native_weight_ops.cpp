@@ -12,6 +12,8 @@ namespace {
 
 using flashrt::models::pi05::NativeBf16Tensor;
 using flashrt::models::pi05::NativeFloatTensor;
+using flashrt::models::pi05::NativeSourceDType;
+using flashrt::models::pi05::NativeSourceTensorView;
 
 void expect(const NativeFloatTensor& tensor,
             std::initializer_list<std::uint64_t> shape,
@@ -21,6 +23,18 @@ void expect(const NativeFloatTensor& tensor,
     std::size_t i = 0;
     for (float value : values) {
         assert(std::fabs(tensor.values[i++] - value) < 1e-6f);
+    }
+}
+
+void expect_bf16(const NativeBf16Tensor& tensor,
+                 std::initializer_list<std::uint64_t> shape,
+                 std::initializer_list<float> values) {
+    assert(tensor.shape == std::vector<std::uint64_t>(shape));
+    assert(tensor.values.size() == values.size());
+    std::size_t i = 0;
+    for (float value : values) {
+        assert(tensor.values[i++] ==
+               flashrt::modalities::float_to_bfloat16(value));
     }
 }
 
@@ -76,6 +90,21 @@ int main() {
     expect(loaded, {2}, {3.0f, -4.0f});
     assert(load_native_float_tensor(file, "f16", &loaded).ok_status());
     expect(loaded, {2}, {5.0f, -6.0f});
+
+    NativeSourceTensorView mapped;
+    NativeBf16Tensor mapped_bf16;
+    assert(load_native_source_tensor(file, "f32", &mapped).ok_status());
+    assert(mapped.dtype == NativeSourceDType::kF32);
+    assert(native_source_to_bf16(mapped, false, &mapped_bf16).ok_status());
+    expect_bf16(mapped_bf16, {2}, {1.25f, -2.5f});
+    assert(load_native_source_tensor(file, "bf16", &mapped).ok_status());
+    assert(mapped.dtype == NativeSourceDType::kBf16);
+    assert(native_source_to_bf16(mapped, false, &mapped_bf16).ok_status());
+    expect_bf16(mapped_bf16, {2}, {3.0f, -4.0f});
+    assert(load_native_source_tensor(file, "f16", &mapped).ok_status());
+    assert(mapped.dtype == NativeSourceDType::kF16);
+    assert(native_source_to_bf16(mapped, false, &mapped_bf16).ok_status());
+    expect_bf16(mapped_bf16, {2}, {5.0f, -6.0f});
     assert(::unlink(path.c_str()) == 0);
 
     NativeFloatTensor matrix{{2, 3}, {1, 2, 3, 4, 5, 6}};
@@ -139,37 +168,37 @@ int main() {
     }
 
     NativeBf16Tensor direct;
-    assert(native_f32_to_bf16(matrix.values.data(), matrix.shape, false,
-                              &direct).ok_status());
-    assert(direct.shape == converted.shape &&
-           direct.values == converted.values);
-    assert(native_f32_to_bf16(matrix.values.data(), matrix.shape, true,
-                              &direct).ok_status());
-    NativeFloatTensor transposed;
-    NativeBf16Tensor transposed_bf16;
-    assert(native_transpose_2d(matrix, &transposed).ok_status());
-    assert(native_to_bf16(transposed, &transposed_bf16).ok_status());
-    assert(direct.shape == transposed_bf16.shape &&
-           direct.values == transposed_bf16.values);
-
-    assert(native_f32_fold_rms_columns_transpose(
-               matrix.values.data(), 2, 3, norm, &direct).ok_status());
-    NativeFloatTensor folded;
-    assert(native_fold_rms_columns(matrix, norm, &folded).ok_status());
-    assert(native_transpose_2d(folded, &transposed).ok_status());
-    assert(native_to_bf16(transposed, &transposed_bf16).ok_status());
-    assert(direct.shape == transposed_bf16.shape &&
-           direct.values == transposed_bf16.values);
-
-    constexpr float kScale = -0.1f;
-    assert(native_f32_round_scale_to_bf16(
-               unrounded.values.data(), unrounded.shape, kScale, false,
-               &direct).ok_status());
-    NativeFloatTensor rounded_scaled;
-    assert(native_scale(result, kScale, &rounded_scaled).ok_status());
-    assert(native_to_bf16(rounded_scaled, &converted).ok_status());
-    assert(direct.shape == converted.shape &&
-           direct.values == converted.values);
+    const float source_f32[] = {1, 2, 3, 4, 5, 6, 7, 8};
+    std::uint16_t source_bf16[8];
+    std::uint16_t source_f16[8];
+    for (std::size_t i = 0; i < 8; ++i) {
+        source_bf16[i] = flashrt::modalities::float_to_bfloat16(source_f32[i]);
+        source_f16[i] = flashrt::modalities::float_to_float16(source_f32[i]);
+    }
+    const NativeSourceTensorView source_views[] = {
+        {source_f32, {2, 4}, NativeSourceDType::kF32},
+        {source_bf16, {2, 4}, NativeSourceDType::kBf16},
+        {source_f16, {2, 4}, NativeSourceDType::kF16},
+    };
+    NativeFloatTensor source_norm{{4}, {0, 0, 0, 0}};
+    for (const NativeSourceTensorView& source_view : source_views) {
+        assert(native_source_to_bf16(source_view, true, &direct).ok_status());
+        expect_bf16(direct, {4, 2}, {1, 5, 2, 6, 3, 7, 4, 8});
+        assert(native_source_fold_rms_columns_transpose(
+                   source_view, source_norm, &direct).ok_status());
+        expect_bf16(direct, {4, 2}, {1, 5, 2, 6, 3, 7, 4, 8});
+        assert(native_source_round_scale_to_bf16(
+                   source_view, 2.0f, true, &direct).ok_status());
+        expect_bf16(direct, {4, 2}, {2, 10, 4, 12, 6, 14, 8, 16});
+        assert(native_source_qkv_to_bf16(
+                   source_view, source_view, source_view, 1, 1, nullptr,
+                   &direct).ok_status());
+        expect_bf16(direct, {4, 6},
+                    {1, 5, 1, 5, 1, 5,
+                     2, 6, 2, 6, 2, 6,
+                     3, 7, 3, 7, 3, 7,
+                     4, 8, 4, 8, 4, 8});
+    }
 
     assert(!native_interleave_qk_rows(matrix, 2, &result).ok_status());
     assert(!native_concat_columns(matrix, k, &result).ok_status());

@@ -140,6 +140,20 @@ Blockers:
 - A hot-path verb (`set_input`/`get_output`, SWAP writes, tick) allocates,
   recaptures, or rebinds graph pointers.
 
+Native checkpoint-loading changes additionally require:
+
+- A phase profile that separates file/header work, materialization and upload,
+  workspace setup, graph capture, and complete producer startup.
+- Byte-level transform parity against the established producer, including the
+  exact order of source rounding, scaling, folding, and final dtype conversion.
+- Coverage for every declared source dtype and for valid unaligned safetensors
+  payload offsets; a fast path must not silently become the only valid path.
+- A real-input end-to-end numerical gate after transform fusion or upload-order
+  changes. A lower startup time is not evidence of numerical equivalence.
+- No checkpoint-sized duplicate tensor dictionary or transformed layout cache
+  unless measurements show that its lifecycle, invalidation key, disk cost,
+  and restart benefit justify the added mechanism.
+
 ## 6. Public API And Import Boundaries
 
 Required:
