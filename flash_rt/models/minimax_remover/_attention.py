@@ -34,6 +34,50 @@ import torch
 
 from ._kernels import rms_norm_fp32stat, rope_apply_bshd, freqs_to_cos_sin
 
+# Optional MiniMax-Remover fused kernels — used when both are available.
+_fvk = None
+try:
+    from flash_rt import flash_rt_minimax_remover as _fvk
+except ImportError:
+    try:
+        import flash_rt_minimax_remover as _fvk  # type: ignore
+    except ImportError:
+        pass
+_has_fused_rmsnorm_rope = (
+    _fvk is not None and hasattr(_fvk, "fp16_rmsnorm_rope_bshd")
+    and os.environ.get("FLASHRT_DISABLE_RMSNORM_ROPE", "0") != "1")
+
+_has_fused_rmsnorm_rope_quant = (
+    _fvk is not None
+    and hasattr(_fvk, "fp16_rmsnorm_rope_quant_int8_q")
+    and hasattr(_fvk, "fp16_rmsnorm_rope_quant_int8_k")
+    and os.environ.get("FLASHRT_DISABLE_FUSED_QUANT", "0") != "1")
+
+_SM89_COMPILE = None
+_PER_CHANNEL_FP8 = None
+
+
+def _get_sm89():
+    global _SM89_COMPILE
+    if _SM89_COMPILE is None:
+        try:
+            from sageattention import sm89_compile
+            _SM89_COMPILE = sm89_compile
+        except ImportError:
+            _SM89_COMPILE = False
+    return _SM89_COMPILE if _SM89_COMPILE is not False else None
+
+
+def _get_per_channel_fp8():
+    global _PER_CHANNEL_FP8
+    if _PER_CHANNEL_FP8 is None:
+        try:
+            from sageattention.quant import per_channel_fp8
+            _PER_CHANNEL_FP8 = per_channel_fp8
+        except ImportError:
+            _PER_CHANNEL_FP8 = False
+    return _PER_CHANNEL_FP8 if _PER_CHANNEL_FP8 is not False else None
+
 try:
     _NUM_SMS = torch.cuda.get_device_properties(0).multi_processor_count
 except Exception:
@@ -145,34 +189,174 @@ class FlashRTFA2Processor:
     def __init__(self):
         self._lse_bufs = {}
         self._cos_sin = {}
+        # Persistent [B*S] fp32 scratch for the fused rmsnorm+rope+int8-quant
+        # Q/K kernels (avoids a per-call cudaMallocAsync in the hot path).
+        self._rstd_bufs = {}
 
     def __call__(self, attn, hidden_states, rotary_emb=None,
-                 attention_mask=None, encoder_hidden_states=None):
+                 attention_mask=None, encoder_hidden_states=None,
+                 no_out_bias=False, fp8_hidden=None, fp8_scale=None):
         mode = _attention_mode()
         B, S, _ = hidden_states.shape
         H = attn.heads
         Dd = attn.inner_dim // H
         scale = 1.0 / math.sqrt(float(Dd))
 
-        q = attn.to_q(hidden_states)
-        k = attn.to_k(hidden_states)
-        v = attn.to_v(hidden_states)
-        if attn.norm_q is not None:
-            q = rms_norm_fp32stat(q, attn.norm_q.weight, attn.norm_q.eps)
-        if attn.norm_k is not None:
-            k = rms_norm_fp32stat(k, attn.norm_k.weight, attn.norm_k.eps)
-
-        q = q.view(B, S, H, Dd)
-        k = k.view(B, S, H, Dd)
-        v = v.view(B, S, H, Dd)
-
+        # ── Fused QKV entry from pre-quantised fp8 input ──
+        # When the caller provides the fp8 output of the fused adaLN+quant
+        # kernel plus the shared scale used to build it, drive Q/K/V from
+        # that fp8 tensor directly — saves 3 activation-quantise passes
+        # (one per Linear) and 1 fp16 read of norm1_out.  Both Linears
+        # must expose gemm_from_fp8_ext (FlashRTFp8Linear post-calibration).
+        _use_fp8 = (fp8_hidden is not None and fp8_scale is not None
+                    and hasattr(attn.to_q, "gemm_from_fp8_ext")
+                    and hasattr(attn.to_k, "gemm_from_fp8_ext")
+                    and hasattr(attn.to_v, "gemm_from_fp8_ext"))
+        cs = None
         if rotary_emb is not None:
             cs = self._cos_sin.get(S)
             if cs is None:
                 cs = freqs_to_cos_sin(rotary_emb)
                 self._cos_sin[S] = cs
-            rope_apply_bshd(q, cs[0], cs[1])
-            rope_apply_bshd(k, cs[0], cs[1])
+
+        _fuse_qk = (_has_fused_rmsnorm_rope and cs is not None
+                    and attn.norm_q is not None and attn.norm_k is not None
+                    and (Dd & 7) == 0)
+        # ── Fully-fused path: RMSNorm + RoPE + int8 quant → sm89 attn ──
+        # Eliminates the fp16 intermediate between norm+rope and QK quantize.
+        _fuse_quant = (_fuse_qk and _has_fused_rmsnorm_rope_quant
+                       and mode in ("sage_fp8", "sage2")
+                       and _get_sm89() is not None
+                       and _get_per_channel_fp8() is not None)
+
+        # Q/K GEMM: when the Q/K bias will be fused into the downstream
+        # rmsnorm+rope+quant kernel (pre-norm add), fetch Q/K WITHOUT bias
+        # to avoid adding it twice. V always keeps its bias (not normed).
+        _qk_nobias = (_use_fp8 and _fuse_quant
+                      and hasattr(attn.to_q, "gemm_from_fp8_ext_nobias"))
+        if _use_fp8:
+            if _qk_nobias:
+                q = attn.to_q.gemm_from_fp8_ext_nobias(fp8_hidden, fp8_scale)
+                k = attn.to_k.gemm_from_fp8_ext_nobias(fp8_hidden, fp8_scale)
+            else:
+                q = attn.to_q.gemm_from_fp8_ext(fp8_hidden, fp8_scale)
+                k = attn.to_k.gemm_from_fp8_ext(fp8_hidden, fp8_scale)
+            v = attn.to_v.gemm_from_fp8_ext(fp8_hidden, fp8_scale)
+        else:
+            q = attn.to_q(hidden_states)
+            k = attn.to_k(hidden_states)
+            v = attn.to_v(hidden_states)
+        if _fuse_quant:
+            if not q.is_contiguous():
+                q = q.contiguous()
+            if not k.is_contiguous():
+                k = k.contiguous()
+            stream = torch.cuda.current_stream().cuda_stream
+            D = H * Dd
+
+            num_groups_q = (S + 31) // 32
+            num_groups_k = (S + 63) // 64
+            q_int8 = torch.empty(B * S, D, device=q.device, dtype=torch.int8)
+            k_int8 = torch.empty(B * S, D, device=q.device, dtype=torch.int8)
+            q_scale = torch.empty(B, H, num_groups_q, device=q.device,
+                                  dtype=torch.float32)
+            k_scale = torch.empty(B, H, num_groups_k, device=q.device,
+                                  dtype=torch.float32)
+
+            # Q/K bias fused pre-norm when the nobias GEMM was used.
+            q_bias_ptr = (attn.to_q.bias.data_ptr()
+                          if (_qk_nobias and attn.to_q.bias is not None) else 0)
+            k_bias_ptr = (attn.to_k.bias.data_ptr()
+                          if (_qk_nobias and attn.to_k.bias is not None) else 0)
+
+            # Reuse a persistent rstd scratch (B*S fp32) across Q/K calls so
+            # the fused kernel does zero hot-path allocation. Q and K run
+            # sequentially on the same stream, so one buffer serves both.
+            rstd = self._rstd_bufs.get((B, S))
+            if rstd is None or rstd.device != q.device:
+                rstd = torch.empty(B * S, dtype=torch.float32, device=q.device)
+                self._rstd_bufs[(B, S)] = rstd
+            rstd_ptr = rstd.data_ptr()
+
+            rc = _fvk.fp16_rmsnorm_rope_quant_int8_q(
+                q.data_ptr(), attn.norm_q.weight.data_ptr(),
+                q_bias_ptr,
+                cs[0].data_ptr(), cs[1].data_ptr(),
+                q_int8.data_ptr(), q_scale.data_ptr(),
+                B, S, H, Dd, float(attn.norm_q.eps), 1.0,
+                rstd_ptr, stream)
+            if rc != 0:
+                raise RuntimeError(
+                    f"fp16_rmsnorm_rope_quant_int8_q failed rc={rc} "
+                    f"(B={B} S={S} H={H} Dd={Dd})")
+            rc = _fvk.fp16_rmsnorm_rope_quant_int8_k(
+                k.data_ptr(), attn.norm_k.weight.data_ptr(),
+                k_bias_ptr,
+                cs[0].data_ptr(), cs[1].data_ptr(),
+                0,  # no smooth_k (negligible impact, saves k.mean compute)
+                k_int8.data_ptr(), k_scale.data_ptr(),
+                B, S, H, Dd, float(attn.norm_k.eps), 1.0,
+                rstd_ptr, stream)
+            if rc != 0:
+                raise RuntimeError(
+                    f"fp16_rmsnorm_rope_quant_int8_k failed rc={rc} "
+                    f"(B={B} S={S} H={H} Dd={Dd})")
+
+            v = v.view(B, S, H, Dd)
+            if not v.is_contiguous():
+                v = v.contiguous()
+
+            per_channel_fp8 = _get_per_channel_fp8()
+            v_fp8, v_scale, _ = per_channel_fp8(
+                v, tensor_layout="NHD", scale_max=2.25, smooth_v=False)
+
+            q_int8 = q_int8.view(B, S, H, Dd)
+            k_int8 = k_int8.view(B, S, H, Dd)
+            out = torch.empty(B, S, H, Dd, device=q.device, dtype=q.dtype)
+
+            sm89 = _get_sm89()
+            sm89.qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf(
+                q_int8, k_int8, v_fp8, out, q_scale, k_scale, v_scale,
+                0, 0, 2, scale, 0)
+
+            hidden_states = out.view(B, S, H * Dd)
+            to_out0 = attn.to_out[0]
+            if no_out_bias and hasattr(to_out0, "gemm_no_bias"):
+                hidden_states = to_out0.gemm_no_bias(hidden_states)
+            else:
+                hidden_states = to_out0(hidden_states)
+            return hidden_states
+
+        if _fuse_qk:
+            if not q.is_contiguous():
+                q = q.contiguous()
+            if not k.is_contiguous():
+                k = k.contiguous()
+            stream = torch.cuda.current_stream().cuda_stream
+            _fvk.fp16_rmsnorm_rope_bshd(
+                q.data_ptr(), attn.norm_q.weight.data_ptr(),
+                cs[0].data_ptr(), cs[1].data_ptr(),
+                B, S, H, Dd, float(attn.norm_q.eps), stream)
+            _fvk.fp16_rmsnorm_rope_bshd(
+                k.data_ptr(), attn.norm_k.weight.data_ptr(),
+                cs[0].data_ptr(), cs[1].data_ptr(),
+                B, S, H, Dd, float(attn.norm_k.eps), stream)
+            q = q.view(B, S, H, Dd)
+            k = k.view(B, S, H, Dd)
+            v = v.view(B, S, H, Dd)
+        else:
+            if attn.norm_q is not None:
+                q = rms_norm_fp32stat(q, attn.norm_q.weight, attn.norm_q.eps)
+            if attn.norm_k is not None:
+                k = rms_norm_fp32stat(k, attn.norm_k.weight, attn.norm_k.eps)
+
+            q = q.view(B, S, H, Dd)
+            k = k.view(B, S, H, Dd)
+            v = v.view(B, S, H, Dd)
+
+            if cs is not None:
+                rope_apply_bshd(q, cs[0], cs[1])
+                rope_apply_bshd(k, cs[0], cs[1])
 
         if not q.is_contiguous():
             q = q.contiguous()
@@ -185,7 +369,11 @@ class FlashRTFA2Processor:
                                 lse_cache=self._lse_bufs)
 
         hidden_states = out.view(B, S, H * Dd)
-        hidden_states = attn.to_out[0](hidden_states)
+        to_out0 = attn.to_out[0]
+        if no_out_bias and hasattr(to_out0, "gemm_no_bias"):
+            hidden_states = to_out0.gemm_no_bias(hidden_states)
+        else:
+            hidden_states = to_out0(hidden_states)
         return hidden_states
 
 

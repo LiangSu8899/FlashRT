@@ -118,6 +118,38 @@ def test_manual_fused_block_uses_shared_attention_forward():
     assert "attention_forward(q, k, v, scale, _attention_mode())" in src
 
 
+def test_runtime_optional_dependencies_are_lazy_imported():
+    """Package import must not require diffusers/einops."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    for rel in (
+        "flash_rt/models/minimax_remover/_fp8_pipeline.py",
+        "flash_rt/models/minimax_remover/_fp8_manual_denoise.py",
+        "flash_rt/models/minimax_remover/_manual_denoise.py",
+    ):
+        src = (root / rel).read_text()
+        assert "from diffusers" not in "\n".join(
+            line for line in src.splitlines()[:80])
+        assert "from einops" not in "\n".join(
+            line for line in src.splitlines()[:80])
+    fp8_src = (root / "flash_rt/models/minimax_remover/_fp8_pipeline.py").read_text()
+    top_level = fp8_src.split("class MiniMaxRemoverPipelineFP8:", 1)[0]
+    assert "_fp8_manual_denoise import FP8ManualDenoise" not in top_level
+
+
+def test_minimax_remover_cmake_requires_blackwell_nvfp4():
+    """The standalone MiniMax module contains SM120 FP8/NVFP4 kernels."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    cmake = (root / "CMakeLists.txt").read_text()
+    start = cmake.index("if(FLASHRT_ENABLE_MINIMAX_REMOVER AND NOT ENABLE_NVFP4)")
+    end = cmake.index("endif()", start)
+    block = cmake[start:end]
+    assert "FLASHRT_ENABLE_MINIMAX_REMOVER requires Blackwell NVFP4" in block
+
+
 # ── 2. load_*_kernels validate the kernel surface ──
 
 def test_load_nvfp4_kernels_raises_when_symbols_absent():
@@ -266,18 +298,60 @@ def test_fp8_pipeline_call_does_not_patch_pipe_class(monkeypatch):
     """Wrapping one FP8 pipe must not alter all instances of that pipe class."""
     from flash_rt.models.minimax_remover import _fp8_pipeline
 
+    # Exercise the delegation path (orig pipe __call__) rather than the
+    # eager-manual denoise default, so the stub does not need a real
+    # transformer/scheduler. The class-isolation guarantee under test is
+    # independent of the steady-state dispatch mode.
+    monkeypatch.setenv("FLASHRT_FP8_EAGER_MANUAL", "0")
+
+    class _Param:
+        dtype = "fp16"
+
     class _Transformer:
+        def __init__(self):
+            self.config = types.SimpleNamespace(eps=1e-6)
+            self._hooks = []
+
         def to(self, _dtype):
             return self
+
+        def parameters(self):
+            return iter([_Param()])
+
+        def register_forward_hook(self, fn):
+            self._hooks.append(fn)
+
+            class _Handle:
+                def __init__(self, hooks, f):
+                    self._hooks = hooks
+                    self._f = f
+
+                def remove(self):
+                    if self._f in self._hooks:
+                        self._hooks.remove(self._f)
+
+            return _Handle(self._hooks, fn)
+
+        def _fire_hooks(self):
+            for fn in list(self._hooks):
+                fn(self, None, None)
+
+    class _Vae:
+        def parameters(self):
+            return iter([_Param()])
 
     class _CallablePipe:
         def __init__(self, name):
             self.name = name
             self.transformer = _Transformer()
+            self.vae = _Vae()
             self.calls = []
 
         def __call__(self, *args, **kwargs):
             self.calls.append((args, kwargs))
+            # Simulate the transformer forward so the one-shot calibration
+            # freeze hook fires during the wrapped pipe's first call.
+            self.transformer._fire_hooks()
             return self.name, args, kwargs
 
     set_calibration_calls = []
@@ -321,6 +395,12 @@ def test_fp8_pipeline_call_does_not_patch_pipe_class(monkeypatch):
         "pipe1", ("wrapped",), {"flag": True})
     assert set_calibration_calls == [True]
     assert freeze_calls == [1.1]
+    assert wrapped._calibrated
+
+    assert wrapped("again") == ("pipe1", ("again",), {})
+    assert set_calibration_calls == [True]
+    assert freeze_calls == [1.1]
+
     assert wrapped._calibrated
 
     assert wrapped("again") == ("pipe1", ("again",), {})

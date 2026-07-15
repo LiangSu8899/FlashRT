@@ -36,8 +36,6 @@ import math
 import os
 
 import torch
-from einops import rearrange
-from diffusers.utils.torch_utils import randn_tensor
 
 from ._kernels import (ada_layernorm_fp16_io, gate_mul_residual_bcast,
                        rms_norm_fp32stat, rope_apply_bshd, freqs_to_cos_sin,
@@ -274,12 +272,14 @@ class ManualRemoverPipeline:
         vae_s = self.vae_scale_factor_spatial
         num_latent_frames = (num_frames - 1) // vae_t + 1
         lat_shape = (1, 16, num_latent_frames, height // vae_s, width // vae_s)
+        from diffusers.utils.torch_utils import randn_tensor
         latents = randn_tensor(lat_shape, generator=generator,
                                device=device, dtype=self._dtype)
 
         masks_t = self.expand_masks(masks, iterations)
         masks_t = self.resize(masks_t, height, width).to(device).to(self._vae_dtype)
         masks_t[masks_t > 0] = 1
+        from einops import rearrange
         images_t = rearrange(images, "f h w c -> c f h w")
         images_t = self.resize(images_t[None, ...], height, width).to(device).to(self._vae_dtype)
         masked_images = mask_mul(images_t, masks_t)

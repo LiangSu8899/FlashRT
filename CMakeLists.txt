@@ -175,6 +175,17 @@ option(FLASHRT_ENABLE_OMNIVOICE
 # TU and its binding in lockstep.
 option(FLASHRT_ENABLE_AUDIO_CODEBOOK
        "Build shared delayed-codebook helper kernels into flash_rt_kernels" ON)
+# MiniMax-Remover — builds flash_rt_minimax_remover.so with model-specific
+# FP8/NVFP4 transformer and VAE fused kernels. OFF by default; enable with
+# -DFLASHRT_ENABLE_MINIMAX_REMOVER=ON on Blackwell only.
+option(FLASHRT_ENABLE_MINIMAX_REMOVER
+       "Build MiniMax-Remover FP8/NVFP4 kernels in flash_rt_minimax_remover" OFF)
+if(FLASHRT_ENABLE_MINIMAX_REMOVER AND NOT ENABLE_NVFP4)
+  message(FATAL_ERROR
+    "FLASHRT_ENABLE_MINIMAX_REMOVER requires Blackwell NVFP4 support "
+    "(GPU_ARCH=120/120a/121/121a). The MiniMax-Remover module contains "
+    "SM120 FP8/NVFP4 kernels and must not be enabled for GPU_ARCH=${GPU_ARCH}.")
+endif()
 option(FLASHRT_ENABLE_SM120_DEV_KERNELS
        "Build SM120 probe/tilesweep tuning kernels and public bindings" OFF)
 # ── Slim build for VLA deployments ──
@@ -1010,6 +1021,51 @@ if(FLASHRT_ENABLE_OMNIVOICE)
   message(STATUS "OmniVoice TTS SM120 kernels: ENABLED")
 else()
   message(STATUS "OmniVoice TTS SM120 kernels: DISABLED")
+endif()
+
+# ── MiniMax-Remover fused kernels (standalone module, independent
+#    of flash_rt_kernels) ──
+# Builds flash_rt_minimax_remover.so with MiniMax-specific FP8/NVFP4
+# transformer kernels plus fused VAE helpers. The module is opt-in and
+# remains separate from the default flash_rt_kernels target.
+# Enable explicitly on a Blackwell (sm_120) build:
+#   cmake -DFLASHRT_ENABLE_MINIMAX_REMOVER=ON -DGPU_ARCH=120 ...
+if(FLASHRT_ENABLE_MINIMAX_REMOVER)
+  pybind11_add_module(flash_rt_minimax_remover
+    csrc/minimax_remover_extra_bindings.cpp
+    csrc/kernels/minimax_remover/fp16_rms_norm_ncdhw.cu
+    csrc/kernels/minimax_remover/fp16_rms_silu_ncdhw.cu
+    csrc/kernels/minimax_remover/fp16_rms_norm_ndhwc.cu
+    csrc/kernels/minimax_remover/fp8_conv3d_mm_ndhwc_fp16out.cu
+  csrc/kernels/minimax_remover/fp16_quant_fp8_per_tensor.cu
+  csrc/kernels/minimax_remover/fp16_rms_silu_fp8_ndhwc.cu
+  csrc/kernels/minimax_remover/fp16_bias_gelu_quant_fp8.cu
+  csrc/kernels/minimax_remover/fp16_bias_gate_residual.cu
+  csrc/kernels/minimax_remover/fp16_ada_layernorm_quant_fp8.cu
+  csrc/kernels/minimax_remover/fp16_rmsnorm_rope.cu
+  csrc/kernels/minimax_remover/fp16_rmsnorm_rope_quant_int8.cu
+  csrc/kernels/minimax_remover/fp16_quant_nvfp4_ndhwc.cu
+  csrc/kernels/minimax_remover/nvfp4_conv3d_ndhwc_fp16out.cu)
+  set_target_properties(flash_rt_minimax_remover PROPERTIES
+    CUDA_STANDARD 17
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
+  target_include_directories(flash_rt_minimax_remover PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels)
+  target_compile_options(flash_rt_minimax_remover PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr -O3 --use_fast_math
+      -U__CUDA_NO_HALF_OPERATORS__
+      -U__CUDA_NO_HALF2_OPERATORS__
+      -U__CUDA_NO_HALF_CONVERSIONS__
+      ${GPU_GENCODE}
+    >)
+  target_link_libraries(flash_rt_minimax_remover PRIVATE CUDA::cudart CUDA::cublas CUDA::cublasLt)
+  install(TARGETS flash_rt_minimax_remover LIBRARY DESTINATION flash_rt)
+  message(STATUS "MiniMax-Remover FP8/NVFP4 kernels: ENABLED")
+else()
+  message(STATUS "MiniMax-Remover FP8/NVFP4 kernels: DISABLED")
 endif()
 
 if(FLASHRT_BUILD_QWEN3_VL)

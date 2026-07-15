@@ -25,6 +25,20 @@ import torch.nn as nn
 
 from flash_rt import flash_rt_kernels as kern
 
+# Optional: FlashRT MiniMax-Remover extra kernel module. Used for the
+# vectorised fp16 bias-add kernel (a drop-in replacement for the scalar
+# `add_bias_fp16` in decoder_fused.cu) — cuts the Q/K/V bias cost.
+_fvk_extra = None
+try:
+    from flash_rt import flash_rt_minimax_remover as _fvk_extra
+except ImportError:
+    try:
+        import flash_rt_minimax_remover as _fvk_extra  # type: ignore
+    except ImportError:
+        _fvk_extra = None
+_has_add_bias_vec8 = _fvk_extra is not None and hasattr(
+    _fvk_extra, "fp16_add_bias_vec8")
+
 logger = logging.getLogger(__name__)
 
 _FP8 = torch.float8_e4m3fn
@@ -158,8 +172,14 @@ class FlashRTFp8Linear(nn.Module):
             m, n, k, scale.data_ptr(), self.weight_scale.data_ptr(), stream,
         )
         if self.bias is not None:
-            # FlashRT fused bias (in-place [m,n]+=bias[n]), no torch op
-            kern.add_bias_fp16(out.data_ptr(), self.bias.data_ptr(), m, n, stream)
+            # Prefer the vectorised fp16x8 bias-add kernel (8× fewer memory
+            # transactions than the scalar decoder_fused implementation).
+            if _has_add_bias_vec8 and (n & 7) == 0:
+                _fvk_extra.fp16_add_bias_vec8(
+                    out.data_ptr(), self.bias.data_ptr(), m, n, stream)
+            else:
+                kern.add_bias_fp16(out.data_ptr(), self.bias.data_ptr(),
+                                    m, n, stream)
         out = out.view(*orig_shape[:-1], n)
 
         if in_dtype != torch.float16:
@@ -174,6 +194,154 @@ class FlashRTFp8Linear(nn.Module):
         scale = max(amax * margin / _FP8_MAX, 1e-12)
         self.act_scale.data = torch.tensor([scale], dtype=torch.float32, device=self.weight_fp8.device)
         self.calibrating = False
+
+    # ── Fused-FFN helpers (used by _kern_block block_forward) ──
+    # These let the FFN path skip 3 full-tensor round-trips between the
+    # proj0 (up) and proj1 (down) Linears by fusing bias+gelu+quant into
+    # one kernel (bias_gelu_quant_fp16_fp8 in flash_rt_minimax_remover).
+
+    def gemm_no_bias(self, x: torch.Tensor) -> torch.Tensor:
+        """Quantise + FP8 GEMM, return raw fp16 output WITHOUT bias.
+
+        The caller applies bias later (fused with gelu+quant).  Only valid
+        when not calibrating (the fused FFN path is disabled during the
+        calibration warm-up pass).
+        """
+        if self.calibrating or self.bias is None:
+            return self.forward(x)
+        if x.dtype != torch.float16:
+            x = x.to(torch.float16)
+        orig_shape = x.shape
+        x2d = x.reshape(-1, self.in_features)
+        if x2d.stride(0) != self.in_features or x2d.stride(1) != 1:
+            x2d = x2d.contiguous()
+        m = x2d.shape[0]
+        k, n = self.in_features, self.out_features
+        scale = self.act_scale.data
+        stream = torch.cuda.current_stream().cuda_stream
+        x_fp8 = torch.empty(m, k, dtype=_FP8, device=x2d.device)
+        out = torch.empty(m, n, dtype=torch.float16, device=x2d.device)
+        kern.quantize_fp8_static_fp16(
+            x2d.data_ptr(), x_fp8.data_ptr(), scale.data_ptr(), m * k, stream)
+        kern.fp8_gemm_descale_fp16(
+            x_fp8.data_ptr(), self.weight_fp8.data_ptr(), out.data_ptr(),
+            m, n, k, scale.data_ptr(), self.weight_scale.data_ptr(), stream)
+        return out.view(*orig_shape[:-1], n)
+
+    def gemm_no_bias_from_fp8(self, x_fp8: torch.Tensor) -> torch.Tensor:
+        """FP8 GEMM from pre-quantised fp8 input, WITHOUT bias.
+
+        Counterpart to ``gemm_no_bias`` when the input is already fp8
+        (produced by ``bias_gelu_quant_fp16_fp8``). Caller applies bias
+        later (e.g. fused with gate + residual).
+        """
+        if self.calibrating:
+            return self.forward(x_fp8)
+        orig_shape = x_fp8.shape
+        x2d = x_fp8.reshape(-1, self.in_features)
+        if x2d.stride(0) != self.in_features or x2d.stride(1) != 1:
+            x2d = x2d.contiguous()
+        m = x2d.shape[0]
+        k, n = self.in_features, self.out_features
+        scale = self.act_scale.data
+        stream = torch.cuda.current_stream().cuda_stream
+        out = torch.empty(m, n, dtype=torch.float16, device=x2d.device)
+        kern.fp8_gemm_descale_fp16(
+            x2d.data_ptr(), self.weight_fp8.data_ptr(), out.data_ptr(),
+            m, n, k, scale.data_ptr(), self.weight_scale.data_ptr(), stream)
+        return out.view(*orig_shape[:-1], n)
+
+    def forward_from_fp8(self, x_fp8: torch.Tensor) -> torch.Tensor:
+        """FP8 GEMM from a pre-quantised fp8 input + bias (skip quantise).
+
+        Counterpart to ``gemm_no_bias`` on the previous Linear: the input
+        was already quantised (by the fused bias+gelu+quant kernel), so we
+        only run the GEMM and the (non-fused) bias-add.
+        """
+        if self.calibrating:
+            return self.forward(x_fp8)
+        orig_shape = x_fp8.shape
+        x2d = x_fp8.reshape(-1, self.in_features)
+        if x2d.stride(0) != self.in_features or x2d.stride(1) != 1:
+            x2d = x2d.contiguous()
+        m = x2d.shape[0]
+        k, n = self.in_features, self.out_features
+        scale = self.act_scale.data
+        stream = torch.cuda.current_stream().cuda_stream
+        out = torch.empty(m, n, dtype=torch.float16, device=x2d.device)
+        kern.fp8_gemm_descale_fp16(
+            x2d.data_ptr(), self.weight_fp8.data_ptr(), out.data_ptr(),
+            m, n, k, scale.data_ptr(), self.weight_scale.data_ptr(), stream)
+        if self.bias is not None:
+            if _has_add_bias_vec8 and (n & 7) == 0:
+                _fvk_extra.fp16_add_bias_vec8(
+                    out.data_ptr(), self.bias.data_ptr(), m, n, stream)
+            else:
+                kern.add_bias_fp16(out.data_ptr(), self.bias.data_ptr(),
+                                   m, n, stream)
+        return out.view(*orig_shape[:-1], n)
+
+    def gemm_from_fp8_ext(self, x_fp8: torch.Tensor,
+                          ext_act_scale: torch.Tensor) -> torch.Tensor:
+        """FP8 GEMM from a pre-quantised fp8 input using an externally
+        supplied activation scale (fp32 [1]).
+
+        Used by the fused ``ada_layernorm_quant_fp8_shared`` path, where
+        several sibling Linears (Q/K/V) share a single fp8-quantised
+        input built with ``shared_scale = max(scale_q, scale_k, scale_v)``.
+        The FP8 GEMM descales with the actual scale used at quantise time,
+        which is arithmetically correct regardless of self.act_scale.
+
+        Includes bias.
+        """
+        if self.calibrating:
+            raise RuntimeError("gemm_from_fp8_ext is only valid post-calibration")
+        orig_shape = x_fp8.shape
+        x2d = x_fp8.reshape(-1, self.in_features)
+        if x2d.stride(0) != self.in_features or x2d.stride(1) != 1:
+            x2d = x2d.contiguous()
+        m = x2d.shape[0]
+        k, n = self.in_features, self.out_features
+        stream = torch.cuda.current_stream().cuda_stream
+        out = torch.empty(m, n, dtype=torch.float16, device=x2d.device)
+        kern.fp8_gemm_descale_fp16(
+            x2d.data_ptr(), self.weight_fp8.data_ptr(), out.data_ptr(),
+            m, n, k, ext_act_scale.data_ptr(),
+            self.weight_scale.data_ptr(), stream)
+        if self.bias is not None:
+            if _has_add_bias_vec8 and (n & 7) == 0:
+                _fvk_extra.fp16_add_bias_vec8(
+                    out.data_ptr(), self.bias.data_ptr(), m, n, stream)
+            else:
+                kern.add_bias_fp16(out.data_ptr(), self.bias.data_ptr(),
+                                   m, n, stream)
+        return out.view(*orig_shape[:-1], n)
+
+    def gemm_from_fp8_ext_nobias(self, x_fp8: torch.Tensor,
+                                 ext_act_scale: torch.Tensor) -> torch.Tensor:
+        """Same as gemm_from_fp8_ext but WITHOUT the bias-add.
+
+        For the fully-fused attention path where the Q/K bias is added
+        inside the downstream ``fp16_rmsnorm_rope_quant_int8_q`` /
+        ``fp16_rmsnorm_rope_quant_int8_k`` kernel (fused pre-norm) --
+        avoids the separate ``add_bias_vec8`` kernel and its fp16 output
+        round-trip.
+        """
+        if self.calibrating:
+            raise RuntimeError("gemm_from_fp8_ext_nobias is only valid post-calibration")
+        orig_shape = x_fp8.shape
+        x2d = x_fp8.reshape(-1, self.in_features)
+        if x2d.stride(0) != self.in_features or x2d.stride(1) != 1:
+            x2d = x2d.contiguous()
+        m = x2d.shape[0]
+        k, n = self.in_features, self.out_features
+        stream = torch.cuda.current_stream().cuda_stream
+        out = torch.empty(m, n, dtype=torch.float16, device=x2d.device)
+        kern.fp8_gemm_descale_fp16(
+            x2d.data_ptr(), self.weight_fp8.data_ptr(), out.data_ptr(),
+            m, n, k, ext_act_scale.data_ptr(),
+            self.weight_scale.data_ptr(), stream)
+        return out.view(*orig_shape[:-1], n)
 
 
 def _is_fp8_target(module: nn.Module) -> bool:
