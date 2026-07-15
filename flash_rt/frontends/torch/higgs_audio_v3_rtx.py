@@ -2,8 +2,9 @@
 
 Hand-written forward over flash_rt_kernels + flash_rt_fa2: a dense Qwen3-4B
 backbone drives a fused multi-codebook head that emits 8 codec tokens per
-acoustic frame under a delay pattern, decoded autoregressively with greedy
-sampling. ``predict`` returns raw ``[T, num_codebooks]`` codes; waveform
+acoustic frame under a delay pattern. Greedy decode is the default fully fused
+path; an explicit temperature fallback uses FlashRT's dependency-free CUDA
+sampler. ``predict`` returns raw ``[T, num_codebooks]`` codes; waveform
 synthesis is the codec's responsibility.
 
 Kernels used: ``rms_norm``, ``bf16_matmul_bf16``, ``silu_mul_qwen36_bf16``,
@@ -16,6 +17,7 @@ Qwen3-8B). Plain RMSNorm weight convention (multiplies by ``w``, not ``1+w``).
 from __future__ import annotations
 
 import json
+import math
 import os
 from typing import Any
 
@@ -26,6 +28,8 @@ from flash_rt.models.higgs_audio_v3.pipeline_rtx import HiggsAudioV3Dims
 _SPECIALS = ("<|tts|>", "<|text|>", "<|audio|>")
 _FP8_CALIBRATION_TEXT = "Four score."
 _REPEAT_STOP_FRAMES = 32
+_GREEDY_TEMP_THRESHOLD = 1e-5
+_MAX_SAMPLING_SEED = (1 << 64) - 1
 
 
 def _delayed_eoc_countdown(codes: torch.Tensor, nc: int, eoc: int) -> int | None:
@@ -42,6 +46,23 @@ def _repeat_code_run(codes: torch.Tensor,
                      count: int) -> tuple[tuple[int, ...], int]:
     key = tuple(int(x) for x in codes.tolist())
     return key, count + 1 if key == prev_key else 1
+
+
+def _normalize_sampling_options(
+    temperature: float, seed: int | None
+) -> tuple[float, int]:
+    """Validate public sampling options and materialize one request seed."""
+    temperature = float(temperature)
+    if not math.isfinite(temperature) or temperature < 0.0:
+        raise ValueError("temperature must be a finite value >= 0")
+    if seed is None:
+        seed = (int.from_bytes(os.urandom(8), "little")
+                if temperature > _GREEDY_TEMP_THRESHOLD else 0)
+    elif isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an integer or None")
+    if not 0 <= seed <= _MAX_SAMPLING_SEED:
+        raise ValueError("seed must be in [0, 2**64 - 1]")
+    return temperature, seed
 
 
 class HiggsAudioV3TorchFrontendRtx:
@@ -418,21 +439,44 @@ class HiggsAudioV3TorchFrontendRtx:
         return self._gen_pos
 
     @torch.no_grad()
-    def decode_stream(self):
-        """Yield committed un-delayed ``[nc]`` int code frames (cpu) as ready."""
+    def decode_stream(self, *, temperature: float = 0.0,
+                      seed: int | None = None):
+        """Yield committed un-delayed ``[nc]`` code frames as ready.
+
+        Greedy decode (``temperature=0``, the default) retains the original
+        fused argmax/embed kernel. A positive temperature selects the explicit
+        dependency-free CUDA sampling fallback; ``temperature=1`` matches the
+        upstream default distribution. A fixed ``seed`` fixes the sampler's
+        random stream.
+        """
         from flash_rt import flash_rt_kernels as fvk
         nc = self._cfg["num_codebooks"]
         boc, eoc = self.DIMS.boc_id, self.DIMS.eoc_id
         P, logits = self._gen_pos, self._gen_logits
+        temperature, sampling_seed = _normalize_sampling_options(
+            temperature, seed)
+        sampled = temperature > _GREEDY_TEMP_THRESHOLD
+        if sampled and not hasattr(fvk, "delayed_codebook_sample_embed_bf16"):
+            raise RuntimeError(
+                "Higgs Audio v3 sampling kernel is not in this build; rebuild "
+                "with FLASHRT_ENABLE_AUDIO_CODEBOOK=ON or use temperature=0.")
         delay, eoc_countdown, done = 0, None, False
         repeat_key, repeat_count = None, 0
         window: list[torch.Tensor] = []
         for j in range(self.max_new_frames):
-            fvk.delayed_codebook_argmax_embed_bf16(
-                logits.data_ptr(), self._weights["codebook"].data_ptr(),
-                self._codes_dev.data_ptr(), self._embed_buf.data_ptr(),
-                nc, self._cfg["codebook_vocab"], self._cfg["hidden"],
-                delay, boc, torch.cuda.current_stream().cuda_stream)
+            stream = torch.cuda.current_stream().cuda_stream
+            if sampled:
+                fvk.delayed_codebook_sample_embed_bf16(
+                    logits.data_ptr(), self._weights["codebook"].data_ptr(),
+                    self._codes_dev.data_ptr(), self._embed_buf.data_ptr(),
+                    nc, self._cfg["codebook_vocab"], self._cfg["hidden"],
+                    delay, boc, temperature, sampling_seed, j, stream)
+            else:
+                fvk.delayed_codebook_argmax_embed_bf16(
+                    logits.data_ptr(), self._weights["codebook"].data_ptr(),
+                    self._codes_dev.data_ptr(), self._embed_buf.data_ptr(),
+                    nc, self._cfg["codebook_vocab"], self._cfg["hidden"],
+                    delay, boc, stream)
             codes = self._codes_dev.cpu()
             if delay < nc:
                 delay += 1
@@ -457,11 +501,14 @@ class HiggsAudioV3TorchFrontendRtx:
             logits = self._decode_logits(fvk, self._embed_buf, P + j)
 
     @torch.no_grad()
-    def predict(self, text: str | None = None) -> torch.Tensor:
-        """Generate acoustic codes for ``text`` (greedy, delay/EOC).
+    def predict(self, text: str | None = None, *, temperature: float = 0.0,
+                seed: int | None = None) -> torch.Tensor:
+        """Generate acoustic codes for ``text`` (delay/EOC).
 
         Returns raw codes of shape ``[T, num_codebooks]`` (int64, CPU);
         feed them to :meth:`synthesize` (or the Higgs codec) for a 24 kHz wave.
+        The default is the fully fused greedy path. Pass ``temperature=1.0``
+        for the upstream-compatible default sampling distribution.
         """
         import time
 
@@ -472,7 +519,7 @@ class HiggsAudioV3TorchFrontendRtx:
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         self.prefill()
-        frames = list(self.decode_stream())
+        frames = list(self.decode_stream(temperature=temperature, seed=seed))
         torch.cuda.synchronize()
         self.latency_records.append((time.perf_counter() - t0) * 1000.0)
         if not frames:
@@ -488,16 +535,19 @@ class HiggsAudioV3TorchFrontendRtx:
         return self._codec.decode(codes)
 
     @torch.no_grad()
-    def generate(self, text: str) -> torch.Tensor:
+    def generate(self, text: str, *, temperature: float = 0.0,
+                 seed: int | None = None) -> torch.Tensor:
         """Full pipeline: text -> acoustic codes -> 24 kHz waveform ``[L]``."""
-        return self.synthesize(self.predict(text))
+        return self.synthesize(self.predict(
+            text, temperature=temperature, seed=seed))
 
     SAMPLES_PER_FRAME = 960   # 24000 Hz / 25 Hz acoustic frame rate
 
     @torch.no_grad()
     def generate_stream(self, text: str, *, system: str | None = None,
                         first_chunk: int = 8, chunk: int = 25, ctx: int = 8,
-                        holdback: int = 8):
+                        holdback: int = 8, temperature: float = 0.0,
+                        seed: int | None = None):
         """Stream 24 kHz audio chunks as frames decode (low TTFA).
 
         Yields mono waveform chunks (cpu f32). ``first_chunk`` frames are emitted
@@ -538,7 +588,7 @@ class HiggsAudioV3TorchFrontendRtx:
             return out
 
         target = first_chunk
-        for frame in self.decode_stream():
+        for frame in self.decode_stream(temperature=temperature, seed=seed):
             frames.append(frame)
             ready = len(frames) - holdback           # frames with full right ctx
             if ready - emitted >= target:

@@ -54,6 +54,8 @@ def build_app(frontend, model_name: str):
         instructions: str | None = None       # shared voice/style preamble
         response_format: str = "pcm"          # pcm | wav
         stream: bool = True
+        temperature: float = 0.0              # greedy native path by default
+        seed: int | None = None
 
     @app.get("/health")
     def health():
@@ -84,7 +86,8 @@ def build_app(frontend, model_name: str):
                 # (only the new input is prefilled). Policy lives here; the
                 # frontend owns the reuse mechanism.
                 for chunk in frontend.generate_stream(
-                        req.input, system=req.instructions):
+                        req.input, system=req.instructions,
+                        temperature=req.temperature, seed=req.seed):
                     yield _pcm16(chunk)
 
         media = "audio/wav" if fmt == "wav" else "audio/pcm"

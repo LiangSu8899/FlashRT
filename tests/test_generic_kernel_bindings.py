@@ -158,9 +158,11 @@ def test_neutral_embedding_binding_exists():
 
 
 def test_delayed_codebook_binding_exists():
-    """Delayed codebook argmax/embed helper is exported by the core module."""
+    """Audio codebook decode helpers share the model build gate."""
     m = _import_kernels()
     if _audio_codebook_enabled():
         assert hasattr(m, "delayed_codebook_argmax_embed_bf16")
+        assert hasattr(m, "delayed_codebook_sample_embed_bf16")
     else:
         assert not hasattr(m, "delayed_codebook_argmax_embed_bf16")
+        assert not hasattr(m, "delayed_codebook_sample_embed_bf16")

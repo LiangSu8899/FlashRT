@@ -47,6 +47,12 @@ curl -s http://127.0.0.1:8000/v1/audio/speech \
 curl -N http://127.0.0.1:8000/v1/audio/speech \
   -H 'Content-Type: application/json' \
   -d '{"input":"Streaming low-latency speech.","response_format":"pcm"}' > out.pcm
+
+# Explicit upstream-compatible sampling fallback. Greedy remains the default.
+curl -N http://127.0.0.1:8000/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{"input":"Sampling avoids a pathological greedy loop.","temperature":1.0,"seed":1234}' \
+  > sampled.pcm
 ```
 
 `GET /health` and `GET /v1/models` report status and the served model.
@@ -64,6 +70,10 @@ faithfulness validation.
 ## Notes
 
 - `response_format`: `pcm` (raw 24 kHz mono int16, lowest latency) or `wav`.
+- `temperature`: `0.0` by default, preserving the fully fused greedy path;
+  explicitly pass `1.0` for the dependency-free CUDA sampling fallback that
+  matches the upstream default distribution. `seed` fixes the sampler's random
+  stream.
 - The frontend's greedy decode is deterministic but, like any reimplementation
   of greedy discrete-code TTS, produces a different valid realisation than other
   engines (see the doc); faithfulness is established by teacher-forced cosine 1.0

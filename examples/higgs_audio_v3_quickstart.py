@@ -17,6 +17,10 @@ Examples:
     # BF16 backbone instead of FP8:
     python examples/higgs_audio_v3_quickstart.py --text "..." --bf16
 
+    # Upstream-compatible default sampling fallback (native default is greedy):
+    python examples/higgs_audio_v3_quickstart.py \
+        --text "..." --temperature 1.0 --seed 1234
+
     # Per-frame decode latency (excludes one-time calibration / codec load):
     python examples/higgs_audio_v3_quickstart.py --text "..." --benchmark 3
 """
@@ -57,6 +61,10 @@ def main() -> None:
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--max-seq", type=int, default=2048)
     ap.add_argument("--bf16", action="store_true", help="use the BF16 backbone")
+    ap.add_argument("--temperature", type=float, default=0.0,
+                    help="0 keeps the fused greedy path; 1 matches upstream default")
+    ap.add_argument("--seed", type=int, default=None,
+                    help="optional uint64 seed for temperature sampling")
     ap.add_argument("--benchmark", type=int, default=0,
                     help="re-generate N times and report per-frame decode latency")
     args = ap.parse_args()
@@ -74,7 +82,7 @@ def main() -> None:
     backbone = "BF16" if not fe.fp8 else "FP8 W8A8"
 
     t0 = time.perf_counter()
-    wav = fe.generate(args.text)                  # 1st call: lazy calibrate + codec
+    wav = fe.generate(args.text, temperature=args.temperature, seed=args.seed)
     dt = time.perf_counter() - t0
     _save_wav(args.out, wav)
     dur = len(wav) / 24_000
@@ -83,7 +91,7 @@ def main() -> None:
     print(f"  -> {args.out}  ({dur:.2f}s audio, {dt:.2f}s wall incl 1st-call setup)")
 
     for i in range(args.benchmark):
-        fe.predict(args.text)                     # warm: no calibration/codec load
+        fe.predict(args.text, temperature=args.temperature, seed=args.seed)
         ms = fe.latency_records[-1]
         n = max(1, int(round(dur * 25)))          # 25 Hz acoustic frames
         print(f"  bench {i + 1}: AR decode {ms:.0f} ms ({ms / n:.2f} ms/frame)")

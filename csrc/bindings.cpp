@@ -4537,6 +4537,24 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("embed_out"), py::arg("num_codebooks"),
         py::arg("codebook_vocab"), py::arg("hidden"), py::arg("delay"),
         py::arg("boc"), py::arg("stream") = 0);
+    m.def("delayed_codebook_sample_embed_bf16",
+        [](uintptr_t logits, uintptr_t codebook, uintptr_t codes_out,
+           uintptr_t embed_out, int num_codebooks, int codebook_vocab,
+           int hidden, int delay, int boc, float temperature, uint64_t seed,
+           uint64_t step, uintptr_t stream) {
+            flash_rt::kernels::delayed_codebook_sample_embed_bf16(
+                reinterpret_cast<const __nv_bfloat16*>(logits),
+                reinterpret_cast<const __nv_bfloat16*>(codebook),
+                reinterpret_cast<int64_t*>(codes_out),
+                reinterpret_cast<__nv_bfloat16*>(embed_out),
+                num_codebooks, codebook_vocab, hidden, delay, boc,
+                temperature, seed, step, to_stream(stream));
+        },
+        py::arg("logits"), py::arg("codebook"), py::arg("codes_out"),
+        py::arg("embed_out"), py::arg("num_codebooks"),
+        py::arg("codebook_vocab"), py::arg("hidden"), py::arg("delay"),
+        py::arg("boc"), py::arg("temperature"), py::arg("seed"),
+        py::arg("step"), py::arg("stream") = 0);
 #endif
 
 #ifdef FLASHRT_HAVE_QWEN36_KERNELS

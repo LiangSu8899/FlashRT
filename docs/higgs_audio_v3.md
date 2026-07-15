@@ -3,8 +3,10 @@
 > Single-stream, zero-shot text-to-speech: an **FP8 W8A8 Qwen3-4B** backbone
 > drives a fused 8-codebook head under a delay pattern, decoded autoregressively
 > and synthesised by the bundled neural codec — **text → 24 kHz waveform in one
-> process, no server required.** Per-frame decode is fully kernelised (no torch
-> in the math path) behind a clean `generate(text) -> waveform` API.
+> process, no server required.** The default greedy path and the explicit
+> temperature-sampling fallback are both implemented by FlashRT-owned CUDA
+> kernels (no sampler dependency) behind a clean `generate(text) -> waveform`
+> API.
 
 Model: [`bosonai/higgs-audio-v3-tts-4b`](https://huggingface.co/bosonai/higgs-audio-v3-tts-4b)
 — a dense Qwen3-4B backbone (36 layers, hidden 2560, GQA 32q/8kv, head_dim 128,
@@ -20,10 +22,11 @@ Jump to: [Usage](#3-quickstart) · [Python API](#4-python-api) ·
 
 ## Performance
 
-Measured on a single **RTX 5090** (SM120), single stream, warm (numbers vary
-with text and clocks). Two precisions, auto-selected by GPU (see *Hardware-
-adaptive* below): **FP8 W8A8** (SM120) and **BF16 W16A16** (the unquantised path,
-also the auto-selection on non-FP8 builds):
+Measured on a single **RTX 5090** (SM120), single stream, warm, using the native
+greedy default (`temperature=0`; numbers vary with text and clocks). Two
+precisions, auto-selected by GPU (see *Hardware-adaptive* below): **FP8 W8A8**
+(SM120) and **BF16 W16A16** (the unquantised path, also the auto-selection on
+non-FP8 builds):
 
 | Metric | **FP8** (default) | **BF16** (`fp8=False`) |
 |---|---|---|
@@ -120,6 +123,11 @@ The directory must contain `config.json`, `model.safetensors`, and
 python examples/higgs_audio_v3_quickstart.py \
     --text "The quick brown fox jumps over the lazy dog." \
     --out fox.wav --benchmark 3
+
+# Explicit fallback matching the upstream default sampling distribution:
+python examples/higgs_audio_v3_quickstart.py \
+    --text "The quick brown fox jumps over the lazy dog." \
+    --temperature 1.0 --seed 1234 --out fox-sampled.wav
 ```
 
 Expected output on a 5090 (numbers vary with text length and clocks):
@@ -148,6 +156,9 @@ fe = HiggsAudioV3TorchFrontendRtx(CHECKPOINT_DIR)   # fp8=None (default): auto F
 
 wav = fe.generate("Hello from FlashRT.")     # text -> 24 kHz mono waveform [L] (cpu f32)
 
+# Explicit dependency-free CUDA sampling fallback. Greedy stays the default.
+wav = fe.generate("Hello from FlashRT.", temperature=1.0, seed=1234)
+
 # or split the stages:
 codes = fe.predict("Hello from FlashRT.")    # [T, 8] acoustic codes (int64, cpu)
 wav   = fe.synthesize(codes)                 # codes -> waveform
@@ -175,6 +186,17 @@ The reuse is a frontend mechanism (the KV cache is owned by the frontend); the
 caching/eviction policy belongs in the serving layer
 (`serving/higgs_audio_agent` forwards the request `instructions` as `system`).
 
+**Sampling policy.** `temperature=0.0` is intentionally the default: it uses
+the original fused argmax + delay-mask + embedding kernel, keeps the native
+path deterministic, and preserves its measured latency. Some prompts can enter
+a repeated-code attractor under greedy decoding in both FlashRT and the
+upstream engine. For those workloads, explicitly pass `temperature=1.0` to use
+the upstream default sampling distribution. This fallback is still a native
+FlashRT kernel: stable softmax, stateless categorical sampling, delay masking,
+and codebook embedding run in CUDA without SGLang, FlashInfer sampling, or
+another runtime dependency. `seed` is an optional uint64 request seed; a fixed
+value reproduces the same draws.
+
 ---
 
 ## 5. What runs under the hood
@@ -192,6 +214,11 @@ rms_norm_fp8 (norm + quant)
   -> M=1 FP8 GEMV  (down_proj, fused residual epilogue: h += down)
   -> rms_norm + quantize_fp8_static -> GEMV (fused 8-codebook head)
 ```
+
+The default argmax/embed epilogue remains one fused helper. With an explicit
+positive temperature, a separate FlashRT CUDA helper performs the categorical
+draw and embedding; it does not alter the backbone graph or the greedy launch
+sequence.
 
 The M=1 GEMV (`csrc/gemm/fp8_gemv_m1_sm120.cu`) is the key kernel: the hand-tuned
 MMA GEMMs pad M=1 to BLOCK_M=16 and starve the SMs on the N=2560 projections;
@@ -266,6 +293,9 @@ python examples/higgs_audio_v3_quickstart.py \
 - **FP8 calibration** is per-tensor static (activation `amax/448`), measured
   once from a short BF16 free-run of a built-in calibration prompt and reused.
   This keeps activation scales independent of the first user request.
+- **Decode policy.** Greedy is the dependency-free native default. Temperature
+  sampling is an explicit, also dependency-free CUDA fallback; top-p/top-k are
+  not part of this narrow fallback surface.
 - The BF16 projection weights are freed after calibration (the FP8 backbone is
   the active path); pass `fp8=False` for the BF16 backbone, which keeps them.
 - **GPU support / precision auto-selection.** The build auto-detects the GPU
