@@ -37,6 +37,9 @@ public:
     const std::map<std::string, SafetensorInfo>& tensors() const {
         return tensors_;
     }
+    const std::map<std::string, std::string>& metadata() const {
+        return metadata_;
+    }
     const SafetensorInfo* find(const std::string& name) const;
     const void* data(const SafetensorInfo& tensor) const;
 
@@ -50,6 +53,7 @@ private:
     std::string path_;
     std::string error_;
     std::map<std::string, SafetensorInfo> tensors_;
+    std::map<std::string, std::string> metadata_;
 };
 
 }  // namespace loader

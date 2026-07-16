@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <map>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -15,6 +16,7 @@ namespace pi05 {
 
 enum class NativeWeightDType {
     kBf16,
+    kFloat16,
     kFp8E4M3,
     kInt8,
     kFloat32,
@@ -35,6 +37,8 @@ public:
 
     modalities::Status upload(const std::string& name,
                               const NativeBf16Tensor& tensor);
+    modalities::Status upload(const std::string& name,
+                              const NativeF16Tensor& tensor);
     modalities::Status upload_bytes(
         const std::string& name,
         const std::vector<std::uint64_t>& shape,
@@ -50,6 +54,7 @@ public:
 private:
     frt_ctx ctx_ = nullptr;  // borrowed; the context owns every buffer
     std::map<std::string, NativeDeviceWeight> weights_;
+    std::mutex upload_mutex_;
 };
 
 }  // namespace pi05

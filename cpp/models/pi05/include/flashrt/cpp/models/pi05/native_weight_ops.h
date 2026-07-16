@@ -22,6 +22,11 @@ struct NativeBf16Tensor {
     std::vector<std::uint16_t> values;
 };
 
+struct NativeF16Tensor {
+    std::vector<std::uint64_t> shape;
+    std::vector<std::uint16_t> values;
+};
+
 enum class NativeSourceDType {
     kF32,
     kBf16,
@@ -43,6 +48,36 @@ modalities::Status native_source_to_bf16(
     const NativeSourceTensorView& input,
     bool transpose,
     NativeBf16Tensor* out);
+
+modalities::Status native_source_to_f16(
+    const NativeSourceTensorView& input,
+    bool transpose,
+    NativeF16Tensor* out);
+
+modalities::Status native_source_qkv_to_f16(
+    const NativeSourceTensorView& q,
+    const NativeSourceTensorView& k,
+    const NativeSourceTensorView& v,
+    std::uint64_t q_heads,
+    std::uint64_t k_heads,
+    const NativeFloatTensor* norm,
+    bool transpose,
+    NativeF16Tensor* out);
+
+modalities::Status native_source_pair_to_f16(
+    const NativeSourceTensorView& left,
+    const NativeSourceTensorView& right,
+    const NativeFloatTensor* norm,
+    bool transpose,
+    NativeF16Tensor* out);
+
+modalities::Status native_source_concat_vectors_to_f16(
+    const std::vector<const NativeSourceTensorView*>& inputs,
+    NativeF16Tensor* out);
+
+modalities::Status native_source_patch_oihw_to_hwio_f16(
+    const NativeSourceTensorView& input,
+    NativeF16Tensor* out);
 
 modalities::Status native_source_fold_rms_columns_transpose(
     const NativeSourceTensorView& weight,
@@ -84,6 +119,9 @@ modalities::Status load_native_float_tensor(
 
 modalities::Status native_to_bf16(const NativeFloatTensor& input,
                                   NativeBf16Tensor* out);
+
+modalities::Status native_to_f16(const NativeFloatTensor& input,
+                                 NativeF16Tensor* out);
 
 modalities::Status native_round_to_bf16_float(
     const NativeFloatTensor& input,
@@ -127,6 +165,11 @@ modalities::Status native_pi05_time_embeddings(
     int num_steps,
     std::uint64_t embedding_dim,
     NativeFloatTensor* out);
+
+modalities::Status native_pi05_time_embeddings_f16(
+    int num_steps,
+    std::uint64_t embedding_dim,
+    NativeF16Tensor* out);
 
 }  // namespace pi05
 }  // namespace models

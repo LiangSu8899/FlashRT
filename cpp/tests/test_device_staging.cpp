@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <vector>
 
 using flashrt::modalities::DType;
@@ -57,6 +58,13 @@ std::uint32_t bf16_ulp_distance(std::uint16_t a, std::uint16_t b) {
 }
 
 void test_vision_h2d_staging() {
+    flashrt::modalities::VisionStaging overflow;
+    auto st = flashrt::modalities::vision_staging_create(
+        &overflow, 2,
+        std::numeric_limits<std::uint64_t>::max() / 2 + 1);
+    assert(!st.ok_status());
+    assert(!overflow.device && !overflow.host_pinned);
+
     const auto spec = flashrt::models::pi05::vision_preprocess_spec(1);
     const std::uint64_t bytes = required_vision_output_bytes(spec);
 
@@ -78,7 +86,7 @@ void test_vision_h2d_staging() {
 
     TensorView dst{device, bytes, DType::kBFloat16, MemoryPlace::kDevice,
                    Layout::kNHWC, Shape{1, 224, 224, 3}};
-    auto st = preprocess_vision(spec, {frame}, dst);
+    st = preprocess_vision(spec, {frame}, dst);
     assert(st.ok_status());
 
     std::vector<std::uint16_t> got(bytes / 2);

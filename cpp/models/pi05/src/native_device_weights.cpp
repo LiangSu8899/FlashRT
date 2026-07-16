@@ -36,6 +36,7 @@ bool element_count(const std::vector<std::uint64_t>& shape,
 std::size_t element_bytes(NativeWeightDType dtype) {
     switch (dtype) {
         case NativeWeightDType::kBf16: return sizeof(std::uint16_t);
+        case NativeWeightDType::kFloat16: return sizeof(std::uint16_t);
         case NativeWeightDType::kFp8E4M3: return sizeof(std::uint8_t);
         case NativeWeightDType::kInt8: return sizeof(std::int8_t);
         case NativeWeightDType::kFloat32: return sizeof(float);
@@ -53,12 +54,21 @@ modalities::Status NativeDeviceWeightStore::upload(
                         tensor.values.size() * sizeof(std::uint16_t));
 }
 
+modalities::Status NativeDeviceWeightStore::upload(
+    const std::string& name,
+    const NativeF16Tensor& tensor) {
+    return upload_bytes(name, tensor.shape, NativeWeightDType::kFloat16,
+                        tensor.values.data(),
+                        tensor.values.size() * sizeof(std::uint16_t));
+}
+
 modalities::Status NativeDeviceWeightStore::upload_bytes(
     const std::string& name,
     const std::vector<std::uint64_t>& shape,
     NativeWeightDType dtype,
     const void* data,
     std::size_t bytes) {
+    std::lock_guard<std::mutex> lock(upload_mutex_);
     if (!ctx_ || name.empty()) return invalid("invalid device weight store");
     if (weights_.find(name) != weights_.end()) {
         return invalid("duplicate device weight name");

@@ -28,6 +28,13 @@ Status vision_staging_create(VisionStaging* out, std::uint32_t n_views,
         return Status::error(StatusCode::kInvalidArgument,
                              "invalid vision staging capacity");
     }
+    if (max_frame_bytes >
+            std::numeric_limits<std::uint64_t>::max() / n_views ||
+        max_frame_bytes >
+            std::numeric_limits<std::size_t>::max() / n_views) {
+        return Status::error(StatusCode::kInvalidArgument,
+                             "vision staging capacity overflows size_t");
+    }
     *out = VisionStaging{};
     const std::uint64_t total = max_frame_bytes * n_views;
     cudaError_t rc = cudaMalloc(&out->device, total);

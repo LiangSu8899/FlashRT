@@ -49,11 +49,12 @@ public:
     HeaderParser(const char* begin, const char* end)
         : begin_(begin), cur_(begin), end_(end) {}
 
-    bool parse(std::map<std::string, SafetensorInfo>* tensors) {
+    bool parse(std::map<std::string, SafetensorInfo>* tensors,
+               std::map<std::string, std::string>* metadata) {
         skip_ws();
         if (!consume('{')) return fail("safetensors header must be an object");
         skip_ws();
-        if (consume('}')) return finish(tensors);
+        if (consume('}')) return finish(tensors, metadata);
         while (cur_ < end_) {
             std::string key;
             if (!parse_string(&key)) return false;
@@ -61,7 +62,11 @@ public:
             if (!consume(':')) return fail("expected ':' after tensor name");
             skip_ws();
             if (key == "__metadata__") {
-                if (!skip_value()) return false;
+                if (metadata_seen_) {
+                    return fail("duplicate safetensors metadata object");
+                }
+                metadata_seen_ = true;
+                if (!parse_metadata()) return false;
             } else {
                 SafetensorInfo tensor;
                 if (!parse_tensor(&tensor)) return false;
@@ -70,7 +75,7 @@ public:
                 }
             }
             skip_ws();
-            if (consume('}')) return finish(tensors);
+            if (consume('}')) return finish(tensors, metadata);
             if (!consume(',')) return fail("expected ',' or '}' in header");
             skip_ws();
         }
@@ -80,12 +85,42 @@ public:
     const std::string& error() const { return error_; }
 
 private:
-    bool finish(std::map<std::string, SafetensorInfo>* tensors) {
+    bool finish(std::map<std::string, SafetensorInfo>* tensors,
+                std::map<std::string, std::string>* metadata) {
         skip_ws();
         if (cur_ != end_) return fail("trailing data in safetensors header");
         if (parsed_.empty()) return fail("safetensors file contains no tensors");
         if (tensors) *tensors = std::move(parsed_);
+        if (metadata) *metadata = std::move(metadata_);
         return true;
+    }
+
+    bool parse_metadata() {
+        if (!consume('{')) return fail("safetensors metadata must be an object");
+        skip_ws();
+        if (consume('}')) return true;
+        while (cur_ < end_) {
+            std::string key;
+            if (!parse_string(&key)) return false;
+            skip_ws();
+            if (!consume(':')) return fail("expected ':' in safetensors metadata");
+            skip_ws();
+            std::string value;
+            if (cur_ >= end_ || *cur_ != '"') {
+                return fail("safetensors metadata values must be strings");
+            }
+            if (!parse_string(&value)) return false;
+            if (!metadata_.emplace(std::move(key), std::move(value)).second) {
+                return fail("duplicate safetensors metadata key");
+            }
+            skip_ws();
+            if (consume('}')) return true;
+            if (!consume(',')) {
+                return fail("expected ',' in safetensors metadata");
+            }
+            skip_ws();
+        }
+        return fail("unterminated safetensors metadata");
     }
 
     bool parse_tensor(SafetensorInfo* tensor) {
@@ -320,6 +355,8 @@ private:
     const char* end_;
     std::string error_;
     std::map<std::string, SafetensorInfo> parsed_;
+    std::map<std::string, std::string> metadata_;
+    bool metadata_seen_ = false;
 };
 
 }  // namespace
@@ -346,6 +383,7 @@ void SafetensorsFile::move_from(SafetensorsFile&& other) noexcept {
     path_ = std::move(other.path_);
     error_ = std::move(other.error_);
     tensors_ = std::move(other.tensors_);
+    metadata_ = std::move(other.metadata_);
     other.fd_ = -1;
     other.mapping_ = nullptr;
     other.mapping_bytes_ = 0;
@@ -391,7 +429,7 @@ bool SafetensorsFile::open(const std::string& path) {
     data_offset_ = 8 + header_bytes;
     const char* header = static_cast<const char*>(mapping_) + 8;
     HeaderParser parser(header, header + header_bytes);
-    if (!parser.parse(&tensors_)) {
+    if (!parser.parse(&tensors_, &metadata_)) {
         error_ = parser.error();
         close();
         return false;
@@ -436,6 +474,7 @@ void SafetensorsFile::close() {
     data_offset_ = 0;
     path_.clear();
     tensors_.clear();
+    metadata_.clear();
 }
 
 const SafetensorInfo* SafetensorsFile::find(const std::string& name) const {

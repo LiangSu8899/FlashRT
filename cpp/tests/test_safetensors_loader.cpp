@@ -53,6 +53,8 @@ int main() {
     assert(file.open(path));
     assert(file.is_open());
     assert(file.tensors().size() == 2);
+    assert(file.metadata().size() == 1);
+    assert(file.metadata().at("format") == "pt");
     const auto* values = file.find("values");
     assert(values);
     assert(values->dtype == "F32");
@@ -63,6 +65,7 @@ int main() {
     SafetensorsFile moved(std::move(file));
     assert(!file.is_open());
     assert(moved.find("u8"));
+    assert(moved.metadata().at("format") == "pt");
     assert(::unlink(path.c_str()) == 0);
     assert(std::memcmp(moved.data(*moved.find("values")), expected,
                        sizeof(expected)) == 0);
@@ -99,6 +102,23 @@ int main() {
                "\"x\":{\"dtype\":\"U8\",\"shape\":[1],"
                "\"data_offsets\":[1,2]}}",
                std::string(2, '\0'));
+    assert(!file.open(invalid));
+    assert(file.error().find("duplicate") != std::string::npos);
+
+    write_file(invalid,
+               "{\"__metadata__\":{\"format\":7},"
+               "\"x\":{\"dtype\":\"U8\",\"shape\":[1],"
+               "\"data_offsets\":[0,1]}}",
+               std::string(1, '\0'));
+    assert(!file.open(invalid));
+    assert(file.error().find("must be strings") != std::string::npos);
+
+    write_file(invalid,
+               "{\"__metadata__\":{\"format\":\"pt\"},"
+               "\"__metadata__\":{\"source\":\"test\"},"
+               "\"x\":{\"dtype\":\"U8\",\"shape\":[1],"
+               "\"data_offsets\":[0,1]}}",
+               std::string(1, '\0'));
     assert(!file.open(invalid));
     assert(file.error().find("duplicate") != std::string::npos);
 

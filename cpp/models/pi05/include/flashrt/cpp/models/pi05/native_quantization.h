@@ -27,6 +27,11 @@ modalities::Status native_quantize_fp8_e4m3(
     bool transpose,
     NativeFp8Tensor* out);
 
+modalities::Status native_quantize_fp8_e4m3(
+    const NativeF16Tensor& fp16_weight,
+    bool transpose,
+    NativeFp8Tensor* out);
+
 modalities::Status native_quantize_int8_per_output(
     const NativeFloatTensor& bf16_weight,
     NativeInt8Tensor* out);

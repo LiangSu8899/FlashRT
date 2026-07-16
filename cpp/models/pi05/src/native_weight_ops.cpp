@@ -116,6 +116,9 @@ struct F32Reader {
     std::uint16_t bf16(std::size_t index) const {
         return modalities::float_to_bfloat16(data[index]);
     }
+    std::uint16_t f16(std::size_t index) const {
+        return modalities::float_to_float16(data[index]);
+    }
 };
 
 struct Bf16Reader {
@@ -124,6 +127,9 @@ struct Bf16Reader {
         return modalities::bfloat16_to_float(data[index]);
     }
     std::uint16_t bf16(std::size_t index) const { return data[index]; }
+    std::uint16_t f16(std::size_t index) const {
+        return modalities::float_to_float16((*this)[index]);
+    }
 };
 
 struct F16Reader {
@@ -135,6 +141,7 @@ struct F16Reader {
         return modalities::float_to_bfloat16(
             modalities::float16_to_float(data[index]));
     }
+    std::uint16_t f16(std::size_t index) const { return data[index]; }
 };
 
 struct UnalignedF32Reader {
@@ -146,6 +153,9 @@ struct UnalignedF32Reader {
     }
     std::uint16_t bf16(std::size_t index) const {
         return modalities::float_to_bfloat16((*this)[index]);
+    }
+    std::uint16_t f16(std::size_t index) const {
+        return modalities::float_to_float16((*this)[index]);
     }
 };
 
@@ -164,6 +174,10 @@ struct UnalignedU16Reader {
     std::uint16_t bf16(std::size_t index) const {
         return IsBf16 ? bits(index)
                       : modalities::float_to_bfloat16((*this)[index]);
+    }
+    std::uint16_t f16(std::size_t index) const {
+        return IsBf16 ? modalities::float_to_float16((*this)[index])
+                      : bits(index);
     }
 };
 
@@ -280,6 +294,267 @@ modalities::Status native_source_to_bf16(
     });
     if (!st.ok_status()) return st;
     *out = std::move(converted);
+    return modalities::Status::ok();
+}
+
+modalities::Status native_source_to_f16(
+    const NativeSourceTensorView& input,
+    bool transpose,
+    NativeF16Tensor* out) {
+    std::size_t count = 0;
+    if (!out || !element_count(input.shape, &count) ||
+        (transpose && input.shape.size() != 2)) {
+        return invalid("invalid direct source to FP16 input");
+    }
+    NativeF16Tensor converted;
+    converted.shape = transpose
+        ? std::vector<std::uint64_t>{input.shape[1], input.shape[0]}
+        : input.shape;
+    converted.values.resize(count);
+    modalities::Status st = dispatch_source(input, [&](const auto& reader) {
+        if (!transpose) {
+            parallel_ranges(count, 1 << 18,
+                            [&](std::size_t begin, std::size_t end) {
+                for (std::size_t i = begin; i < end; ++i) {
+                    converted.values[i] = reader.f16(i);
+                }
+            });
+        } else {
+            const std::size_t rows = static_cast<std::size_t>(input.shape[0]);
+            const std::size_t cols = static_cast<std::size_t>(input.shape[1]);
+            tiled_transform_transpose(
+                rows, cols, rows, 0, converted.values.data(),
+                [&](std::size_t row, std::size_t col) {
+                    return reader.f16(row * cols + col);
+                });
+        }
+        return modalities::Status::ok();
+    });
+    if (!st.ok_status()) return st;
+    *out = std::move(converted);
+    return modalities::Status::ok();
+}
+
+modalities::Status native_source_qkv_to_f16(
+    const NativeSourceTensorView& q,
+    const NativeSourceTensorView& k,
+    const NativeSourceTensorView& v,
+    std::uint64_t q_heads,
+    std::uint64_t k_heads,
+    const NativeFloatTensor* norm,
+    bool transpose,
+    NativeF16Tensor* out) {
+    std::size_t q_count = 0;
+    std::size_t k_count = 0;
+    std::size_t v_count = 0;
+    if (!out || q.shape.size() != 2 || k.shape.size() != 2 ||
+        v.shape.size() != 2 || q.shape[1] != k.shape[1] ||
+        q.shape[1] != v.shape[1] || !element_count(q.shape, &q_count) ||
+        !element_count(k.shape, &k_count) ||
+        !element_count(v.shape, &v_count) ||
+        q.shape[0] > std::numeric_limits<std::uint64_t>::max() - k.shape[0] ||
+        q.shape[0] + k.shape[0] >
+            std::numeric_limits<std::uint64_t>::max() - v.shape[0] ||
+        (q_heads && (q.shape[0] % q_heads ||
+                     (q.shape[0] / q_heads) % 2)) ||
+        (k_heads && (k.shape[0] % k_heads ||
+                     (k.shape[0] / k_heads) % 2)) ||
+        q.shape[1] > std::numeric_limits<std::size_t>::max() ||
+        q.shape[0] + k.shape[0] + v.shape[0] >
+            std::numeric_limits<std::size_t>::max() ||
+        (norm && (!valid_tensor(*norm) || norm->shape.size() != 1 ||
+                  norm->shape[0] != q.shape[1]))) {
+        return invalid("FP16 QKV source tensors have incompatible shapes");
+    }
+    const std::size_t cols = static_cast<std::size_t>(q.shape[1]);
+    const std::size_t total_rows = static_cast<std::size_t>(
+        q.shape[0] + k.shape[0] + v.shape[0]);
+    NativeF16Tensor joined;
+    joined.shape = transpose
+        ? std::vector<std::uint64_t>{q.shape[1],
+                                     static_cast<std::uint64_t>(total_rows)}
+        : std::vector<std::uint64_t>{static_cast<std::uint64_t>(total_rows),
+                                     q.shape[1]};
+    if (total_rows && cols > std::numeric_limits<std::size_t>::max() /
+                                 total_rows) {
+        return invalid("FP16 QKV output shape overflows size_t");
+    }
+    joined.values.resize(total_rows * cols);
+    const auto write = [&](const NativeSourceTensorView& source,
+                           std::size_t heads,
+                           bool interleave,
+                           std::size_t row_offset) {
+        return dispatch_source(source, [&](const auto& reader) {
+            const std::size_t rows = static_cast<std::size_t>(source.shape[0]);
+            const auto value = [&](std::size_t output_row, std::size_t col) {
+                const std::size_t source_row = interleave
+                    ? interleaved_source_row(output_row, rows, heads)
+                    : output_row;
+                const float weight = reader[source_row * cols + col];
+                const float folded = norm
+                    ? weight * (1.0f + norm->values[col])
+                    : weight;
+                return modalities::float_to_float16(folded);
+            };
+            if (transpose) {
+                tiled_transform_transpose(
+                    rows, cols, total_rows, row_offset,
+                    joined.values.data(), value);
+            } else {
+                parallel_ranges(rows, 16,
+                                [&](std::size_t begin, std::size_t end) {
+                    for (std::size_t row = begin; row < end; ++row) {
+                        std::uint16_t* destination = joined.values.data() +
+                            (row_offset + row) * cols;
+                        for (std::size_t col = 0; col < cols; ++col) {
+                            destination[col] = value(row, col);
+                        }
+                    }
+                });
+            }
+            return modalities::Status::ok();
+        });
+    };
+    modalities::Status st = write(q, q_heads, q_heads != 0, 0);
+    if (!st.ok_status()) return st;
+    st = write(k, k_heads, k_heads != 0,
+               static_cast<std::size_t>(q.shape[0]));
+    if (!st.ok_status()) return st;
+    st = write(v, 1, false,
+               static_cast<std::size_t>(q.shape[0] + k.shape[0]));
+    if (!st.ok_status()) return st;
+    *out = std::move(joined);
+    return modalities::Status::ok();
+}
+
+modalities::Status native_source_pair_to_f16(
+    const NativeSourceTensorView& left,
+    const NativeSourceTensorView& right,
+    const NativeFloatTensor* norm,
+    bool transpose,
+    NativeF16Tensor* out) {
+    std::size_t source_count = 0;
+    if (!out || left.shape.size() != 2 || right.shape != left.shape ||
+        !element_count(left.shape, &source_count) ||
+        left.shape[0] > std::numeric_limits<std::uint64_t>::max() / 2 ||
+        source_count > std::numeric_limits<std::size_t>::max() / 2 ||
+        (norm && (!valid_tensor(*norm) || norm->shape.size() != 1 ||
+                  norm->shape[0] != left.shape[1]))) {
+        return invalid("FP16 paired source tensors have incompatible shapes");
+    }
+    const std::size_t rows = static_cast<std::size_t>(left.shape[0]);
+    const std::size_t cols = static_cast<std::size_t>(left.shape[1]);
+    const std::size_t total_rows = rows * 2;
+    NativeF16Tensor joined;
+    joined.shape = transpose
+        ? std::vector<std::uint64_t>{left.shape[1], left.shape[0] * 2}
+        : std::vector<std::uint64_t>{left.shape[0] * 2, left.shape[1]};
+    joined.values.resize(source_count * 2);
+    const auto write = [&](const NativeSourceTensorView& source,
+                           std::size_t row_offset) {
+        return dispatch_source(source, [&](const auto& reader) {
+            const auto value = [&](std::size_t row, std::size_t col) {
+                const float weight = reader[row * cols + col];
+                return modalities::float_to_float16(
+                    norm ? weight * (1.0f + norm->values[col]) : weight);
+            };
+            if (transpose) {
+                tiled_transform_transpose(
+                    rows, cols, total_rows, row_offset,
+                    joined.values.data(), value);
+            } else {
+                parallel_ranges(rows, 16,
+                                [&](std::size_t begin, std::size_t end) {
+                    for (std::size_t row = begin; row < end; ++row) {
+                        std::uint16_t* destination = joined.values.data() +
+                            (row_offset + row) * cols;
+                        for (std::size_t col = 0; col < cols; ++col) {
+                            destination[col] = value(row, col);
+                        }
+                    }
+                });
+            }
+            return modalities::Status::ok();
+        });
+    };
+    modalities::Status st = write(left, 0);
+    if (!st.ok_status()) return st;
+    st = write(right, rows);
+    if (!st.ok_status()) return st;
+    *out = std::move(joined);
+    return modalities::Status::ok();
+}
+
+modalities::Status native_source_concat_vectors_to_f16(
+    const std::vector<const NativeSourceTensorView*>& inputs,
+    NativeF16Tensor* out) {
+    if (!out || inputs.empty()) return invalid("FP16 vector concat has no inputs");
+    std::size_t total = 0;
+    for (const NativeSourceTensorView* input : inputs) {
+        if (!input || input->shape.size() != 1 ||
+            input->shape[0] > std::numeric_limits<std::size_t>::max() ||
+            input->shape[0] > std::numeric_limits<std::size_t>::max() - total) {
+            return invalid("FP16 vector concat tensors have incompatible shapes");
+        }
+        total += static_cast<std::size_t>(input->shape[0]);
+    }
+    NativeF16Tensor joined;
+    joined.shape = {static_cast<std::uint64_t>(total)};
+    joined.values.resize(total);
+    std::size_t offset = 0;
+    for (const NativeSourceTensorView* input : inputs) {
+        const std::size_t count = static_cast<std::size_t>(input->shape[0]);
+        modalities::Status st = dispatch_source(*input, [&](const auto& reader) {
+            parallel_ranges(count, 1 << 18,
+                            [&](std::size_t begin, std::size_t end) {
+                for (std::size_t i = begin; i < end; ++i) {
+                    joined.values[offset + i] = reader.f16(i);
+                }
+            });
+            return modalities::Status::ok();
+        });
+        if (!st.ok_status()) return st;
+        offset += count;
+    }
+    *out = std::move(joined);
+    return modalities::Status::ok();
+}
+
+modalities::Status native_source_patch_oihw_to_hwio_f16(
+    const NativeSourceTensorView& input,
+    NativeF16Tensor* out) {
+    std::size_t count = 0;
+    if (!out || input.shape.size() != 4 ||
+        !element_count(input.shape, &count)) {
+        return invalid("FP16 patch permutation requires a rank-4 tensor");
+    }
+    const std::size_t outputs = static_cast<std::size_t>(input.shape[0]);
+    const std::size_t channels = static_cast<std::size_t>(input.shape[1]);
+    const std::size_t height = static_cast<std::size_t>(input.shape[2]);
+    const std::size_t width = static_cast<std::size_t>(input.shape[3]);
+    NativeF16Tensor result;
+    result.shape = {input.shape[2], input.shape[3], input.shape[1],
+                    input.shape[0]};
+    result.values.resize(count);
+    modalities::Status st = dispatch_source(input, [&](const auto& reader) {
+        parallel_ranges(height * width * channels, 32,
+                        [&](std::size_t begin, std::size_t end) {
+            for (std::size_t hwc = begin; hwc < end; ++hwc) {
+                const std::size_t c = hwc % channels;
+                const std::size_t hw = hwc / channels;
+                const std::size_t h = hw / width;
+                const std::size_t w = hw % width;
+                for (std::size_t o = 0; o < outputs; ++o) {
+                    const std::size_t src =
+                        ((o * channels + c) * height + h) * width + w;
+                    result.values[hwc * outputs + o] = reader.f16(src);
+                }
+            }
+        });
+        return modalities::Status::ok();
+    });
+    if (!st.ok_status()) return st;
+    *out = std::move(result);
     return modalities::Status::ok();
 }
 
@@ -545,46 +820,28 @@ modalities::Status load_native_float_tensor(
     const loader::SafetensorsFile& file,
     const std::string& key,
     NativeFloatTensor* out) {
-    if (!file.is_open() || !out) return invalid("invalid native tensor load");
-    const loader::SafetensorInfo* tensor = find_source_tensor(file, key);
-    if (!tensor) {
-        return modalities::Status::error(modalities::StatusCode::kNotFound,
-                                         "native tensor not found: " + key);
-    }
+    if (!out) return invalid("invalid native tensor load");
+    NativeSourceTensorView source;
+    modalities::Status st = load_native_source_tensor(file, key, &source);
+    if (!st.ok_status()) return st;
     std::size_t count = 0;
-    if (!element_count(tensor->shape, &count)) {
+    if (!element_count(source.shape, &count)) {
         return invalid("native tensor shape overflows size_t");
     }
-    const void* data = file.data(*tensor);
-    if (!data && tensor->bytes) return invalid("native tensor has no payload");
 
     NativeFloatTensor loaded;
-    loaded.shape = tensor->shape;
+    loaded.shape = source.shape;
     loaded.values.resize(count);
-    if (tensor->dtype == "F32") {
-        std::memcpy(loaded.values.data(), data, count * sizeof(float));
-    } else if (tensor->dtype == "BF16") {
-        const auto* src = static_cast<const std::uint16_t*>(data);
+    st = dispatch_source(source, [&](const auto& reader) {
         parallel_ranges(count, 1 << 18, [&](std::size_t begin,
                                              std::size_t end) {
             for (std::size_t i = begin; i < end; ++i) {
-                loaded.values[i] = modalities::bfloat16_to_float(src[i]);
+                loaded.values[i] = reader[i];
             }
         });
-    } else if (tensor->dtype == "F16") {
-        const auto* src = static_cast<const std::uint16_t*>(data);
-        parallel_ranges(count, 1 << 18, [&](std::size_t begin,
-                                             std::size_t end) {
-            for (std::size_t i = begin; i < end; ++i) {
-                loaded.values[i] = modalities::float16_to_float(src[i]);
-            }
-        });
-    } else {
-        return modalities::Status::error(
-            modalities::StatusCode::kUnsupported,
-            "native tensor dtype is not a floating-point weight: " +
-                tensor->dtype);
-    }
+        return modalities::Status::ok();
+    });
+    if (!st.ok_status()) return st;
     *out = std::move(loaded);
     return modalities::Status::ok();
 }
@@ -600,6 +857,23 @@ modalities::Status native_to_bf16(const NativeFloatTensor& input,
         for (std::size_t i = begin; i < end; ++i) {
             converted.values[i] =
                 modalities::float_to_bfloat16(input.values[i]);
+        }
+    });
+    *out = std::move(converted);
+    return modalities::Status::ok();
+}
+
+modalities::Status native_to_f16(const NativeFloatTensor& input,
+                                 NativeF16Tensor* out) {
+    if (!out || !valid_tensor(input)) return invalid("invalid FP16 input");
+    NativeF16Tensor converted;
+    converted.shape = input.shape;
+    converted.values.resize(input.values.size());
+    parallel_ranges(input.values.size(), 1 << 18,
+                    [&](std::size_t begin, std::size_t end) {
+        for (std::size_t i = begin; i < end; ++i) {
+            converted.values[i] =
+                modalities::float_to_float16(input.values[i]);
         }
     });
     *out = std::move(converted);
@@ -880,6 +1154,46 @@ modalities::Status native_pi05_time_embeddings(
             result.values[row + half + i] = std::cos(angle);
         }
         t += dt;
+    }
+    *out = std::move(result);
+    return modalities::Status::ok();
+}
+
+modalities::Status native_pi05_time_embeddings_f16(
+    int num_steps,
+    std::uint64_t embedding_dim,
+    NativeF16Tensor* out) {
+    if (!out || num_steps <= 0 || embedding_dim < 2 ||
+        embedding_dim % 2 != 0 ||
+        embedding_dim > std::numeric_limits<std::size_t>::max() /
+                            static_cast<std::size_t>(num_steps)) {
+        return invalid("Pi0.5 FP16 time embedding shape is invalid");
+    }
+    const std::uint64_t half = embedding_dim / 2;
+    NativeF16Tensor result;
+    result.shape = {static_cast<std::uint64_t>(num_steps), embedding_dim};
+    result.values.resize(static_cast<std::size_t>(num_steps) * embedding_dim);
+    constexpr double kMinPeriod = 4.0e-3;
+    constexpr double kPeriodRatio = 1000.0;
+    constexpr double kTwoPi = 6.283185307179586476925286766559;
+    for (int step = 0; step < num_steps; ++step) {
+        const float t_f32 = static_cast<float>(
+            1.0 - static_cast<double>(step) /
+                      static_cast<double>(num_steps));
+        const double t = static_cast<double>(t_f32);
+        const std::size_t row = static_cast<std::size_t>(step) * embedding_dim;
+        for (std::uint64_t i = 0; i < half; ++i) {
+            const double fraction = half == 1
+                ? 0.0
+                : static_cast<double>(i) / static_cast<double>(half - 1);
+            const double period =
+                kMinPeriod * std::pow(kPeriodRatio, fraction);
+            const double angle = t * kTwoPi / period;
+            result.values[row + i] = modalities::float_to_float16(
+                static_cast<float>(std::sin(angle)));
+            result.values[row + half + i] = modalities::float_to_float16(
+                static_cast<float>(std::cos(angle)));
+        }
     }
     *out = std::move(result);
     return modalities::Status::ok();
