@@ -1,4 +1,5 @@
 #include "flashrt/cpp/models/pi05/native_calibration.h"
+#include "flashrt/cpp/models/pi05/native_calibration_session.h"
 
 #include <cassert>
 #include <cmath>
@@ -22,9 +23,60 @@ std::string temp_path() {
 
 int main() {
     using flashrt::models::pi05::NativeCalibrationArtifact;
+    using flashrt::models::pi05::NativeCalibrationConfig;
     using flashrt::models::pi05::load_native_calibration_artifact;
+    using flashrt::models::pi05::normalize_native_calibration_state;
+    using flashrt::models::pi05::prepare_native_calibration_noise;
     using flashrt::models::pi05::reduce_native_calibration_samples;
     using flashrt::models::pi05::save_native_calibration_artifact;
+    using flashrt::models::pi05::valid_native_calibration_config;
+
+    NativeCalibrationConfig config;
+    config.checkpoint_path = "checkpoint";
+    config.tokenizer_model_path = "tokenizer.model";
+    config.state_dim = 2;
+    config.num_views = 3;
+    config.state_q01 = {-2.0f, 0.0f};
+    config.state_q99 = {2.0f, 4.0f};
+    assert(valid_native_calibration_config(config));
+    std::vector<float> normalized;
+    const float state[] = {0.0f, 1.0f};
+    assert(normalize_native_calibration_state(
+               config, state, 2, &normalized)
+               .ok_status());
+    assert(normalized.size() == 2);
+    assert(std::fabs(normalized[0]) < 1e-6f);
+    assert(std::fabs(normalized[1] + 0.5f) < 1e-6f);
+    const float invalid_state[] = {0.0f, INFINITY};
+    assert(!normalize_native_calibration_state(
+                config, invalid_state, 2, &normalized)
+                .ok_status());
+
+    const float explicit_noise[] = {-1.0f, 0.0f, 1.0f};
+    std::vector<std::uint16_t> encoded;
+    assert(prepare_native_calibration_noise(
+               explicit_noise, 3, 0, 3,
+               flashrt::modalities::DType::kBFloat16, &encoded)
+               .ok_status());
+    assert(encoded == std::vector<std::uint16_t>({
+                          flashrt::modalities::float_to_bfloat16(-1.0f),
+                          flashrt::modalities::float_to_bfloat16(0.0f),
+                          flashrt::modalities::float_to_bfloat16(1.0f)}));
+    std::vector<std::uint16_t> generated;
+    assert(prepare_native_calibration_noise(
+               nullptr, 0, 1234, 7,
+               flashrt::modalities::DType::kFloat16, &generated)
+               .ok_status());
+    std::vector<std::uint16_t> repeated;
+    assert(prepare_native_calibration_noise(
+               nullptr, 0, 1234, 7,
+               flashrt::modalities::DType::kFloat16, &repeated)
+               .ok_status());
+    assert(generated == repeated);
+    assert(!prepare_native_calibration_noise(
+                explicit_noise, 2, 0, 3,
+                flashrt::modalities::DType::kFloat16, &encoded)
+                .ok_status());
 
     std::vector<float> reduced;
     assert(reduce_native_calibration_samples(

@@ -70,10 +70,27 @@ int calibration_error(frt_pi05_calibration_session* session,
 
 int main(int argc, char** argv) {
     if (argc != 6 && argc != 7) {
-        std::cerr << "usage: pi05_native_thor_fp8_probe CHECKPOINT TOKENIZER "
+        std::cerr << "usage: pi05_native_fp8_calibration_probe CHECKPOINT "
+                     "TOKENIZER "
                      "ARTIFACT SAMPLES VIEWS [RAW_ACTION_OUTPUT]\n";
         return 2;
     }
+    int device = 0;
+    cudaDeviceProp properties{};
+    cudaError_t cuda_rc = cudaGetDevice(&device);
+    if (cuda_rc == cudaSuccess) {
+        cuda_rc = cudaGetDeviceProperties(&properties, device);
+    }
+    if (cuda_rc != cudaSuccess ||
+        !((properties.major == 11 || properties.major == 12) &&
+          properties.minor == 0)) {
+        std::cerr << "native FP8 calibration requires SM110 or SM120\n";
+        return 1;
+    }
+    const bool rtx = properties.major == 12;
+    const std::string hardware =
+        "sm" + std::to_string(properties.major * 10 + properties.minor);
+    const std::string hardware_identity = "hardware=" + hardware;
     const int samples = std::atoi(argv[4]);
     if (samples < 1 || samples > 256) {
         std::cerr << "SAMPLES must be in [1, 256]\n";
@@ -254,7 +271,9 @@ int main(int argc, char** argv) {
     flashrt::models::pi05::NativeCalibrationArtifact artifact;
     auto status = flashrt::models::pi05::load_native_calibration_artifact(
         single_path, &artifact);
-    if (!status.ok_status() || artifact.sample_count != 1) {
+    if (!status.ok_status() || artifact.sample_count != 1 ||
+        artifact.hardware != hardware ||
+        artifact.activation_dtype != (rtx ? "bfloat16" : "float16")) {
         std::cerr << "single calibration artifact validation failed\n";
         return 1;
     }
@@ -287,11 +306,15 @@ int main(int argc, char** argv) {
                      exp->identity &&
                      std::strstr(exp->identity,
                                  "precision=fp8_e4m3fn") &&
-                     std::strstr(exp->identity, "hardware=sm110") &&
+                     std::strstr(exp->identity,
+                                 hardware_identity.c_str()) &&
                      std::strstr(exp->identity, "calibration_sha256=") &&
-                     model->ports[2].dtype == FRT_RT_DTYPE_F16 &&
-                     model->ports[3].dtype == FRT_RT_DTYPE_F16 &&
-                     model->ports[5].dtype == FRT_RT_DTYPE_F16;
+                     model->ports[2].dtype ==
+                         (rtx ? FRT_RT_DTYPE_BF16 : FRT_RT_DTYPE_F16) &&
+                     model->ports[3].dtype ==
+                         (rtx ? FRT_RT_DTYPE_BF16 : FRT_RT_DTYPE_F16) &&
+                     model->ports[5].dtype ==
+                         (rtx ? FRT_RT_DTYPE_BF16 : FRT_RT_DTYPE_F16);
     for (std::uint64_t i = 0; schema_ok && i < exp->n_graphs; ++i) {
         schema_ok =
             frt_graph_variant_count(exp->graphs[i].handle) == 1;
@@ -327,13 +350,16 @@ int main(int argc, char** argv) {
         model->release(model->owner);
         return 1;
     }
-    std::vector<std::uint16_t> noise_f16(noise.size());
+    std::vector<std::uint16_t> noise_payload(noise.size());
     for (std::size_t i = 0; i < noise.size(); ++i) {
-        noise_f16[i] = flashrt::modalities::float_to_float16(noise[i]);
+        noise_payload[i] =
+            rtx ? flashrt::modalities::float_to_bfloat16(noise[i])
+                : flashrt::modalities::float_to_float16(noise[i]);
     }
     if (!model->ports[3].buffer ||
-        cudaMemcpy(frt_buffer_dptr(model->ports[3].buffer), noise_f16.data(),
-                   noise_f16.size() * sizeof(std::uint16_t),
+        cudaMemcpy(frt_buffer_dptr(model->ports[3].buffer),
+                   noise_payload.data(),
+                   noise_payload.size() * sizeof(std::uint16_t),
                    cudaMemcpyHostToDevice) != cudaSuccess ||
         model->verbs.step(model->self) != 0 ||
         cudaDeviceSynchronize() != cudaSuccess) {
@@ -347,8 +373,9 @@ int main(int argc, char** argv) {
         cudaMemcpy(raw.data(), frt_buffer_dptr(model->ports[5].buffer),
                    raw.size() * sizeof(raw[0]),
                    cudaMemcpyDeviceToHost) != cudaSuccess ||
-        cudaMemcpy(frt_buffer_dptr(model->ports[3].buffer), noise_f16.data(),
-                   noise_f16.size() * sizeof(std::uint16_t),
+        cudaMemcpy(frt_buffer_dptr(model->ports[3].buffer),
+                   noise_payload.data(),
+                   noise_payload.size() * sizeof(std::uint16_t),
                    cudaMemcpyHostToDevice) != cudaSuccess ||
         frt_graph_replay(exp->graphs[2].handle, 0,
                          exp->graphs[2].stream_id) != FRT_OK ||
@@ -398,6 +425,7 @@ int main(int argc, char** argv) {
         }
     }
     model->release(model->owner);
-    std::cout << "PASS native Thor FP8 calibration and runtime lifecycle\n";
+    std::cout << "PASS native " << hardware
+              << " FP8 calibration and runtime lifecycle\n";
     return 0;
 }

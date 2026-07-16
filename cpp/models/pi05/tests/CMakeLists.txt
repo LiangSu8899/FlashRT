@@ -170,10 +170,11 @@ if(FLASHRT_CPP_WITH_CUDA_KERNELS)
       PRIVATE flashrt_cpp_pi05)
   endif()
 
-  if(FLASHRT_CPP_WITH_THOR_FP8 AND FLASHRT_CPP_WITH_SENTENCEPIECE)
-    add_executable(pi05_native_thor_fp8_probe
-      ${_pi05_test_source_dir}/pi05_native_thor_fp8_probe.cpp)
-    target_link_libraries(pi05_native_thor_fp8_probe
+  if(FLASHRT_CPP_WITH_SENTENCEPIECE AND
+     (FLASHRT_CPP_WITH_FA2 OR FLASHRT_CPP_WITH_THOR_FP8))
+    add_executable(pi05_native_fp8_calibration_probe
+      ${_pi05_test_source_dir}/pi05_native_fp8_calibration_probe.cpp)
+    target_link_libraries(pi05_native_fp8_calibration_probe
       PRIVATE flashrt_cpp_pi05_c flashrt_exec CUDA::cudart)
   endif()
 

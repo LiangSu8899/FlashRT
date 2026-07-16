@@ -14,7 +14,6 @@
 #include <cmath>
 #include <cstring>
 #include <future>
-#include <limits>
 #include <new>
 
 namespace flashrt {
@@ -37,66 +36,6 @@ struct HashResult {
     std::string digest;
     std::string error;
 };
-
-std::uint64_t splitmix64(std::uint64_t* state) {
-    std::uint64_t value = (*state += 0x9e3779b97f4a7c15ull);
-    value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ull;
-    value = (value ^ (value >> 27)) * 0x94d049bb133111ebull;
-    return value ^ (value >> 31);
-}
-
-double uniform_open(std::uint64_t* state) {
-    constexpr double kDenominator = 9007199254740993.0;
-    return (static_cast<double>(splitmix64(state) >> 11) + 1.0) /
-           kDenominator;
-}
-
-void deterministic_normal_f16(std::uint64_t seed,
-                              std::vector<std::uint16_t>* output) {
-    constexpr double kTwoPi = 6.283185307179586476925286766559;
-    std::uint64_t state = seed ^ 0x243f6a8885a308d3ull;
-    for (std::size_t i = 0; i < output->size(); i += 2) {
-        const double radius = std::sqrt(-2.0 * std::log(uniform_open(&state)));
-        const double angle = kTwoPi * uniform_open(&state);
-        (*output)[i] = modalities::float_to_float16(
-            static_cast<float>(radius * std::cos(angle)));
-        if (i + 1 < output->size()) {
-            (*output)[i + 1] = modalities::float_to_float16(
-                static_cast<float>(radius * std::sin(angle)));
-        }
-    }
-}
-
-bool valid_config(const NativeThorCalibrationConfig& config) {
-    const std::uint64_t width =
-        static_cast<std::uint64_t>(config.max_frame_width);
-    const std::uint64_t height =
-        static_cast<std::uint64_t>(config.max_frame_height);
-    bool valid_quantiles =
-        config.state_q01.size() ==
-            static_cast<std::size_t>(config.state_dim) &&
-        config.state_q99.size() == config.state_q01.size();
-    for (std::size_t i = 0;
-         valid_quantiles && i < config.state_q01.size(); ++i) {
-        valid_quantiles = std::isfinite(config.state_q01[i]) &&
-                          std::isfinite(config.state_q99[i]) &&
-                          config.state_q99[i] > config.state_q01[i];
-    }
-    return !config.checkpoint_path.empty() &&
-           !config.tokenizer_model_path.empty() && config.state_dim > 0 &&
-           config.num_views >= 1 && config.num_views <= 3 &&
-           config.max_prompt_tokens >= 1 &&
-           !(config.max_prompt_tokens & 1) && config.chunk_size > 0 &&
-           config.num_steps > 0 && config.vision_pool_factor == 1 &&
-           static_cast<std::uint64_t>(config.max_prompt_tokens) +
-                   static_cast<std::uint64_t>(config.chunk_size) +
-                   static_cast<std::uint64_t>(config.num_views) * 256 <=
-               static_cast<std::uint64_t>(
-                   std::numeric_limits<int>::max()) &&
-           config.max_frame_width > 0 && config.max_frame_height > 0 &&
-           width <= std::numeric_limits<std::uint64_t>::max() / height / 4 &&
-           valid_quantiles;
-}
 
 modalities::TensorView device_view(const NativeWorkspaceBuffer* buffer,
                                    modalities::DType dtype,
@@ -289,24 +228,11 @@ struct NativeThorCalibrationSession::Impl {
         const float* noise,
         std::uint64_t n_noise,
         std::uint64_t noise_seed) {
-        if (!state || n_state != static_cast<std::uint64_t>(config.state_dim)) {
-            return invalid("Thor calibration state shape is invalid");
-        }
-        if ((noise && n_noise != noise_f16.size()) ||
-            (!noise && n_noise != 0)) {
-            return invalid("Thor calibration noise shape is invalid");
-        }
-        for (std::size_t i = 0; i < normalized_state.size(); ++i) {
-            if (!std::isfinite(state[i])) {
-                return invalid("Thor calibration state contains non-finite data");
-            }
-            const float lo = config.state_q01[i];
-            const float hi = config.state_q99[i];
-            normalized_state[i] =
-                ((state[i] - lo) / (hi - lo + 1e-6f)) * 2.0f - 1.0f;
-        }
+        modalities::Status st = normalize_native_calibration_state(
+            config, state, n_state, &normalized_state);
+        if (!st.ok_status()) return st;
         std::uint64_t prompt_len = 0;
-        modalities::Status st = embed_prompt(
+        st = embed_prompt(
             tokenizer, prompt_spec, prompt, normalized_state.data(),
             normalized_state.size(), embedding_table, prompt_output,
             &token_ids, &prompt_len, stream, &text_staging,
@@ -336,19 +262,12 @@ struct NativeThorCalibrationSession::Impl {
             stream);
         if (rc_check != cudaSuccess) return backend(cudaGetErrorString(rc_check));
 
-        if (noise) {
-            for (std::size_t i = 0; i < noise_f16.size(); ++i) {
-                if (!std::isfinite(noise[i])) {
-                    return invalid(
-                        "Thor calibration noise contains non-finite data");
-                }
-                noise_f16[i] = modalities::float_to_float16(noise[i]);
-            }
-        } else {
-            deterministic_normal_f16(
-                noise_seed + static_cast<std::uint64_t>(encoder_samples.size()),
-                &noise_f16);
-        }
+        st = prepare_native_calibration_noise(
+            noise, n_noise,
+            noise_seed + static_cast<std::uint64_t>(encoder_samples.size()),
+            static_cast<std::size_t>(config.chunk_size) * 32,
+            modalities::DType::kFloat16, &noise_f16);
+        if (!st.ok_status()) return st;
         rc_check = cudaMemcpyAsync(
             action_output.data, noise_f16.data(),
             noise_f16.size() * sizeof(std::uint16_t), cudaMemcpyHostToDevice,
@@ -439,7 +358,9 @@ NativeThorCalibrationSession::create(
     const NativeThorCalibrationConfig& config,
     double percentile,
     modalities::Status* status) {
-    if (!valid_config(config) || !std::isfinite(percentile) ||
+    if (!valid_native_calibration_config(config) ||
+        config.vision_pool_factor != 1 || (config.max_prompt_tokens & 1) ||
+        !std::isfinite(percentile) ||
         percentile < 0.0 || percentile > 100.0) {
         if (status) *status = invalid("Thor calibration config is invalid");
         return nullptr;

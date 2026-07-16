@@ -16,6 +16,7 @@ set(_pi05_sources
   src/native_weight_packer.cpp
   src/native_weight_materializer.cpp
   src/native_calibration.cpp
+  src/native_calibration_session.cpp
   src/native_workspace.cpp
   src/native_rtx_attention.cpp
   src/prompt_format.cpp
@@ -125,7 +126,12 @@ if(FLASHRT_CPP_WITH_CUDA_KERNELS)
   if(FLASHRT_CPP_WITH_FA2)
     target_sources(flashrt_cpp_pi05_kernels PRIVATE
       src/native_graph_owner.cpp
+      src/native_rtx_autotune.cpp
       src/native_rtx_attention_driver.cu)
+    if(FLASHRT_CPP_WITH_SENTENCEPIECE)
+      target_sources(flashrt_cpp_pi05_kernels PRIVATE
+        src/native_rtx_calibration_session.cpp)
+    endif()
     target_include_directories(flashrt_cpp_pi05_kernels PRIVATE
       ${FLASHRT_CPP_SOURCE_DIR}/../csrc)
     target_link_libraries(flashrt_cpp_pi05_kernels
@@ -138,7 +144,7 @@ endif()
 add_library(flashrt_cpp_pi05_c SHARED
   src/c_api.cpp
   src/model_runtime.cpp
-  src/native_thor_calibration_c_api.cpp
+  src/native_calibration_c_api.cpp
   src/native_model_runtime.cpp
   src/native_open.cpp)
 target_link_libraries(flashrt_cpp_pi05_c

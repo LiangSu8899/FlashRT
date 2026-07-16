@@ -2,6 +2,7 @@
 
 #include "flashrt/cpp/models/pi05/native_style_precompute.h"
 #include "flashrt/cpp/models/pi05/native_weight_materializer.h"
+#include "flashrt/cpp/models/pi05/native_rtx_autotune.h"
 #include "flashrt/cpp/models/pi05/native_rtx_weight_packer.h"
 
 #include <cuda_runtime_api.h>
@@ -52,15 +53,14 @@ modalities::Status upload_scales(
 
 NativeGraphOwner::NativeGraphOwner(
     frt_ctx ctx,
-    const NativeGraphConfig& config)
+    const NativeGraphConfig& config,
+    NativeRtxLinearMode linear_mode)
     : graphs_(ctx),
       config_(config),
       weights_(ctx),
       workspace_(ctx),
       attention_(ctx),
-      linear_(&driver_, config.precision == NativeGraphPrecision::kFp8E4M3
-                            ? NativeRtxLinearMode::kFp8Static
-                            : NativeRtxLinearMode::kBf16),
+      linear_(&driver_, linear_mode),
       forward_(&driver_, &linear_) {}
 
 NativeGraphOwner::~NativeGraphOwner() = default;
@@ -69,7 +69,8 @@ std::unique_ptr<NativeGraphOwner> NativeGraphOwner::create(
     const std::string& checkpoint_path,
     const NativeGraphConfig& config,
     modalities::Status* status) {
-    if (config.num_views < 1 || config.num_views > 3 ||
+    if (config.precision != NativeGraphPrecision::kBf16 ||
+        config.num_views < 1 || config.num_views > 3 ||
         config.max_prompt_tokens < 1 || config.chunk_size < 1 ||
         config.num_steps < 1 ||
         static_cast<std::uint64_t>(config.max_prompt_tokens) +
@@ -87,7 +88,8 @@ std::unique_ptr<NativeGraphOwner> NativeGraphOwner::create(
         return nullptr;
     }
     std::unique_ptr<NativeGraphOwner> owner(
-        new (std::nothrow) NativeGraphOwner(ctx, config));
+        new (std::nothrow) NativeGraphOwner(
+            ctx, config, NativeRtxLinearMode::kBf16));
     if (!owner) {
         frt_ctx_destroy(ctx);
         if (status) *status = backend("native graph owner allocation failed");
@@ -117,7 +119,8 @@ std::unique_ptr<NativeGraphOwner> NativeGraphOwner::create(
         return nullptr;
     }
     std::unique_ptr<NativeGraphOwner> owner(
-        new (std::nothrow) NativeGraphOwner(ctx, config));
+        new (std::nothrow) NativeGraphOwner(
+            ctx, config, NativeRtxLinearMode::kFp8Static));
     if (!owner) {
         frt_ctx_destroy(ctx);
         if (status) *status = backend("native graph owner allocation failed");
@@ -132,11 +135,43 @@ std::unique_ptr<NativeGraphOwner> NativeGraphOwner::create(
     return owner;
 }
 
+std::unique_ptr<NativeGraphOwner> NativeGraphOwner::create_calibration(
+    const std::string& checkpoint_path,
+    const NativeGraphConfig& config,
+    modalities::Status* status) {
+    if (config.precision != NativeGraphPrecision::kFp8E4M3) {
+        if (status) {
+            *status = invalid("native RTX calibration precision is invalid");
+        }
+        return nullptr;
+    }
+    frt_ctx ctx = frt_ctx_create();
+    if (!ctx) {
+        if (status) *status = backend("native graph context creation failed");
+        return nullptr;
+    }
+    std::unique_ptr<NativeGraphOwner> owner(
+        new (std::nothrow) NativeGraphOwner(
+            ctx, config, NativeRtxLinearMode::kFp8Dynamic));
+    if (!owner) {
+        frt_ctx_destroy(ctx);
+        if (status) *status = backend("native graph owner allocation failed");
+        return nullptr;
+    }
+    modalities::Status st = owner->initialize(checkpoint_path, nullptr);
+    if (!st.ok_status()) {
+        if (status) *status = st;
+        return nullptr;
+    }
+    if (status) *status = modalities::Status::ok();
+    return owner;
+}
+
 modalities::Status NativeGraphOwner::initialize(
     const std::string& checkpoint_path,
     const NativeCalibrationArtifact* calibration) {
-    const bool fp8 = config_.precision == NativeGraphPrecision::kFp8E4M3;
-    if (fp8 != (calibration != nullptr) ||
+    const bool fp8 = linear_.fp8();
+    if ((calibration != nullptr) != linear_.static_fp8() ||
         (calibration && calibration->activation_dtype != "bfloat16")) {
         return invalid("native RTX FP8 calibration is incompatible");
     }
@@ -183,7 +218,7 @@ modalities::Status NativeGraphOwner::initialize(
                                   : NativeWorkspaceFlavor::kBf16;
     st = workspace_.allocate(workspace_config);
     if (!st.ok_status()) return st;
-    if (fp8) {
+    if (linear_.static_fp8()) {
         st = upload_scales(
             &workspace_, "rtx_fp8_vision_scales",
             calibration->vision_scales);
@@ -195,6 +230,21 @@ modalities::Status NativeGraphOwner::initialize(
         st = upload_scales(
             &workspace_, "rtx_fp8_decoder_scales",
             calibration->decoder_scales);
+        if (!st.ok_status()) return st;
+    } else if (linear_.dynamic_fp8()) {
+        st = upload_scales(
+            &workspace_, "rtx_fp8_vision_scales",
+            std::vector<float>(109, 1.0f));
+        if (!st.ok_status()) return st;
+        st = upload_scales(
+            &workspace_, "rtx_fp8_encoder_scales",
+            std::vector<float>(18 * 4, 1.0f));
+        if (!st.ok_status()) return st;
+        st = upload_scales(
+            &workspace_, "rtx_fp8_decoder_scales",
+            std::vector<float>(
+                static_cast<std::size_t>(config_.num_steps) * 18 * 4,
+                1.0f));
         if (!st.ok_status()) return st;
     }
     st = workspace_.expand_vision_position_embedding(weights_);
@@ -222,7 +272,9 @@ modalities::Status NativeGraphOwner::initialize(
     st = attention_driver_->status();
     if (!st.ok_status()) return st;
     if (fp8) {
-        st = autotune_fp8();
+        st = autotune_native_rtx_fp8(
+            weights_, &workspace_, linear_, config_.num_views,
+            config_.chunk_size);
         if (!st.ok_status()) return st;
         report("fp8_autotune");
     }
@@ -271,69 +323,6 @@ modalities::Status NativeGraphOwner::initialize(
         std::fprintf(stderr, "native_setup total_ms=%.3f\n",
                      std::chrono::duration<double, std::milli>(
                          now - setup_begin).count());
-    }
-    return modalities::Status::ok();
-}
-
-modalities::Status NativeGraphOwner::autotune_fp8() {
-    const int vision_sequence = config_.num_views * 256;
-    const int encoder_vision_sequence = workspace_.encoder_vision_sequence();
-    const int encoder_sequence = workspace_.encoder_sequence();
-    const int decoder_sequence = config_.chunk_size;
-    struct Shape {
-        const char* weight;
-        NativeRtxScaleSite site;
-        const char* output;
-        int m;
-        int n;
-        int k;
-    };
-    const Shape shapes[] = {
-        {"vision_attn_qkv_w_0", {NativeRtxScaleDomain::kVision, 0},
-         "vision_QKV",
-         vision_sequence, 3456, 1152},
-        {"vision_attn_o_w_0", {NativeRtxScaleDomain::kVision, 1},
-         "vision_x_norm",
-         vision_sequence, 1152, 1152},
-        {"vision_ffn_up_w_0", {NativeRtxScaleDomain::kVision, 2},
-         "vision_hidden",
-         vision_sequence, 4304, 1152},
-        {"vision_ffn_down_w_0", {NativeRtxScaleDomain::kVision, 3},
-         "vision_x_norm",
-         vision_sequence, 1152, 4304},
-        {"encoder_multi_modal_projector_w",
-         {NativeRtxScaleDomain::kVision, 108}, "encoder_x",
-         encoder_vision_sequence, 2048, 1152},
-        {"encoder_attn_qkv_w_0", {NativeRtxScaleDomain::kEncoder, 0},
-         "encoder_QKV",
-         encoder_sequence, 2560, 2048},
-        {"encoder_attn_o_w_0", {NativeRtxScaleDomain::kEncoder, 1},
-         "encoder_x_norm",
-         encoder_sequence, 2048, 2048},
-        {"encoder_ffn_gate_up_w_0", {NativeRtxScaleDomain::kEncoder, 2},
-         "encoder_gate_merged", encoder_sequence, 32768, 2048},
-        {"encoder_ffn_down_w_0", {NativeRtxScaleDomain::kEncoder, 3},
-         "encoder_x_norm",
-         encoder_sequence, 2048, 16384},
-        {"decoder_attn_qkv_w_0", {NativeRtxScaleDomain::kDecoder, 0},
-         "decoder_QKV",
-         decoder_sequence, 2560, 1024},
-        {"decoder_attn_o_w_0", {NativeRtxScaleDomain::kDecoder, 1},
-         "x_normed_buf",
-         decoder_sequence, 1024, 2048},
-        {"decoder_ffn_gate_up_w_0", {NativeRtxScaleDomain::kDecoder, 2},
-         "decoder_gate_merged", decoder_sequence, 8192, 1024},
-        {"decoder_ffn_down_w_0", {NativeRtxScaleDomain::kDecoder, 3},
-         "x_normed_buf",
-         decoder_sequence, 1024, 4096},
-    };
-    for (const Shape& shape : shapes) {
-        const NativeWorkspaceBuffer* output = workspace_.find(shape.output);
-        if (!output) return invalid("native FP8 autotune output is missing");
-        modalities::Status st = linear_.autotune(
-            weights_, &workspace_, shape.weight, shape.site,
-            frt_buffer_dptr(output->buffer), shape.m, shape.n, shape.k);
-        if (!st.ok_status()) return st;
     }
     return modalities::Status::ok();
 }

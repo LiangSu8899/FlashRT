@@ -1,8 +1,7 @@
 #ifndef FLASHRT_CPP_MODELS_PI05_NATIVE_THOR_CALIBRATION_SESSION_H
 #define FLASHRT_CPP_MODELS_PI05_NATIVE_THOR_CALIBRATION_SESSION_H
 
-#include "flashrt/cpp/modalities/vision.h"
-#include "flashrt/cpp/modalities/types.h"
+#include "flashrt/cpp/models/pi05/native_calibration_session.h"
 
 #include <cstdint>
 #include <memory>
@@ -13,29 +12,16 @@ namespace flashrt {
 namespace models {
 namespace pi05 {
 
-struct NativeThorCalibrationConfig {
-    std::string checkpoint_path;
-    std::string tokenizer_model_path;
-    int max_prompt_tokens = 200;
-    int state_dim = 0;
-    int num_views = 2;
-    int chunk_size = 10;
-    int num_steps = 10;
-    int vision_pool_factor = 1;
-    int max_frame_width = 1280;
-    int max_frame_height = 720;
-    std::vector<float> state_q01;
-    std::vector<float> state_q99;
-};
+using NativeThorCalibrationConfig = NativeCalibrationConfig;
 
-class NativeThorCalibrationSession {
+class NativeThorCalibrationSession final : public NativeCalibrationSession {
 public:
     static std::unique_ptr<NativeThorCalibrationSession> create(
         const NativeThorCalibrationConfig& config,
         double percentile,
         modalities::Status* status);
 
-    ~NativeThorCalibrationSession();
+    ~NativeThorCalibrationSession() override;
 
     NativeThorCalibrationSession(const NativeThorCalibrationSession&) = delete;
     NativeThorCalibrationSession& operator=(
@@ -48,9 +34,10 @@ public:
         const std::vector<modalities::VisionFrame>& frames,
         const float* noise,
         std::uint64_t n_noise,
-        std::uint64_t noise_seed);
-    modalities::Status finalize(const std::string& artifact_path) const;
-    std::uint64_t sample_count() const;
+        std::uint64_t noise_seed) override;
+    modalities::Status finalize(
+        const std::string& artifact_path) const override;
+    std::uint64_t sample_count() const override;
 
 private:
     struct Impl;

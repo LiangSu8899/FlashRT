@@ -4,9 +4,18 @@
 #include "flashrt/cpp/models/pi05/spec.h"
 #include "native_open_internal.h"
 
-#if defined(FLASHRT_CPP_WITH_THOR_FP8) && \
-    defined(FLASHRT_CPP_HAS_SENTENCEPIECE)
+#if defined(FLASHRT_CPP_HAS_SENTENCEPIECE) && \
+    (defined(FLASHRT_CPP_WITH_FA2) || \
+     defined(FLASHRT_CPP_WITH_THOR_FP8))
+#define FLASHRT_CPP_HAS_NATIVE_CALIBRATION 1
+#include "flashrt/cpp/models/pi05/native_calibration_session.h"
+#if defined(FLASHRT_CPP_WITH_FA2)
+#include "flashrt/cpp/models/pi05/native_rtx_calibration_session.h"
+#endif
+#if defined(FLASHRT_CPP_WITH_THOR_FP8)
 #include "flashrt/cpp/models/pi05/native_thor_calibration_session.h"
+#endif
+#include <cuda_runtime_api.h>
 #endif
 
 #include <cstddef>
@@ -26,9 +35,8 @@ using flashrt::modalities::VisionFrame;
 thread_local std::string g_calibration_create_error;
 
 struct frt_pi05_calibration_session_s {
-#if defined(FLASHRT_CPP_WITH_THOR_FP8) && \
-    defined(FLASHRT_CPP_HAS_SENTENCEPIECE)
-    std::unique_ptr<flashrt::models::pi05::NativeThorCalibrationSession> impl;
+#if defined(FLASHRT_CPP_HAS_NATIVE_CALIBRATION)
+    std::unique_ptr<flashrt::models::pi05::NativeCalibrationSession> impl;
 #endif
     std::string last_error;
     std::vector<std::string> view_names;
@@ -37,8 +45,7 @@ struct frt_pi05_calibration_session_s {
 
 namespace {
 
-#if defined(FLASHRT_CPP_WITH_THOR_FP8) && \
-    defined(FLASHRT_CPP_HAS_SENTENCEPIECE)
+#if defined(FLASHRT_CPP_HAS_NATIVE_CALIBRATION)
 int set_error(frt_pi05_calibration_session* session,
               const flashrt::modalities::Status& status) {
     if (session) session->last_error = status.message;
@@ -107,8 +114,7 @@ extern "C" int frt_pi05_calibration_create_v1(
         return -1;
     }
     *out = nullptr;
-#if defined(FLASHRT_CPP_WITH_THOR_FP8) && \
-    defined(FLASHRT_CPP_HAS_SENTENCEPIECE)
+#if defined(FLASHRT_CPP_HAS_NATIVE_CALIBRATION)
     flashrt::models::pi05::NativeOpenConfig open_config;
     int rc = flashrt::models::pi05::parse_native_open_config(
         config_json, &open_config, &g_calibration_create_error);
@@ -118,7 +124,7 @@ extern "C" int frt_pi05_calibration_create_v1(
             "Pi0.5 calibration precision must resolve to fp8_e4m3fn";
         return -1;
     }
-    flashrt::models::pi05::NativeThorCalibrationConfig config;
+    flashrt::models::pi05::NativeCalibrationConfig config;
     config.checkpoint_path = open_config.checkpoint_path;
     config.tokenizer_model_path = open_config.tokenizer_model_path;
     config.max_prompt_tokens = open_config.max_prompt_tokens;
@@ -131,10 +137,42 @@ extern "C" int frt_pi05_calibration_create_v1(
     config.max_frame_height = open_config.max_frame_height;
     config.state_q01 = std::move(open_config.state_q01);
     config.state_q99 = std::move(open_config.state_q99);
+
+    int device = 0;
+    cudaDeviceProp properties{};
+    cudaError_t cuda_rc = cudaGetDevice(&device);
+    if (cuda_rc == cudaSuccess) {
+        cuda_rc = cudaGetDeviceProperties(&properties, device);
+    }
+    if (cuda_rc != cudaSuccess) {
+        g_calibration_create_error = cudaGetErrorString(cuda_rc);
+        return -6;
+    }
     flashrt::modalities::Status status;
-    auto impl =
-        flashrt::models::pi05::NativeThorCalibrationSession::create(
+    std::unique_ptr<flashrt::models::pi05::NativeCalibrationSession> impl;
+    if (properties.major == 12 && properties.minor == 0) {
+#if defined(FLASHRT_CPP_WITH_FA2)
+        impl = flashrt::models::pi05::NativeRtxCalibrationSession::create(
             config, percentile, &status);
+#else
+        status = flashrt::modalities::Status::error(
+            flashrt::modalities::StatusCode::kUnsupported,
+            "Pi0.5 SM120 calibration backend is not built");
+#endif
+    } else if (properties.major == 11 && properties.minor == 0) {
+#if defined(FLASHRT_CPP_WITH_THOR_FP8)
+        impl = flashrt::models::pi05::NativeThorCalibrationSession::create(
+            config, percentile, &status);
+#else
+        status = flashrt::modalities::Status::error(
+            flashrt::modalities::StatusCode::kUnsupported,
+            "Pi0.5 SM110 calibration backend is not built");
+#endif
+    } else {
+        status = flashrt::modalities::Status::error(
+            flashrt::modalities::StatusCode::kUnsupported,
+            "Pi0.5 native FP8 calibration has no backend for this device");
+    }
     if (!impl) {
         g_calibration_create_error = status.message;
         return flashrt::models::pi05::cface::status_code(status);
@@ -155,7 +193,7 @@ extern "C" int frt_pi05_calibration_create_v1(
     (void)config_json;
     (void)percentile;
     g_calibration_create_error =
-        "Pi0.5 calibration requires Thor FP8 and SentencePiece";
+        "Pi0.5 calibration requires a native FP8 backend and SentencePiece";
     return -3;
 #endif
 } catch (const std::exception& error) {
@@ -171,8 +209,7 @@ extern "C" int frt_pi05_calibration_create_v1(
 extern "C" int frt_pi05_calibration_observe_v1(
     frt_pi05_calibration_session* session,
     const frt_pi05_calibration_sample_v1* sample) try {
-#if defined(FLASHRT_CPP_WITH_THOR_FP8) && \
-    defined(FLASHRT_CPP_HAS_SENTENCEPIECE)
+#if defined(FLASHRT_CPP_HAS_NATIVE_CALIBRATION)
     if (!session || !session->impl || !sample ||
         sample->struct_size < sizeof(frt_pi05_calibration_sample_v1) ||
         !sample->prompt || (!sample->state && sample->n_state) ||
@@ -203,8 +240,7 @@ extern "C" int frt_pi05_calibration_observe_v1(
 extern "C" int frt_pi05_calibration_finalize_v1(
     frt_pi05_calibration_session* session,
     const char* artifact_path) try {
-#if defined(FLASHRT_CPP_WITH_THOR_FP8) && \
-    defined(FLASHRT_CPP_HAS_SENTENCEPIECE)
+#if defined(FLASHRT_CPP_HAS_NATIVE_CALIBRATION)
     if (!session || !session->impl || !artifact_path || !artifact_path[0]) {
         if (session) session->last_error = "calibration output path is invalid";
         return -1;
@@ -229,8 +265,7 @@ extern "C" int frt_pi05_calibration_finalize_v1(
 
 extern "C" uint64_t frt_pi05_calibration_sample_count_v1(
     const frt_pi05_calibration_session* session) {
-#if defined(FLASHRT_CPP_WITH_THOR_FP8) && \
-    defined(FLASHRT_CPP_HAS_SENTENCEPIECE)
+#if defined(FLASHRT_CPP_HAS_NATIVE_CALIBRATION)
     return session && session->impl ? session->impl->sample_count() : 0;
 #else
     (void)session;

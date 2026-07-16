@@ -21,6 +21,9 @@ public:
         const std::string& checkpoint_path, const NativeGraphConfig& config,
         const NativeCalibrationArtifact& calibration,
         modalities::Status* status);
+    static std::unique_ptr<NativeGraphOwner> create_calibration(
+        const std::string& checkpoint_path, const NativeGraphConfig& config,
+        modalities::Status* status);
 
     ~NativeGraphOwner() override;
 
@@ -46,14 +49,14 @@ public:
     modalities::Status synchronize() const override;
 
 private:
-    explicit NativeGraphOwner(frt_ctx ctx, const NativeGraphConfig& config);
+    NativeGraphOwner(frt_ctx ctx, const NativeGraphConfig& config,
+                     NativeRtxLinearMode linear_mode);
     modalities::Status initialize(
         const std::string& checkpoint_path,
         const NativeCalibrationArtifact* calibration);
     modalities::Status record(NativeGraphKind kind, void* stream);
     modalities::Status record_context(void* stream);
     modalities::Status record_action(void* stream);
-    modalities::Status autotune_fp8();
     static modalities::Status record_graph(
         void* user, NativeGraphKind kind, void* stream);
 

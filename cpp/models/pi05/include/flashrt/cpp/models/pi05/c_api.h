@@ -141,10 +141,11 @@ int frt_pi05_runtime_read_actions(frt_pi05_runtime*,
 const frt_runtime_export_v1* frt_pi05_runtime_export(frt_pi05_runtime*);
 const char* frt_pi05_runtime_last_error(frt_pi05_runtime*);
 
-/* Native SM110 FP8 calibration. `config_json` uses the same checkpoint,
+/* Native FP8 calibration. `config_json` uses the same checkpoint,
  * tokenizer, shape, and normalization fields as frt_model_runtime_open_v1.
- * The precision must resolve to fp8_e4m3fn. A session accepts one or many
- * observations and publishes one identity-bound safetensors artifact. */
+ * The precision must resolve to fp8_e4m3fn on a compiled backend. A session
+ * accepts one or many observations and publishes one identity-bound
+ * safetensors artifact. */
 int frt_pi05_calibration_create_v1(
     const char* config_json,
     double percentile,
