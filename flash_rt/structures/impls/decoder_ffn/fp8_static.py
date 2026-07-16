@@ -2,17 +2,19 @@
 
 Composes the fused FP8 gate/up -> activation -> down block from the
 ``flashrt/flashrt-fp8-swiglu-ffn`` Hub kernel behind the structure
-boundary. The norm and optional AdaLN modulation run in torch and feed
-the fused block through static-scale FP8 quantization. Activation
-scales are calibrated at bind time from caller-provided representative
-inputs; weight scales are per-tensor amax computed while packing.
+boundary. Two bind entrypoints share the packing and calibration code:
+``bind`` covers the full structure (norm and AdaLN modulation run in
+torch ahead of the fused block); ``bind_mlp_seam`` covers the
+normed-input -> ffn-output slice for hosts whose replaceable module
+boundary is the MLP. Activation scales are static per-tensor,
+calibrated from caller-provided representative inputs.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any, Callable, Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
 import torch
 
@@ -38,6 +40,15 @@ def _kernel():
     from kernels import get_kernel
 
     return get_kernel(KERNEL_DEP["repo"], version=KERNEL_DEP["version"])
+
+
+def _activation(variant: Mapping[str, str]) -> tuple[str, Callable]:
+    name = variant.get("activation", "gelu")
+    if name not in _ENTRYPOINTS:
+        raise ValueError(f"unsupported activation: {name!r}")
+    if name == "gelu":
+        return name, lambda t: torch.nn.functional.gelu(t, approximate="tanh")
+    return name, torch.nn.functional.silu
 
 
 def _amax_scale(tensor: torch.Tensor) -> torch.Tensor:
@@ -71,66 +82,8 @@ def _normalize(
     return h.to(torch.bfloat16)
 
 
-@dataclass(frozen=True)
-class BoundDecoderFfnFp8:
-    """Bound callable: boundary inputs in, boundary output out."""
-
-    fused_mlp: Callable[..., torch.Tensor]
-    w_norm: torch.Tensor
-    gate_up_fp8: torch.Tensor
-    down_fp8: torch.Tensor
-    input_scale: torch.Tensor
-    gate_up_scale: torch.Tensor
-    hidden_scale: torch.Tensor
-    down_scale: torch.Tensor
-    norm_weight_mode: str
-    eps: float
-
-    def __call__(
-        self,
-        x: torch.Tensor,
-        *,
-        cond_scale: torch.Tensor | None = None,
-        cond_shift: torch.Tensor | None = None,
-        cond_gate: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        h = _normalize(x, self.w_norm, self.norm_weight_mode,
-                       cond_scale, cond_shift, self.eps)
-        out = self.fused_mlp(
-            _quantize(h, self.input_scale),
-            self.gate_up_fp8,
-            self.down_fp8,
-            self.input_scale.view(1),
-            self.gate_up_scale.view(1),
-            self.hidden_scale.view(1),
-            self.down_scale.view(1),
-        )
-        if cond_gate is not None:
-            out = out * cond_gate
-        return x + out.to(x.dtype)
-
-
-def bind(
-    weights: Mapping[str, torch.Tensor],
-    *,
-    variant: Mapping[str, str],
-    calibration_inputs: Sequence[Mapping[str, torch.Tensor]],
-    eps: float = 1e-6,
-) -> BoundDecoderFfnFp8:
-    """Pack weights, calibrate activation scales, return a bound callable.
-
-    ``calibration_inputs`` must be non-empty and drawn from the real
-    input distribution of the target binding; static FP8 scales are only
-    as trustworthy as the data they were measured on.
-    """
-    activation = variant.get("activation", "gelu")
-    if activation not in _ENTRYPOINTS:
-        raise ValueError(f"unsupported activation: {activation!r}")
-    mode = variant.get("norm_weight_mode", "offset")
-    if not calibration_inputs:
-        raise ValueError("calibration_inputs must be non-empty")
-
-    w_norm = weights["w_norm"]
+def _check_and_pack(weights: Mapping[str, torch.Tensor]):
+    """Validate dims against the support envelope; pack FP8 weights."""
     w_gate, w_up, w_down = weights["w_gate"], weights["w_up"], weights["w_down"]
     dim_d, dim_f = w_gate.shape
     if w_up.shape != (dim_d, dim_f) or w_down.shape != (dim_f, dim_d):
@@ -147,37 +100,155 @@ def bind(
             )
     if not (w_gate.is_cuda and w_up.is_cuda and w_down.is_cuda):
         raise ValueError("fp8_static requires CUDA-resident weights")
-
     gate_up = torch.cat([w_gate.t(), w_up.t()], dim=0).contiguous()
     down = w_down.t().contiguous()
-    gate_up_scale = _amax_scale(gate_up)
-    down_scale = _amax_scale(down)
+    return gate_up, down, _amax_scale(gate_up), _amax_scale(down)
 
-    act: Callable[[torch.Tensor], torch.Tensor]
-    if activation == "gelu":
-        act = lambda t: torch.nn.functional.gelu(t, approximate="tanh")
-    else:
-        act = torch.nn.functional.silu
-    input_amax = torch.zeros((), device=w_gate.device)
-    hidden_amax = torch.zeros((), device=w_gate.device)
+
+def _calibrate_scales(
+    normed_samples: Sequence[torch.Tensor],
+    w_gate: torch.Tensor,
+    w_up: torch.Tensor,
+    act: Callable[[torch.Tensor], torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Static per-tensor input/hidden scales from normed activations."""
+    if not normed_samples:
+        raise ValueError("calibration samples must be non-empty")
+    device = w_gate.device
+    input_amax = torch.zeros((), device=device)
+    hidden_amax = torch.zeros((), device=device)
     with torch.no_grad():
-        for sample in calibration_inputs:
-            h = _normalize(sample["x"], w_norm, mode,
-                           sample.get("cond_scale"), sample.get("cond_shift"),
-                           eps)
-            hidden = act(h.float() @ w_gate.float()) * (h.float() @ w_up.float())
-            input_amax = torch.maximum(input_amax, h.float().abs().max())
+        for h in normed_samples:
+            flat = h.reshape(-1, h.shape[-1]).float().to(device)
+            hidden = act(flat @ w_gate.float()) * (flat @ w_up.float())
+            input_amax = torch.maximum(input_amax, flat.abs().max())
             hidden_amax = torch.maximum(hidden_amax, hidden.abs().max())
+    return ((input_amax / _FP8_MAX).clamp(min=1e-8),
+            (hidden_amax / _FP8_MAX).clamp(min=1e-8))
 
+
+@dataclass(frozen=True)
+class BoundDecoderFfnFp8:
+    """Bound callable for the full structure boundary."""
+
+    fused_mlp: Callable[..., torch.Tensor]
+    w_norm: torch.Tensor
+    gate_up_fp8: torch.Tensor
+    down_fp8: torch.Tensor
+    input_scale: torch.Tensor
+    gate_up_scale: torch.Tensor
+    hidden_scale: torch.Tensor
+    down_scale: torch.Tensor
+    norm_weight_mode: str
+    eps: float
+
+    def ffn(self, normed: torch.Tensor) -> torch.Tensor:
+        """The normed-input -> ffn-output slice (no norm, no residual)."""
+        shape = normed.shape
+        out = self.fused_mlp(
+            _quantize(normed.reshape(-1, shape[-1]), self.input_scale),
+            self.gate_up_fp8,
+            self.down_fp8,
+            self.input_scale.view(1),
+            self.gate_up_scale.view(1),
+            self.hidden_scale.view(1),
+            self.down_scale.view(1),
+        )
+        return out.reshape(shape).to(normed.dtype)
+
+    def __call__(
+        self,
+        x: torch.Tensor,
+        *,
+        cond_scale: torch.Tensor | None = None,
+        cond_shift: torch.Tensor | None = None,
+        cond_gate: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        h = _normalize(x, self.w_norm, self.norm_weight_mode,
+                       cond_scale, cond_shift, self.eps)
+        out = self.ffn(h)
+        if cond_gate is not None:
+            out = out * cond_gate
+        return x + out.to(x.dtype)
+
+
+class FusedGeGluMlp(torch.nn.Module):
+    """MLP-seam module for hosts whose replaceable boundary is the MLP.
+
+    The host keeps its own norm, AdaLN gate, and residual. ``original``
+    is retained so hosts that introspect the projection attributes of
+    the module they call keep working, and so detachment restores the
+    exact original.
+    """
+
+    def __init__(self, bound: BoundDecoderFfnFp8,
+                 original: torch.nn.Module | None = None):
+        super().__init__()
+        self._bound = bound
+        if original is not None:
+            self.gate_proj = original.gate_proj
+            self.up_proj = original.up_proj
+            self.down_proj = original.down_proj
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        return self._bound.ffn(hidden)
+
+
+def _build(weights, variant, input_scale, hidden_scale, eps):
+    name, _ = _activation(variant)
+    gate_up, down, gate_up_scale, down_scale = _check_and_pack(weights)
     return BoundDecoderFfnFp8(
-        fused_mlp=getattr(_kernel(), _ENTRYPOINTS[activation]),
-        w_norm=w_norm,
+        fused_mlp=getattr(_kernel(), _ENTRYPOINTS[name]),
+        w_norm=weights["w_norm"],
         gate_up_fp8=_quantize(gate_up, gate_up_scale),
         down_fp8=_quantize(down, down_scale),
-        input_scale=(input_amax / _FP8_MAX).clamp(min=1e-8),
+        input_scale=input_scale,
         gate_up_scale=gate_up_scale,
-        hidden_scale=(hidden_amax / _FP8_MAX).clamp(min=1e-8),
+        hidden_scale=hidden_scale,
         down_scale=down_scale,
-        norm_weight_mode=mode,
+        norm_weight_mode=variant.get("norm_weight_mode", "offset"),
         eps=eps,
     )
+
+
+def bind(
+    weights: Mapping[str, torch.Tensor],
+    *,
+    variant: Mapping[str, str],
+    calibration_inputs: Sequence[Mapping[str, torch.Tensor]],
+    eps: float = 1e-6,
+) -> BoundDecoderFfnFp8:
+    """Bind the full structure: calibration inputs are boundary inputs.
+
+    ``calibration_inputs`` must be drawn from the real input distribution
+    of the target binding; static FP8 scales are only as trustworthy as
+    the data they were measured on.
+    """
+    if not calibration_inputs:
+        raise ValueError("calibration_inputs must be non-empty")
+    _, act = _activation(variant)
+    mode = variant.get("norm_weight_mode", "offset")
+    normed = [
+        _normalize(sample["x"], weights["w_norm"], mode,
+                   sample.get("cond_scale"), sample.get("cond_shift"), eps)
+        for sample in calibration_inputs
+    ]
+    input_scale, hidden_scale = _calibrate_scales(
+        normed, weights["w_gate"], weights["w_up"], act)
+    return _build(weights, variant, input_scale, hidden_scale, eps)
+
+
+def bind_mlp_seam(
+    weights: Mapping[str, torch.Tensor],
+    *,
+    variant: Mapping[str, str],
+    calibration_normed: Sequence[torch.Tensor],
+    original: torch.nn.Module | None = None,
+    eps: float = 1e-6,
+) -> FusedGeGluMlp:
+    """Bind the MLP-seam slice: calibration inputs are normed activations."""
+    _, act = _activation(variant)
+    input_scale, hidden_scale = _calibrate_scales(
+        calibration_normed, weights["w_gate"], weights["w_up"], act)
+    bound = _build(weights, variant, input_scale, hidden_scale, eps)
+    return FusedGeGluMlp(bound, original=original)

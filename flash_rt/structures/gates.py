@@ -93,6 +93,11 @@ def _call(spec: StructureSpec, fn: Callable[..., Any],
     return fn(*args, **kwargs)
 
 
+def parity_metrics(got: torch.Tensor, want: torch.Tensor) -> dict[str, float]:
+    """Cosine / max-abs / p99-abs between an implementation and a truth."""
+    return _parity_metrics(got, want)
+
+
 def _parity_metrics(got: torch.Tensor, want: torch.Tensor) -> dict[str, float]:
     if got.shape != want.shape:
         raise ValueError(
