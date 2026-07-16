@@ -17,9 +17,12 @@
 - [ ] Focused tests cover success and rejection paths
 - [ ] Affected CUDA-off/hardware configurations were checked or disclosed
 - [ ] Numerical claims use a fixed, justified gate
+- [ ] Calibration artifacts and cache invalidation are identity-complete
+- [ ] Single/multi-sample calibration and named-input rejection are covered
 - [ ] STAGED ports have real matching verbs
 - [ ] Identity uses observed runtime facts and changes with contract changes
 - [ ] Hot-path allocation/capture/rebind claims are measured at the right scope
 - [ ] Documentation and migration notes are updated
 - [ ] Diff contains no private paths, hosts, containers, credentials, or logs
 - [ ] Shared kernel/CMake ownership and packaging were reviewed
+- [ ] Model semantics remain model-local; frozen runtime/exec stay generic

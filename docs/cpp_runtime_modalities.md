@@ -60,8 +60,8 @@ Model adapters live in `cpp/models/<model>/`:
 
 Pi0.5 is the first adapter:
 
-- vision: `image`, `wrist_image`, `wrist_image_right` -> NHWC BF16 224x224,
-  normalized to `[-1, 1]`;
+- vision: `image`, `wrist_image`, `wrist_image_right` -> NHWC 224x224 in the
+  producer-declared dtype, normalized to `[-1, 1]`;
 - action: `(chunk, 32)` model output -> first 7 robot dims, unnormalized by
   deployment stats.
 - `flashrt::models::pi05::RuntimeIo` binds those specs to concrete tensor
@@ -82,23 +82,25 @@ Current Pi0.5 status:
   resize/normalize/cast directly into export device buffers;
 - conservative action staging path: device action buffer -> D2H -> CPU
   reference postprocess;
-- native SM120 checkpoint loading, tokenizer/prompt staging, weight
-  materialization, and graph capture are implemented by the optional
-  `frt_model_runtime_open_v1` producer. They present the same model-runtime ABI
-  and remain FlashRT responsibilities, not Nexus features.
+- native SM120 BF16 and SM110 FP8 checkpoint loading, tokenizer/prompt staging,
+  weight materialization, calibration where required, and graph capture are
+  implemented by the optional `frt_model_runtime_open_v1` producer. They
+  present the same model-runtime ABI and remain FlashRT responsibilities, not
+  Nexus features.
 
-## CPU Reference First
+## Reference First
 
-The current implementation is a CPU reference path:
+The portable semantic references are:
 
 - `preprocess_vision_cpu`
 - `postprocess_action_cpu`
 
-This is intentional. It gives every CUDA/DMA/zero-copy fast path a golden
-contract. The current vision device path already uses a CUDA
-resize/normalize/cast kernel and is tested against the CPU reference. The
-action device path is still conservative D2H staging because the postprocess is
-small; it can be moved to CUDA without changing model adapters.
+They give every CUDA/DMA/zero-copy fast path a golden contract. The vision
+device path uses CUDA resize/normalize/cast and is tested against the CPU
+reference at the declared output dtype. The action device path remains
+conservative D2H staging because postprocess is small; it can move to CUDA
+without changing model adapters. Native SM110 calibration and inference add
+separate producer-parity gates on top of these modality references.
 
 ## Hot Path Rules
 

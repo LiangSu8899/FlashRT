@@ -10,10 +10,9 @@ cannot promise. This document is the structure map; the interface reference is
 ## One struct, two producers
 
 Everything converges on `frt_model_runtime_v1` (the standard face of one
-deployed, tickable model). The Python setup bridge produces it today; a native
-model-runtime `.so` (`frt_model_runtime_open_v1`) produces the same struct
-later. Consumers — FlashRT-Nexus, robot loops, FFI hosts — never change when
-the producer does.
+deployed, tickable model). Python setup bridges and native model-runtime shared
+objects (`frt_model_runtime_open_v1`) produce the same struct. Consumers —
+FlashRT-Nexus, robot loops, FFI hosts — never change when the producer does.
 
 The clean hybrid path is **verb override**: the setup producer exports the
 authoritative ports, stage DAG, graph streams, identity and fingerprint; a
@@ -67,19 +66,22 @@ GROOT runtime would export its own model factory, and so on. That code owns the
 model's hot-path transforms: image normalization, state packing, action
 postprocess, and the names/shapes of public ports it supports.
 
-The **hardware** is selected before the C++ runtime sees the model: the Python
-or native setup producer chooses the hardware pipeline, captures the graphs,
-allocates live buffers, calibrates precision-specific paths, and writes the
-canonical identity/fingerprint. The C++ overlay then inherits those graph,
-stream, stage, and buffer declarations with `frt_model_runtime_override_verbs`.
+The **hardware** is selected by the producer, not by the ABI consumer. A Python
+producer uses its hardware dispatch map. A native producer queries the active
+device, resolves an explicitly supported precision/backend pair, captures the
+graphs, allocates live buffers, calibrates precision-specific paths when
+required, and writes observed hardware into identity. Neither path adds a
+backend-kind field to the frozen structs.
 
-So the expected setup shape is:
+There are two setup shapes:
 
-1. The hardware-specific pipeline builds a ready model instance.
-2. `flash_rt/models/<model>/runtime_export.py` exports that instance as the
-   model family's standard `frt_model_runtime_v1` face.
-3. `cpp/models/<model>/` overlays native hot verbs on that exact declaration.
-4. Nexus or a robot loop consumes only the resulting model-runtime handle.
+1. An adopted producer builds a ready model instance, exports its declarations,
+   and lets `cpp/models/<model>/` override only the hot verbs it implements.
+2. A native producer under `cpp/models/<model>/` loads the checkpoint and
+   tokenizer, builds/captures its backend, and publishes the complete model
+   runtime directly through `frt_model_runtime_open_v1`.
+3. In both cases Nexus or another host consumes only the resulting
+   `frt_model_runtime_v1` handle.
 
 If two hardware pipelines expose the same logical ports and stage DAG, they can
 share one native C++ overlay. If their visible contract differs, the difference
@@ -112,11 +114,12 @@ Optional cuts are managed outside the C++ runtime under `flash_rt/subgraphs/`.
 See [`subgraph_stage_plans.md`](subgraph_stage_plans.md) for the customer
 registration and capture-hook workflow.
 
-The C++ runtime does not parse manifests or hardcode split names. For Pi0.5,
-`frt_pi05_model_runtime_create_over` inherits the producer's declarations and
-maps only the public ports it implements (`images`, optional `noise`,
-`actions`). `step` is convenience only: same-stream stage chains may replay
-sequentially; cross-stream dependencies require a host scheduler.
+The C++ runtime does not infer stage plans from manifests. For Pi0.5, the
+adopted `frt_pi05_model_runtime_create_over` path inherits the producer's graph
+and stage declarations. The native `frt_model_runtime_open_v1` producer
+currently declares one `infer` stage. `step` is convenience only: same-stream
+stage chains may replay sequentially; cross-stream dependencies require a host
+scheduler.
 
 Pi0.5's default producer plan is:
 
@@ -131,9 +134,12 @@ actions for the same inputs.
 It also exposes two IO faces over the same captured graphs:
 
 - `io="python"`: Python frontend hot loop; normalized tensors are SWAP ports.
-- `io="native"`: native C++ hot loop; raw images/actions are STAGED and noise
-  remains a SWAP port. This is the face consumed by
+- `io="native"`: adopted native C++ hot loop; raw images/actions are STAGED and
+  noise remains a SWAP port. This is the face consumed by
   `frt_pi05_model_runtime_create_over`.
+- `io="native_v2"`: Python-free native producer; checkpoint loading,
+  tokenizer/prompt/state processing, calibration where required, and graph
+  capture are all producer-owned setup.
 
 The native `actions` port declares the logical output chunk delivered by
 `get_output`, not necessarily the raw model buffer layout. A Pi0.5 producer may

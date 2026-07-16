@@ -169,6 +169,34 @@ out the exact command.
 do I need to migrate?**
 A: No. The legacy path is still in the search list.
 
+### Pi0.5 Native C++ Runtime
+
+Pi0.5 can also be loaded without a resident Python producer through
+`frt_model_runtime_open_v1`. This is a separate deployment face from
+`flash_rt.load_model()` and returns the backend-neutral
+`frt_model_runtime_v1` contract.
+
+| Hardware | Native precision | Required backend | Calibration artifact |
+|---|---|---|---|
+| SM120 | BF16 | native FA2 + SentencePiece | no |
+| Thor SM110 | FP8 E4M3 | Thor FP8/CUTLASS + SentencePiece | yes |
+
+The SM110 producer includes model-specific C APIs for single-view,
+multi-view, and repeated dataset-observation calibration. The resulting
+safetensors artifact is bound to hardware, checkpoint, tokenizer, fixed
+shapes, sample count, and reducer policy; runtime identity also includes the
+artifact SHA-256. Native C++ NVFP4 is not currently supported. Python FP8 and
+NVFP4 routes keep their existing behavior.
+
+Native safetensors setup uses one direct mmap -> transform/quantize -> device
+upload path and does not create an implicit weight-cache format. This is
+independent of the Python JAX Orbax weight cache documented below.
+
+See [Pi0.5 Native C++ FP8 on Thor](docs/pi05_thor_native_fp8.md) for build
+flags, configuration JSON, C calibration usage, camera-name rules, artifact
+invalidation, runtime ports, and validation commands. The complete portable IO
+contract is [Pi0.5 Native Model Runtime IO](docs/pi05_io_contract.md).
+
 ---
 
 ## Quick Start

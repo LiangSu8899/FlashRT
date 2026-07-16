@@ -15,13 +15,12 @@ orchestration is the consumer's job.
 ```
 producer (owns model + capture)              consumer (owns loop + state policy)
 ─────────────────────────────────            ──────────────────────────────────
-today:                                        e.g. FlashRT-Nexus capsule host,
-  Python setup/capture                        a robot loop, a server shell
+Python setup/capture                          e.g. FlashRT-Nexus capsule host,
     flash_rt/runtime/export.py
       └─ _flashrt_runtime.Builder ──┐
-later (same struct, host unchanged): │        adopt(export*)
+native setup (same struct):          │        adopt(export*)
   native model runtime .so           ├──►  frt_runtime_export_v1  ◄──┘
-    frt_runtime_open_v1(config,&out)─┘        │ ctx, streams[], graphs[],
+    frt_model_runtime_open_v1(...)───┘        │ ctx, streams[], graphs[],
                                               │ buffers[], capsule_regions[],
                                               │ fingerprint/identity/manifest,
                                               │ owner + retain/release
@@ -42,9 +41,9 @@ flash_rt/runtime/export.py    Python producer: RuntimeExport / build_export()
 
 ## The contract, in five rules
 
-1. **One struct, two producers.** Today Python fills it in-process; later a
-   native model runtime `.so` exports `frt_runtime_open_v1` (symbol name is in
-   the header) and fills the *same* struct. Consumers never change.
+1. **One struct, two producers.** Python fills it in-process; a native model
+   runtime `.so` exports `frt_model_runtime_open_v1` (symbol name is in the
+   model-runtime header) and fills the *same* struct. Consumers never change.
 2. **Consumers see handles, never internals.** No Python, torch, model code, or
    kernel headers cross this boundary — only `frt_*` handles, POD descriptors,
    and strings owned by the export.
@@ -138,16 +137,20 @@ Nexus should not implement or own these rules. It adopts `frt_runtime_export_v1`
 and drives snapshot/restore/replay; FlashRT model runtimes prepare inputs and
 decode outputs.
 
-Pi0.5 is the reference C++ model runtime under `cpp/models/pi05/`. The current
-implementation is the adopted-export path: setup/capture can still be produced
-by Python, while the native runtime owns vision prepare, graph replay dispatch,
-action decode, and export lifetime. It includes a CUDA vision
-resize/normalize/cast path for device buffers, with CPU reference tests, and a
-conservative D2H action staging path. The `flashrt_cpp_pi05_c` target exposes a
-small C host ABI around this path so C/Python/serving shells can drive the
-adopted export without including C++ classes. A future pure C++ checkpoint
-loader/tokenizer/capture path must produce the same `frt_runtime_export_v1`, so
-Nexus and serving hosts do not change.
+Pi0.5 is the reference C++ model runtime under `cpp/models/pi05/`. It supports
+both producer forms. The adopted-export path accepts Python- or native-produced
+graphs and overlays native vision/action/prompt/state verbs. The Python-free
+path loads safetensors and SentencePiece assets, selects an explicitly built
+hardware backend, captures one native graph, and publishes the complete
+`frt_model_runtime_v1` through `frt_model_runtime_open_v1`. SM120 currently
+uses BF16 plus native FA2; SM110 uses FP8 E4M3 plus an identity-bound native
+calibration artifact. Both expose the same backend-neutral contract, so Nexus
+and serving hosts do not change.
+
+The `flashrt_cpp_pi05_c` target also exposes the model-specific host/calibration
+C API. These functions own Pi0.5 semantic transforms; they do not extend the
+frozen runtime or exec structs. See [`pi05_io_contract.md`](pi05_io_contract.md)
+and [`pi05_thor_native_fp8.md`](pi05_thor_native_fp8.md).
 
 ## Extending the ABI
 

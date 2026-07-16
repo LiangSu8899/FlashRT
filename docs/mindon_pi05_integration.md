@@ -64,7 +64,7 @@ The C++ host updates these ports with `cap_model_set_input` or the embedded
 session equivalent. The producer formats, tokenizes, embeds, and writes the
 fixed prompt window. Nexus remains unchanged.
 
-### Lane C: Native SM120 Producer
+### Lane C: Native Producer
 
 Load a native FlashRT shared object and call:
 
@@ -77,14 +77,25 @@ The returned struct must expose the same public model-runtime contract as the
 Python setup producer. The host and Nexus adoption code must not change when
 switching between Lane A and Lane C.
 
-The current C++ shared object implements this symbol as a complete SM120
-native-v2 producer when built with CUDA kernels, native FA2, and SentencePiece.
-It validates `io`, checkpoint/tokenizer paths, fixed prompt mode, capacities,
-the complete 812-tensor inventory, and OpenPI or LeRobot action/state q01/q99
+The current C++ shared object implements this symbol as a complete native-v2
+producer on SM120 BF16 and SM110 FP8. Both require CUDA kernels and
+SentencePiece; SM120 uses native FA2, while SM110 uses the Thor FP8/CUTLASS
+backend and an identity-bound calibration artifact. The factory validates `io`,
+precision, checkpoint/tokenizer paths, fixed prompt mode, capacities, the
+complete 812-tensor inventory, and OpenPI or LeRobot action/state q01/q99
 metadata. It then hashes the model and tokenizer for deployment identity,
 materializes context-owned weights/workspace, captures one `infer` variant,
-and returns the integrated model runtime. Missing FA2/SentencePiece support or
-non-SM120 hardware returns unsupported instead of publishing unusable ports.
+and returns the integrated model runtime. Missing backend/SentencePiece support
+or unsupported hardware returns unsupported instead of publishing unusable
+ports.
+
+On SM110, create the artifact with the model-specific calibration API before
+opening the runtime, then pass it as `calibration_path`. One observation can
+contain one, two, or three named camera frames; repeat observations for dataset
+calibration. Camera synchronization and dataset policy stay in the Mindon host.
+See [`pi05_thor_native_fp8.md`](pi05_thor_native_fp8.md) for exact build flags,
+C API usage, artifact invalidation, and validation gates. Native C++ NVFP4 is
+not currently advertised; Python precision routes remain independent.
 
 Use a Release build for MindOn deployment. Native startup includes full-content
 checkpoint hashing and CUDA graph capture in addition to safetensors parsing
@@ -96,12 +107,13 @@ weight materialization execute concurrently, but the factory publishes no
 runtime until both have succeeded.
 
 The native loader maps the checkpoint read-only and directly emits final BF16
-device layouts from F32, BF16, or F16 source tensors. QKV interleave/concat,
-RMS folding, patch permutation, transpose, and output scaling are fused into
-that pass; there is no checkpoint-sized Python dictionary or chain of float
-intermediates. `FLASHRT_PROFILE_NATIVE_SETUP=1` reports header, materialization,
-workspace/style, input initialization, capture, stream, and total setup time.
-This diagnostic is setup-only and does not change the runtime contract.
+or F16/FP8 device layouts from F32, BF16, or F16 source tensors. QKV
+interleave/concat, RMS folding, patch permutation, transpose, and output scaling
+are fused into that pass; there is no checkpoint-sized Python dictionary or
+chain of float intermediates. `FLASHRT_PROFILE_NATIVE_SETUP=1` reports header,
+materialization, workspace/style, input initialization, capture, stream, and
+total setup time. This diagnostic is setup-only and does not change the runtime
+contract.
 
 ## No-HTTP C++ Host Shape
 

@@ -100,15 +100,16 @@ Producer-owned preprocessing:
 - frame payloads are host `u8` pixels in `RGB8`/`HWC` layout;
 - target tensor is `(num_views, 224, 224, 3)`;
 - output layout is `NHWC`;
-- output dtype is the exported tensor dtype, normally BF16 for the FP8 path;
+- output dtype is the exported tensor dtype: BF16 for the SM120 native backend
+  and F16 for the SM110 native FP8 backend;
 - normalization is `x / 127.5 - 1.0`;
 - resizing to 224x224 is producer-owned.
 
 `stride_bytes=0` means tightly packed RGB. A positive stride may include row
 padding but must be at least `width * 3`; negative and short strides are shape
-errors. The native CUDA and CPU reference paths are bit-exact in BF16 over the
-validation matrix (`1x1`, odd dimensions, non-4:3 inputs, wide/tall inputs,
-224x224, and padded rows).
+errors. The native CUDA and CPU reference paths are bit-exact at the exported
+rounding boundary over the validation matrix (`1x1`, odd dimensions, non-4:3
+inputs, wide/tall inputs, 224x224, and padded rows).
 
 The Pi0.5 native face rejects unsupported input shape, dtype, layout, pixel
 format, or view count with a shape/status error. BGR, grayscale, RGBA, CHW, and
@@ -136,7 +137,7 @@ must be read from the port shape; host code must not assume `(10, 32)`.
 
 `actions` is the host-visible robot action chunk after producer-owned
 postprocess. Its declared dtype is F32 because that is the payload returned by
-`get_output`; it does not expose the BF16 diffusion window as backing.
+`get_output`; it does not expose the backend's diffusion window as backing.
 
 The logical output shape is:
 
@@ -218,16 +219,20 @@ There are three supported integration lanes:
   the hot loop adopts `frt_model_runtime_v1` and runs through C++/Nexus.
 - Lane B: an adopted setup producer exposes real hot `prompt`/`state` STAGED
   ports and the C++ overlay owns their transforms.
-- Lane C, current on RTX SM120: a C++ shared object implements
+- Lane C, current on SM120 and SM110: a C++ shared object implements
   `frt_model_runtime_open_v1(config_json, &out)` and produces the same public
   struct without Python setup.
 
 The Pi0.5 C++ shared object exports `frt_model_runtime_open_v1` as a complete
-native-v2 producer when built with CUDA kernels, native FA2, and SentencePiece.
-Execution currently requires RTX SM120. The factory requires `io="native_v2"`,
-`checkpoint_path`, `tokenizer_model_path`, `state_prompt_mode="fixed"`,
-`max_prompt_tokens >= 200`, and a positive `state_dim`; `num_views`, `chunk`,
-`num_steps`, and `vision_pool_factor` are optional fixed setup values. It parses
+native-v2 producer when built with CUDA kernels, SentencePiece, and the backend
+for the executing device: native FA2 for SM120 BF16 or the Thor FP8/CUTLASS
+backend for SM110. The factory requires `io="native_v2"`, `checkpoint_path`,
+`tokenizer_model_path`, `state_prompt_mode="fixed"`, `max_prompt_tokens >= 200`,
+and a positive `state_dim`; `precision`, `num_views`, `chunk`, `num_steps`,
+`vision_pool_factor`, and frame capacities are producer setup values. SM110
+FP8 additionally requires an identity-compatible `calibration_path`. See
+[`pi05_thor_native_fp8.md`](pi05_thor_native_fp8.md) for the build, calibration,
+artifact, and validation contract. It parses
 `checkpoint_path/model.safetensors` through the native read-only mmap loader to
 verify the complete 812-tensor Pi0.5 inventory: all 27 vision layers, all 18
 language encoder layers, all 18 action-expert layers, embeddings/final norms,
@@ -235,9 +240,15 @@ projectors, action projections, and time MLP. It also verifies action/state q01/
 dimensions from either openpi `norm_stats.json` or LeRobot policy
 normalizer/unnormalizer safetensors. Safetensors tensor byte ranges must match
 dtype/shape, and normalization quantiles must be finite ordered pairs. Builds
-without native FA2 or SentencePiece validate the config and return unsupported;
-they do not advertise a runtime they cannot execute. The mmap and parsed tensor
-views are setup-side assets; they never enter the model-runtime ABI or hot path.
+without the selected backend or SentencePiece validate the config and return
+unsupported; they do not advertise a runtime they cannot execute. The mmap and
+parsed tensor views are setup-side assets; they never enter the model-runtime
+ABI or hot path.
+
+The BF16/FA2 implementation details below describe the SM120 backend unless a
+paragraph explicitly says otherwise. The SM110 backend uses the same public
+ports and lifecycle with F16 tensor windows, producer-equivalent FP8 packing,
+FP16 attention/setup math where required, and identity-bound activation scales.
 
 The native setup layer also carries CPU reference transforms matching the
 existing PyTorch producer: source BF16 rounding for vision/decoder weights,
@@ -250,12 +261,12 @@ Build native producers with `CMAKE_BUILD_TYPE=Release` for deployment. The
 native source view accepts F32, BF16, and F16 safetensors without materializing
 a checkpoint-sized float dictionary. Type dispatch occurs once per tensor;
 aligned payloads use typed loops and valid unaligned safetensors ranges use
-safe scalar reads. Plain copy/transpose preserves source BF16 bits. Conversion,
-RMS fold, Q/K interleave, QKV concat/transpose, patch OIHW-to-HWIO layout, and
-action scaling write the final BF16 payload directly. They do not create
-rounded, permuted, or concatenated F32 intermediates. Tests cover every source
-dtype, and real-checkpoint gates byte-compare all fused transform families with
-the PyTorch multi-step reference.
+alignment-safe scalar reads. Plain copy/transpose preserves source bits.
+Conversion, RMS fold, Q/K interleave, QKV concat/transpose, patch OIHW-to-HWIO
+layout, and action scaling write the backend's final BF16 or F16 payload
+directly. They do not create rounded, permuted, or concatenated checkpoint-sized
+F32 intermediates. Tests cover every source dtype, and real-checkpoint gates
+byte-compare fused transform families with the matching shipped producer.
 
 Checkpoint identity remains a full-file SHA-256, not a path, timestamp, or
 partial-content surrogate. When OpenSSL is available at configure time the
@@ -274,6 +285,14 @@ reference measurements, not a latency ABI. Use
 `FLASHRT_PROFILE_NATIVE_SETUP=1` to print the same setup phase breakdown on a
 deployment system. Compare producer startup using the complete scope; a Python
 timer that stops after safetensors conversion is not the same metric.
+
+On a representative Thor SM110 Release run with the same checkpoint size,
+native setup measured 7.90 seconds and the complete open/infer/output/teardown
+lifecycle measured 8.62 seconds. Weight transform, FP8 quantization, and upload
+accounted for 7.61 seconds; workspace/style setup, warmup, and capture measured
+94 ms, 163 ms, and 26 ms respectively. These measurements do not add a binary
+weight cache: native safetensors loading remains one direct, identity-checked
+path.
 
 Materialized device weights use `frt_buffer` allocations owned by the native
 producer's `frt_ctx`. They are internal setup assets, not model ports and not
@@ -423,11 +442,13 @@ same `libflashrt_fa2_raw` kernel owner.
 
 The native builder publishes one `infer` graph/stage and the ordered ports
 `prompt`, `state`, `images`, `noise`, `actions`, and `actions_raw`. Identity
-includes SM120, model/tokenizer SHA-256 values, prompt mode, fixed shapes, and
-schedule parameters. The only capsule region is `rollout_boundary` over the
-diffusion/action buffer. Prompt embeddings, encoder/decoder caches, attention
-lengths, and RoPE remain context-owned `frt_buffer` workspace that each infer
-rebuilds; they are not falsely advertised as independently restorable state.
+includes observed hardware, precision, model/tokenizer SHA-256 values, prompt
+mode, fixed shapes, and schedule parameters. SM110 FP8 identity also includes
+the calibration artifact SHA-256. The only capsule region is
+`rollout_boundary` over the diffusion/action buffer. Prompt embeddings,
+encoder/decoder caches, attention lengths, and RoPE remain context-owned
+`frt_buffer` workspace that each infer rebuilds; they are not falsely
+advertised as independently restorable state.
 
 The returned verb override retains the builder-produced base model, which
 retains the export and graph owner. Releasing the final public model releases
@@ -466,9 +487,9 @@ python cpp/tests/gate_pi05_c_api_export.py ...
 
 The Python-produced overlay gate uses the FA2-enabled, SentencePiece-off SM120
 build because Python already owns prompt/tokenizer setup. Native-v2 factory
-gates use the SentencePiece-enabled SM120 build in a Python-free producer
-process. In either lane, pybind modules and the producer library must come from
-the same build directory; graph and buffer handles cannot cross exec builds.
+gates use a SentencePiece-enabled build with either SM120 FA2 or SM110 Thor FP8.
+In either lane, pybind modules and the producer library must come from the same
+build directory; graph and buffer handles cannot cross exec builds.
 
 Prompt/state STAGED ports require token-exact, formatter string-exact,
 embedding bit-exact, fixed-vs-exact E2E cosine, and hot-contract coverage; a
@@ -478,12 +499,37 @@ The native factory lifecycle gate is:
 
 ```
 <build-dir>/pi05_native_open_probe \
-  <checkpoint> <tokenizer.model>
+  <checkpoint> <tokenizer.model> [calibration.safetensors]
 ```
 
 Run it against both OpenPI and LeRobot checkpoint layouts. It validates the
 public schema, one captured variant, prompt/state/image staging, direct SWAP
 noise input, finite action output, and retain/release teardown.
+
+SM110 FP8 calibration and runtime math are gated separately against the shipped
+Torch producer:
+
+```
+python cpp/tests/gate_pi05_native_thor_fp8.py \
+  --probe <build-dir>/pi05_native_thor_fp8_probe \
+  --checkpoint <pi05-checkpoint> \
+  --tokenizer <tokenizer.model> \
+  --artifact <calibration.safetensors> \
+  --samples 1 --views 1
+
+python cpp/tests/gate_pi05_native_thor_fp8.py \
+  --probe <build-dir>/pi05_native_thor_fp8_probe \
+  --checkpoint <pi05-checkpoint> \
+  --tokenizer <tokenizer.model> \
+  --artifact <calibration.safetensors> \
+  --samples 3 --views 2
+```
+
+The two-view gate submits cameras in reverse order to verify name-based
+canonicalization. It also rejects incomplete/duplicate camera sets and invalid
+noise without committing a sample, exercises deterministic generated noise,
+and requires all encoder scales, decoder scales, and raw actions to be
+bit-exact. Dataset iteration and camera synchronization remain host policy.
 
 Python and C++ native-v2 producers must also publish identical canonical
 port/stage/region records (their producer identity and fingerprints remain
@@ -586,7 +632,7 @@ nsys profile --trace=cuda \
   --capture-range=cudaProfilerApi --capture-range-end=stop \
   -o <hot-report> \
   <build-dir>/pi05_native_open_probe \
-  <checkpoint> <tokenizer.model>
+  <checkpoint> <tokenizer.model> [calibration.safetensors]
 nsys stats --report cuda_api_trace --format csv \
   <hot-report>.nsys-rep > <hot-api-trace>.csv
 python cpp/tests/gate_pi05_hot_allocator.py \
@@ -610,13 +656,14 @@ device update):
 ```
 FLASHRT_HOT_STATE_UPDATES=1000 FLASHRT_HOT_STATE_P99_US=1000 \
   <build-dir>/pi05_native_open_probe \
-  <checkpoint> <tokenizer.model>
+  <checkpoint> <tokenizer.model> [calibration.safetensors]
 ```
 
 The probe varies all eight state dimensions, warms 20 updates, measures 1,000
-updates, and requires the graph variant count to remain one. The reference
-RTX 5090 SM120 run measured p50/p99/max of 39.31/41.70/43.44 microseconds,
-well below the explicit one-millisecond p99 contract.
+updates, and requires the graph variant count to remain one. A reference RTX
+5090 SM120 run measured p50/p99/max of 39.31/41.70/43.44 microseconds. A
+reference Thor SM110 FP8 run measured 129.13/265.66/541.68 microseconds. Both
+remain below the explicit one-millisecond p99 contract.
 
 The unload probe has no static dependency on the Pi0.5 producer. It resolves
 the factory from the shared object, exercises an extra retain/release pair,

@@ -247,6 +247,24 @@ calibration, or graph capture behavior, include a precision comparison:
 - action sanity check for quickstart-only paths
 - latency before/after for performance-sensitive changes
 
+Native calibration APIs and artifacts have additional producer-boundary rules:
+
+- Keep model calibration sites, dimensions, camera names, prompt/state
+  semantics, and artifact schema under `cpp/models/<model>/`; do not add them
+  to the frozen runtime ABI or generic `exec/` mechanism.
+- Keep dataset discovery, decoding, synchronization, and sampling policy in the
+  host. A calibration session accepts complete observations; it does not own a
+  dataset loader.
+- Bind reusable artifacts to observed hardware, model/tokenizer content,
+  precision, fixed shapes, reducer/schema version, and any other input that can
+  change scale meaning. Include the artifact digest in producer identity when
+  changing it changes inference math.
+- Test single-observation and repeated-observation reduction. Named multi-input
+  samples must reject missing/duplicate/unknown names and prove that caller
+  array order does not change semantic order.
+- Use explicit fixed stochastic inputs for reference comparison. A generated
+  fallback must be deterministic, documented, and separately exercised.
+
 ### Performance Measurement
 
 Use the right metric for the claim:

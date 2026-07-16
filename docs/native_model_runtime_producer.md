@@ -42,6 +42,26 @@ Manifest fields are discovery metadata, not a substitute for identity. A
 schema or restore change intentionally produces a new fingerprint and rejects
 old capsules.
 
+## Calibration artifacts
+
+Calibration is producer setup, not a new runtime mechanism. Keep model sites,
+tensor dimensions, camera names, state/prompt semantics, and artifact format in
+`cpp/models/<model>/`. Generic loaders may parse a standard container, but
+`runtime/`, `exec/`, and consumers must not interpret model calibration data.
+
+The host owns dataset traversal, decoding, synchronization, and sampling
+policy. A model session consumes one complete observation per call and may
+reduce repeated observations according to a documented policy. Named inputs
+must be canonicalized before model math and reject missing, duplicate, or
+unknown names atomically.
+
+An artifact must bind every fact that changes scale meaning: observed hardware,
+model and tokenizer content digests, precision, fixed shapes, schema/reducer
+version, and successful sample count. When artifact bytes change inference
+math, include the artifact digest in producer identity. Loading incompatible
+metadata is a hard setup error, never a warning or fallback recalibration in the
+hot process.
+
 ## Multiple producers and backends
 
 Python, native CUDA, CPU, llama.cpp, and future producers expose the same

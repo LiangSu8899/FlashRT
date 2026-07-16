@@ -454,6 +454,16 @@ Required:
 - Quantized paths need cosine, token-match, or domain-specific validation
   against the relevant reference.
 - Cache reuse must document exactly what is cached and when it is invalidated.
+- Native calibration artifacts must bind hardware, model/tokenizer content,
+  precision, fixed shapes, reducer/schema version, and sample count. If artifact
+  bytes change inference math, their digest must participate in producer
+  identity/fingerprint.
+- Dataset traversal and camera synchronization stay host policy. Model-local
+  calibration code consumes complete observations and canonicalizes named
+  inputs before model math.
+- Single-observation and repeated-observation reducers need independent gates;
+  multi-input gates must cover reordered, missing, duplicate, and unknown
+  inputs. Reference parity uses explicit fixed stochastic inputs.
 
 Blockers:
 
@@ -464,6 +474,10 @@ Blockers:
 - Speed is reported without correctness.
 - Low correctness is accepted without comparing to the right reference noise
   floor.
+- A calibration artifact can be reused after checkpoint, tokenizer, hardware,
+  shape, precision, or reducer semantics change without a hard identity error.
+- Generic runtime/exec code learns a model's calibration sites, camera names,
+  dataset format, or dimensions.
 
 Minimum correctness evidence:
 

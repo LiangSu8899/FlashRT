@@ -9,22 +9,21 @@
 ## 1. Runtime layers
 
 ```
-serving/   scenario hosts: sessions, schedulers, protocols, robot loops,
-           OpenAI-compatible HTTP/SSE, streaming audio, rollout policy
-             │
-             ▼
-flash_rt/   Python frontends: weights, calibration, CUDA Graph capture,
-           model APIs and per-model pipeline composition
-             │
-             ▼
-exec/       C ABI execution contract: Buffer / Graph / Plan, replay-time
-           mechanism for native hosts
-             │
-             ▼
-csrc/       CUDA/C++ kernels and vendored attention/GEMM building blocks
+flash_rt/  Python producers: weights, calibration, graph capture ─┐
+cpp/       native producers: checkpoint/tokenizer IO, capture ────┤
+csrc/      CUDA/C++ kernels and vendor building blocks ───────────┘
+                                                                  │
+                                                                  ▼
+runtime/   backend-neutral model hand-off: ports, stages, regions, identity
+                                                                  │
+                                                                  ▼
+exec/      Buffer / Graph / Plan replay mechanism                 │
+                                                                  ▼
+serving/   sessions, protocols, robot loops, and scheduling policy
 ```
 
-The serving layer is deliberately above the model runtime. It decides
+Python and native producers are alternatives; neither is layered on top of the
+other. The serving layer is deliberately above the model runtime. It decides
 session policy, streaming protocol, episode lifecycle, interrupt/reset
 behavior, and host language. The core runtime owns the graph and kernel
 mechanism. See [`../serving/README.md`](../serving/README.md),
@@ -88,7 +87,11 @@ mechanism. See [`../serving/README.md`](../serving/README.md),
 └──────────────────────────────────────────────────────────────┘
 ```
 
-The frontend is the only file you write per model. Everything below it is shared infrastructure. Everything above it is dispatch.
+For the Python producer, the frontend is the primary per-model integration.
+An optional Python-free producer instead lives under `cpp/models/<model>/` and
+must present the same backend-neutral model-runtime contract. Model checkpoint
+names, dimensions, prompt/state rules, and calibration sites stay model-local
+in either producer; `runtime/` and `exec/` do not learn them.
 
 ---
 
