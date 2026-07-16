@@ -3,7 +3,8 @@ version: 1
 description: >
   Post-attention feed-forward block of a transformer decoder layer:
   x -> RMSNorm (optionally AdaLN-modulated) -> gate/up projections ->
-  activation(gate) * up -> down projection -> residual add.
+  activation(gate) * up -> down projection -> residual add (optionally
+  gated by an AdaLN gate term).
 
 reference:
   module: decoder_ffn.reference
@@ -15,6 +16,7 @@ boundary:
     - {name: x, dims: [M, D], dtype: "@binding"}
     - {name: cond_scale, dims: [M, D], dtype: "@binding", optional: true}
     - {name: cond_shift, dims: [M, D], dtype: "@binding", optional: true}
+    - {name: cond_gate, dims: [M, D], dtype: "@binding", optional: true}
   outputs:
     - {name: x, dims: [M, D], dtype: "@binding"}
 

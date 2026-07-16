@@ -28,14 +28,18 @@ def decoder_ffn_ref(
     norm_weight_mode: str = "offset",
     cond_scale: torch.Tensor | None = None,
     cond_shift: torch.Tensor | None = None,
+    cond_gate: torch.Tensor | None = None,
     eps: float = 1e-6,
 ) -> torch.Tensor:
     """x -> RMSNorm -> gate/up GEMM -> act(gate) * up -> down GEMM -> + x.
 
     ``norm_weight_mode``: "offset" multiplies by ``1 + w_norm`` (Gemma
     convention), "direct" multiplies by ``w_norm`` (Qwen convention).
-    ``cond_scale``/``cond_shift`` apply AdaLN-style modulation after the
-    norm when the binding uses the ``ada_ln`` conditioning variant.
+    ``cond_scale``/``cond_shift``/``cond_gate`` apply AdaLN-style
+    modulation under the ``ada_ln`` conditioning variant: the norm output
+    becomes ``normed * (1 + scale) + shift`` and the residual becomes
+    ``x + ffn_out * gate``. A binding whose AdaLN branch has no learned
+    norm weight maps ``w_norm`` to zeros under "offset" mode.
     """
     act = _ACTIVATIONS[activation]
 
@@ -54,4 +58,7 @@ def decoder_ffn_ref(
     h = h.to(x.dtype)
 
     hidden = act(h @ w_gate) * (h @ w_up)
-    return x + hidden @ w_down
+    out = hidden @ w_down
+    if cond_gate is not None:
+        out = out * cond_gate
+    return x + out

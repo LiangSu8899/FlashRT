@@ -92,6 +92,7 @@ class BoundDecoderFfnFp8:
         *,
         cond_scale: torch.Tensor | None = None,
         cond_shift: torch.Tensor | None = None,
+        cond_gate: torch.Tensor | None = None,
     ) -> torch.Tensor:
         h = _normalize(x, self.w_norm, self.norm_weight_mode,
                        cond_scale, cond_shift, self.eps)
@@ -104,6 +105,8 @@ class BoundDecoderFfnFp8:
             self.hidden_scale.view(1),
             self.down_scale.view(1),
         )
+        if cond_gate is not None:
+            out = out * cond_gate
         return x + out.to(x.dtype)
 
 
