@@ -71,9 +71,16 @@ def solve_dims(
 
 
 def _call(spec: StructureSpec, fn: Callable[..., Any],
-          case: QualificationCase) -> torch.Tensor:
+          case: QualificationCase, *, bound: bool = False) -> torch.Tensor:
+    """Invoke ``fn`` per the structure calling convention.
+
+    ``bound=False`` targets full-signature callables (the reference):
+    required inputs, then weight slots, with variants and optional inputs
+    as keywords. ``bound=True`` targets bound implementations whose
+    weights and variant were baked in at bind time: inputs only.
+    """
     args: list[torch.Tensor] = []
-    kwargs: dict[str, Any] = dict(case.variant)
+    kwargs: dict[str, Any] = {} if bound else dict(case.variant)
     for entry in spec.boundary["inputs"]:
         tensor = case.inputs.get(entry["name"])
         if entry.get("optional", False):
@@ -81,7 +88,8 @@ def _call(spec: StructureSpec, fn: Callable[..., Any],
                 kwargs[entry["name"]] = tensor
         else:
             args.append(tensor)
-    args.extend(case.weights[slot] for slot in spec.weight_slots)
+    if not bound:
+        args.extend(case.weights[slot] for slot in spec.weight_slots)
     return fn(*args, **kwargs)
 
 
@@ -125,13 +133,15 @@ def qualify_parity(
     *,
     impl_id: str,
     thresholds: Mapping[str, float],
+    bound: bool = False,
 ) -> dict[str, Any]:
     """Judge ``impl`` against the structure reference on one workload.
 
     ``thresholds`` maps metric name to its passing bound (``cosine`` is a
     floor, absolute-error metrics are ceilings). Every thresholded metric
     must pass for a PASS verdict; metrics without thresholds are recorded
-    as evidence only.
+    as evidence only. Set ``bound=True`` when ``impl`` was produced by an
+    implementation's ``bind`` and takes boundary inputs only.
     """
     for key in case.variant:
         if key not in spec.variants:
@@ -140,7 +150,7 @@ def qualify_parity(
     reference = spec.reference()
 
     want = _call(spec, reference, case)
-    got = _call(spec, impl, case)
+    got = _call(spec, impl, case, bound=bound)
     metrics = _parity_metrics(got, want)
 
     passed = True
