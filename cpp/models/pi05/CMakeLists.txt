@@ -49,13 +49,17 @@ if(FLASHRT_CPP_WITH_CUDA_KERNELS)
     src/native_bf16_forward.cpp
     src/native_graph_runtime.cpp
     src/native_kernel_driver.cu
+    src/native_rtx_linear.cpp
+    src/native_rtx_weight_packer.cpp
     src/native_style_precompute.cu
     ${FLASHRT_CPP_SOURCE_DIR}/../csrc/gemm/gemm_runner.cu
     ${FLASHRT_CPP_SOURCE_DIR}/../csrc/kernels/activation.cu
     ${FLASHRT_CPP_SOURCE_DIR}/../csrc/kernels/dit_bf16.cu
     ${FLASHRT_CPP_SOURCE_DIR}/../csrc/kernels/elementwise.cu
+    ${FLASHRT_CPP_SOURCE_DIR}/../csrc/kernels/fusion.cu
     ${FLASHRT_CPP_SOURCE_DIR}/../csrc/kernels/norm.cu
     ${FLASHRT_CPP_SOURCE_DIR}/../csrc/kernels/patch_embed.cu
+    ${FLASHRT_CPP_SOURCE_DIR}/../csrc/kernels/quantize.cu
     ${FLASHRT_CPP_SOURCE_DIR}/../csrc/kernels/rope.cu)
   target_include_directories(flashrt_cpp_pi05_kernels
     PRIVATE ${_pi05_public_include}
@@ -101,7 +105,6 @@ if(FLASHRT_CPP_WITH_CUDA_KERNELS)
       ${FLASHRT_CPP_SOURCE_DIR}/../csrc/gemm/cutlass_sm100.cu
       ${FLASHRT_CPP_SOURCE_DIR}/../csrc/kernels/attention_cublas.cu
       ${FLASHRT_CPP_SOURCE_DIR}/../csrc/kernels/decoder_fused.cu
-      ${FLASHRT_CPP_SOURCE_DIR}/../csrc/kernels/quantize.cu
       ${FLASHRT_CPP_SOURCE_DIR}/../csrc/kernels/softmax.cu)
     target_include_directories(flashrt_cpp_pi05_kernels PRIVATE
       ${FLASHRT_CPP_SOURCE_DIR}/../csrc/attention

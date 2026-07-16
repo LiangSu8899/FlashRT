@@ -2,9 +2,11 @@
 
 #include "activation.cuh"
 #include "elementwise.cuh"
+#include "fusion.cuh"
 #include "gemm_runner.h"
 #include "norm.cuh"
 #include "patch_embed.cuh"
+#include "quantize.cuh"
 #include "rope.cuh"
 
 #include <cuda_runtime_api.h>
@@ -93,6 +95,112 @@ modalities::Status NativeKernelDriver::bf16_nn(
     }
 }
 
+modalities::Status NativeKernelDriver::fp8_nn_bf16(
+    void* a,
+    void* b,
+    void* output,
+    int m,
+    int n,
+    int k,
+    const float* activation_scale,
+    const float* weight_scale,
+    std::uintptr_t stream) const {
+    if (!impl_) return backend(error_);
+    if (!a || !b || !output || !activation_scale || !weight_scale ||
+        m <= 0 || n <= 0 || k <= 0) {
+        return invalid("native FP8 GEMM arguments are invalid");
+    }
+    try {
+        impl_->gemm.fp8_nn_dev(
+            a, b, output, m, n, k, const_cast<float*>(activation_scale),
+            const_cast<float*>(weight_scale),
+            reinterpret_cast<cudaStream_t>(stream));
+        return modalities::Status::ok();
+    } catch (const std::exception& e) {
+        return backend(e.what());
+    } catch (...) {
+        return backend("native FP8 GEMM launch failed");
+    }
+}
+
+modalities::Status NativeKernelDriver::autotune_fp8_nn_bf16(
+    void* a,
+    void* b,
+    void* output,
+    int m,
+    int n,
+    int k,
+    const float* activation_scale,
+    const float* weight_scale) const {
+    if (!impl_) return backend(error_);
+    if (!a || !b || !output || !activation_scale || !weight_scale ||
+        m <= 0 || n <= 0 || k <= 0) {
+        return invalid("native FP8 GEMM autotune arguments are invalid");
+    }
+    try {
+        impl_->gemm.autotune_fp8_nn_dev(
+            a, b, output, m, n, k,
+            const_cast<float*>(activation_scale),
+            const_cast<float*>(weight_scale));
+        return modalities::Status::ok();
+    } catch (const std::exception& e) {
+        return backend(e.what());
+    } catch (...) {
+        return backend("native FP8 GEMM autotune failed");
+    }
+}
+
+modalities::Status NativeKernelDriver::quantize_fp8_static_bf16(
+    const void* values,
+    void* output,
+    const float* scale,
+    std::size_t elements,
+    std::uintptr_t stream) const {
+    if (!impl_) return backend(error_);
+    if (!values || !output || !scale || !elements || elements > INT_MAX) {
+        return invalid("native static FP8 quantization arguments are invalid");
+    }
+    ::quantize_fp8_static(
+        static_cast<const __nv_bfloat16*>(values),
+        static_cast<__nv_fp8_e4m3*>(output), scale,
+        static_cast<int>(elements), reinterpret_cast<cudaStream_t>(stream));
+    return launch_status();
+}
+
+modalities::Status NativeKernelDriver::quantize_fp8_dynamic_bf16(
+    const void* values,
+    void* output,
+    float* scale,
+    std::size_t elements,
+    std::uintptr_t stream) const {
+    if (!impl_) return backend(error_);
+    if (!values || !output || !scale || !elements || elements > INT_MAX) {
+        return invalid("native dynamic FP8 quantization arguments are invalid");
+    }
+    ::quantize_fp8_device(
+        static_cast<const __nv_bfloat16*>(values),
+        static_cast<__nv_fp8_e4m3*>(output), scale,
+        static_cast<int>(elements), reinterpret_cast<cudaStream_t>(stream));
+    return launch_status();
+}
+
+modalities::Status NativeKernelDriver::quantize_fp8_weight_bf16(
+    const void* values,
+    void* output,
+    float* scale,
+    std::size_t elements,
+    std::uintptr_t stream) const {
+    if (!impl_) return backend(error_);
+    if (!values || !output || !scale || !elements || elements > INT_MAX) {
+        return invalid("native FP8 weight quantization arguments are invalid");
+    }
+    ::quantize_fp8_weight_device(
+        static_cast<const __nv_bfloat16*>(values),
+        static_cast<__nv_fp8_e4m3*>(output), scale,
+        static_cast<int>(elements), reinterpret_cast<cudaStream_t>(stream));
+    return launch_status();
+}
+
 modalities::Status NativeKernelDriver::add_bias_bf16(
     void* values,
     const void* bias,
@@ -149,6 +257,41 @@ modalities::Status NativeKernelDriver::gate_gelu_bf16(
                     static_cast<__nv_bfloat16*>(output),
                     static_cast<int>(elements),
                     reinterpret_cast<cudaStream_t>(stream));
+    return launch_status();
+}
+
+modalities::Status NativeKernelDriver::gate_gelu_merged_bf16(
+    const void* merged,
+    void* output,
+    int rows,
+    int hidden,
+    std::uintptr_t stream) const {
+    if (!impl_) return backend(error_);
+    if (!merged || !output || rows <= 0 || hidden <= 0) {
+        return invalid("native BF16 merged gated GELU arguments are invalid");
+    }
+    ::gate_silu_mul_merged(
+        static_cast<const __nv_bfloat16*>(merged),
+        static_cast<__nv_bfloat16*>(output), rows, hidden,
+        reinterpret_cast<cudaStream_t>(stream));
+    return launch_status();
+}
+
+modalities::Status NativeKernelDriver::gate_gelu_merged_fp8_bf16(
+    const void* merged,
+    void* output,
+    int rows,
+    int hidden,
+    const float* scale,
+    std::uintptr_t stream) const {
+    if (!impl_) return backend(error_);
+    if (!merged || !output || !scale || rows <= 0 || hidden <= 0) {
+        return invalid("native BF16 merged gated GELU FP8 arguments are invalid");
+    }
+    ::gate_silu_mul_merged_fp8(
+        static_cast<const __nv_bfloat16*>(merged),
+        static_cast<__nv_fp8_e4m3*>(output), rows, hidden, scale,
+        reinterpret_cast<cudaStream_t>(stream));
     return launch_status();
 }
 
@@ -213,6 +356,51 @@ modalities::Status NativeKernelDriver::rms_norm_bf16(
     return launch_status();
 }
 
+modalities::Status NativeKernelDriver::rms_norm_fp8_bf16(
+    const void* values,
+    const void* weight,
+    void* output,
+    int rows,
+    int columns,
+    float epsilon,
+    const float* scale,
+    std::uintptr_t stream) const {
+    if (!impl_) return backend(error_);
+    if (!values || !weight || !output || !scale || rows <= 0 || columns <= 0) {
+        return invalid("native BF16 RMS norm FP8 arguments are invalid");
+    }
+    ::rms_norm_fp8(
+        static_cast<const __nv_bfloat16*>(values),
+        static_cast<const __nv_bfloat16*>(weight),
+        static_cast<__nv_fp8_e4m3*>(output), rows, columns, epsilon, scale,
+        reinterpret_cast<cudaStream_t>(stream));
+    return launch_status();
+}
+
+modalities::Status NativeKernelDriver::residual_add_rms_norm_fp8_bf16(
+    void* residual,
+    const void* values,
+    const void* weight,
+    void* output,
+    int rows,
+    int columns,
+    float epsilon,
+    const float* scale,
+    std::uintptr_t stream) const {
+    if (!impl_) return backend(error_);
+    if (!residual || !values || !weight || !output || !scale || rows <= 0 ||
+        columns <= 0) {
+        return invalid("native BF16 residual RMS norm FP8 arguments are invalid");
+    }
+    ::residual_add_rms_norm_fp8(
+        static_cast<__nv_bfloat16*>(residual),
+        static_cast<const __nv_bfloat16*>(values),
+        static_cast<const __nv_bfloat16*>(weight),
+        static_cast<__nv_fp8_e4m3*>(output), rows, columns, epsilon, scale,
+        reinterpret_cast<cudaStream_t>(stream));
+    return launch_status();
+}
+
 modalities::Status NativeKernelDriver::layer_norm_bf16(
     const void* values, const void* weight, const void* bias, void* output,
     int rows, int columns, float epsilon, std::uintptr_t stream) const {
@@ -245,6 +433,62 @@ modalities::Status NativeKernelDriver::ada_rms_norm_style_bf16(
         static_cast<__nv_bfloat16*>(output),
         static_cast<__nv_bfloat16*>(gate_output), rows, columns, epsilon,
         reinterpret_cast<cudaStream_t>(stream));
+    return launch_status();
+}
+
+modalities::Status NativeKernelDriver::ada_rms_norm_style_fp8_bf16(
+    const void* values,
+    const void* weight,
+    const void* style,
+    void* output,
+    void* gate_output,
+    int rows,
+    int columns,
+    float epsilon,
+    const float* scale,
+    std::uintptr_t stream) const {
+    if (!impl_) return backend(error_);
+    if (!values || !weight || !style || !output || !gate_output || !scale ||
+        rows <= 0 || columns <= 0) {
+        return invalid("native BF16 Ada RMS norm FP8 arguments are invalid");
+    }
+    ::ada_rms_norm_style_fp8(
+        static_cast<const __nv_bfloat16*>(values),
+        static_cast<const __nv_bfloat16*>(weight),
+        static_cast<const __nv_bfloat16*>(style),
+        static_cast<__nv_fp8_e4m3*>(output),
+        static_cast<__nv_bfloat16*>(gate_output), rows, columns, epsilon,
+        scale, reinterpret_cast<cudaStream_t>(stream));
+    return launch_status();
+}
+
+modalities::Status NativeKernelDriver::gate_residual_ada_norm_fp8_bf16(
+    void* residual,
+    const void* values,
+    const void* gate,
+    const void* weight,
+    const void* style,
+    void* output,
+    void* gate_output,
+    int rows,
+    int columns,
+    float epsilon,
+    const float* scale,
+    std::uintptr_t stream) const {
+    if (!impl_) return backend(error_);
+    if (!residual || !values || !gate || !weight || !style || !output ||
+        !gate_output || !scale || rows <= 0 || columns <= 0) {
+        return invalid("native BF16 gated residual Ada norm FP8 arguments are invalid");
+    }
+    ::gate_residual_ada_norm_fp8(
+        static_cast<__nv_bfloat16*>(residual),
+        static_cast<const __nv_bfloat16*>(values),
+        static_cast<const __nv_bfloat16*>(gate),
+        static_cast<const __nv_bfloat16*>(weight),
+        static_cast<const __nv_bfloat16*>(style),
+        static_cast<__nv_fp8_e4m3*>(output),
+        static_cast<__nv_bfloat16*>(gate_output), rows, columns, epsilon,
+        scale, reinterpret_cast<cudaStream_t>(stream));
     return launch_status();
 }
 

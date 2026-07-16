@@ -5,6 +5,7 @@
 #include <cuda_runtime_api.h>
 #endif
 
+#include <algorithm>
 #include <limits>
 #include <cmath>
 
@@ -517,6 +518,18 @@ modalities::Status NativeWorkspace::allocate(
     FRT_ADD("x_normed_buf", {ds, 1024}, modalities::DType::kBFloat16);
     FRT_ADD("gate_buf", {ds, 1024}, modalities::DType::kBFloat16);
     FRT_ADD("decoder_rms_ones", {1024}, modalities::DType::kBFloat16);
+    if (flavor_ == NativeWorkspaceFlavor::kRtxFp8) {
+        const std::uint64_t scratch_elements = std::max({
+            vs * 4304, es * 16384, ds * 4096});
+        FRT_ADD("rtx_fp8_scratch", {scratch_elements},
+                modalities::DType::kUInt8);
+        FRT_ADD("rtx_fp8_vision_scales", {109},
+                modalities::DType::kFloat32);
+        FRT_ADD("rtx_fp8_encoder_scales", {18 * 4},
+                modalities::DType::kFloat32);
+        FRT_ADD("rtx_fp8_decoder_scales", {steps * 18 * 4},
+                modalities::DType::kFloat32);
+    }
 #undef FRT_ADD
     const NativeWorkspaceBuffer* decoder = find("decoder_rope_weights");
     if (!decoder) return invalid("decoder RoPE buffer was not allocated");

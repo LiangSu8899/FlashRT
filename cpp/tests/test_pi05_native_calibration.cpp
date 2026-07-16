@@ -79,7 +79,24 @@ int main() {
     assert(loaded.num_steps == expected.num_steps);
     assert(loaded.vision_pool_factor == expected.vision_pool_factor);
     assert(loaded.sample_count == expected.sample_count);
+    assert(loaded.activation_dtype == expected.activation_dtype);
+    assert(loaded.vision_scales == expected.vision_scales);
     assert(std::fabs(loaded.percentile - expected.percentile) < 1e-12);
+    assert(loaded.encoder_scales == expected.encoder_scales);
+    assert(loaded.decoder_scales == expected.decoder_scales);
+    assert(::unlink(path.c_str()) == 0);
+
+    expected.activation_dtype = "bfloat16";
+    expected.hardware = "sm120";
+    expected.vision_scales.resize(27 * 4 + 1);
+    for (std::size_t i = 0; i < expected.vision_scales.size(); ++i) {
+        expected.vision_scales[i] = 0.002f * static_cast<float>(i + 1);
+    }
+    assert(save_native_calibration_artifact(path, expected).ok_status());
+    assert(load_native_calibration_artifact(path, &loaded).ok_status());
+    assert(loaded.activation_dtype == expected.activation_dtype);
+    assert(loaded.hardware == expected.hardware);
+    assert(loaded.vision_scales == expected.vision_scales);
     assert(loaded.encoder_scales == expected.encoder_scales);
     assert(loaded.decoder_scales == expected.decoder_scales);
     assert(::unlink(path.c_str()) == 0);

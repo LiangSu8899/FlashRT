@@ -17,6 +17,7 @@ namespace pi05 {
 
 enum class NativeWorkspaceFlavor {
     kBf16,
+    kRtxFp8,
     kThorFp8,
 };
 

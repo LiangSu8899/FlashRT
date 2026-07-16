@@ -24,6 +24,22 @@ public:
     modalities::Status bf16_nn(void* a, void* b, void* output,
                                int m, int n, int k,
                                std::uintptr_t stream) const;
+    modalities::Status fp8_nn_bf16(
+        void* a, void* b, void* output, int m, int n, int k,
+        const float* activation_scale, const float* weight_scale,
+        std::uintptr_t stream) const;
+    modalities::Status autotune_fp8_nn_bf16(
+        void* a, void* b, void* output, int m, int n, int k,
+        const float* activation_scale, const float* weight_scale) const;
+    modalities::Status quantize_fp8_static_bf16(
+        const void* values, void* output, const float* scale,
+        std::size_t elements, std::uintptr_t stream) const;
+    modalities::Status quantize_fp8_dynamic_bf16(
+        const void* values, void* output, float* scale,
+        std::size_t elements, std::uintptr_t stream) const;
+    modalities::Status quantize_fp8_weight_bf16(
+        const void* values, void* output, float* scale,
+        std::size_t elements, std::uintptr_t stream) const;
     modalities::Status add_bias_bf16(void* values, const void* bias,
                                      int rows, int columns,
                                      std::uintptr_t stream) const;
@@ -34,6 +50,12 @@ public:
     modalities::Status gate_gelu_bf16(const void* gate, const void* up,
                                       void* output, std::size_t elements,
                                       std::uintptr_t stream) const;
+    modalities::Status gate_gelu_merged_bf16(
+        const void* merged, void* output, int rows, int hidden,
+        std::uintptr_t stream) const;
+    modalities::Status gate_gelu_merged_fp8_bf16(
+        const void* merged, void* output, int rows, int hidden,
+        const float* scale, std::uintptr_t stream) const;
     modalities::Status residual_add_bf16(void* residual, const void* values,
                                          std::size_t elements,
                                          std::uintptr_t stream) const;
@@ -46,6 +68,14 @@ public:
     modalities::Status rms_norm_bf16(
         const void* values, const void* weight, void* output,
         int rows, int columns, float epsilon, std::uintptr_t stream) const;
+    modalities::Status rms_norm_fp8_bf16(
+        const void* values, const void* weight, void* output,
+        int rows, int columns, float epsilon, const float* scale,
+        std::uintptr_t stream) const;
+    modalities::Status residual_add_rms_norm_fp8_bf16(
+        void* residual, const void* values, const void* weight, void* output,
+        int rows, int columns, float epsilon, const float* scale,
+        std::uintptr_t stream) const;
     modalities::Status layer_norm_bf16(
         const void* values, const void* weight, const void* bias, void* output,
         int rows, int columns, float epsilon, std::uintptr_t stream) const;
@@ -53,6 +83,15 @@ public:
         const void* values, const void* weight, const void* style,
         void* output, void* gate_output, int rows, int columns,
         float epsilon, std::uintptr_t stream) const;
+    modalities::Status ada_rms_norm_style_fp8_bf16(
+        const void* values, const void* weight, const void* style,
+        void* output, void* gate_output, int rows, int columns,
+        float epsilon, const float* scale, std::uintptr_t stream) const;
+    modalities::Status gate_residual_ada_norm_fp8_bf16(
+        void* residual, const void* values, const void* gate,
+        const void* weight, const void* style, void* output,
+        void* gate_output, int rows, int columns, float epsilon,
+        const float* scale, std::uintptr_t stream) const;
     modalities::Status qkv_split_bf16(
         const void* qkv, void* query, void* key, void* value,
         int rows, int query_columns, int key_columns, int value_columns,

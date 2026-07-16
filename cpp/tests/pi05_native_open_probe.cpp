@@ -32,6 +32,43 @@ bool all_graph_variants_stable(const frt_runtime_export_v1* exp) {
     return true;
 }
 
+const frt_runtime_buffer_desc* find_buffer(
+    const frt_runtime_export_v1* exp,
+    const char* name) {
+    if (!exp || !name) return nullptr;
+    for (std::uint64_t index = 0; index < exp->n_buffers; ++index) {
+        if (std::strcmp(exp->buffers[index].name, name) == 0) {
+            return &exp->buffers[index];
+        }
+    }
+    return nullptr;
+}
+
+bool write_diagnostics(
+    const frt_runtime_export_v1* exp,
+    const char* path) {
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    if (!output) return false;
+    for (const char* name : {
+             "observation_images_normalized",
+             "prompt_embedding",
+             "encoder_x"}) {
+        const frt_runtime_buffer_desc* buffer = find_buffer(exp, name);
+        if (!buffer || !buffer->handle || !buffer->bytes) return false;
+        std::vector<unsigned char> host(
+            static_cast<std::size_t>(buffer->bytes));
+        if (cudaMemcpy(host.data(), frt_buffer_dptr(buffer->handle),
+                       host.size(), cudaMemcpyDeviceToHost) != cudaSuccess) {
+            return false;
+        }
+        output.write(
+            reinterpret_cast<const char*>(host.data()),
+            static_cast<std::streamsize>(host.size()));
+        if (!output) return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -470,6 +507,35 @@ int main(int argc, char** argv) {
             model->release(model->owner);
             return 1;
         }
+    }
+    const char* raw_output = std::getenv("FLASHRT_RAW_ACTION_OUTPUT");
+    if (raw_output && raw_output[0] != '\0') {
+        std::vector<std::uint16_t> raw(host_noise.size());
+        if (!model->ports[5].buffer ||
+            cudaMemcpy(raw.data(), frt_buffer_dptr(model->ports[5].buffer),
+                       raw.size() * sizeof(raw[0]),
+                       cudaMemcpyDeviceToHost) != cudaSuccess) {
+            std::cerr << "native raw action download failed\n";
+            model->release(model->owner);
+            return 1;
+        }
+        std::ofstream output(raw_output, std::ios::binary | std::ios::trunc);
+        output.write(reinterpret_cast<const char*>(raw.data()),
+                     static_cast<std::streamsize>(
+                         raw.size() * sizeof(raw[0])));
+        if (!output) {
+            std::cerr << "native raw action output failed\n";
+            model->release(model->owner);
+            return 1;
+        }
+    }
+    const char* diagnostic_output =
+        std::getenv("FLASHRT_DIAGNOSTIC_OUTPUT");
+    if (diagnostic_output && diagnostic_output[0] != '\0' &&
+        !write_diagnostics(exp, diagnostic_output)) {
+        std::cerr << "native diagnostic output failed\n";
+        model->release(model->owner);
+        return 1;
     }
     model->retain(model->owner);
     model->release(model->owner);

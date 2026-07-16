@@ -11,12 +11,18 @@ namespace flashrt {
 namespace models {
 namespace pi05 {
 
+enum class NativeGraphPrecision {
+    kBf16,
+    kFp8E4M3,
+};
+
 struct NativeGraphConfig {
     int num_views = 2;
     int max_prompt_tokens = 200;
     int chunk_size = 10;
     int num_steps = 10;
     int vision_pool_factor = 1;
+    NativeGraphPrecision precision = NativeGraphPrecision::kBf16;
 };
 
 enum class NativeGraphKind : std::size_t {

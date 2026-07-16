@@ -38,6 +38,11 @@ bool exact_shape(const NativeAttentionBuffer* buffer,
     return buffer && buffer->shape == std::vector<std::uint64_t>(expected);
 }
 
+float inverse_sqrt(int dimension) {
+    // Match the Python producer: evaluate in binary64, then narrow once.
+    return static_cast<float>(1.0 / std::sqrt(static_cast<double>(dimension)));
+}
+
 }  // namespace
 
 NativeRtxAttentionDriver::NativeRtxAttentionDriver(
@@ -118,7 +123,7 @@ modalities::Status NativeRtxAttentionDriver::vision(
         frt_buffer_dptr(o_accum->buffer), num_views_, 256, 256, 16, 16, 72,
         batch_stride, row_stride, 72, batch_stride, row_stride, 72,
         batch_stride, row_stride, 72, batch_stride, row_stride, 72,
-        1.0f / std::sqrt(72.0f), num_sms_,
+        inverse_sqrt(72), num_sms_,
         reinterpret_cast<cudaStream_t>(stream));
     return launch_status();
 }
@@ -145,7 +150,7 @@ modalities::Status NativeRtxAttentionDriver::encoder(
         encoder_sequence_, encoder_sequence_, 8, 1, 256, q_batch_stride,
         q_row_stride, 256, kv_batch_stride, 256, 256, kv_batch_stride, 256,
         256, q_batch_stride, q_row_stride, 256,
-        1.0f / std::sqrt(256.0f), num_sms_,
+        inverse_sqrt(256), num_sms_,
         reinterpret_cast<cudaStream_t>(stream));
     return launch_status();
 }
@@ -183,7 +188,7 @@ modalities::Status NativeRtxAttentionDriver::decoder(
         frt_buffer_dptr(lse_accum->buffer), frt_buffer_dptr(o_accum->buffer),
         1, chunk_size_, total_kv_, 8, 1, 256, q_batch_stride, q_row_stride,
         256, kv_batch_stride, 256, 256, kv_batch_stride, 256, 256,
-        q_batch_stride, q_row_stride, 256, 1.0f / std::sqrt(256.0f),
+        q_batch_stride, q_row_stride, 256, inverse_sqrt(256),
         num_sms_, reinterpret_cast<cudaStream_t>(stream));
     return launch_status();
 }

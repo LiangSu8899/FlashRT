@@ -12,6 +12,7 @@ namespace models {
 namespace pi05 {
 
 struct NativeCalibrationArtifact {
+    std::string activation_dtype = "float16";
     std::string hardware;
     std::string weights_sha256;
     std::string tokenizer_sha256;
@@ -23,6 +24,7 @@ struct NativeCalibrationArtifact {
     int vision_pool_factor = 0;
     std::uint64_t sample_count = 0;
     double percentile = 100.0;
+    std::vector<float> vision_scales;
     std::vector<float> encoder_scales;
     std::vector<float> decoder_scales;
 };

@@ -98,7 +98,9 @@ int build_native_model_runtime(const NativeOpenConfig& config,
     Precision precision;
     if (config.precision == "auto") {
         if (properties.major == 12 && properties.minor == 0) {
-            precision = Precision::kBf16;
+            precision = config.calibration_path.empty()
+                            ? Precision::kBf16
+                            : Precision::kFp8E4M3Fn;
         } else if (properties.major == 11 && properties.minor == 0) {
             precision = Precision::kFp8E4M3Fn;
         } else {
@@ -121,8 +123,9 @@ int build_native_model_runtime(const NativeOpenConfig& config,
         return -3;
     }
     if (precision == Precision::kFp8E4M3Fn &&
-        (properties.major != 11 || properties.minor != 0)) {
-        if (error) *error = "Pi0.5 native FP8 requires SM110";
+        !((properties.major == 11 || properties.major == 12) &&
+          properties.minor == 0)) {
+        if (error) *error = "Pi0.5 native FP8 requires SM110 or SM120";
         return -3;
     }
 #if !defined(FLASHRT_CPP_WITH_FA2)
@@ -132,8 +135,14 @@ int build_native_model_runtime(const NativeOpenConfig& config,
     }
 #endif
 #if !defined(FLASHRT_CPP_WITH_THOR_FP8)
-    if (precision == Precision::kFp8E4M3Fn) {
+    if (precision == Precision::kFp8E4M3Fn && properties.major == 11) {
         if (error) *error = "Pi0.5 native Thor FP8 backend is not built";
+        return -3;
+    }
+#endif
+#if !defined(FLASHRT_CPP_WITH_FA2)
+    if (precision == Precision::kFp8E4M3Fn && properties.major == 12) {
+        if (error) *error = "Pi0.5 native RTX FP8 backend is not built";
         return -3;
     }
 #endif
@@ -163,7 +172,6 @@ int build_native_model_runtime(const NativeOpenConfig& config,
     NativeCalibrationArtifact calibration;
     std::string calibration_sha256;
     if (precision == Precision::kFp8E4M3Fn) {
-#if defined(FLASHRT_CPP_WITH_THOR_FP8)
         if (config.calibration_path.empty()) {
             if (error) *error = "Pi0.5 native FP8 requires calibration_path";
             return -1;
@@ -176,6 +184,8 @@ int build_native_model_runtime(const NativeOpenConfig& config,
             return cface::status_code(calibration_status);
         }
         if (calibration.hardware != hardware_id ||
+            calibration.activation_dtype !=
+                (properties.major == 11 ? "float16" : "bfloat16") ||
             calibration.tokenizer_sha256 != tokenizer_sha256 ||
             calibration.num_views != config.num_views ||
             calibration.max_prompt_tokens != config.max_prompt_tokens ||
@@ -191,7 +201,6 @@ int build_native_model_runtime(const NativeOpenConfig& config,
             if (error) *error = hash_error;
             return -2;
         }
-#endif
     }
 
     NativeGraphConfig graph_config;
@@ -200,14 +209,25 @@ int build_native_model_runtime(const NativeOpenConfig& config,
     graph_config.chunk_size = config.chunk;
     graph_config.num_steps = config.num_steps;
     graph_config.vision_pool_factor = config.vision_pool_factor;
+    graph_config.precision = precision == Precision::kFp8E4M3Fn
+                                 ? NativeGraphPrecision::kFp8E4M3
+                                 : NativeGraphPrecision::kBf16;
     modalities::Status st;
     std::unique_ptr<NativeGraphRuntime> graph;
-    if (precision == Precision::kBf16) {
+    const bool thor_fp8 = precision == Precision::kFp8E4M3Fn &&
+                          properties.major == 11;
+    const bool rtx_fp8 = precision == Precision::kFp8E4M3Fn &&
+                         properties.major == 12;
+    if (precision == Precision::kBf16 || rtx_fp8) {
 #if defined(FLASHRT_CPP_WITH_FA2)
-        graph = NativeGraphOwner::create(
-            config.checkpoint_path, graph_config, &st);
+        graph = rtx_fp8
+                    ? NativeGraphOwner::create(
+                          config.checkpoint_path, graph_config, calibration,
+                          &st)
+                    : NativeGraphOwner::create(
+                          config.checkpoint_path, graph_config, &st);
 #endif
-    } else {
+    } else if (thor_fp8) {
 #if defined(FLASHRT_CPP_WITH_THOR_FP8)
         graph = NativeThorGraphOwner::create(
             config.checkpoint_path, graph_config, calibration, &st);
@@ -246,9 +266,8 @@ int build_native_model_runtime(const NativeOpenConfig& config,
         "embedding_weight");
     if (!images || !noise || !encoder || !previous || !prefix_weights ||
         !guidance || !prompt || !embedding ||
-        embedding->dtype != (precision == Precision::kBf16
-                                 ? NativeWeightDType::kBf16
-                                 : NativeWeightDType::kFloat16) ||
+        embedding->dtype != (thor_fp8 ? NativeWeightDType::kFloat16
+                                      : NativeWeightDType::kBf16) ||
         embedding->shape.size() != 2 || embedding->shape[1] != 2048) {
         if (error) *error = "native graph export buffers are incomplete";
         return -6;
@@ -308,9 +327,12 @@ int build_native_model_runtime(const NativeOpenConfig& config,
              FRT_RT_REGION_SNAPSHOT | FRT_RT_REGION_RESTORE) == 0;
     if (!ok) return fail_builder(builder, error, "native region build failed");
 
-    const bool thor_fp8 = precision == Precision::kFp8E4M3Fn;
-    const std::string precision_id = thor_fp8 ? "fp8_e4m3fn" : "bf16";
-    const std::string pipeline_id = thor_fp8 ? "NativeThorFp8" : "NativeBf16";
+    const bool fp8 = precision == Precision::kFp8E4M3Fn;
+    const std::string precision_id = fp8 ? "fp8_e4m3fn" : "bf16";
+    const std::string pipeline_id = thor_fp8
+                                        ? "NativeThorFp8"
+                                        : rtx_fp8 ? "NativeRtxFp8"
+                                                  : "NativeBf16";
     const std::string tensor_dtype = thor_fp8 ? "float16" : "bf16";
     ok = add_identity(builder, "model", "pi05") &&
          add_identity(builder, "producer", "native") &&
@@ -334,7 +356,7 @@ int build_native_model_runtime(const NativeOpenConfig& config,
          add_identity(builder, "model_action_dim", "32") &&
          add_identity(builder, "robot_action_dim",
                       std::to_string(config.action_q01.size()));
-    if (ok && thor_fp8) {
+    if (ok && fp8) {
         ok = add_identity(builder, "calibration_sha256", calibration_sha256);
     }
     if (!ok) return fail_builder(builder, error, "native identity build failed");

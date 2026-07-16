@@ -21,11 +21,14 @@ namespace models {
 namespace pi05 {
 namespace {
 
-constexpr char kSchema[] = "flashrt.pi05.fp8_calibration.v1";
+constexpr char kSchemaV1[] = "flashrt.pi05.fp8_calibration.v1";
+constexpr char kSchemaV2[] = "flashrt.pi05.fp8_calibration.v2";
 constexpr char kModel[] = "pi05";
 constexpr char kPrecision[] = "fp8_e4m3fn";
-constexpr char kTensorDtype[] = "float16";
+constexpr char kFloat16[] = "float16";
+constexpr char kBfloat16[] = "bfloat16";
 constexpr char kReducer[] = "linear_percentile";
+constexpr std::size_t kVisionScaleCount = 27 * 4 + 1;
 constexpr std::size_t kEncoderScaleCount = 18 * 4;
 
 modalities::Status invalid(const std::string& message) {
@@ -93,10 +96,12 @@ std::string decimal(double value) {
 std::map<std::string, std::string> artifact_metadata(
     const NativeCalibrationArtifact& artifact) {
     return {
-        {"schema", kSchema},
+        {"schema", artifact.activation_dtype == kBfloat16
+                       ? kSchemaV2
+                       : kSchemaV1},
         {"model", kModel},
         {"precision", kPrecision},
-        {"tensor_dtype", kTensorDtype},
+        {"tensor_dtype", artifact.activation_dtype},
         {"reducer", kReducer},
         {"hardware", artifact.hardware},
         {"weights_sha256", artifact.weights_sha256},
@@ -114,6 +119,8 @@ std::map<std::string, std::string> artifact_metadata(
 
 std::string make_header(const NativeCalibrationArtifact& artifact) {
     const auto metadata = artifact_metadata(artifact);
+    const std::uint64_t vision_bytes =
+        artifact.vision_scales.size() * sizeof(float);
     const std::uint64_t encoder_bytes =
         artifact.encoder_scales.size() * sizeof(float);
     const std::uint64_t decoder_bytes =
@@ -126,12 +133,20 @@ std::string make_header(const NativeCalibrationArtifact& artifact) {
         first = false;
         out << json_string(entry.first) << ':' << json_string(entry.second);
     }
-    out << "},\"encoder_scales\":{\"dtype\":\"F32\",\"shape\":["
+    out << '}';
+    if (!artifact.vision_scales.empty()) {
+        out << ",\"vision_scales\":{\"dtype\":\"F32\",\"shape\":["
+            << artifact.vision_scales.size()
+            << "],\"data_offsets\":[0," << vision_bytes << "]}";
+    }
+    out << ",\"encoder_scales\":{\"dtype\":\"F32\",\"shape\":["
         << artifact.encoder_scales.size()
-        << "],\"data_offsets\":[0," << encoder_bytes
+        << "],\"data_offsets\":[" << vision_bytes << ','
+        << vision_bytes + encoder_bytes
         << "]},\"decoder_scales\":{\"dtype\":\"F32\",\"shape\":["
         << artifact.decoder_scales.size() << "],\"data_offsets\":["
-        << encoder_bytes << ',' << encoder_bytes + decoder_bytes << "]}}";
+        << vision_bytes + encoder_bytes << ','
+        << vision_bytes + encoder_bytes + decoder_bytes << "]}}";
     std::string header = out.str();
     while (header.size() % 8) header.push_back(' ');
     return header;
@@ -240,7 +255,9 @@ bool copy_f32_tensor(const loader::SafetensorsFile& file,
 
 modalities::Status validate_native_calibration_artifact(
     const NativeCalibrationArtifact& artifact) {
-    if (artifact.hardware.empty() || !valid_digest(artifact.weights_sha256) ||
+    if ((artifact.activation_dtype != kFloat16 &&
+         artifact.activation_dtype != kBfloat16) ||
+        artifact.hardware.empty() || !valid_digest(artifact.weights_sha256) ||
         !valid_digest(artifact.tokenizer_sha256) || artifact.num_views < 1 ||
         artifact.num_views > 3 || artifact.max_prompt_tokens < 1 ||
         artifact.state_dim < 1 || artifact.chunk_size < 1 ||
@@ -252,7 +269,13 @@ modalities::Status validate_native_calibration_artifact(
         artifact.percentile < 0.0 || artifact.percentile > 100.0) {
         return invalid("native calibration metadata is invalid");
     }
-    if (artifact.encoder_scales.size() != kEncoderScaleCount ||
+    const bool vision_valid =
+        artifact.activation_dtype == kBfloat16
+            ? artifact.vision_scales.size() == kVisionScaleCount &&
+                  valid_scales(artifact.vision_scales)
+            : artifact.vision_scales.empty();
+    if (!vision_valid ||
+        artifact.encoder_scales.size() != kEncoderScaleCount ||
         artifact.decoder_scales.size() !=
             static_cast<std::size_t>(artifact.num_steps) * 18 * 4 ||
         !valid_scales(artifact.encoder_scales) ||
@@ -291,6 +314,8 @@ modalities::Status save_native_calibration_artifact(
     }
     ok = write_all(fd, header_size, sizeof(header_size)) &&
          write_all(fd, header.data(), header.size()) &&
+         write_all(fd, artifact.vision_scales.data(),
+                   artifact.vision_scales.size() * sizeof(float)) &&
          write_all(fd, artifact.encoder_scales.data(),
                    artifact.encoder_scales.size() * sizeof(float)) &&
          write_all(fd, artifact.decoder_scales.data(),
@@ -321,14 +346,18 @@ modalities::Status load_native_calibration_artifact(
     loader::SafetensorsFile file;
     if (!file.open(path)) return not_found(file.error());
     const auto& metadata = file.metadata();
-    if (!metadata_is(metadata, "schema", kSchema) ||
+    const bool is_v1 = metadata_is(metadata, "schema", kSchemaV1) &&
+                       metadata_is(metadata, "tensor_dtype", kFloat16);
+    const bool is_v2 = metadata_is(metadata, "schema", kSchemaV2) &&
+                       metadata_is(metadata, "tensor_dtype", kBfloat16);
+    if ((!is_v1 && !is_v2) ||
         !metadata_is(metadata, "model", kModel) ||
         !metadata_is(metadata, "precision", kPrecision) ||
-        !metadata_is(metadata, "tensor_dtype", kTensorDtype) ||
         !metadata_is(metadata, "reducer", kReducer)) {
         return invalid("native calibration artifact schema is incompatible");
     }
     NativeCalibrationArtifact loaded;
+    loaded.activation_dtype = is_v2 ? kBfloat16 : kFloat16;
     const auto hardware = metadata.find("hardware");
     const auto weights = metadata.find("weights_sha256");
     const auto tokenizer = metadata.find("tokenizer_sha256");
@@ -342,6 +371,8 @@ modalities::Status load_native_calibration_artifact(
         !parse_int(metadata, "vision_pool_factor", &loaded.vision_pool_factor) ||
         !parse_u64(metadata, "sample_count", &loaded.sample_count) ||
         !parse_double(metadata, "percentile", &loaded.percentile) ||
+        (is_v2 &&
+         !copy_f32_tensor(file, "vision_scales", &loaded.vision_scales)) ||
         !copy_f32_tensor(file, "encoder_scales", &loaded.encoder_scales) ||
         !copy_f32_tensor(file, "decoder_scales", &loaded.decoder_scales)) {
         return invalid("native calibration artifact metadata is incomplete");

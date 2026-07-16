@@ -1,6 +1,14 @@
 #include "flashrt/cpp/models/pi05/native_quantization.h"
+#include "flashrt/cpp/models/pi05/native_device_weights.h"
+#include "flashrt/cpp/models/pi05/native_kernel_driver.h"
+#include "flashrt/cpp/models/pi05/native_rtx_weight_packer.h"
+#include "flashrt/cpp/models/pi05/native_weight_materializer.h"
+#include "flashrt/exec.h"
+
+#include <cuda_runtime_api.h>
 
 #include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -97,13 +105,20 @@ void print_shape(const std::vector<std::uint64_t>& shape) {
 void print_result(const std::vector<std::uint64_t>& shape,
                   const void* values, std::size_t value_bytes,
                   const std::vector<float>& scales) {
+    std::uint32_t first_scale_bits = 0;
+    if (!scales.empty()) {
+        static_assert(sizeof(first_scale_bits) == sizeof(scales.front()));
+        std::memcpy(&first_scale_bits, scales.data(), sizeof(first_scale_bits));
+    }
     std::cout << "shape=";
     print_shape(shape);
     std::cout << " values_fnv=" << std::hex << std::setw(16)
               << std::setfill('0') << fnv1a(values, value_bytes)
               << " scale_shape=" << std::dec << scales.size()
               << " scales_fnv=" << std::hex << std::setw(16)
-              << fnv1a(scales.data(), scales.size() * sizeof(float)) << '\n';
+              << fnv1a(scales.data(), scales.size() * sizeof(float))
+              << " first_scale_bits=" << std::setw(8)
+              << first_scale_bits << '\n';
 }
 
 }  // namespace
@@ -119,6 +134,91 @@ int main(int argc, char** argv) {
         return 2;
     }
     const std::string op = argv[2];
+    if (op == "decoder_qkv0_fp8_kn_gpu" ||
+        op == "vision_attn_qkv0_fp8_kn_gpu" ||
+        op == "vision_ffn_down4_fp8_kn_gpu") {
+        frt_ctx ctx = frt_ctx_create();
+        if (!ctx) {
+            std::cerr << "failed to create FlashRT context\n";
+            return 1;
+        }
+        std::vector<std::uint64_t> shape;
+        std::vector<std::uint8_t> values;
+        std::vector<float> scales;
+        std::uint64_t input_hash = 0;
+        std::string error;
+        {
+            flashrt::models::pi05::NativeDeviceWeightStore weights(ctx);
+            flashrt::models::pi05::NativeWeightMaterializer materializer(
+                file, &weights);
+            const bool vision_qkv = op.find("vision_attn") == 0;
+            const bool vision_down = op.find("vision_ffn") == 0;
+            const std::string name =
+                vision_qkv ? "vision_attn_qkv_w_0" :
+                vision_down ? "vision_ffn_down_w_4" :
+                              "decoder_attn_qkv_w_0";
+            Status st = vision_qkv
+                            ? materializer.materialize_vision_layer(0)
+                        : vision_down
+                            ? materializer.materialize_vision_layer(4)
+                            : materializer.materialize_decoder_layer(0, true);
+            flashrt::models::pi05::NativeKernelDriver driver;
+            if (st.ok_status()) st = driver.status();
+            flashrt::models::pi05::NativeRtxWeightPacker packer(
+                &weights, &driver);
+            if (st.ok_status()) st = packer.pack_weight(name);
+            if (!st.ok_status()) {
+                error = st.message;
+            } else {
+                const auto* input = weights.find(name);
+                const auto* output = weights.find("fp8." + name);
+                const auto* scale = weights.find("fp8." + name + ".scale");
+                if (!input || !output || !scale) {
+                    error = "GPU FP8 weight pack output is missing";
+                } else {
+                    std::vector<std::uint8_t> input_values(
+                        frt_buffer_bytes(input->buffer));
+                    shape = output->shape;
+                    values.resize(frt_buffer_bytes(output->buffer));
+                    scales.resize(1);
+                    if (cudaMemcpy(
+                            input_values.data(), frt_buffer_dptr(input->buffer),
+                            input_values.size(), cudaMemcpyDeviceToHost) !=
+                            cudaSuccess ||
+                        cudaMemcpy(
+                            values.data(), frt_buffer_dptr(output->buffer),
+                            values.size(), cudaMemcpyDeviceToHost) !=
+                            cudaSuccess ||
+                        cudaMemcpy(
+                            scales.data(), frt_buffer_dptr(scale->buffer),
+                            sizeof(float), cudaMemcpyDeviceToHost) !=
+                            cudaSuccess) {
+                        error = "GPU FP8 weight download failed";
+                    } else {
+                        input_hash = fnv1a(
+                            input_values.data(), input_values.size());
+                    }
+                }
+            }
+        }
+        frt_ctx_destroy(ctx);
+        if (!error.empty()) {
+            std::cerr << error << '\n';
+            return 1;
+        }
+        std::cout << "input_fnv=" << std::hex << std::setw(16)
+                  << std::setfill('0') << input_hash << ' ';
+        if (argc == 4) {
+            std::ofstream output(argv[3], std::ios::binary | std::ios::trunc);
+            output.write(
+                reinterpret_cast<const char*>(values.data()),
+                static_cast<std::streamsize>(values.size()));
+            if (!output) return 1;
+        }
+        print_result(
+            shape, values.data(), values.size(), scales);
+        return 0;
+    }
     if (op == "encoder_gate_up0_fp8") {
         NativeF16Tensor weight;
         NativeFp8Tensor output;

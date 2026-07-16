@@ -114,6 +114,43 @@ modalities::Status NativeDeviceWeightStore::upload_bytes(
 #endif
 }
 
+modalities::Status NativeDeviceWeightStore::allocate(
+    const std::string& name,
+    const std::vector<std::uint64_t>& shape,
+    NativeWeightDType dtype) {
+    std::lock_guard<std::mutex> lock(upload_mutex_);
+    if (!ctx_ || name.empty() || weights_.find(name) != weights_.end()) {
+        return invalid("invalid device weight allocation");
+    }
+    std::size_t elements = 0;
+    const std::size_t width = element_bytes(dtype);
+    if (!width || !element_count(shape, &elements) || !elements ||
+        elements > std::numeric_limits<std::size_t>::max() / width) {
+        return invalid("device weight allocation shape is invalid");
+    }
+#ifndef FLASHRT_CPP_WITH_CUDA_STAGING
+    return modalities::Status::error(
+        modalities::StatusCode::kUnsupported,
+        "device weight allocation requires the CUDA build");
+#else
+    const std::size_t bytes = elements * width;
+    frt_buffer buffer = frt_buffer_alloc(ctx_, name.c_str(), bytes);
+    if (!buffer) {
+        std::size_t free_bytes = 0;
+        std::size_t total_bytes = 0;
+        cudaMemGetInfo(&free_bytes, &total_bytes);
+        std::ostringstream message;
+        message << "device weight allocation failed: " << name
+                << " requested=" << bytes << " free=" << free_bytes
+                << " total=" << total_bytes;
+        return modalities::Status::error(modalities::StatusCode::kBackend,
+                                         message.str());
+    }
+    weights_.emplace(name, NativeDeviceWeight{buffer, shape, dtype});
+    return modalities::Status::ok();
+#endif
+}
+
 const NativeDeviceWeight* NativeDeviceWeightStore::find(
     const std::string& name) const {
     const auto it = weights_.find(name);

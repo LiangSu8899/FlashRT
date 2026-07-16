@@ -44,7 +44,8 @@ if(FLASHRT_CPP_WITH_CUDA_KERNELS)
 
   add_executable(pi05_native_quant_probe
     ${_pi05_test_source_dir}/pi05_native_quant_probe.cpp)
-  target_link_libraries(pi05_native_quant_probe PRIVATE flashrt_cpp_pi05)
+  target_link_libraries(pi05_native_quant_probe
+    PRIVATE flashrt_cpp_pi05_kernels flashrt_exec CUDA::cudart)
 
   add_executable(test_pi05_native_weight_packer
     ${_pi05_test_source_dir}/test_pi05_native_weight_packer.cpp)

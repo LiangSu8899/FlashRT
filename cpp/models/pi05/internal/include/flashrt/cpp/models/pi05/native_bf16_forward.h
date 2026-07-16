@@ -2,6 +2,7 @@
 #define FLASHRT_CPP_MODELS_PI05_NATIVE_BF16_FORWARD_H
 
 #include "flashrt/cpp/models/pi05/native_kernel_driver.h"
+#include "flashrt/cpp/models/pi05/native_rtx_linear.h"
 #include "flashrt/cpp/models/pi05/native_rtx_attention.h"
 #include "flashrt/cpp/models/pi05/native_rtx_attention_driver.h"
 #include "flashrt/cpp/models/pi05/native_workspace.h"
@@ -13,7 +14,12 @@ namespace pi05 {
 class NativeBf16Forward {
 public:
     explicit NativeBf16Forward(const NativeKernelDriver* driver)
-        : driver_(driver) {}
+        : driver_(driver), fallback_linear_(driver, NativeRtxLinearMode::kBf16),
+          linear_(&fallback_linear_) {}
+    NativeBf16Forward(const NativeKernelDriver* driver,
+                      const NativeRtxLinear* linear)
+        : driver_(driver), fallback_linear_(driver, NativeRtxLinearMode::kBf16),
+          linear_(linear ? linear : &fallback_linear_) {}
 
     modalities::Status encoder_qkv(
         int layer, const NativeDeviceWeightStore& weights,
@@ -59,6 +65,8 @@ public:
 
 private:
     const NativeKernelDriver* driver_ = nullptr;
+    NativeRtxLinear fallback_linear_;
+    const NativeRtxLinear* linear_ = nullptr;
 };
 
 }  // namespace pi05

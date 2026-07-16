@@ -45,6 +45,10 @@ public:
         NativeWeightDType dtype,
         const void* data,
         std::size_t bytes);
+    modalities::Status allocate(
+        const std::string& name,
+        const std::vector<std::uint64_t>& shape,
+        NativeWeightDType dtype);
     modalities::Status download_bf16(
         const std::string& name,
         NativeBf16Tensor* out) const;

@@ -7,6 +7,14 @@ from safetensors import safe_open
 
 
 DECODER = "paligemma_with_expert.gemma_expert.model.layers.0"
+VISION = (
+    "paligemma_with_expert.paligemma.model.vision_tower.vision_model"
+    ".encoder.layers.4"
+)
+VISION_ROOT = (
+    "paligemma_with_expert.paligemma.model.vision_tower.vision_model"
+    ".encoder.layers.0"
+)
 
 
 def interleave_qk(weight: torch.Tensor, num_heads: int) -> torch.Tensor:
@@ -78,6 +86,39 @@ def main() -> None:
             1,
             digest(scale_tensor),
         )
+        if layout == "kn":
+            expected["decoder_qkv0_fp8_kn_gpu"] = expected[
+                "decoder_qkv0_fp8_kn"
+            ]
+
+    vision_down = bf16(f"{VISION}.mlp.fc2.weight").t().contiguous().cuda()
+    scale = max(vision_down.float().abs().max().item() / 448.0, 1e-12)
+    quantized = (vision_down.float() / scale).clamp(-448.0, 448.0).to(
+        torch.float8_e4m3fn
+    )
+    scale_tensor = torch.tensor([scale], dtype=torch.float32, device="cuda")
+    expected["vision_ffn_down4_fp8_kn_gpu"] = (
+        tuple(quantized.shape),
+        digest(quantized.view(torch.uint8)),
+        1,
+        digest(scale_tensor),
+    )
+
+    vision_qkv = torch.cat([
+        bf16(f"{VISION_ROOT}.self_attn.{stem}_proj.weight")
+        for stem in ("q", "k", "v")
+    ], dim=0).t().contiguous().cuda()
+    scale = max(vision_qkv.float().abs().max().item() / 448.0, 1e-12)
+    quantized = (vision_qkv.float() / scale).clamp(-448.0, 448.0).to(
+        torch.float8_e4m3fn
+    )
+    scale_tensor = torch.tensor([scale], dtype=torch.float32, device="cuda")
+    expected["vision_attn_qkv0_fp8_kn_gpu"] = (
+        tuple(quantized.shape),
+        digest(quantized.view(torch.uint8)),
+        1,
+        digest(scale_tensor),
+    )
 
     transposed = weight.float().transpose(0, 1).contiguous()
     scales = torch.clamp(

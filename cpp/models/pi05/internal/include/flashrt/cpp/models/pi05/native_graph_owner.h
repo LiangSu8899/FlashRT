@@ -2,6 +2,7 @@
 #define FLASHRT_CPP_MODELS_PI05_NATIVE_GRAPH_OWNER_H
 
 #include "flashrt/cpp/models/pi05/native_bf16_forward.h"
+#include "flashrt/cpp/models/pi05/native_calibration.h"
 #include "flashrt/cpp/models/pi05/native_graph_runtime.h"
 
 #include <memory>
@@ -15,6 +16,10 @@ class NativeGraphOwner final : public NativeGraphRuntime {
 public:
     static std::unique_ptr<NativeGraphOwner> create(
         const std::string& checkpoint_path, const NativeGraphConfig& config,
+        modalities::Status* status);
+    static std::unique_ptr<NativeGraphOwner> create(
+        const std::string& checkpoint_path, const NativeGraphConfig& config,
+        const NativeCalibrationArtifact& calibration,
         modalities::Status* status);
 
     ~NativeGraphOwner() override;
@@ -42,10 +47,13 @@ public:
 
 private:
     explicit NativeGraphOwner(frt_ctx ctx, const NativeGraphConfig& config);
-    modalities::Status initialize(const std::string& checkpoint_path);
+    modalities::Status initialize(
+        const std::string& checkpoint_path,
+        const NativeCalibrationArtifact* calibration);
     modalities::Status record(NativeGraphKind kind, void* stream);
     modalities::Status record_context(void* stream);
     modalities::Status record_action(void* stream);
+    modalities::Status autotune_fp8();
     static modalities::Status record_graph(
         void* user, NativeGraphKind kind, void* stream);
 
@@ -55,6 +63,7 @@ private:
     NativeWorkspace workspace_;
     NativeRtxAttentionWorkspace attention_;
     NativeKernelDriver driver_;
+    NativeRtxLinear linear_;
     NativeBf16Forward forward_;
     std::unique_ptr<NativeRtxAttentionDriver> attention_driver_;
 };
