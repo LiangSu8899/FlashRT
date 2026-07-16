@@ -26,28 +26,33 @@ public:
     NativeThorGraphOwner(const NativeThorGraphOwner&) = delete;
     NativeThorGraphOwner& operator=(const NativeThorGraphOwner&) = delete;
 
-    frt_ctx context() const override { return ctx_; }
-    frt_graph infer_graph() const override { return infer_graph_; }
-    int stream_id() const override { return stream_id_; }
-    void* native_stream() const override { return replay_stream_; }
+    frt_ctx context() const override { return graphs_.context(); }
+    frt_graph graph(NativeGraphKind kind) const override {
+        return graphs_.graph(kind);
+    }
+    int stream_id() const override { return graphs_.stream_id(); }
+    void* native_stream() const override { return graphs_.native_stream(); }
     NativeDeviceWeightStore& weights() override { return weights_; }
     const NativeDeviceWeightStore& weights() const override { return weights_; }
     NativeWorkspace& workspace() override { return workspace_; }
     const NativeWorkspace& workspace() const override { return workspace_; }
 
     modalities::Status set_prompt_length(int prompt_tokens) override;
-    int replay() const;
-    modalities::Status synchronize() const;
+    int replay(NativeGraphKind kind = NativeGraphKind::kInfer) const override;
+    modalities::Status synchronize() const override;
 
 private:
     NativeThorGraphOwner(frt_ctx ctx, const NativeGraphConfig& config);
     modalities::Status initialize(
         const std::string& checkpoint_path,
         const NativeCalibrationArtifact& calibration);
-    modalities::Status record(void* stream);
-    static void record_graph(void* user, void* stream);
+    modalities::Status record(NativeGraphKind kind, void* stream);
+    modalities::Status record_context(void* stream);
+    modalities::Status record_action(void* stream);
+    static modalities::Status record_graph(
+        void* user, NativeGraphKind kind, void* stream);
 
-    frt_ctx ctx_ = nullptr;
+    NativeGraphCatalog graphs_;
     NativeGraphConfig config_;
     NativeDeviceWeightStore weights_;
     NativeWorkspace workspace_;
@@ -55,10 +60,6 @@ private:
     NativeThorFp8Forward forward_;
     NativeThorWeightScales weight_scales_;
     std::vector<float> encoder_alphas_;
-    frt_graph infer_graph_ = nullptr;
-    void* replay_stream_ = nullptr;
-    int stream_id_ = -1;
-    modalities::Status capture_status_;
 };
 
 }  // namespace pi05

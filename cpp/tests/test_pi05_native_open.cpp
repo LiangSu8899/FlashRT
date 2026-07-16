@@ -219,6 +219,14 @@ int main() {
 
     out = reinterpret_cast<frt_model_runtime_v1*>(0x1);
     rc = frt_model_runtime_open_v1(
+        config(root, tokenizer, ",\"stage_plan\":\"async_magic\"").c_str(),
+        &out);
+    assert(rc == -1);
+    assert(out == nullptr);
+    assert(std::strstr(frt_pi05_native_open_last_error(), "stage_plan"));
+
+    out = reinterpret_cast<frt_model_runtime_v1*>(0x1);
+    rc = frt_model_runtime_open_v1(
         config(root, tokenizer,
                ",\"calibration_path\":\"/missing/calibration.safetensors\"")
             .c_str(),
@@ -283,15 +291,16 @@ int main() {
     assert(std::strstr(frt_pi05_native_open_last_error(), "validated"));
 #endif
 
-    const std::string short_prompt =
+    const std::string invalid_prompt_capacity =
         std::string("{") +
         "\"io\":\"native_v2\"," +
         "\"checkpoint_path\":\"" + root + "\"," +
         "\"tokenizer_model_path\":\"" + tokenizer + "\"," +
         "\"state_prompt_mode\":\"fixed\"," +
-        "\"max_prompt_tokens\":199," +
+        "\"max_prompt_tokens\":0," +
         "\"state_dim\":8}";
-    rc = frt_model_runtime_open_v1(short_prompt.c_str(), &out);
+    rc = frt_model_runtime_open_v1(
+        invalid_prompt_capacity.c_str(), &out);
     assert(rc == -1);
     assert(std::strstr(frt_pi05_native_open_last_error(),
                        "max_prompt_tokens"));

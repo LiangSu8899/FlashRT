@@ -32,25 +32,14 @@ modalities::Status backend(const char* message) {
 NativeGraphOwner::NativeGraphOwner(
     frt_ctx ctx,
     const NativeGraphConfig& config)
-    : ctx_(ctx),
+    : graphs_(ctx),
       config_(config),
       weights_(ctx),
       workspace_(ctx),
       attention_(ctx),
-      forward_(&driver_),
-      capture_status_(modalities::Status::ok()) {}
+      forward_(&driver_) {}
 
-NativeGraphOwner::~NativeGraphOwner() {
-    if (replay_stream_) {
-        cudaStreamSynchronize(static_cast<cudaStream_t>(replay_stream_));
-        cudaStreamDestroy(static_cast<cudaStream_t>(replay_stream_));
-        replay_stream_ = nullptr;
-    }
-    if (ctx_) {
-        frt_ctx_destroy(ctx_);
-        ctx_ = nullptr;
-    }
-}
+NativeGraphOwner::~NativeGraphOwner() = default;
 
 std::unique_ptr<NativeGraphOwner> NativeGraphOwner::create(
     const std::string& checkpoint_path,
@@ -166,40 +155,28 @@ modalities::Status NativeGraphOwner::initialize(
     }
     report("input_init");
 
-    infer_graph_ = frt_graph_create(ctx_, "infer", 1);
-    const NativeWorkspaceBuffer* images =
-        workspace_.find("observation_images_normalized");
-    const NativeWorkspaceBuffer* prompt = workspace_.find("prompt_embedding");
-    const NativeWorkspaceBuffer* encoder = workspace_.find("encoder_x");
-    const NativeWorkspaceBuffer* noise = workspace_.find("diffusion_noise");
-    if (!infer_graph_ || !images || !prompt || !encoder || !noise ||
-        frt_graph_bind(infer_graph_, "images", images->buffer) != FRT_OK ||
-        frt_graph_bind(infer_graph_, "prompt", prompt->buffer) != FRT_OK ||
-        frt_graph_bind(infer_graph_, "encoder_x", encoder->buffer) != FRT_OK ||
-        frt_graph_bind(infer_graph_, "noise", noise->buffer) != FRT_OK) {
-        return backend("native graph binding failed");
-    }
-    capture_status_ = modalities::Status::ok();
-    if (frt_graph_capture(infer_graph_, 0, record_graph, this) != FRT_OK) {
-        return capture_status_.ok_status()
-                   ? backend("native full graph capture failed")
-                   : capture_status_;
-    }
-    if (!capture_status_.ok_status() ||
-        frt_graph_variant_count(infer_graph_) != 1) {
-        return capture_status_.ok_status()
-                   ? backend("native full graph variant is missing")
-                   : capture_status_;
-    }
+    st = graphs_.capture(
+        NativeGraphKind::kInfer, workspace_,
+        {"observation_images_normalized", "prompt_embedding", "encoder_x",
+         "diffusion_noise", "rtc_prev_action_chunk", "rtc_prefix_weights",
+         "rtc_guidance_weight"},
+        record_graph, this);
+    if (!st.ok_status()) return st;
+    st = graphs_.capture(
+        NativeGraphKind::kDecodeOnly, workspace_,
+        {"encoder_x", "diffusion_noise", "rtc_prev_action_chunk",
+         "rtc_prefix_weights", "rtc_guidance_weight"},
+        record_graph, this);
+    if (!st.ok_status()) return st;
+    st = graphs_.capture(
+        NativeGraphKind::kContext, workspace_,
+        {"observation_images_normalized", "prompt_embedding", "encoder_x"},
+        record_graph, this);
+    if (!st.ok_status()) return st;
     report("capture");
 
-    cudaStream_t stream = nullptr;
-    if (cudaStreamCreate(&stream) != cudaSuccess) {
-        return backend("native replay stream creation failed");
-    }
-    replay_stream_ = stream;
-    stream_id_ = frt_ctx_wrap_stream(ctx_, replay_stream_);
-    if (stream_id_ < 0) return backend("native replay stream wrapping failed");
+    st = graphs_.create_replay_stream();
+    if (!st.ok_status()) return st;
     report("stream");
     if (profile_setup) {
         const auto now = std::chrono::steady_clock::now();
@@ -210,27 +187,10 @@ modalities::Status NativeGraphOwner::initialize(
     return modalities::Status::ok();
 }
 
-modalities::Status NativeGraphOwner::record(void* stream) {
-    const NativeWorkspaceBuffer* prompt = workspace_.find("prompt_embedding");
-    const NativeWorkspaceBuffer* encoder = workspace_.find("encoder_x");
-    if (!prompt || !encoder) return invalid("native prompt buffers are missing");
-    const std::size_t prompt_bytes = frt_buffer_bytes(prompt->buffer);
-    const std::size_t prompt_offset =
-        static_cast<std::size_t>(workspace_.encoder_vision_sequence()) * 2048 *
-        sizeof(std::uint16_t);
-    if (prompt_offset > frt_buffer_bytes(encoder->buffer) ||
-        prompt_bytes > frt_buffer_bytes(encoder->buffer) - prompt_offset) {
-        return invalid("native prompt window exceeds encoder storage");
-    }
-    auto* destination =
-        static_cast<unsigned char*>(frt_buffer_dptr(encoder->buffer)) +
-        prompt_offset;
-    if (cudaMemcpyAsync(destination, frt_buffer_dptr(prompt->buffer),
-                        prompt_bytes, cudaMemcpyDeviceToDevice,
-                        static_cast<cudaStream_t>(stream)) != cudaSuccess) {
-        return backend("native prompt graph copy failed");
-    }
-    modalities::Status st = forward_.vision(
+modalities::Status NativeGraphOwner::record_context(void* stream) {
+    modalities::Status st = copy_prompt_to_encoder(&workspace_, stream);
+    if (!st.ok_status()) return st;
+    st = forward_.vision(
         weights_, &workspace_, &attention_, attention_driver_.get(),
         reinterpret_cast<std::uintptr_t>(stream));
     if (!st.ok_status()) return st;
@@ -238,14 +198,30 @@ modalities::Status NativeGraphOwner::record(void* stream) {
                           attention_driver_.get(),
                           reinterpret_cast<std::uintptr_t>(stream));
     if (!st.ok_status()) return st;
+    return st;
+}
+
+modalities::Status NativeGraphOwner::record_action(void* stream) {
     return forward_.diffusion(weights_, &workspace_, &attention_,
                               attention_driver_.get(),
                               reinterpret_cast<std::uintptr_t>(stream));
 }
 
-void NativeGraphOwner::record_graph(void* user, void* stream) {
+modalities::Status NativeGraphOwner::record(NativeGraphKind kind,
+                                             void* stream) {
+    if (kind == NativeGraphKind::kContext) return record_context(stream);
+    if (kind == NativeGraphKind::kDecodeOnly) return record_action(stream);
+    if (kind != NativeGraphKind::kInfer) {
+        return invalid("native graph kind is invalid");
+    }
+    modalities::Status st = record_context(stream);
+    return st.ok_status() ? record_action(stream) : st;
+}
+
+modalities::Status NativeGraphOwner::record_graph(
+    void* user, NativeGraphKind kind, void* stream) {
     auto* owner = static_cast<NativeGraphOwner*>(user);
-    owner->capture_status_ = owner->record(stream);
+    return owner->record(kind, stream);
 }
 
 modalities::Status NativeGraphOwner::set_prompt_length(int prompt_tokens) {
@@ -254,17 +230,12 @@ modalities::Status NativeGraphOwner::set_prompt_length(int prompt_tokens) {
     return workspace_.update_decoder_rope(prompt_tokens);
 }
 
-int NativeGraphOwner::replay() const {
-    if (!infer_graph_ || stream_id_ < 0) return FRT_ERR_INVALID;
-    return frt_graph_replay(infer_graph_, 0, stream_id_);
+int NativeGraphOwner::replay(NativeGraphKind kind) const {
+    return graphs_.replay(kind);
 }
 
 modalities::Status NativeGraphOwner::synchronize() const {
-    if (!replay_stream_) return invalid("native replay stream is missing");
-    const cudaError_t rc =
-        cudaStreamSynchronize(static_cast<cudaStream_t>(replay_stream_));
-    return rc == cudaSuccess ? modalities::Status::ok()
-                             : backend(cudaGetErrorString(rc));
+    return graphs_.synchronize();
 }
 
 }  // namespace pi05

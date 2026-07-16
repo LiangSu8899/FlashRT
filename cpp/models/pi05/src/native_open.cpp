@@ -605,13 +605,15 @@ int validate_config(
     std::string state_prompt_mode;
     std::string precision;
     std::string calibration_path;
+    std::string stage_plan;
     if (!string_field(obj, "io", &io, true) ||
         !string_field(obj, "checkpoint_path", &checkpoint_path, true) ||
         !string_field(obj, "tokenizer_model_path", &tokenizer_model_path,
                       true) ||
         !string_field(obj, "state_prompt_mode", &state_prompt_mode, true) ||
         !string_field(obj, "precision", &precision, false) ||
-        !string_field(obj, "calibration_path", &calibration_path, false)) {
+        !string_field(obj, "calibration_path", &calibration_path, false) ||
+        !string_field(obj, "stage_plan", &stage_plan, false)) {
         return -1;
     }
     if (io != "native_v2") {
@@ -628,6 +630,12 @@ int validate_config(
         precision != "fp8_e4m3fn") {
         g_last_error =
             "precision must be 'auto', 'bf16', or 'fp8_e4m3fn'";
+        return -1;
+    }
+    if (stage_plan.empty()) stage_plan = "full";
+    if (stage_plan != "full" && stage_plan != "context_action") {
+        g_last_error =
+            "stage_plan must be 'full' or 'context_action'";
         return -1;
     }
     if (!path_exists(checkpoint_path)) {
@@ -665,8 +673,8 @@ int validate_config(
         !integer_field(obj, "max_frame_height", &max_frame_height)) {
         return -1;
     }
-    if (max_prompt_tokens < 200 || max_prompt_tokens > INT_MAX) {
-        g_last_error = "max_prompt_tokens must be in [200, INT_MAX]";
+    if (max_prompt_tokens <= 0 || max_prompt_tokens > INT_MAX) {
+        g_last_error = "max_prompt_tokens must be in [1, INT_MAX]";
         return -1;
     }
     if (state_dim <= 0 || state_dim > INT_MAX) {
@@ -700,6 +708,7 @@ int validate_config(
     config.tokenizer_model_path = tokenizer_model_path;
     config.precision = precision;
     config.calibration_path = calibration_path;
+    config.stage_plan = stage_plan;
     config.max_prompt_tokens = static_cast<int>(max_prompt_tokens);
     config.state_dim = static_cast<int>(state_dim);
     config.num_views = static_cast<int>(num_views ? num_views : 2);

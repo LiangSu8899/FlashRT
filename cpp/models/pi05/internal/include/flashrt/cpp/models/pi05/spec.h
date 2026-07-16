@@ -14,6 +14,7 @@ static constexpr int kImageSize = 224;
 static constexpr int kDefaultChunk = 10;
 static constexpr int kModelActionDim = 32;
 static constexpr int kLiberoActionDim = 7;
+static constexpr int kEncoderWidth = 2048;
 
 modalities::VisionPreprocessSpec vision_preprocess_spec(int num_views);
 

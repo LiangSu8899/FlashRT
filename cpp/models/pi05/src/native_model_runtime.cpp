@@ -265,7 +265,16 @@ int build_native_model_runtime(const NativeOpenConfig& config,
             builder, "main", graph->stream_id(), 0,
             graph->native_stream()) == 0 &&
         frt_runtime_builder_add_graph(
-            builder, "infer", graph->infer_graph(), 0, keys, 1,
+            builder, NativeGraphCatalog::name(NativeGraphKind::kInfer),
+            graph->graph(NativeGraphKind::kInfer), 0, keys, 1,
+            graph->stream_id()) == 0 &&
+        frt_runtime_builder_add_graph(
+            builder, NativeGraphCatalog::name(NativeGraphKind::kDecodeOnly),
+            graph->graph(NativeGraphKind::kDecodeOnly), 0, keys, 1,
+            graph->stream_id()) == 0 &&
+        frt_runtime_builder_add_graph(
+            builder, NativeGraphCatalog::name(NativeGraphKind::kContext),
+            graph->graph(NativeGraphKind::kContext), 0, keys, 1,
             graph->stream_id()) == 0 &&
         frt_runtime_builder_add_buffer(
             builder, "observation_images_normalized", images->buffer,
@@ -312,6 +321,7 @@ int build_native_model_runtime(const NativeOpenConfig& config,
          add_identity(builder, "weights_sha256", weights_sha256.digest) &&
          add_identity(builder, "tokenizer_sha256", tokenizer_sha256) &&
          add_identity(builder, "io", "native_v2") &&
+         add_identity(builder, "stage_plan", config.stage_plan) &&
          add_identity(builder, "state_prompt_mode", "fixed") &&
          add_identity(builder, "num_views", std::to_string(config.num_views)) &&
          add_identity(builder, "max_prompt_len",
@@ -334,9 +344,19 @@ int build_native_model_runtime(const NativeOpenConfig& config,
              << "\"hardware\":\"" << hardware_id
              << "\",\"precision\":\"" << precision_id
              << "\",\"io\":\"native_v2\","
-             << "\"stage_plan\":{\"name\":\"full\","
-             << "\"stages\":[{\"name\":\"infer\","
-             << "\"graph\":\"infer\",\"after\":[]}]}}";
+             << "\"graphs\":[\"infer\",\"decode_only\",\"context\"],"
+             << "\"stage_plan\":{\"name\":\"" << config.stage_plan
+             << "\",\"stages\":";
+    if (config.stage_plan == "full") {
+        manifest << "[{\"name\":\"infer\",\"graph\":\"infer\","
+                 << "\"after\":[]}]}";
+    } else {
+        manifest << "[{\"name\":\"context\",\"graph\":\"context\","
+                 << "\"after\":[]},{\"name\":\"action\","
+                 << "\"graph\":\"decode_only\","
+                 << "\"after\":[\"context\"]}]}";
+    }
+    manifest << '}';
     if (frt_runtime_builder_set_manifest(builder, manifest.str().c_str()) != 0) {
         return fail_builder(builder, error, "native manifest build failed");
     }
@@ -378,8 +398,15 @@ int build_native_model_runtime(const NativeOpenConfig& config,
              builder, "actions_raw", FRT_RT_MOD_TENSOR, io_dtype,
              FRT_RT_LAYOUT_FLAT, FRT_RT_PORT_OUT, FRT_RT_PORT_SWAP, 0,
              raw_action_shape, 2, 0, noise->buffer, 0,
-             frt_buffer_bytes(noise->buffer)) == 0 &&
-         frt_runtime_builder_add_stage(builder, 0, nullptr, 0) == 0;
+             frt_buffer_bytes(noise->buffer)) == 0;
+    if (ok && config.stage_plan == "full") {
+        ok = frt_runtime_builder_add_stage(builder, 0, nullptr, 0) == 0;
+    } else if (ok) {
+        const uint32_t context_stage[] = {0};
+        ok = frt_runtime_builder_add_stage(builder, 2, nullptr, 0) == 0 &&
+             frt_runtime_builder_add_stage(
+                 builder, 1, context_stage, 1) == 0;
+    }
     if (!ok) return fail_builder(builder, error, "native port/stage build failed");
 
     NativeGraphRuntime* raw_graph = graph.release();

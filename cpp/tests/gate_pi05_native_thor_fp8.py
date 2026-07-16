@@ -34,6 +34,9 @@ def _sample(index: int, num_views: int
     pixels = np.arange(224 * 224 * 3, dtype=np.uint64)
     image = ((pixels * 3 + index * 17) % 251).astype(np.uint8)
     wrist = ((pixels * 7 + index * 29 + 11) % 253).astype(np.uint8)
+    right_wrist = (
+        (pixels * 11 + index * 37 + 19) % 247
+    ).astype(np.uint8)
     state = np.asarray(
         [((index * 8 + dim) % 17 - 8) / 8.0 for dim in range(8)],
         dtype=np.float32,
@@ -47,7 +50,11 @@ def _sample(index: int, num_views: int
         if index & 1
         else "pick up the black bowl"
     )
-    images = [image.reshape(224, 224, 3), wrist.reshape(224, 224, 3)]
+    images = [
+        image.reshape(224, 224, 3),
+        wrist.reshape(224, 224, 3),
+        right_wrist.reshape(224, 224, 3),
+    ]
     return (
         prompt,
         state,
@@ -270,10 +277,13 @@ def main() -> None:
     parser.add_argument("--tokenizer", type=Path, required=True)
     parser.add_argument("--artifact", type=Path, required=True)
     parser.add_argument("--samples", type=int, default=3)
-    parser.add_argument("--views", type=int, choices=(1, 2), default=2)
+    parser.add_argument("--views", type=int, choices=(1, 2, 3), default=2)
+    parser.add_argument("--max-prompt-tokens", type=int, default=200)
     args = parser.parse_args()
     if args.samples < 1 or args.samples > 256:
         parser.error("--samples must be in [1, 256]")
+    if args.max_prompt_tokens < 1:
+        parser.error("--max-prompt-tokens must be positive")
 
     probe = args.probe.resolve()
     os.environ["FLASH_RT_PALIGEMMA_TOKENIZER"] = str(
@@ -286,6 +296,7 @@ def main() -> None:
     if env.get("LD_LIBRARY_PATH"):
         library_paths.append(Path(env["LD_LIBRARY_PATH"]))
     env["LD_LIBRARY_PATH"] = os.pathsep.join(map(str, library_paths))
+    env["FLASHRT_MAX_PROMPT_TOKENS"] = str(args.max_prompt_tokens)
     subprocess.run(
         [
             str(probe),
@@ -312,7 +323,7 @@ def main() -> None:
         str(args.checkpoint), num_views=args.views, use_cuda_graph=True,
         autotune=0,
         use_fp8=True, state_prompt_mode="fixed",
-        state_prompt_fixed_max_len=200,
+        state_prompt_fixed_max_len=args.max_prompt_tokens,
     )
     frontend._calibrate = types.MethodType(
         _seed_calibration(expected_encoder, expected_decoder), frontend

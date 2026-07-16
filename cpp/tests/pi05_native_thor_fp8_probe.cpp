@@ -5,6 +5,7 @@
 
 #include <cuda_runtime_api.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -35,6 +36,7 @@ std::string json_string(const std::string& value) {
 std::string config_json(const std::string& checkpoint,
                         const std::string& tokenizer,
                         int num_views,
+                        int max_prompt_tokens,
                         const std::string& calibration = "") {
     std::ostringstream out;
     out << "{\"io\":\"native_v2\",\"checkpoint_path\":"
@@ -42,7 +44,8 @@ std::string config_json(const std::string& checkpoint,
         << json_string(tokenizer)
         << ",\"state_prompt_mode\":\"fixed\","
            "\"precision\":\"fp8_e4m3fn\","
-           "\"max_prompt_tokens\":200,\"state_dim\":8,\"num_views\":"
+           "\"max_prompt_tokens\":"
+        << max_prompt_tokens << ",\"state_dim\":8,\"num_views\":"
         << num_views << ",\"chunk\":10,\"num_steps\":10,"
            "\"vision_pool_factor\":1";
     if (!calibration.empty()) {
@@ -77,14 +80,25 @@ int main(int argc, char** argv) {
         return 2;
     }
     const int num_views = std::atoi(argv[5]);
-    if (num_views < 1 || num_views > 2) {
-        std::cerr << "VIEWS must be in [1, 2]\n";
+    if (num_views < 1 || num_views > 3) {
+        std::cerr << "VIEWS must be in [1, 3]\n";
         return 2;
+    }
+    int max_prompt_tokens = 200;
+    if (const char* value = std::getenv("FLASHRT_MAX_PROMPT_TOKENS")) {
+        char* end = nullptr;
+        const long parsed = std::strtol(value, &end, 10);
+        if (!end || *end != '\0' || parsed < 1 || parsed > 100000) {
+            std::cerr << "FLASHRT_MAX_PROMPT_TOKENS must be in "
+                         "[1, 100000]\n";
+            return 2;
+        }
+        max_prompt_tokens = static_cast<int>(parsed);
     }
     const std::string calibration_path = argv[3];
     const std::string single_path = calibration_path + ".single";
     const std::string calibration_config =
-        config_json(argv[1], argv[2], num_views);
+        config_json(argv[1], argv[2], num_views, max_prompt_tokens);
     frt_pi05_calibration_session* session = nullptr;
     int rc = frt_pi05_calibration_create_v1(
         calibration_config.c_str(), 99.9, &session);
@@ -94,11 +108,14 @@ int main(int argc, char** argv) {
 
     std::vector<std::uint8_t> image(224 * 224 * 3);
     std::vector<std::uint8_t> wrist(image.size());
+    std::vector<std::uint8_t> right_wrist(image.size());
     float state[8]{};
     std::vector<float> noise(10 * 32);
     std::vector<frt_pi05_vision_frame> frames(num_views);
-    const char* names[] = {"image", "wrist_image"};
-    std::vector<std::uint8_t>* pixels[] = {&image, &wrist};
+    const char* names[] = {
+        "image", "wrist_image", "wrist_image_right"};
+    std::vector<std::uint8_t>* pixels[] = {
+        &image, &wrist, &right_wrist};
     for (int view = 0; view < num_views; ++view) {
         frames[view].struct_size = sizeof(frt_pi05_vision_frame);
         frames[view].name = names[view];
@@ -109,13 +126,15 @@ int main(int argc, char** argv) {
         frames[view].stride_bytes = 224 * 3;
         frames[view].pixel_format = FRT_PI05_PIXEL_RGB8;
     }
-    if (num_views == 2) std::swap(frames[0], frames[1]);
+    if (num_views > 1) std::reverse(frames.begin(), frames.end());
     for (int sample_index = 0; sample_index < samples; ++sample_index) {
         for (std::size_t i = 0; i < image.size(); ++i) {
             image[i] = static_cast<std::uint8_t>(
                 (i * 3 + sample_index * 17) % 251);
             wrist[i] = static_cast<std::uint8_t>(
                 (i * 7 + sample_index * 29 + 11) % 253);
+            right_wrist[i] = static_cast<std::uint8_t>(
+                (i * 11 + sample_index * 37 + 19) % 247);
         }
         for (int i = 0; i < 8; ++i) {
             state[i] = static_cast<float>(
@@ -243,13 +262,15 @@ int main(int argc, char** argv) {
         calibration_path, &artifact);
     if (!status.ok_status() || artifact.sample_count !=
                                    static_cast<std::uint64_t>(samples) ||
-        artifact.num_views != num_views) {
+        artifact.num_views != num_views ||
+        artifact.max_prompt_tokens != max_prompt_tokens) {
         std::cerr << "dataset calibration artifact validation failed\n";
         return 1;
     }
 
     const std::string runtime_config =
-        config_json(argv[1], argv[2], num_views, calibration_path);
+        config_json(argv[1], argv[2], num_views, max_prompt_tokens,
+                    calibration_path);
     frt_model_runtime_v1* model = nullptr;
     rc = frt_model_runtime_open_v1(runtime_config.c_str(), &model);
     if (rc != 0 || !model) {
@@ -258,8 +279,11 @@ int main(int argc, char** argv) {
         return 1;
     }
     const frt_runtime_export_v1* exp = model->exp;
-    bool schema_ok = model->n_ports == 6 && exp && exp->n_graphs == 1 &&
-                     frt_graph_variant_count(exp->graphs[0].handle) == 1 &&
+    bool schema_ok = model->n_ports == 6 && model->n_stages == 1 &&
+                     exp && exp->n_graphs == 3 &&
+                     std::strcmp(exp->graphs[0].name, "infer") == 0 &&
+                     std::strcmp(exp->graphs[1].name, "decode_only") == 0 &&
+                     std::strcmp(exp->graphs[2].name, "context") == 0 &&
                      exp->identity &&
                      std::strstr(exp->identity,
                                  "precision=fp8_e4m3fn") &&
@@ -268,6 +292,10 @@ int main(int argc, char** argv) {
                      model->ports[2].dtype == FRT_RT_DTYPE_F16 &&
                      model->ports[3].dtype == FRT_RT_DTYPE_F16 &&
                      model->ports[5].dtype == FRT_RT_DTYPE_F16;
+    for (std::uint64_t i = 0; schema_ok && i < exp->n_graphs; ++i) {
+        schema_ok =
+            frt_graph_variant_count(exp->graphs[i].handle) == 1;
+    }
     if (!schema_ok) {
         std::cerr << "native FP8 schema validation failed\n";
         model->release(model->owner);
@@ -314,16 +342,34 @@ int main(int argc, char** argv) {
         model->release(model->owner);
         return 1;
     }
+    std::vector<std::uint16_t> raw(noise.size());
+    if (!model->ports[5].buffer ||
+        cudaMemcpy(raw.data(), frt_buffer_dptr(model->ports[5].buffer),
+                   raw.size() * sizeof(raw[0]),
+                   cudaMemcpyDeviceToHost) != cudaSuccess ||
+        cudaMemcpy(frt_buffer_dptr(model->ports[3].buffer), noise_f16.data(),
+                   noise_f16.size() * sizeof(std::uint16_t),
+                   cudaMemcpyHostToDevice) != cudaSuccess ||
+        frt_graph_replay(exp->graphs[2].handle, 0,
+                         exp->graphs[2].stream_id) != FRT_OK ||
+        frt_graph_replay(exp->graphs[1].handle, 0,
+                         exp->graphs[1].stream_id) != FRT_OK ||
+        cudaDeviceSynchronize() != cudaSuccess) {
+        std::cerr << "native FP8 split replay failed\n";
+        model->release(model->owner);
+        return 1;
+    }
+    std::vector<std::uint16_t> split_raw(noise.size());
+    if (cudaMemcpy(split_raw.data(),
+                   frt_buffer_dptr(model->ports[5].buffer),
+                   split_raw.size() * sizeof(split_raw[0]),
+                   cudaMemcpyDeviceToHost) != cudaSuccess ||
+        split_raw != raw) {
+        std::cerr << "native FP8 full/split raw actions differ\n";
+        model->release(model->owner);
+        return 1;
+    }
     if (argc == 7) {
-        std::vector<std::uint16_t> raw(noise.size());
-        if (!model->ports[5].buffer ||
-            cudaMemcpy(raw.data(), frt_buffer_dptr(model->ports[5].buffer),
-                       raw.size() * sizeof(raw[0]),
-                       cudaMemcpyDeviceToHost) != cudaSuccess) {
-            std::cerr << "native FP8 raw action download failed\n";
-            model->release(model->owner);
-            return 1;
-        }
         std::ofstream output(argv[6], std::ios::binary | std::ios::trunc);
         output.write(reinterpret_cast<const char*>(raw.data()),
                      static_cast<std::streamsize>(

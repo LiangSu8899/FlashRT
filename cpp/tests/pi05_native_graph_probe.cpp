@@ -41,8 +41,13 @@ int main(int argc, char** argv) {
         owner->workspace().find("prompt_embedding");
     const NativeWorkspaceBuffer* noise =
         owner->workspace().find("diffusion_noise");
-    if (!images || !prompt || !noise || !owner->infer_graph() ||
-        frt_graph_variant_count(owner->infer_graph()) != 1 ||
+    const frt_graph infer = owner->graph(NativeGraphKind::kInfer);
+    const frt_graph decode = owner->graph(NativeGraphKind::kDecodeOnly);
+    const frt_graph context = owner->graph(NativeGraphKind::kContext);
+    if (!images || !prompt || !noise || !infer || !decode || !context ||
+        frt_graph_variant_count(infer) != 1 ||
+        frt_graph_variant_count(decode) != 1 ||
+        frt_graph_variant_count(context) != 1 ||
         owner->stream_id() < 0 || !owner->native_stream()) {
         return 1;
     }
@@ -82,22 +87,37 @@ int main(int argc, char** argv) {
     }
     const std::vector<std::uint16_t> expected = download(noise->buffer);
     if (expected.empty()) return 1;
+    if (cudaMemcpy(frt_buffer_dptr(noise->buffer), host_noise.data(),
+                   frt_buffer_bytes(noise->buffer),
+                   cudaMemcpyHostToDevice) != cudaSuccess ||
+        owner->replay(NativeGraphKind::kContext) != FRT_OK ||
+        owner->replay(NativeGraphKind::kDecodeOnly) != FRT_OK ||
+        !owner->synchronize().ok_status() ||
+        download(noise->buffer) != expected) {
+        return 1;
+    }
     for (int replay = 0; replay < 100; ++replay) {
         if (cudaMemcpyAsync(
                 frt_buffer_dptr(noise->buffer), host_noise.data(),
                 frt_buffer_bytes(noise->buffer), cudaMemcpyHostToDevice,
                 static_cast<cudaStream_t>(owner->native_stream())) !=
                 cudaSuccess ||
-            owner->replay() != FRT_OK) {
+            owner->replay(replay % 2 == 0
+                              ? NativeGraphKind::kInfer
+                              : NativeGraphKind::kContext) != FRT_OK ||
+            (replay % 2 != 0 &&
+             owner->replay(NativeGraphKind::kDecodeOnly) != FRT_OK)) {
             return 1;
         }
     }
     if (!owner->synchronize().ok_status() ||
-        frt_graph_variant_count(owner->infer_graph()) != 1 ||
+        frt_graph_variant_count(infer) != 1 ||
+        frt_graph_variant_count(decode) != 1 ||
+        frt_graph_variant_count(context) != 1 ||
         owner->workspace().allocation_count() != allocation_count ||
         download(noise->buffer) != expected) {
         return 1;
     }
-    std::cout << "PASS native full graph 100 replays\n";
+    std::cout << "PASS native full/split graphs 100 replays\n";
     return 0;
 }

@@ -59,24 +59,13 @@ bool calibration_matches(const NativeCalibrationArtifact& artifact,
 NativeThorGraphOwner::NativeThorGraphOwner(
     frt_ctx ctx,
     const NativeGraphConfig& config)
-    : ctx_(ctx),
+    : graphs_(ctx),
       config_(config),
       weights_(ctx),
       workspace_(ctx),
-      forward_(&driver_),
-      capture_status_(modalities::Status::ok()) {}
+      forward_(&driver_) {}
 
-NativeThorGraphOwner::~NativeThorGraphOwner() {
-    if (replay_stream_) {
-        cudaStreamSynchronize(static_cast<cudaStream_t>(replay_stream_));
-        cudaStreamDestroy(static_cast<cudaStream_t>(replay_stream_));
-        replay_stream_ = nullptr;
-    }
-    if (ctx_) {
-        frt_ctx_destroy(ctx_);
-        ctx_ = nullptr;
-    }
-}
+NativeThorGraphOwner::~NativeThorGraphOwner() = default;
 
 std::unique_ptr<NativeThorGraphOwner> NativeThorGraphOwner::create(
     const std::string& checkpoint_path,
@@ -205,7 +194,7 @@ modalities::Status NativeThorGraphOwner::initialize(
     }
 
     // CUTLASS, cuBLAS, and FMHA initialize tactics outside CUDA capture.
-    st = record(nullptr);
+    st = record(NativeGraphKind::kInfer, nullptr);
     if (!st.ok_status()) return st;
     if (cudaDeviceSynchronize() != cudaSuccess) {
         return backend("Thor graph warmup synchronization failed");
@@ -218,39 +207,28 @@ modalities::Status NativeThorGraphOwner::initialize(
     }
     report("warmup");
 
-    infer_graph_ = frt_graph_create(ctx_, "infer", 1);
-    const NativeWorkspaceBuffer* images =
-        workspace_.find("observation_images_normalized");
-    const NativeWorkspaceBuffer* prompt = workspace_.find("prompt_embedding");
-    const NativeWorkspaceBuffer* encoder = workspace_.find("encoder_x");
-    if (!infer_graph_ || !images || !prompt || !encoder || !noise ||
-        frt_graph_bind(infer_graph_, "images", images->buffer) != FRT_OK ||
-        frt_graph_bind(infer_graph_, "prompt", prompt->buffer) != FRT_OK ||
-        frt_graph_bind(infer_graph_, "encoder_x", encoder->buffer) != FRT_OK ||
-        frt_graph_bind(infer_graph_, "noise", noise->buffer) != FRT_OK) {
-        return backend("Thor graph binding failed");
-    }
-    capture_status_ = modalities::Status::ok();
-    if (frt_graph_capture(infer_graph_, 0, record_graph, this) != FRT_OK) {
-        return capture_status_.ok_status()
-                   ? backend("Thor full graph capture failed")
-                   : capture_status_;
-    }
-    if (!capture_status_.ok_status() ||
-        frt_graph_variant_count(infer_graph_) != 1) {
-        return capture_status_.ok_status()
-                   ? backend("Thor full graph variant is missing")
-                   : capture_status_;
-    }
+    st = graphs_.capture(
+        NativeGraphKind::kInfer, workspace_,
+        {"observation_images_normalized", "prompt_embedding", "encoder_x",
+         "diffusion_noise", "rtc_prev_action_chunk", "rtc_prefix_weights",
+         "rtc_guidance_weight"},
+        record_graph, this);
+    if (!st.ok_status()) return st;
+    st = graphs_.capture(
+        NativeGraphKind::kDecodeOnly, workspace_,
+        {"encoder_x", "diffusion_noise", "rtc_prev_action_chunk",
+         "rtc_prefix_weights", "rtc_guidance_weight"},
+        record_graph, this);
+    if (!st.ok_status()) return st;
+    st = graphs_.capture(
+        NativeGraphKind::kContext, workspace_,
+        {"observation_images_normalized", "prompt_embedding", "encoder_x"},
+        record_graph, this);
+    if (!st.ok_status()) return st;
     report("capture");
 
-    cudaStream_t stream = nullptr;
-    if (cudaStreamCreate(&stream) != cudaSuccess) {
-        return backend("Thor replay stream creation failed");
-    }
-    replay_stream_ = stream;
-    stream_id_ = frt_ctx_wrap_stream(ctx_, replay_stream_);
-    if (stream_id_ < 0) return backend("Thor replay stream wrapping failed");
+    st = graphs_.create_replay_stream();
+    if (!st.ok_status()) return st;
     report("stream");
     if (profile_setup) {
         const auto now = std::chrono::steady_clock::now();
@@ -261,56 +239,48 @@ modalities::Status NativeThorGraphOwner::initialize(
     return modalities::Status::ok();
 }
 
-modalities::Status NativeThorGraphOwner::record(void* stream) {
-    const NativeWorkspaceBuffer* prompt = workspace_.find("prompt_embedding");
-    const NativeWorkspaceBuffer* encoder = workspace_.find("encoder_x");
-    if (!prompt || !encoder) return invalid("Thor prompt buffers are missing");
-    const std::size_t prompt_bytes = frt_buffer_bytes(prompt->buffer);
-    const std::size_t prompt_offset =
-        static_cast<std::size_t>(workspace_.encoder_vision_sequence()) * 2048 *
-        sizeof(std::uint16_t);
-    if (prompt_offset > frt_buffer_bytes(encoder->buffer) ||
-        prompt_bytes > frt_buffer_bytes(encoder->buffer) - prompt_offset) {
-        return invalid("Thor prompt window exceeds encoder storage");
-    }
-    auto* destination =
-        static_cast<unsigned char*>(frt_buffer_dptr(encoder->buffer)) +
-        prompt_offset;
-    if (cudaMemcpyAsync(destination, frt_buffer_dptr(prompt->buffer),
-                        prompt_bytes, cudaMemcpyDeviceToDevice,
-                        static_cast<cudaStream_t>(stream)) != cudaSuccess) {
-        return backend("Thor prompt graph copy failed");
-    }
+modalities::Status NativeThorGraphOwner::record_context(void* stream) {
+    modalities::Status st = copy_prompt_to_encoder(&workspace_, stream);
+    if (!st.ok_status()) return st;
     const std::uintptr_t stream_id = reinterpret_cast<std::uintptr_t>(stream);
-    modalities::Status st =
-        forward_.vision(weights_, &workspace_, weight_scales_, stream_id);
+    st = forward_.vision(weights_, &workspace_, weight_scales_, stream_id);
     if (!st.ok_status()) return st;
-    st = forward_.encoder(weights_, &workspace_, encoder_alphas_, stream_id);
-    if (!st.ok_status()) return st;
-    return forward_.diffusion(weights_, &workspace_, stream_id);
+    return forward_.encoder(
+        weights_, &workspace_, encoder_alphas_, stream_id);
 }
 
-void NativeThorGraphOwner::record_graph(void* user, void* stream) {
+modalities::Status NativeThorGraphOwner::record_action(void* stream) {
+    return forward_.diffusion(
+        weights_, &workspace_, reinterpret_cast<std::uintptr_t>(stream));
+}
+
+modalities::Status NativeThorGraphOwner::record(NativeGraphKind kind,
+                                                 void* stream) {
+    if (kind == NativeGraphKind::kContext) return record_context(stream);
+    if (kind == NativeGraphKind::kDecodeOnly) return record_action(stream);
+    if (kind != NativeGraphKind::kInfer) {
+        return invalid("Thor graph kind is invalid");
+    }
+    modalities::Status st = record_context(stream);
+    return st.ok_status() ? record_action(stream) : st;
+}
+
+modalities::Status NativeThorGraphOwner::record_graph(
+    void* user, NativeGraphKind kind, void* stream) {
     auto* owner = static_cast<NativeThorGraphOwner*>(user);
-    owner->capture_status_ = owner->record(stream);
+    return owner->record(kind, stream);
 }
 
 modalities::Status NativeThorGraphOwner::set_prompt_length(int prompt_tokens) {
     return workspace_.set_fixed_prompt_length(prompt_tokens);
 }
 
-int NativeThorGraphOwner::replay() const {
-    if (!infer_graph_ || stream_id_ < 0) return FRT_ERR_INVALID;
-    return frt_graph_replay(infer_graph_, 0, stream_id_);
+int NativeThorGraphOwner::replay(NativeGraphKind kind) const {
+    return graphs_.replay(kind);
 }
 
 modalities::Status NativeThorGraphOwner::synchronize() const {
-    if (!replay_stream_) return invalid("Thor replay stream is missing");
-    const cudaError_t rc =
-        cudaStreamSynchronize(static_cast<cudaStream_t>(replay_stream_));
-    return rc == cudaSuccess
-               ? modalities::Status::ok()
-               : backend("Thor replay synchronization failed");
+    return graphs_.synchronize();
 }
 
 }  // namespace pi05

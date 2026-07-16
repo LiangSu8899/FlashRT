@@ -47,6 +47,7 @@ endif()
 if(FLASHRT_CPP_WITH_CUDA_KERNELS)
   add_library(flashrt_cpp_pi05_kernels STATIC
     src/native_bf16_forward.cpp
+    src/native_graph_runtime.cpp
     src/native_kernel_driver.cu
     src/native_style_precompute.cu
     ${FLASHRT_CPP_SOURCE_DIR}/../csrc/gemm/gemm_runner.cu

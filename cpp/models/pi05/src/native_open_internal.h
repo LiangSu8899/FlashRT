@@ -15,6 +15,7 @@ struct NativeOpenConfig {
     std::string tokenizer_model_path;
     std::string precision = "auto";
     std::string calibration_path;
+    std::string stage_plan = "full";
     int max_prompt_tokens = 200;
     int state_dim = 0;
     int num_views = 2;

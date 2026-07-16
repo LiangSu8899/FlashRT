@@ -19,6 +19,21 @@ extern "C" int frt_model_runtime_open_v1(const char* config_json,
                                           frt_model_runtime_v1** out);
 extern "C" const char* frt_pi05_native_open_last_error();
 
+namespace {
+
+constexpr int kLatencyWarmupReplays = 10;
+
+bool all_graph_variants_stable(const frt_runtime_export_v1* exp) {
+    for (std::uint64_t graph = 0; graph < exp->n_graphs; ++graph) {
+        if (frt_graph_variant_count(exp->graphs[graph].handle) != 1) {
+            return false;
+        }
+    }
+    return true;
+}
+
+}  // namespace
+
 int main(int argc, char** argv) {
     if (argc != 3 && argc != 4) {
         std::cerr << "usage: pi05_native_open_probe CHECKPOINT TOKENIZER "
@@ -36,12 +51,44 @@ int main(int argc, char** argv) {
         }
         replay_count = static_cast<int>(parsed);
     }
-    const bool profile_service_loop =
+    bool profile_service_loop =
         std::getenv("FLASHRT_PROFILE_SERVICE_LOOP") != nullptr;
-    if (profile_service_loop && !replay_env) {
+    int latency_replays = 0;
+    const char* latency_env =
+        std::getenv("FLASHRT_E2E_LATENCY_REPLAYS");
+    if (latency_env) {
+        char* end = nullptr;
+        const long parsed = std::strtol(latency_env, &end, 10);
+        if (!end || *end != '\0' || parsed <= 0 || parsed > 100000) {
+            std::cerr << "FLASHRT_E2E_LATENCY_REPLAYS must be in "
+                         "[1, 100000]\n";
+            return 2;
+        }
+        if (replay_env) {
+            std::cerr << "FLASHRT_E2E_LATENCY_REPLAYS cannot be combined "
+                         "with FLASHRT_PROFILE_REPLAYS\n";
+            return 2;
+        }
+        latency_replays = static_cast<int>(parsed);
+        replay_count = kLatencyWarmupReplays + latency_replays;
+        profile_service_loop = true;
+    }
+    if (profile_service_loop && !replay_env && !latency_env) {
         std::cerr << "FLASHRT_PROFILE_SERVICE_LOOP requires "
                      "FLASHRT_PROFILE_REPLAYS\n";
         return 2;
+    }
+    double latency_p99_limit_ms = 0.0;
+    const char* latency_limit_env = std::getenv("FLASHRT_E2E_P99_MS");
+    if (latency_limit_env) {
+        char* end = nullptr;
+        latency_p99_limit_ms = std::strtod(latency_limit_env, &end);
+        if (!end || *end != '\0' || !std::isfinite(latency_p99_limit_ms) ||
+            latency_p99_limit_ms <= 0.0 || latency_replays == 0) {
+            std::cerr << "FLASHRT_E2E_P99_MS must be positive and requires "
+                         "FLASHRT_E2E_LATENCY_REPLAYS\n";
+            return 2;
+        }
     }
     int hot_state_updates = 0;
     const char* hot_updates_env = std::getenv("FLASHRT_HOT_STATE_UPDATES");
@@ -53,6 +100,38 @@ int main(int argc, char** argv) {
             return 2;
         }
         hot_state_updates = static_cast<int>(parsed);
+    }
+    const char* stage_plan_env = std::getenv("FLASHRT_STAGE_PLAN");
+    const std::string stage_plan =
+        stage_plan_env ? stage_plan_env : "full";
+    if (stage_plan != "full" && stage_plan != "context_action") {
+        std::cerr << "FLASHRT_STAGE_PLAN must be full or context_action\n";
+        return 2;
+    }
+    const bool split_stage_plan = stage_plan == "context_action";
+    int num_views = 2;
+    const char* num_views_env = std::getenv("FLASHRT_NUM_VIEWS");
+    if (num_views_env) {
+        char* end = nullptr;
+        const long parsed = std::strtol(num_views_env, &end, 10);
+        if (!end || *end != '\0' || parsed < 1 || parsed > 3) {
+            std::cerr << "FLASHRT_NUM_VIEWS must be in [1, 3]\n";
+            return 2;
+        }
+        num_views = static_cast<int>(parsed);
+    }
+    int max_prompt_tokens = 200;
+    const char* max_prompt_env =
+        std::getenv("FLASHRT_MAX_PROMPT_TOKENS");
+    if (max_prompt_env) {
+        char* end = nullptr;
+        const long parsed = std::strtol(max_prompt_env, &end, 10);
+        if (!end || *end != '\0' || parsed < 1 || parsed > 100000) {
+            std::cerr << "FLASHRT_MAX_PROMPT_TOKENS must be in "
+                         "[1, 100000]\n";
+            return 2;
+        }
+        max_prompt_tokens = static_cast<int>(parsed);
     }
     double hot_state_p99_limit_us = 0.0;
     const char* hot_limit_env = std::getenv("FLASHRT_HOT_STATE_P99_US");
@@ -69,9 +148,12 @@ int main(int argc, char** argv) {
     json << "{\"io\":\"native_v2\",\"checkpoint_path\":\""
          << argv[1] << "\",\"tokenizer_model_path\":\"" << argv[2]
          << "\",\"state_prompt_mode\":\"fixed\","
-         << "\"max_prompt_tokens\":200,\"state_dim\":8,"
-         << "\"num_views\":2,\"chunk\":10,\"num_steps\":10,"
-         << "\"vision_pool_factor\":1";
+         << "\"max_prompt_tokens\":" << max_prompt_tokens
+         << ",\"state_dim\":8,"
+         << "\"num_views\":" << num_views
+         << ",\"chunk\":10,\"num_steps\":10,"
+         << "\"vision_pool_factor\":1,\"stage_plan\":\""
+         << stage_plan << '"';
     if (argc == 4) {
         json << ",\"calibration_path\":\"" << argv[3] << '"';
     }
@@ -106,8 +188,9 @@ int main(int argc, char** argv) {
               model->struct_size == sizeof(frt_model_runtime_v1) && exp &&
               exp->abi_version == FRT_RUNTIME_ABI_VERSION &&
               exp->struct_size == sizeof(frt_runtime_export_v1) &&
-              model->n_ports == 6 && model->n_stages == 1 &&
-              exp->n_graphs == 1 && exp->n_streams == 1 &&
+              model->n_ports == 6 &&
+              model->n_stages == (split_stage_plan ? 2u : 1u) &&
+              exp->n_graphs == 3 && exp->n_streams == 1 &&
               exp->n_capsule_regions == 1 && exp->n_buffers == 7 &&
               exp->fingerprint != 0 && exp->identity &&
               std::strstr(exp->identity, "producer=native") &&
@@ -117,8 +200,17 @@ int main(int argc, char** argv) {
               std::strstr(exp->manifest_json, hardware_manifest.c_str()) &&
               std::strstr(exp->identity, "weights_sha256=") &&
               std::strstr(exp->identity, "tokenizer_sha256=") &&
-              model->stages[0].graph == 0 &&
-              frt_graph_variant_count(exp->graphs[0].handle) == 1;
+              model->stages[0].graph == (split_stage_plan ? 2u : 0u) &&
+              std::strcmp(exp->graphs[0].name, "infer") == 0 &&
+              std::strcmp(exp->graphs[1].name, "decode_only") == 0 &&
+              std::strcmp(exp->graphs[2].name, "context") == 0;
+    ok = ok && all_graph_variants_stable(exp);
+    if (split_stage_plan) {
+        ok = ok && model->stages[0].n_after == 0 &&
+             model->stages[1].graph == 1 &&
+             model->stages[1].n_after == 1 &&
+             model->stages[1].after[0] == 0;
+    }
     for (std::uint64_t i = 0; i < model->n_ports; ++i) {
         ok = ok && std::strcmp(model->ports[i].name, port_names[i]) == 0;
     }
@@ -170,6 +262,8 @@ int main(int argc, char** argv) {
         }
     }
     if (model->verbs.prepare(model->self, 0, 0) != 0 ||
+        model->verbs.prepare(model->self, 1, 0) != 0 ||
+        model->verbs.prepare(model->self, 2, 0) != 0 ||
         model->verbs.prepare(model->self, 0, 1) != -2) {
         std::cerr << "native prepare validation failed\n";
         model->release(model->owner);
@@ -224,30 +318,33 @@ int main(int argc, char** argv) {
                   << " max_us=" << maximum << '\n';
         if ((hot_state_p99_limit_us > 0.0 &&
              p99 > hot_state_p99_limit_us) ||
-            frt_graph_variant_count(exp->graphs[0].handle) != 1) {
+            !all_graph_variants_stable(exp)) {
             std::cerr << "native hot state update gate failed\n";
             model->release(model->owner);
             return 1;
         }
     }
-    std::vector<std::uint8_t> rgb0(224 * 224 * 3);
-    std::vector<std::uint8_t> rgb1(rgb0.size());
-    for (std::size_t i = 0; i < rgb0.size(); ++i) {
-        rgb0[i] = static_cast<std::uint8_t>(i % 251);
-        rgb1[i] = static_cast<std::uint8_t>((3 * i + 17) % 251);
+    std::vector<std::vector<std::uint8_t>> rgb(
+        num_views, std::vector<std::uint8_t>(224 * 224 * 3));
+    for (int view = 0; view < num_views; ++view) {
+        for (std::size_t i = 0; i < rgb[view].size(); ++i) {
+            rgb[view][i] = static_cast<std::uint8_t>(
+                ((2 * view + 1) * i + 17 * view) % 251);
+        }
     }
-    frt_image_view views[2]{};
-    for (int i = 0; i < 2; ++i) {
+    std::vector<frt_image_view> views(num_views);
+    for (int i = 0; i < num_views; ++i) {
         views[i].struct_size = sizeof(frt_image_view);
         views[i].pixel_format = FRT_RT_PIXEL_RGB8;
-        views[i].data = i ? static_cast<const void*>(rgb1.data())
-                          : static_cast<const void*>(rgb0.data());
-        views[i].bytes = rgb0.size();
+        views[i].data = rgb[i].data();
+        views[i].bytes = rgb[i].size();
         views[i].width = 224;
         views[i].height = 224;
         views[i].stride_bytes = 224 * 3;
     }
-    if (model->verbs.set_input(model->self, 2, views, sizeof(views), -1) != 0) {
+    if (model->verbs.set_input(
+            model->self, 2, views.data(),
+            views.size() * sizeof(frt_image_view), -1) != 0) {
         std::cerr << "native image staging failed: "
                   << model->verbs.last_error(model->self) << '\n';
         model->release(model->owner);
@@ -279,7 +376,11 @@ int main(int argc, char** argv) {
     }
     int step_rc = 0;
     cudaError_t upload_rc = cudaSuccess;
+    cudaError_t replay_sync_rc = cudaSuccess;
+    std::vector<double> latency_samples_ms;
+    latency_samples_ms.reserve(latency_replays);
     for (int replay = 0; replay < replay_count; ++replay) {
+        const auto replay_begin = std::chrono::steady_clock::now();
         if (profile_service_loop) {
             for (int dim = 0; dim < 8; ++dim) {
                 state[dim] = std::sin(
@@ -294,7 +395,8 @@ int main(int argc, char** argv) {
                 model->verbs.set_input(
                     model->self, 1, state, sizeof(state), -1) != 0 ||
                 model->verbs.set_input(
-                    model->self, 2, views, sizeof(views), -1) != 0) {
+                    model->self, 2, views.data(),
+                    views.size() * sizeof(frt_image_view), -1) != 0) {
                 step_rc = -1;
                 break;
             }
@@ -315,17 +417,44 @@ int main(int argc, char** argv) {
             step_rc = -1;
             break;
         }
+        if (latency_replays != 0) {
+            replay_sync_rc = cudaDeviceSynchronize();
+            if (replay_sync_rc != cudaSuccess) break;
+            if (replay >= kLatencyWarmupReplays) {
+                const auto replay_end = std::chrono::steady_clock::now();
+                latency_samples_ms.push_back(
+                    std::chrono::duration<double, std::milli>(
+                        replay_end - replay_begin)
+                        .count());
+            }
+        }
     }
     const cudaError_t sync_rc = cudaDeviceSynchronize();
     const cudaError_t profiler_rc =
         profile_range ? cudaProfilerStop() : cudaSuccess;
-    if (step_rc != 0 || upload_rc != cudaSuccess || sync_rc != cudaSuccess ||
-        profiler_rc != cudaSuccess ||
-        frt_graph_variant_count(exp->graphs[0].handle) != 1) {
+    if (step_rc != 0 || upload_rc != cudaSuccess ||
+        replay_sync_rc != cudaSuccess || sync_rc != cudaSuccess ||
+        profiler_rc != cudaSuccess || !all_graph_variants_stable(exp)) {
         std::cerr << "native step failed: "
                   << model->verbs.last_error(model->self) << '\n';
         model->release(model->owner);
         return 1;
+    }
+    if (latency_replays != 0) {
+        std::sort(latency_samples_ms.begin(), latency_samples_ms.end());
+        const std::size_t p99_index =
+            (latency_samples_ms.size() * 99 + 99) / 100 - 1;
+        const double p50 = latency_samples_ms[latency_samples_ms.size() / 2];
+        const double p99 = latency_samples_ms[p99_index];
+        const double maximum = latency_samples_ms.back();
+        std::cout << "native service latency: n=" << latency_samples_ms.size()
+                  << " p50_ms=" << p50 << " p99_ms=" << p99
+                  << " max_ms=" << maximum << '\n';
+        if (latency_p99_limit_ms > 0.0 && p99 > latency_p99_limit_ms) {
+            std::cerr << "native service latency gate failed\n";
+            model->release(model->owner);
+            return 1;
+        }
     }
     if (model->verbs.get_output(model->self, 4, actions, sizeof(actions),
                                 &written, -1) != 0 ||
