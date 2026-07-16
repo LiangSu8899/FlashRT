@@ -108,10 +108,13 @@ def _parity_metrics(got: torch.Tensor, want: torch.Tensor) -> dict[str, float]:
     cosine = torch.nn.functional.cosine_similarity(
         got.double().flatten(), want.double().flatten(), dim=0
     )
+    # kthvalue instead of quantile: exact and free of quantile's input
+    # size limit (qualification outputs can exceed it, e.g. LLM logits)
+    k = max(1, int(0.99 * diff.numel()))
     return {
         "cosine": float(cosine),
         "max_abs": float(diff.max()),
-        "p99_abs": float(torch.quantile(diff, 0.99)),
+        "p99_abs": float(diff.kthvalue(k).values),
     }
 
 
