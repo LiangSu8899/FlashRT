@@ -211,6 +211,7 @@ def _build(weights, variant, input_scale, hidden_scale, eps):
     )
 
 
+@torch.no_grad()
 def bind(
     weights: Mapping[str, torch.Tensor],
     *,
@@ -238,6 +239,7 @@ def bind(
     return _build(weights, variant, input_scale, hidden_scale, eps)
 
 
+@torch.no_grad()
 def bind_mlp_seam(
     weights: Mapping[str, torch.Tensor],
     *,
