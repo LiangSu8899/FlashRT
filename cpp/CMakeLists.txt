@@ -218,7 +218,8 @@ endif()
 
 add_library(flashrt_cpp_pi05 STATIC ${FLASHRT_CPP_PI05_SRCS})
 target_include_directories(flashrt_cpp_pi05
-  PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/include)
+  PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/include
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/internal/include)
 target_link_libraries(flashrt_cpp_pi05
   PUBLIC flashrt_cpp_modalities flashrt_cpp_vla flashrt_cpp_loader)
 
@@ -235,8 +236,9 @@ if(FLASHRT_CPP_WITH_CUDA_KERNELS)
     ${CMAKE_CURRENT_SOURCE_DIR}/../csrc/kernels/patch_embed.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/../csrc/kernels/rope.cu)
   target_include_directories(flashrt_cpp_pi05_kernels
-    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/include
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../csrc/gemm
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/internal/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/../csrc/gemm
             ${CMAKE_CURRENT_SOURCE_DIR}/../csrc/kernels)
   target_link_libraries(flashrt_cpp_pi05_kernels
     PUBLIC flashrt_cpp_pi05 CUDA::cublas CUDA::cublasLt CUDA::cudart)
@@ -315,13 +317,19 @@ add_library(flashrt_cpp_pi05_c SHARED
 target_link_libraries(flashrt_cpp_pi05_c
   PUBLIC flashrt_cpp_pi05 flashrt_runtime)
 target_include_directories(flashrt_cpp_pi05_c
-  PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/include)
+  PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/include
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/internal/include)
 if(FLASHRT_CPP_WITH_CUDA_KERNELS)
   target_link_libraries(flashrt_cpp_pi05_c
     PRIVATE flashrt_cpp_pi05_kernels)
 endif()
 
 if(BUILD_TESTING)
+  # PI0.5 implementation headers are build-only. Tests may inspect internal
+  # invariants without publishing those headers to downstream consumers.
+  include_directories(
+    ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/internal/include)
+
   # The test executables use assert() as their fail-fast check, including
   # around setup calls whose side effects are required by later checks.
   # Keep those checks active for Release test builds as well.

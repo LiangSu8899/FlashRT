@@ -6,12 +6,12 @@
 #include "config_map.h"
 #include "flashrt/cpp/loader/sha256.h"
 #include "flashrt/cpp/models/pi05/model_runtime.h"
+#include "flashrt/cpp/models/pi05/native_calibration.h"
 #include "flashrt/cpp/models/pi05/native_graph_runtime.h"
 #if defined(FLASHRT_CPP_WITH_FA2)
 #include "flashrt/cpp/models/pi05/native_graph_owner.h"
 #endif
 #if defined(FLASHRT_CPP_WITH_THOR_FP8)
-#include "flashrt/cpp/models/pi05/native_calibration.h"
 #include "flashrt/cpp/models/pi05/native_thor_graph_owner.h"
 #endif
 
