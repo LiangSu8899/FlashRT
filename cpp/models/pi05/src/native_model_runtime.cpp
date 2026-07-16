@@ -1,11 +1,19 @@
 #include "native_open_internal.h"
 
-#if defined(FLASHRT_CPP_WITH_FA2) && defined(FLASHRT_CPP_HAS_SENTENCEPIECE)
+#if defined(FLASHRT_CPP_HAS_SENTENCEPIECE) && \
+    (defined(FLASHRT_CPP_WITH_FA2) || defined(FLASHRT_CPP_WITH_THOR_FP8))
 
 #include "config_map.h"
 #include "flashrt/cpp/loader/sha256.h"
 #include "flashrt/cpp/models/pi05/model_runtime.h"
+#include "flashrt/cpp/models/pi05/native_graph_runtime.h"
+#if defined(FLASHRT_CPP_WITH_FA2)
 #include "flashrt/cpp/models/pi05/native_graph_owner.h"
+#endif
+#if defined(FLASHRT_CPP_WITH_THOR_FP8)
+#include "flashrt/cpp/models/pi05/native_calibration.h"
+#include "flashrt/cpp/models/pi05/native_thor_graph_owner.h"
+#endif
 
 #include <cuda_runtime_api.h>
 
@@ -21,17 +29,17 @@ namespace pi05 {
 namespace {
 
 const NativeWorkspaceBuffer* workspace_buffer(
-    const NativeGraphOwner& owner,
+    const NativeGraphRuntime& owner,
     const char* name) {
     return owner.workspace().find(name);
 }
 
 void release_graph_owner(void* owner) {
-    delete static_cast<NativeGraphOwner*>(owner);
+    delete static_cast<NativeGraphRuntime*>(owner);
 }
 
 int update_prompt_length(void* owner, std::uint64_t prompt_len) {
-    auto* graph = static_cast<NativeGraphOwner*>(owner);
+    auto* graph = static_cast<NativeGraphRuntime*>(owner);
     if (!graph || prompt_len > static_cast<std::uint64_t>(INT_MAX)) return -1;
     return cface::status_code(
         graph->set_prompt_length(static_cast<int>(prompt_len)));
@@ -84,12 +92,51 @@ int build_native_model_runtime(const NativeOpenConfig& config,
         if (error) *error = cudaGetErrorString(cuda_rc);
         return -6;
     }
-    if (properties.major != 12 || properties.minor != 0) {
-        if (error) *error = "Pi0.5 native_v2 requires RTX SM120";
-        return -3;
-    }
     const std::string hardware_id =
         "sm" + std::to_string(properties.major * 10 + properties.minor);
+    enum class Precision { kBf16, kFp8E4M3Fn };
+    Precision precision;
+    if (config.precision == "auto") {
+        if (properties.major == 12 && properties.minor == 0) {
+            precision = Precision::kBf16;
+        } else if (properties.major == 11 && properties.minor == 0) {
+            precision = Precision::kFp8E4M3Fn;
+        } else {
+            if (error) {
+                *error = "Pi0.5 native_v2 has no backend for " + hardware_id;
+            }
+            return -3;
+        }
+    } else if (config.precision == "bf16") {
+        precision = Precision::kBf16;
+    } else if (config.precision == "fp8_e4m3fn") {
+        precision = Precision::kFp8E4M3Fn;
+    } else {
+        if (error) *error = "Pi0.5 native precision is invalid";
+        return -1;
+    }
+    if (precision == Precision::kBf16 &&
+        (properties.major != 12 || properties.minor != 0)) {
+        if (error) *error = "Pi0.5 native BF16 requires SM120";
+        return -3;
+    }
+    if (precision == Precision::kFp8E4M3Fn &&
+        (properties.major != 11 || properties.minor != 0)) {
+        if (error) *error = "Pi0.5 native FP8 requires SM110";
+        return -3;
+    }
+#if !defined(FLASHRT_CPP_WITH_FA2)
+    if (precision == Precision::kBf16) {
+        if (error) *error = "Pi0.5 native BF16 backend is not built";
+        return -3;
+    }
+#endif
+#if !defined(FLASHRT_CPP_WITH_THOR_FP8)
+    if (precision == Precision::kFp8E4M3Fn) {
+        if (error) *error = "Pi0.5 native Thor FP8 backend is not built";
+        return -3;
+    }
+#endif
 
     struct HashResult {
         bool ok = false;
@@ -113,6 +160,40 @@ int build_native_model_runtime(const NativeOpenConfig& config,
         return -2;
     }
 
+    NativeCalibrationArtifact calibration;
+    std::string calibration_sha256;
+    if (precision == Precision::kFp8E4M3Fn) {
+#if defined(FLASHRT_CPP_WITH_THOR_FP8)
+        if (config.calibration_path.empty()) {
+            if (error) *error = "Pi0.5 native FP8 requires calibration_path";
+            return -1;
+        }
+        modalities::Status calibration_status =
+            load_native_calibration_artifact(config.calibration_path,
+                                             &calibration);
+        if (!calibration_status.ok_status()) {
+            if (error) *error = calibration_status.message;
+            return cface::status_code(calibration_status);
+        }
+        if (calibration.hardware != hardware_id ||
+            calibration.tokenizer_sha256 != tokenizer_sha256 ||
+            calibration.num_views != config.num_views ||
+            calibration.max_prompt_tokens != config.max_prompt_tokens ||
+            calibration.state_dim != config.state_dim ||
+            calibration.chunk_size != config.chunk ||
+            calibration.num_steps != config.num_steps ||
+            calibration.vision_pool_factor != config.vision_pool_factor) {
+            if (error) *error = "Pi0.5 calibration identity does not match config";
+            return -2;
+        }
+        if (!loader::sha256_file(config.calibration_path,
+                                 &calibration_sha256, &hash_error)) {
+            if (error) *error = hash_error;
+            return -2;
+        }
+#endif
+    }
+
     NativeGraphConfig graph_config;
     graph_config.num_views = config.num_views;
     graph_config.max_prompt_tokens = config.max_prompt_tokens;
@@ -120,8 +201,18 @@ int build_native_model_runtime(const NativeOpenConfig& config,
     graph_config.num_steps = config.num_steps;
     graph_config.vision_pool_factor = config.vision_pool_factor;
     modalities::Status st;
-    std::unique_ptr<NativeGraphOwner> graph = NativeGraphOwner::create(
-        config.checkpoint_path, graph_config, &st);
+    std::unique_ptr<NativeGraphRuntime> graph;
+    if (precision == Precision::kBf16) {
+#if defined(FLASHRT_CPP_WITH_FA2)
+        graph = NativeGraphOwner::create(
+            config.checkpoint_path, graph_config, &st);
+#endif
+    } else {
+#if defined(FLASHRT_CPP_WITH_THOR_FP8)
+        graph = NativeThorGraphOwner::create(
+            config.checkpoint_path, graph_config, calibration, &st);
+#endif
+    }
     if (!graph) {
         if (error) *error = st.message;
         return cface::status_code(st);
@@ -129,6 +220,11 @@ int build_native_model_runtime(const NativeOpenConfig& config,
     HashResult weights_sha256 = weights_hash.get();
     if (!weights_sha256.ok) {
         if (error) *error = weights_sha256.error;
+        return -2;
+    }
+    if (precision == Precision::kFp8E4M3Fn &&
+        calibration.weights_sha256 != weights_sha256.digest) {
+        if (error) *error = "Pi0.5 calibration checkpoint digest mismatch";
         return -2;
     }
 
@@ -150,7 +246,9 @@ int build_native_model_runtime(const NativeOpenConfig& config,
         "embedding_weight");
     if (!images || !noise || !encoder || !previous || !prefix_weights ||
         !guidance || !prompt || !embedding ||
-        embedding->dtype != NativeWeightDType::kBf16 ||
+        embedding->dtype != (precision == Precision::kBf16
+                                 ? NativeWeightDType::kBf16
+                                 : NativeWeightDType::kFloat16) ||
         embedding->shape.size() != 2 || embedding->shape[1] != 2048) {
         if (error) *error = "native graph export buffers are incomplete";
         return -6;
@@ -201,11 +299,16 @@ int build_native_model_runtime(const NativeOpenConfig& config,
              FRT_RT_REGION_SNAPSHOT | FRT_RT_REGION_RESTORE) == 0;
     if (!ok) return fail_builder(builder, error, "native region build failed");
 
+    const bool thor_fp8 = precision == Precision::kFp8E4M3Fn;
+    const std::string precision_id = thor_fp8 ? "fp8_e4m3fn" : "bf16";
+    const std::string pipeline_id = thor_fp8 ? "NativeThorFp8" : "NativeBf16";
+    const std::string tensor_dtype = thor_fp8 ? "float16" : "bf16";
     ok = add_identity(builder, "model", "pi05") &&
          add_identity(builder, "producer", "native") &&
-         add_identity(builder, "pipeline", "NativeBf16") &&
+         add_identity(builder, "pipeline", pipeline_id) &&
          add_identity(builder, "hardware", hardware_id) &&
-         add_identity(builder, "tensor_dtype", "bf16") &&
+         add_identity(builder, "precision", precision_id) &&
+         add_identity(builder, "tensor_dtype", tensor_dtype) &&
          add_identity(builder, "weights_sha256", weights_sha256.digest) &&
          add_identity(builder, "tokenizer_sha256", tokenizer_sha256) &&
          add_identity(builder, "io", "native_v2") &&
@@ -221,11 +324,15 @@ int build_native_model_runtime(const NativeOpenConfig& config,
          add_identity(builder, "model_action_dim", "32") &&
          add_identity(builder, "robot_action_dim",
                       std::to_string(config.action_q01.size()));
+    if (ok && thor_fp8) {
+        ok = add_identity(builder, "calibration_sha256", calibration_sha256);
+    }
     if (!ok) return fail_builder(builder, error, "native identity build failed");
 
     std::ostringstream manifest;
     manifest << "{\"model\":\"pi05\",\"producer\":\"native\","
              << "\"hardware\":\"" << hardware_id
+             << "\",\"precision\":\"" << precision_id
              << "\",\"io\":\"native_v2\","
              << "\"stage_plan\":{\"name\":\"full\","
              << "\"stages\":[{\"name\":\"infer\","
@@ -243,6 +350,8 @@ int build_native_model_runtime(const NativeOpenConfig& config,
     const std::uint64_t action_bytes =
         static_cast<std::uint64_t>(config.chunk) *
         config.action_q01.size() * sizeof(float);
+    const uint32_t io_dtype =
+        thor_fp8 ? FRT_RT_DTYPE_F16 : FRT_RT_DTYPE_BF16;
     ok = frt_runtime_builder_add_port(
              builder, "prompt", FRT_RT_MOD_TEXT, FRT_RT_DTYPE_U8,
              FRT_RT_LAYOUT_FLAT, FRT_RT_PORT_IN, FRT_RT_PORT_STAGED, 1,
@@ -252,12 +361,12 @@ int build_native_model_runtime(const NativeOpenConfig& config,
              FRT_RT_LAYOUT_FLAT, FRT_RT_PORT_IN, FRT_RT_PORT_STAGED, 1,
              state_shape, 1, 0, nullptr, 0, 0) == 0 &&
          frt_runtime_builder_add_port(
-             builder, "images", FRT_RT_MOD_IMAGE, FRT_RT_DTYPE_BF16,
+             builder, "images", FRT_RT_MOD_IMAGE, io_dtype,
              FRT_RT_LAYOUT_NHWC, FRT_RT_PORT_IN, FRT_RT_PORT_STAGED, 1,
              image_shape, 4, 30, images->buffer, 0,
              frt_buffer_bytes(images->buffer)) == 0 &&
          frt_runtime_builder_add_port(
-             builder, "noise", FRT_RT_MOD_TENSOR, FRT_RT_DTYPE_BF16,
+             builder, "noise", FRT_RT_MOD_TENSOR, io_dtype,
              FRT_RT_LAYOUT_FLAT, FRT_RT_PORT_IN, FRT_RT_PORT_SWAP, 0,
              raw_action_shape, 2, 0, noise->buffer, 0,
              frt_buffer_bytes(noise->buffer)) == 0 &&
@@ -266,14 +375,14 @@ int build_native_model_runtime(const NativeOpenConfig& config,
              FRT_RT_LAYOUT_FLAT, FRT_RT_PORT_OUT, FRT_RT_PORT_STAGED, 0,
              action_shape, 2, 0, nullptr, 0, action_bytes) == 0 &&
          frt_runtime_builder_add_port(
-             builder, "actions_raw", FRT_RT_MOD_TENSOR, FRT_RT_DTYPE_BF16,
+             builder, "actions_raw", FRT_RT_MOD_TENSOR, io_dtype,
              FRT_RT_LAYOUT_FLAT, FRT_RT_PORT_OUT, FRT_RT_PORT_SWAP, 0,
              raw_action_shape, 2, 0, noise->buffer, 0,
              frt_buffer_bytes(noise->buffer)) == 0 &&
          frt_runtime_builder_add_stage(builder, 0, nullptr, 0) == 0;
     if (!ok) return fail_builder(builder, error, "native port/stage build failed");
 
-    NativeGraphOwner* raw_graph = graph.release();
+    NativeGraphRuntime* raw_graph = graph.release();
     /* This base is retained only by the verb override below and is never
      * returned to a consumer. The published object always has real verbs. */
     frt_model_runtime_verbs base_verbs = unpublished_verbs();
@@ -306,20 +415,24 @@ int build_native_model_runtime(const NativeOpenConfig& config,
     runtime_config.graph_name = "infer";
     runtime_config.image_buffer_name = "observation_images_normalized";
     runtime_config.action_buffer_name = "diffusion_noise";
-    runtime_config.image_dtype = FRT_PI05_DTYPE_BFLOAT16;
-    runtime_config.action_dtype = FRT_PI05_DTYPE_BFLOAT16;
+    const int runtime_dtype = thor_fp8 ? FRT_PI05_DTYPE_FLOAT16
+                                      : FRT_PI05_DTYPE_BFLOAT16;
+    runtime_config.image_dtype = runtime_dtype;
+    runtime_config.action_dtype = runtime_dtype;
+    runtime_config.max_frame_width = config.max_frame_width;
+    runtime_config.max_frame_height = config.max_frame_height;
     runtime_config.prompt_tokenizer_model_path =
         config.tokenizer_model_path.c_str();
     runtime_config.prompt_embedding_table_data =
         frt_buffer_dptr(embedding->buffer);
     runtime_config.prompt_embedding_table_bytes =
         frt_buffer_bytes(embedding->buffer);
-    runtime_config.prompt_embedding_table_dtype = FRT_PI05_DTYPE_BFLOAT16;
+    runtime_config.prompt_embedding_table_dtype = runtime_dtype;
     runtime_config.prompt_embedding_vocab_size = embedding->shape[0];
     runtime_config.prompt_embedding_hidden_dim = 2048;
     runtime_config.prompt_embedding_data = frt_buffer_dptr(prompt->buffer);
     runtime_config.prompt_embedding_bytes = frt_buffer_bytes(prompt->buffer);
-    runtime_config.prompt_embedding_dtype = FRT_PI05_DTYPE_BFLOAT16;
+    runtime_config.prompt_embedding_dtype = runtime_dtype;
     runtime_config.max_prompt_tokens = config.max_prompt_tokens;
     runtime_config.prompt_embedding_scale = std::sqrt(2048.0f);
     runtime_config.state_q01 = config.state_q01.data();
@@ -357,7 +470,9 @@ int build_native_model_runtime(const NativeOpenConfig&,
                                frt_model_runtime_v1** out,
                                std::string* error) {
     if (out) *out = nullptr;
-    if (error) *error = "native FA2 and SentencePiece are unavailable";
+    if (error) {
+        *error = "native graph backend and SentencePiece are unavailable";
+    }
     return -3;
 }
 

@@ -51,6 +51,11 @@ int main() {
         return 0;
     }
 
+    assert(frt_pi05_calibration_sample_count_v1(nullptr) == 0);
+    assert(frt_pi05_calibration_create_v1("{}", 99.9, nullptr) == -1);
+    assert(std::strstr(frt_pi05_calibration_create_last_error_v1(), "out"));
+    frt_pi05_calibration_destroy_v1(nullptr);
+
     frt_ctx ctx = frt_ctx_create();
     assert(ctx);
     int sid = frt_ctx_stream(ctx, 0);

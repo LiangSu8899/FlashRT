@@ -3,6 +3,7 @@
 #include <cuda_runtime_api.h>
 
 #include <cstdint>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <string>
@@ -35,9 +36,9 @@ std::vector<std::uint16_t> download(
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc != 6) {
+    if (argc < 6 || argc > 8) {
         std::cerr << "usage: pi05_native_rope_probe VIEWS MAX_PROMPT CHUNK "
-                     "POOL PROMPT\n";
+                     "POOL PROMPT [thor_fp8 [OUTPUT_PREFIX]]\n";
         return 2;
     }
     flashrt::models::pi05::NativeWorkspaceConfig config;
@@ -45,12 +46,18 @@ int main(int argc, char** argv) {
     config.max_prompt_tokens = std::stoi(argv[2]);
     config.chunk_size = std::stoi(argv[3]);
     config.vision_pool_factor = std::stoi(argv[4]);
+    if (argc >= 7) {
+        if (std::string(argv[6]) != "thor_fp8") return 2;
+        config.flavor =
+            flashrt::models::pi05::NativeWorkspaceFlavor::kThorFp8;
+    }
     const int prompt = std::stoi(argv[5]);
     frt_ctx ctx = frt_ctx_create();
     if (!ctx) return 1;
     flashrt::models::pi05::NativeWorkspace workspace(ctx);
     if (!workspace.allocate(config).ok_status() ||
-        !workspace.update_decoder_rope(prompt).ok_status()) {
+        !(argc >= 7 ? workspace.set_fixed_prompt_length(prompt)
+                    : workspace.update_decoder_rope(prompt)).ok_status()) {
         frt_ctx_destroy(ctx);
         return 1;
     }
@@ -58,6 +65,20 @@ int main(int argc, char** argv) {
         download(*workspace.find("encoder_rope_weights"));
     const std::vector<std::uint16_t> decoder =
         download(*workspace.find("decoder_rope_weights"));
+    if (argc == 8) {
+        std::ofstream encoder_file(
+            std::string(argv[7]) + ".encoder", std::ios::binary);
+        std::ofstream decoder_file(
+            std::string(argv[7]) + ".decoder", std::ios::binary);
+        encoder_file.write(reinterpret_cast<const char*>(encoder.data()),
+                           encoder.size() * sizeof(encoder[0]));
+        decoder_file.write(reinterpret_cast<const char*>(decoder.data()),
+                           decoder.size() * sizeof(decoder[0]));
+        if (!encoder_file || !decoder_file) {
+            frt_ctx_destroy(ctx);
+            return 1;
+        }
+    }
     std::cout << "encoder_shape=" << workspace.encoder_sequence() << ",256"
               << " encoder_fnv=" << std::hex << std::setw(16)
               << std::setfill('0') << fnv1a(encoder)

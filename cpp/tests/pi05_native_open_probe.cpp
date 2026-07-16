@@ -20,8 +20,9 @@ extern "C" int frt_model_runtime_open_v1(const char* config_json,
 extern "C" const char* frt_pi05_native_open_last_error();
 
 int main(int argc, char** argv) {
-    if (argc != 3) {
-        std::cerr << "usage: pi05_native_open_probe CHECKPOINT TOKENIZER\n";
+    if (argc != 3 && argc != 4) {
+        std::cerr << "usage: pi05_native_open_probe CHECKPOINT TOKENIZER "
+                     "[CALIBRATION]\n";
         return 2;
     }
     int replay_count = 1;
@@ -70,7 +71,11 @@ int main(int argc, char** argv) {
          << "\",\"state_prompt_mode\":\"fixed\","
          << "\"max_prompt_tokens\":200,\"state_dim\":8,"
          << "\"num_views\":2,\"chunk\":10,\"num_steps\":10,"
-         << "\"vision_pool_factor\":1}";
+         << "\"vision_pool_factor\":1";
+    if (argc == 4) {
+        json << ",\"calibration_path\":\"" << argv[3] << '"';
+    }
+    json << '}';
     frt_model_runtime_v1* model = nullptr;
     const int open_rc = frt_model_runtime_open_v1(json.str().c_str(), &model);
     if (open_rc != 0 || !model) {
@@ -94,6 +99,9 @@ int main(int argc, char** argv) {
     const std::string hardware_identity = "hardware=" + hardware_id;
     const std::string hardware_manifest =
         "\"hardware\":\"" + hardware_id + "\"";
+    const uint32_t expected_io_dtype = hardware_id == "sm110"
+        ? FRT_RT_DTYPE_F16
+        : FRT_RT_DTYPE_BF16;
     bool ok = model->abi_version == FRT_MODEL_RUNTIME_ABI_VERSION &&
               model->struct_size == sizeof(frt_model_runtime_v1) && exp &&
               exp->abi_version == FRT_RUNTIME_ABI_VERSION &&
@@ -126,7 +134,9 @@ int main(int argc, char** argv) {
          model->ports[4].update == FRT_RT_PORT_STAGED &&
          model->ports[4].buffer == nullptr &&
          model->ports[4].bytes == 10 * 7 * sizeof(float) &&
-         model->ports[5].dtype == FRT_RT_DTYPE_BF16 &&
+         model->ports[2].dtype == expected_io_dtype &&
+         model->ports[3].dtype == expected_io_dtype &&
+         model->ports[5].dtype == expected_io_dtype &&
          model->ports[5].update == FRT_RT_PORT_SWAP &&
          model->ports[5].buffer == model->ports[3].buffer &&
          model->ports[5].offset == model->ports[3].offset &&
@@ -246,8 +256,11 @@ int main(int argc, char** argv) {
     frt_buffer noise = model->ports[3].buffer;
     std::vector<std::uint16_t> host_noise(10 * 32);
     for (std::size_t i = 0; i < host_noise.size(); ++i) {
-        host_noise[i] = flashrt::modalities::float_to_bfloat16(
-            static_cast<float>(static_cast<int>(i % 23) - 11) / 12.0f);
+        const float value =
+            static_cast<float>(static_cast<int>(i % 23) - 11) / 12.0f;
+        host_noise[i] = expected_io_dtype == FRT_RT_DTYPE_F16
+            ? flashrt::modalities::float_to_float16(value)
+            : flashrt::modalities::float_to_bfloat16(value);
     }
     const bool profile_range = replay_env ||
         std::getenv("FLASHRT_PROFILE_RANGE") != nullptr;

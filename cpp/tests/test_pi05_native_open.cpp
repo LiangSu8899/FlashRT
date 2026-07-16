@@ -210,6 +210,25 @@ int main() {
     write_file(tokenizer);
 
     out = reinterpret_cast<frt_model_runtime_v1*>(0x1);
+    rc = frt_model_runtime_open_v1(
+        config(root, tokenizer, ",\"precision\":\"nvfp4\"").c_str(),
+        &out);
+    assert(rc == -1);
+    assert(out == nullptr);
+    assert(std::strstr(frt_pi05_native_open_last_error(), "precision"));
+
+    out = reinterpret_cast<frt_model_runtime_v1*>(0x1);
+    rc = frt_model_runtime_open_v1(
+        config(root, tokenizer,
+               ",\"calibration_path\":\"/missing/calibration.safetensors\"")
+            .c_str(),
+        &out);
+    assert(rc == -2);
+    assert(out == nullptr);
+    assert(std::strstr(frt_pi05_native_open_last_error(),
+                       "calibration_path"));
+
+    out = reinterpret_cast<frt_model_runtime_v1*>(0x1);
     rc = frt_model_runtime_open_v1(config(root, tokenizer).c_str(), &out);
     assert(rc == -2);
     assert(out == nullptr);
@@ -234,6 +253,13 @@ int main() {
                        missing_key.c_str()));
 
     write_safetensors(root + "/model.safetensors");
+    out = reinterpret_cast<frt_model_runtime_v1*>(0x1);
+    rc = frt_model_runtime_open_v1(
+        config(root, tokenizer, ",\"max_frame_width\":0").c_str(), &out);
+    assert(rc == -1);
+    assert(out == nullptr);
+    assert(std::strstr(frt_pi05_native_open_last_error(), "max_frame"));
+
     out = reinterpret_cast<frt_model_runtime_v1*>(0x1);
     rc = frt_model_runtime_open_v1(config(root, tokenizer).c_str(), &out);
     assert(rc == -2);

@@ -24,8 +24,13 @@ option(FLASHRT_CPP_WITH_CUDA_STAGING "Enable conservative CUDA H2D/D2H modality 
 option(FLASHRT_CPP_WITH_CUDA_KERNELS "Enable CUDA modality kernels" ON)
 option(FLASHRT_CPP_WITH_SENTENCEPIECE "Enable native SentencePiece text tokenization" OFF)
 option(FLASHRT_CPP_WITH_FA2 "Enable the Python-free vendored FA2 driver" OFF)
+option(FLASHRT_CPP_WITH_THOR_FP8
+       "Enable the native Thor SM110 FP8 kernel backend" OFF)
 set(FLASHRT_CPP_FA2_LIBRARY "" CACHE FILEPATH
     "Path to the Python-free libflashrt_fa2_raw shared library")
+set(FLASHRT_CPP_CUTLASS_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/cutlass" CACHE PATH
+    "Path to CUTLASS for the native Thor SM110 FP8 backend")
 if(FLASHRT_CPP_WITH_CUDA_STAGING)
   find_package(CUDAToolkit REQUIRED)
 endif()
@@ -52,6 +57,26 @@ if(FLASHRT_CPP_WITH_FA2)
   add_library(flashrt_cpp_fa2_external SHARED IMPORTED GLOBAL)
   set_target_properties(flashrt_cpp_fa2_external PROPERTIES
     IMPORTED_LOCATION ${FLASHRT_CPP_FA2_LIBRARY})
+endif()
+if(FLASHRT_CPP_WITH_THOR_FP8)
+  if(NOT FLASHRT_CPP_WITH_CUDA_KERNELS)
+    message(FATAL_ERROR
+      "FLASHRT_CPP_WITH_THOR_FP8 requires FLASHRT_CPP_WITH_CUDA_KERNELS")
+  endif()
+  if(NOT FLASHRT_CPP_WITH_CUDA_STAGING)
+    message(FATAL_ERROR
+      "FLASHRT_CPP_WITH_THOR_FP8 requires FLASHRT_CPP_WITH_CUDA_STAGING")
+  endif()
+  if(NOT FLASHRT_CPP_WITH_EXEC)
+    message(FATAL_ERROR
+      "FLASHRT_CPP_WITH_THOR_FP8 requires FLASHRT_CPP_WITH_EXEC")
+  endif()
+  if(NOT EXISTS
+     "${FLASHRT_CPP_CUTLASS_DIR}/include/cutlass/cutlass.h")
+    message(FATAL_ERROR
+      "FLASHRT_CPP_WITH_THOR_FP8 requires CUTLASS; set "
+      "FLASHRT_CPP_CUTLASS_DIR to a compatible checkout")
+  endif()
 endif()
 if(FLASHRT_CPP_WITH_SENTENCEPIECE)
   find_path(FLASHRT_SENTENCEPIECE_INCLUDE_DIR sentencepiece_processor.h)
@@ -114,6 +139,16 @@ if(FLASHRT_CPP_WITH_CUDA_KERNELS)
 endif()
 
 add_library(flashrt_cpp_modalities STATIC ${FLASHRT_CPP_MODALITY_SRCS})
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  # Match the CUDA preprocess kernels' explicit round-to-nearest operations in
+  # optimized builds; otherwise the host compiler may contract lerps to FMAs.
+  set_property(SOURCE modalities/src/vision_cpu.cpp APPEND PROPERTY
+    COMPILE_OPTIONS -ffp-contract=off)
+  # Weight fusion mirrors producer-side add/cast/multiply tensor operations.
+  # Keep each float operation rounded before the final FP16 conversion.
+  set_property(SOURCE models/pi05/src/native_weight_ops.cpp APPEND PROPERTY
+    COMPILE_OPTIONS -ffp-contract=off)
+endif()
 target_include_directories(flashrt_cpp_modalities
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/modalities/include)
 if(FLASHRT_CPP_WITH_CUDA_STAGING)
@@ -164,6 +199,7 @@ set(FLASHRT_CPP_PI05_SRCS
   models/pi05/src/native_device_weights.cpp
   models/pi05/src/native_weight_packer.cpp
   models/pi05/src/native_weight_materializer.cpp
+  models/pi05/src/native_calibration.cpp
   models/pi05/src/native_workspace.cpp
   models/pi05/src/native_rtx_attention.cpp
   models/pi05/src/prompt_format.cpp
@@ -172,10 +208,12 @@ set(FLASHRT_CPP_PI05_SRCS
   models/pi05/src/runtime.cpp)
 if(FLASHRT_CPP_WITH_CUDA_KERNELS)
   list(APPEND FLASHRT_CPP_PI05_SRCS
-    models/pi05/src/native_quantization.cu)
+    models/pi05/src/native_quantization.cu
+    models/pi05/src/native_rope.cu)
 else()
   list(APPEND FLASHRT_CPP_PI05_SRCS
-    models/pi05/src/native_quantization_unavailable.cpp)
+    models/pi05/src/native_quantization_unavailable.cpp
+    models/pi05/src/native_rope_unavailable.cpp)
 endif()
 
 add_library(flashrt_cpp_pi05 STATIC ${FLASHRT_CPP_PI05_SRCS})
@@ -209,6 +247,52 @@ if(FLASHRT_CPP_WITH_CUDA_KERNELS)
     $<$<COMPILE_LANGUAGE:CUDA>:
       --expt-relaxed-constexpr -O3
       --ftz=true --prec-div=false --prec-sqrt=false>)
+  if(FLASHRT_CPP_WITH_THOR_FP8)
+    add_library(flashrt_cpp_pi05_thor_precise OBJECT
+      models/pi05/src/native_thor_setup_ops.cu
+      ${CMAKE_CURRENT_SOURCE_DIR}/../csrc/attention/fmha_fp16_strided.cu)
+    target_include_directories(flashrt_cpp_pi05_thor_precise PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/../csrc/attention
+      ${FLASHRT_CPP_CUTLASS_DIR}/examples/77_blackwell_fmha
+      ${FLASHRT_CPP_CUTLASS_DIR}/include
+      ${FLASHRT_CPP_CUTLASS_DIR}/tools/util/include)
+    target_compile_options(flashrt_cpp_pi05_thor_precise PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:
+        --expt-relaxed-constexpr --expt-extended-lambda -O3>)
+    set_target_properties(flashrt_cpp_pi05_thor_precise PROPERTIES
+      CUDA_ARCHITECTURES 110a
+      CUDA_STANDARD 17
+      CUDA_STANDARD_REQUIRED ON
+      POSITION_INDEPENDENT_CODE ON)
+    target_sources(flashrt_cpp_pi05_kernels PRIVATE
+      $<TARGET_OBJECTS:flashrt_cpp_pi05_thor_precise>)
+    target_sources(flashrt_cpp_pi05_kernels PRIVATE
+      models/pi05/src/native_thor_kernel_driver.cu
+      models/pi05/src/native_thor_weight_materializer.cpp
+      models/pi05/src/native_thor_fp8_forward.cpp
+      models/pi05/src/native_thor_graph_owner.cpp
+      models/pi05/src/native_thor_calibration_session.cpp
+      models/pi05/src/native_thor_style_precompute.cpp
+      ${CMAKE_CURRENT_SOURCE_DIR}/../csrc/gemm/cutlass_sm100.cu
+      ${CMAKE_CURRENT_SOURCE_DIR}/../csrc/kernels/attention_cublas.cu
+      ${CMAKE_CURRENT_SOURCE_DIR}/../csrc/kernels/decoder_fused.cu
+      ${CMAKE_CURRENT_SOURCE_DIR}/../csrc/kernels/quantize.cu
+      ${CMAKE_CURRENT_SOURCE_DIR}/../csrc/kernels/softmax.cu)
+    target_include_directories(flashrt_cpp_pi05_kernels PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/../csrc/attention
+      ${FLASHRT_CPP_CUTLASS_DIR}/examples/77_blackwell_fmha
+      ${FLASHRT_CPP_CUTLASS_DIR}/include
+      ${FLASHRT_CPP_CUTLASS_DIR}/tools/util/include)
+    target_compile_definitions(flashrt_cpp_pi05_kernels
+      PUBLIC FLASHRT_CPP_WITH_THOR_FP8=1)
+    target_compile_options(flashrt_cpp_pi05_kernels PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:
+        --expt-extended-lambda --use_fast_math
+        -gencode=arch=compute_110a,code=sm_110a>)
+    set_target_properties(flashrt_cpp_pi05_kernels PROPERTIES
+      CUDA_ARCHITECTURES 110a
+      CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+  endif()
   if(FLASHRT_CPP_WITH_FA2)
     target_sources(flashrt_cpp_pi05_kernels PRIVATE
       models/pi05/src/native_graph_owner.cpp
@@ -225,6 +309,7 @@ endif()
 add_library(flashrt_cpp_pi05_c SHARED
   models/pi05/src/c_api.cpp
   models/pi05/src/model_runtime.cpp
+  models/pi05/src/native_thor_calibration_c_api.cpp
   models/pi05/src/native_model_runtime.cpp
   models/pi05/src/native_open.cpp)
 target_link_libraries(flashrt_cpp_pi05_c
@@ -237,6 +322,15 @@ if(FLASHRT_CPP_WITH_CUDA_KERNELS)
 endif()
 
 if(BUILD_TESTING)
+  # The test executables use assert() as their fail-fast check, including
+  # around setup calls whose side effects are required by later checks.
+  # Keep those checks active for Release test builds as well.
+  if(MSVC)
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/UNDEBUG>)
+  else()
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-UNDEBUG>)
+  endif()
+
   add_executable(test_safetensors_loader tests/test_safetensors_loader.cpp)
   target_link_libraries(test_safetensors_loader PRIVATE flashrt_cpp_loader)
   add_test(NAME safetensors_loader COMMAND test_safetensors_loader)
@@ -267,6 +361,11 @@ if(BUILD_TESTING)
     tests/test_pi05_native_weight_ops.cpp)
   target_link_libraries(test_pi05_native_weight_ops PRIVATE flashrt_cpp_pi05)
   add_test(NAME pi05_native_weight_ops COMMAND test_pi05_native_weight_ops)
+
+  add_executable(test_pi05_native_calibration
+    tests/test_pi05_native_calibration.cpp)
+  target_link_libraries(test_pi05_native_calibration PRIVATE flashrt_cpp_pi05)
+  add_test(NAME pi05_native_calibration COMMAND test_pi05_native_calibration)
 
   add_executable(pi05_native_weight_probe
     tests/pi05_native_weight_probe.cpp)
@@ -369,11 +468,6 @@ if(BUILD_TESTING)
         PRIVATE flashrt_cpp_pi05_kernels flashrt_exec CUDA::cudart)
 
       if(FLASHRT_CPP_WITH_SENTENCEPIECE)
-        add_executable(pi05_native_open_probe
-          tests/pi05_native_open_probe.cpp)
-        target_link_libraries(pi05_native_open_probe
-          PRIVATE flashrt_cpp_pi05_c flashrt_exec CUDA::cudart)
-
         add_executable(pi05_native_e2e_probe
           tests/pi05_native_e2e_probe.cpp)
         target_link_libraries(pi05_native_e2e_probe
@@ -396,11 +490,26 @@ if(BUILD_TESTING)
         COMMAND test_pi05_native_rtx_attention_driver)
     endif()
 
+    if(FLASHRT_CPP_WITH_SENTENCEPIECE AND
+       (FLASHRT_CPP_WITH_FA2 OR FLASHRT_CPP_WITH_THOR_FP8))
+      add_executable(pi05_native_open_probe
+        tests/pi05_native_open_probe.cpp)
+      target_link_libraries(pi05_native_open_probe
+        PRIVATE flashrt_cpp_pi05_c flashrt_exec CUDA::cudart)
+    endif()
+
     if(FLASHRT_CPP_WITH_SENTENCEPIECE)
       add_executable(pi05_tokenizer_corpus_probe
         tests/pi05_tokenizer_corpus_probe.cpp)
       target_link_libraries(pi05_tokenizer_corpus_probe
         PRIVATE flashrt_cpp_pi05)
+    endif()
+
+    if(FLASHRT_CPP_WITH_THOR_FP8 AND FLASHRT_CPP_WITH_SENTENCEPIECE)
+      add_executable(pi05_native_thor_fp8_probe
+        tests/pi05_native_thor_fp8_probe.cpp)
+      target_link_libraries(pi05_native_thor_fp8_probe
+        PRIVATE flashrt_cpp_pi05_c flashrt_exec CUDA::cudart)
     endif()
 
     add_executable(pi05_native_rope_probe
@@ -450,7 +559,8 @@ if(BUILD_TESTING)
     add_executable(test_pi05_native_open tests/test_pi05_native_open.cpp)
     target_link_libraries(test_pi05_native_open
       PRIVATE flashrt_cpp_pi05_c flashrt_runtime)
-    if(FLASHRT_CPP_WITH_FA2 AND FLASHRT_CPP_WITH_SENTENCEPIECE)
+    if((FLASHRT_CPP_WITH_FA2 OR FLASHRT_CPP_WITH_THOR_FP8) AND
+       FLASHRT_CPP_WITH_SENTENCEPIECE)
       target_compile_definitions(test_pi05_native_open
         PRIVATE FLASHRT_CPP_PI05_NATIVE_OPEN_ENABLED=1)
     endif()

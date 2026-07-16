@@ -11,6 +11,7 @@
 #include <cstring>
 #include <dirent.h>
 #include <cmath>
+#include <exception>
 #include <fstream>
 #include <iterator>
 #include <map>
@@ -602,11 +603,15 @@ int validate_config(
     std::string checkpoint_path;
     std::string tokenizer_model_path;
     std::string state_prompt_mode;
+    std::string precision;
+    std::string calibration_path;
     if (!string_field(obj, "io", &io, true) ||
         !string_field(obj, "checkpoint_path", &checkpoint_path, true) ||
         !string_field(obj, "tokenizer_model_path", &tokenizer_model_path,
                       true) ||
-        !string_field(obj, "state_prompt_mode", &state_prompt_mode, true)) {
+        !string_field(obj, "state_prompt_mode", &state_prompt_mode, true) ||
+        !string_field(obj, "precision", &precision, false) ||
+        !string_field(obj, "calibration_path", &calibration_path, false)) {
         return -1;
     }
     if (io != "native_v2") {
@@ -618,12 +623,24 @@ int validate_config(
             "Pi0.5 native_v2 requires state_prompt_mode='fixed'";
         return -1;
     }
+    if (precision.empty()) precision = "auto";
+    if (precision != "auto" && precision != "bf16" &&
+        precision != "fp8_e4m3fn") {
+        g_last_error =
+            "precision must be 'auto', 'bf16', or 'fp8_e4m3fn'";
+        return -1;
+    }
     if (!path_exists(checkpoint_path)) {
         g_last_error = "checkpoint_path does not exist";
         return -2;
     }
     if (!regular_file_exists(tokenizer_model_path)) {
         g_last_error = "tokenizer_model_path does not name a file";
+        return -2;
+    }
+    if (!calibration_path.empty() &&
+        !regular_file_exists(calibration_path)) {
+        g_last_error = "calibration_path does not name a file";
         return -2;
     }
     if (!validate_pi05_safetensors(checkpoint_path)) {
@@ -636,12 +653,16 @@ int validate_config(
     int64_t chunk = 0;
     int64_t num_steps = 10;
     int64_t vision_pool_factor = 1;
+    int64_t max_frame_width = 1280;
+    int64_t max_frame_height = 720;
     if (!integer_field(obj, "max_prompt_tokens", &max_prompt_tokens) ||
         !integer_field(obj, "state_dim", &state_dim) ||
         !integer_field(obj, "num_views", &num_views) ||
         !integer_field(obj, "chunk", &chunk) ||
         !integer_field(obj, "num_steps", &num_steps) ||
-        !integer_field(obj, "vision_pool_factor", &vision_pool_factor)) {
+        !integer_field(obj, "vision_pool_factor", &vision_pool_factor) ||
+        !integer_field(obj, "max_frame_width", &max_frame_width) ||
+        !integer_field(obj, "max_frame_height", &max_frame_height)) {
         return -1;
     }
     if (max_prompt_tokens < 200 || max_prompt_tokens > INT_MAX) {
@@ -669,15 +690,24 @@ int validate_config(
         g_last_error = "vision_pool_factor must be one of 1, 2, or 4";
         return -1;
     }
+    if (max_frame_width <= 0 || max_frame_width > INT_MAX ||
+        max_frame_height <= 0 || max_frame_height > INT_MAX) {
+        g_last_error = "max_frame_width/height must be in [1, INT_MAX]";
+        return -1;
+    }
     flashrt::models::pi05::NativeOpenConfig config;
     config.checkpoint_path = checkpoint_path;
     config.tokenizer_model_path = tokenizer_model_path;
+    config.precision = precision;
+    config.calibration_path = calibration_path;
     config.max_prompt_tokens = static_cast<int>(max_prompt_tokens);
     config.state_dim = static_cast<int>(state_dim);
     config.num_views = static_cast<int>(num_views ? num_views : 2);
     config.chunk = static_cast<int>(chunk ? chunk : 10);
     config.num_steps = static_cast<int>(num_steps);
     config.vision_pool_factor = static_cast<int>(vision_pool_factor);
+    config.max_frame_width = static_cast<int>(max_frame_width);
+    config.max_frame_height = static_cast<int>(max_frame_height);
     if (!validate_norm_stats(checkpoint_path, state_dim, &config)) {
         return -2;
     }
@@ -689,25 +719,51 @@ int validate_config(
 
 }  // namespace
 
+namespace flashrt {
+namespace models {
+namespace pi05 {
+
+int parse_native_open_config(const char* config_json,
+                             NativeOpenConfig* out,
+                             std::string* error) {
+    const int rc = validate_config(config_json, out);
+    if (error) *error = g_last_error;
+    return rc;
+}
+
+}  // namespace pi05
+}  // namespace models
+}  // namespace flashrt
+
 extern "C" int frt_model_runtime_open_v1(const char* config_json,
-                                          frt_model_runtime_v1** out) {
+                                          frt_model_runtime_v1** out) try {
     if (!out) {
         g_last_error = "out is null";
         return -1;
     }
     *out = nullptr;
     flashrt::models::pi05::NativeOpenConfig config;
-    const int rc = validate_config(config_json, &config);
+    const int rc = flashrt::models::pi05::parse_native_open_config(
+        config_json, &config, &g_last_error);
     if (rc != 0) return rc;
-#if defined(FLASHRT_CPP_WITH_FA2) && defined(FLASHRT_CPP_HAS_SENTENCEPIECE)
+#if defined(FLASHRT_CPP_HAS_SENTENCEPIECE) && \
+    (defined(FLASHRT_CPP_WITH_FA2) || defined(FLASHRT_CPP_WITH_THOR_FP8))
     return flashrt::models::pi05::build_native_model_runtime(
         config, out, &g_last_error);
 #else
     g_last_error =
-        "Pi0.5 native open validated config; this build requires native "
-        "FA2 and SentencePiece for graph capture";
+        "Pi0.5 native open validated config; this build requires "
+        "SentencePiece and a native graph backend";
     return -3;
 #endif
+} catch (const std::exception& error) {
+    if (out) *out = nullptr;
+    g_last_error = error.what();
+    return -6;
+} catch (...) {
+    if (out) *out = nullptr;
+    g_last_error = "Pi0.5 native open failed";
+    return -6;
 }
 
 extern "C" const char* frt_pi05_native_open_last_error() {

@@ -15,12 +15,19 @@ namespace flashrt {
 namespace models {
 namespace pi05 {
 
+enum class NativeWorkspaceFlavor {
+    kBf16,
+    kThorFp8,
+};
+
 struct NativeWorkspaceConfig {
     int num_views = 2;
     int max_prompt_tokens = 200;
     int chunk_size = 10;
     int num_steps = 10;
     int vision_pool_factor = 1;
+    NativeWorkspaceFlavor flavor = NativeWorkspaceFlavor::kBf16;
+    bool enable_calibration = false;
 };
 
 struct NativeWorkspaceBuffer {
@@ -39,6 +46,7 @@ public:
 
     modalities::Status allocate(const NativeWorkspaceConfig& config);
     modalities::Status update_decoder_rope(int prompt_tokens);
+    modalities::Status set_fixed_prompt_length(int prompt_tokens);
     modalities::Status expand_vision_position_embedding(
         const NativeDeviceWeightStore& weights);
     const NativeWorkspaceBuffer* find(const std::string& name) const;
@@ -49,6 +57,11 @@ public:
     int vision_sequence() const { return vision_sequence_; }
     int encoder_vision_sequence() const { return encoder_vision_sequence_; }
     int encoder_sequence() const { return encoder_sequence_; }
+    int total_keys() const { return encoder_sequence_ + chunk_size_; }
+    int num_views() const { return num_views_; }
+    int chunk_size() const { return chunk_size_; }
+    int num_steps() const { return num_steps_; }
+    NativeWorkspaceFlavor flavor() const { return flavor_; }
 
 private:
     modalities::Status add(const std::string& name,
@@ -70,7 +83,11 @@ private:
     int num_views_ = 0;
     int max_prompt_tokens_ = 0;
     int chunk_size_ = 0;
+    int num_steps_ = 0;
+    NativeWorkspaceFlavor flavor_ = NativeWorkspaceFlavor::kBf16;
     frt_buffer decoder_rope_buffer_ = nullptr;
+    frt_buffer prompt_embedding_buffer_ = nullptr;
+    frt_buffer prompt_length_buffers_[3] = {};
     std::vector<std::uint16_t> rope_table_;
 };
 
