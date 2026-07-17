@@ -122,6 +122,13 @@ Every pybind entry must have matching CMake target ownership.
   both sides: the target that was missing the symbols imports successfully,
   and the target that already had them does not fail with duplicate
   definitions.
+- Treat effective CUDA math options as part of each operation's numerical
+  contract. Before moving a source, compare inherited fast-math, FTZ,
+  precise-div/sqrt, contraction, optimization, and architecture flags. A
+  setup/calibration operation that requires precise rounding belongs in an
+  explicitly configured shared object target, even when hot kernels use more
+  aggressive math. Add a full-result bit-pattern test against an independently
+  compiled reference; source equality alone does not prove numerical parity.
 
 ### Kernel Alias And Shape Contracts
 

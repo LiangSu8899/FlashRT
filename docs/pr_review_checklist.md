@@ -205,6 +205,10 @@ Required:
   those kernels are truly shared.
 - Vendor-, architecture-, and precision-specific sources must be gated at the
   object-library or target level, not only at runtime.
+- Source moves must preserve the operation's effective compiler-math contract.
+  Compare inherited fast-math, FTZ, precise-div/sqrt, contraction,
+  optimization, and architecture flags; isolate precise setup/calibration
+  operations when their target differs from optimized hot kernels.
 - Gated `.cu` sources must not be referenced by unconditional pybind entries.
 - Dedicated modules are preferred for large model-specific kernel groups:
   `flash_rt_<model>_kernels`, `flash_rt_<feature>`, or similar.
@@ -220,6 +224,9 @@ Blockers:
 - CMake flag says OFF by default but sources still enter the default target.
 - Architecture-specific kernels compile into unsupported architecture targets.
 - Vendor-specific compile options leak into generic targets without a gate.
+- A source move silently changes compiler math semantics, or claims parity
+  from unchanged source without a result test against an independently
+  compiled reference.
 - Binding list and required-symbol list are not updated together.
 
 Build checks:
@@ -664,6 +671,8 @@ Before merge, verify:
 - [ ] Default build path still works.
 - [ ] Gated build path works if a gated feature is added.
 - [ ] Required symbols and bindings match CMake ownership.
+- [ ] Moved CUDA sources preserve their effective compiler-math contract and
+      have result-level numerical evidence.
 - [ ] New kernels are named and located according to ownership rules.
 - [ ] New model code follows frontend/pipeline split.
 - [ ] Optional dependencies are lazy imported.

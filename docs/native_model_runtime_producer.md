@@ -36,6 +36,23 @@ operations. It must not redefine model buffers or state semantics. New hardware
 therefore adds operation bindings and private requirements without cloning the
 semantic pipeline.
 
+### Operation compilation contracts
+
+An operation's numerical contract includes its effective compiler math mode,
+not only its source formula and launcher signature. Moving a CUDA source between
+targets requires comparing inherited options such as fast math, flush-to-zero,
+precise division/square root, contraction, and architecture code generation.
+Source-identical `pow`, trigonometric, normalization, or reduction code can
+produce different tables, scales, and quantized outputs under different modes.
+
+Keep a model-agnostic setup or calibration operation that requires precise
+rounding in a shared `csrc` target with explicit precise options. Optimized
+hot-path operations may remain in hardware-tuned targets; do not add a model or
+precision branch to compensate for a target-level math change. Protect the
+boundary with a result test against an independently compiled reference. When
+fixing a compiler-mode regression, also verify that restoring the incompatible
+option makes that test fail.
+
 ## Construction
 
 Use one existing construction path:
