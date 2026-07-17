@@ -490,8 +490,8 @@ ctest --test-dir cpp/build --output-on-failure
 
 Detailed real-checkpoint oracles are maintained in the
 [MindOn validation suite](https://github.com/LiangSu8899/MindOn-dev/tree/main/validation/pi05_cpp).
-Build their stage probes with
-`FLASHRT_CPP_BUILD_PI05_DIAGNOSTICS=ON`; default FlashRT builds retain contract,
+Build private stage probes from that suite's CMake overlay against the exact
+FlashRT source revision under test. Default FlashRT builds retain contract,
 lifecycle, calibration, final-result, and hot-path tests.
 
 Real-checkpoint oracle example:
@@ -499,7 +499,7 @@ Real-checkpoint oracle example:
 ```
 python <validation-root>/oracles/gate_pi05_native_weight_ops.py \
   --checkpoint <pi05 checkpoint> \
-  --probe cpp/build/pi05_native_weight_probe
+  --probe <validation-build-dir>/pi05_native_weight_probe
 ```
 
 ```
@@ -582,7 +582,7 @@ python <validation-root>/oracles/gate_pi05_tokenizer_corpus.py \
   --dataset <libero-lerobot-root> \
   --checkpoint <openpi-pytorch-checkpoint> \
   --tokenizer <tokenizer.model> \
-  --probe <build-dir>/pi05_tokenizer_corpus_probe \
+  --probe <validation-build-dir>/pi05_tokenizer_corpus_probe \
   --count 10000
 ```
 
@@ -602,7 +602,7 @@ python <validation-root>/oracles/gate_pi05_native_e2e.py \
   --checkpoint <openpi-pytorch-checkpoint> \
   --tokenizer <tokenizer.model> \
   --dataset <libero-lerobot-root> \
-  --probe <build-dir>/pi05_native_e2e_probe \
+  --probe <validation-build-dir>/pi05_native_e2e_probe \
   --episode 0 --frame 0
 ```
 
@@ -636,7 +636,7 @@ nsys stats --report cuda_gpu_trace --format csv \
   <native-report>.nsys-rep > <native-trace>.csv
 nsys stats --report cuda_gpu_trace --format csv \
   <python-report>.nsys-rep > <python-trace>.csv
-python cpp/tests/gate_pi05_kernel_sequence.py \
+python <validation-root>/perf/gate_pi05_kernel_sequence.py \
   --native <native-trace>.csv --python <python-trace>.csv
 ```
 

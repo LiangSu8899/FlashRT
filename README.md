@@ -578,9 +578,9 @@ NVFP4 weights directly from the Orbax checkpoint (no torch dependency at
 runtime) and uses the same two-phase multi-sample calibration flow as the
 torch FP4 path. Treat the table as Thor correctness / availability evidence,
 not a broad performance claim across every view count or host.
-Reproduce with
-[`tests/bench_pi05_thor_views.py`](tests/bench_pi05_thor_views.py)
-(defaults now include `jax_fp4`).
+The view-count benchmark is maintained in the
+[MindOn PI0.5 validation suite](https://github.com/LiangSu8899/MindOn-dev/tree/main/validation/pi05_cpp/perf)
+(`bench_pi05_thor_views.py`; defaults include `jax_fp4`).
 
 **What's next**:
 - Decoder FP4 (S2 precision-validated set — 72 weight tensors, ~-6 ms estimated)

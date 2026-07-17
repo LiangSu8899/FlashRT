@@ -59,10 +59,10 @@ useful for the same test matrix but is not a latency reference.
 
 For SM120, build the shared FA2 raw library first, then configure the C++ tree
 with `CMAKE_CUDA_ARCHITECTURES=120`, `FLASHRT_CPP_WITH_FA2=ON`, and
-`FLASHRT_CPP_FA2_LIBRARY=<libflashrt_fa2_raw.so>`. Detailed real-checkpoint
-diagnostic probes are opt-in through
-`FLASHRT_CPP_BUILD_PI05_DIAGNOSTICS=ON`; default builds retain the contract,
-lifecycle, calibration, final-result, and hot-path tests.
+`FLASHRT_CPP_FA2_LIBRARY=<libflashrt_fa2_raw.so>`. Default FlashRT builds retain
+the contract, lifecycle, calibration, final-result, and hot-path tests.
+Implementation-level probes and unit tests are built from the separate MindOn
+validation overlay and are not part of the product target graph.
 
 ## Native Configuration
 
@@ -349,8 +349,8 @@ ctest --test-dir "$BUILD_DIR" --output-on-failure
 
 Real-checkpoint producer oracles and profiling tools are maintained in the
 [MindOn validation suite](https://github.com/LiangSu8899/MindOn-dev/tree/main/validation/pi05_cpp).
-Configure diagnostic probes when an oracle needs a stage-level binary, then
-run the matching script. The public paths below are placeholders:
+Configure the validation overlay when an oracle needs a private stage-level
+binary, then run the matching script. The public paths below are placeholders:
 
 ```bash
 python <validation-root>/oracles/gate_pi05_native_thor_fp8.py \
