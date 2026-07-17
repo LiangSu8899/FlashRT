@@ -81,6 +81,36 @@ modalities::Status copy_prompt_to_encoder(NativeWorkspace* workspace,
                : backend("native prompt graph copy failed");
 }
 
+modalities::Status resolve_native_runtime_artifacts(
+    const NativeWorkspace& workspace,
+    const NativeDeviceWeightStore& weights,
+    NativeWeightDType embedding_dtype,
+    NativeRuntimeArtifacts* artifacts) {
+    if (!artifacts) {
+        return invalid("native runtime artifacts destination is null");
+    }
+    NativeRuntimeArtifacts result;
+    result.images = workspace.find("observation_images_normalized");
+    result.noise = workspace.find("diffusion_noise");
+    result.encoder = workspace.find("encoder_x");
+    result.previous_actions = workspace.find("rtc_prev_action_chunk");
+    result.prefix_weights = workspace.find("rtc_prefix_weights");
+    result.guidance_weight = workspace.find("rtc_guidance_weight");
+    result.prompt_embedding = workspace.find("prompt_embedding");
+    result.embedding_table = weights.find("embedding_weight");
+    if (!result.images || !result.noise || !result.encoder ||
+        !result.previous_actions || !result.prefix_weights ||
+        !result.guidance_weight || !result.prompt_embedding ||
+        !result.embedding_table ||
+        result.embedding_table->dtype != embedding_dtype ||
+        result.embedding_table->shape.size() != 2 ||
+        result.embedding_table->shape[1] != kEncoderWidth) {
+        return backend("native graph export buffers are incomplete");
+    }
+    *artifacts = result;
+    return modalities::Status::ok();
+}
+
 }  // namespace pi05
 }  // namespace models
 }  // namespace flashrt

@@ -46,6 +46,23 @@ modalities::Status capture_native_graph(
 modalities::Status copy_prompt_to_encoder(NativeWorkspace* workspace,
                                           void* stream);
 
+struct NativeRuntimeArtifacts {
+    const NativeWorkspaceBuffer* images = nullptr;
+    const NativeWorkspaceBuffer* noise = nullptr;
+    const NativeWorkspaceBuffer* encoder = nullptr;
+    const NativeWorkspaceBuffer* previous_actions = nullptr;
+    const NativeWorkspaceBuffer* prefix_weights = nullptr;
+    const NativeWorkspaceBuffer* guidance_weight = nullptr;
+    const NativeWorkspaceBuffer* prompt_embedding = nullptr;
+    const NativeDeviceWeight* embedding_table = nullptr;
+};
+
+modalities::Status resolve_native_runtime_artifacts(
+    const NativeWorkspace& workspace,
+    const NativeDeviceWeightStore& weights,
+    NativeWeightDType embedding_dtype,
+    NativeRuntimeArtifacts* artifacts);
+
 class NativeGraphRuntime {
 public:
     virtual ~NativeGraphRuntime() = default;
@@ -55,10 +72,7 @@ public:
     frt_graph infer_graph() const { return graph(NativeGraphKind::kInfer); }
     virtual int stream_id() const = 0;
     virtual void* native_stream() const = 0;
-    virtual NativeDeviceWeightStore& weights() = 0;
-    virtual const NativeDeviceWeightStore& weights() const = 0;
-    virtual NativeWorkspace& workspace() = 0;
-    virtual const NativeWorkspace& workspace() const = 0;
+    virtual const NativeRuntimeArtifacts& artifacts() const = 0;
     virtual modalities::Status set_prompt_length(int prompt_tokens) = 0;
     virtual int replay(NativeGraphKind kind = NativeGraphKind::kInfer) const = 0;
     virtual modalities::Status synchronize() const = 0;

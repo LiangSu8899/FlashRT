@@ -180,6 +180,10 @@ modalities::Status NativeThorGraphOwner::initialize(
     if (!st.ok_status()) return st;
     report("workspace_style");
 
+    st = resolve_native_runtime_artifacts(
+        workspace_, weights_, NativeWeightDType::kFloat16, &artifacts_);
+    if (!st.ok_status()) return st;
+
     for (const char* name : {"observation_images_normalized",
                              "prompt_embedding", "diffusion_noise"}) {
         const NativeWorkspaceBuffer* input = workspace_.find(name);

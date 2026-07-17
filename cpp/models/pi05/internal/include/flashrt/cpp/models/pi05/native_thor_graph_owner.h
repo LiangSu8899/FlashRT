@@ -32,10 +32,13 @@ public:
     }
     int stream_id() const override { return graphs_.stream_id(); }
     void* native_stream() const override { return graphs_.native_stream(); }
-    NativeDeviceWeightStore& weights() override { return weights_; }
-    const NativeDeviceWeightStore& weights() const override { return weights_; }
-    NativeWorkspace& workspace() override { return workspace_; }
-    const NativeWorkspace& workspace() const override { return workspace_; }
+    NativeDeviceWeightStore& weights() { return weights_; }
+    const NativeDeviceWeightStore& weights() const { return weights_; }
+    NativeWorkspace& workspace() { return workspace_; }
+    const NativeWorkspace& workspace() const { return workspace_; }
+    const NativeRuntimeArtifacts& artifacts() const override {
+        return artifacts_;
+    }
 
     modalities::Status set_prompt_length(int prompt_tokens) override;
     int replay(NativeGraphKind kind = NativeGraphKind::kInfer) const override;
@@ -56,6 +59,7 @@ private:
     NativeGraphConfig config_;
     NativeDeviceWeightStore weights_;
     NativeWorkspace workspace_;
+    NativeRuntimeArtifacts artifacts_;
     NativeThorKernelDriver driver_;
     NativeThorFp8Forward forward_;
     NativeThorWeightScales weight_scales_;

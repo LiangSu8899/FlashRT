@@ -280,6 +280,10 @@ modalities::Status NativeGraphOwner::initialize(
     }
     report("workspace_style");
 
+    st = resolve_native_runtime_artifacts(
+        workspace_, weights_, NativeWeightDType::kBf16, &artifacts_);
+    if (!st.ok_status()) return st;
+
     for (const char* name : {"observation_images_normalized",
                              "prompt_embedding", "encoder_x",
                              "diffusion_noise"}) {

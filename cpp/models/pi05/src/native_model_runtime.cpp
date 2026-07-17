@@ -8,6 +8,7 @@
 #include "flashrt/cpp/models/pi05/model_runtime.h"
 #include "flashrt/cpp/models/pi05/native_calibration.h"
 #include "flashrt/cpp/models/pi05/native_graph_runtime.h"
+#include "flashrt/cpp/models/pi05/spec.h"
 #if defined(FLASHRT_CPP_WITH_FA2)
 #include "flashrt/cpp/models/pi05/native_graph_owner.h"
 #endif
@@ -27,12 +28,6 @@ namespace flashrt {
 namespace models {
 namespace pi05 {
 namespace {
-
-const NativeWorkspaceBuffer* workspace_buffer(
-    const NativeGraphRuntime& owner,
-    const char* name) {
-    return owner.workspace().find(name);
-}
 
 void release_graph_owner(void* owner) {
     delete static_cast<NativeGraphRuntime*>(owner);
@@ -248,30 +243,15 @@ int build_native_model_runtime(const NativeOpenConfig& config,
         return -2;
     }
 
-    const NativeWorkspaceBuffer* images =
-        workspace_buffer(*graph, "observation_images_normalized");
-    const NativeWorkspaceBuffer* noise =
-        workspace_buffer(*graph, "diffusion_noise");
-    const NativeWorkspaceBuffer* encoder =
-        workspace_buffer(*graph, "encoder_x");
-    const NativeWorkspaceBuffer* previous =
-        workspace_buffer(*graph, "rtc_prev_action_chunk");
-    const NativeWorkspaceBuffer* prefix_weights =
-        workspace_buffer(*graph, "rtc_prefix_weights");
-    const NativeWorkspaceBuffer* guidance =
-        workspace_buffer(*graph, "rtc_guidance_weight");
-    const NativeWorkspaceBuffer* prompt =
-        workspace_buffer(*graph, "prompt_embedding");
-    const NativeDeviceWeight* embedding = graph->weights().find(
-        "embedding_weight");
-    if (!images || !noise || !encoder || !previous || !prefix_weights ||
-        !guidance || !prompt || !embedding ||
-        embedding->dtype != (thor_fp8 ? NativeWeightDType::kFloat16
-                                      : NativeWeightDType::kBf16) ||
-        embedding->shape.size() != 2 || embedding->shape[1] != 2048) {
-        if (error) *error = "native graph export buffers are incomplete";
-        return -6;
-    }
+    const NativeRuntimeArtifacts& artifacts = graph->artifacts();
+    const NativeWorkspaceBuffer* images = artifacts.images;
+    const NativeWorkspaceBuffer* noise = artifacts.noise;
+    const NativeWorkspaceBuffer* encoder = artifacts.encoder;
+    const NativeWorkspaceBuffer* previous = artifacts.previous_actions;
+    const NativeWorkspaceBuffer* prefix_weights = artifacts.prefix_weights;
+    const NativeWorkspaceBuffer* guidance = artifacts.guidance_weight;
+    const NativeWorkspaceBuffer* prompt = artifacts.prompt_embedding;
+    const NativeDeviceWeight* embedding = artifacts.embedding_table;
 
     frt_runtime_builder builder = frt_runtime_builder_create(graph->context());
     if (!builder) {
@@ -353,7 +333,8 @@ int build_native_model_runtime(const NativeOpenConfig& config,
          add_identity(builder, "num_steps", std::to_string(config.num_steps)) &&
          add_identity(builder, "vision_pool_factor",
                       std::to_string(config.vision_pool_factor)) &&
-         add_identity(builder, "model_action_dim", "32") &&
+         add_identity(builder, "model_action_dim",
+                      std::to_string(kModelActionDim)) &&
          add_identity(builder, "robot_action_dim",
                       std::to_string(config.action_q01.size()));
     if (ok && fp8) {
@@ -385,8 +366,10 @@ int build_native_model_runtime(const NativeOpenConfig& config,
 
     const int64_t prompt_shape[] = {-1};
     const int64_t state_shape[] = {config.state_dim};
-    const int64_t image_shape[] = {config.num_views, 224, 224, 3};
-    const int64_t raw_action_shape[] = {config.chunk, 32};
+    const int64_t image_shape[] = {
+        config.num_views, kImageSize, kImageSize, 3};
+    const int64_t raw_action_shape[] = {
+        config.chunk, kModelActionDim};
     const int64_t action_shape[] = {
         config.chunk, static_cast<int64_t>(config.action_q01.size())};
     const std::uint64_t action_bytes =
@@ -455,7 +438,7 @@ int build_native_model_runtime(const NativeOpenConfig& config,
     runtime_config.struct_size = sizeof(runtime_config);
     runtime_config.num_views = config.num_views;
     runtime_config.chunk = config.chunk;
-    runtime_config.model_action_dim = 32;
+    runtime_config.model_action_dim = kModelActionDim;
     runtime_config.robot_action_dim = static_cast<int>(action_mean.size());
     runtime_config.action_mean = action_mean.data();
     runtime_config.n_action_mean = action_mean.size();
@@ -478,12 +461,13 @@ int build_native_model_runtime(const NativeOpenConfig& config,
         frt_buffer_bytes(embedding->buffer);
     runtime_config.prompt_embedding_table_dtype = runtime_dtype;
     runtime_config.prompt_embedding_vocab_size = embedding->shape[0];
-    runtime_config.prompt_embedding_hidden_dim = 2048;
+    runtime_config.prompt_embedding_hidden_dim = kEncoderWidth;
     runtime_config.prompt_embedding_data = frt_buffer_dptr(prompt->buffer);
     runtime_config.prompt_embedding_bytes = frt_buffer_bytes(prompt->buffer);
     runtime_config.prompt_embedding_dtype = runtime_dtype;
     runtime_config.max_prompt_tokens = config.max_prompt_tokens;
-    runtime_config.prompt_embedding_scale = std::sqrt(2048.0f);
+    runtime_config.prompt_embedding_scale =
+        std::sqrt(static_cast<float>(kEncoderWidth));
     runtime_config.state_q01 = config.state_q01.data();
     runtime_config.n_state_q01 = config.state_q01.size();
     runtime_config.state_q99 = config.state_q99.data();
