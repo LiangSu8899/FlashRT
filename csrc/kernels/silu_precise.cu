@@ -17,7 +17,7 @@ __global__ void precise_silu_fp16_kernel(__half* values,
 
 }  // namespace
 
-extern "C" cudaError_t frt_pi05_precise_silu_fp16(
+extern "C" cudaError_t flashrt_silu_inplace_fp16_precise(
     __half* values, std::size_t elements, cudaStream_t stream) {
     if (!values || !elements) return cudaErrorInvalidValue;
     constexpr unsigned int kBlock = 256;

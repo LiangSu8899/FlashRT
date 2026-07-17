@@ -23,17 +23,6 @@ namespace models {
 namespace pi05 {
 namespace {
 
-__global__ void native_silu_bf16_kernel(__nv_bfloat16* values,
-                                        std::size_t elements) {
-    const std::size_t index =
-        static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (index < elements) {
-        const float value = __bfloat162float(values[index]);
-        values[index] =
-            __float2bfloat16(value / (1.0f + expf(-value)));
-    }
-}
-
 modalities::Status invalid(const char* message) {
     return modalities::Status::error(modalities::StatusCode::kInvalidArgument,
                                      message);
@@ -222,12 +211,13 @@ modalities::Status NativeKernelDriver::silu_bf16(
     std::size_t elements,
     std::uintptr_t stream) const {
     if (!impl_) return backend(error_);
-    if (!values || !elements) {
+    if (!values || !elements ||
+        elements > static_cast<std::size_t>(INT_MAX)) {
         return invalid("native BF16 SiLU arguments are invalid");
     }
-    native_silu_bf16_kernel<<<(elements + 255) / 256, 256, 0,
-                              reinterpret_cast<cudaStream_t>(stream)>>>(
-        static_cast<__nv_bfloat16*>(values), elements);
+    ::silu_inplace_bf16(static_cast<__nv_bfloat16*>(values),
+                        static_cast<int>(elements),
+                        reinterpret_cast<cudaStream_t>(stream));
     return launch_status();
 }
 

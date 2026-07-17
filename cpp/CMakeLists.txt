@@ -190,6 +190,94 @@ if(FLASHRT_CPP_WITH_CUDA_KERNELS)
     PUBLIC flashrt_cpp_modalities flashrt_exec CUDA::cudart)
 endif()
 
+if(FLASHRT_CPP_WITH_CUDA_KERNELS AND
+   (FLASHRT_CPP_WITH_FA2 OR FLASHRT_CPP_WITH_THOR_FP8))
+  set(_flashrt_csrc_dir "${CMAKE_CURRENT_SOURCE_DIR}/../csrc")
+
+  function(_flashrt_configure_csrc_target target)
+    target_include_directories(${target} PUBLIC
+      ${_flashrt_csrc_dir}
+      ${_flashrt_csrc_dir}/attention
+      ${_flashrt_csrc_dir}/gemm
+      ${_flashrt_csrc_dir}/kernels)
+    target_link_libraries(${target} PUBLIC
+      CUDA::cublas CUDA::cublasLt CUDA::cudart)
+    target_compile_options(${target} PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:
+        --expt-relaxed-constexpr -O3
+        --ftz=true --prec-div=false --prec-sqrt=false>)
+    set_target_properties(${target} PROPERTIES
+      CUDA_STANDARD 17
+      CUDA_STANDARD_REQUIRED ON)
+  endfunction()
+
+  add_library(flashrt_cpp_csrc_core STATIC
+    ${_flashrt_csrc_dir}/gemm/gemm_runner.cu
+    ${_flashrt_csrc_dir}/kernels/activation.cu
+    ${_flashrt_csrc_dir}/kernels/elementwise.cu
+    ${_flashrt_csrc_dir}/kernels/norm.cu
+    ${_flashrt_csrc_dir}/kernels/patch_embed.cu
+    ${_flashrt_csrc_dir}/kernels/quantize.cu
+    ${_flashrt_csrc_dir}/kernels/rope.cu)
+  _flashrt_configure_csrc_target(flashrt_cpp_csrc_core)
+  if(FLASHRT_CPP_WITH_THOR_FP8)
+    target_compile_options(flashrt_cpp_csrc_core PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:
+        --expt-extended-lambda --use_fast_math
+        -gencode=arch=compute_110a,code=sm_110a>)
+    set_target_properties(flashrt_cpp_csrc_core PROPERTIES
+      CUDA_ARCHITECTURES 110a)
+  endif()
+
+  if(FLASHRT_CPP_WITH_FA2)
+    add_library(flashrt_cpp_csrc_sm120 STATIC
+      ${_flashrt_csrc_dir}/kernels/dit_bf16.cu
+      ${_flashrt_csrc_dir}/kernels/fusion.cu)
+    _flashrt_configure_csrc_target(flashrt_cpp_csrc_sm120)
+    target_link_libraries(flashrt_cpp_csrc_sm120
+      PUBLIC flashrt_cpp_csrc_core)
+  endif()
+
+  if(FLASHRT_CPP_WITH_THOR_FP8)
+    add_library(flashrt_cpp_csrc_sm110_precise OBJECT
+      ${_flashrt_csrc_dir}/attention/fmha_fp16_strided.cu
+      ${_flashrt_csrc_dir}/kernels/silu_precise.cu)
+    target_include_directories(flashrt_cpp_csrc_sm110_precise PRIVATE
+      ${_flashrt_csrc_dir}/attention
+      ${FLASHRT_CPP_CUTLASS_DIR}/examples/77_blackwell_fmha
+      ${FLASHRT_CPP_CUTLASS_DIR}/include
+      ${FLASHRT_CPP_CUTLASS_DIR}/tools/util/include)
+    target_compile_options(flashrt_cpp_csrc_sm110_precise PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:
+        --expt-relaxed-constexpr --expt-extended-lambda -O3>)
+    set_target_properties(flashrt_cpp_csrc_sm110_precise PROPERTIES
+      CUDA_ARCHITECTURES 110a
+      CUDA_STANDARD 17
+      CUDA_STANDARD_REQUIRED ON)
+
+    add_library(flashrt_cpp_csrc_sm110 STATIC
+      $<TARGET_OBJECTS:flashrt_cpp_csrc_sm110_precise>
+      ${_flashrt_csrc_dir}/gemm/cutlass_sm100.cu
+      ${_flashrt_csrc_dir}/kernels/attention_cublas.cu
+      ${_flashrt_csrc_dir}/kernels/decoder_fused.cu
+      ${_flashrt_csrc_dir}/kernels/softmax.cu)
+    _flashrt_configure_csrc_target(flashrt_cpp_csrc_sm110)
+    target_include_directories(flashrt_cpp_csrc_sm110 PRIVATE
+      ${FLASHRT_CPP_CUTLASS_DIR}/examples/77_blackwell_fmha
+      ${FLASHRT_CPP_CUTLASS_DIR}/include
+      ${FLASHRT_CPP_CUTLASS_DIR}/tools/util/include)
+    target_link_libraries(flashrt_cpp_csrc_sm110
+      PUBLIC flashrt_cpp_csrc_core)
+    target_compile_options(flashrt_cpp_csrc_sm110 PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:
+        --expt-extended-lambda --use_fast_math
+        -gencode=arch=compute_110a,code=sm_110a>)
+    set_target_properties(flashrt_cpp_csrc_sm110 PROPERTIES
+      CUDA_ARCHITECTURES 110a
+      CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+  endif()
+endif()
+
 add_library(flashrt_cpp_loader STATIC
   loader/src/safetensors.cpp
   loader/src/sha256.cpp)

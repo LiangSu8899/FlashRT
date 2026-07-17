@@ -32,9 +32,6 @@ extern "C" int cutlass_fp8_plain(void*, void*, void*, int, int, int, float,
 extern "C" int fmha_fp16_strided(
     const void*, const void*, const void*, void*, int, int, int, int, int,
     int, int, int, cudaStream_t);
-extern "C" cudaError_t frt_pi05_precise_silu_fp16(
-    __half*, std::size_t, cudaStream_t);
-void silu_inplace_fp16(__half*, int, cudaStream_t);
 
 namespace flashrt {
 namespace models {
@@ -357,7 +354,7 @@ modalities::Status NativeThorKernelDriver::precise_silu_fp16(
     if (!values || !elements || elements > INT_MAX) {
         return invalid("Thor precise FP16 SiLU arguments are invalid");
     }
-    const cudaError_t rc = frt_pi05_precise_silu_fp16(
+    const cudaError_t rc = flashrt_silu_inplace_fp16_precise(
         static_cast<__half*>(values), elements,
         reinterpret_cast<cudaStream_t>(stream));
     return rc == cudaSuccess ? modalities::Status::ok()

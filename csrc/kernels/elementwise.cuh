@@ -5,6 +5,8 @@
 // ================================================================
 #pragma once
 
+#include <cstddef>
+
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
@@ -436,6 +438,9 @@ void bias_gate_mul_residual_fp16(__half* residual,
 
 void residual_add_fp16(__half* residual, const __half* x, int n,
                        cudaStream_t stream = 0);
+
+void fill_negative_infinity_f32(float* values, std::size_t count,
+                                cudaStream_t stream = 0);
 
 // ── Classifier-Free Guidance combine ──
 // In-place: noise[i] += v_uncond[i] + beta * (v_cond[i] - v_uncond[i])

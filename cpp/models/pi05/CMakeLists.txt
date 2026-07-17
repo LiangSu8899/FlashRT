@@ -23,8 +23,12 @@ set(_pi05_sources
   src/backend/native_calibration_session.cpp)
 if(FLASHRT_CPP_WITH_CUDA_KERNELS)
   list(APPEND _pi05_sources
-    src/support/native_quantization.cu
-    src/support/native_rope.cu)
+    src/support/native_quantization.cu)
+  if(FLASHRT_CPP_WITH_FA2 OR FLASHRT_CPP_WITH_THOR_FP8)
+    list(APPEND _pi05_sources src/support/native_rope.cu)
+  else()
+    list(APPEND _pi05_sources src/support/native_rope_unavailable.cpp)
+  endif()
 else()
   list(APPEND _pi05_sources
     src/support/native_quantization_unavailable.cpp
@@ -37,6 +41,12 @@ target_include_directories(flashrt_cpp_pi05
   PRIVATE ${_pi05_internal_include})
 target_link_libraries(flashrt_cpp_pi05
   PUBLIC flashrt_cpp_modalities flashrt_cpp_vla flashrt_cpp_loader)
+if(FLASHRT_CPP_WITH_CUDA_KERNELS AND
+   (FLASHRT_CPP_WITH_FA2 OR FLASHRT_CPP_WITH_THOR_FP8))
+  target_include_directories(flashrt_cpp_pi05 PRIVATE
+    ${FLASHRT_CPP_SOURCE_DIR}/../csrc/kernels)
+  target_link_libraries(flashrt_cpp_pi05 PRIVATE flashrt_cpp_csrc_core)
+endif()
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   # Preserve producer-side add/cast/multiply operation boundaries.
   set_property(SOURCE src/support/native_weight_ops.cpp APPEND PROPERTY
@@ -67,24 +77,8 @@ if(FLASHRT_CPP_WITH_CUDA_KERNELS)
 
   if(FLASHRT_CPP_WITH_FA2 OR FLASHRT_CPP_WITH_THOR_FP8)
     add_library(flashrt_cpp_pi05_backend_cuda STATIC
-      src/backend/session.cpp
-      ${FLASHRT_CPP_SOURCE_DIR}/../csrc/gemm/gemm_runner.cu
-      ${FLASHRT_CPP_SOURCE_DIR}/../csrc/kernels/activation.cu
-      ${FLASHRT_CPP_SOURCE_DIR}/../csrc/kernels/elementwise.cu
-      ${FLASHRT_CPP_SOURCE_DIR}/../csrc/kernels/norm.cu
-      ${FLASHRT_CPP_SOURCE_DIR}/../csrc/kernels/patch_embed.cu
-      ${FLASHRT_CPP_SOURCE_DIR}/../csrc/kernels/quantize.cu
-      ${FLASHRT_CPP_SOURCE_DIR}/../csrc/kernels/rope.cu)
+      src/backend/session.cpp)
     _flashrt_configure_pi05_cuda_target(flashrt_cpp_pi05_backend_cuda)
-
-    if(FLASHRT_CPP_WITH_THOR_FP8)
-      target_compile_options(flashrt_cpp_pi05_backend_cuda PRIVATE
-        $<$<COMPILE_LANGUAGE:CUDA>:
-          --expt-extended-lambda --use_fast_math
-          -gencode=arch=compute_110a,code=sm_110a>)
-      set_target_properties(flashrt_cpp_pi05_backend_cuda PROPERTIES
-        CUDA_ARCHITECTURES 110a)
-    endif()
   endif()
 
   if(FLASHRT_CPP_WITH_FA2)
@@ -97,9 +91,7 @@ if(FLASHRT_CPP_WITH_CUDA_KERNELS)
       src/backends/sm120/native_rtx_autotune.cpp
       src/backends/sm120/native_rtx_linear.cpp
       src/backends/sm120/native_rtx_weight_packer.cpp
-      src/backends/sm120/native_style_precompute.cu
-      ${FLASHRT_CPP_SOURCE_DIR}/../csrc/kernels/dit_bf16.cu
-      ${FLASHRT_CPP_SOURCE_DIR}/../csrc/kernels/fusion.cu)
+      src/backends/sm120/native_style_precompute.cu)
     if(FLASHRT_CPP_WITH_SENTENCEPIECE)
       target_sources(flashrt_cpp_pi05_backend_sm120 PRIVATE
         src/backends/sm120/native_rtx_calibration_session.cpp)
@@ -108,42 +100,21 @@ if(FLASHRT_CPP_WITH_CUDA_KERNELS)
     target_include_directories(flashrt_cpp_pi05_backend_sm120 PRIVATE
       ${FLASHRT_CPP_SOURCE_DIR}/../csrc)
     target_link_libraries(flashrt_cpp_pi05_backend_sm120 PUBLIC
-      flashrt_cpp_pi05_backend_cuda flashrt_cpp_fa2_external)
+      flashrt_cpp_pi05_backend_cuda flashrt_cpp_csrc_sm120
+      flashrt_cpp_fa2_external)
     target_compile_definitions(flashrt_cpp_pi05_backend_sm120
       PUBLIC FLASHRT_CPP_WITH_FA2=1)
     list(APPEND _pi05_backend_targets flashrt_cpp_pi05_backend_sm120)
   endif()
 
   if(FLASHRT_CPP_WITH_THOR_FP8)
-    add_library(flashrt_cpp_pi05_thor_precise OBJECT
-      src/backends/sm110/native_thor_setup_ops.cu
-      ${FLASHRT_CPP_SOURCE_DIR}/../csrc/attention/fmha_fp16_strided.cu)
-    target_include_directories(flashrt_cpp_pi05_thor_precise PRIVATE
-      ${FLASHRT_CPP_SOURCE_DIR}/../csrc/attention
-      ${FLASHRT_CPP_CUTLASS_DIR}/examples/77_blackwell_fmha
-      ${FLASHRT_CPP_CUTLASS_DIR}/include
-      ${FLASHRT_CPP_CUTLASS_DIR}/tools/util/include)
-    target_compile_options(flashrt_cpp_pi05_thor_precise PRIVATE
-      $<$<COMPILE_LANGUAGE:CUDA>:
-        --expt-relaxed-constexpr --expt-extended-lambda -O3>)
-    set_target_properties(flashrt_cpp_pi05_thor_precise PROPERTIES
-      CUDA_ARCHITECTURES 110a
-      CUDA_STANDARD 17
-      CUDA_STANDARD_REQUIRED ON
-      POSITION_INDEPENDENT_CODE ON)
-
     add_library(flashrt_cpp_pi05_backend_sm110 STATIC
-      $<TARGET_OBJECTS:flashrt_cpp_pi05_thor_precise>
       src/backends/sm110/native_thor_kernel_driver.cu
       src/backends/sm110/native_thor_weight_materializer.cpp
       src/backends/sm110/native_thor_fp8_forward.cpp
       src/backends/sm110/session.cpp
       src/backends/sm110/native_thor_calibration_session.cpp
-      src/backends/sm110/native_thor_style_precompute.cpp
-      ${FLASHRT_CPP_SOURCE_DIR}/../csrc/gemm/cutlass_sm100.cu
-      ${FLASHRT_CPP_SOURCE_DIR}/../csrc/kernels/attention_cublas.cu
-      ${FLASHRT_CPP_SOURCE_DIR}/../csrc/kernels/decoder_fused.cu
-      ${FLASHRT_CPP_SOURCE_DIR}/../csrc/kernels/softmax.cu)
+      src/backends/sm110/native_thor_style_precompute.cpp)
     _flashrt_configure_pi05_cuda_target(flashrt_cpp_pi05_backend_sm110)
     target_include_directories(flashrt_cpp_pi05_backend_sm110 PRIVATE
       ${FLASHRT_CPP_SOURCE_DIR}/../csrc/attention
@@ -151,7 +122,8 @@ if(FLASHRT_CPP_WITH_CUDA_KERNELS)
       ${FLASHRT_CPP_CUTLASS_DIR}/include
       ${FLASHRT_CPP_CUTLASS_DIR}/tools/util/include)
     target_link_libraries(flashrt_cpp_pi05_backend_sm110 PUBLIC
-      flashrt_cpp_pi05_backend_cuda)
+      flashrt_cpp_pi05_backend_cuda
+      flashrt_cpp_csrc_sm110)
     target_compile_definitions(flashrt_cpp_pi05_backend_sm110
       PUBLIC FLASHRT_CPP_WITH_THOR_FP8=1)
     target_compile_options(flashrt_cpp_pi05_backend_sm110 PRIVATE

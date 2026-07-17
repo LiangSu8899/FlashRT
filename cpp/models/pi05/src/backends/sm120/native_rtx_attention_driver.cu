@@ -1,6 +1,7 @@
 #include "flashrt/cpp/models/pi05/backends/sm120/native_rtx_attention_driver.h"
 
 #include "attention/fa2_wrapper.h"
+#include "elementwise.cuh"
 
 #include <cuda_runtime_api.h>
 
@@ -25,12 +26,6 @@ modalities::Status launch_status() {
     const cudaError_t rc = cudaGetLastError();
     return rc == cudaSuccess ? modalities::Status::ok()
                              : backend(cudaGetErrorString(rc));
-}
-
-__global__ void fill_negative_infinity(float* values, std::size_t count) {
-    const std::size_t index =
-        static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (index < count) values[index] = __int_as_float(0xff800000);
 }
 
 bool exact_shape(const NativeAttentionBuffer* buffer,
@@ -173,9 +168,9 @@ modalities::Status NativeRtxAttentionDriver::decoder(
     }
     const std::size_t accum_count =
         frt_buffer_bytes(lse_accum->buffer) / sizeof(float);
-    fill_negative_infinity<<<(accum_count + 255) / 256, 256, 0,
-                              reinterpret_cast<cudaStream_t>(stream)>>>(
-        static_cast<float*>(frt_buffer_dptr(lse_accum->buffer)), accum_count);
+    ::fill_negative_infinity_f32(
+        static_cast<float*>(frt_buffer_dptr(lse_accum->buffer)), accum_count,
+        reinterpret_cast<cudaStream_t>(stream));
     cudaError_t rc = cudaGetLastError();
     if (rc != cudaSuccess) return backend(cudaGetErrorString(rc));
 
