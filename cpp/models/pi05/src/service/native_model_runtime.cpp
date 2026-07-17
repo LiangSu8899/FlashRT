@@ -7,13 +7,13 @@
 #include "flashrt/cpp/loader/sha256.h"
 #include "flashrt/cpp/models/pi05/model_runtime.h"
 #include "flashrt/cpp/models/pi05/support/native_calibration.h"
-#include "flashrt/cpp/models/pi05/backend/session.h"
+#include "flashrt/cpp/models/pi05/model/pipeline.h"
 #include "flashrt/cpp/models/pi05/model/spec.h"
 #if defined(FLASHRT_CPP_WITH_FA2)
-#include "flashrt/cpp/models/pi05/backends/sm120/session.h"
+#include "flashrt/cpp/models/pi05/plans/sm120/lowered_plan.h"
 #endif
 #if defined(FLASHRT_CPP_WITH_THOR_FP8)
-#include "flashrt/cpp/models/pi05/backends/sm110/session.h"
+#include "flashrt/cpp/models/pi05/plans/sm110/lowered_plan.h"
 #endif
 
 #include <cuda_runtime_api.h>
@@ -198,15 +198,15 @@ int build_native_model_runtime(const NativeOpenConfig& config,
         }
     }
 
-    BackendConfig graph_config;
+    Pi05PipelineConfig graph_config;
     graph_config.num_views = config.num_views;
     graph_config.max_prompt_tokens = config.max_prompt_tokens;
     graph_config.chunk_size = config.chunk;
     graph_config.num_steps = config.num_steps;
     graph_config.vision_pool_factor = config.vision_pool_factor;
     graph_config.precision = precision == Precision::kFp8E4M3Fn
-                                 ? BackendPrecision::kFp8E4M3
-                                 : BackendPrecision::kBf16;
+                                 ? Pi05Precision::kFp8E4M3
+                                 : Pi05Precision::kBf16;
     modalities::Status st;
     std::unique_ptr<Pi05Pipeline> graph;
     const bool thor_fp8 = precision == Precision::kFp8E4M3Fn &&
@@ -216,15 +216,15 @@ int build_native_model_runtime(const NativeOpenConfig& config,
     if (precision == Precision::kBf16 || rtx_fp8) {
 #if defined(FLASHRT_CPP_WITH_FA2)
         graph = rtx_fp8
-                    ? Sm120BackendSession::create(
+                    ? Sm120LoweredPlan::create(
                           config.checkpoint_path, graph_config, calibration,
                           &st)
-                    : Sm120BackendSession::create(
+                    : Sm120LoweredPlan::create(
                           config.checkpoint_path, graph_config, &st);
 #endif
     } else if (thor_fp8) {
 #if defined(FLASHRT_CPP_WITH_THOR_FP8)
-        graph = Sm110BackendSession::create(
+        graph = Sm110LoweredPlan::create(
             config.checkpoint_path, graph_config, calibration, &st);
 #endif
     }
@@ -243,7 +243,7 @@ int build_native_model_runtime(const NativeOpenConfig& config,
         return -2;
     }
 
-    const BackendArtifacts& artifacts = graph->artifacts();
+    const PipelineArtifacts& artifacts = graph->artifacts();
     const NativeWorkspaceBuffer* images = artifacts.images;
     const NativeWorkspaceBuffer* noise = artifacts.noise;
     const NativeWorkspaceBuffer* encoder = artifacts.encoder;
@@ -264,15 +264,15 @@ int build_native_model_runtime(const NativeOpenConfig& config,
             builder, "main", graph->stream_id(), 0,
             graph->native_stream()) == 0 &&
         frt_runtime_builder_add_graph(
-            builder, backend_graph_name(GraphKind::kInfer),
+            builder, pipeline_graph_name(GraphKind::kInfer),
             graph->graph(GraphKind::kInfer), 0, keys, 1,
             graph->stream_id()) == 0 &&
         frt_runtime_builder_add_graph(
-            builder, backend_graph_name(GraphKind::kDecodeOnly),
+            builder, pipeline_graph_name(GraphKind::kDecodeOnly),
             graph->graph(GraphKind::kDecodeOnly), 0, keys, 1,
             graph->stream_id()) == 0 &&
         frt_runtime_builder_add_graph(
-            builder, backend_graph_name(GraphKind::kContext),
+            builder, pipeline_graph_name(GraphKind::kContext),
             graph->graph(GraphKind::kContext), 0, keys, 1,
             graph->stream_id()) == 0 &&
         frt_runtime_builder_add_buffer(

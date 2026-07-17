@@ -72,72 +72,72 @@ if(FLASHRT_CPP_WITH_CUDA_KERNELS)
         --ftz=true --prec-div=false --prec-sqrt=false>)
   endfunction()
 
-  add_library(flashrt_cpp_pi05_kernels INTERFACE)
-  set(_pi05_backend_targets)
+  add_library(flashrt_cpp_pi05_plans INTERFACE)
+  set(_pi05_plan_targets)
 
   if(FLASHRT_CPP_WITH_FA2 OR FLASHRT_CPP_WITH_THOR_FP8)
-    add_library(flashrt_cpp_pi05_backend_cuda STATIC
-      src/backend/session.cpp)
-    _flashrt_configure_pi05_cuda_target(flashrt_cpp_pi05_backend_cuda)
+    add_library(flashrt_cpp_pi05_pipeline_cuda STATIC
+      src/model/pipeline.cpp)
+    _flashrt_configure_pi05_cuda_target(flashrt_cpp_pi05_pipeline_cuda)
   endif()
 
   if(FLASHRT_CPP_WITH_FA2)
-    add_library(flashrt_cpp_pi05_backend_sm120 STATIC
-      src/backends/sm120/native_bf16_forward.cpp
-      src/backends/sm120/session.cpp
-      src/backends/sm120/native_kernel_driver.cu
-      src/backends/sm120/native_rtx_attention.cpp
-      src/backends/sm120/native_rtx_attention_driver.cu
-      src/backends/sm120/native_rtx_autotune.cpp
-      src/backends/sm120/native_rtx_linear.cpp
-      src/backends/sm120/native_rtx_weight_packer.cpp
-      src/backends/sm120/native_style_precompute.cu)
+    add_library(flashrt_cpp_pi05_plan_sm120 STATIC
+      src/plans/sm120/native_bf16_forward.cpp
+      src/plans/sm120/lowered_plan.cpp
+      src/plans/sm120/native_kernel_driver.cu
+      src/plans/sm120/native_rtx_attention.cpp
+      src/plans/sm120/native_rtx_attention_driver.cu
+      src/plans/sm120/native_rtx_autotune.cpp
+      src/plans/sm120/native_rtx_linear.cpp
+      src/plans/sm120/native_rtx_weight_packer.cpp
+      src/plans/sm120/native_style_precompute.cu)
     if(FLASHRT_CPP_WITH_SENTENCEPIECE)
-      target_sources(flashrt_cpp_pi05_backend_sm120 PRIVATE
-        src/backends/sm120/native_rtx_calibration_session.cpp)
+      target_sources(flashrt_cpp_pi05_plan_sm120 PRIVATE
+        src/plans/sm120/native_rtx_calibration_session.cpp)
     endif()
-    _flashrt_configure_pi05_cuda_target(flashrt_cpp_pi05_backend_sm120)
-    target_include_directories(flashrt_cpp_pi05_backend_sm120 PRIVATE
+    _flashrt_configure_pi05_cuda_target(flashrt_cpp_pi05_plan_sm120)
+    target_include_directories(flashrt_cpp_pi05_plan_sm120 PRIVATE
       ${FLASHRT_CPP_SOURCE_DIR}/../csrc)
-    target_link_libraries(flashrt_cpp_pi05_backend_sm120 PUBLIC
-      flashrt_cpp_pi05_backend_cuda flashrt_cpp_csrc_sm120
+    target_link_libraries(flashrt_cpp_pi05_plan_sm120 PUBLIC
+      flashrt_cpp_pi05_pipeline_cuda flashrt_cpp_csrc_sm120
       flashrt_cpp_fa2_external)
-    target_compile_definitions(flashrt_cpp_pi05_backend_sm120
+    target_compile_definitions(flashrt_cpp_pi05_plan_sm120
       PUBLIC FLASHRT_CPP_WITH_FA2=1)
-    list(APPEND _pi05_backend_targets flashrt_cpp_pi05_backend_sm120)
+    list(APPEND _pi05_plan_targets flashrt_cpp_pi05_plan_sm120)
   endif()
 
   if(FLASHRT_CPP_WITH_THOR_FP8)
-    add_library(flashrt_cpp_pi05_backend_sm110 STATIC
-      src/backends/sm110/native_thor_kernel_driver.cu
-      src/backends/sm110/native_thor_weight_materializer.cpp
-      src/backends/sm110/native_thor_fp8_forward.cpp
-      src/backends/sm110/session.cpp
-      src/backends/sm110/native_thor_calibration_session.cpp
-      src/backends/sm110/native_thor_style_precompute.cpp)
-    _flashrt_configure_pi05_cuda_target(flashrt_cpp_pi05_backend_sm110)
-    target_include_directories(flashrt_cpp_pi05_backend_sm110 PRIVATE
+    add_library(flashrt_cpp_pi05_plan_sm110 STATIC
+      src/plans/sm110/native_thor_kernel_driver.cu
+      src/plans/sm110/native_thor_weight_materializer.cpp
+      src/plans/sm110/native_thor_fp8_forward.cpp
+      src/plans/sm110/lowered_plan.cpp
+      src/plans/sm110/native_thor_calibration_session.cpp
+      src/plans/sm110/native_thor_style_precompute.cpp)
+    _flashrt_configure_pi05_cuda_target(flashrt_cpp_pi05_plan_sm110)
+    target_include_directories(flashrt_cpp_pi05_plan_sm110 PRIVATE
       ${FLASHRT_CPP_SOURCE_DIR}/../csrc/attention
       ${FLASHRT_CPP_CUTLASS_DIR}/examples/77_blackwell_fmha
       ${FLASHRT_CPP_CUTLASS_DIR}/include
       ${FLASHRT_CPP_CUTLASS_DIR}/tools/util/include)
-    target_link_libraries(flashrt_cpp_pi05_backend_sm110 PUBLIC
-      flashrt_cpp_pi05_backend_cuda
+    target_link_libraries(flashrt_cpp_pi05_plan_sm110 PUBLIC
+      flashrt_cpp_pi05_pipeline_cuda
       flashrt_cpp_csrc_sm110)
-    target_compile_definitions(flashrt_cpp_pi05_backend_sm110
+    target_compile_definitions(flashrt_cpp_pi05_plan_sm110
       PUBLIC FLASHRT_CPP_WITH_THOR_FP8=1)
-    target_compile_options(flashrt_cpp_pi05_backend_sm110 PRIVATE
+    target_compile_options(flashrt_cpp_pi05_plan_sm110 PRIVATE
       $<$<COMPILE_LANGUAGE:CUDA>:
         --expt-extended-lambda --use_fast_math
         -gencode=arch=compute_110a,code=sm_110a>)
-    set_target_properties(flashrt_cpp_pi05_backend_sm110 PROPERTIES
+    set_target_properties(flashrt_cpp_pi05_plan_sm110 PROPERTIES
       CUDA_ARCHITECTURES 110a
       CUDA_RESOLVE_DEVICE_SYMBOLS ON)
-    list(APPEND _pi05_backend_targets flashrt_cpp_pi05_backend_sm110)
+    list(APPEND _pi05_plan_targets flashrt_cpp_pi05_plan_sm110)
   endif()
 
-  target_link_libraries(flashrt_cpp_pi05_kernels INTERFACE
-    ${_pi05_backend_targets})
+  target_link_libraries(flashrt_cpp_pi05_plans INTERFACE
+    ${_pi05_plan_targets})
 endif()
 
 add_library(flashrt_cpp_pi05_c SHARED
@@ -154,7 +154,7 @@ target_include_directories(flashrt_cpp_pi05_c
   PRIVATE ${_pi05_internal_include})
 if(FLASHRT_CPP_WITH_CUDA_KERNELS)
   target_link_libraries(flashrt_cpp_pi05_c
-    PRIVATE flashrt_cpp_pi05_kernels)
+    PRIVATE flashrt_cpp_pi05_plans)
 endif()
 
 if(BUILD_TESTING)

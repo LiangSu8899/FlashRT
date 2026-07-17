@@ -17,17 +17,21 @@ contract remain valid.
 
 The native producer is organized by ownership rather than execution order:
 
-- `src/model/` owns PI0.5 topology and prompt/state/IO semantics;
+- `src/model/` owns the single PI0.5 semantic pipeline plus prompt/state/IO
+  semantics;
 - `src/support/` owns model-private weights, calibration data, and workspace;
-- `src/backend/` defines the coarse model-private backend session seam;
-- `src/backends/sm120/` and `src/backends/sm110/` own hardware implementations;
+- `src/plans/` lowers that pipeline for a supported hardware/precision pair;
+- `src/plans/sm120/` and `src/plans/sm110/` bind logical operations,
+  weight packing, private scratch, and calibration observers to `csrc`;
 - `src/service/` owns C ABI construction, native open, and runtime publication.
 
 The matching private headers use the same layout. None of these headers is an
-installed API. `flashrt_cpp_pi05_backend_cuda` contains only mechanisms shared
-by both CUDA backends; the SM120 and SM110 targets compile only their own
-sources and dependencies. `flashrt_cpp_pi05_kernels` is an internal interface
-target kept as the aggregate link entry, not a source bucket.
+installed API. `flashrt_cpp_pi05_pipeline_cuda` contains the semantic pipeline
+and graph mechanism shared by both plans. `flashrt_cpp_pi05_plan_sm120` and
+`flashrt_cpp_pi05_plan_sm110` compile only their operation bindings and private
+requirements. Kernel implementations remain in `csrc`; the PI0.5 C++ tree is a
+frontend and does not own CUDA kernels. `flashrt_cpp_pi05_plans` is an
+internal aggregate link entry, not a source bucket.
 
 ## Adopted-export Legacy Face
 

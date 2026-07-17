@@ -10,10 +10,10 @@
 #define FLASHRT_CPP_HAS_NATIVE_CALIBRATION 1
 #include "flashrt/cpp/models/pi05/backend/native_calibration_session.h"
 #if defined(FLASHRT_CPP_WITH_FA2)
-#include "flashrt/cpp/models/pi05/backends/sm120/native_rtx_calibration_session.h"
+#include "flashrt/cpp/models/pi05/plans/sm120/native_rtx_calibration_session.h"
 #endif
 #if defined(FLASHRT_CPP_WITH_THOR_FP8)
-#include "flashrt/cpp/models/pi05/backends/sm110/native_thor_calibration_session.h"
+#include "flashrt/cpp/models/pi05/plans/sm110/native_thor_calibration_session.h"
 #endif
 #include <cuda_runtime_api.h>
 #endif
