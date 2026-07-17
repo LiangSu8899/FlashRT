@@ -148,7 +148,8 @@ add_library(flashrt_cpp_pi05_c SHARED
   src/native_model_runtime.cpp
   src/native_open.cpp)
 target_link_libraries(flashrt_cpp_pi05_c
-  PUBLIC flashrt_cpp_pi05 flashrt_runtime)
+  PUBLIC flashrt_cpp_pi05 flashrt_runtime
+  PRIVATE flashrt_cpp_native)
 target_include_directories(flashrt_cpp_pi05_c
   PUBLIC ${_pi05_public_include}
   PRIVATE ${_pi05_internal_include})

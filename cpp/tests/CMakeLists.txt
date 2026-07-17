@@ -15,6 +15,10 @@ add_executable(test_sha256 test_sha256.cpp)
 target_link_libraries(test_sha256 PRIVATE flashrt_cpp_loader)
 add_test(NAME sha256 COMMAND test_sha256)
 
+add_executable(test_native_config test_native_config.cpp)
+target_link_libraries(test_native_config PRIVATE flashrt_cpp_native)
+add_test(NAME native_config COMMAND test_native_config)
+
 add_executable(test_text_modalities test_text_modalities.cpp)
 target_link_libraries(test_text_modalities PRIVATE flashrt_cpp_modalities)
 add_test(NAME text_modalities COMMAND test_text_modalities)

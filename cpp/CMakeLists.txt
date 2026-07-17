@@ -179,6 +179,11 @@ target_include_directories(flashrt_cpp_vla
 target_link_libraries(flashrt_cpp_vla
   INTERFACE flashrt_cpp_modalities flashrt_cpp)
 
+add_library(flashrt_cpp_native STATIC
+  native/src/config_object.cpp)
+target_include_directories(flashrt_cpp_native
+  PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/native/include)
+
 add_library(flashrt_cpp_loader STATIC
   loader/src/safetensors.cpp
   loader/src/sha256.cpp)
