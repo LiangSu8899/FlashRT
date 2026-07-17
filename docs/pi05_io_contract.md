@@ -13,6 +13,22 @@ It does not freeze the C++ implementation classes under `cpp/`. Those classes
 may evolve as long as the exported ports, stages, regions, identity, and hot
 contract remain valid.
 
+## Private Source Ownership
+
+The native producer is organized by ownership rather than execution order:
+
+- `src/model/` owns PI0.5 topology and prompt/state/IO semantics;
+- `src/support/` owns model-private weights, calibration data, and workspace;
+- `src/backend/` defines the coarse model-private backend session seam;
+- `src/backends/sm120/` and `src/backends/sm110/` own hardware implementations;
+- `src/service/` owns C ABI construction, native open, and runtime publication.
+
+The matching private headers use the same layout. None of these headers is an
+installed API. `flashrt_cpp_pi05_backend_cuda` contains only mechanisms shared
+by both CUDA backends; the SM120 and SM110 targets compile only their own
+sources and dependencies. `flashrt_cpp_pi05_kernels` is an internal interface
+target kept as the aggregate link entry, not a source bucket.
+
 ## Adopted-export Legacy Face
 
 The Python-produced Pi0.5 `io="native"` export declares three host-visible

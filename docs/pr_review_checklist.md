@@ -758,6 +758,10 @@ gates:
       host allocation claims use a host-side counter.
 - [ ] A heterogeneous backend enters through an instance backend/capsule seam,
       not a new backend registry or frozen `backend_kind` field.
+- [ ] Each native hardware target compiles only its own implementation; shared
+      CUDA mechanisms contain no model policy or backend-specific flags.
+- [ ] Aggregate model targets only forward link dependencies, and validation
+      cases are registered against the backend capability they exercise.
 - [ ] Public commands use placeholders and the diff contains no absolute local
       paths, user/host/container names, tokens, internal URLs, environment
       dumps, logs, or proprietary asset identifiers.

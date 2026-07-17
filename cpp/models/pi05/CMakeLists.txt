@@ -21,8 +21,7 @@ set(_pi05_sources
   src/support/native_weight_materializer.cpp
   src/support/native_calibration.cpp
   src/support/native_workspace.cpp
-  src/backend/native_calibration_session.cpp
-  src/backends/sm120/native_rtx_attention.cpp)
+  src/backend/native_calibration_session.cpp)
 if(FLASHRT_CPP_WITH_CUDA_KERNELS)
   list(APPEND _pi05_sources
     src/support/native_quantization.cu
@@ -46,37 +45,75 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 if(FLASHRT_CPP_WITH_CUDA_KERNELS)
-  add_library(flashrt_cpp_pi05_kernels STATIC
-    src/backend/native_graph_runtime.cpp
-    src/backends/sm120/native_bf16_forward.cpp
-    src/backends/sm120/native_kernel_driver.cu
-    src/backends/sm120/native_rtx_linear.cpp
-    src/backends/sm120/native_rtx_weight_packer.cpp
-    src/backends/sm120/native_style_precompute.cu
-    ${FLASHRT_CPP_SOURCE_DIR}/../csrc/gemm/gemm_runner.cu
-    ${FLASHRT_CPP_SOURCE_DIR}/../csrc/kernels/activation.cu
-    ${FLASHRT_CPP_SOURCE_DIR}/../csrc/kernels/dit_bf16.cu
-    ${FLASHRT_CPP_SOURCE_DIR}/../csrc/kernels/elementwise.cu
-    ${FLASHRT_CPP_SOURCE_DIR}/../csrc/kernels/fusion.cu
-    ${FLASHRT_CPP_SOURCE_DIR}/../csrc/kernels/norm.cu
-    ${FLASHRT_CPP_SOURCE_DIR}/../csrc/kernels/patch_embed.cu
-    ${FLASHRT_CPP_SOURCE_DIR}/../csrc/kernels/quantize.cu
-    ${FLASHRT_CPP_SOURCE_DIR}/../csrc/kernels/rope.cu)
-  target_include_directories(flashrt_cpp_pi05_kernels
-    PRIVATE ${_pi05_public_include}
-            ${_pi05_internal_include}
-            ${FLASHRT_CPP_SOURCE_DIR}/../csrc/gemm
-            ${FLASHRT_CPP_SOURCE_DIR}/../csrc/kernels)
-  target_link_libraries(flashrt_cpp_pi05_kernels
-    PUBLIC flashrt_cpp_pi05 flashrt_cpp_native_cuda
-           CUDA::cublas CUDA::cublasLt CUDA::cudart)
-  set_target_properties(flashrt_cpp_pi05_kernels PROPERTIES
-    CUDA_STANDARD 17
-    CUDA_STANDARD_REQUIRED ON)
-  target_compile_options(flashrt_cpp_pi05_kernels PRIVATE
-    $<$<COMPILE_LANGUAGE:CUDA>:
-      --expt-relaxed-constexpr -O3
-      --ftz=true --prec-div=false --prec-sqrt=false>)
+  function(_flashrt_configure_pi05_cuda_target target)
+    target_include_directories(${target} PRIVATE
+      ${_pi05_public_include}
+      ${_pi05_internal_include}
+      ${FLASHRT_CPP_SOURCE_DIR}/../csrc/gemm
+      ${FLASHRT_CPP_SOURCE_DIR}/../csrc/kernels)
+    target_link_libraries(${target} PUBLIC
+      flashrt_cpp_pi05 flashrt_cpp_native_cuda
+      CUDA::cublas CUDA::cublasLt CUDA::cudart)
+    set_target_properties(${target} PROPERTIES
+      CUDA_STANDARD 17
+      CUDA_STANDARD_REQUIRED ON)
+    target_compile_options(${target} PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:
+        --expt-relaxed-constexpr -O3
+        --ftz=true --prec-div=false --prec-sqrt=false>)
+  endfunction()
+
+  add_library(flashrt_cpp_pi05_kernels INTERFACE)
+  set(_pi05_backend_targets)
+
+  if(FLASHRT_CPP_WITH_FA2 OR FLASHRT_CPP_WITH_THOR_FP8)
+    add_library(flashrt_cpp_pi05_backend_cuda STATIC
+      src/backend/native_graph_runtime.cpp
+      ${FLASHRT_CPP_SOURCE_DIR}/../csrc/gemm/gemm_runner.cu
+      ${FLASHRT_CPP_SOURCE_DIR}/../csrc/kernels/activation.cu
+      ${FLASHRT_CPP_SOURCE_DIR}/../csrc/kernels/elementwise.cu
+      ${FLASHRT_CPP_SOURCE_DIR}/../csrc/kernels/norm.cu
+      ${FLASHRT_CPP_SOURCE_DIR}/../csrc/kernels/patch_embed.cu
+      ${FLASHRT_CPP_SOURCE_DIR}/../csrc/kernels/quantize.cu
+      ${FLASHRT_CPP_SOURCE_DIR}/../csrc/kernels/rope.cu)
+    _flashrt_configure_pi05_cuda_target(flashrt_cpp_pi05_backend_cuda)
+
+    if(FLASHRT_CPP_WITH_THOR_FP8)
+      target_compile_options(flashrt_cpp_pi05_backend_cuda PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:
+          --expt-extended-lambda --use_fast_math
+          -gencode=arch=compute_110a,code=sm_110a>)
+      set_target_properties(flashrt_cpp_pi05_backend_cuda PROPERTIES
+        CUDA_ARCHITECTURES 110a)
+    endif()
+  endif()
+
+  if(FLASHRT_CPP_WITH_FA2)
+    add_library(flashrt_cpp_pi05_backend_sm120 STATIC
+      src/backends/sm120/native_bf16_forward.cpp
+      src/backends/sm120/native_graph_owner.cpp
+      src/backends/sm120/native_kernel_driver.cu
+      src/backends/sm120/native_rtx_attention.cpp
+      src/backends/sm120/native_rtx_attention_driver.cu
+      src/backends/sm120/native_rtx_autotune.cpp
+      src/backends/sm120/native_rtx_linear.cpp
+      src/backends/sm120/native_rtx_weight_packer.cpp
+      src/backends/sm120/native_style_precompute.cu
+      ${FLASHRT_CPP_SOURCE_DIR}/../csrc/kernels/dit_bf16.cu
+      ${FLASHRT_CPP_SOURCE_DIR}/../csrc/kernels/fusion.cu)
+    if(FLASHRT_CPP_WITH_SENTENCEPIECE)
+      target_sources(flashrt_cpp_pi05_backend_sm120 PRIVATE
+        src/backends/sm120/native_rtx_calibration_session.cpp)
+    endif()
+    _flashrt_configure_pi05_cuda_target(flashrt_cpp_pi05_backend_sm120)
+    target_include_directories(flashrt_cpp_pi05_backend_sm120 PRIVATE
+      ${FLASHRT_CPP_SOURCE_DIR}/../csrc)
+    target_link_libraries(flashrt_cpp_pi05_backend_sm120 PUBLIC
+      flashrt_cpp_pi05_backend_cuda flashrt_cpp_fa2_external)
+    target_compile_definitions(flashrt_cpp_pi05_backend_sm120
+      PUBLIC FLASHRT_CPP_WITH_FA2=1)
+    list(APPEND _pi05_backend_targets flashrt_cpp_pi05_backend_sm120)
+  endif()
 
   if(FLASHRT_CPP_WITH_THOR_FP8)
     add_library(flashrt_cpp_pi05_thor_precise OBJECT
@@ -96,7 +133,7 @@ if(FLASHRT_CPP_WITH_CUDA_KERNELS)
       CUDA_STANDARD_REQUIRED ON
       POSITION_INDEPENDENT_CODE ON)
 
-    target_sources(flashrt_cpp_pi05_kernels PRIVATE
+    add_library(flashrt_cpp_pi05_backend_sm110 STATIC
       $<TARGET_OBJECTS:flashrt_cpp_pi05_thor_precise>
       src/backends/sm110/native_thor_kernel_driver.cu
       src/backends/sm110/native_thor_weight_materializer.cpp
@@ -108,38 +145,28 @@ if(FLASHRT_CPP_WITH_CUDA_KERNELS)
       ${FLASHRT_CPP_SOURCE_DIR}/../csrc/kernels/attention_cublas.cu
       ${FLASHRT_CPP_SOURCE_DIR}/../csrc/kernels/decoder_fused.cu
       ${FLASHRT_CPP_SOURCE_DIR}/../csrc/kernels/softmax.cu)
-    target_include_directories(flashrt_cpp_pi05_kernels PRIVATE
+    _flashrt_configure_pi05_cuda_target(flashrt_cpp_pi05_backend_sm110)
+    target_include_directories(flashrt_cpp_pi05_backend_sm110 PRIVATE
       ${FLASHRT_CPP_SOURCE_DIR}/../csrc/attention
       ${FLASHRT_CPP_CUTLASS_DIR}/examples/77_blackwell_fmha
       ${FLASHRT_CPP_CUTLASS_DIR}/include
       ${FLASHRT_CPP_CUTLASS_DIR}/tools/util/include)
-    target_compile_definitions(flashrt_cpp_pi05_kernels
+    target_link_libraries(flashrt_cpp_pi05_backend_sm110 PUBLIC
+      flashrt_cpp_pi05_backend_cuda)
+    target_compile_definitions(flashrt_cpp_pi05_backend_sm110
       PUBLIC FLASHRT_CPP_WITH_THOR_FP8=1)
-    target_compile_options(flashrt_cpp_pi05_kernels PRIVATE
+    target_compile_options(flashrt_cpp_pi05_backend_sm110 PRIVATE
       $<$<COMPILE_LANGUAGE:CUDA>:
         --expt-extended-lambda --use_fast_math
         -gencode=arch=compute_110a,code=sm_110a>)
-    set_target_properties(flashrt_cpp_pi05_kernels PROPERTIES
+    set_target_properties(flashrt_cpp_pi05_backend_sm110 PROPERTIES
       CUDA_ARCHITECTURES 110a
       CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+    list(APPEND _pi05_backend_targets flashrt_cpp_pi05_backend_sm110)
   endif()
 
-  if(FLASHRT_CPP_WITH_FA2)
-    target_sources(flashrt_cpp_pi05_kernels PRIVATE
-      src/backends/sm120/native_graph_owner.cpp
-      src/backends/sm120/native_rtx_autotune.cpp
-      src/backends/sm120/native_rtx_attention_driver.cu)
-    if(FLASHRT_CPP_WITH_SENTENCEPIECE)
-      target_sources(flashrt_cpp_pi05_kernels PRIVATE
-        src/backends/sm120/native_rtx_calibration_session.cpp)
-    endif()
-    target_include_directories(flashrt_cpp_pi05_kernels PRIVATE
-      ${FLASHRT_CPP_SOURCE_DIR}/../csrc)
-    target_link_libraries(flashrt_cpp_pi05_kernels
-      PUBLIC flashrt_cpp_fa2_external)
-    target_compile_definitions(flashrt_cpp_pi05_kernels
-      PUBLIC FLASHRT_CPP_WITH_FA2=1)
-  endif()
+  target_link_libraries(flashrt_cpp_pi05_kernels INTERFACE
+    ${_pi05_backend_targets})
 endif()
 
 add_library(flashrt_cpp_pi05_c SHARED

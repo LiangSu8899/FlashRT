@@ -237,6 +237,21 @@ reviewers hold every PR to:
 - Schema shared by multiple producers needs checked-in canonical records;
   every producer compares independently against that golden face.
 
+### Native C++ Model Ownership
+
+Keep a native model producer split by ownership: model semantics, model-private
+support, a coarse backend session seam, hardware backend implementations, and
+the public service/plugin face. Do not expose those private classes as installed
+headers or move model topology into generic runtime/exec code.
+
+Each hardware backend target must compile only its own implementation and link
+the explicitly shared mechanisms it needs. An aggregate compatibility target
+may forward link dependencies, but it must not become a source bucket that
+injects every hardware implementation and architecture flag into every build.
+Validation targets must be registered from actual backend capabilities; do not
+compile one backend's private classes for another device just to preserve a test
+count.
+
 ### Calibration And Precision
 
 FP8/NVFP4 changes must preserve the calibration cache contract described in
