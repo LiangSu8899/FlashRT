@@ -87,15 +87,27 @@ class BoundVisionFfnFp8:
 
 
 class FusedGeluMlp(torch.nn.Module):
-    """MLP-seam module: the host keeps its own norm and residual."""
+    """MLP-seam module: the host keeps its own norm and residual.
+
+    ``original`` is retained whole (host MLP naming varies across model
+    families), and attribute lookups fall through to it so hosts that
+    introspect the module they call keep working.
+    """
 
     def __init__(self, bound: BoundVisionFfnFp8,
                  original: torch.nn.Module | None = None):
         super().__init__()
         self._bound = bound
         if original is not None:
-            self.fc1 = original.fc1
-            self.fc2 = original.fc2
+            self.host_mlp = original
+
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            if name == "host_mlp":
+                raise
+            return getattr(super().__getattr__("host_mlp"), name)
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
         return self._bound.ffn(hidden)

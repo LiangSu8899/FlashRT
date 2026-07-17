@@ -176,9 +176,9 @@ class FusedGeGluMlp(torch.nn.Module):
     """MLP-seam module for hosts whose replaceable boundary is the MLP.
 
     The host keeps its own norm, AdaLN gate, and residual. ``original``
-    is retained so hosts that introspect the projection attributes of
-    the module they call keep working, and so detachment restores the
-    exact original.
+    is retained whole (host MLP naming varies across model families), and
+    attribute lookups fall through to it so hosts that introspect the
+    projection attributes of the module they call keep working.
     """
 
     def __init__(self, bound: BoundDecoderFfnFp8,
@@ -186,9 +186,15 @@ class FusedGeGluMlp(torch.nn.Module):
         super().__init__()
         self._bound = bound
         if original is not None:
-            self.gate_proj = original.gate_proj
-            self.up_proj = original.up_proj
-            self.down_proj = original.down_proj
+            self.host_mlp = original
+
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            if name == "host_mlp":
+                raise
+            return getattr(super().__getattr__("host_mlp"), name)
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
         return self._bound.ffn(hidden)
