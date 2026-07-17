@@ -13,6 +13,12 @@ namespace flashrt {
 namespace models {
 namespace pi05 {
 
+NativeWorkspaceRequirements make_sm110_workspace_requirements(
+    const NativeWorkspaceConfig& config,
+    bool enable_calibration);
+
+modalities::Status initialize_sm110_workspace(NativeWorkspace* workspace);
+
 class Sm110LoweredPlan final : public Pi05Pipeline {
 public:
     static std::unique_ptr<Sm110LoweredPlan> create(

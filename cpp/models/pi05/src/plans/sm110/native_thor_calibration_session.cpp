@@ -4,6 +4,7 @@
 #include "flashrt/cpp/loader/sha256.h"
 #include "flashrt/cpp/models/pi05/model/io.h"
 #include "flashrt/cpp/models/pi05/support/native_calibration.h"
+#include "flashrt/cpp/models/pi05/plans/sm110/lowered_plan.h"
 #include "flashrt/cpp/models/pi05/plans/sm110/native_thor_fp8_forward.h"
 #include "flashrt/cpp/models/pi05/plans/sm110/native_thor_style_precompute.h"
 #include "flashrt/cpp/models/pi05/plans/sm110/native_thor_weight_materializer.h"
@@ -134,9 +135,11 @@ struct NativeThorCalibrationSession::Impl {
         workspace_config.chunk_size = config.chunk_size;
         workspace_config.num_steps = config.num_steps;
         workspace_config.vision_pool_factor = config.vision_pool_factor;
-        workspace_config.flavor = NativeWorkspaceFlavor::kThorFp8;
-        workspace_config.enable_calibration = true;
-        st = workspace.allocate(workspace_config);
+        NativeWorkspaceRequirements workspace_requirements =
+            make_sm110_workspace_requirements(workspace_config, true);
+        st = workspace.allocate(workspace_config, workspace_requirements);
+        if (!st.ok_status()) return st;
+        st = initialize_sm110_workspace(&workspace);
         if (!st.ok_status()) return st;
         st = workspace.expand_vision_position_embedding(weights);
         if (!st.ok_status()) return st;

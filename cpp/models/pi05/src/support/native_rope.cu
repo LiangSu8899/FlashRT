@@ -16,7 +16,7 @@ constexpr int kFrequencies = 128;
 
 }  // namespace
 
-modalities::Status generate_native_thor_rope_f16(
+modalities::Status generate_native_rope_f16(
     void* output, int start_position, int positions, std::uintptr_t stream) {
     constexpr int kMax = std::numeric_limits<int>::max();
     if (!output || start_position < 0 || positions <= 0 ||
@@ -24,7 +24,7 @@ modalities::Status generate_native_thor_rope_f16(
         start_position > kMax - (positions - 1)) {
         return modalities::Status::error(
             modalities::StatusCode::kInvalidArgument,
-            "Thor RoPE generation arguments are invalid");
+            "native RoPE generation arguments are invalid");
     }
     cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
     ::generate_rope_table_f16(
@@ -36,7 +36,7 @@ modalities::Status generate_native_thor_rope_f16(
                ? modalities::Status::ok()
                : modalities::Status::error(
                      modalities::StatusCode::kBackend,
-                     std::string("Thor RoPE generation failed: ") +
+                     std::string("native RoPE generation failed: ") +
                          cudaGetErrorString(rc));
 }
 

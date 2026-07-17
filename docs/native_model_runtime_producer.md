@@ -16,6 +16,26 @@ Do not add `model_kind`, `backend_kind`, model dimensions, checkpoint fields,
 or a State object to the frozen ABI. Express the public face with ports,
 stages, regions, verbs, and producer identity.
 
+## Native frontend structure
+
+A native model is a frontend over shared execution and kernel mechanisms. It
+has one semantic pipeline and may lower that pipeline into different physical
+plans for hardware and precision. A physical plan is not a second model.
+
+- `model/` owns semantic stage order, graph cuts, model state, and public
+  artifacts.
+- `plans/<target>/` binds logical operations, weight packing, calibration
+  observers, and plan-private scratch for one physical execution route.
+- `csrc/` owns CUDA kernel implementations. Model frontends call its launcher
+  APIs and must not define or compile private copies of those kernels.
+
+The model owns one logical workspace schema: logical names, shapes, aliases,
+and state meaning are stable across plans. A lowered plan supplies the physical
+activation dtype and appends private buffers or aliases required by its
+operations. It must not redefine model buffers or state semantics. New hardware
+therefore adds operation bindings and private requirements without cloning the
+semantic pipeline.
+
 ## Construction
 
 Use one existing construction path:

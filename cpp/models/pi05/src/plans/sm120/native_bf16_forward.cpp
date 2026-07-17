@@ -825,27 +825,6 @@ modalities::Status NativeBf16Forward::diffusion_step(
         static_cast<std::size_t>(sequence) * 32, stream);
 }
 
-modalities::Status NativeBf16Forward::diffusion(
-    const NativeDeviceWeightStore& weights,
-    NativeWorkspace* workspace,
-    NativeRtxAttentionWorkspace* attention,
-    const NativeRtxAttentionDriver* attention_driver,
-    std::uintptr_t stream) const {
-    if (!workspace) return invalid("native diffusion workspace is invalid");
-    const NativeWorkspaceBuffer* style =
-        workspace->find("decoder_style_final");
-    if (!style || style->shape.size() != 3 || !style->shape[0] ||
-        style->shape[0] > static_cast<std::uint64_t>(INT_MAX)) {
-        return invalid("native diffusion step count is invalid");
-    }
-    const int steps = static_cast<int>(style->shape[0]);
-    for (int step = 0; step < steps; ++step) {
-        modalities::Status st = diffusion_step(
-            step, weights, workspace, attention, attention_driver, stream);
-        if (!st.ok_status()) return st;
-    }
-    return modalities::Status::ok();
-}
 #endif
 
 }  // namespace pi05

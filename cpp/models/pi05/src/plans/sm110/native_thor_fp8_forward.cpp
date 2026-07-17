@@ -125,7 +125,7 @@ modalities::Status NativeThorFp8Forward::vision(
     const NativeThorWeightScales& weight_scales,
     std::uintptr_t stream) const {
     if (!driver_ || !driver_->status().ok_status() || !workspace ||
-        workspace->flavor() != NativeWorkspaceFlavor::kThorFp8 ||
+        workspace->activation_dtype() != modalities::DType::kFloat16 ||
         weight_scales.vision.size() != 27 * 4) {
         return invalid("Thor vision forward owner is invalid");
     }
@@ -313,7 +313,7 @@ modalities::Status NativeThorFp8Forward::encoder(
     const std::vector<float>& activation_weight_alphas,
     std::uintptr_t stream) const {
     if (!driver_ || !driver_->status().ok_status() || !workspace ||
-        workspace->flavor() != NativeWorkspaceFlavor::kThorFp8 ||
+        workspace->activation_dtype() != modalities::DType::kFloat16 ||
         activation_weight_alphas.size() != kLayers * 4) {
         return invalid("Thor encoder forward owner is invalid");
     }
@@ -466,7 +466,7 @@ modalities::Status NativeThorFp8Forward::calibrate_encoder(
     std::uintptr_t stream) const {
     if (!driver_ || !driver_->status().ok_status() || !workspace ||
         !sample_scales ||
-        workspace->flavor() != NativeWorkspaceFlavor::kThorFp8 ||
+        workspace->activation_dtype() != modalities::DType::kFloat16 ||
         weight_scales.encoder.size() != kLayers * 4) {
         return invalid("Thor encoder calibration owner is invalid");
     }
@@ -705,7 +705,7 @@ modalities::Status NativeThorFp8Forward::calibrate_decoder(
     std::uintptr_t stream) const {
     if (!driver_ || !driver_->status().ok_status() || !workspace ||
         !sample_scales ||
-        workspace->flavor() != NativeWorkspaceFlavor::kThorFp8) {
+        workspace->activation_dtype() != modalities::DType::kFloat16) {
         return invalid("Thor decoder calibration owner is invalid");
     }
     const std::uint64_t sequence = workspace->chunk_size();
@@ -1042,7 +1042,7 @@ modalities::Status NativeThorFp8Forward::diffusion_step(
     NativeWorkspace* workspace,
     std::uintptr_t stream) const {
     if (step < 0 || !driver_ || !driver_->status().ok_status() || !workspace ||
-        workspace->flavor() != NativeWorkspaceFlavor::kThorFp8) {
+        workspace->activation_dtype() != modalities::DType::kFloat16) {
         return invalid("Thor decoder forward owner is invalid");
     }
     const std::uint64_t sequence = workspace->chunk_size();

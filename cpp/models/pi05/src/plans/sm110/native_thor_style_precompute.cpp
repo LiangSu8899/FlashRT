@@ -44,7 +44,7 @@ modalities::Status NativeThorStylePrecomputer::run(
     NativeWorkspace* workspace,
     std::uintptr_t stream) const {
     if (!driver_ || !driver_->status().ok_status() || !workspace ||
-        workspace->flavor() != NativeWorkspaceFlavor::kThorFp8) {
+        workspace->activation_dtype() != modalities::DType::kFloat16) {
         return invalid("Thor style precomputer is invalid");
     }
     const NativeWorkspaceBuffer* time_output =

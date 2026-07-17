@@ -9,7 +9,7 @@ namespace flashrt {
 namespace models {
 namespace pi05 {
 
-modalities::Status generate_native_thor_rope_f16(
+modalities::Status generate_native_rope_f16(
     void* output, int start_position, int positions, std::uintptr_t stream);
 
 }  // namespace pi05

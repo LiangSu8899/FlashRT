@@ -56,6 +56,127 @@ bool calibration_matches(const NativeCalibrationArtifact& artifact,
 
 }  // namespace
 
+NativeWorkspaceRequirements make_sm110_workspace_requirements(
+    const NativeWorkspaceConfig& config,
+    bool enable_calibration) {
+    NativeWorkspaceRequirements requirements;
+    requirements.activation_dtype = modalities::DType::kFloat16;
+    requirements.fixed_prompt_controls = true;
+
+    const std::uint64_t vs =
+        static_cast<std::uint64_t>(config.num_views) * 256;
+    const std::uint64_t pool =
+        static_cast<std::uint64_t>(config.vision_pool_factor) *
+        static_cast<std::uint64_t>(config.vision_pool_factor);
+    const std::uint64_t es =
+        vs / pool + static_cast<std::uint64_t>(config.max_prompt_tokens);
+    const std::uint64_t ds =
+        static_cast<std::uint64_t>(config.chunk_size);
+    const std::uint64_t steps =
+        static_cast<std::uint64_t>(config.num_steps);
+    const std::uint64_t keys = es + ds;
+    const auto add_f16 =
+        [&](const char* name,
+            std::initializer_list<std::uint64_t> shape) {
+            requirements.add_buffer(
+                name, shape, modalities::DType::kFloat16);
+        };
+
+    requirements.add_buffer(
+        "vision_x_fp8", {vs, 1152}, modalities::DType::kUInt8);
+    add_f16("vision_QKV", {vs, 3456});
+    add_f16("vision_attn", {vs, 1152});
+    add_f16("vision_hidden", {vs, 4304});
+    requirements.add_buffer(
+        "vision_hidden_fp8", {vs, 4304}, modalities::DType::kUInt8);
+    requirements.add_buffer(
+        "vision_unit_scale", {1}, modalities::DType::kFloat32);
+    requirements.add_alias(
+        "vision_postln_scratch", "vision_attn", {vs, 1152});
+
+    requirements.add_buffer(
+        "encoder_x_fp8", {es, 2048}, modalities::DType::kUInt8);
+    add_f16("encoder_QKV", {es, 2560});
+    add_f16("encoder_logits", {es * 8, keys});
+    add_f16("encoder_attn", {es, 2048});
+    requirements.add_buffer(
+        "encoder_o_fp8", {es, 2048}, modalities::DType::kUInt8);
+    add_f16("encoder_gate_merged", {es, 32768});
+    add_f16("encoder_hidden", {es, 16384});
+    requirements.add_buffer(
+        "encoder_hidden_fp8", {es, 16384}, modalities::DType::kUInt8);
+    add_f16("encoder_fg", {es, 2048});
+    requirements.add_buffer(
+        "encoder_activation_scales", {18, 4},
+        modalities::DType::kFloat32);
+    add_f16("encoder_k_cache", {18, keys, 256});
+    add_f16("encoder_v_cache", {18, keys, 256});
+    requirements.add_buffer(
+        "attn_enc_seqused", {sizeof(std::int32_t)},
+        modalities::DType::kUInt8);
+    requirements.add_buffer(
+        "attn_dec_seqused", {sizeof(std::int32_t)},
+        modalities::DType::kUInt8);
+    requirements.add_buffer(
+        "attn_dec_devpos", {sizeof(std::int32_t)},
+        modalities::DType::kUInt8);
+
+    add_f16("x_normed_buf", {ds, 1024});
+    add_f16("gate_buf", {ds, 1024});
+    add_f16("decoder_QKV", {ds, 2560});
+    add_f16("decoder_logits", {ds * 8, keys});
+    add_f16("decoder_attn", {ds, 2048});
+    add_f16("decoder_hidden", {ds, 8192});
+    add_f16("decoder_fg", {ds, 8192});
+    requirements.add_buffer(
+        "decoder_action_f32", {ds, 32}, modalities::DType::kFloat32);
+    requirements.add_buffer(
+        "decoder_x_fp8", {ds, 1024}, modalities::DType::kUInt8);
+    requirements.add_buffer(
+        "decoder_hidden_fp8", {ds, 4096}, modalities::DType::kUInt8);
+    requirements.add_buffer(
+        "decoder_context_fp8", {ds, 2048}, modalities::DType::kUInt8);
+    requirements.add_buffer(
+        "decoder_activation_scales", {steps, 18, 4},
+        modalities::DType::kFloat32);
+
+    if (enable_calibration) {
+        add_f16("encoder_norm_scratch", {es, 2048});
+        add_f16("encoder_x_scratch", {es, 2048});
+        requirements.add_buffer(
+            "encoder_fp8_scratch", {es, 16384},
+            modalities::DType::kUInt8);
+        requirements.add_buffer(
+            "encoder_sample_scales", {18, 4},
+            modalities::DType::kFloat32);
+        requirements.add_buffer(
+            "decoder_fp8_scratch", {ds, 4096},
+            modalities::DType::kUInt8);
+        requirements.add_buffer(
+            "decoder_sample_scales", {steps, 18, 4},
+            modalities::DType::kFloat32);
+        requirements.add_buffer(
+            "calibration_scale", {1}, modalities::DType::kFloat32);
+    }
+    return requirements;
+}
+
+modalities::Status initialize_sm110_workspace(NativeWorkspace* workspace) {
+    const NativeWorkspaceBuffer* unit =
+        workspace ? workspace->find("vision_unit_scale") : nullptr;
+    if (!unit || unit->dtype != modalities::DType::kFloat32 ||
+        unit->shape != std::vector<std::uint64_t>({1})) {
+        return invalid("SM110 unit scale workspace is invalid");
+    }
+    const float value = 1.0f;
+    const cudaError_t rc = cudaMemcpy(
+        frt_buffer_dptr(unit->buffer), &value, sizeof(value),
+        cudaMemcpyHostToDevice);
+    return rc == cudaSuccess
+               ? modalities::Status::ok()
+               : backend("SM110 unit scale upload failed");
+}
+
 Sm110LoweredPlan::Sm110LoweredPlan(
     frt_ctx ctx,
     const Pi05PipelineConfig& config)
@@ -149,8 +270,11 @@ modalities::Status Sm110LoweredPlan::initialize(
     workspace_config.chunk_size = config().chunk_size;
     workspace_config.num_steps = config().num_steps;
     workspace_config.vision_pool_factor = config().vision_pool_factor;
-    workspace_config.flavor = NativeWorkspaceFlavor::kThorFp8;
-    st = workspace_.allocate(workspace_config);
+    NativeWorkspaceRequirements workspace_requirements =
+        make_sm110_workspace_requirements(workspace_config, false);
+    st = workspace_.allocate(workspace_config, workspace_requirements);
+    if (!st.ok_status()) return st;
+    st = initialize_sm110_workspace(&workspace_);
     if (!st.ok_status()) return st;
     st = workspace_.expand_vision_position_embedding(weights_);
     if (!st.ok_status()) return st;

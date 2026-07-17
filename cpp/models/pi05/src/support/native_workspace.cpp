@@ -5,9 +5,8 @@
 #include <cuda_runtime_api.h>
 #endif
 
-#include <algorithm>
-#include <limits>
 #include <cmath>
+#include <limits>
 
 namespace flashrt {
 namespace models {
@@ -24,7 +23,7 @@ modalities::Status backend(const char* message) {
                                      message);
 }
 
-bool element_count(std::initializer_list<std::uint64_t> shape,
+bool element_count(const std::vector<std::uint64_t>& shape,
                    std::size_t* out) {
     std::size_t count = 1;
     for (std::uint64_t dim : shape) {
@@ -43,7 +42,7 @@ bool element_count(std::initializer_list<std::uint64_t> shape,
 
 modalities::Status NativeWorkspace::add(
     const std::string& name,
-    std::initializer_list<std::uint64_t> shape,
+    const std::vector<std::uint64_t>& shape,
     modalities::DType dtype) {
     if (!ctx_ || name.empty() || buffers_.find(name) != buffers_.end()) {
         return invalid("native workspace buffer definition is invalid");
@@ -57,9 +56,8 @@ modalities::Status NativeWorkspace::add(
     const std::size_t bytes = elements * width;
     frt_buffer buffer = frt_buffer_alloc(ctx_, name.c_str(), bytes);
     if (!buffer) return backend("native workspace allocation failed");
-    buffers_.emplace(name, NativeWorkspaceBuffer{
-                               buffer, std::vector<std::uint64_t>(shape),
-                               dtype, false});
+    buffers_.emplace(
+        name, NativeWorkspaceBuffer{buffer, shape, dtype, false});
     ++allocation_count_;
     allocated_bytes_ += bytes;
     return modalities::Status::ok();
@@ -68,7 +66,7 @@ modalities::Status NativeWorkspace::add(
 modalities::Status NativeWorkspace::add_alias(
     const std::string& name,
     const std::string& source_name,
-    std::initializer_list<std::uint64_t> shape) {
+    const std::vector<std::uint64_t>& shape) {
     if (name.empty() || buffers_.find(name) != buffers_.end()) {
         return invalid("native workspace alias definition is invalid");
     }
@@ -84,10 +82,9 @@ modalities::Status NativeWorkspace::add_alias(
             frt_buffer_bytes(source->second.buffer)) {
         return invalid("native workspace alias shape does not match source");
     }
-    buffers_.emplace(name, NativeWorkspaceBuffer{
-                               source->second.buffer,
-                               std::vector<std::uint64_t>(shape),
-                               source->second.dtype, true});
+    buffers_.emplace(
+        name, NativeWorkspaceBuffer{
+                  source->second.buffer, shape, source->second.dtype, true});
     return modalities::Status::ok();
 }
 
@@ -125,15 +122,22 @@ modalities::Status NativeWorkspace::initialize_rope() {
         modalities::StatusCode::kUnsupported,
         "native RoPE initialization requires the CUDA build");
 #else
-    const int max_positions = encoder_sequence_ + chunk_size_;
-    rope_table_.resize(static_cast<std::size_t>(max_positions) * 256);
     const NativeWorkspaceBuffer* encoder = find("encoder_rope_weights");
-    if (!encoder) return invalid("encoder RoPE buffer was not allocated");
-    if (flavor_ == NativeWorkspaceFlavor::kThorFp8) {
-        modalities::Status st = generate_native_thor_rope_f16(
+    if (!encoder || encoder->dtype != activation_dtype_) {
+        return invalid("encoder RoPE buffer was not allocated");
+    }
+    if (activation_dtype_ == modalities::DType::kFloat16) {
+        rope_table_.clear();
+        modalities::Status st = generate_native_rope_f16(
             frt_buffer_dptr(encoder->buffer), 0, encoder_sequence_, 0);
         return st.ok_status() ? update_decoder_rope(0) : st;
     }
+    if (activation_dtype_ != modalities::DType::kBFloat16) {
+        return invalid("native RoPE activation dtype is unsupported");
+    }
+
+    const int max_positions = encoder_sequence_ + chunk_size_;
+    rope_table_.resize(static_cast<std::size_t>(max_positions) * 256);
     for (int position = 0; position < max_positions; ++position) {
         const std::size_t row = static_cast<std::size_t>(position) * 256;
         for (int i = 0; i < 128; ++i) {
@@ -161,21 +165,21 @@ modalities::Status NativeWorkspace::initialize_rope() {
 
 modalities::Status NativeWorkspace::set_fixed_prompt_length(
     int prompt_tokens) {
-    if (flavor_ != NativeWorkspaceFlavor::kThorFp8) {
+    if (!fixed_prompt_controls_) {
         return update_decoder_rope(prompt_tokens);
     }
     if (prompt_tokens < 0 || prompt_tokens > max_prompt_tokens_ ||
         !prompt_embedding_buffer_) {
-        return invalid("Thor fixed prompt length is invalid");
+        return invalid("fixed prompt length is invalid");
     }
     const int rounded_prompt = prompt_tokens + (prompt_tokens & 1);
     if (rounded_prompt > max_prompt_tokens_) {
-        return invalid("Thor fixed prompt length exceeds its even capacity");
+        return invalid("fixed prompt length exceeds its even capacity");
     }
 #ifndef FLASHRT_CPP_WITH_CUDA_STAGING
     return modalities::Status::error(
         modalities::StatusCode::kUnsupported,
-        "Thor fixed prompt update requires the CUDA build");
+        "fixed prompt update requires the CUDA build");
 #else
     if (rounded_prompt != prompt_tokens && prompt_tokens > 0) {
         const std::size_t row_bytes = 2048 * sizeof(std::uint16_t);
@@ -186,7 +190,7 @@ modalities::Status NativeWorkspace::set_fixed_prompt_length(
             base + static_cast<std::size_t>(prompt_tokens - 1) * row_bytes,
             row_bytes, cudaMemcpyDeviceToDevice);
         if (copy_rc != cudaSuccess) {
-            return backend("Thor prompt padding copy failed");
+            return backend("prompt padding copy failed");
         }
     }
     const std::int32_t valid = encoder_vision_sequence_ + rounded_prompt;
@@ -196,16 +200,16 @@ modalities::Status NativeWorkspace::set_fixed_prompt_length(
             cudaMemcpy(frt_buffer_dptr(prompt_length_buffers_[i]), &values[i],
                        sizeof(values[i]), cudaMemcpyHostToDevice) !=
                 cudaSuccess) {
-            return backend("Thor fixed prompt control upload failed");
+            return backend("fixed prompt control upload failed");
         }
     }
     return update_decoder_rope(rounded_prompt);
 #endif
 }
 
-modalities::Status NativeWorkspace::update_decoder_rope(int prompt_tokens) {
-    if (prompt_tokens < 0 || prompt_tokens > max_prompt_tokens_ ||
-        rope_table_.empty()) {
+modalities::Status NativeWorkspace::update_decoder_rope(
+    int prompt_tokens) {
+    if (prompt_tokens < 0 || prompt_tokens > max_prompt_tokens_) {
         return invalid("Pi0.5 decoder RoPE prompt length is invalid");
     }
 #ifndef FLASHRT_CPP_WITH_CUDA_STAGING
@@ -213,12 +217,17 @@ modalities::Status NativeWorkspace::update_decoder_rope(int prompt_tokens) {
         modalities::StatusCode::kUnsupported,
         "decoder RoPE update requires the CUDA build");
 #else
-    if (!decoder_rope_buffer_)
+    if (!decoder_rope_buffer_) {
         return invalid("decoder RoPE buffer was not allocated");
-    if (flavor_ == NativeWorkspaceFlavor::kThorFp8) {
-        return generate_native_thor_rope_f16(
+    }
+    if (activation_dtype_ == modalities::DType::kFloat16) {
+        return generate_native_rope_f16(
             frt_buffer_dptr(decoder_rope_buffer_),
             encoder_vision_sequence_ + prompt_tokens, chunk_size_, 0);
+    }
+    if (activation_dtype_ != modalities::DType::kBFloat16 ||
+        rope_table_.empty()) {
+        return invalid("decoder RoPE activation dtype is unsupported");
     }
     const std::size_t start =
         static_cast<std::size_t>(encoder_vision_sequence_ + prompt_tokens) *
@@ -244,16 +253,19 @@ modalities::Status NativeWorkspace::expand_vision_position_embedding(
         weights.find("vision_position_embedding");
     const NativeWorkspaceBuffer* destination =
         find("vision_pos_embed_expanded");
-    const NativeWeightDType expected_weight =
-        flavor_ == NativeWorkspaceFlavor::kThorFp8
-            ? NativeWeightDType::kFloat16
-            : NativeWeightDType::kBf16;
-    const modalities::DType expected_buffer =
-        flavor_ == NativeWorkspaceFlavor::kThorFp8
-            ? modalities::DType::kFloat16
-            : modalities::DType::kBFloat16;
-    if (!source || !destination || source->dtype != expected_weight ||
-        destination->dtype != expected_buffer ||
+    if (!destination) {
+        return invalid("vision position embedding destination is invalid");
+    }
+
+    NativeWeightDType expected_weight;
+    if (destination->dtype == modalities::DType::kFloat16) {
+        expected_weight = NativeWeightDType::kFloat16;
+    } else if (destination->dtype == modalities::DType::kBFloat16) {
+        expected_weight = NativeWeightDType::kBf16;
+    } else {
+        return invalid("vision position embedding dtype is invalid");
+    }
+    if (!source || source->dtype != expected_weight ||
         source->shape != std::vector<std::uint64_t>({256, 1152})) {
         return invalid("vision position embedding source is invalid");
     }
@@ -283,7 +295,8 @@ modalities::Status NativeWorkspace::expand_vision_position_embedding(
 }
 
 modalities::Status NativeWorkspace::allocate(
-    const NativeWorkspaceConfig& config) {
+    const NativeWorkspaceConfig& config,
+    const NativeWorkspaceRequirements& requirements) {
     if (!ctx_ || !buffers_.empty() || config.num_views < 1 ||
         config.num_views > 3 || config.max_prompt_tokens <= 0 ||
         config.max_prompt_tokens > std::numeric_limits<int>::max() - 768 ||
@@ -294,249 +307,115 @@ modalities::Status NativeWorkspace::allocate(
         (config.vision_pool_factor != 1 &&
          config.vision_pool_factor != 2 &&
          config.vision_pool_factor != 4) ||
-        (config.flavor == NativeWorkspaceFlavor::kThorFp8 &&
-         (config.vision_pool_factor != 1 ||
-          (config.max_prompt_tokens & 1)))) {
+        (requirements.activation_dtype != modalities::DType::kFloat16 &&
+         requirements.activation_dtype != modalities::DType::kBFloat16)) {
         return invalid("Pi0.5 native workspace configuration is invalid");
     }
+
     const int pool_area =
         config.vision_pool_factor * config.vision_pool_factor;
     num_views_ = config.num_views;
     max_prompt_tokens_ = config.max_prompt_tokens;
     chunk_size_ = config.chunk_size;
     num_steps_ = config.num_steps;
-    flavor_ = config.flavor;
+    activation_dtype_ = requirements.activation_dtype;
+    fixed_prompt_controls_ = requirements.fixed_prompt_controls;
     vision_sequence_ = config.num_views * 256;
     encoder_vision_sequence_ = vision_sequence_ / pool_area;
     encoder_sequence_ =
         encoder_vision_sequence_ + config.max_prompt_tokens;
-    const std::uint64_t nv = static_cast<std::uint64_t>(config.num_views);
+
+    const std::uint64_t nv = static_cast<std::uint64_t>(num_views_);
     const std::uint64_t vs = static_cast<std::uint64_t>(vision_sequence_);
     const std::uint64_t vs_enc =
         static_cast<std::uint64_t>(encoder_vision_sequence_);
     const std::uint64_t es = static_cast<std::uint64_t>(encoder_sequence_);
-    const std::uint64_t ds = static_cast<std::uint64_t>(config.chunk_size);
-    const std::uint64_t steps = static_cast<std::uint64_t>(config.num_steps);
+    const std::uint64_t ds = static_cast<std::uint64_t>(chunk_size_);
+    const std::uint64_t steps = static_cast<std::uint64_t>(num_steps_);
     modalities::Status st;
-#define FRT_ADD(...)                      \
-    do {                                  \
-        st = add(__VA_ARGS__);             \
-        if (!st.ok_status()) return st;    \
+
+#define FRT_ADD(...)                   \
+    do {                               \
+        st = add(__VA_ARGS__);         \
+        if (!st.ok_status()) return st; \
     } while (false)
-    if (flavor_ == NativeWorkspaceFlavor::kThorFp8) {
-        const std::uint64_t keys = es + ds;
-        FRT_ADD("observation_images_normalized", {nv, 224, 224, 3},
-                modalities::DType::kFloat16);
-        FRT_ADD("vision_x", {vs, 1152}, modalities::DType::kFloat16);
-        st = add_alias("vision_x_pooled", "vision_x", {vs, 1152});
-        if (!st.ok_status()) return st;
-        FRT_ADD("vision_x_fp8", {vs, 1152}, modalities::DType::kUInt8);
-        FRT_ADD("vision_QKV", {vs, 3456}, modalities::DType::kFloat16);
-        FRT_ADD("vision_attn", {vs, 1152}, modalities::DType::kFloat16);
-        st = add_alias("vision_postln_scratch", "vision_attn", {vs, 1152});
-        if (!st.ok_status()) return st;
-        FRT_ADD("vision_hidden", {vs, 4304}, modalities::DType::kFloat16);
-        FRT_ADD("vision_hidden_fp8", {vs, 4304},
-                modalities::DType::kUInt8);
-        FRT_ADD("vision_pos_embed_expanded", {vs, 1152},
-                modalities::DType::kFloat16);
-        FRT_ADD("vision_patches", {vs, 588}, modalities::DType::kFloat16);
-        FRT_ADD("vision_unit_scale", {1}, modalities::DType::kFloat32);
 
-        FRT_ADD("encoder_rope_weights", {es, 256},
-                modalities::DType::kFloat16);
-        FRT_ADD("prompt_embedding",
-                {static_cast<std::uint64_t>(max_prompt_tokens_), 2048},
-                modalities::DType::kFloat16);
-        FRT_ADD("encoder_x", {es, 2048}, modalities::DType::kFloat16);
-        FRT_ADD("encoder_x_fp8", {es, 2048}, modalities::DType::kUInt8);
-        FRT_ADD("encoder_QKV", {es, 2560}, modalities::DType::kFloat16);
-        FRT_ADD("encoder_logits", {es * 8, keys},
-                modalities::DType::kFloat16);
-        FRT_ADD("encoder_attn", {es, 2048}, modalities::DType::kFloat16);
-        FRT_ADD("encoder_o_fp8", {es, 2048}, modalities::DType::kUInt8);
-        FRT_ADD("encoder_gate_merged", {es, 32768},
-                modalities::DType::kFloat16);
-        FRT_ADD("encoder_hidden", {es, 16384},
-                modalities::DType::kFloat16);
-        FRT_ADD("encoder_hidden_fp8", {es, 16384},
-                modalities::DType::kUInt8);
-        FRT_ADD("encoder_fg", {es, 2048}, modalities::DType::kFloat16);
-        FRT_ADD("encoder_rms_ones", {2048}, modalities::DType::kFloat16);
-        FRT_ADD("encoder_activation_scales", {18, 4},
-                modalities::DType::kFloat32);
-        FRT_ADD("encoder_k_cache", {18, keys, 256},
-                modalities::DType::kFloat16);
-        FRT_ADD("encoder_v_cache", {18, keys, 256},
-                modalities::DType::kFloat16);
-        FRT_ADD("attn_enc_seqused", {sizeof(std::int32_t)},
-                modalities::DType::kUInt8);
-        FRT_ADD("attn_dec_seqused", {sizeof(std::int32_t)},
-                modalities::DType::kUInt8);
-        FRT_ADD("attn_dec_devpos", {sizeof(std::int32_t)},
-                modalities::DType::kUInt8);
-
-        FRT_ADD("decoder_rope_weights", {ds, 256},
-                modalities::DType::kFloat16);
-        FRT_ADD("decoder_x", {ds, 1024}, modalities::DType::kFloat16);
-        FRT_ADD("x_normed_buf", {ds, 1024}, modalities::DType::kFloat16);
-        FRT_ADD("gate_buf", {ds, 1024}, modalities::DType::kFloat16);
-        FRT_ADD("decoder_QKV", {ds, 2560}, modalities::DType::kFloat16);
-        FRT_ADD("decoder_logits", {ds * 8, keys},
-                modalities::DType::kFloat16);
-        FRT_ADD("decoder_attn", {ds, 2048}, modalities::DType::kFloat16);
-        FRT_ADD("decoder_hidden", {ds, 8192}, modalities::DType::kFloat16);
-        FRT_ADD("decoder_fg", {ds, 8192}, modalities::DType::kFloat16);
-        FRT_ADD("decoder_action_f32", {ds, 32},
-                modalities::DType::kFloat32);
-        FRT_ADD("decoder_x_fp8", {ds, 1024}, modalities::DType::kUInt8);
-        FRT_ADD("decoder_hidden_fp8", {ds, 4096},
-                modalities::DType::kUInt8);
-        FRT_ADD("decoder_context_fp8", {ds, 2048},
-                modalities::DType::kUInt8);
-        FRT_ADD("decoder_time_emb", {steps, ds, 1024},
-                modalities::DType::kFloat16);
-        FRT_ADD("decoder_style_attn", {steps, 18, ds, 3072},
-                modalities::DType::kFloat16);
-        FRT_ADD("decoder_style_ffn", {steps, 18, ds, 3072},
-                modalities::DType::kFloat16);
-        FRT_ADD("decoder_style_final", {steps, ds, 3072},
-                modalities::DType::kFloat16);
-        FRT_ADD("decoder_activation_scales", {steps, 18, 4},
-                modalities::DType::kFloat32);
-        FRT_ADD("diffusion_noise", {ds, 32}, modalities::DType::kFloat16);
-        FRT_ADD("rtc_prev_action_chunk", {ds, 32},
-                modalities::DType::kFloat16);
-        FRT_ADD("rtc_prefix_weights", {ds}, modalities::DType::kFloat32);
-        FRT_ADD("rtc_guidance_weight", {1}, modalities::DType::kFloat32);
-        FRT_ADD("decoder_rms_ones", {1024}, modalities::DType::kFloat16);
-
-        if (config.enable_calibration) {
-            FRT_ADD("encoder_norm_scratch", {es, 2048},
-                    modalities::DType::kFloat16);
-            FRT_ADD("encoder_x_scratch", {es, 2048},
-                    modalities::DType::kFloat16);
-            FRT_ADD("encoder_fp8_scratch", {es, 16384},
-                    modalities::DType::kUInt8);
-            FRT_ADD("encoder_sample_scales", {18, 4},
-                    modalities::DType::kFloat32);
-            FRT_ADD("decoder_fp8_scratch", {ds, 4096},
-                    modalities::DType::kUInt8);
-            FRT_ADD("decoder_sample_scales", {steps, 18, 4},
-                    modalities::DType::kFloat32);
-            FRT_ADD("calibration_scale", {1}, modalities::DType::kFloat32);
-        }
-
-        const NativeWorkspaceBuffer* decoder = find("decoder_rope_weights");
-        const NativeWorkspaceBuffer* prompt = find("prompt_embedding");
-        if (!decoder || !prompt) {
-            return invalid("Thor prompt workspace was not allocated");
-        }
-        decoder_rope_buffer_ = decoder->buffer;
-        prompt_embedding_buffer_ = prompt->buffer;
-        const char* controls[] = {
-            "attn_enc_seqused", "attn_dec_seqused", "attn_dec_devpos"};
-        for (int i = 0; i < 3; ++i) {
-            const NativeWorkspaceBuffer* control = find(controls[i]);
-            if (!control) return invalid("Thor attention control is missing");
-            prompt_length_buffers_[i] = control->buffer;
-        }
-#ifndef FLASHRT_CPP_WITH_CUDA_STAGING
-        return modalities::Status::error(
-            modalities::StatusCode::kUnsupported,
-            "Thor workspace initialization requires the CUDA build");
-#else
-        const float unit_scale = 1.0f;
-        const NativeWorkspaceBuffer* unit = find("vision_unit_scale");
-        if (!unit || cudaMemcpy(frt_buffer_dptr(unit->buffer), &unit_scale,
-                                sizeof(unit_scale), cudaMemcpyHostToDevice) !=
-                         cudaSuccess) {
-            return backend("Thor unit scale upload failed");
-        }
-#endif
-        st = initialize_rms_ones();
-        if (!st.ok_status()) return st;
-        st = initialize_rope();
-        if (!st.ok_status()) return st;
-        return set_fixed_prompt_length(0);
-    }
     FRT_ADD("observation_images_normalized", {nv, 224, 224, 3},
-            modalities::DType::kBFloat16);
-    FRT_ADD("vision_x", {vs, 1152}, modalities::DType::kBFloat16);
-    FRT_ADD("vision_x_norm", {vs, 1152}, modalities::DType::kBFloat16);
+            activation_dtype_);
+    FRT_ADD("vision_x", {vs, 1152}, activation_dtype_);
     if (config.vision_pool_factor == 1) {
         st = add_alias("vision_x_pooled", "vision_x", {vs_enc, 1152});
         if (!st.ok_status()) return st;
     } else {
-        FRT_ADD("vision_x_pooled", {vs_enc, 1152},
-                modalities::DType::kBFloat16);
+        FRT_ADD("vision_x_pooled", {vs_enc, 1152}, activation_dtype_);
     }
-    FRT_ADD("vision_QKV", {vs, 3456}, modalities::DType::kBFloat16);
-    FRT_ADD("vision_hidden", {vs, 4304}, modalities::DType::kBFloat16);
-    FRT_ADD("vision_pos_embed_expanded", {vs, 1152},
-            modalities::DType::kBFloat16);
-    FRT_ADD("vision_patches", {vs, 588}, modalities::DType::kBFloat16);
+    FRT_ADD("vision_pos_embed_expanded", {vs, 1152}, activation_dtype_);
+    FRT_ADD("vision_patches", {vs, 588}, activation_dtype_);
 
-    FRT_ADD("encoder_rope_weights", {es, 256},
-            modalities::DType::kBFloat16);
+    FRT_ADD("encoder_rope_weights", {es, 256}, activation_dtype_);
     FRT_ADD("prompt_embedding",
             {static_cast<std::uint64_t>(max_prompt_tokens_), 2048},
-            modalities::DType::kBFloat16);
-    FRT_ADD("encoder_x", {es, 2048}, modalities::DType::kBFloat16);
-    FRT_ADD("encoder_x_norm", {es, 2048}, modalities::DType::kBFloat16);
-    FRT_ADD("encoder_QKV", {es, 2560}, modalities::DType::kBFloat16);
-    FRT_ADD("encoder_hidden", {es, 16384}, modalities::DType::kBFloat16);
-    FRT_ADD("encoder_gate_merged", {es, 32768},
-            modalities::DType::kBFloat16);
-    FRT_ADD("encoder_gate_buf", {es, 16384},
-            modalities::DType::kBFloat16);
-    FRT_ADD("encoder_rms_ones", {2048}, modalities::DType::kBFloat16);
+            activation_dtype_);
+    FRT_ADD("encoder_x", {es, 2048}, activation_dtype_);
+    FRT_ADD("encoder_rms_ones", {2048}, activation_dtype_);
 
-    FRT_ADD("decoder_rope_weights", {ds, 256},
-            modalities::DType::kBFloat16);
-    FRT_ADD("decoder_x", {ds, 1024}, modalities::DType::kBFloat16);
-    FRT_ADD("decoder_action_buf", {ds, 32}, modalities::DType::kBFloat16);
-    FRT_ADD("decoder_time_emb", {steps, ds, 1024},
-            modalities::DType::kBFloat16);
+    FRT_ADD("decoder_rope_weights", {ds, 256}, activation_dtype_);
+    FRT_ADD("decoder_x", {ds, 1024}, activation_dtype_);
+    FRT_ADD("decoder_time_emb", {steps, ds, 1024}, activation_dtype_);
     FRT_ADD("decoder_style_attn", {steps, 18, ds, 3072},
-            modalities::DType::kBFloat16);
+            activation_dtype_);
     FRT_ADD("decoder_style_ffn", {steps, 18, ds, 3072},
-            modalities::DType::kBFloat16);
+            activation_dtype_);
     FRT_ADD("decoder_style_final", {steps, ds, 3072},
-            modalities::DType::kBFloat16);
-    FRT_ADD("decoder_QKV", {ds, 2560}, modalities::DType::kBFloat16);
-    FRT_ADD("decoder_hidden", {ds, 4096}, modalities::DType::kBFloat16);
-    FRT_ADD("decoder_gate_merged", {ds, 8192},
-            modalities::DType::kBFloat16);
-    FRT_ADD("decoder_gate_buf", {ds, 4096},
-            modalities::DType::kBFloat16);
-    FRT_ADD("diffusion_noise", {ds, 32}, modalities::DType::kBFloat16);
-    FRT_ADD("rtc_prev_action_chunk", {ds, 32},
-            modalities::DType::kBFloat16);
+            activation_dtype_);
+    FRT_ADD("diffusion_noise", {ds, 32}, activation_dtype_);
+    FRT_ADD("rtc_prev_action_chunk", {ds, 32}, activation_dtype_);
     FRT_ADD("rtc_prefix_weights", {ds}, modalities::DType::kFloat32);
     FRT_ADD("rtc_guidance_weight", {1}, modalities::DType::kFloat32);
-    FRT_ADD("x_normed_buf", {ds, 1024}, modalities::DType::kBFloat16);
-    FRT_ADD("gate_buf", {ds, 1024}, modalities::DType::kBFloat16);
-    FRT_ADD("decoder_rms_ones", {1024}, modalities::DType::kBFloat16);
-    if (flavor_ == NativeWorkspaceFlavor::kRtxFp8) {
-        const std::uint64_t scratch_elements = std::max({
-            vs * 4304, es * 16384, ds * 4096});
-        FRT_ADD("rtx_fp8_scratch", {scratch_elements},
-                modalities::DType::kUInt8);
-        FRT_ADD("rtx_fp8_vision_scales", {109},
-                modalities::DType::kFloat32);
-        FRT_ADD("rtx_fp8_encoder_scales", {18 * 4},
-                modalities::DType::kFloat32);
-        FRT_ADD("rtx_fp8_decoder_scales", {steps * 18 * 4},
-                modalities::DType::kFloat32);
+    FRT_ADD("decoder_rms_ones", {1024}, activation_dtype_);
+    logical_size_ = buffers_.size();
+
+    for (const NativeWorkspaceBufferRequirement& buffer :
+         requirements.buffers) {
+        st = add(buffer.name, buffer.shape, buffer.dtype);
+        if (!st.ok_status()) return st;
+    }
+    for (const NativeWorkspaceAliasRequirement& alias :
+         requirements.aliases) {
+        st = add_alias(alias.name, alias.source, alias.shape);
+        if (!st.ok_status()) return st;
     }
 #undef FRT_ADD
+
     const NativeWorkspaceBuffer* decoder = find("decoder_rope_weights");
-    if (!decoder) return invalid("decoder RoPE buffer was not allocated");
+    const NativeWorkspaceBuffer* prompt = find("prompt_embedding");
+    if (!decoder || !prompt || decoder->dtype != activation_dtype_ ||
+        prompt->dtype != activation_dtype_) {
+        return invalid("model workspace controls were not allocated");
+    }
     decoder_rope_buffer_ = decoder->buffer;
+    prompt_embedding_buffer_ = prompt->buffer;
+
+    if (fixed_prompt_controls_) {
+        const char* controls[] = {
+            "attn_enc_seqused", "attn_dec_seqused", "attn_dec_devpos"};
+        for (int i = 0; i < 3; ++i) {
+            const NativeWorkspaceBuffer* control = find(controls[i]);
+            if (!control || control->dtype != modalities::DType::kUInt8 ||
+                frt_buffer_bytes(control->buffer) != sizeof(std::int32_t)) {
+                return invalid("fixed prompt control is missing");
+            }
+            prompt_length_buffers_[i] = control->buffer;
+        }
+    }
+
     st = initialize_rms_ones();
     if (!st.ok_status()) return st;
-    return initialize_rope();
+    st = initialize_rope();
+    if (!st.ok_status()) return st;
+    return fixed_prompt_controls_
+               ? set_fixed_prompt_length(0)
+               : modalities::Status::ok();
 }
 
 const NativeWorkspaceBuffer* NativeWorkspace::find(

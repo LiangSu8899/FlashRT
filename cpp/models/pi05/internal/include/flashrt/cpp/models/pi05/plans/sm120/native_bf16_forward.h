@@ -56,11 +56,6 @@ public:
         NativeWorkspace* workspace, NativeRtxAttentionWorkspace* attention,
         const NativeRtxAttentionDriver* attention_driver,
         std::uintptr_t stream) const;
-    modalities::Status diffusion(
-        const NativeDeviceWeightStore& weights, NativeWorkspace* workspace,
-        NativeRtxAttentionWorkspace* attention,
-        const NativeRtxAttentionDriver* attention_driver,
-        std::uintptr_t stream) const;
 #endif
 
 private:

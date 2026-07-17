@@ -12,6 +12,10 @@ namespace flashrt {
 namespace models {
 namespace pi05 {
 
+NativeWorkspaceRequirements make_sm120_workspace_requirements(
+    const NativeWorkspaceConfig& config,
+    bool fp8);
+
 class Sm120LoweredPlan final : public Pi05Pipeline {
 public:
     static std::unique_ptr<Sm120LoweredPlan> create(

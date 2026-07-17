@@ -7,6 +7,7 @@
 
 #include <cuda_runtime_api.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -27,6 +28,22 @@ modalities::Status invalid(const char* message) {
 modalities::Status backend(const char* message) {
     return modalities::Status::error(modalities::StatusCode::kBackend,
                                      message);
+}
+
+bool valid_sm120_config(const Pi05PipelineConfig& config) {
+    const std::uint64_t total_sequence =
+        static_cast<std::uint64_t>(config.max_prompt_tokens) +
+        static_cast<std::uint64_t>(config.chunk_size) +
+        static_cast<std::uint64_t>(config.num_views) * 256;
+    return config.num_views >= 1 && config.num_views <= 3 &&
+           config.max_prompt_tokens >= 1 && config.chunk_size >= 1 &&
+           config.num_steps >= 1 &&
+           total_sequence <=
+               static_cast<std::uint64_t>(
+                   std::numeric_limits<int>::max()) &&
+           (config.vision_pool_factor == 1 ||
+            config.vision_pool_factor == 2 ||
+            config.vision_pool_factor == 4);
 }
 
 modalities::Status upload_scales(
@@ -51,6 +68,65 @@ modalities::Status upload_scales(
 
 }  // namespace
 
+NativeWorkspaceRequirements make_sm120_workspace_requirements(
+    const NativeWorkspaceConfig& config,
+    bool fp8) {
+    NativeWorkspaceRequirements requirements;
+    requirements.activation_dtype = modalities::DType::kBFloat16;
+
+    const std::uint64_t vs =
+        static_cast<std::uint64_t>(config.num_views) * 256;
+    const std::uint64_t pool =
+        static_cast<std::uint64_t>(config.vision_pool_factor) *
+        static_cast<std::uint64_t>(config.vision_pool_factor);
+    const std::uint64_t es =
+        vs / pool + static_cast<std::uint64_t>(config.max_prompt_tokens);
+    const std::uint64_t ds =
+        static_cast<std::uint64_t>(config.chunk_size);
+    const std::uint64_t steps =
+        static_cast<std::uint64_t>(config.num_steps);
+    const auto add_bf16 =
+        [&](const char* name,
+            std::initializer_list<std::uint64_t> shape) {
+            requirements.add_buffer(
+                name, shape, modalities::DType::kBFloat16);
+        };
+
+    add_bf16("vision_x_norm", {vs, 1152});
+    add_bf16("vision_QKV", {vs, 3456});
+    add_bf16("vision_hidden", {vs, 4304});
+    add_bf16("encoder_x_norm", {es, 2048});
+    add_bf16("encoder_QKV", {es, 2560});
+    add_bf16("encoder_hidden", {es, 16384});
+    add_bf16("encoder_gate_merged", {es, 32768});
+    add_bf16("encoder_gate_buf", {es, 16384});
+    add_bf16("decoder_action_buf", {ds, 32});
+    add_bf16("decoder_QKV", {ds, 2560});
+    add_bf16("decoder_hidden", {ds, 4096});
+    add_bf16("decoder_gate_merged", {ds, 8192});
+    add_bf16("decoder_gate_buf", {ds, 4096});
+    add_bf16("x_normed_buf", {ds, 1024});
+    add_bf16("gate_buf", {ds, 1024});
+
+    if (fp8) {
+        const std::uint64_t scratch_elements = std::max({
+            vs * 4304, es * 16384, ds * 4096});
+        requirements.add_buffer(
+            "rtx_fp8_scratch", {scratch_elements},
+            modalities::DType::kUInt8);
+        requirements.add_buffer(
+            "rtx_fp8_vision_scales", {109},
+            modalities::DType::kFloat32);
+        requirements.add_buffer(
+            "rtx_fp8_encoder_scales", {18 * 4},
+            modalities::DType::kFloat32);
+        requirements.add_buffer(
+            "rtx_fp8_decoder_scales", {steps * 18 * 4},
+            modalities::DType::kFloat32);
+    }
+    return requirements;
+}
+
 Sm120LoweredPlan::Sm120LoweredPlan(
     frt_ctx ctx,
     const Pi05PipelineConfig& config,
@@ -69,15 +145,7 @@ std::unique_ptr<Sm120LoweredPlan> Sm120LoweredPlan::create(
     const Pi05PipelineConfig& config,
     modalities::Status* status) {
     if (config.precision != Pi05Precision::kBf16 ||
-        config.num_views < 1 || config.num_views > 3 ||
-        config.max_prompt_tokens < 1 || config.chunk_size < 1 ||
-        config.num_steps < 1 ||
-        static_cast<std::uint64_t>(config.max_prompt_tokens) +
-                static_cast<std::uint64_t>(config.chunk_size) +
-                static_cast<std::uint64_t>(config.num_views) * 256 >
-            static_cast<std::uint64_t>(std::numeric_limits<int>::max()) ||
-        (config.vision_pool_factor != 1 &&
-         config.vision_pool_factor != 2 && config.vision_pool_factor != 4)) {
+        !valid_sm120_config(config)) {
         if (status) *status = invalid("native graph configuration is invalid");
         return nullptr;
     }
@@ -108,7 +176,8 @@ std::unique_ptr<Sm120LoweredPlan> Sm120LoweredPlan::create(
     const Pi05PipelineConfig& config,
     const NativeCalibrationArtifact& calibration,
     modalities::Status* status) {
-    if (config.precision != Pi05Precision::kFp8E4M3) {
+    if (config.precision != Pi05Precision::kFp8E4M3 ||
+        !valid_sm120_config(config)) {
         if (status) *status = invalid("native RTX FP8 graph precision is invalid");
         return nullptr;
     }
@@ -138,7 +207,8 @@ std::unique_ptr<Sm120LoweredPlan> Sm120LoweredPlan::create_calibration(
     const std::string& checkpoint_path,
     const Pi05PipelineConfig& config,
     modalities::Status* status) {
-    if (config.precision != Pi05Precision::kFp8E4M3) {
+    if (config.precision != Pi05Precision::kFp8E4M3 ||
+        !valid_sm120_config(config)) {
         if (status) {
             *status = invalid("native RTX calibration precision is invalid");
         }
@@ -213,9 +283,9 @@ modalities::Status Sm120LoweredPlan::initialize(
     workspace_config.chunk_size = config().chunk_size;
     workspace_config.num_steps = config().num_steps;
     workspace_config.vision_pool_factor = config().vision_pool_factor;
-    workspace_config.flavor = fp8 ? NativeWorkspaceFlavor::kRtxFp8
-                                  : NativeWorkspaceFlavor::kBf16;
-    st = workspace_.allocate(workspace_config);
+    NativeWorkspaceRequirements workspace_requirements =
+        make_sm120_workspace_requirements(workspace_config, fp8);
+    st = workspace_.allocate(workspace_config, workspace_requirements);
     if (!st.ok_status()) return st;
     if (linear_.static_fp8()) {
         st = upload_scales(
