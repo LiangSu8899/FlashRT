@@ -26,6 +26,8 @@ option(FLASHRT_CPP_WITH_SENTENCEPIECE "Enable native SentencePiece text tokeniza
 option(FLASHRT_CPP_WITH_FA2 "Enable the Python-free vendored FA2 driver" OFF)
 option(FLASHRT_CPP_WITH_THOR_FP8
        "Enable the native Thor SM110 FP8 kernel backend" OFF)
+option(FLASHRT_CPP_BUILD_PI05_DIAGNOSTICS
+       "Build detailed PI0.5 real-checkpoint diagnostic probes" OFF)
 set(FLASHRT_CPP_FA2_LIBRARY "" CACHE FILEPATH
     "Path to the Python-free libflashrt_fa2_raw shared library")
 set(FLASHRT_CPP_CUTLASS_DIR

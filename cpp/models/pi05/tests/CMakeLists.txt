@@ -31,9 +31,11 @@ add_executable(test_pi05_native_calibration
 target_link_libraries(test_pi05_native_calibration PRIVATE flashrt_cpp_pi05)
 add_test(NAME pi05_native_calibration COMMAND test_pi05_native_calibration)
 
-add_executable(pi05_native_weight_probe
-  ${_pi05_test_source_dir}/pi05_native_weight_probe.cpp)
-target_link_libraries(pi05_native_weight_probe PRIVATE flashrt_cpp_pi05)
+if(FLASHRT_CPP_BUILD_PI05_DIAGNOSTICS)
+  add_executable(pi05_native_weight_probe
+    ${_pi05_test_source_dir}/pi05_native_weight_probe.cpp)
+  target_link_libraries(pi05_native_weight_probe PRIVATE flashrt_cpp_pi05)
+endif()
 
 if(FLASHRT_CPP_WITH_CUDA_KERNELS)
   add_executable(test_pi05_native_quantization
@@ -42,10 +44,12 @@ if(FLASHRT_CPP_WITH_CUDA_KERNELS)
   add_test(NAME pi05_native_quantization
     COMMAND test_pi05_native_quantization)
 
-  add_executable(pi05_native_quant_probe
-    ${_pi05_test_source_dir}/pi05_native_quant_probe.cpp)
-  target_link_libraries(pi05_native_quant_probe
-    PRIVATE flashrt_cpp_pi05_kernels flashrt_exec CUDA::cudart)
+  if(FLASHRT_CPP_BUILD_PI05_DIAGNOSTICS)
+    add_executable(pi05_native_quant_probe
+      ${_pi05_test_source_dir}/pi05_native_quant_probe.cpp)
+    target_link_libraries(pi05_native_quant_probe
+      PRIVATE flashrt_cpp_pi05_kernels flashrt_exec CUDA::cudart)
+  endif()
 
   add_executable(test_pi05_native_weight_packer
     ${_pi05_test_source_dir}/test_pi05_native_weight_packer.cpp)
@@ -75,10 +79,12 @@ if(FLASHRT_CPP_WITH_CUDA_KERNELS)
   add_test(NAME pi05_native_bf16_forward
     COMMAND test_pi05_native_bf16_forward)
 
-  add_executable(pi05_native_encoder_qkv_probe
-    ${_pi05_test_source_dir}/pi05_native_encoder_qkv_probe.cpp)
-  target_link_libraries(pi05_native_encoder_qkv_probe
-    PRIVATE flashrt_cpp_pi05_kernels flashrt_exec CUDA::cudart)
+  if(FLASHRT_CPP_BUILD_PI05_DIAGNOSTICS)
+    add_executable(pi05_native_encoder_qkv_probe
+      ${_pi05_test_source_dir}/pi05_native_encoder_qkv_probe.cpp)
+    target_link_libraries(pi05_native_encoder_qkv_probe
+      PRIVATE flashrt_cpp_pi05_kernels flashrt_exec CUDA::cudart)
+  endif()
 
   add_executable(test_pi05_native_style_precompute
     ${_pi05_test_source_dir}/test_pi05_native_style_precompute.cpp)
@@ -87,10 +93,12 @@ if(FLASHRT_CPP_WITH_CUDA_KERNELS)
   add_test(NAME pi05_native_style_precompute
     COMMAND test_pi05_native_style_precompute)
 
-  add_executable(pi05_native_style_probe
-    ${_pi05_test_source_dir}/pi05_native_style_probe.cpp)
-  target_link_libraries(pi05_native_style_probe
-    PRIVATE flashrt_cpp_pi05_kernels flashrt_exec CUDA::cudart)
+  if(FLASHRT_CPP_BUILD_PI05_DIAGNOSTICS)
+    add_executable(pi05_native_style_probe
+      ${_pi05_test_source_dir}/pi05_native_style_probe.cpp)
+    target_link_libraries(pi05_native_style_probe
+      PRIVATE flashrt_cpp_pi05_kernels flashrt_exec CUDA::cudart)
+  endif()
 
   add_executable(test_pi05_native_workspace
     ${_pi05_test_source_dir}/test_pi05_native_workspace.cpp)
@@ -107,37 +115,41 @@ if(FLASHRT_CPP_WITH_CUDA_KERNELS)
     COMMAND test_pi05_native_rtx_attention)
 
   if(FLASHRT_CPP_WITH_FA2)
-    add_executable(pi05_native_encoder_layer_probe
-      ${_pi05_test_source_dir}/pi05_native_encoder_layer_probe.cpp)
-    target_link_libraries(pi05_native_encoder_layer_probe
-      PRIVATE flashrt_cpp_pi05_kernels flashrt_exec CUDA::cudart)
+    if(FLASHRT_CPP_BUILD_PI05_DIAGNOSTICS)
+      add_executable(pi05_native_encoder_layer_probe
+        ${_pi05_test_source_dir}/pi05_native_encoder_layer_probe.cpp)
+      target_link_libraries(pi05_native_encoder_layer_probe
+        PRIVATE flashrt_cpp_pi05_kernels flashrt_exec CUDA::cudart)
 
-    add_executable(pi05_native_encoder_probe
-      ${_pi05_test_source_dir}/pi05_native_encoder_probe.cpp)
-    target_link_libraries(pi05_native_encoder_probe
-      PRIVATE flashrt_cpp_pi05_kernels flashrt_exec CUDA::cudart)
+      add_executable(pi05_native_encoder_probe
+        ${_pi05_test_source_dir}/pi05_native_encoder_probe.cpp)
+      target_link_libraries(pi05_native_encoder_probe
+        PRIVATE flashrt_cpp_pi05_kernels flashrt_exec CUDA::cudart)
 
-    add_executable(pi05_native_vision_probe
-      ${_pi05_test_source_dir}/pi05_native_vision_probe.cpp)
-    target_link_libraries(pi05_native_vision_probe
-      PRIVATE flashrt_cpp_pi05_kernels flashrt_exec CUDA::cudart)
+      add_executable(pi05_native_vision_probe
+        ${_pi05_test_source_dir}/pi05_native_vision_probe.cpp)
+      target_link_libraries(pi05_native_vision_probe
+        PRIVATE flashrt_cpp_pi05_kernels flashrt_exec CUDA::cudart)
 
-    add_executable(pi05_native_diffusion_probe
-      ${_pi05_test_source_dir}/pi05_native_diffusion_probe.cpp)
-    target_link_libraries(pi05_native_diffusion_probe
-      PRIVATE flashrt_cpp_pi05_kernels flashrt_exec CUDA::cudart)
+      add_executable(pi05_native_diffusion_probe
+        ${_pi05_test_source_dir}/pi05_native_diffusion_probe.cpp)
+      target_link_libraries(pi05_native_diffusion_probe
+        PRIVATE flashrt_cpp_pi05_kernels flashrt_exec CUDA::cudart)
 
-    add_executable(pi05_native_graph_probe
-      ${_pi05_test_source_dir}/pi05_native_graph_probe.cpp)
-    target_link_libraries(pi05_native_graph_probe
-      PRIVATE flashrt_cpp_pi05_kernels flashrt_exec CUDA::cudart)
+      add_executable(pi05_native_graph_probe
+        ${_pi05_test_source_dir}/pi05_native_graph_probe.cpp)
+      target_link_libraries(pi05_native_graph_probe
+        PRIVATE flashrt_cpp_pi05_kernels flashrt_exec CUDA::cudart)
+
+      if(FLASHRT_CPP_WITH_SENTENCEPIECE)
+        add_executable(pi05_native_e2e_probe
+          ${_pi05_test_source_dir}/pi05_native_e2e_probe.cpp)
+        target_link_libraries(pi05_native_e2e_probe
+          PRIVATE flashrt_cpp_pi05_c flashrt_exec CUDA::cudart)
+      endif()
+    endif()
 
     if(FLASHRT_CPP_WITH_SENTENCEPIECE)
-      add_executable(pi05_native_e2e_probe
-        ${_pi05_test_source_dir}/pi05_native_e2e_probe.cpp)
-      target_link_libraries(pi05_native_e2e_probe
-        PRIVATE flashrt_cpp_pi05_c flashrt_exec CUDA::cudart)
-
       add_executable(pi05_native_dlopen_probe
         ${_pi05_test_source_dir}/pi05_native_dlopen_probe.cpp)
       target_include_directories(pi05_native_dlopen_probe
@@ -163,7 +175,8 @@ if(FLASHRT_CPP_WITH_CUDA_KERNELS)
       PRIVATE flashrt_cpp_pi05_c flashrt_exec CUDA::cudart)
   endif()
 
-  if(FLASHRT_CPP_WITH_SENTENCEPIECE)
+  if(FLASHRT_CPP_WITH_SENTENCEPIECE AND
+     FLASHRT_CPP_BUILD_PI05_DIAGNOSTICS)
     add_executable(pi05_tokenizer_corpus_probe
       ${_pi05_test_source_dir}/pi05_tokenizer_corpus_probe.cpp)
     target_link_libraries(pi05_tokenizer_corpus_probe
@@ -178,10 +191,12 @@ if(FLASHRT_CPP_WITH_CUDA_KERNELS)
       PRIVATE flashrt_cpp_pi05_c flashrt_exec CUDA::cudart)
   endif()
 
-  add_executable(pi05_native_rope_probe
-    ${_pi05_test_source_dir}/pi05_native_rope_probe.cpp)
-  target_link_libraries(pi05_native_rope_probe
-    PRIVATE flashrt_cpp_pi05 flashrt_exec CUDA::cudart)
+  if(FLASHRT_CPP_BUILD_PI05_DIAGNOSTICS)
+    add_executable(pi05_native_rope_probe
+      ${_pi05_test_source_dir}/pi05_native_rope_probe.cpp)
+    target_link_libraries(pi05_native_rope_probe
+      PRIVATE flashrt_cpp_pi05 flashrt_exec CUDA::cudart)
+  endif()
 endif()
 
 add_executable(test_pi05_prompt_format

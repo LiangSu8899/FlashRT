@@ -141,11 +141,13 @@ Pi0.5 is the reference C++ model runtime under `cpp/models/pi05/`. It supports
 both producer forms. The adopted-export path accepts Python- or native-produced
 graphs and overlays native vision/action/prompt/state verbs. The Python-free
 path loads safetensors and SentencePiece assets, selects an explicitly built
-hardware backend, captures one native graph, and publishes the complete
-`frt_model_runtime_v1` through `frt_model_runtime_open_v1`. SM120 currently
-uses BF16 plus native FA2; SM110 uses FP8 E4M3 plus an identity-bound native
-calibration artifact. Both expose the same backend-neutral contract, so Nexus
-and serving hosts do not change.
+hardware backend, captures the model-owned graph catalog, selects a stage plan,
+and publishes the complete `frt_model_runtime_v1` through
+`frt_model_runtime_open_v1`. SM120 supports BF16 and calibrated static FP8 with
+native FA2; SM110 supports calibrated FP8 E4M3 through the Thor backend. Every
+FP8 route requires an identity-bound native calibration artifact. All routes
+expose the same backend-neutral contract, so Nexus and serving hosts do not
+change.
 
 The `flashrt_cpp_pi05_c` target also exposes the model-specific host/calibration
 C API. These functions own Pi0.5 semantic transforms; they do not extend the

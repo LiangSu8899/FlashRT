@@ -464,6 +464,11 @@ Required:
 - Single-observation and repeated-observation reducers need independent gates;
   multi-input gates must cover reordered, missing, duplicate, and unknown
   inputs. Reference parity uses explicit fixed stochastic inputs.
+- Public tensor-window dtype is not proof of compute precision. Native low-
+  precision claims must agree across producer identity, artifact metadata, and
+  captured kernel dispatch. Document expected mixed-precision boundaries.
+- Producer binaries used for parity must be built from the same source
+  revision. A stale extension or shared library invalidates the comparison.
 
 Blockers:
 
@@ -510,6 +515,17 @@ Tests must not:
 - Skip everything in the default environment without testing import/fail-fast.
 - Depend on test ordering or global CUDA state from another test.
 - Use network downloads in default tests.
+
+Native producer test ownership:
+
+- FlashRT retains ABI/schema, lifecycle/ownership, artifact, final-result,
+  subgraph-equivalence, and hot-path invariant coverage.
+- Layer diagnostics, official-framework/real-dataset oracles, profiler traces,
+  deployment shadow comparison, and soak tests may be maintained externally.
+- Detailed probe targets are opt-in and non-installed. Never add production
+  intermediate-output ports only to satisfy an external oracle.
+- A migrated gate needs a coverage map, byte-identical transfer or reviewed
+  rewrite, and one overlapping successful run before removal.
 
 Commands:
 
@@ -658,6 +674,10 @@ Before merge, verify:
 - [ ] Hardware-specific behavior is isolated.
 - [ ] Unsupported hardware/platform combinations fail clearly.
 - [ ] Precision/cache/graph changes have correctness evidence.
+- [ ] Precision claims include identity/artifact/kernel-dispatch evidence and
+      same-revision producer binaries.
+- [ ] Test migrations preserve core in-repository coverage and have an audited
+      coverage map.
 - [ ] Docs match actual API, flags, modules, and behavior.
 - [ ] Performance claims include reproducible commands and correctness.
 

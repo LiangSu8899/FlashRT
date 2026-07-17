@@ -264,6 +264,28 @@ Native calibration APIs and artifacts have additional producer-boundary rules:
   array order does not change semantic order.
 - Use explicit fixed stochastic inputs for reference comparison. A generated
   fallback must be deterministic, documented, and separately exercised.
+- Do not infer compute precision from a public staging dtype. Native low-
+  precision evidence must agree across producer identity, calibration artifact
+  metadata, and captured kernel dispatch; mixed-precision boundary kernels are
+  documented separately from the main GEMM route.
+- Build every producer used in a parity comparison from the same source
+  revision. A stale pybind extension or shared library is an invalid numerical
+  oracle even when its Python sources match the checkout.
+
+### Native Producer Test Ownership
+
+Keep frozen ABI/schema, lifecycle/ownership, artifact validation, final-result,
+subgraph-equivalence, and hot-path invariant tests in FlashRT. Large-checkpoint
+official-framework oracles, layer-by-layer diagnostics, profiler reports,
+deployment shadow comparisons, and soak workloads may live in an integration
+validation repository. Detailed native probes must be opt-in, non-installed
+targets; do not expose intermediate model state through the production ABI to
+make an external test convenient.
+
+Moving a test requires a checked-in coverage map, byte-for-byte migration (or
+an explicitly reviewed rewrite), and one overlapping successful run before the
+old path is removed. Default builds must still exercise failure paths and final
+observable behavior without private checkpoints.
 
 ### Performance Measurement
 

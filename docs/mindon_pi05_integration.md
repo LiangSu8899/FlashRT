@@ -78,21 +78,24 @@ Python setup producer. The host and Nexus adoption code must not change when
 switching between Lane A and Lane C.
 
 The current C++ shared object implements this symbol as a complete native-v2
-producer on SM120 BF16 and SM110 FP8. Both require CUDA kernels and
-SentencePiece; SM120 uses native FA2, while SM110 uses the Thor FP8/CUTLASS
-backend and an identity-bound calibration artifact. The factory validates `io`,
-precision, checkpoint/tokenizer paths, fixed prompt mode, capacities, the
-complete 812-tensor inventory, and OpenPI or LeRobot action/state q01/q99
+producer for SM120 BF16, SM120 FP8, and SM110 FP8. All routes require CUDA
+kernels and SentencePiece. SM120 uses native FA2 with either BF16 GEMMs or
+calibrated static FP8 GEMMs; SM110 uses the Thor FP8/CUTLASS backend. Every
+FP8 route requires an identity-bound calibration artifact. The factory
+validates `io`, precision, checkpoint/tokenizer paths, fixed prompt mode,
+capacities, the complete 812-tensor inventory, and OpenPI or LeRobot
+action/state q01/q99
 metadata. It then hashes the model and tokenizer for deployment identity,
-materializes context-owned weights/workspace, captures one `infer` variant,
-and returns the integrated model runtime. Missing backend/SentencePiece support
-or unsupported hardware returns unsupported instead of publishing unusable
-ports.
+materializes context-owned weights/workspace, captures the `infer`, `context`,
+and `decode_only` graph catalog, and returns the integrated model runtime.
+Missing backend/SentencePiece support or unsupported hardware returns
+unsupported instead of publishing unusable ports.
 
-On SM110, create the artifact with the model-specific calibration API before
-opening the runtime, then pass it as `calibration_path`. One observation can
-contain one, two, or three named camera frames; repeat observations for dataset
-calibration. Camera synchronization and dataset policy stay in the Mindon host.
+For either FP8 backend, create the artifact with the model-specific calibration
+API before opening the runtime, then pass it as `calibration_path`. One
+observation can contain one, two, or three named camera frames; repeat
+observations for dataset calibration. Camera synchronization and dataset
+policy stay in the Mindon host.
 See [`pi05_thor_native_fp8.md`](pi05_thor_native_fp8.md) for exact build flags,
 C API usage, artifact invalidation, and validation gates. Native C++ NVFP4 is
 not currently advertised; Python precision routes remain independent.

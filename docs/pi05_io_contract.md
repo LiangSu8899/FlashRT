@@ -225,12 +225,13 @@ There are three supported integration lanes:
 
 The Pi0.5 C++ shared object exports `frt_model_runtime_open_v1` as a complete
 native-v2 producer when built with CUDA kernels, SentencePiece, and the backend
-for the executing device: native FA2 for SM120 BF16 or the Thor FP8/CUTLASS
-backend for SM110. The factory requires `io="native_v2"`, `checkpoint_path`,
+for the executing device: native FA2 for SM120 BF16/static FP8 or the Thor
+FP8/CUTLASS backend for SM110. The factory requires `io="native_v2"`,
+`checkpoint_path`,
 `tokenizer_model_path`, `state_prompt_mode="fixed"`, `max_prompt_tokens >= 200`,
 and a positive `state_dim`; `precision`, `num_views`, `chunk`, `num_steps`,
-`vision_pool_factor`, and frame capacities are producer setup values. SM110
-FP8 additionally requires an identity-compatible `calibration_path`. See
+`vision_pool_factor`, and frame capacities are producer setup values. Every
+FP8 route additionally requires an identity-compatible `calibration_path`. See
 [`pi05_thor_native_fp8.md`](pi05_thor_native_fp8.md) for the build, calibration,
 artifact, and validation contract. It parses
 `checkpoint_path/model.safetensors` through the native read-only mmap loader to
@@ -440,11 +441,13 @@ capture, replays 100 times with one variant, and verifies the new device-side
 valid length is observed. `flash_rt_fa2` remains a thin Python adapter over the
 same `libflashrt_fa2_raw` kernel owner.
 
-The native builder publishes one `infer` graph/stage and the ordered ports
-`prompt`, `state`, `images`, `noise`, `actions`, and `actions_raw`. Identity
-includes observed hardware, precision, model/tokenizer SHA-256 values, prompt
-mode, fixed shapes, and schedule parameters. SM110 FP8 identity also includes
-the calibration artifact SHA-256. The only capsule region is
+The native builder publishes `infer`, `context`, and `decode_only` graphs and
+selects either one `infer` stage or the `context -> decode_only` stage DAG. It
+also publishes the ordered ports `prompt`, `state`, `images`, `noise`,
+`actions`, and `actions_raw`. Identity includes observed hardware, precision,
+model/tokenizer SHA-256 values, prompt mode, fixed shapes, stage plan, and
+schedule parameters. FP8 identity also includes the calibration artifact
+SHA-256. The only capsule region is
 `rollout_boundary` over the diffusion/action buffer. Prompt embeddings,
 encoder/decoder caches, attention lengths, and RoPE remain context-owned
 `frt_buffer` workspace that each infer rebuilds; they are not falsely
@@ -470,10 +473,16 @@ PYTHONPATH=.:./exec/build:./runtime/build python runtime/tests/test_model_runtim
 ctest --test-dir cpp/build --output-on-failure
 ```
 
-Real-checkpoint gates:
+Detailed real-checkpoint oracles are maintained in the
+[MindOn validation suite](https://github.com/LiangSu8899/MindOn-dev/tree/main/validation/pi05_cpp).
+Build their stage probes with
+`FLASHRT_CPP_BUILD_PI05_DIAGNOSTICS=ON`; default FlashRT builds retain contract,
+lifecycle, calibration, final-result, and hot-path tests.
+
+Real-checkpoint oracle example:
 
 ```
-python cpp/tests/gate_pi05_native_weight_ops.py \
+python <validation-root>/oracles/gate_pi05_native_weight_ops.py \
   --checkpoint <pi05 checkpoint> \
   --probe cpp/build/pi05_native_weight_probe
 ```
@@ -488,8 +497,9 @@ python cpp/tests/gate_pi05_c_api_export.py ...
 The Python-produced overlay gate uses the FA2-enabled, SentencePiece-off SM120
 build because Python already owns prompt/tokenizer setup. Native-v2 factory
 gates use a SentencePiece-enabled build with either SM120 FA2 or SM110 Thor FP8.
-In either lane, pybind modules and the producer library must come from the same
-build directory; graph and buffer handles cannot cross exec builds.
+In either lane, pybind modules and the producer library must be compiled from
+the same source revision; graph and buffer handles cannot cross exec builds.
+A stale extension is not a numerical reference for a newly built producer.
 
 Prompt/state STAGED ports require token-exact, formatter string-exact,
 embedding bit-exact, fixed-vs-exact E2E cosine, and hot-contract coverage; a
@@ -503,33 +513,34 @@ The native factory lifecycle gate is:
 ```
 
 Run it against both OpenPI and LeRobot checkpoint layouts. It validates the
-public schema, one captured variant, prompt/state/image staging, direct SWAP
-noise input, finite action output, and retain/release teardown.
+public schema, one variant per captured graph, prompt/state/image staging,
+direct SWAP noise input, finite action output, and retain/release teardown.
 
-SM110 FP8 calibration and runtime math are gated separately against the shipped
-Torch producer:
+SM110 and SM120 FP8 calibration/runtime math are gated separately against a
+Torch producer built from the same source revision:
 
 ```
-python cpp/tests/gate_pi05_native_thor_fp8.py \
-  --probe <build-dir>/pi05_native_thor_fp8_probe \
+python <validation-root>/oracles/gate_pi05_native_thor_fp8.py \
+  --probe <build-dir>/pi05_native_fp8_calibration_probe \
   --checkpoint <pi05-checkpoint> \
   --tokenizer <tokenizer.model> \
   --artifact <calibration.safetensors> \
   --samples 1 --views 1
 
-python cpp/tests/gate_pi05_native_thor_fp8.py \
-  --probe <build-dir>/pi05_native_thor_fp8_probe \
+python <validation-root>/oracles/gate_pi05_native_calibration.py \
+  --probe <build-dir>/pi05_native_fp8_calibration_probe \
   --checkpoint <pi05-checkpoint> \
   --tokenizer <tokenizer.model> \
   --artifact <calibration.safetensors> \
-  --samples 3 --views 2
+  --samples 3 --views 3
 ```
 
-The two-view gate submits cameras in reverse order to verify name-based
+The multi-view gate submits cameras in reverse order to verify name-based
 canonicalization. It also rejects incomplete/duplicate camera sets and invalid
 noise without committing a sample, exercises deterministic generated noise,
-and requires all encoder scales, decoder scales, and raw actions to be
-bit-exact. Dataset iteration and camera synchronization remain host policy.
+and requires encoder scales, decoder scales, and raw actions to be bit-exact.
+The SM120 gate additionally requires all 109 vision scales to be bit-exact.
+Dataset iteration and camera synchronization remain host policy.
 
 Python and C++ native-v2 producers must also publish identical canonical
 port/stage/region records (their producer identity and fingerprints remain
@@ -552,7 +563,7 @@ The native formatter and tokenizer must also remain token-exact over real
 prompt/state traffic:
 
 ```
-python cpp/tests/gate_pi05_tokenizer_corpus.py \
+python <validation-root>/oracles/gate_pi05_tokenizer_corpus.py \
   --dataset <libero-lerobot-root> \
   --checkpoint <openpi-pytorch-checkpoint> \
   --tokenizer <tokenizer.model> \
@@ -572,7 +583,7 @@ The real-episode numerical gate compares against the official OpenPI PyTorch
 `PI0Pytorch.sample_actions` path, not another native intermediate:
 
 ```
-python cpp/tests/gate_pi05_native_e2e.py \
+python <validation-root>/oracles/gate_pi05_native_e2e.py \
   --checkpoint <openpi-pytorch-checkpoint> \
   --tokenizer <tokenizer.model> \
   --dataset <libero-lerobot-root> \
@@ -603,7 +614,7 @@ FLASHRT_PROFILE_RANGE=1 nsys profile --trace=cuda \
 nsys profile --trace=cuda --cuda-graph-trace=node \
   --capture-range=cudaProfilerApi --capture-range-end=stop \
   -o <python-report> \
-  python cpp/tests/profile_pi05_python_replay.py \
+  python <validation-root>/perf/profile_pi05_python_replay.py \
   --checkpoint <checkpoint> --num-views 2 --steps 10
 
 nsys stats --report cuda_gpu_trace --format csv \

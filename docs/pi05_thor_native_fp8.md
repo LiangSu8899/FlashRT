@@ -1,8 +1,8 @@
-# Pi0.5 Native C++ FP8 On Thor
+# Pi0.5 Native C++ FP8
 
-This guide covers the Python-free Pi0.5 producer on NVIDIA Thor SM110. It
-loads a safetensors checkpoint, calibrates FP8 activation scales, captures one
-fixed-shape CUDA Graph, and returns `frt_model_runtime_v1` from
+This guide covers the Python-free Pi0.5 FP8 producer on NVIDIA SM110 and
+SM120. It loads a safetensors checkpoint, calibrates FP8 activation scales,
+captures fixed-shape CUDA Graphs, and returns `frt_model_runtime_v1` from
 `frt_model_runtime_open_v1`.
 
 The implementation is model-specific by design. The stable runtime ABI remains
@@ -17,17 +17,24 @@ responsibilities.
 |---|---|---|---|---|
 | Native C++ | SM110 | FP8 E4M3 | Required | F16 |
 | Native C++ | SM120 | BF16 | Not used | BF16 |
+| Native C++ | SM120 | FP8 E4M3 | Required | BF16 |
 | Python | Backend-specific | Existing FP8/BF16/NVFP4 routes | Existing Python contract | Producer-declared |
 
-`precision="auto"` selects FP8 E4M3 on SM110 and BF16 on SM120. Production
-configuration should normally specify the intended precision explicitly.
+`precision="auto"` selects FP8 E4M3 on SM110. On SM120 it selects static FP8
+when `calibration_path` is present and BF16 otherwise. Production
+configuration should specify the intended precision explicitly. BF16 native
+windows on SM120 describe activation storage and attention boundaries; they
+do not mean that an FP8 runtime fell back to BF16 GEMMs.
+
 Native C++ NVFP4 is not implemented by this producer; `precision="nvfp4"` is
 rejected. This does not change the independent Python NVFP4 path.
 
 ## Build
 
-The SM110 backend requires CUDA kernels, CUDA staging, exec, SentencePiece,
-and a compatible CUTLASS checkout. It has been validated with CUDA 13.0.
+Both backends require CUDA kernels, CUDA staging, exec, and SentencePiece.
+SM110 additionally requires a compatible CUTLASS checkout. SM120 requires the
+Python-free FA2 raw library from the same source revision; see
+[`pi05_cpp_runtime_migration.md`](pi05_cpp_runtime_migration.md).
 
 ```bash
 export BUILD_DIR="$PWD/cpp/build-thor"
@@ -50,10 +57,17 @@ Configure fails if the Thor backend is enabled without CUDA kernels, CUDA
 staging, exec, or CUTLASS. Build `Release` for deployment. A Debug build is
 useful for the same test matrix but is not a latency reference.
 
+For SM120, build the shared FA2 raw library first, then configure the C++ tree
+with `CMAKE_CUDA_ARCHITECTURES=120`, `FLASHRT_CPP_WITH_FA2=ON`, and
+`FLASHRT_CPP_FA2_LIBRARY=<libflashrt_fa2_raw.so>`. Detailed real-checkpoint
+diagnostic probes are opt-in through
+`FLASHRT_CPP_BUILD_PI05_DIAGNOSTICS=ON`; default builds retain the contract,
+lifecycle, calibration, final-result, and hot-path tests.
+
 ## Native Configuration
 
 Calibration and runtime open consume the same model configuration. Calibration
-does not need `calibration_path`; runtime open requires it on SM110.
+does not need `calibration_path`; every FP8 runtime open requires it.
 
 ```json
 {
@@ -119,7 +133,7 @@ sample.n_noise = chunk * 32;
 
 rc = frt_pi05_calibration_observe_v1(session, &sample);
 rc = frt_pi05_calibration_finalize_v1(
-    session, "/path/to/pi05-sm110-fp8.safetensors");
+    session, "/path/to/pi05-fp8.safetensors");
 frt_pi05_calibration_destroy_v1(session);
 ```
 
@@ -170,9 +184,9 @@ common activations, so every artifact still needs an end-to-end action gate.
 
 `noise` is optional F32 `[chunk, 32]`. Supply fixed noise when comparing with a
 reference producer. If it is omitted with `n_noise=0`, FlashRT generates
-deterministic normal F16 noise from `noise_seed + successful_sample_index`.
-Malformed or non-finite state/noise payloads are rejected before the sample is
-committed.
+deterministic normal noise from `noise_seed + successful_sample_index`, rounded
+to the backend activation dtype: F16 on SM110 and BF16 on SM120. Malformed or
+non-finite state/noise payloads are rejected before the sample is committed.
 
 Calibration materializes the model and runs uncaptured reference forwards. It
 is an offline/setup operation, not a control-loop operation. Reuse the produced
@@ -180,11 +194,20 @@ artifact until an identity input or calibration policy changes.
 
 ## Artifact Contract
 
-The calibration file is an atomically published safetensors artifact with two
-F32 tensors:
+The calibration file is an atomically published safetensors artifact. SM110
+uses schema `flashrt.pi05.fp8_calibration.v1` and two F32 tensors:
 
 - `encoder_scales`: 72 values;
 - `decoder_scales`: `num_steps * 18 * 4` values.
+
+SM120 uses schema `flashrt.pi05.fp8_calibration.v2`, BF16 activation metadata,
+and one additional F32 tensor:
+
+- `vision_scales`: 109 values.
+
+The same C API dispatches by the active CUDA device. SM120 calibration reuses
+the production graph pipeline in dynamic-scale mode; static runtime open
+reuses it with the artifact scales. There is no duplicate calibration forward.
 
 Metadata binds the artifact to:
 
@@ -216,7 +239,7 @@ standard model-runtime symbol:
   "tokenizer_model_path": "/path/to/paligemma_tokenizer.model",
   "state_prompt_mode": "fixed",
   "precision": "fp8_e4m3fn",
-  "calibration_path": "/path/to/pi05-sm110-fp8.safetensors",
+  "calibration_path": "/path/to/pi05-fp8.safetensors",
   "max_prompt_tokens": 200,
   "state_dim": 8,
   "num_views": 2,
@@ -228,17 +251,19 @@ standard model-runtime symbol:
 
 Resolve `FRT_MODEL_RUNTIME_OPEN_V1_SYMBOL` as
 `frt_model_runtime_open_v1_fn`, or link the producer library and call
-`frt_model_runtime_open_v1` directly. The returned runtime publishes one
-`infer` stage and these ordered ports:
+`frt_model_runtime_open_v1` directly. The returned runtime publishes `infer`,
+`decode_only`, and `context` graphs. The selected stage plan is either one
+`infer` stage or the ordered `context -> decode_only` DAG. Both plans use these
+ordered ports:
 
-| Port | Update | SM110 dtype | Payload |
-|---|---|---|---|
-| `prompt` | STAGED | U8 | UTF-8 task text |
-| `state` | STAGED | F32 | raw proprioception |
-| `images` | STAGED | F16 | host `frt_image_view[]` transformed into the captured window |
-| `noise` | SWAP | F16 | device `[chunk, 32]` |
-| `actions` | STAGED | F32 | host `[chunk, robot_action_dim]` |
-| `actions_raw` | SWAP | F16 | device `[chunk, 32]` alias |
+| Port | Update | SM110 FP8 | SM120 BF16/FP8 | Payload |
+|---|---|---|---|---|
+| `prompt` | STAGED | U8 | U8 | UTF-8 task text |
+| `state` | STAGED | F32 | F32 | raw proprioception |
+| `images` | STAGED | F16 | BF16 | host `frt_image_view[]` transformed into the captured window |
+| `noise` | SWAP | F16 | BF16 | device `[chunk, 32]` |
+| `actions` | STAGED | F32 | F32 | host `[chunk, robot_action_dim]` |
+| `actions_raw` | SWAP | F16 | BF16 | device `[chunk, 32]` alias |
 
 Prompt formatting, state normalization/discretization, tokenization, embedding,
 vision preprocessing, and action postprocessing remain producer-owned. Nexus
@@ -264,11 +289,12 @@ another invalidation and serialization boundary while keeping the mathematical
 source path identical to the shipped producer. The OS page cache may improve
 repeated file reads but is not part of the FlashRT contract.
 
-On a representative SM110 run with a 14.47 GB F32 checkpoint, native setup was
-7.90 seconds and the complete open/infer/output/teardown lifecycle was 8.62
-seconds. Of setup time, 7.61 seconds was weight transform/quantization/upload,
-94 ms was workspace/style setup, 163 ms was warmup, and 26 ms was graph capture.
-These are reference measurements, not latency ABI guarantees.
+On a representative current SM110 run, model-owner setup was 7.65 seconds and
+the complete `open_v1` publication path was 10.3 seconds. Of owner setup,
+7.38 seconds was weight transform/quantization/upload, 85 ms was
+workspace/style setup, 142 ms was warmup, and 44 ms was three-graph capture.
+These are reference measurements, not latency ABI guarantees, and should not
+be compared with a timer that stops after Python safetensors loading.
 
 ## Validation
 
@@ -278,31 +304,37 @@ Run CPU/CUDA-off tests in addition to SM110 Release and Debug builds:
 ctest --test-dir "$BUILD_DIR" --output-on-failure
 ```
 
-The real-checkpoint gate compares native calibration and inference with the
-shipped Torch producer using fixed observations and noise:
+Real-checkpoint producer oracles and profiling tools are maintained in the
+[MindOn validation suite](https://github.com/LiangSu8899/MindOn-dev/tree/main/validation/pi05_cpp).
+Configure diagnostic probes when an oracle needs a stage-level binary, then
+run the matching script. The public paths below are placeholders:
 
 ```bash
-python cpp/tests/gate_pi05_native_thor_fp8.py \
-  --probe "$BUILD_DIR/pi05_native_thor_fp8_probe" \
+python <validation-root>/oracles/gate_pi05_native_thor_fp8.py \
+  --probe "$BUILD_DIR/pi05_native_fp8_calibration_probe" \
   --checkpoint "$CHECKPOINT_DIR" \
   --tokenizer "$TOKENIZER_MODEL" \
   --artifact "$CALIBRATION_FILE" \
   --samples 1 --views 1
 
-python cpp/tests/gate_pi05_native_thor_fp8.py \
-  --probe "$BUILD_DIR/pi05_native_thor_fp8_probe" \
+python <validation-root>/oracles/gate_pi05_native_calibration.py \
+  --probe "$BUILD_DIR/pi05_native_fp8_calibration_probe" \
   --checkpoint "$CHECKPOINT_DIR" \
   --tokenizer "$TOKENIZER_MODEL" \
   --artifact "$CALIBRATION_FILE" \
-  --samples 3 --views 2
+  --samples 3 --views 3
 ```
 
-The two-view probe deliberately submits reversed camera order and checks
+The multi-view probe deliberately submits reversed camera order and checks
 duplicate/incomplete/unknown names, non-RGB input rejection, malformed noise,
-deterministic generated noise, artifact loading, runtime identity, one graph
-variant, finite logical actions, and teardown. The reference gates require all
-72 encoder scales, all 720 decoder scales for ten steps, and all 320 raw action
-values to be bit-exact.
+deterministic generated noise, artifact loading, runtime identity, one variant
+per captured graph, full/split equivalence, finite logical actions, and
+teardown. SM110
+requires all 72 encoder scales, all 720 decoder scales for ten steps, and all
+320 raw action values to be bit-exact. SM120 additionally requires all 109
+vision scales to be bit-exact. Build the Python extension and C++ producer from
+the same source revision before producer parity testing; stale compiled kernels
+are not a valid reference.
 
 For the complete service loop, profile the CUDA profiler range around 1,000
 iterations of prompt/state/image/noise update, replay, and action output:
@@ -320,4 +352,28 @@ The validated trace contained exactly 1,000 graph launches and no CUDA device
 allocation/free, CUDA host allocation/registration, mempool, virtual-memory,
 graph instantiation, or capture API in the measured range. A separate
 1,000-update prompt/state gate measured 266 microseconds p99 against a 1 ms
-limit, with one graph variant throughout.
+limit, with the selected graph's variant count fixed at one.
+
+## Reference Latency And Precision Evidence
+
+The complete service-loop timer includes prompt/state/image staging, noise
+upload, graph replay, synchronization, and logical action read. With a fixed
+64-token prompt window, 10 warmups, and 100 measured ticks, representative
+results were:
+
+| Hardware | Views | Precision | p50 | p99 |
+|---|---:|---|---:|---:|
+| RTX 5090 SM120 | 1 | static FP8 E4M3 | 15.62 ms | 15.65 ms |
+| RTX 5090 SM120 | 2 | static FP8 E4M3 | 18.47 ms | 18.51 ms |
+| RTX 5090 SM120 | 3 | static FP8 E4M3 | 21.22 ms | 21.25 ms |
+| Thor SM110 | 1 | static FP8 E4M3 | 38.82 ms | 39.01 ms |
+| Thor SM110 | 2 | static FP8 E4M3 | 46.55 ms | 46.87 ms |
+| Thor SM110 | 3 | static FP8 E4M3 | 56.10 ms | 56.24 ms |
+
+The SM120 label is backed by runtime identity, v2 calibration metadata,
+producer bit-exact raw actions, and a graph-node trace. One one-view replay
+contained 898 `nvjet_sm120_qqtst_mma` FP8 GEMMs, 306 BF16-to-E4M3 quantization
+kernels, and the fused E4M3 norm/gating kernels. BF16 FA2 attention kernels in
+the same trace are intentional boundaries, not evidence of BF16 GEMM fallback.
+Latency varies with clocks, prompt capacity, build flags, and system load; it
+is validation evidence rather than a public performance guarantee.

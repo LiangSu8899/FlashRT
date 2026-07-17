@@ -22,9 +22,24 @@ FP8 quantization boundaries and is not equivalent for this producer.
 ## Action output
 
 The logical `actions` STAGED output is F32 and includes the producer's declared
-postprocessing. `actions_raw` is the BF16 SWAP alias for consumers that need
-the model-space result. Consumers must select the declared port rather than
-infer dtype or normalization from a model name.
+postprocessing. `actions_raw` is the producer-declared SWAP alias for consumers
+that need the model-space result: BF16 on SM120 and F16 on SM110. Consumers
+must select the declared port rather than infer dtype or normalization from a
+model name.
+
+## Native precision routes
+
+The native producer supports SM120 BF16, SM120 static FP8 E4M3, and SM110
+static FP8 E4M3. Every FP8 route requires a compatible calibration artifact;
+SM120 uses the v2 artifact with vision, encoder, and decoder scales, while
+SM110 uses the v1 artifact with encoder and decoder scales. `precision="auto"`
+selects SM120 FP8 only when `calibration_path` is present, otherwise SM120 BF16;
+SM110 auto-selects FP8 and therefore still requires the artifact.
+
+Public BF16 windows on SM120 describe staging and attention-boundary storage,
+not the GEMM precision. An FP8 claim must be verified from producer identity,
+artifact metadata, and captured kernel dispatch. Native C++ NVFP4 is not
+implemented; Python precision routes remain independent.
 
 ## Runtime adoption
 
