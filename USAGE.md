@@ -179,20 +179,24 @@ Pi0.5 can also be loaded without a resident Python producer through
 | Hardware | Native precision | Required backend | Calibration artifact |
 |---|---|---|---|
 | SM120 | BF16 | native FA2 + SentencePiece | no |
+| SM120 | static FP8 E4M3 | native FA2 + SentencePiece | yes (schema v2) |
 | Thor SM110 | FP8 E4M3 | Thor FP8/CUTLASS + SentencePiece | yes |
 
-The SM110 producer includes model-specific C APIs for single-view,
-multi-view, and repeated dataset-observation calibration. The resulting
-safetensors artifact is bound to hardware, checkpoint, tokenizer, fixed
-shapes, sample count, and reducer policy; runtime identity also includes the
-artifact SHA-256. Native C++ NVFP4 is not currently supported. Python FP8 and
-NVFP4 routes keep their existing behavior.
+The native producer includes model-specific C APIs for single-view,
+multi-view, and repeated dataset-observation calibration on SM110 and SM120.
+SM110 artifacts contain encoder and decoder scales (schema v1); SM120 also
+contains vision scales (schema v2). Every artifact is bound to hardware,
+checkpoint, tokenizer, fixed shapes, sample count, and reducer policy; runtime
+identity also includes its SHA-256. With `precision="auto"`, SM120 selects
+static FP8 when `calibration_path` is present and BF16 otherwise; SM110 selects
+FP8 and therefore still requires an artifact. Native C++ NVFP4 is not currently
+supported. Python FP8 and NVFP4 routes keep their existing behavior.
 
 Native safetensors setup uses one direct mmap -> transform/quantize -> device
 upload path and does not create an implicit weight-cache format. This is
 independent of the Python JAX Orbax weight cache documented below.
 
-See [Pi0.5 Native C++ FP8 on Thor](docs/pi05_thor_native_fp8.md) for build
+See [Pi0.5 Native C++ FP8](docs/pi05_thor_native_fp8.md) for build
 flags, configuration JSON, C calibration usage, camera-name rules, artifact
 invalidation, runtime ports, and validation commands. The complete portable IO
 contract is [Pi0.5 Native Model Runtime IO](docs/pi05_io_contract.md).

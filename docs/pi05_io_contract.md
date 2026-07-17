@@ -288,12 +288,12 @@ deployment system. Compare producer startup using the complete scope; a Python
 timer that stops after safetensors conversion is not the same metric.
 
 On a representative Thor SM110 Release run with the same checkpoint size,
-native setup measured 7.90 seconds and the complete open/infer/output/teardown
-lifecycle measured 8.62 seconds. Weight transform, FP8 quantization, and upload
-accounted for 7.61 seconds; workspace/style setup, warmup, and capture measured
-94 ms, 163 ms, and 26 ms respectively. These measurements do not add a binary
-weight cache: native safetensors loading remains one direct, identity-checked
-path.
+model-owner setup measured 7.65 seconds and complete `open_v1` publication
+measured 10.3 seconds. Weight transform, FP8 quantization, and upload accounted
+for 7.38 seconds; workspace/style setup, warmup, and three-graph capture
+measured 85 ms, 142 ms, and 44 ms respectively. These measurements do not add
+a binary weight cache: native safetensors loading remains one direct,
+identity-checked path.
 
 Materialized device weights use `frt_buffer` allocations owned by the native
 producer's `frt_ctx`. They are internal setup assets, not model ports and not
