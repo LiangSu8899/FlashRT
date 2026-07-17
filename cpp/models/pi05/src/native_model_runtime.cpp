@@ -284,15 +284,15 @@ int build_native_model_runtime(const NativeOpenConfig& config,
             builder, "main", graph->stream_id(), 0,
             graph->native_stream()) == 0 &&
         frt_runtime_builder_add_graph(
-            builder, NativeGraphCatalog::name(NativeGraphKind::kInfer),
+            builder, native_graph_name(NativeGraphKind::kInfer),
             graph->graph(NativeGraphKind::kInfer), 0, keys, 1,
             graph->stream_id()) == 0 &&
         frt_runtime_builder_add_graph(
-            builder, NativeGraphCatalog::name(NativeGraphKind::kDecodeOnly),
+            builder, native_graph_name(NativeGraphKind::kDecodeOnly),
             graph->graph(NativeGraphKind::kDecodeOnly), 0, keys, 1,
             graph->stream_id()) == 0 &&
         frt_runtime_builder_add_graph(
-            builder, NativeGraphCatalog::name(NativeGraphKind::kContext),
+            builder, native_graph_name(NativeGraphKind::kContext),
             graph->graph(NativeGraphKind::kContext), 0, keys, 1,
             graph->stream_id()) == 0 &&
         frt_runtime_builder_add_buffer(

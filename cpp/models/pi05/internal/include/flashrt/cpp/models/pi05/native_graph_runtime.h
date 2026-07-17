@@ -3,6 +3,7 @@
 
 #include "flashrt/cpp/models/pi05/native_device_weights.h"
 #include "flashrt/cpp/models/pi05/native_workspace.h"
+#include "flashrt/cpp/native/cuda_graph_set.h"
 
 #include <cstddef>
 #include <initializer_list>
@@ -32,41 +33,15 @@ enum class NativeGraphKind : std::size_t {
     kCount = 3,
 };
 
-class NativeGraphCatalog {
-public:
-    using RecordFn = modalities::Status (*)(
-        void* owner, NativeGraphKind kind, void* stream);
+const char* native_graph_name(NativeGraphKind kind);
 
-    explicit NativeGraphCatalog(frt_ctx ctx) : ctx_(ctx) {}
-    ~NativeGraphCatalog();
-
-    NativeGraphCatalog(const NativeGraphCatalog&) = delete;
-    NativeGraphCatalog& operator=(const NativeGraphCatalog&) = delete;
-
-    modalities::Status capture(
-        NativeGraphKind kind, const NativeWorkspace& workspace,
-        std::initializer_list<const char*> bindings,
-        RecordFn record, void* owner);
-    modalities::Status create_replay_stream();
-
-    frt_ctx context() const { return ctx_; }
-    frt_graph graph(NativeGraphKind kind) const;
-    int stream_id() const { return stream_id_; }
-    void* native_stream() const { return replay_stream_; }
-    int replay(NativeGraphKind kind) const;
-    modalities::Status synchronize() const;
-
-    static const char* name(NativeGraphKind kind);
-
-private:
-    struct CaptureCall;
-    static void record_graph(void* user, void* stream);
-
-    frt_ctx ctx_ = nullptr;
-    frt_graph graphs_[static_cast<std::size_t>(NativeGraphKind::kCount)] = {};
-    void* replay_stream_ = nullptr;
-    int stream_id_ = -1;
-};
+modalities::Status capture_native_graph(
+    native::CudaGraphSet* graphs,
+    NativeGraphKind kind,
+    const NativeWorkspace& workspace,
+    std::initializer_list<const char*> bindings,
+    native::CudaGraphSet::RecordFn record,
+    void* owner);
 
 modalities::Status copy_prompt_to_encoder(NativeWorkspace* workspace,
                                           void* stream);

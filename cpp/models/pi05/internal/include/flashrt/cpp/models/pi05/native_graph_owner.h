@@ -32,7 +32,7 @@ public:
 
     frt_ctx context() const override { return graphs_.context(); }
     frt_graph graph(NativeGraphKind kind) const override {
-        return graphs_.graph(kind);
+        return graphs_.graph(static_cast<std::size_t>(kind));
     }
     int stream_id() const override { return graphs_.stream_id(); }
     void* native_stream() const override { return graphs_.native_stream(); }
@@ -58,9 +58,9 @@ private:
     modalities::Status record_context(void* stream);
     modalities::Status record_action(void* stream);
     static modalities::Status record_graph(
-        void* user, NativeGraphKind kind, void* stream);
+        void* user, std::size_t slot, void* stream);
 
-    NativeGraphCatalog graphs_;
+    native::CudaGraphSet graphs_;
     NativeGraphConfig config_;
     NativeDeviceWeightStore weights_;
     NativeWorkspace workspace_;

@@ -19,6 +19,13 @@ add_executable(test_native_config test_native_config.cpp)
 target_link_libraries(test_native_config PRIVATE flashrt_cpp_native)
 add_test(NAME native_config COMMAND test_native_config)
 
+if(FLASHRT_CPP_WITH_CUDA_KERNELS)
+  add_executable(test_native_cuda_graph_set test_native_cuda_graph_set.cpp)
+  target_link_libraries(test_native_cuda_graph_set
+    PRIVATE flashrt_cpp_native_cuda)
+  add_test(NAME native_cuda_graph_set COMMAND test_native_cuda_graph_set)
+endif()
+
 add_executable(test_text_modalities test_text_modalities.cpp)
 target_link_libraries(test_text_modalities PRIVATE flashrt_cpp_modalities)
 add_test(NAME text_modalities COMMAND test_text_modalities)

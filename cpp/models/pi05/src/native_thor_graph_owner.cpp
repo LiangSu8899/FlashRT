@@ -59,7 +59,7 @@ bool calibration_matches(const NativeCalibrationArtifact& artifact,
 NativeThorGraphOwner::NativeThorGraphOwner(
     frt_ctx ctx,
     const NativeGraphConfig& config)
-    : graphs_(ctx),
+    : graphs_(ctx, static_cast<std::size_t>(NativeGraphKind::kCount)),
       config_(config),
       weights_(ctx),
       workspace_(ctx),
@@ -207,20 +207,23 @@ modalities::Status NativeThorGraphOwner::initialize(
     }
     report("warmup");
 
-    st = graphs_.capture(
+    st = capture_native_graph(
+        &graphs_,
         NativeGraphKind::kInfer, workspace_,
         {"observation_images_normalized", "prompt_embedding", "encoder_x",
          "diffusion_noise", "rtc_prev_action_chunk", "rtc_prefix_weights",
          "rtc_guidance_weight"},
         record_graph, this);
     if (!st.ok_status()) return st;
-    st = graphs_.capture(
+    st = capture_native_graph(
+        &graphs_,
         NativeGraphKind::kDecodeOnly, workspace_,
         {"encoder_x", "diffusion_noise", "rtc_prev_action_chunk",
          "rtc_prefix_weights", "rtc_guidance_weight"},
         record_graph, this);
     if (!st.ok_status()) return st;
-    st = graphs_.capture(
+    st = capture_native_graph(
+        &graphs_,
         NativeGraphKind::kContext, workspace_,
         {"observation_images_normalized", "prompt_embedding", "encoder_x"},
         record_graph, this);
@@ -266,9 +269,9 @@ modalities::Status NativeThorGraphOwner::record(NativeGraphKind kind,
 }
 
 modalities::Status NativeThorGraphOwner::record_graph(
-    void* user, NativeGraphKind kind, void* stream) {
+    void* user, std::size_t slot, void* stream) {
     auto* owner = static_cast<NativeThorGraphOwner*>(user);
-    return owner->record(kind, stream);
+    return owner->record(static_cast<NativeGraphKind>(slot), stream);
 }
 
 modalities::Status NativeThorGraphOwner::set_prompt_length(int prompt_tokens) {
@@ -276,7 +279,7 @@ modalities::Status NativeThorGraphOwner::set_prompt_length(int prompt_tokens) {
 }
 
 int NativeThorGraphOwner::replay(NativeGraphKind kind) const {
-    return graphs_.replay(kind);
+    return graphs_.replay(static_cast<std::size_t>(kind));
 }
 
 modalities::Status NativeThorGraphOwner::synchronize() const {

@@ -183,6 +183,14 @@ add_library(flashrt_cpp_native STATIC
   native/src/config_object.cpp)
 target_include_directories(flashrt_cpp_native
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/native/include)
+if(FLASHRT_CPP_WITH_CUDA_KERNELS)
+  add_library(flashrt_cpp_native_cuda STATIC
+    native/src/cuda_graph_set.cpp)
+  target_include_directories(flashrt_cpp_native_cuda
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/native/include)
+  target_link_libraries(flashrt_cpp_native_cuda
+    PUBLIC flashrt_cpp_modalities flashrt_exec CUDA::cudart)
+endif()
 
 add_library(flashrt_cpp_loader STATIC
   loader/src/safetensors.cpp

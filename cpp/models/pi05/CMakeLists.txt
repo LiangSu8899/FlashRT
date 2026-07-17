@@ -68,7 +68,8 @@ if(FLASHRT_CPP_WITH_CUDA_KERNELS)
             ${FLASHRT_CPP_SOURCE_DIR}/../csrc/gemm
             ${FLASHRT_CPP_SOURCE_DIR}/../csrc/kernels)
   target_link_libraries(flashrt_cpp_pi05_kernels
-    PUBLIC flashrt_cpp_pi05 CUDA::cublas CUDA::cublasLt CUDA::cudart)
+    PUBLIC flashrt_cpp_pi05 flashrt_cpp_native_cuda
+           CUDA::cublas CUDA::cublasLt CUDA::cudart)
   set_target_properties(flashrt_cpp_pi05_kernels PROPERTIES
     CUDA_STANDARD 17
     CUDA_STANDARD_REQUIRED ON)
