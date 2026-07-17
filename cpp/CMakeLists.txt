@@ -211,7 +211,18 @@ if(FLASHRT_CPP_WITH_CUDA_KERNELS AND
       CUDA_STANDARD_REQUIRED ON)
   endfunction()
 
+  add_library(flashrt_cpp_csrc_precise_math OBJECT
+    ${_flashrt_csrc_dir}/kernels/rope_table.cu)
+  target_include_directories(flashrt_cpp_csrc_precise_math PRIVATE
+    ${_flashrt_csrc_dir}/kernels)
+  target_compile_options(flashrt_cpp_csrc_precise_math PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:-O3>)
+  set_target_properties(flashrt_cpp_csrc_precise_math PROPERTIES
+    CUDA_STANDARD 17
+    CUDA_STANDARD_REQUIRED ON)
+
   add_library(flashrt_cpp_csrc_core STATIC
+    $<TARGET_OBJECTS:flashrt_cpp_csrc_precise_math>
     ${_flashrt_csrc_dir}/gemm/gemm_runner.cu
     ${_flashrt_csrc_dir}/kernels/activation.cu
     ${_flashrt_csrc_dir}/kernels/elementwise.cu

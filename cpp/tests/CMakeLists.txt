@@ -26,6 +26,19 @@ if(FLASHRT_CPP_WITH_CUDA_KERNELS)
   add_test(NAME native_cuda_graph_set COMMAND test_native_cuda_graph_set)
 endif()
 
+if(FLASHRT_CPP_WITH_CUDA_KERNELS AND
+   (FLASHRT_CPP_WITH_FA2 OR FLASHRT_CPP_WITH_THOR_FP8))
+  add_executable(test_csrc_rope_table test_csrc_rope_table.cu)
+  target_include_directories(test_csrc_rope_table PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../csrc/kernels)
+  target_link_libraries(test_csrc_rope_table PRIVATE
+    flashrt_cpp_csrc_core CUDA::cudart)
+  set_target_properties(test_csrc_rope_table PROPERTIES
+    CUDA_STANDARD 17
+    CUDA_STANDARD_REQUIRED ON)
+  add_test(NAME csrc_rope_table COMMAND test_csrc_rope_table)
+endif()
+
 add_executable(test_text_modalities test_text_modalities.cpp)
 target_link_libraries(test_text_modalities PRIVATE flashrt_cpp_modalities)
 add_test(NAME text_modalities COMMAND test_text_modalities)
