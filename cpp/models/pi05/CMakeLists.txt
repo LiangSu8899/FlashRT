@@ -17,7 +17,6 @@ set(_pi05_sources
   src/support/native_weights.cpp
   src/support/native_weight_ops.cpp
   src/support/native_device_weights.cpp
-  src/support/native_weight_packer.cpp
   src/support/native_weight_materializer.cpp
   src/support/native_calibration.cpp
   src/support/native_workspace.cpp
