@@ -69,10 +69,11 @@ int calibration_error(frt_pi05_calibration_session* session,
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc != 6 && argc != 7) {
+    if (argc != 6 && argc != 7 && argc != 8) {
         std::cerr << "usage: pi05_native_fp8_calibration_probe CHECKPOINT "
                      "TOKENIZER "
-                     "ARTIFACT SAMPLES VIEWS [RAW_ACTION_OUTPUT]\n";
+                     "ARTIFACT SAMPLES VIEWS [RAW_ACTION_OUTPUT "
+                     "ACTION_OUTPUT]\n";
         return 2;
     }
     int device = 0;
@@ -396,7 +397,7 @@ int main(int argc, char** argv) {
         model->release(model->owner);
         return 1;
     }
-    if (argc == 7) {
+    if (argc >= 7) {
         std::ofstream output(argv[6], std::ios::binary | std::ios::trunc);
         output.write(reinterpret_cast<const char*>(raw.data()),
                      static_cast<std::streamsize>(
@@ -420,6 +421,17 @@ int main(int argc, char** argv) {
     for (float value : actions) {
         if (!std::isfinite(value)) {
             std::cerr << "native FP8 action is non-finite\n";
+            model->release(model->owner);
+            return 1;
+        }
+    }
+    if (argc == 8) {
+        std::ofstream output(argv[7], std::ios::binary | std::ios::trunc);
+        output.write(reinterpret_cast<const char*>(actions.data()),
+                     static_cast<std::streamsize>(
+                         actions.size() * sizeof(actions[0])));
+        if (!output) {
+            std::cerr << "native FP8 logical action write failed\n";
             model->release(model->owner);
             return 1;
         }

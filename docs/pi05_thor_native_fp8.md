@@ -92,6 +92,27 @@ shape fields are fixed setup values. Increasing a capacity or changing view,
 chunk, schedule, tokenizer, checkpoint, precision, or calibration artifact
 produces a different deployment identity where applicable.
 
+| Field | Requirement/default | Accepted value | Contract effect |
+|---|---|---|---|
+| `io` | required | `native_v2` | selects the complete six-port face |
+| `checkpoint_path` | required | Pi0.5 safetensors directory | content hash enters identity |
+| `tokenizer_model_path` | required | SentencePiece model file | content hash enters identity |
+| `state_prompt_mode` | required | `fixed` | graph-safe prompt/state staging; enters identity |
+| `precision` | default `auto` | `auto`, `bf16`, `fp8_e4m3fn` | resolves against hardware; resolved precision enters identity |
+| `calibration_path` | required for FP8 | compatible artifact file | artifact hash enters FP8 identity |
+| `stage_plan` | default `full` | `full`, `context_action` | changes stage DAG and fingerprint |
+| `max_prompt_tokens` | required | positive integer | fixed text window; enters identity |
+| `state_dim` | required | positive integer matching checkpoint stats | state port shape; enters identity |
+| `num_views` | default `2` | `1`, `2`, or `3` | image shape/workspace/calibration; enters identity |
+| `chunk` | default `10` | positive integer | noise/action shapes and workspace; enters identity |
+| `num_steps` | default `10` | positive integer | denoise graph/calibration; enters identity |
+| `vision_pool_factor` | default `1` | `1`, `2`, or `4` | vision graph/workspace/calibration; enters identity |
+| `max_frame_width`, `max_frame_height` | defaults `1280`, `720` | positive integers | persistent host staging capacity; not model math |
+
+Omitting an optional numeric field selects its documented default. Supplying
+zero does not mean default and is rejected. Configuration is setup-only; there
+is no API to mutate these fields after publication.
+
 ## Calibration API
 
 The model-specific API is declared in
@@ -253,8 +274,8 @@ Resolve `FRT_MODEL_RUNTIME_OPEN_V1_SYMBOL` as
 `frt_model_runtime_open_v1_fn`, or link the producer library and call
 `frt_model_runtime_open_v1` directly. The returned runtime publishes `infer`,
 `decode_only`, and `context` graphs. The selected stage plan is either one
-`infer` stage or the ordered `context -> decode_only` DAG. Both plans use these
-ordered ports:
+`infer` stage or the ordered logical `context -> action` DAG, where `action`
+references the `decode_only` graph. Both plans use these ordered ports:
 
 | Port | Update | SM110 FP8 | SM120 BF16/FP8 | Payload |
 |---|---|---|---|---|
@@ -269,6 +290,28 @@ Prompt formatting, state normalization/discretization, tokenization, embedding,
 vision preprocessing, and action postprocessing remain producer-owned. Nexus
 or another consumer moves declared payloads and schedules declared stages; it
 does not interpret Pi0.5 semantics.
+
+Initialize `state` before `prompt` when both first become available so the
+first embedding update already contains the complete pair. During a normal
+control loop the task prompt is stable and only raw F32 `state`, images, and
+noise change each tick. If both prompt and state change, stage both before the
+next replay; an embedded step does this before firing the DAG. Runtime image
+views are positional in the declared camera order, unlike the named frames used
+by calibration.
+
+The complete native producer captures one graph catalog and selects a stage
+plan over it:
+
+| `stage_plan` | Published stages | Intended use |
+|---|---|---|
+| `full` | stage 0 -> graph `infer` | one-call serialized inference |
+| `context_action` | stage 0 -> graph `context`; stage 1 -> graph `decode_only`, after stage 0 | explicit context/action scheduling |
+
+`context_action` does not duplicate hand-off buffers. It supports independent
+stage fire/query/sync and asynchronous execution relative to the host control
+loop, but context from the next tick must not overwrite buffers while the prior
+action stage is still reading them. Safe cross-tick GPU overlap requires a
+future producer-owned double-buffered declaration; it is not implied by Nexus.
 
 ## Loading Path
 
@@ -331,10 +374,11 @@ deterministic generated noise, artifact loading, runtime identity, one variant
 per captured graph, full/split equivalence, finite logical actions, and
 teardown. SM110
 requires all 72 encoder scales, all 720 decoder scales for ten steps, and all
-320 raw action values to be bit-exact. SM120 additionally requires all 109
-vision scales to be bit-exact. Build the Python extension and C++ producer from
-the same source revision before producer parity testing; stale compiled kernels
-are not a valid reference.
+320 raw action values to be bit-exact. It also compares the final F32 logical
+action chunk at cosine `>= 0.999999` and `rtol=atol=1e-6`. SM120 additionally
+requires all 109 vision scales to be bit-exact. Build the Python extension and
+C++ producer from the same source revision before producer parity testing;
+stale compiled kernels are not a valid reference.
 
 For the complete service loop, profile the CUDA profiler range around 1,000
 iterations of prompt/state/image/noise update, replay, and action output:
@@ -368,7 +412,7 @@ results were:
 | RTX 5090 SM120 | 3 | static FP8 E4M3 | 21.22 ms | 21.25 ms |
 | Thor SM110 | 1 | static FP8 E4M3 | 38.82 ms | 39.01 ms |
 | Thor SM110 | 2 | static FP8 E4M3 | 46.55 ms | 46.87 ms |
-| Thor SM110 | 3 | static FP8 E4M3 | 56.10 ms | 56.24 ms |
+| Thor SM110 | 3 | static FP8 E4M3 | 57.04 ms | 57.25 ms |
 
 The SM120 label is backed by runtime identity, v2 calibration metadata,
 producer bit-exact raw actions, and a graph-node trace. One one-view replay
@@ -377,3 +421,19 @@ kernels, and the fused E4M3 norm/gating kernels. BF16 FA2 attention kernels in
 the same trace are intentional boundaries, not evidence of BF16 GEMM fallback.
 Latency varies with clocks, prompt capacity, build flags, and system load; it
 is validation evidence rather than a public performance guarantee.
+
+For the current three-view Thor audit, the same fixed clocks, 64-token prompt
+window, inputs, warmup, and 100-sample service scope produced:
+
+| Producer | Scope | p50 | p99 |
+|---|---|---:|---:|
+| Python Torch | image/infer wall time | 56.46 ms | 56.70 ms |
+| Python Torch | prompt/state plus image/infer wall time | 57.05 ms | 57.20 ms |
+| Native C++ | complete service loop | 57.04 ms | 57.25 ms |
+
+The comparable complete-service medians differ by `0.01 ms` and p99 values by
+`0.05 ms` after rounding. The 320 raw F16 action values are bit-exact; the
+logical F32 result reaches cosine `1.000000000` with maximum absolute error
+`2.98e-8`. Dynamic CPU or memory clocks can widen p99 substantially, so latency
+acceptance records clock policy instead of treating an unpinned sample as a
+code regression.

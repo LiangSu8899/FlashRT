@@ -657,8 +657,8 @@ int validate_config(
 
     int64_t max_prompt_tokens = 0;
     int64_t state_dim = 0;
-    int64_t num_views = 0;
-    int64_t chunk = 0;
+    int64_t num_views = 2;
+    int64_t chunk = 10;
     int64_t num_steps = 10;
     int64_t vision_pool_factor = 1;
     int64_t max_frame_width = 1280;
@@ -681,11 +681,11 @@ int validate_config(
         g_last_error = "state_dim must be in [1, INT_MAX]";
         return -1;
     }
-    if (num_views && (num_views < 1 || num_views > 3)) {
+    if (num_views < 1 || num_views > 3) {
         g_last_error = "num_views must be in [1, 3]";
         return -1;
     }
-    if (chunk && (chunk <= 0 || chunk > INT_MAX)) {
+    if (chunk <= 0 || chunk > INT_MAX) {
         g_last_error = "chunk must be in [1, INT_MAX]";
         return -1;
     }
@@ -711,8 +711,8 @@ int validate_config(
     config.stage_plan = stage_plan;
     config.max_prompt_tokens = static_cast<int>(max_prompt_tokens);
     config.state_dim = static_cast<int>(state_dim);
-    config.num_views = static_cast<int>(num_views ? num_views : 2);
-    config.chunk = static_cast<int>(chunk ? chunk : 10);
+    config.num_views = static_cast<int>(num_views);
+    config.chunk = static_cast<int>(chunk);
     config.num_steps = static_cast<int>(num_steps);
     config.vision_pool_factor = static_cast<int>(vision_pool_factor);
     config.max_frame_width = static_cast<int>(max_frame_width);

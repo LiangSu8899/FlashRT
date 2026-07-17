@@ -263,6 +263,20 @@ int main() {
     write_safetensors(root + "/model.safetensors");
     out = reinterpret_cast<frt_model_runtime_v1*>(0x1);
     rc = frt_model_runtime_open_v1(
+        config(root, tokenizer, ",\"num_views\":0").c_str(), &out);
+    assert(rc == -1);
+    assert(out == nullptr);
+    assert(std::strstr(frt_pi05_native_open_last_error(), "num_views"));
+
+    out = reinterpret_cast<frt_model_runtime_v1*>(0x1);
+    rc = frt_model_runtime_open_v1(
+        config(root, tokenizer, ",\"chunk\":0").c_str(), &out);
+    assert(rc == -1);
+    assert(out == nullptr);
+    assert(std::strstr(frt_pi05_native_open_last_error(), "chunk"));
+
+    out = reinterpret_cast<frt_model_runtime_v1*>(0x1);
+    rc = frt_model_runtime_open_v1(
         config(root, tokenizer, ",\"max_frame_width\":0").c_str(), &out);
     assert(rc == -1);
     assert(out == nullptr);

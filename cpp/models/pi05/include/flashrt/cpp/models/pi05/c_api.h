@@ -45,9 +45,9 @@ typedef struct frt_pi05_runtime_config {
     const char* image_buffer_name;
     const char* action_buffer_name;
 
-    /* Optional ABI extension. Zero keeps the v1 default: BF16 buffers, which
-     * is the production FP8 Pi0.5 path. FP16 reference exports set both to
-     * FRT_PI05_DTYPE_FLOAT16. */
+    /* Optional ABI extension. Zero keeps the legacy v1 BF16 default. Complete
+     * producers set these from their declared tensor windows: BF16 on SM120,
+     * F16 on the SM110 FP8 producer. */
     int image_dtype;
     int action_dtype;
 

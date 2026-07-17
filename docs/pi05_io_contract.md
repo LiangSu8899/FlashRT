@@ -13,10 +13,11 @@ It does not freeze the C++ implementation classes under `cpp/`. Those classes
 may evolve as long as the exported ports, stages, regions, identity, and hot
 contract remain valid.
 
-## Current Native Face
+## Adopted-export Legacy Face
 
-The current Pi0.5 `io="native"` export declares three host-visible ports.
-This is the contract implemented by `frt_pi05_model_runtime_create_over`.
+The Python-produced Pi0.5 `io="native"` export declares three host-visible
+ports. This is the legacy adopted-export lane, not the complete native C++
+factory returned by `frt_model_runtime_open_v1`.
 
 | port | modality/update | direction | dtype/layout/shape | backing |
 |---|---|---|---|---|
@@ -37,17 +38,17 @@ discovery manifest carries `declaration_only: true`; callers must pass them to
 `frt_pi05_model_runtime_create_over` before adoption. Generic Python-produced
 model runtimes reject STAGED ports without matching input/output verbs.
 
-There is deliberately no `prompt` port on the adopted-export path today. The
+There is deliberately no `prompt` port on this adopted-export path. The
 prompt embedding is prepared by the producer before graph capture/export. A
 producer must not declare a `TEXT/STAGED` or `STATE/STAGED` port until the
 native verb can really update that input on the hot path.
 
-## Native V2 Face
+## Complete Native V2 Face
 
-The `io="native_v2"` export adds prompt/state staging and a raw action alias.
-Adding these ports changes the model-runtime identity and therefore the
-fingerprint. Existing capsules from the old face must refuse restore into this
-face.
+The `io="native_v2"` face returned by `frt_model_runtime_open_v1` adds working
+prompt/state staging and a raw action alias. Adding these ports changes the
+model-runtime identity and therefore the fingerprint. Existing capsules from
+the old face must refuse restore into this face.
 
 | port | modality/update | direction | dtype/layout/shape | backing |
 |---|---|---|---|---|
@@ -63,6 +64,12 @@ normalized, discretized into OpenPI-compatible 256-bin state tokens, rendered
 into the prompt text, tokenized, embedded, and written into the language rows
 of `encoder_x`. Therefore prompt and state updates are one producer-owned text
 staging path.
+
+`num_views`, `chunk`, `num_steps`, `max_prompt_tokens`, `state_dim`, precision,
+and stage plan are fixed before graph capture. They determine declared shapes,
+captured workspaces, calibration compatibility, and deployment identity; none
+is a per-tick setter. A host discovers action dimensions from the `actions`
+descriptor and never assumes `(10, 7)` or the model-space width of 32.
 
 Internal model buffers such as `encoder_x`, KV/cache windows, residual
 streams, and `diffusion_noise` are not `STATE` ports. They are `TENSOR` ports
@@ -442,7 +449,10 @@ valid length is observed. `flash_rt_fa2` remains a thin Python adapter over the
 same `libflashrt_fa2_raw` kernel owner.
 
 The native builder publishes `infer`, `context`, and `decode_only` graphs and
-selects either one `infer` stage or the `context -> decode_only` stage DAG. It
+selects either one `infer` stage or a logical `context -> action` stage DAG,
+where the action stage is backed by the `decode_only` graph. Graph names and
+stage roles are distinct: the frozen stage descriptor references graph indices,
+while the producer manifest preserves the plan and logical stage names. It
 also publishes the ordered ports `prompt`, `state`, `images`, `noise`,
 `actions`, and `actions_raw`. Identity includes observed hardware, precision,
 model/tokenizer SHA-256 values, prompt mode, fixed shapes, stage plan, and
@@ -452,6 +462,11 @@ SHA-256. The only capsule region is
 encoder/decoder caches, attention lengths, and RoPE remain context-owned
 `frt_buffer` workspace that each infer rebuilds; they are not falsely
 advertised as independently restorable state.
+
+Both plans use one logical workspace/buffer set. `context_action` enables
+stage-level scheduling and host-asynchronous action production, but it does not
+claim safe cross-tick context/action overlap. That requires a producer to
+publish double-buffered hand-off state and a new compatible declaration.
 
 The returned verb override retains the builder-produced base model, which
 retains the export and graph owner. Releasing the final public model releases
