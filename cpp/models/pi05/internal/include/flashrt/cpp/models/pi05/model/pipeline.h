@@ -1,12 +1,12 @@
 #ifndef FLASHRT_CPP_MODELS_PI05_MODEL_PIPELINE_H
 #define FLASHRT_CPP_MODELS_PI05_MODEL_PIPELINE_H
 
+#include "flashrt/cpp/models/pi05/model/spec.h"
 #include "flashrt/cpp/models/pi05/support/native_device_weights.h"
 #include "flashrt/cpp/models/pi05/support/native_workspace.h"
 #include "flashrt/cpp/native/cuda_graph_set.h"
 
 #include <cstddef>
-#include <initializer_list>
 
 namespace flashrt {
 namespace models {
@@ -25,23 +25,6 @@ struct Pi05PipelineConfig {
     int vision_pool_factor = 1;
     Pi05Precision precision = Pi05Precision::kBf16;
 };
-
-enum class GraphKind : std::size_t {
-    kInfer = 0,
-    kDecodeOnly = 1,
-    kContext = 2,
-    kCount = 3,
-};
-
-const char* pipeline_graph_name(GraphKind kind);
-
-modalities::Status capture_pipeline_graph(
-    native::CudaGraphSet* graphs,
-    GraphKind kind,
-    const NativeWorkspace& workspace,
-    std::initializer_list<const char*> bindings,
-    native::CudaGraphSet::RecordFn record,
-    void* owner);
 
 modalities::Status copy_prompt_to_encoder(NativeWorkspace* workspace,
                                           void* stream);

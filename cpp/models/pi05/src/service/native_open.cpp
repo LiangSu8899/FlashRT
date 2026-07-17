@@ -1,5 +1,6 @@
 #include "flashrt/model_runtime.h"
 #include "flashrt/cpp/loader/safetensors.h"
+#include "flashrt/cpp/models/pi05/model/spec.h"
 #include "flashrt/cpp/models/pi05/support/native_weights.h"
 #include "flashrt/cpp/native/config_object.h"
 #include "native_open_internal.h"
@@ -456,11 +457,14 @@ int validate_config(
         return -1;
     }
     if (stage_plan.empty()) stage_plan = "full";
-    if (stage_plan != "full" && stage_plan != "context_action") {
+    const auto* execution_plan =
+        flashrt::models::pi05::pi05_execution_plan(stage_plan.c_str());
+    if (!execution_plan) {
         g_last_error =
             "stage_plan must be 'full' or 'context_action'";
         return -1;
     }
+    stage_plan = execution_plan->name;
     if (!path_exists(checkpoint_path)) {
         g_last_error = "checkpoint_path does not exist";
         return -2;

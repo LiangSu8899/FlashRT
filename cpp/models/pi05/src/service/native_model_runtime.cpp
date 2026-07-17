@@ -252,6 +252,12 @@ int build_native_model_runtime(const NativeOpenConfig& config,
     const NativeWorkspaceBuffer* guidance = artifacts.guidance_weight;
     const NativeWorkspaceBuffer* prompt = artifacts.prompt_embedding;
     const NativeDeviceWeight* embedding = artifacts.embedding_table;
+    const Pi05ExecutionPlan* execution_plan =
+        pi05_execution_plan(config.stage_plan.c_str());
+    if (!execution_plan || !execution_plan->n_stages) {
+        if (error) *error = "Pi0.5 execution plan is invalid";
+        return -1;
+    }
 
     frt_runtime_builder builder = frt_runtime_builder_create(graph->context());
     if (!builder) {
@@ -259,23 +265,20 @@ int build_native_model_runtime(const NativeOpenConfig& config,
         return -6;
     }
     const frt_shape_key keys[] = {0};
-    bool ok =
-        frt_runtime_builder_add_stream(
-            builder, "main", graph->stream_id(), 0,
-            graph->native_stream()) == 0 &&
-        frt_runtime_builder_add_graph(
-            builder, pipeline_graph_name(GraphKind::kInfer),
-            graph->graph(GraphKind::kInfer), 0, keys, 1,
-            graph->stream_id()) == 0 &&
-        frt_runtime_builder_add_graph(
-            builder, pipeline_graph_name(GraphKind::kDecodeOnly),
-            graph->graph(GraphKind::kDecodeOnly), 0, keys, 1,
-            graph->stream_id()) == 0 &&
-        frt_runtime_builder_add_graph(
-            builder, pipeline_graph_name(GraphKind::kContext),
-            graph->graph(GraphKind::kContext), 0, keys, 1,
-            graph->stream_id()) == 0 &&
-        frt_runtime_builder_add_buffer(
+    bool ok = frt_runtime_builder_add_stream(
+                  builder, "main", graph->stream_id(), 0,
+                  graph->native_stream()) == 0;
+    std::size_t graph_count = 0;
+    const Pi05GraphSpec* graph_catalog =
+        pi05_graph_catalog(&graph_count);
+    for (std::size_t i = 0; ok && i < graph_count; ++i) {
+        const Pi05GraphSpec& spec = graph_catalog[i];
+        ok = static_cast<std::size_t>(spec.kind) == i &&
+             frt_runtime_builder_add_graph(
+                 builder, spec.name, graph->graph(spec.kind), 0, keys, 1,
+                 graph->stream_id()) == 0;
+    }
+    ok = ok && frt_runtime_builder_add_buffer(
             builder, "observation_images_normalized", images->buffer,
             frt_buffer_bytes(images->buffer), FRT_RT_ROLE_INPUT) == 0 &&
         frt_runtime_builder_add_buffer(
@@ -323,7 +326,7 @@ int build_native_model_runtime(const NativeOpenConfig& config,
          add_identity(builder, "weights_sha256", weights_sha256.digest) &&
          add_identity(builder, "tokenizer_sha256", tokenizer_sha256) &&
          add_identity(builder, "io", "native_v2") &&
-         add_identity(builder, "stage_plan", config.stage_plan) &&
+         add_identity(builder, "stage_plan", execution_plan->name) &&
          add_identity(builder, "state_prompt_mode", "fixed") &&
          add_identity(builder, "num_views", std::to_string(config.num_views)) &&
          add_identity(builder, "max_prompt_len",
@@ -346,20 +349,37 @@ int build_native_model_runtime(const NativeOpenConfig& config,
     manifest << "{\"model\":\"pi05\",\"producer\":\"native\","
              << "\"hardware\":\"" << hardware_id
              << "\",\"precision\":\"" << precision_id
-             << "\",\"io\":\"native_v2\","
-             << "\"graphs\":[\"infer\",\"decode_only\",\"context\"],"
-             << "\"stage_plan\":{\"name\":\"" << config.stage_plan
-             << "\",\"stages\":";
-    if (config.stage_plan == "full") {
-        manifest << "[{\"name\":\"infer\",\"graph\":\"infer\","
-                 << "\"after\":[]}]}";
-    } else {
-        manifest << "[{\"name\":\"context\",\"graph\":\"context\","
-                 << "\"after\":[]},{\"name\":\"action\","
-                 << "\"graph\":\"decode_only\","
-                 << "\"after\":[\"context\"]}]}";
+             << "\",\"io\":\"native_v2\",\"graphs\":[";
+    for (std::size_t i = 0; i < graph_count; ++i) {
+        if (i) manifest << ',';
+        manifest << '\"' << graph_catalog[i].name << '\"';
     }
-    manifest << '}';
+    manifest << "],\"stage_plan\":{\"name\":\""
+             << execution_plan->name << "\",\"stages\":[";
+    for (std::size_t i = 0; i < execution_plan->n_stages; ++i) {
+        const Pi05StageSpec& stage = execution_plan->stages[i];
+        const char* graph_name = pi05_graph_name(stage.graph);
+        if (!graph_name) {
+            return fail_builder(builder, error,
+                                "native execution plan build failed");
+        }
+        if (i) manifest << ',';
+        manifest << "{\"name\":\"" << stage.name
+                 << "\",\"graph\":\"" << graph_name
+                 << "\",\"after\":[";
+        for (std::uint32_t d = 0; d < stage.n_after; ++d) {
+            const std::uint32_t dependency = stage.after[d];
+            if (dependency >= i) {
+                return fail_builder(builder, error,
+                                    "native execution plan build failed");
+            }
+            if (d) manifest << ',';
+            manifest << '\"' << execution_plan->stages[dependency].name
+                     << '\"';
+        }
+        manifest << "]}";
+    }
+    manifest << "]}}";
     if (frt_runtime_builder_set_manifest(builder, manifest.str().c_str()) != 0) {
         return fail_builder(builder, error, "native manifest build failed");
     }
@@ -404,13 +424,11 @@ int build_native_model_runtime(const NativeOpenConfig& config,
              FRT_RT_LAYOUT_FLAT, FRT_RT_PORT_OUT, FRT_RT_PORT_SWAP, 0,
              raw_action_shape, 2, 0, noise->buffer, 0,
              frt_buffer_bytes(noise->buffer)) == 0;
-    if (ok && config.stage_plan == "full") {
-        ok = frt_runtime_builder_add_stage(builder, 0, nullptr, 0) == 0;
-    } else if (ok) {
-        const uint32_t context_stage[] = {0};
-        ok = frt_runtime_builder_add_stage(builder, 2, nullptr, 0) == 0 &&
-             frt_runtime_builder_add_stage(
-                 builder, 1, context_stage, 1) == 0;
+    for (std::size_t i = 0; ok && i < execution_plan->n_stages; ++i) {
+        const Pi05StageSpec& stage = execution_plan->stages[i];
+        ok = frt_runtime_builder_add_stage(
+                 builder, static_cast<std::uint32_t>(stage.graph),
+                 stage.after, stage.n_after) == 0;
     }
     if (!ok) return fail_builder(builder, error, "native port/stage build failed");
 
@@ -444,7 +462,8 @@ int build_native_model_runtime(const NativeOpenConfig& config,
     runtime_config.n_action_mean = action_mean.size();
     runtime_config.action_stddev = action_stddev.data();
     runtime_config.n_action_stddev = action_stddev.size();
-    runtime_config.graph_name = "infer";
+    runtime_config.graph_name =
+        pi05_graph_name(execution_plan->stages[0].graph);
     runtime_config.image_buffer_name = "observation_images_normalized";
     runtime_config.action_buffer_name = "diffusion_noise";
     const int runtime_dtype = thor_fp8 ? FRT_PI05_DTYPE_FLOAT16

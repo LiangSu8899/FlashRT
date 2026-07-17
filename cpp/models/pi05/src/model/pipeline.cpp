@@ -5,6 +5,7 @@
 #include <cuda_runtime_api.h>
 
 #include <cstdint>
+#include <vector>
 
 namespace flashrt {
 namespace models {
@@ -21,44 +22,64 @@ modalities::Status backend(const char* message) {
                                      message);
 }
 
-}  // namespace
+struct GraphBindings {
+    const char* const* names;
+    std::size_t count;
+};
 
-Pi05Pipeline::Pi05Pipeline(frt_ctx context, const Pi05PipelineConfig& config)
-    : graphs_(context, static_cast<std::size_t>(GraphKind::kCount)),
-      config_(config) {}
-
-const char* pipeline_graph_name(GraphKind kind) {
+GraphBindings graph_bindings(GraphKind kind) {
+    static const char* const infer[] = {
+        "observation_images_normalized", "prompt_embedding", "encoder_x",
+        "diffusion_noise", "rtc_prev_action_chunk", "rtc_prefix_weights",
+        "rtc_guidance_weight"};
+    static const char* const decode[] = {
+        "encoder_x", "diffusion_noise", "rtc_prev_action_chunk",
+        "rtc_prefix_weights", "rtc_guidance_weight"};
+    static const char* const context[] = {
+        "observation_images_normalized", "prompt_embedding", "encoder_x"};
     switch (kind) {
-        case GraphKind::kInfer: return "infer";
-        case GraphKind::kDecodeOnly: return "decode_only";
-        case GraphKind::kContext: return "context";
-        case GraphKind::kCount: break;
+        case GraphKind::kInfer:
+            return {infer, sizeof(infer) / sizeof(infer[0])};
+        case GraphKind::kDecodeOnly:
+            return {decode, sizeof(decode) / sizeof(decode[0])};
+        case GraphKind::kContext:
+            return {context, sizeof(context) / sizeof(context[0])};
+        case GraphKind::kCount:
+            break;
     }
-    return nullptr;
+    return {nullptr, 0};
 }
 
 modalities::Status capture_pipeline_graph(
     native::CudaGraphSet* graphs,
     GraphKind kind,
     const NativeWorkspace& workspace,
-    std::initializer_list<const char*> bindings,
+    GraphBindings bindings,
     native::CudaGraphSet::RecordFn record,
     void* owner) {
-    if (!graphs || !pipeline_graph_name(kind)) {
+    const char* name = pi05_graph_name(kind);
+    if (!graphs || !name || !bindings.names || !bindings.count) {
         return invalid("native graph capture request is invalid");
     }
     std::vector<native::CudaGraphBinding> resolved;
-    resolved.reserve(bindings.size());
-    for (const char* binding : bindings) {
+    resolved.reserve(bindings.count);
+    for (std::size_t i = 0; i < bindings.count; ++i) {
+        const char* binding = bindings.names[i];
         const NativeWorkspaceBuffer* buffer = workspace.find(binding);
         if (!buffer) {
             return backend("native graph binding failed");
         }
         resolved.push_back({binding, buffer->buffer});
     }
-    return graphs->capture(static_cast<std::size_t>(kind),
-                           pipeline_graph_name(kind), resolved, record, owner);
+    return graphs->capture(static_cast<std::size_t>(kind), name, resolved,
+                           record, owner);
 }
+
+}  // namespace
+
+Pi05Pipeline::Pi05Pipeline(frt_ctx context, const Pi05PipelineConfig& config)
+    : graphs_(context, static_cast<std::size_t>(GraphKind::kCount)),
+      config_(config) {}
 
 modalities::Status copy_prompt_to_encoder(NativeWorkspace* workspace,
                                           void* stream) {
@@ -219,24 +240,17 @@ modalities::Status Pi05Pipeline::finish_prepare(
         }
     }
 
-    st = capture_pipeline_graph(
-        &graphs_, GraphKind::kInfer, workspace(),
-        {"observation_images_normalized", "prompt_embedding", "encoder_x",
-         "diffusion_noise", "rtc_prev_action_chunk", "rtc_prefix_weights",
-         "rtc_guidance_weight"},
-        record_graph, this);
-    if (!st.ok_status()) return st;
-    st = capture_pipeline_graph(
-        &graphs_, GraphKind::kDecodeOnly, workspace(),
-        {"encoder_x", "diffusion_noise", "rtc_prev_action_chunk",
-         "rtc_prefix_weights", "rtc_guidance_weight"},
-        record_graph, this);
-    if (!st.ok_status()) return st;
-    st = capture_pipeline_graph(
-        &graphs_, GraphKind::kContext, workspace(),
-        {"observation_images_normalized", "prompt_embedding", "encoder_x"},
-        record_graph, this);
-    if (!st.ok_status()) return st;
+    std::size_t graph_count = 0;
+    const Pi05GraphSpec* catalog = pi05_graph_catalog(&graph_count);
+    for (std::size_t i = 0; i < graph_count; ++i) {
+        if (static_cast<std::size_t>(catalog[i].kind) != i) {
+            return backend("Pi0.5 graph catalog order is invalid");
+        }
+        st = capture_pipeline_graph(
+            &graphs_, catalog[i].kind, workspace(),
+            graph_bindings(catalog[i].kind), record_graph, this);
+        if (!st.ok_status()) return st;
+    }
     return graphs_.create_replay_stream();
 }
 
