@@ -1,4 +1,4 @@
-#include "flashrt/cpp/models/pi05/backends/sm120/native_graph_owner.h"
+#include "flashrt/cpp/models/pi05/backends/sm120/session.h"
 
 #include "flashrt/cpp/models/pi05/backends/sm120/native_style_precompute.h"
 #include "flashrt/cpp/models/pi05/support/native_weight_materializer.h"
@@ -51,11 +51,11 @@ modalities::Status upload_scales(
 
 }  // namespace
 
-NativeGraphOwner::NativeGraphOwner(
+Sm120BackendSession::Sm120BackendSession(
     frt_ctx ctx,
-    const NativeGraphConfig& config,
+    const BackendConfig& config,
     NativeRtxLinearMode linear_mode)
-    : graphs_(ctx, static_cast<std::size_t>(NativeGraphKind::kCount)),
+    : graphs_(ctx, static_cast<std::size_t>(GraphKind::kCount)),
       config_(config),
       weights_(ctx),
       workspace_(ctx),
@@ -63,13 +63,13 @@ NativeGraphOwner::NativeGraphOwner(
       linear_(&driver_, linear_mode),
       forward_(&driver_, &linear_) {}
 
-NativeGraphOwner::~NativeGraphOwner() = default;
+Sm120BackendSession::~Sm120BackendSession() = default;
 
-std::unique_ptr<NativeGraphOwner> NativeGraphOwner::create(
+std::unique_ptr<Sm120BackendSession> Sm120BackendSession::create(
     const std::string& checkpoint_path,
-    const NativeGraphConfig& config,
+    const BackendConfig& config,
     modalities::Status* status) {
-    if (config.precision != NativeGraphPrecision::kBf16 ||
+    if (config.precision != BackendPrecision::kBf16 ||
         config.num_views < 1 || config.num_views > 3 ||
         config.max_prompt_tokens < 1 || config.chunk_size < 1 ||
         config.num_steps < 1 ||
@@ -87,29 +87,29 @@ std::unique_ptr<NativeGraphOwner> NativeGraphOwner::create(
         if (status) *status = backend("native graph context creation failed");
         return nullptr;
     }
-    std::unique_ptr<NativeGraphOwner> owner(
-        new (std::nothrow) NativeGraphOwner(
+    std::unique_ptr<Sm120BackendSession> session(
+        new (std::nothrow) Sm120BackendSession(
             ctx, config, NativeRtxLinearMode::kBf16));
-    if (!owner) {
+    if (!session) {
         frt_ctx_destroy(ctx);
-        if (status) *status = backend("native graph owner allocation failed");
+        if (status) *status = backend("SM120 backend session allocation failed");
         return nullptr;
     }
-    modalities::Status st = owner->initialize(checkpoint_path, nullptr);
+    modalities::Status st = session->initialize(checkpoint_path, nullptr);
     if (!st.ok_status()) {
         if (status) *status = st;
         return nullptr;
     }
     if (status) *status = modalities::Status::ok();
-    return owner;
+    return session;
 }
 
-std::unique_ptr<NativeGraphOwner> NativeGraphOwner::create(
+std::unique_ptr<Sm120BackendSession> Sm120BackendSession::create(
     const std::string& checkpoint_path,
-    const NativeGraphConfig& config,
+    const BackendConfig& config,
     const NativeCalibrationArtifact& calibration,
     modalities::Status* status) {
-    if (config.precision != NativeGraphPrecision::kFp8E4M3) {
+    if (config.precision != BackendPrecision::kFp8E4M3) {
         if (status) *status = invalid("native RTX FP8 graph precision is invalid");
         return nullptr;
     }
@@ -118,28 +118,28 @@ std::unique_ptr<NativeGraphOwner> NativeGraphOwner::create(
         if (status) *status = backend("native graph context creation failed");
         return nullptr;
     }
-    std::unique_ptr<NativeGraphOwner> owner(
-        new (std::nothrow) NativeGraphOwner(
+    std::unique_ptr<Sm120BackendSession> session(
+        new (std::nothrow) Sm120BackendSession(
             ctx, config, NativeRtxLinearMode::kFp8Static));
-    if (!owner) {
+    if (!session) {
         frt_ctx_destroy(ctx);
-        if (status) *status = backend("native graph owner allocation failed");
+        if (status) *status = backend("SM120 backend session allocation failed");
         return nullptr;
     }
-    modalities::Status st = owner->initialize(checkpoint_path, &calibration);
+    modalities::Status st = session->initialize(checkpoint_path, &calibration);
     if (!st.ok_status()) {
         if (status) *status = st;
         return nullptr;
     }
     if (status) *status = modalities::Status::ok();
-    return owner;
+    return session;
 }
 
-std::unique_ptr<NativeGraphOwner> NativeGraphOwner::create_calibration(
+std::unique_ptr<Sm120BackendSession> Sm120BackendSession::create_calibration(
     const std::string& checkpoint_path,
-    const NativeGraphConfig& config,
+    const BackendConfig& config,
     modalities::Status* status) {
-    if (config.precision != NativeGraphPrecision::kFp8E4M3) {
+    if (config.precision != BackendPrecision::kFp8E4M3) {
         if (status) {
             *status = invalid("native RTX calibration precision is invalid");
         }
@@ -150,24 +150,24 @@ std::unique_ptr<NativeGraphOwner> NativeGraphOwner::create_calibration(
         if (status) *status = backend("native graph context creation failed");
         return nullptr;
     }
-    std::unique_ptr<NativeGraphOwner> owner(
-        new (std::nothrow) NativeGraphOwner(
+    std::unique_ptr<Sm120BackendSession> session(
+        new (std::nothrow) Sm120BackendSession(
             ctx, config, NativeRtxLinearMode::kFp8Dynamic));
-    if (!owner) {
+    if (!session) {
         frt_ctx_destroy(ctx);
-        if (status) *status = backend("native graph owner allocation failed");
+        if (status) *status = backend("SM120 backend session allocation failed");
         return nullptr;
     }
-    modalities::Status st = owner->initialize(checkpoint_path, nullptr);
+    modalities::Status st = session->initialize(checkpoint_path, nullptr);
     if (!st.ok_status()) {
         if (status) *status = st;
         return nullptr;
     }
     if (status) *status = modalities::Status::ok();
-    return owner;
+    return session;
 }
 
-modalities::Status NativeGraphOwner::initialize(
+modalities::Status Sm120BackendSession::initialize(
     const std::string& checkpoint_path,
     const NativeCalibrationArtifact* calibration) {
     const bool fp8 = linear_.fp8();
@@ -280,7 +280,7 @@ modalities::Status NativeGraphOwner::initialize(
     }
     report("workspace_style");
 
-    st = resolve_native_runtime_artifacts(
+    st = resolve_backend_artifacts(
         workspace_, weights_, NativeWeightDType::kBf16, &artifacts_);
     if (!st.ok_status()) return st;
 
@@ -299,24 +299,24 @@ modalities::Status NativeGraphOwner::initialize(
     }
     report("input_init");
 
-    st = capture_native_graph(
+    st = capture_backend_graph(
         &graphs_,
-        NativeGraphKind::kInfer, workspace_,
+        GraphKind::kInfer, workspace_,
         {"observation_images_normalized", "prompt_embedding", "encoder_x",
          "diffusion_noise", "rtc_prev_action_chunk", "rtc_prefix_weights",
          "rtc_guidance_weight"},
         record_graph, this);
     if (!st.ok_status()) return st;
-    st = capture_native_graph(
+    st = capture_backend_graph(
         &graphs_,
-        NativeGraphKind::kDecodeOnly, workspace_,
+        GraphKind::kDecodeOnly, workspace_,
         {"encoder_x", "diffusion_noise", "rtc_prev_action_chunk",
          "rtc_prefix_weights", "rtc_guidance_weight"},
         record_graph, this);
     if (!st.ok_status()) return st;
-    st = capture_native_graph(
+    st = capture_backend_graph(
         &graphs_,
-        NativeGraphKind::kContext, workspace_,
+        GraphKind::kContext, workspace_,
         {"observation_images_normalized", "prompt_embedding", "encoder_x"},
         record_graph, this);
     if (!st.ok_status()) return st;
@@ -334,7 +334,7 @@ modalities::Status NativeGraphOwner::initialize(
     return modalities::Status::ok();
 }
 
-modalities::Status NativeGraphOwner::record_context(void* stream) {
+modalities::Status Sm120BackendSession::record_context(void* stream) {
     modalities::Status st = copy_prompt_to_encoder(&workspace_, stream);
     if (!st.ok_status()) return st;
     st = forward_.vision(
@@ -348,40 +348,40 @@ modalities::Status NativeGraphOwner::record_context(void* stream) {
     return st;
 }
 
-modalities::Status NativeGraphOwner::record_action(void* stream) {
+modalities::Status Sm120BackendSession::record_action(void* stream) {
     return forward_.diffusion(weights_, &workspace_, &attention_,
                               attention_driver_.get(),
                               reinterpret_cast<std::uintptr_t>(stream));
 }
 
-modalities::Status NativeGraphOwner::record(NativeGraphKind kind,
+modalities::Status Sm120BackendSession::record(GraphKind kind,
                                              void* stream) {
-    if (kind == NativeGraphKind::kContext) return record_context(stream);
-    if (kind == NativeGraphKind::kDecodeOnly) return record_action(stream);
-    if (kind != NativeGraphKind::kInfer) {
+    if (kind == GraphKind::kContext) return record_context(stream);
+    if (kind == GraphKind::kDecodeOnly) return record_action(stream);
+    if (kind != GraphKind::kInfer) {
         return invalid("native graph kind is invalid");
     }
     modalities::Status st = record_context(stream);
     return st.ok_status() ? record_action(stream) : st;
 }
 
-modalities::Status NativeGraphOwner::record_graph(
+modalities::Status Sm120BackendSession::record_graph(
     void* user, std::size_t slot, void* stream) {
-    auto* owner = static_cast<NativeGraphOwner*>(user);
-    return owner->record(static_cast<NativeGraphKind>(slot), stream);
+    auto* session = static_cast<Sm120BackendSession*>(user);
+    return session->record(static_cast<GraphKind>(slot), stream);
 }
 
-modalities::Status NativeGraphOwner::set_prompt_length(int prompt_tokens) {
+modalities::Status Sm120BackendSession::set_prompt_length(int prompt_tokens) {
     modalities::Status st = attention_.set_fixed_prompt_length(prompt_tokens);
     if (!st.ok_status()) return st;
     return workspace_.update_decoder_rope(prompt_tokens);
 }
 
-int NativeGraphOwner::replay(NativeGraphKind kind) const {
+int Sm120BackendSession::replay(GraphKind kind) const {
     return graphs_.replay(static_cast<std::size_t>(kind));
 }
 
-modalities::Status NativeGraphOwner::synchronize() const {
+modalities::Status Sm120BackendSession::synchronize() const {
     return graphs_.synchronize();
 }
 

@@ -3,7 +3,7 @@
 #include "flashrt/cpp/loader/sha256.h"
 #include "flashrt/cpp/models/pi05/model/io.h"
 #include "flashrt/cpp/models/pi05/support/native_calibration.h"
-#include "flashrt/cpp/models/pi05/backends/sm120/native_graph_owner.h"
+#include "flashrt/cpp/models/pi05/backends/sm120/session.h"
 #include "flashrt/cpp/models/pi05/model/prompt_embed.h"
 
 #include <cuda_runtime_api.h>
@@ -97,15 +97,15 @@ struct NativeRtxCalibrationSession::Impl {
                 return result;
             });
 
-        NativeGraphConfig graph_config;
+        BackendConfig graph_config;
         graph_config.num_views = config.num_views;
         graph_config.max_prompt_tokens = config.max_prompt_tokens;
         graph_config.chunk_size = config.chunk_size;
         graph_config.num_steps = config.num_steps;
         graph_config.vision_pool_factor = config.vision_pool_factor;
-        graph_config.precision = NativeGraphPrecision::kFp8E4M3;
+        graph_config.precision = BackendPrecision::kFp8E4M3;
         modalities::Status st;
-        graph = NativeGraphOwner::create_calibration(
+        graph = Sm120BackendSession::create_calibration(
             config.checkpoint_path, graph_config, &st);
         if (!graph) return st;
 
@@ -358,7 +358,7 @@ struct NativeRtxCalibrationSession::Impl {
     std::string hardware;
     std::string weights_sha256;
     std::string tokenizer_sha256;
-    std::unique_ptr<NativeGraphOwner> graph;
+    std::unique_ptr<Sm120BackendSession> graph;
     modalities::VisionStaging vision_staging;
     modalities::TextEmbeddingStaging text_staging;
     modalities::SentencePieceTokenizer tokenizer;

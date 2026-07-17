@@ -7,13 +7,13 @@
 #include "flashrt/cpp/loader/sha256.h"
 #include "flashrt/cpp/models/pi05/model_runtime.h"
 #include "flashrt/cpp/models/pi05/support/native_calibration.h"
-#include "flashrt/cpp/models/pi05/backend/native_graph_runtime.h"
+#include "flashrt/cpp/models/pi05/backend/session.h"
 #include "flashrt/cpp/models/pi05/model/spec.h"
 #if defined(FLASHRT_CPP_WITH_FA2)
-#include "flashrt/cpp/models/pi05/backends/sm120/native_graph_owner.h"
+#include "flashrt/cpp/models/pi05/backends/sm120/session.h"
 #endif
 #if defined(FLASHRT_CPP_WITH_THOR_FP8)
-#include "flashrt/cpp/models/pi05/backends/sm110/native_thor_graph_owner.h"
+#include "flashrt/cpp/models/pi05/backends/sm110/session.h"
 #endif
 
 #include <cuda_runtime_api.h>
@@ -29,12 +29,12 @@ namespace models {
 namespace pi05 {
 namespace {
 
-void release_graph_owner(void* owner) {
-    delete static_cast<NativeGraphRuntime*>(owner);
+void release_backend_session(void* owner) {
+    delete static_cast<BackendSession*>(owner);
 }
 
 int update_prompt_length(void* owner, std::uint64_t prompt_len) {
-    auto* graph = static_cast<NativeGraphRuntime*>(owner);
+    auto* graph = static_cast<BackendSession*>(owner);
     if (!graph || prompt_len > static_cast<std::uint64_t>(INT_MAX)) return -1;
     return cface::status_code(
         graph->set_prompt_length(static_cast<int>(prompt_len)));
@@ -198,17 +198,17 @@ int build_native_model_runtime(const NativeOpenConfig& config,
         }
     }
 
-    NativeGraphConfig graph_config;
+    BackendConfig graph_config;
     graph_config.num_views = config.num_views;
     graph_config.max_prompt_tokens = config.max_prompt_tokens;
     graph_config.chunk_size = config.chunk;
     graph_config.num_steps = config.num_steps;
     graph_config.vision_pool_factor = config.vision_pool_factor;
     graph_config.precision = precision == Precision::kFp8E4M3Fn
-                                 ? NativeGraphPrecision::kFp8E4M3
-                                 : NativeGraphPrecision::kBf16;
+                                 ? BackendPrecision::kFp8E4M3
+                                 : BackendPrecision::kBf16;
     modalities::Status st;
-    std::unique_ptr<NativeGraphRuntime> graph;
+    std::unique_ptr<BackendSession> graph;
     const bool thor_fp8 = precision == Precision::kFp8E4M3Fn &&
                           properties.major == 11;
     const bool rtx_fp8 = precision == Precision::kFp8E4M3Fn &&
@@ -216,15 +216,15 @@ int build_native_model_runtime(const NativeOpenConfig& config,
     if (precision == Precision::kBf16 || rtx_fp8) {
 #if defined(FLASHRT_CPP_WITH_FA2)
         graph = rtx_fp8
-                    ? NativeGraphOwner::create(
+                    ? Sm120BackendSession::create(
                           config.checkpoint_path, graph_config, calibration,
                           &st)
-                    : NativeGraphOwner::create(
+                    : Sm120BackendSession::create(
                           config.checkpoint_path, graph_config, &st);
 #endif
     } else if (thor_fp8) {
 #if defined(FLASHRT_CPP_WITH_THOR_FP8)
-        graph = NativeThorGraphOwner::create(
+        graph = Sm110BackendSession::create(
             config.checkpoint_path, graph_config, calibration, &st);
 #endif
     }
@@ -243,7 +243,7 @@ int build_native_model_runtime(const NativeOpenConfig& config,
         return -2;
     }
 
-    const NativeRuntimeArtifacts& artifacts = graph->artifacts();
+    const BackendArtifacts& artifacts = graph->artifacts();
     const NativeWorkspaceBuffer* images = artifacts.images;
     const NativeWorkspaceBuffer* noise = artifacts.noise;
     const NativeWorkspaceBuffer* encoder = artifacts.encoder;
@@ -264,16 +264,16 @@ int build_native_model_runtime(const NativeOpenConfig& config,
             builder, "main", graph->stream_id(), 0,
             graph->native_stream()) == 0 &&
         frt_runtime_builder_add_graph(
-            builder, native_graph_name(NativeGraphKind::kInfer),
-            graph->graph(NativeGraphKind::kInfer), 0, keys, 1,
+            builder, backend_graph_name(GraphKind::kInfer),
+            graph->graph(GraphKind::kInfer), 0, keys, 1,
             graph->stream_id()) == 0 &&
         frt_runtime_builder_add_graph(
-            builder, native_graph_name(NativeGraphKind::kDecodeOnly),
-            graph->graph(NativeGraphKind::kDecodeOnly), 0, keys, 1,
+            builder, backend_graph_name(GraphKind::kDecodeOnly),
+            graph->graph(GraphKind::kDecodeOnly), 0, keys, 1,
             graph->stream_id()) == 0 &&
         frt_runtime_builder_add_graph(
-            builder, native_graph_name(NativeGraphKind::kContext),
-            graph->graph(NativeGraphKind::kContext), 0, keys, 1,
+            builder, backend_graph_name(GraphKind::kContext),
+            graph->graph(GraphKind::kContext), 0, keys, 1,
             graph->stream_id()) == 0 &&
         frt_runtime_builder_add_buffer(
             builder, "observation_images_normalized", images->buffer,
@@ -414,13 +414,13 @@ int build_native_model_runtime(const NativeOpenConfig& config,
     }
     if (!ok) return fail_builder(builder, error, "native port/stage build failed");
 
-    NativeGraphRuntime* raw_graph = graph.release();
+    BackendSession* raw_graph = graph.release();
     /* This base is retained only by the verb override below and is never
      * returned to a consumer. The published object always has real verbs. */
     frt_model_runtime_verbs base_verbs = unpublished_verbs();
     frt_model_runtime_v1* base = frt_runtime_builder_finish_model(
         builder, &base_verbs, nullptr, raw_graph, nullptr,
-        release_graph_owner);
+        release_backend_session);
     if (!base) {
         delete raw_graph;
         if (error) *error = "native integrated runtime finish failed";

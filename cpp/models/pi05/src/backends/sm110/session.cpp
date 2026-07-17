@@ -1,4 +1,4 @@
-#include "flashrt/cpp/models/pi05/backends/sm110/native_thor_graph_owner.h"
+#include "flashrt/cpp/models/pi05/backends/sm110/session.h"
 
 #include "flashrt/cpp/models/pi05/backends/sm110/native_thor_style_precompute.h"
 #include "flashrt/cpp/models/pi05/backends/sm110/native_thor_weight_materializer.h"
@@ -46,7 +46,7 @@ modalities::Status copy_scales(const NativeWorkspace& workspace,
 }
 
 bool calibration_matches(const NativeCalibrationArtifact& artifact,
-                         const NativeGraphConfig& config) {
+                         const BackendConfig& config) {
     return artifact.num_views == config.num_views &&
            artifact.max_prompt_tokens == config.max_prompt_tokens &&
            artifact.chunk_size == config.chunk_size &&
@@ -56,20 +56,20 @@ bool calibration_matches(const NativeCalibrationArtifact& artifact,
 
 }  // namespace
 
-NativeThorGraphOwner::NativeThorGraphOwner(
+Sm110BackendSession::Sm110BackendSession(
     frt_ctx ctx,
-    const NativeGraphConfig& config)
-    : graphs_(ctx, static_cast<std::size_t>(NativeGraphKind::kCount)),
+    const BackendConfig& config)
+    : graphs_(ctx, static_cast<std::size_t>(GraphKind::kCount)),
       config_(config),
       weights_(ctx),
       workspace_(ctx),
       forward_(&driver_) {}
 
-NativeThorGraphOwner::~NativeThorGraphOwner() = default;
+Sm110BackendSession::~Sm110BackendSession() = default;
 
-std::unique_ptr<NativeThorGraphOwner> NativeThorGraphOwner::create(
+std::unique_ptr<Sm110BackendSession> Sm110BackendSession::create(
     const std::string& checkpoint_path,
-    const NativeGraphConfig& config,
+    const BackendConfig& config,
     const NativeCalibrationArtifact& calibration,
     modalities::Status* status) {
     if (config.num_views < 1 || config.num_views > 3 ||
@@ -97,23 +97,23 @@ std::unique_ptr<NativeThorGraphOwner> NativeThorGraphOwner::create(
         if (status) *status = backend("Thor graph context creation failed");
         return nullptr;
     }
-    std::unique_ptr<NativeThorGraphOwner> owner(
-        new (std::nothrow) NativeThorGraphOwner(ctx, config));
-    if (!owner) {
+    std::unique_ptr<Sm110BackendSession> session(
+        new (std::nothrow) Sm110BackendSession(ctx, config));
+    if (!session) {
         frt_ctx_destroy(ctx);
-        if (status) *status = backend("Thor graph owner allocation failed");
+        if (status) *status = backend("SM110 backend session allocation failed");
         return nullptr;
     }
-    st = owner->initialize(checkpoint_path, calibration);
+    st = session->initialize(checkpoint_path, calibration);
     if (!st.ok_status()) {
         if (status) *status = st;
         return nullptr;
     }
     if (status) *status = modalities::Status::ok();
-    return owner;
+    return session;
 }
 
-modalities::Status NativeThorGraphOwner::initialize(
+modalities::Status Sm110BackendSession::initialize(
     const std::string& checkpoint_path,
     const NativeCalibrationArtifact& calibration) {
     const bool profile_setup = std::getenv("FLASHRT_PROFILE_NATIVE_SETUP");
@@ -180,7 +180,7 @@ modalities::Status NativeThorGraphOwner::initialize(
     if (!st.ok_status()) return st;
     report("workspace_style");
 
-    st = resolve_native_runtime_artifacts(
+    st = resolve_backend_artifacts(
         workspace_, weights_, NativeWeightDType::kFloat16, &artifacts_);
     if (!st.ok_status()) return st;
 
@@ -198,7 +198,7 @@ modalities::Status NativeThorGraphOwner::initialize(
     }
 
     // CUTLASS, cuBLAS, and FMHA initialize tactics outside CUDA capture.
-    st = record(NativeGraphKind::kInfer, nullptr);
+    st = record(GraphKind::kInfer, nullptr);
     if (!st.ok_status()) return st;
     if (cudaDeviceSynchronize() != cudaSuccess) {
         return backend("Thor graph warmup synchronization failed");
@@ -211,24 +211,24 @@ modalities::Status NativeThorGraphOwner::initialize(
     }
     report("warmup");
 
-    st = capture_native_graph(
+    st = capture_backend_graph(
         &graphs_,
-        NativeGraphKind::kInfer, workspace_,
+        GraphKind::kInfer, workspace_,
         {"observation_images_normalized", "prompt_embedding", "encoder_x",
          "diffusion_noise", "rtc_prev_action_chunk", "rtc_prefix_weights",
          "rtc_guidance_weight"},
         record_graph, this);
     if (!st.ok_status()) return st;
-    st = capture_native_graph(
+    st = capture_backend_graph(
         &graphs_,
-        NativeGraphKind::kDecodeOnly, workspace_,
+        GraphKind::kDecodeOnly, workspace_,
         {"encoder_x", "diffusion_noise", "rtc_prev_action_chunk",
          "rtc_prefix_weights", "rtc_guidance_weight"},
         record_graph, this);
     if (!st.ok_status()) return st;
-    st = capture_native_graph(
+    st = capture_backend_graph(
         &graphs_,
-        NativeGraphKind::kContext, workspace_,
+        GraphKind::kContext, workspace_,
         {"observation_images_normalized", "prompt_embedding", "encoder_x"},
         record_graph, this);
     if (!st.ok_status()) return st;
@@ -246,7 +246,7 @@ modalities::Status NativeThorGraphOwner::initialize(
     return modalities::Status::ok();
 }
 
-modalities::Status NativeThorGraphOwner::record_context(void* stream) {
+modalities::Status Sm110BackendSession::record_context(void* stream) {
     modalities::Status st = copy_prompt_to_encoder(&workspace_, stream);
     if (!st.ok_status()) return st;
     const std::uintptr_t stream_id = reinterpret_cast<std::uintptr_t>(stream);
@@ -256,37 +256,37 @@ modalities::Status NativeThorGraphOwner::record_context(void* stream) {
         weights_, &workspace_, encoder_alphas_, stream_id);
 }
 
-modalities::Status NativeThorGraphOwner::record_action(void* stream) {
+modalities::Status Sm110BackendSession::record_action(void* stream) {
     return forward_.diffusion(
         weights_, &workspace_, reinterpret_cast<std::uintptr_t>(stream));
 }
 
-modalities::Status NativeThorGraphOwner::record(NativeGraphKind kind,
+modalities::Status Sm110BackendSession::record(GraphKind kind,
                                                  void* stream) {
-    if (kind == NativeGraphKind::kContext) return record_context(stream);
-    if (kind == NativeGraphKind::kDecodeOnly) return record_action(stream);
-    if (kind != NativeGraphKind::kInfer) {
+    if (kind == GraphKind::kContext) return record_context(stream);
+    if (kind == GraphKind::kDecodeOnly) return record_action(stream);
+    if (kind != GraphKind::kInfer) {
         return invalid("Thor graph kind is invalid");
     }
     modalities::Status st = record_context(stream);
     return st.ok_status() ? record_action(stream) : st;
 }
 
-modalities::Status NativeThorGraphOwner::record_graph(
+modalities::Status Sm110BackendSession::record_graph(
     void* user, std::size_t slot, void* stream) {
-    auto* owner = static_cast<NativeThorGraphOwner*>(user);
-    return owner->record(static_cast<NativeGraphKind>(slot), stream);
+    auto* session = static_cast<Sm110BackendSession*>(user);
+    return session->record(static_cast<GraphKind>(slot), stream);
 }
 
-modalities::Status NativeThorGraphOwner::set_prompt_length(int prompt_tokens) {
+modalities::Status Sm110BackendSession::set_prompt_length(int prompt_tokens) {
     return workspace_.set_fixed_prompt_length(prompt_tokens);
 }
 
-int NativeThorGraphOwner::replay(NativeGraphKind kind) const {
+int Sm110BackendSession::replay(GraphKind kind) const {
     return graphs_.replay(static_cast<std::size_t>(kind));
 }
 
-modalities::Status NativeThorGraphOwner::synchronize() const {
+modalities::Status Sm110BackendSession::synchronize() const {
     return graphs_.synchronize();
 }
 

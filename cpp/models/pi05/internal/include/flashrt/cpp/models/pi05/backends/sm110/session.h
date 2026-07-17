@@ -1,8 +1,8 @@
-#ifndef FLASHRT_CPP_MODELS_PI05_NATIVE_THOR_GRAPH_OWNER_H
-#define FLASHRT_CPP_MODELS_PI05_NATIVE_THOR_GRAPH_OWNER_H
+#ifndef FLASHRT_CPP_MODELS_PI05_BACKENDS_SM110_SESSION_H
+#define FLASHRT_CPP_MODELS_PI05_BACKENDS_SM110_SESSION_H
 
 #include "flashrt/cpp/models/pi05/support/native_calibration.h"
-#include "flashrt/cpp/models/pi05/backend/native_graph_runtime.h"
+#include "flashrt/cpp/models/pi05/backend/session.h"
 #include "flashrt/cpp/models/pi05/backends/sm110/native_thor_fp8_forward.h"
 
 #include <memory>
@@ -13,21 +13,21 @@ namespace flashrt {
 namespace models {
 namespace pi05 {
 
-class NativeThorGraphOwner final : public NativeGraphRuntime {
+class Sm110BackendSession final : public BackendSession {
 public:
-    static std::unique_ptr<NativeThorGraphOwner> create(
+    static std::unique_ptr<Sm110BackendSession> create(
         const std::string& checkpoint_path,
-        const NativeGraphConfig& config,
+        const BackendConfig& config,
         const NativeCalibrationArtifact& calibration,
         modalities::Status* status);
 
-    ~NativeThorGraphOwner() override;
+    ~Sm110BackendSession() override;
 
-    NativeThorGraphOwner(const NativeThorGraphOwner&) = delete;
-    NativeThorGraphOwner& operator=(const NativeThorGraphOwner&) = delete;
+    Sm110BackendSession(const Sm110BackendSession&) = delete;
+    Sm110BackendSession& operator=(const Sm110BackendSession&) = delete;
 
     frt_ctx context() const override { return graphs_.context(); }
-    frt_graph graph(NativeGraphKind kind) const override {
+    frt_graph graph(GraphKind kind) const override {
         return graphs_.graph(static_cast<std::size_t>(kind));
     }
     int stream_id() const override { return graphs_.stream_id(); }
@@ -36,30 +36,30 @@ public:
     const NativeDeviceWeightStore& weights() const { return weights_; }
     NativeWorkspace& workspace() { return workspace_; }
     const NativeWorkspace& workspace() const { return workspace_; }
-    const NativeRuntimeArtifacts& artifacts() const override {
+    const BackendArtifacts& artifacts() const override {
         return artifacts_;
     }
 
     modalities::Status set_prompt_length(int prompt_tokens) override;
-    int replay(NativeGraphKind kind = NativeGraphKind::kInfer) const override;
+    int replay(GraphKind kind = GraphKind::kInfer) const override;
     modalities::Status synchronize() const override;
 
 private:
-    NativeThorGraphOwner(frt_ctx ctx, const NativeGraphConfig& config);
+    Sm110BackendSession(frt_ctx ctx, const BackendConfig& config);
     modalities::Status initialize(
         const std::string& checkpoint_path,
         const NativeCalibrationArtifact& calibration);
-    modalities::Status record(NativeGraphKind kind, void* stream);
+    modalities::Status record(GraphKind kind, void* stream);
     modalities::Status record_context(void* stream);
     modalities::Status record_action(void* stream);
     static modalities::Status record_graph(
         void* user, std::size_t slot, void* stream);
 
     native::CudaGraphSet graphs_;
-    NativeGraphConfig config_;
+    BackendConfig config_;
     NativeDeviceWeightStore weights_;
     NativeWorkspace workspace_;
-    NativeRuntimeArtifacts artifacts_;
+    BackendArtifacts artifacts_;
     NativeThorKernelDriver driver_;
     NativeThorFp8Forward forward_;
     NativeThorWeightScales weight_scales_;
@@ -70,4 +70,4 @@ private:
 }  // namespace models
 }  // namespace flashrt
 
-#endif  // FLASHRT_CPP_MODELS_PI05_NATIVE_THOR_GRAPH_OWNER_H
+#endif  // FLASHRT_CPP_MODELS_PI05_BACKENDS_SM110_SESSION_H

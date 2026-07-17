@@ -67,7 +67,7 @@ if(FLASHRT_CPP_WITH_CUDA_KERNELS)
 
   if(FLASHRT_CPP_WITH_FA2 OR FLASHRT_CPP_WITH_THOR_FP8)
     add_library(flashrt_cpp_pi05_backend_cuda STATIC
-      src/backend/native_graph_runtime.cpp
+      src/backend/session.cpp
       ${FLASHRT_CPP_SOURCE_DIR}/../csrc/gemm/gemm_runner.cu
       ${FLASHRT_CPP_SOURCE_DIR}/../csrc/kernels/activation.cu
       ${FLASHRT_CPP_SOURCE_DIR}/../csrc/kernels/elementwise.cu
@@ -90,7 +90,7 @@ if(FLASHRT_CPP_WITH_CUDA_KERNELS)
   if(FLASHRT_CPP_WITH_FA2)
     add_library(flashrt_cpp_pi05_backend_sm120 STATIC
       src/backends/sm120/native_bf16_forward.cpp
-      src/backends/sm120/native_graph_owner.cpp
+      src/backends/sm120/session.cpp
       src/backends/sm120/native_kernel_driver.cu
       src/backends/sm120/native_rtx_attention.cpp
       src/backends/sm120/native_rtx_attention_driver.cu
@@ -137,7 +137,7 @@ if(FLASHRT_CPP_WITH_CUDA_KERNELS)
       src/backends/sm110/native_thor_kernel_driver.cu
       src/backends/sm110/native_thor_weight_materializer.cpp
       src/backends/sm110/native_thor_fp8_forward.cpp
-      src/backends/sm110/native_thor_graph_owner.cpp
+      src/backends/sm110/session.cpp
       src/backends/sm110/native_thor_calibration_session.cpp
       src/backends/sm110/native_thor_style_precompute.cpp
       ${FLASHRT_CPP_SOURCE_DIR}/../csrc/gemm/cutlass_sm100.cu

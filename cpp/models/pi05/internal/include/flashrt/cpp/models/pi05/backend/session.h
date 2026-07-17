@@ -1,5 +1,5 @@
-#ifndef FLASHRT_CPP_MODELS_PI05_NATIVE_GRAPH_RUNTIME_H
-#define FLASHRT_CPP_MODELS_PI05_NATIVE_GRAPH_RUNTIME_H
+#ifndef FLASHRT_CPP_MODELS_PI05_BACKEND_SESSION_H
+#define FLASHRT_CPP_MODELS_PI05_BACKEND_SESSION_H
 
 #include "flashrt/cpp/models/pi05/support/native_device_weights.h"
 #include "flashrt/cpp/models/pi05/support/native_workspace.h"
@@ -12,32 +12,32 @@ namespace flashrt {
 namespace models {
 namespace pi05 {
 
-enum class NativeGraphPrecision {
+enum class BackendPrecision {
     kBf16,
     kFp8E4M3,
 };
 
-struct NativeGraphConfig {
+struct BackendConfig {
     int num_views = 2;
     int max_prompt_tokens = 200;
     int chunk_size = 10;
     int num_steps = 10;
     int vision_pool_factor = 1;
-    NativeGraphPrecision precision = NativeGraphPrecision::kBf16;
+    BackendPrecision precision = BackendPrecision::kBf16;
 };
 
-enum class NativeGraphKind : std::size_t {
+enum class GraphKind : std::size_t {
     kInfer = 0,
     kDecodeOnly = 1,
     kContext = 2,
     kCount = 3,
 };
 
-const char* native_graph_name(NativeGraphKind kind);
+const char* backend_graph_name(GraphKind kind);
 
-modalities::Status capture_native_graph(
+modalities::Status capture_backend_graph(
     native::CudaGraphSet* graphs,
-    NativeGraphKind kind,
+    GraphKind kind,
     const NativeWorkspace& workspace,
     std::initializer_list<const char*> bindings,
     native::CudaGraphSet::RecordFn record,
@@ -46,7 +46,7 @@ modalities::Status capture_native_graph(
 modalities::Status copy_prompt_to_encoder(NativeWorkspace* workspace,
                                           void* stream);
 
-struct NativeRuntimeArtifacts {
+struct BackendArtifacts {
     const NativeWorkspaceBuffer* images = nullptr;
     const NativeWorkspaceBuffer* noise = nullptr;
     const NativeWorkspaceBuffer* encoder = nullptr;
@@ -57,24 +57,24 @@ struct NativeRuntimeArtifacts {
     const NativeDeviceWeight* embedding_table = nullptr;
 };
 
-modalities::Status resolve_native_runtime_artifacts(
+modalities::Status resolve_backend_artifacts(
     const NativeWorkspace& workspace,
     const NativeDeviceWeightStore& weights,
     NativeWeightDType embedding_dtype,
-    NativeRuntimeArtifacts* artifacts);
+    BackendArtifacts* artifacts);
 
-class NativeGraphRuntime {
+class BackendSession {
 public:
-    virtual ~NativeGraphRuntime() = default;
+    virtual ~BackendSession() = default;
 
     virtual frt_ctx context() const = 0;
-    virtual frt_graph graph(NativeGraphKind kind) const = 0;
-    frt_graph infer_graph() const { return graph(NativeGraphKind::kInfer); }
+    virtual frt_graph graph(GraphKind kind) const = 0;
+    frt_graph infer_graph() const { return graph(GraphKind::kInfer); }
     virtual int stream_id() const = 0;
     virtual void* native_stream() const = 0;
-    virtual const NativeRuntimeArtifacts& artifacts() const = 0;
+    virtual const BackendArtifacts& artifacts() const = 0;
     virtual modalities::Status set_prompt_length(int prompt_tokens) = 0;
-    virtual int replay(NativeGraphKind kind = NativeGraphKind::kInfer) const = 0;
+    virtual int replay(GraphKind kind = GraphKind::kInfer) const = 0;
     virtual modalities::Status synchronize() const = 0;
 };
 
@@ -82,4 +82,4 @@ public:
 }  // namespace models
 }  // namespace flashrt
 
-#endif  // FLASHRT_CPP_MODELS_PI05_NATIVE_GRAPH_RUNTIME_H
+#endif  // FLASHRT_CPP_MODELS_PI05_BACKEND_SESSION_H

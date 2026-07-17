@@ -1,4 +1,4 @@
-#include "flashrt/cpp/models/pi05/backend/native_graph_runtime.h"
+#include "flashrt/cpp/models/pi05/backend/session.h"
 
 #include "flashrt/cpp/models/pi05/model/spec.h"
 
@@ -23,24 +23,24 @@ modalities::Status backend(const char* message) {
 
 }  // namespace
 
-const char* native_graph_name(NativeGraphKind kind) {
+const char* backend_graph_name(GraphKind kind) {
     switch (kind) {
-        case NativeGraphKind::kInfer: return "infer";
-        case NativeGraphKind::kDecodeOnly: return "decode_only";
-        case NativeGraphKind::kContext: return "context";
-        case NativeGraphKind::kCount: break;
+        case GraphKind::kInfer: return "infer";
+        case GraphKind::kDecodeOnly: return "decode_only";
+        case GraphKind::kContext: return "context";
+        case GraphKind::kCount: break;
     }
     return nullptr;
 }
 
-modalities::Status capture_native_graph(
+modalities::Status capture_backend_graph(
     native::CudaGraphSet* graphs,
-    NativeGraphKind kind,
+    GraphKind kind,
     const NativeWorkspace& workspace,
     std::initializer_list<const char*> bindings,
     native::CudaGraphSet::RecordFn record,
     void* owner) {
-    if (!graphs || !native_graph_name(kind)) {
+    if (!graphs || !backend_graph_name(kind)) {
         return invalid("native graph capture request is invalid");
     }
     std::vector<native::CudaGraphBinding> resolved;
@@ -53,7 +53,7 @@ modalities::Status capture_native_graph(
         resolved.push_back({binding, buffer->buffer});
     }
     return graphs->capture(static_cast<std::size_t>(kind),
-                           native_graph_name(kind), resolved, record, owner);
+                           backend_graph_name(kind), resolved, record, owner);
 }
 
 modalities::Status copy_prompt_to_encoder(NativeWorkspace* workspace,
@@ -81,15 +81,15 @@ modalities::Status copy_prompt_to_encoder(NativeWorkspace* workspace,
                : backend("native prompt graph copy failed");
 }
 
-modalities::Status resolve_native_runtime_artifacts(
+modalities::Status resolve_backend_artifacts(
     const NativeWorkspace& workspace,
     const NativeDeviceWeightStore& weights,
     NativeWeightDType embedding_dtype,
-    NativeRuntimeArtifacts* artifacts) {
+    BackendArtifacts* artifacts) {
     if (!artifacts) {
         return invalid("native runtime artifacts destination is null");
     }
-    NativeRuntimeArtifacts result;
+    BackendArtifacts result;
     result.images = workspace.find("observation_images_normalized");
     result.noise = workspace.find("diffusion_noise");
     result.encoder = workspace.find("encoder_x");
