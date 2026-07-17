@@ -596,8 +596,8 @@ both runs. Raw and robot action outputs must each reach cosine 0.9999 against
 the official FP32 residual path. Separately, the STAGED `actions` bytes must
 match q01/q99 postprocess recomputed from the native BF16 `actions_raw` window
 at `rtol=atol=1e-6`; this keeps numerical precision and IO semantics as two
-independent acceptance checks. Set `OPENPI_BASELINE_SITE_PACKAGES` when the
-official OpenPI Transformers replacement is installed in a separate prefix.
+independent acceptance checks. Run the gate against the official OpenPI
+reference; the external validation suite documents reference dependency setup.
 
 Collect replay-only native and Python BF16 Nsight traces with the same fixed
 shape. Setup, graph capture, prompt/image/noise staging, and output copies must

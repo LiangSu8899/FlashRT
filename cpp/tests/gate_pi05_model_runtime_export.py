@@ -1,11 +1,8 @@
 """Gate a real Pi0.5 export through the generic frt_model_runtime_v1 face.
 
-Run inside the CUDA container from the repo root:
-
-    FLASHRT_BUILD_DIR=cpp/build-sm120-debug \
-    python cpp/tests/gate_pi05_model_runtime_export.py \
-      --checkpoint "${PI05_CHECKPOINT:-/path/to/pi05_libero_pytorch}" --fp8 \
-      --lib cpp/build-sm120-debug/libflashrt_cpp_pi05_c.so
+Run from the repository root with the matching producer build, checkpoint,
+and optional ``--fp8`` flag. The producer library and Python extension used by
+the comparison must come from the same source revision.
 
 The gate compares three surfaces:
   1. Python frontend staging/replay/postprocess.
