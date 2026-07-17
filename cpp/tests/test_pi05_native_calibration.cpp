@@ -1,5 +1,5 @@
-#include "flashrt/cpp/models/pi05/native_calibration.h"
-#include "flashrt/cpp/models/pi05/native_calibration_session.h"
+#include "flashrt/cpp/models/pi05/support/native_calibration.h"
+#include "flashrt/cpp/models/pi05/backend/native_calibration_session.h"
 
 #include <cassert>
 #include <cmath>

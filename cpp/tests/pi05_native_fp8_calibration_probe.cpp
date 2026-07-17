@@ -1,7 +1,7 @@
 #include "flashrt/model_runtime.h"
 #include "flashrt/cpp/modalities/types.h"
 #include "flashrt/cpp/models/pi05/c_api.h"
-#include "flashrt/cpp/models/pi05/native_calibration.h"
+#include "flashrt/cpp/models/pi05/support/native_calibration.h"
 
 #include <cuda_runtime_api.h>
 

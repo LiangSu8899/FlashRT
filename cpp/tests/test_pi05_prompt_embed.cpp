@@ -1,4 +1,4 @@
-#include "flashrt/cpp/models/pi05/prompt_embed.h"
+#include "flashrt/cpp/models/pi05/model/prompt_embed.h"
 
 #ifdef FLASHRT_CPP_WITH_CUDA_STAGING
 #include <cuda_runtime_api.h>

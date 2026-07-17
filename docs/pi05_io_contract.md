@@ -29,9 +29,9 @@ Current source of truth:
 
 - Export declaration: `flash_rt/models/pi05/runtime_export.py`,
   `export_model_runtime(..., io="native")`
-- Native verb implementation: `cpp/models/pi05/src/model_runtime.cpp`
-- C++ modality binding: `cpp/models/pi05/src/runtime.cpp`,
-  `cpp/models/pi05/src/io.cpp`, `cpp/models/pi05/src/spec.cpp`
+- Native verb implementation: `cpp/models/pi05/src/service/model_runtime.cpp`
+- C++ modality binding: `cpp/models/pi05/src/model/runtime.cpp`,
+  `cpp/models/pi05/src/model/io.cpp`, `cpp/models/pi05/src/model/spec.cpp`
 
 `io="native"` and `io="native_v2"` are declaration-only handoffs. Their
 discovery manifest carries `declaration_only: true`; callers must pass them to

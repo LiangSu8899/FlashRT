@@ -1,7 +1,7 @@
 #include "flashrt/cpp/modalities/action.h"
 #include "flashrt/cpp/modalities/text.h"
 #include "flashrt/cpp/modalities/vision.h"
-#include "flashrt/cpp/models/pi05/spec.h"
+#include "flashrt/cpp/models/pi05/model/spec.h"
 
 #include <cuda_runtime_api.h>
 

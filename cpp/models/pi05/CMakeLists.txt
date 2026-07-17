@@ -9,28 +9,28 @@ set(_pi05_public_include "${CMAKE_CURRENT_SOURCE_DIR}/include")
 set(_pi05_internal_include "${CMAKE_CURRENT_SOURCE_DIR}/internal/include")
 
 set(_pi05_sources
-  src/spec.cpp
-  src/native_weights.cpp
-  src/native_weight_ops.cpp
-  src/native_device_weights.cpp
-  src/native_weight_packer.cpp
-  src/native_weight_materializer.cpp
-  src/native_calibration.cpp
-  src/native_calibration_session.cpp
-  src/native_workspace.cpp
-  src/native_rtx_attention.cpp
-  src/prompt_format.cpp
-  src/prompt_embed.cpp
-  src/io.cpp
-  src/runtime.cpp)
+  src/model/spec.cpp
+  src/model/prompt_format.cpp
+  src/model/prompt_embed.cpp
+  src/model/io.cpp
+  src/model/runtime.cpp
+  src/support/native_weights.cpp
+  src/support/native_weight_ops.cpp
+  src/support/native_device_weights.cpp
+  src/support/native_weight_packer.cpp
+  src/support/native_weight_materializer.cpp
+  src/support/native_calibration.cpp
+  src/support/native_workspace.cpp
+  src/backend/native_calibration_session.cpp
+  src/backends/sm120/native_rtx_attention.cpp)
 if(FLASHRT_CPP_WITH_CUDA_KERNELS)
   list(APPEND _pi05_sources
-    src/native_quantization.cu
-    src/native_rope.cu)
+    src/support/native_quantization.cu
+    src/support/native_rope.cu)
 else()
   list(APPEND _pi05_sources
-    src/native_quantization_unavailable.cpp
-    src/native_rope_unavailable.cpp)
+    src/support/native_quantization_unavailable.cpp
+    src/support/native_rope_unavailable.cpp)
 endif()
 
 add_library(flashrt_cpp_pi05 STATIC ${_pi05_sources})
@@ -41,18 +41,18 @@ target_link_libraries(flashrt_cpp_pi05
   PUBLIC flashrt_cpp_modalities flashrt_cpp_vla flashrt_cpp_loader)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   # Preserve producer-side add/cast/multiply operation boundaries.
-  set_property(SOURCE src/native_weight_ops.cpp APPEND PROPERTY
+  set_property(SOURCE src/support/native_weight_ops.cpp APPEND PROPERTY
     COMPILE_OPTIONS -ffp-contract=off)
 endif()
 
 if(FLASHRT_CPP_WITH_CUDA_KERNELS)
   add_library(flashrt_cpp_pi05_kernels STATIC
-    src/native_bf16_forward.cpp
-    src/native_graph_runtime.cpp
-    src/native_kernel_driver.cu
-    src/native_rtx_linear.cpp
-    src/native_rtx_weight_packer.cpp
-    src/native_style_precompute.cu
+    src/backend/native_graph_runtime.cpp
+    src/backends/sm120/native_bf16_forward.cpp
+    src/backends/sm120/native_kernel_driver.cu
+    src/backends/sm120/native_rtx_linear.cpp
+    src/backends/sm120/native_rtx_weight_packer.cpp
+    src/backends/sm120/native_style_precompute.cu
     ${FLASHRT_CPP_SOURCE_DIR}/../csrc/gemm/gemm_runner.cu
     ${FLASHRT_CPP_SOURCE_DIR}/../csrc/kernels/activation.cu
     ${FLASHRT_CPP_SOURCE_DIR}/../csrc/kernels/dit_bf16.cu
@@ -80,7 +80,7 @@ if(FLASHRT_CPP_WITH_CUDA_KERNELS)
 
   if(FLASHRT_CPP_WITH_THOR_FP8)
     add_library(flashrt_cpp_pi05_thor_precise OBJECT
-      src/native_thor_setup_ops.cu
+      src/backends/sm110/native_thor_setup_ops.cu
       ${FLASHRT_CPP_SOURCE_DIR}/../csrc/attention/fmha_fp16_strided.cu)
     target_include_directories(flashrt_cpp_pi05_thor_precise PRIVATE
       ${FLASHRT_CPP_SOURCE_DIR}/../csrc/attention
@@ -98,12 +98,12 @@ if(FLASHRT_CPP_WITH_CUDA_KERNELS)
 
     target_sources(flashrt_cpp_pi05_kernels PRIVATE
       $<TARGET_OBJECTS:flashrt_cpp_pi05_thor_precise>
-      src/native_thor_kernel_driver.cu
-      src/native_thor_weight_materializer.cpp
-      src/native_thor_fp8_forward.cpp
-      src/native_thor_graph_owner.cpp
-      src/native_thor_calibration_session.cpp
-      src/native_thor_style_precompute.cpp
+      src/backends/sm110/native_thor_kernel_driver.cu
+      src/backends/sm110/native_thor_weight_materializer.cpp
+      src/backends/sm110/native_thor_fp8_forward.cpp
+      src/backends/sm110/native_thor_graph_owner.cpp
+      src/backends/sm110/native_thor_calibration_session.cpp
+      src/backends/sm110/native_thor_style_precompute.cpp
       ${FLASHRT_CPP_SOURCE_DIR}/../csrc/gemm/cutlass_sm100.cu
       ${FLASHRT_CPP_SOURCE_DIR}/../csrc/kernels/attention_cublas.cu
       ${FLASHRT_CPP_SOURCE_DIR}/../csrc/kernels/decoder_fused.cu
@@ -126,12 +126,12 @@ if(FLASHRT_CPP_WITH_CUDA_KERNELS)
 
   if(FLASHRT_CPP_WITH_FA2)
     target_sources(flashrt_cpp_pi05_kernels PRIVATE
-      src/native_graph_owner.cpp
-      src/native_rtx_autotune.cpp
-      src/native_rtx_attention_driver.cu)
+      src/backends/sm120/native_graph_owner.cpp
+      src/backends/sm120/native_rtx_autotune.cpp
+      src/backends/sm120/native_rtx_attention_driver.cu)
     if(FLASHRT_CPP_WITH_SENTENCEPIECE)
       target_sources(flashrt_cpp_pi05_kernels PRIVATE
-        src/native_rtx_calibration_session.cpp)
+        src/backends/sm120/native_rtx_calibration_session.cpp)
     endif()
     target_include_directories(flashrt_cpp_pi05_kernels PRIVATE
       ${FLASHRT_CPP_SOURCE_DIR}/../csrc)
@@ -143,11 +143,11 @@ if(FLASHRT_CPP_WITH_CUDA_KERNELS)
 endif()
 
 add_library(flashrt_cpp_pi05_c SHARED
-  src/c_api.cpp
-  src/model_runtime.cpp
-  src/native_calibration_c_api.cpp
-  src/native_model_runtime.cpp
-  src/native_open.cpp)
+  src/service/c_api.cpp
+  src/service/model_runtime.cpp
+  src/service/native_calibration_c_api.cpp
+  src/service/native_model_runtime.cpp
+  src/service/native_open.cpp)
 target_link_libraries(flashrt_cpp_pi05_c
   PUBLIC flashrt_cpp_pi05 flashrt_runtime
   PRIVATE flashrt_cpp_native)

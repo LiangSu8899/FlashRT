@@ -1,5 +1,5 @@
 #include "flashrt/model_runtime.h"
-#include "flashrt/cpp/models/pi05/native_weights.h"
+#include "flashrt/cpp/models/pi05/support/native_weights.h"
 
 #include <algorithm>
 #include <cassert>

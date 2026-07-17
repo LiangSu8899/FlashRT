@@ -1,4 +1,4 @@
-#include "flashrt/cpp/models/pi05/runtime.h"
+#include "flashrt/cpp/models/pi05/model/runtime.h"
 
 #include <cassert>
 #include <cmath>

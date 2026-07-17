@@ -1,4 +1,4 @@
-#include "flashrt/cpp/models/pi05/prompt_format.h"
+#include "flashrt/cpp/models/pi05/model/prompt_format.h"
 
 #include <cassert>
 #include <cmath>
