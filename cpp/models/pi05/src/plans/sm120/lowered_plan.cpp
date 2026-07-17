@@ -365,22 +365,49 @@ modalities::Status Sm120LoweredPlan::initialize(
     return modalities::Status::ok();
 }
 
-modalities::Status Sm120LoweredPlan::record_vision(void* stream) {
-    return forward_.vision(
+modalities::Status Sm120LoweredPlan::record_vision_begin(void* stream) {
+    return forward_.vision_begin(
         weights_, &workspace_, &attention_, attention_driver_.get(),
         reinterpret_cast<std::uintptr_t>(stream));
 }
 
-modalities::Status Sm120LoweredPlan::record_encoder(void* stream) {
-    return forward_.encoder(weights_, &workspace_, &attention_,
-                            attention_driver_.get(),
-                            reinterpret_cast<std::uintptr_t>(stream));
+modalities::Status Sm120LoweredPlan::record_vision_layer(
+    int layer, void* stream) {
+    return forward_.vision_layer(
+        layer, weights_, &workspace_, &attention_, attention_driver_.get(),
+        reinterpret_cast<std::uintptr_t>(stream));
 }
 
-modalities::Status Sm120LoweredPlan::record_diffusion_step(
-    int step,
-    void* stream) {
-    return forward_.diffusion_step(
+modalities::Status Sm120LoweredPlan::record_vision_end(void* stream) {
+    return forward_.vision_end(
+        weights_, &workspace_, &attention_, attention_driver_.get(),
+        reinterpret_cast<std::uintptr_t>(stream));
+}
+
+modalities::Status Sm120LoweredPlan::record_encoder_layer(
+    int layer, void* stream) {
+    return forward_.encoder_layer(
+        layer, weights_, &workspace_, &attention_, attention_driver_.get(),
+        reinterpret_cast<std::uintptr_t>(stream));
+}
+
+modalities::Status Sm120LoweredPlan::record_diffusion_begin(
+    int step, void* stream) {
+    return forward_.diffusion_begin(
+        step, weights_, &workspace_, &attention_, attention_driver_.get(),
+        reinterpret_cast<std::uintptr_t>(stream));
+}
+
+modalities::Status Sm120LoweredPlan::record_decoder_layer(
+    int step, int layer, void* stream) {
+    return forward_.decoder_layer(
+        layer, step, weights_, &workspace_, &attention_,
+        attention_driver_.get(), reinterpret_cast<std::uintptr_t>(stream));
+}
+
+modalities::Status Sm120LoweredPlan::record_diffusion_end(
+    int step, void* stream) {
+    return forward_.diffusion_end(
         step, weights_, &workspace_, &attention_, attention_driver_.get(),
         reinterpret_cast<std::uintptr_t>(stream));
 }

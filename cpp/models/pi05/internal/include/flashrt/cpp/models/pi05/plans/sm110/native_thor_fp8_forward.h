@@ -17,20 +17,35 @@ public:
     explicit NativeThorFp8Forward(const NativeThorKernelDriver* driver)
         : driver_(driver) {}
 
-    modalities::Status vision(const NativeDeviceWeightStore& weights,
-                              NativeWorkspace* workspace,
-                              const NativeThorWeightScales& weight_scales,
-                              std::uintptr_t stream) const;
-    modalities::Status encoder(
+    modalities::Status vision_begin(
         const NativeDeviceWeightStore& weights,
+        NativeWorkspace* workspace,
+        std::uintptr_t stream) const;
+    modalities::Status vision_layer(
+        int layer,
+        const NativeDeviceWeightStore& weights,
+        NativeWorkspace* workspace,
+        const NativeThorWeightScales& weight_scales,
+        std::uintptr_t stream) const;
+    modalities::Status vision_end(
+        const NativeDeviceWeightStore& weights,
+        NativeWorkspace* workspace,
+        std::uintptr_t stream) const;
+    modalities::Status encoder_layer(
+        int layer, const NativeDeviceWeightStore& weights,
         NativeWorkspace* workspace,
         const std::vector<float>& activation_weight_alphas,
         std::uintptr_t stream) const;
-    modalities::Status diffusion_step(
-        int step,
-        const NativeDeviceWeightStore& weights,
+    modalities::Status diffusion_begin(
+        int step, const NativeDeviceWeightStore& weights,
         NativeWorkspace* workspace,
         std::uintptr_t stream) const;
+    modalities::Status decoder_layer(
+        int step, int layer, const NativeDeviceWeightStore& weights,
+        NativeWorkspace* workspace, std::uintptr_t stream) const;
+    modalities::Status diffusion_end(
+        int step, const NativeDeviceWeightStore& weights,
+        NativeWorkspace* workspace, std::uintptr_t stream) const;
 
     modalities::Status calibrate_encoder(
         const NativeDeviceWeightStore& weights,

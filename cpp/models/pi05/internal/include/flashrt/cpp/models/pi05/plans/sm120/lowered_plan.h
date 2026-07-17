@@ -52,10 +52,16 @@ private:
     modalities::Status initialize(
         const std::string& checkpoint_path,
         const NativeCalibrationArtifact* calibration);
-    modalities::Status record_vision(void* stream) override;
-    modalities::Status record_encoder(void* stream) override;
-    modalities::Status record_diffusion_step(int step,
+    modalities::Status record_vision_begin(void* stream) override;
+    modalities::Status record_vision_layer(int layer, void* stream) override;
+    modalities::Status record_vision_end(void* stream) override;
+    modalities::Status record_encoder_layer(int layer, void* stream) override;
+    modalities::Status record_diffusion_begin(int step,
                                               void* stream) override;
+    modalities::Status record_decoder_layer(int step, int layer,
+                                            void* stream) override;
+    modalities::Status record_diffusion_end(int step,
+                                            void* stream) override;
 
     NativeDeviceWeightStore weights_;
     NativeWorkspace workspace_;

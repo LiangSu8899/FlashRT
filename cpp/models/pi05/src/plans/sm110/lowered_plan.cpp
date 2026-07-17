@@ -319,22 +319,47 @@ modalities::Status Sm110LoweredPlan::initialize(
     return modalities::Status::ok();
 }
 
-modalities::Status Sm110LoweredPlan::record_vision(void* stream) {
-    return forward_.vision(
-        weights_, &workspace_, weight_scales_,
+modalities::Status Sm110LoweredPlan::record_vision_begin(void* stream) {
+    return forward_.vision_begin(
+        weights_, &workspace_, reinterpret_cast<std::uintptr_t>(stream));
+}
+
+modalities::Status Sm110LoweredPlan::record_vision_layer(
+    int layer, void* stream) {
+    return forward_.vision_layer(
+        layer, weights_, &workspace_, weight_scales_,
         reinterpret_cast<std::uintptr_t>(stream));
 }
 
-modalities::Status Sm110LoweredPlan::record_encoder(void* stream) {
-    return forward_.encoder(
-        weights_, &workspace_, encoder_alphas_,
+modalities::Status Sm110LoweredPlan::record_vision_end(void* stream) {
+    return forward_.vision_end(
+        weights_, &workspace_, reinterpret_cast<std::uintptr_t>(stream));
+}
+
+modalities::Status Sm110LoweredPlan::record_encoder_layer(
+    int layer, void* stream) {
+    return forward_.encoder_layer(
+        layer, weights_, &workspace_, encoder_alphas_,
         reinterpret_cast<std::uintptr_t>(stream));
 }
 
-modalities::Status Sm110LoweredPlan::record_diffusion_step(
-    int step,
-    void* stream) {
-    return forward_.diffusion_step(
+modalities::Status Sm110LoweredPlan::record_diffusion_begin(
+    int step, void* stream) {
+    return forward_.diffusion_begin(
+        step, weights_, &workspace_,
+        reinterpret_cast<std::uintptr_t>(stream));
+}
+
+modalities::Status Sm110LoweredPlan::record_decoder_layer(
+    int step, int layer, void* stream) {
+    return forward_.decoder_layer(
+        step, layer, weights_, &workspace_,
+        reinterpret_cast<std::uintptr_t>(stream));
+}
+
+modalities::Status Sm110LoweredPlan::record_diffusion_end(
+    int step, void* stream) {
+    return forward_.diffusion_end(
         step, weights_, &workspace_,
         reinterpret_cast<std::uintptr_t>(stream));
 }

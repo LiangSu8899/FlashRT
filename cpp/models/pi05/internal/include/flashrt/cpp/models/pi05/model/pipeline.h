@@ -88,14 +88,25 @@ protected:
     modalities::Status finish_prepare(bool warmup_before_capture);
     virtual NativeWorkspace& workspace() = 0;
     virtual const NativeWorkspace& workspace() const = 0;
-    virtual modalities::Status record_vision(void* stream) = 0;
-    virtual modalities::Status record_encoder(void* stream) = 0;
-    virtual modalities::Status record_diffusion_step(int step,
+    virtual modalities::Status record_vision_begin(void* stream) = 0;
+    virtual modalities::Status record_vision_layer(int layer,
+                                                   void* stream) = 0;
+    virtual modalities::Status record_vision_end(void* stream) = 0;
+    virtual modalities::Status record_encoder_layer(int layer,
+                                                    void* stream) = 0;
+    virtual modalities::Status record_diffusion_begin(int step,
                                                       void* stream) = 0;
+    virtual modalities::Status record_decoder_layer(int step, int layer,
+                                                    void* stream) = 0;
+    virtual modalities::Status record_diffusion_end(int step,
+                                                    void* stream) = 0;
 
 private:
     modalities::Status initialize_capture_inputs();
     modalities::Status record(GraphKind kind, void* stream);
+    modalities::Status record_vision(void* stream);
+    modalities::Status record_encoder(void* stream);
+    modalities::Status record_diffusion_step(int step, void* stream);
     modalities::Status record_context(void* stream);
     modalities::Status record_decode(void* stream);
     static modalities::Status record_graph(

@@ -1,4 +1,5 @@
 #include "flashrt/cpp/models/pi05/plans/sm110/native_thor_fp8_forward.h"
+#include "flashrt/cpp/models/pi05/model/spec.h"
 
 #include <cuda_runtime_api.h>
 
@@ -16,7 +17,6 @@ constexpr int kVisionWidth = 1152;
 constexpr int kVisionHidden = 4304;
 constexpr int kVisionHeads = 16;
 constexpr int kVisionHeadDimension = 72;
-constexpr int kEncoderWidth = 2048;
 constexpr int kEncoderHidden = 16384;
 constexpr int kDecoderWidth = 1024;
 constexpr int kDecoderHidden = 4096;
@@ -119,14 +119,12 @@ modalities::Status measure_scale(
 
 }  // namespace
 
-modalities::Status NativeThorFp8Forward::vision(
+modalities::Status NativeThorFp8Forward::vision_begin(
     const NativeDeviceWeightStore& weights,
     NativeWorkspace* workspace,
-    const NativeThorWeightScales& weight_scales,
     std::uintptr_t stream) const {
     if (!driver_ || !driver_->status().ok_status() || !workspace ||
-        workspace->activation_dtype() != modalities::DType::kFloat16 ||
-        weight_scales.vision.size() != 27 * 4) {
+        workspace->activation_dtype() != modalities::DType::kFloat16) {
         return invalid("Thor vision forward owner is invalid");
     }
     const std::uint64_t sequence = workspace->vision_sequence();
@@ -140,6 +138,45 @@ modalities::Status NativeThorFp8Forward::vision(
     const NativeWorkspaceBuffer* position = buffer(
         *workspace, "vision_pos_embed_expanded",
         modalities::DType::kFloat16, {sequence, kVisionWidth});
+    const NativeWorkspaceBuffer* x = buffer(
+        *workspace, "vision_x", modalities::DType::kFloat16,
+        {sequence, kVisionWidth});
+    const NativeDeviceWeight* patch_w = weight(
+        weights, "vision_patch_embedding_w", NativeWeightDType::kFloat16,
+        {14, 14, 3, kVisionWidth});
+    const NativeDeviceWeight* patch_b = weight(
+        weights, "vision_patch_embedding_b", NativeWeightDType::kFloat16,
+        {kVisionWidth});
+    if (!images || !patches || !position || !x || !patch_w || !patch_b) {
+        return invalid("Thor vision input buffers or weights are incomplete");
+    }
+    modalities::Status st = driver_->patch_im2col_fp16(
+        dptr(images), dptr(patches), static_cast<int>(views), stream);
+    if (!st.ok_status()) return st;
+    st = driver_->fp16_nn(
+        dptr(patches), dptr(patch_w), dptr(x),
+        static_cast<int>(sequence), kVisionWidth, 588, stream);
+    if (!st.ok_status()) return st;
+    return driver_->patch_bias_position_fp16(
+        dptr(x), dptr(patch_b), dptr(position), static_cast<int>(sequence),
+        kVisionWidth, 256, stream);
+}
+
+modalities::Status NativeThorFp8Forward::vision_layer(
+    int layer,
+    const NativeDeviceWeightStore& weights,
+    NativeWorkspace* workspace,
+    const NativeThorWeightScales& weight_scales,
+    std::uintptr_t stream) const {
+    if (layer < 0 || layer >= kVisionLayers || !driver_ ||
+        !driver_->status().ok_status() || !workspace ||
+        workspace->activation_dtype() != modalities::DType::kFloat16 ||
+        weight_scales.vision.size() !=
+            static_cast<std::size_t>(kVisionLayers) * 4) {
+        return invalid("Thor vision layer owner is invalid");
+    }
+    const std::uint64_t sequence = workspace->vision_sequence();
+    const std::uint64_t views = workspace->num_views();
     const NativeWorkspaceBuffer* x = buffer(
         *workspace, "vision_x", modalities::DType::kFloat16,
         {sequence, kVisionWidth});
@@ -160,125 +197,114 @@ modalities::Status NativeThorFp8Forward::vision(
         {sequence, kVisionHidden});
     const NativeWorkspaceBuffer* unit_scale = buffer(
         *workspace, "vision_unit_scale", modalities::DType::kFloat32, {1});
+    const std::string suffix = std::to_string(layer);
+    const NativeDeviceWeight* ln_attn_w = weight(
+        weights, "vision_pre_attn_norm_w_" + suffix,
+        NativeWeightDType::kFloat16, {kVisionWidth});
+    const NativeDeviceWeight* ln_attn_b = weight(
+        weights, "vision_pre_attn_norm_b_" + suffix,
+        NativeWeightDType::kFloat16, {kVisionWidth});
+    const NativeDeviceWeight* qkv_w = weight(
+        weights, "vision_attn_qkv_w_" + suffix,
+        NativeWeightDType::kFp8E4M3, {kVisionWidth, 3 * kVisionWidth});
+    const NativeDeviceWeight* qkv_b = weight(
+        weights, "vision_attn_qkv_b_" + suffix,
+        NativeWeightDType::kFloat16, {3 * kVisionWidth});
+    const NativeDeviceWeight* o_w = weight(
+        weights, "vision_attn_o_w_" + suffix,
+        NativeWeightDType::kFp8E4M3, {kVisionWidth, kVisionWidth});
+    const NativeDeviceWeight* o_b = weight(
+        weights, "vision_attn_o_b_" + suffix,
+        NativeWeightDType::kFloat16, {kVisionWidth});
+    const NativeDeviceWeight* ln_ffn_w = weight(
+        weights, "vision_pre_ffn_norm_w_" + suffix,
+        NativeWeightDType::kFloat16, {kVisionWidth});
+    const NativeDeviceWeight* ln_ffn_b = weight(
+        weights, "vision_pre_ffn_norm_b_" + suffix,
+        NativeWeightDType::kFloat16, {kVisionWidth});
+    const NativeDeviceWeight* up_w = weight(
+        weights, "vision_ffn_up_w_" + suffix,
+        NativeWeightDType::kFp8E4M3, {kVisionWidth, kVisionHidden});
+    const NativeDeviceWeight* up_b = weight(
+        weights, "vision_ffn_up_b_" + suffix,
+        NativeWeightDType::kFloat16, {kVisionHidden});
+    const NativeDeviceWeight* down_w = weight(
+        weights, "vision_ffn_down_w_" + suffix,
+        NativeWeightDType::kFp8E4M3, {kVisionHidden, kVisionWidth});
+    const NativeDeviceWeight* down_b = weight(
+        weights, "vision_ffn_down_b_" + suffix,
+        NativeWeightDType::kFloat16, {kVisionWidth});
+    if (!x || !x_fp8 || !qkv || !attention || !hidden || !hidden_fp8 ||
+        !unit_scale || !ln_attn_w || !ln_attn_b || !qkv_w || !qkv_b ||
+        !o_w || !o_b || !ln_ffn_w || !ln_ffn_b || !up_w || !up_b ||
+        !down_w || !down_b) {
+        return invalid("Thor vision layer buffers or weights are incomplete");
+    }
+    const std::size_t scale = static_cast<std::size_t>(layer) * 4;
+    modalities::Status st = driver_->layer_norm_fp8(
+        dptr(x), dptr(x_fp8), dptr(ln_attn_w), dptr(ln_attn_b),
+        static_cast<int>(sequence), kVisionWidth, 1e-5f, stream);
+    if (!st.ok_status()) return st;
+    st = driver_->fp8_nn_bias(
+        dptr(x_fp8), dptr(qkv_w), dptr(qkv), dptr(qkv_b),
+        static_cast<int>(sequence), 3 * kVisionWidth, kVisionWidth,
+        weight_scales.vision[scale], stream);
+    if (!st.ok_status()) return st;
+    st = driver_->vision_fmha_fp16(
+        dptr(qkv), offset_bytes(dptr(qkv), kVisionWidth * 2),
+        offset_bytes(dptr(qkv), 2 * kVisionWidth * 2), dptr(attention),
+        static_cast<int>(views), 256, 256, kVisionHeads, kVisionHeads,
+        kVisionHeadDimension, 3 * kVisionWidth, 3 * kVisionWidth, stream);
+    if (!st.ok_status()) return st;
+    st = driver_->quantize_fp8_static(
+        dptr(attention), dptr(x_fp8),
+        static_cast<const float*>(dptr(unit_scale)),
+        sequence * kVisionWidth, stream);
+    if (!st.ok_status()) return st;
+    st = driver_->fp8_nn_bias_residual(
+        dptr(x_fp8), dptr(o_w), dptr(x), dptr(o_b),
+        static_cast<int>(sequence), kVisionWidth, kVisionWidth,
+        weight_scales.vision[scale + 1], stream);
+    if (!st.ok_status()) return st;
+    st = driver_->layer_norm_fp8(
+        dptr(x), dptr(x_fp8), dptr(ln_ffn_w), dptr(ln_ffn_b),
+        static_cast<int>(sequence), kVisionWidth, 1e-5f, stream);
+    if (!st.ok_status()) return st;
+    st = driver_->fp8_nn_gelu_bias(
+        dptr(x_fp8), dptr(up_w), dptr(hidden), dptr(up_b),
+        static_cast<int>(sequence), kVisionHidden, kVisionWidth,
+        weight_scales.vision[scale + 2], stream);
+    if (!st.ok_status()) return st;
+    st = driver_->quantize_fp8_static(
+        dptr(hidden), dptr(hidden_fp8),
+        static_cast<const float*>(dptr(unit_scale)),
+        sequence * kVisionHidden, stream);
+    if (!st.ok_status()) return st;
+    return driver_->fp8_nn_bias_residual(
+        dptr(hidden_fp8), dptr(down_w), dptr(x), dptr(down_b),
+        static_cast<int>(sequence), kVisionWidth, kVisionHidden,
+        weight_scales.vision[scale + 3], stream);
+}
+
+modalities::Status NativeThorFp8Forward::vision_end(
+    const NativeDeviceWeightStore& weights,
+    NativeWorkspace* workspace,
+    std::uintptr_t stream) const {
+    if (!driver_ || !driver_->status().ok_status() || !workspace ||
+        workspace->activation_dtype() != modalities::DType::kFloat16) {
+        return invalid("Thor vision forward owner is invalid");
+    }
+    const std::uint64_t sequence = workspace->vision_sequence();
+    const NativeWorkspaceBuffer* x = buffer(
+        *workspace, "vision_x", modalities::DType::kFloat16,
+        {sequence, kVisionWidth});
+    const NativeWorkspaceBuffer* attention = buffer(
+        *workspace, "vision_attn", modalities::DType::kFloat16,
+        {sequence, kVisionWidth});
     const NativeWorkspaceBuffer* encoder_x = buffer(
         *workspace, "encoder_x", modalities::DType::kFloat16,
         {static_cast<std::uint64_t>(workspace->encoder_sequence()),
          kEncoderWidth});
-    const NativeDeviceWeight* patch_w = weight(
-        weights, "vision_patch_embedding_w", NativeWeightDType::kFloat16,
-        {14, 14, 3, kVisionWidth});
-    const NativeDeviceWeight* patch_b = weight(
-        weights, "vision_patch_embedding_b", NativeWeightDType::kFloat16,
-        {kVisionWidth});
-    if (!images || !patches || !position || !x || !x_fp8 || !qkv ||
-        !attention || !hidden || !hidden_fp8 || !unit_scale || !encoder_x ||
-        !patch_w || !patch_b) {
-        return invalid("Thor vision buffers or weights are incomplete");
-    }
-
-    modalities::Status st = driver_->patch_im2col_fp16(
-        dptr(images), dptr(patches), static_cast<int>(views), stream);
-    if (!st.ok_status()) return st;
-    st = driver_->fp16_nn(dptr(patches), dptr(patch_w), dptr(x),
-                          static_cast<int>(sequence), kVisionWidth, 588,
-                          stream);
-    if (!st.ok_status()) return st;
-    st = driver_->patch_bias_position_fp16(
-        dptr(x), dptr(patch_b), dptr(position), static_cast<int>(sequence),
-        kVisionWidth, 256, stream);
-    if (!st.ok_status()) return st;
-
-    for (int layer = 0; layer < 27; ++layer) {
-        const std::string suffix = std::to_string(layer);
-        const NativeDeviceWeight* ln_attn_w = weight(
-            weights, "vision_pre_attn_norm_w_" + suffix,
-            NativeWeightDType::kFloat16, {kVisionWidth});
-        const NativeDeviceWeight* ln_attn_b = weight(
-            weights, "vision_pre_attn_norm_b_" + suffix,
-            NativeWeightDType::kFloat16, {kVisionWidth});
-        const NativeDeviceWeight* qkv_w = weight(
-            weights, "vision_attn_qkv_w_" + suffix,
-            NativeWeightDType::kFp8E4M3,
-            {kVisionWidth, 3 * kVisionWidth});
-        const NativeDeviceWeight* qkv_b = weight(
-            weights, "vision_attn_qkv_b_" + suffix,
-            NativeWeightDType::kFloat16, {3 * kVisionWidth});
-        const NativeDeviceWeight* o_w = weight(
-            weights, "vision_attn_o_w_" + suffix,
-            NativeWeightDType::kFp8E4M3, {kVisionWidth, kVisionWidth});
-        const NativeDeviceWeight* o_b = weight(
-            weights, "vision_attn_o_b_" + suffix,
-            NativeWeightDType::kFloat16, {kVisionWidth});
-        const NativeDeviceWeight* ln_ffn_w = weight(
-            weights, "vision_pre_ffn_norm_w_" + suffix,
-            NativeWeightDType::kFloat16, {kVisionWidth});
-        const NativeDeviceWeight* ln_ffn_b = weight(
-            weights, "vision_pre_ffn_norm_b_" + suffix,
-            NativeWeightDType::kFloat16, {kVisionWidth});
-        const NativeDeviceWeight* up_w = weight(
-            weights, "vision_ffn_up_w_" + suffix,
-            NativeWeightDType::kFp8E4M3, {kVisionWidth, kVisionHidden});
-        const NativeDeviceWeight* up_b = weight(
-            weights, "vision_ffn_up_b_" + suffix,
-            NativeWeightDType::kFloat16, {kVisionHidden});
-        const NativeDeviceWeight* down_w = weight(
-            weights, "vision_ffn_down_w_" + suffix,
-            NativeWeightDType::kFp8E4M3, {kVisionHidden, kVisionWidth});
-        const NativeDeviceWeight* down_b = weight(
-            weights, "vision_ffn_down_b_" + suffix,
-            NativeWeightDType::kFloat16, {kVisionWidth});
-        if (!ln_attn_w || !ln_attn_b || !qkv_w || !qkv_b || !o_w || !o_b ||
-            !ln_ffn_w || !ln_ffn_b || !up_w || !up_b || !down_w || !down_b) {
-            return invalid("Thor vision layer weights are incomplete");
-        }
-        const std::size_t scale = static_cast<std::size_t>(layer) * 4;
-        st = driver_->layer_norm_fp8(
-            dptr(x), dptr(x_fp8), dptr(ln_attn_w), dptr(ln_attn_b),
-            static_cast<int>(sequence), kVisionWidth, 1e-5f, stream);
-        if (!st.ok_status()) return st;
-        st = driver_->fp8_nn_bias(
-            dptr(x_fp8), dptr(qkv_w), dptr(qkv), dptr(qkv_b),
-            static_cast<int>(sequence), 3 * kVisionWidth, kVisionWidth,
-            weight_scales.vision[scale], stream);
-        if (!st.ok_status()) return st;
-        st = driver_->vision_fmha_fp16(
-            dptr(qkv), offset_bytes(dptr(qkv), kVisionWidth * 2),
-            offset_bytes(dptr(qkv), 2 * kVisionWidth * 2), dptr(attention),
-            static_cast<int>(views), 256, 256, kVisionHeads, kVisionHeads,
-            kVisionHeadDimension,
-            3 * kVisionWidth, 3 * kVisionWidth, stream);
-        if (!st.ok_status()) return st;
-        st = driver_->quantize_fp8_static(
-            dptr(attention), dptr(x_fp8),
-            static_cast<const float*>(dptr(unit_scale)),
-            sequence * kVisionWidth, stream);
-        if (!st.ok_status()) return st;
-        st = driver_->fp8_nn_bias_residual(
-            dptr(x_fp8), dptr(o_w), dptr(x), dptr(o_b),
-            static_cast<int>(sequence), kVisionWidth, kVisionWidth,
-            weight_scales.vision[scale + 1], stream);
-        if (!st.ok_status()) return st;
-        st = driver_->layer_norm_fp8(
-            dptr(x), dptr(x_fp8), dptr(ln_ffn_w), dptr(ln_ffn_b),
-            static_cast<int>(sequence), kVisionWidth, 1e-5f, stream);
-        if (!st.ok_status()) return st;
-        st = driver_->fp8_nn_gelu_bias(
-            dptr(x_fp8), dptr(up_w), dptr(hidden), dptr(up_b),
-            static_cast<int>(sequence), kVisionHidden, kVisionWidth,
-            weight_scales.vision[scale + 2], stream);
-        if (!st.ok_status()) return st;
-        st = driver_->quantize_fp8_static(
-            dptr(hidden), dptr(hidden_fp8),
-            static_cast<const float*>(dptr(unit_scale)),
-            sequence * kVisionHidden, stream);
-        if (!st.ok_status()) return st;
-        st = driver_->fp8_nn_bias_residual(
-            dptr(hidden_fp8), dptr(down_w), dptr(x), dptr(down_b),
-            static_cast<int>(sequence), kVisionWidth, kVisionHidden,
-            weight_scales.vision[scale + 3], stream);
-        if (!st.ok_status()) return st;
-    }
-
     const NativeDeviceWeight* final_w = weight(
         weights, "vision_final_norm_w", NativeWeightDType::kFloat16,
         {kVisionWidth});
@@ -291,10 +317,11 @@ modalities::Status NativeThorFp8Forward::vision(
     const NativeDeviceWeight* projector_b = weight(
         weights, "encoder_multi_modal_projector_b",
         NativeWeightDType::kFloat16, {kEncoderWidth});
-    if (!final_w || !final_b || !projector_w || !projector_b) {
-        return invalid("Thor vision projection weights are incomplete");
+    if (!x || !attention || !encoder_x || !final_w || !final_b ||
+        !projector_w || !projector_b) {
+        return invalid("Thor vision output buffers or weights are incomplete");
     }
-    st = driver_->layer_norm_fp16(
+    modalities::Status st = driver_->layer_norm_fp16(
         dptr(x), dptr(final_w), dptr(final_b), dptr(attention),
         static_cast<int>(sequence), kVisionWidth, 1e-6f, stream);
     if (!st.ok_status()) return st;
@@ -307,16 +334,19 @@ modalities::Status NativeThorFp8Forward::vision(
         kEncoderWidth, stream);
 }
 
-modalities::Status NativeThorFp8Forward::encoder(
+modalities::Status NativeThorFp8Forward::encoder_layer(
+    int layer,
     const NativeDeviceWeightStore& weights,
     NativeWorkspace* workspace,
     const std::vector<float>& activation_weight_alphas,
     std::uintptr_t stream) const {
-    if (!driver_ || !driver_->status().ok_status() || !workspace ||
+    if (layer < 0 || layer >= kLayers || !driver_ ||
+        !driver_->status().ok_status() || !workspace ||
         workspace->activation_dtype() != modalities::DType::kFloat16 ||
         activation_weight_alphas.size() != kLayers * 4) {
-        return invalid("Thor encoder forward owner is invalid");
+        return invalid("Thor encoder layer owner is invalid");
     }
+
     const std::uint64_t sequence = workspace->encoder_sequence();
     const std::uint64_t keys = workspace->total_keys();
     const NativeWorkspaceBuffer* x = buffer(
@@ -370,92 +400,90 @@ modalities::Status NativeThorFp8Forward::encoder(
     const float attention_scale =
         1.0f / std::sqrt(static_cast<float>(kHeadDimension));
     const std::size_t cache_layer_elements = keys * kHeadDimension;
-    for (int layer = 0; layer < kLayers; ++layer) {
-        const std::string suffix = std::to_string(layer);
-        const NativeDeviceWeight* qkv_w = weight(
-            weights, "encoder_attn_qkv_w_" + suffix,
-            NativeWeightDType::kFp8E4M3, {2560, kEncoderWidth});
-        if (!qkv_w) return invalid("Thor encoder QKV weight is invalid");
-        const std::size_t scale = static_cast<std::size_t>(layer) * 4;
-        modalities::Status st = driver_->rms_norm_fp8_noweight(
-            dptr(x), dptr(x_fp8), static_cast<int>(sequence), kEncoderWidth,
-            scale_ptr(activation_scales, scale), stream);
-        if (!st.ok_status()) return st;
-        st = driver_->fp8_cutlass(
-            dptr(x_fp8), dptr(qkv_w), dptr(qkv), static_cast<int>(sequence),
-            2560, kEncoderWidth, activation_weight_alphas[scale], 0.0f,
-            NativeThorFp8Tactic::kSquare, stream);
-        if (!st.ok_status()) return st;
-        st = driver_->qkv_rope_cache_fp16(
-            dptr(qkv), dptr(rope), dptr(attention), dptr(key_cache),
-            dptr(value_cache), static_cast<int>(sequence), kEncoderWidth,
-            kHeadDimension, kHeadDimension, 2560,
-            static_cast<int>(scale / 4 * cache_layer_elements),
-            kHeadDimension, stream);
-        if (!st.ok_status() || layer == kLayers - 1) return st;
+    const std::string suffix = std::to_string(layer);
+    const NativeDeviceWeight* qkv_w = weight(
+        weights, "encoder_attn_qkv_w_" + suffix,
+        NativeWeightDType::kFp8E4M3, {2560, kEncoderWidth});
+    if (!qkv_w) return invalid("Thor encoder QKV weight is invalid");
+    const std::size_t scale = static_cast<std::size_t>(layer) * 4;
+    modalities::Status st = driver_->rms_norm_fp8_noweight(
+        dptr(x), dptr(x_fp8), static_cast<int>(sequence), kEncoderWidth,
+        scale_ptr(activation_scales, scale), stream);
+    if (!st.ok_status()) return st;
+    st = driver_->fp8_cutlass(
+        dptr(x_fp8), dptr(qkv_w), dptr(qkv), static_cast<int>(sequence),
+        2560, kEncoderWidth, activation_weight_alphas[scale], 0.0f,
+        NativeThorFp8Tactic::kSquare, stream);
+    if (!st.ok_status()) return st;
+    st = driver_->qkv_rope_cache_fp16(
+        dptr(qkv), dptr(rope), dptr(attention), dptr(key_cache),
+        dptr(value_cache), static_cast<int>(sequence), kEncoderWidth,
+        kHeadDimension, kHeadDimension, 2560,
+        static_cast<int>(scale / 4 * cache_layer_elements),
+        kHeadDimension, stream);
+    if (!st.ok_status() || layer == kLayers - 1) return st;
 
-        void* layer_key = offset_bytes(
-            dptr(key_cache), static_cast<std::size_t>(layer) *
-                                 cache_layer_elements * sizeof(std::uint16_t));
-        void* layer_value = offset_bytes(
-            dptr(value_cache), static_cast<std::size_t>(layer) *
-                                   cache_layer_elements * sizeof(std::uint16_t));
-        st = driver_->attention_seqused_fp16(
-            dptr(attention), layer_key, layer_value, dptr(logits),
-            dptr(attention), static_cast<int>(sequence),
-            static_cast<int>(sequence), kHeads, kHeadDimension,
-            static_cast<const int*>(dptr(valid_keys)), attention_scale, stream);
-        if (!st.ok_status()) return st;
+    void* layer_key = offset_bytes(
+        dptr(key_cache), static_cast<std::size_t>(layer) *
+                             cache_layer_elements * sizeof(std::uint16_t));
+    void* layer_value = offset_bytes(
+        dptr(value_cache), static_cast<std::size_t>(layer) *
+                               cache_layer_elements * sizeof(std::uint16_t));
+    st = driver_->attention_seqused_fp16(
+        dptr(attention), layer_key, layer_value, dptr(logits),
+        dptr(attention), static_cast<int>(sequence),
+        static_cast<int>(sequence), kHeads, kHeadDimension,
+        static_cast<const int*>(dptr(valid_keys)), attention_scale, stream);
+    if (!st.ok_status()) return st;
 
-        const NativeDeviceWeight* o_w = weight(
-            weights, "encoder_attn_o_w_" + suffix,
-            NativeWeightDType::kFp8E4M3, {kEncoderWidth, kEncoderWidth});
-        const NativeDeviceWeight* gate_w = weight(
-            weights, "encoder_ffn_gate_up_w_" + suffix,
-            NativeWeightDType::kFp8E4M3,
-            {2 * kEncoderHidden, kEncoderWidth});
-        const NativeDeviceWeight* down_w = weight(
-            weights, "encoder_ffn_down_w_" + suffix,
-            NativeWeightDType::kFp8E4M3,
-            {kEncoderWidth, kEncoderHidden});
-        if (!o_w || !gate_w || !down_w) {
-            return invalid("Thor encoder layer weights are incomplete");
-        }
-        st = driver_->quantize_fp8_static(
-            dptr(attention), dptr(o_fp8), scale_ptr(activation_scales, scale + 1),
-            sequence * kEncoderWidth, stream);
-        if (!st.ok_status()) return st;
-        st = driver_->fp8_cutlass(
-            dptr(o_fp8), dptr(o_w), dptr(fg), static_cast<int>(sequence),
-            kEncoderWidth, kEncoderWidth,
-            activation_weight_alphas[scale + 1], 0.0f,
-            NativeThorFp8Tactic::kSquare, stream);
-        if (!st.ok_status()) return st;
-        st = driver_->residual_rms_norm_fp8_noweight(
-            dptr(x), dptr(fg), dptr(x_fp8), static_cast<int>(sequence),
-            kEncoderWidth, scale_ptr(activation_scales, scale + 2), stream);
-        if (!st.ok_status()) return st;
-        st = driver_->fp8_cutlass(
-            dptr(x_fp8), dptr(gate_w), dptr(gate), static_cast<int>(sequence),
-            2 * kEncoderHidden, kEncoderWidth,
-            activation_weight_alphas[scale + 2], 0.0f,
-            NativeThorFp8Tactic::kT1, stream);
-        if (!st.ok_status()) return st;
-        st = driver_->gate_gelu_fp8(
-            dptr(gate), dptr(hidden_fp8), static_cast<int>(sequence),
-            kEncoderHidden, scale_ptr(activation_scales, scale + 3), stream);
-        if (!st.ok_status()) return st;
-        st = driver_->fp8_cutlass(
-            dptr(hidden_fp8), dptr(down_w), dptr(fg),
-            static_cast<int>(sequence), kEncoderWidth, kEncoderHidden,
-            activation_weight_alphas[scale + 3], 0.0f,
-            NativeThorFp8Tactic::kWide, stream);
-        if (!st.ok_status()) return st;
-        st = driver_->residual_add_fp16(
-            dptr(x), dptr(fg), sequence * kEncoderWidth, stream);
-        if (!st.ok_status()) return st;
+    const NativeDeviceWeight* o_w = weight(
+        weights, "encoder_attn_o_w_" + suffix,
+        NativeWeightDType::kFp8E4M3, {kEncoderWidth, kEncoderWidth});
+    const NativeDeviceWeight* gate_w = weight(
+        weights, "encoder_ffn_gate_up_w_" + suffix,
+        NativeWeightDType::kFp8E4M3,
+        {2 * kEncoderHidden, kEncoderWidth});
+    const NativeDeviceWeight* down_w = weight(
+        weights, "encoder_ffn_down_w_" + suffix,
+        NativeWeightDType::kFp8E4M3,
+        {kEncoderWidth, kEncoderHidden});
+    if (!o_w || !gate_w || !down_w) {
+        return invalid("Thor encoder layer weights are incomplete");
     }
-    return modalities::Status::ok();
+    st = driver_->quantize_fp8_static(
+        dptr(attention), dptr(o_fp8), scale_ptr(activation_scales, scale + 1),
+        sequence * kEncoderWidth, stream);
+    if (!st.ok_status()) return st;
+    st = driver_->fp8_cutlass(
+        dptr(o_fp8), dptr(o_w), dptr(fg), static_cast<int>(sequence),
+        kEncoderWidth, kEncoderWidth,
+        activation_weight_alphas[scale + 1], 0.0f,
+        NativeThorFp8Tactic::kSquare, stream);
+    if (!st.ok_status()) return st;
+    st = driver_->residual_rms_norm_fp8_noweight(
+        dptr(x), dptr(fg), dptr(x_fp8), static_cast<int>(sequence),
+        kEncoderWidth, scale_ptr(activation_scales, scale + 2), stream);
+    if (!st.ok_status()) return st;
+    st = driver_->fp8_cutlass(
+        dptr(x_fp8), dptr(gate_w), dptr(gate), static_cast<int>(sequence),
+        2 * kEncoderHidden, kEncoderWidth,
+        activation_weight_alphas[scale + 2], 0.0f,
+        NativeThorFp8Tactic::kT1, stream);
+    if (!st.ok_status()) return st;
+    st = driver_->gate_gelu_fp8(
+        dptr(gate), dptr(hidden_fp8), static_cast<int>(sequence),
+        kEncoderHidden, scale_ptr(activation_scales, scale + 3), stream);
+    if (!st.ok_status()) return st;
+    st = driver_->fp8_cutlass(
+        dptr(hidden_fp8), dptr(down_w), dptr(fg),
+        static_cast<int>(sequence), kEncoderWidth, kEncoderHidden,
+        activation_weight_alphas[scale + 3], 0.0f,
+        NativeThorFp8Tactic::kWide, stream);
+    if (!st.ok_status()) return st;
+    st = driver_->residual_add_fp16(
+        dptr(x), dptr(fg), sequence * kEncoderWidth, stream);
+    if (!st.ok_status()) return st;
+    return st;
 }
 
 modalities::Status NativeThorFp8Forward::calibrate_encoder(
@@ -1036,7 +1064,7 @@ modalities::Status NativeThorFp8Forward::calibrate_decoder(
                              : backend(cudaGetErrorString(rc));
 }
 
-modalities::Status NativeThorFp8Forward::diffusion_step(
+modalities::Status NativeThorFp8Forward::diffusion_begin(
     int step,
     const NativeDeviceWeightStore& weights,
     NativeWorkspace* workspace,
@@ -1047,15 +1075,50 @@ modalities::Status NativeThorFp8Forward::diffusion_step(
     }
     const std::uint64_t sequence = workspace->chunk_size();
     const std::uint64_t steps = workspace->num_steps();
-    const std::uint64_t keys = workspace->total_keys();
     const NativeWorkspaceBuffer* noise = buffer(
         *workspace, "diffusion_noise", modalities::DType::kFloat16,
         {sequence, 32});
     const NativeWorkspaceBuffer* x = buffer(
         *workspace, "decoder_x", modalities::DType::kFloat16,
         {sequence, kDecoderWidth});
-    const NativeWorkspaceBuffer* xn = buffer(
-        *workspace, "x_normed_buf", modalities::DType::kFloat16,
+    const NativeDeviceWeight* input_w = weight(
+        weights, "decoder_action_in_proj_w", NativeWeightDType::kFloat16,
+        {32, kDecoderWidth});
+    const NativeDeviceWeight* input_b = weight(
+        weights, "decoder_action_in_proj_b", NativeWeightDType::kFloat16,
+        {kDecoderWidth});
+    if (static_cast<std::uint64_t>(step) >= steps || !noise || !x ||
+        !input_w || !input_b) {
+        return invalid("Thor decoder input buffers or weights are incomplete");
+    }
+    modalities::Status st = driver_->gmm_fp16(
+        dptr(noise), dptr(input_w), dptr(x), static_cast<int>(sequence),
+        kDecoderWidth, 32, 0.0f, stream);
+    if (!st.ok_status()) return st;
+    return driver_->add_bias_fp16(
+        dptr(x), dptr(input_b), static_cast<int>(sequence),
+        kDecoderWidth, stream);
+}
+
+modalities::Status NativeThorFp8Forward::decoder_layer(
+    int step,
+    int layer,
+    const NativeDeviceWeightStore& weights,
+    NativeWorkspace* workspace,
+    std::uintptr_t stream) const {
+    if (step < 0 || layer < 0 || layer >= kDecoderLayers || !driver_ ||
+        !driver_->status().ok_status() || !workspace ||
+        workspace->activation_dtype() != modalities::DType::kFloat16) {
+        return invalid("Thor decoder layer owner is invalid");
+    }
+    const std::uint64_t sequence = workspace->chunk_size();
+    const std::uint64_t steps = workspace->num_steps();
+    const std::uint64_t keys = workspace->total_keys();
+    if (static_cast<std::uint64_t>(step) >= steps) {
+        return invalid("Thor diffusion step is out of range");
+    }
+    const NativeWorkspaceBuffer* x = buffer(
+        *workspace, "decoder_x", modalities::DType::kFloat16,
         {sequence, kDecoderWidth});
     const NativeWorkspaceBuffer* gate = buffer(
         *workspace, "gate_buf", modalities::DType::kFloat16,
@@ -1075,9 +1138,6 @@ modalities::Status NativeThorFp8Forward::diffusion_step(
     const NativeWorkspaceBuffer* fg = buffer(
         *workspace, "decoder_fg", modalities::DType::kFloat16,
         {sequence, 2 * kDecoderHidden});
-    const NativeWorkspaceBuffer* action_f32 = buffer(
-        *workspace, "decoder_action_f32", modalities::DType::kFloat32,
-        {sequence, 32});
     const NativeWorkspaceBuffer* xn_fp8 = buffer(
         *workspace, "decoder_x_fp8", modalities::DType::kUInt8,
         {sequence, kDecoderWidth});
@@ -1092,22 +1152,19 @@ modalities::Status NativeThorFp8Forward::diffusion_step(
         {sequence, kHeadDimension});
     const NativeWorkspaceBuffer* style_attn = buffer(
         *workspace, "decoder_style_attn", modalities::DType::kFloat16,
-        {steps, kLayers, sequence, 3 * kDecoderWidth});
+        {steps, kDecoderLayers, sequence, 3 * kDecoderWidth});
     const NativeWorkspaceBuffer* style_ffn = buffer(
         *workspace, "decoder_style_ffn", modalities::DType::kFloat16,
-        {steps, kLayers, sequence, 3 * kDecoderWidth});
-    const NativeWorkspaceBuffer* style_final = buffer(
-        *workspace, "decoder_style_final", modalities::DType::kFloat16,
-        {steps, sequence, 3 * kDecoderWidth});
+        {steps, kDecoderLayers, sequence, 3 * kDecoderWidth});
     const NativeWorkspaceBuffer* activation_scales = buffer(
         *workspace, "decoder_activation_scales",
-        modalities::DType::kFloat32, {steps, kLayers, 4});
+        modalities::DType::kFloat32, {steps, kDecoderLayers, 4});
     const NativeWorkspaceBuffer* key_cache = buffer(
         *workspace, "encoder_k_cache", modalities::DType::kFloat16,
-        {kLayers, keys, kHeadDimension});
+        {kDecoderLayers, keys, kHeadDimension});
     const NativeWorkspaceBuffer* value_cache = buffer(
         *workspace, "encoder_v_cache", modalities::DType::kFloat16,
-        {kLayers, keys, kHeadDimension});
+        {kDecoderLayers, keys, kHeadDimension});
     const NativeWorkspaceBuffer* valid_keys = buffer(
         *workspace, "attn_dec_seqused", modalities::DType::kUInt8,
         {sizeof(std::int32_t)});
@@ -1116,184 +1173,190 @@ modalities::Status NativeThorFp8Forward::diffusion_step(
         {sizeof(std::int32_t)});
     const NativeDeviceWeight* weight_scales = weight(
         weights, "decoder_weight_scales", NativeWeightDType::kFloat32,
-        {kLayers * 4});
-    const NativeDeviceWeight* input_w = weight(
-        weights, "decoder_action_in_proj_w", NativeWeightDType::kFloat16,
-        {32, kDecoderWidth});
-    const NativeDeviceWeight* input_b = weight(
-        weights, "decoder_action_in_proj_b", NativeWeightDType::kFloat16,
-        {kDecoderWidth});
+        {kDecoderLayers * 4});
+    const std::string suffix = std::to_string(layer);
+    const NativeDeviceWeight* qkv_w = weight(
+        weights, "decoder_attn_qkv_w_" + suffix,
+        NativeWeightDType::kFp8E4M3, {kDecoderWidth, 2560});
+    const NativeDeviceWeight* o_w = weight(
+        weights, "decoder_attn_o_w_" + suffix,
+        NativeWeightDType::kFp8E4M3, {kEncoderWidth, kDecoderWidth});
+    const NativeDeviceWeight* gate_w = weight(
+        weights, "decoder_ffn_gate_up_w_" + suffix,
+        NativeWeightDType::kFp8E4M3,
+        {kDecoderWidth, 2 * kDecoderHidden});
+    const NativeDeviceWeight* down_w = weight(
+        weights, "decoder_ffn_down_w_" + suffix,
+        NativeWeightDType::kFp8E4M3, {kDecoderHidden, kDecoderWidth});
+    if (!x || !gate || !qkv || !logits || !attention || !hidden || !fg ||
+        !xn_fp8 || !hidden_fp8 || !context_fp8 || !rope || !style_attn ||
+        !style_ffn || !activation_scales || !key_cache || !value_cache ||
+        !valid_keys || !device_position || !weight_scales || !qkv_w ||
+        !o_w || !gate_w || !down_w) {
+        return invalid("Thor decoder layer buffers or weights are incomplete");
+    }
+
+    const float attention_scale =
+        1.0f / std::sqrt(static_cast<float>(kHeadDimension));
+    const std::size_t cache_layer_elements = keys * kHeadDimension;
+    const std::size_t style_row_elements =
+        sequence * 3 * kDecoderWidth;
+    const std::size_t site =
+        (static_cast<std::size_t>(step) * kDecoderLayers + layer) * 4;
+    const std::size_t style_site =
+        (static_cast<std::size_t>(step) * kDecoderLayers + layer) *
+        style_row_elements;
+    const void* attn_style =
+        offset_bytes(dptr(style_attn), style_site * sizeof(std::uint16_t));
+    const void* ffn_style =
+        offset_bytes(dptr(style_ffn), style_site * sizeof(std::uint16_t));
+
+    modalities::Status st = modalities::Status::ok();
+    if (layer == 0) {
+        st = driver_->fused_adarms_fp8(
+            dptr(x), attn_style, dptr(xn_fp8), dptr(gate),
+            static_cast<int>(sequence), kDecoderWidth,
+            scale_ptr(activation_scales, site), stream);
+        if (!st.ok_status()) return st;
+    }
+    st = driver_->fp8_descale(
+        dptr(xn_fp8), dptr(qkv_w), dptr(qkv),
+        static_cast<int>(sequence), 2560, kDecoderWidth,
+        scale_ptr(activation_scales, site),
+        scale_ptr(weight_scales, static_cast<std::size_t>(layer) * 4),
+        stream);
+    if (!st.ok_status()) return st;
+    st = driver_->qkv_rope_cache_devpos_fp16(
+        dptr(qkv), dptr(rope), dptr(attention), dptr(key_cache),
+        dptr(value_cache), static_cast<const int*>(dptr(device_position)),
+        static_cast<int>(sequence), kEncoderWidth, kHeadDimension,
+        kHeadDimension, 2560,
+        static_cast<int>(static_cast<std::size_t>(layer) *
+                         cache_layer_elements),
+        kHeadDimension, stream);
+    if (!st.ok_status()) return st;
+    void* layer_key = offset_bytes(
+        dptr(key_cache), static_cast<std::size_t>(layer) *
+                             cache_layer_elements * sizeof(std::uint16_t));
+    void* layer_value = offset_bytes(
+        dptr(value_cache), static_cast<std::size_t>(layer) *
+                               cache_layer_elements * sizeof(std::uint16_t));
+    st = driver_->attention_seqused_fp16(
+        dptr(attention), layer_key, layer_value, dptr(logits),
+        dptr(attention), static_cast<int>(sequence),
+        static_cast<int>(keys), kHeads, kHeadDimension,
+        static_cast<const int*>(dptr(valid_keys)), attention_scale, stream);
+    if (!st.ok_status()) return st;
+    st = driver_->quantize_fp8_static(
+        dptr(attention), dptr(context_fp8),
+        scale_ptr(activation_scales, site + 1),
+        sequence * kEncoderWidth, stream);
+    if (!st.ok_status()) return st;
+    st = driver_->fp8_descale(
+        dptr(context_fp8), dptr(o_w), dptr(fg),
+        static_cast<int>(sequence), kDecoderWidth, kEncoderWidth,
+        scale_ptr(activation_scales, site + 1),
+        scale_ptr(weight_scales,
+                  static_cast<std::size_t>(layer) * 4 + 1),
+        stream);
+    if (!st.ok_status()) return st;
+    st = driver_->gate_res_adarms_fp8(
+        dptr(fg), dptr(gate), dptr(x), ffn_style, dptr(xn_fp8),
+        dptr(gate), static_cast<int>(sequence), kDecoderWidth,
+        scale_ptr(activation_scales, site + 2), stream);
+    if (!st.ok_status()) return st;
+    st = driver_->fp8_descale(
+        dptr(xn_fp8), dptr(gate_w), dptr(fg),
+        static_cast<int>(sequence), 2 * kDecoderHidden,
+        kDecoderWidth, scale_ptr(activation_scales, site + 2),
+        scale_ptr(weight_scales,
+                  static_cast<std::size_t>(layer) * 4 + 2),
+        stream);
+    if (!st.ok_status()) return st;
+    st = driver_->gate_gelu_fp8(
+        dptr(fg), dptr(hidden_fp8), static_cast<int>(sequence),
+        kDecoderHidden, scale_ptr(activation_scales, site + 3), stream);
+    if (!st.ok_status()) return st;
+    st = driver_->fp8_descale(
+        dptr(hidden_fp8), dptr(down_w), dptr(fg),
+        static_cast<int>(sequence), kDecoderWidth, kDecoderHidden,
+        scale_ptr(activation_scales, site + 3),
+        scale_ptr(weight_scales,
+                  static_cast<std::size_t>(layer) * 4 + 3),
+        stream);
+    if (!st.ok_status()) return st;
+    if (layer + 1 < kDecoderLayers) {
+        const std::size_t next_style_site =
+            style_site + style_row_elements;
+        const void* next_attn_style = offset_bytes(
+            dptr(style_attn),
+            next_style_site * sizeof(std::uint16_t));
+        return driver_->gate_res_adarms_fp8(
+            dptr(fg), dptr(gate), dptr(x), next_attn_style,
+            dptr(xn_fp8), dptr(gate), static_cast<int>(sequence),
+            kDecoderWidth, scale_ptr(activation_scales, site + 4),
+            stream);
+    }
+    return driver_->gate_res_fp16(
+        dptr(fg), dptr(gate), dptr(x), sequence * kDecoderWidth, stream);
+}
+
+modalities::Status NativeThorFp8Forward::diffusion_end(
+    int step,
+    const NativeDeviceWeightStore& weights,
+    NativeWorkspace* workspace,
+    std::uintptr_t stream) const {
+    if (step < 0 || !driver_ || !driver_->status().ok_status() || !workspace ||
+        workspace->activation_dtype() != modalities::DType::kFloat16) {
+        return invalid("Thor decoder forward owner is invalid");
+    }
+    const std::uint64_t sequence = workspace->chunk_size();
+    const std::uint64_t steps = workspace->num_steps();
+    const NativeWorkspaceBuffer* noise = buffer(
+        *workspace, "diffusion_noise", modalities::DType::kFloat16,
+        {sequence, 32});
+    const NativeWorkspaceBuffer* x = buffer(
+        *workspace, "decoder_x", modalities::DType::kFloat16,
+        {sequence, kDecoderWidth});
+    const NativeWorkspaceBuffer* xn = buffer(
+        *workspace, "x_normed_buf", modalities::DType::kFloat16,
+        {sequence, kDecoderWidth});
+    const NativeWorkspaceBuffer* gate = buffer(
+        *workspace, "gate_buf", modalities::DType::kFloat16,
+        {sequence, kDecoderWidth});
+    const NativeWorkspaceBuffer* action_f32 = buffer(
+        *workspace, "decoder_action_f32", modalities::DType::kFloat32,
+        {sequence, 32});
+    const NativeWorkspaceBuffer* style_final = buffer(
+        *workspace, "decoder_style_final", modalities::DType::kFloat16,
+        {steps, sequence, 3 * kDecoderWidth});
     const NativeDeviceWeight* output_w = weight(
         weights, "decoder_action_out_proj_w", NativeWeightDType::kFloat16,
         {kDecoderWidth, 32});
     const NativeDeviceWeight* output_b = weight(
         weights, "decoder_action_out_proj_b", NativeWeightDType::kFloat16,
         {32});
-    if (!noise || !x || !xn || !gate || !qkv || !logits || !attention ||
-        !hidden || !fg || !action_f32 || !xn_fp8 || !hidden_fp8 ||
-        !context_fp8 || !rope || !style_attn || !style_ffn || !style_final ||
-        !activation_scales || !key_cache || !value_cache || !valid_keys ||
-        !device_position || !weight_scales || !input_w || !input_b ||
-        !output_w || !output_b) {
-        return invalid("Thor decoder workspace or global weights are incomplete");
+    if (static_cast<std::uint64_t>(step) >= steps || !noise || !x || !xn ||
+        !gate || !action_f32 || !style_final || !output_w || !output_b) {
+        return invalid("Thor decoder output buffers or weights are incomplete");
     }
-
-    const float attention_scale =
-        1.0f / std::sqrt(static_cast<float>(kHeadDimension));
-    if (static_cast<std::uint64_t>(step) >= steps) {
-        return invalid("Thor diffusion step is out of range");
-    }
+    const std::size_t style_row_elements =
+        sequence * 3 * kDecoderWidth;
+    const void* final_style = offset_bytes(
+        dptr(style_final), static_cast<std::size_t>(step) *
+                               style_row_elements * sizeof(std::uint16_t));
+    modalities::Status st = driver_->adarms_fp16(
+        dptr(x), final_style, dptr(xn), dptr(gate),
+        static_cast<int>(sequence), kDecoderWidth, stream);
+    if (!st.ok_status()) return st;
+    st = driver_->gmm_fp16_out_fp32(
+        dptr(xn), dptr(output_w), static_cast<float*>(dptr(action_f32)),
+        static_cast<int>(sequence), 32, kDecoderWidth, stream);
+    if (!st.ok_status()) return st;
     const float dt = -1.0f / static_cast<float>(steps);
-    const std::size_t cache_layer_elements = keys * kHeadDimension;
-    const std::size_t style_row_elements = sequence * 3 * kDecoderWidth;
-    {
-        modalities::Status st = driver_->gmm_fp16(
-            dptr(noise), dptr(input_w), dptr(x), static_cast<int>(sequence),
-            kDecoderWidth, 32, 0.0f, stream);
-        if (!st.ok_status()) return st;
-        st = driver_->add_bias_fp16(
-            dptr(x), dptr(input_b), static_cast<int>(sequence),
-            kDecoderWidth, stream);
-        if (!st.ok_status()) return st;
-
-        for (int layer = 0; layer < kLayers; ++layer) {
-            const std::string suffix = std::to_string(layer);
-            const NativeDeviceWeight* qkv_w = weight(
-                weights, "decoder_attn_qkv_w_" + suffix,
-                NativeWeightDType::kFp8E4M3, {kDecoderWidth, 2560});
-            const NativeDeviceWeight* o_w = weight(
-                weights, "decoder_attn_o_w_" + suffix,
-                NativeWeightDType::kFp8E4M3,
-                {kEncoderWidth, kDecoderWidth});
-            const NativeDeviceWeight* gate_w = weight(
-                weights, "decoder_ffn_gate_up_w_" + suffix,
-                NativeWeightDType::kFp8E4M3,
-                {kDecoderWidth, 2 * kDecoderHidden});
-            const NativeDeviceWeight* down_w = weight(
-                weights, "decoder_ffn_down_w_" + suffix,
-                NativeWeightDType::kFp8E4M3,
-                {kDecoderHidden, kDecoderWidth});
-            if (!qkv_w || !o_w || !gate_w || !down_w) {
-                return invalid("Thor decoder layer weights are incomplete");
-            }
-            const std::size_t site =
-                (static_cast<std::size_t>(step) * kLayers + layer) * 4;
-            const std::size_t style_site =
-                (static_cast<std::size_t>(step) * kLayers + layer) *
-                style_row_elements;
-            const void* attn_style = offset_bytes(dptr(style_attn),
-                                                   style_site * 2);
-            const void* ffn_style = offset_bytes(dptr(style_ffn),
-                                                  style_site * 2);
-            if (layer == 0) {
-                st = driver_->fused_adarms_fp8(
-                    dptr(x), attn_style, dptr(xn_fp8), dptr(gate),
-                    static_cast<int>(sequence), kDecoderWidth,
-                    scale_ptr(activation_scales, site), stream);
-                if (!st.ok_status()) return st;
-            }
-            st = driver_->fp8_descale(
-                dptr(xn_fp8), dptr(qkv_w), dptr(qkv),
-                static_cast<int>(sequence), 2560, kDecoderWidth,
-                scale_ptr(activation_scales, site),
-                scale_ptr(weight_scales, static_cast<std::size_t>(layer) * 4),
-                stream);
-            if (!st.ok_status()) return st;
-            st = driver_->qkv_rope_cache_devpos_fp16(
-                dptr(qkv), dptr(rope), dptr(attention), dptr(key_cache),
-                dptr(value_cache), static_cast<const int*>(dptr(device_position)),
-                static_cast<int>(sequence), kEncoderWidth, kHeadDimension,
-                kHeadDimension, 2560,
-                static_cast<int>(static_cast<std::size_t>(layer) *
-                                 cache_layer_elements),
-                kHeadDimension, stream);
-            if (!st.ok_status()) return st;
-            void* layer_key = offset_bytes(
-                dptr(key_cache), static_cast<std::size_t>(layer) *
-                                     cache_layer_elements * 2);
-            void* layer_value = offset_bytes(
-                dptr(value_cache), static_cast<std::size_t>(layer) *
-                                       cache_layer_elements * 2);
-            st = driver_->attention_seqused_fp16(
-                dptr(attention), layer_key, layer_value, dptr(logits),
-                dptr(attention), static_cast<int>(sequence),
-                static_cast<int>(keys), kHeads, kHeadDimension,
-                static_cast<const int*>(dptr(valid_keys)), attention_scale,
-                stream);
-            if (!st.ok_status()) return st;
-            st = driver_->quantize_fp8_static(
-                dptr(attention), dptr(context_fp8),
-                scale_ptr(activation_scales, site + 1),
-                sequence * kEncoderWidth, stream);
-            if (!st.ok_status()) return st;
-            st = driver_->fp8_descale(
-                dptr(context_fp8), dptr(o_w), dptr(fg),
-                static_cast<int>(sequence), kDecoderWidth, kEncoderWidth,
-                scale_ptr(activation_scales, site + 1),
-                scale_ptr(weight_scales,
-                          static_cast<std::size_t>(layer) * 4 + 1),
-                stream);
-            if (!st.ok_status()) return st;
-            st = driver_->gate_res_adarms_fp8(
-                dptr(fg), dptr(gate), dptr(x), ffn_style, dptr(xn_fp8),
-                dptr(gate), static_cast<int>(sequence), kDecoderWidth,
-                scale_ptr(activation_scales, site + 2), stream);
-            if (!st.ok_status()) return st;
-            st = driver_->fp8_descale(
-                dptr(xn_fp8), dptr(gate_w), dptr(fg),
-                static_cast<int>(sequence), 2 * kDecoderHidden,
-                kDecoderWidth, scale_ptr(activation_scales, site + 2),
-                scale_ptr(weight_scales,
-                          static_cast<std::size_t>(layer) * 4 + 2),
-                stream);
-            if (!st.ok_status()) return st;
-            st = driver_->gate_gelu_fp8(
-                dptr(fg), dptr(hidden_fp8), static_cast<int>(sequence),
-                kDecoderHidden, scale_ptr(activation_scales, site + 3),
-                stream);
-            if (!st.ok_status()) return st;
-            st = driver_->fp8_descale(
-                dptr(hidden_fp8), dptr(down_w), dptr(fg),
-                static_cast<int>(sequence), kDecoderWidth, kDecoderHidden,
-                scale_ptr(activation_scales, site + 3),
-                scale_ptr(weight_scales,
-                          static_cast<std::size_t>(layer) * 4 + 3),
-                stream);
-            if (!st.ok_status()) return st;
-            if (layer + 1 < kLayers) {
-                const std::size_t next_style_site = style_site + style_row_elements;
-                const void* next_attn_style = offset_bytes(
-                    dptr(style_attn), next_style_site * 2);
-                st = driver_->gate_res_adarms_fp8(
-                    dptr(fg), dptr(gate), dptr(x), next_attn_style,
-                    dptr(xn_fp8), dptr(gate), static_cast<int>(sequence),
-                    kDecoderWidth, scale_ptr(activation_scales, site + 4),
-                    stream);
-            } else {
-                st = driver_->gate_res_fp16(
-                    dptr(fg), dptr(gate), dptr(x),
-                    sequence * kDecoderWidth, stream);
-            }
-            if (!st.ok_status()) return st;
-        }
-
-        const void* final_style = offset_bytes(
-            dptr(style_final), static_cast<std::size_t>(step) *
-                                   style_row_elements * 2);
-        st = driver_->adarms_fp16(
-            dptr(x), final_style, dptr(xn), dptr(gate),
-            static_cast<int>(sequence), kDecoderWidth, stream);
-        if (!st.ok_status()) return st;
-        st = driver_->gmm_fp16_out_fp32(
-            dptr(xn), dptr(output_w), static_cast<float*>(dptr(action_f32)),
-            static_cast<int>(sequence), 32, kDecoderWidth, stream);
-        if (!st.ok_status()) return st;
-        st = driver_->action_update_fp16(
-            static_cast<const float*>(dptr(action_f32)), dptr(output_b),
-            dptr(noise), static_cast<int>(sequence), 32, dt, stream);
-        if (!st.ok_status()) return st;
-    }
-    return modalities::Status::ok();
+    return driver_->action_update_fp16(
+        static_cast<const float*>(dptr(action_f32)), dptr(output_b),
+        dptr(noise), static_cast<int>(sequence), 32, dt, stream);
 }
 
 }  // namespace pi05

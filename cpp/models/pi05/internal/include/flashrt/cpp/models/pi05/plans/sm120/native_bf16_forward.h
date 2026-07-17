@@ -26,12 +26,17 @@ public:
         NativeWorkspace* workspace, NativeRtxAttentionWorkspace* attention,
         std::uintptr_t stream) const;
 #ifdef FLASHRT_CPP_WITH_FA2
+    modalities::Status vision_begin(
+        const NativeDeviceWeightStore& weights, NativeWorkspace* workspace,
+        NativeRtxAttentionWorkspace* attention,
+        const NativeRtxAttentionDriver* attention_driver,
+        std::uintptr_t stream) const;
     modalities::Status vision_layer(
         int layer, const NativeDeviceWeightStore& weights,
         NativeWorkspace* workspace, NativeRtxAttentionWorkspace* attention,
         const NativeRtxAttentionDriver* attention_driver,
         std::uintptr_t stream) const;
-    modalities::Status vision(
+    modalities::Status vision_end(
         const NativeDeviceWeightStore& weights, NativeWorkspace* workspace,
         NativeRtxAttentionWorkspace* attention,
         const NativeRtxAttentionDriver* attention_driver,
@@ -41,9 +46,9 @@ public:
         NativeWorkspace* workspace, NativeRtxAttentionWorkspace* attention,
         const NativeRtxAttentionDriver* attention_driver,
         std::uintptr_t stream) const;
-    modalities::Status encoder(
-        const NativeDeviceWeightStore& weights, NativeWorkspace* workspace,
-        NativeRtxAttentionWorkspace* attention,
+    modalities::Status diffusion_begin(
+        int step, const NativeDeviceWeightStore& weights,
+        NativeWorkspace* workspace, NativeRtxAttentionWorkspace* attention,
         const NativeRtxAttentionDriver* attention_driver,
         std::uintptr_t stream) const;
     modalities::Status decoder_layer(
@@ -51,7 +56,7 @@ public:
         NativeWorkspace* workspace, NativeRtxAttentionWorkspace* attention,
         const NativeRtxAttentionDriver* attention_driver,
         std::uintptr_t stream) const;
-    modalities::Status diffusion_step(
+    modalities::Status diffusion_end(
         int step, const NativeDeviceWeightStore& weights,
         NativeWorkspace* workspace, NativeRtxAttentionWorkspace* attention,
         const NativeRtxAttentionDriver* attention_driver,

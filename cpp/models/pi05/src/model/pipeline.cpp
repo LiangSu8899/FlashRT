@@ -130,6 +130,35 @@ modalities::Status Pi05Pipeline::initialize_capture_inputs() {
                : backend("Pi0.5 graph setup synchronization failed");
 }
 
+modalities::Status Pi05Pipeline::record_vision(void* stream) {
+    modalities::Status st = record_vision_begin(stream);
+    if (!st.ok_status()) return st;
+    for (int layer = 0; layer < kVisionLayers; ++layer) {
+        st = record_vision_layer(layer, stream);
+        if (!st.ok_status()) return st;
+    }
+    return record_vision_end(stream);
+}
+
+modalities::Status Pi05Pipeline::record_encoder(void* stream) {
+    for (int layer = 0; layer < kEncoderLayers; ++layer) {
+        modalities::Status st = record_encoder_layer(layer, stream);
+        if (!st.ok_status()) return st;
+    }
+    return modalities::Status::ok();
+}
+
+modalities::Status Pi05Pipeline::record_diffusion_step(
+    int step, void* stream) {
+    modalities::Status st = record_diffusion_begin(step, stream);
+    if (!st.ok_status()) return st;
+    for (int layer = 0; layer < kDecoderLayers; ++layer) {
+        st = record_decoder_layer(step, layer, stream);
+        if (!st.ok_status()) return st;
+    }
+    return record_diffusion_end(step, stream);
+}
+
 modalities::Status Pi05Pipeline::record_context(void* stream) {
     modalities::Status st = copy_prompt_to_encoder(&workspace(), stream);
     if (!st.ok_status()) return st;

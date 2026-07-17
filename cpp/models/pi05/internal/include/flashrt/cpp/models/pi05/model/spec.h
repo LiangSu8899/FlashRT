@@ -15,6 +15,9 @@ static constexpr int kDefaultChunk = 10;
 static constexpr int kModelActionDim = 32;
 static constexpr int kLiberoActionDim = 7;
 static constexpr int kEncoderWidth = 2048;
+static constexpr int kVisionLayers = 27;
+static constexpr int kEncoderLayers = 18;
+static constexpr int kDecoderLayers = 18;
 
 modalities::VisionPreprocessSpec vision_preprocess_spec(int num_views);
 

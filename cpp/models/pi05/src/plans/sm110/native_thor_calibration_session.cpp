@@ -3,6 +3,7 @@
 #include "flashrt/cpp/loader/safetensors.h"
 #include "flashrt/cpp/loader/sha256.h"
 #include "flashrt/cpp/models/pi05/model/io.h"
+#include "flashrt/cpp/models/pi05/model/spec.h"
 #include "flashrt/cpp/models/pi05/support/native_calibration.h"
 #include "flashrt/cpp/models/pi05/plans/sm110/lowered_plan.h"
 #include "flashrt/cpp/models/pi05/plans/sm110/native_thor_fp8_forward.h"
@@ -279,7 +280,14 @@ struct NativeThorCalibrationSession::Impl {
 
         const std::uintptr_t native_stream =
             reinterpret_cast<std::uintptr_t>(stream);
-        st = forward.vision(weights, &workspace, weight_scales, native_stream);
+        st = forward.vision_begin(weights, &workspace, native_stream);
+        if (!st.ok_status()) return st;
+        for (int layer = 0; layer < kVisionLayers; ++layer) {
+            st = forward.vision_layer(
+                layer, weights, &workspace, weight_scales, native_stream);
+            if (!st.ok_status()) return st;
+        }
+        st = forward.vision_end(weights, &workspace, native_stream);
         if (!st.ok_status()) return st;
         std::vector<float> encoder_scale;
         st = forward.calibrate_encoder(
