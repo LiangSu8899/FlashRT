@@ -47,14 +47,29 @@ public:
         int step, const NativeDeviceWeightStore& weights,
         NativeWorkspace* workspace, std::uintptr_t stream) const;
 
-    modalities::Status calibrate_encoder(
+    modalities::Status calibration_encoder_begin(
+        NativeWorkspace* workspace,
+        std::uintptr_t stream) const;
+    modalities::Status calibration_encoder_layer(
+        int layer,
         const NativeDeviceWeightStore& weights,
         NativeWorkspace* workspace,
         const NativeThorWeightScales& weight_scales,
+        std::uintptr_t stream) const;
+    modalities::Status calibration_encoder_end(
+        NativeWorkspace* workspace,
         std::vector<float>* sample_scales,
         std::uintptr_t stream) const;
-    modalities::Status calibrate_decoder(
+    modalities::Status calibration_decoder_begin(
+        NativeWorkspace* workspace,
+        std::uintptr_t stream) const;
+    modalities::Status calibration_decoder_layer(
+        int step,
+        int layer,
         const NativeDeviceWeightStore& weights,
+        NativeWorkspace* workspace,
+        std::uintptr_t stream) const;
+    modalities::Status calibration_decoder_end(
         NativeWorkspace* workspace,
         std::vector<float>* sample_scales,
         std::uintptr_t stream) const;

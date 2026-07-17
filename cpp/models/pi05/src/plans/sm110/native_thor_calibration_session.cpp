@@ -3,7 +3,6 @@
 #include "flashrt/cpp/loader/safetensors.h"
 #include "flashrt/cpp/loader/sha256.h"
 #include "flashrt/cpp/models/pi05/model/io.h"
-#include "flashrt/cpp/models/pi05/model/spec.h"
 #include "flashrt/cpp/models/pi05/support/native_calibration.h"
 #include "flashrt/cpp/models/pi05/plans/sm110/lowered_plan.h"
 #include "flashrt/cpp/models/pi05/plans/sm110/native_thor_fp8_forward.h"
@@ -37,6 +36,72 @@ struct HashResult {
     bool ok = false;
     std::string digest;
     std::string error;
+};
+
+class ThorCalibrationOperations final : public Pi05Operations {
+public:
+    ThorCalibrationOperations(
+        const NativeThorFp8Forward& forward,
+        const NativeDeviceWeightStore& weights,
+        NativeWorkspace& workspace,
+        const NativeThorWeightScales& weight_scales)
+        : forward_(forward),
+          weights_(weights),
+          workspace_(workspace),
+          weight_scales_(weight_scales) {}
+
+    modalities::Status record_vision_begin(void* stream) override {
+        return forward_.vision_begin(
+            weights_, &workspace_,
+            reinterpret_cast<std::uintptr_t>(stream));
+    }
+
+    modalities::Status record_vision_layer(
+        int layer, void* stream) override {
+        return forward_.vision_layer(
+            layer, weights_, &workspace_, weight_scales_,
+            reinterpret_cast<std::uintptr_t>(stream));
+    }
+
+    modalities::Status record_vision_end(void* stream) override {
+        return forward_.vision_end(
+            weights_, &workspace_,
+            reinterpret_cast<std::uintptr_t>(stream));
+    }
+
+    modalities::Status record_encoder_layer(
+        int layer, void* stream) override {
+        return forward_.calibration_encoder_layer(
+            layer, weights_, &workspace_, weight_scales_,
+            reinterpret_cast<std::uintptr_t>(stream));
+    }
+
+    modalities::Status record_diffusion_begin(
+        int step, void* stream) override {
+        return forward_.diffusion_begin(
+            step, weights_, &workspace_,
+            reinterpret_cast<std::uintptr_t>(stream));
+    }
+
+    modalities::Status record_decoder_layer(
+        int step, int layer, void* stream) override {
+        return forward_.calibration_decoder_layer(
+            step, layer, weights_, &workspace_,
+            reinterpret_cast<std::uintptr_t>(stream));
+    }
+
+    modalities::Status record_diffusion_end(
+        int step, void* stream) override {
+        return forward_.diffusion_end(
+            step, weights_, &workspace_,
+            reinterpret_cast<std::uintptr_t>(stream));
+    }
+
+private:
+    const NativeThorFp8Forward& forward_;
+    const NativeDeviceWeightStore& weights_;
+    NativeWorkspace& workspace_;
+    const NativeThorWeightScales& weight_scales_;
 };
 
 modalities::TensorView device_view(const NativeWorkspaceBuffer* buffer,
@@ -249,23 +314,6 @@ struct NativeThorCalibrationSession::Impl {
         st = io->prepare_vision(frames);
         if (!st.ok_status()) return st;
 
-        const NativeWorkspaceBuffer* encoder = workspace.find("encoder_x");
-        const NativeWorkspaceBuffer* prompt_buffer =
-            workspace.find("prompt_embedding");
-        if (!encoder || !prompt_buffer) {
-            return invalid("Thor calibration prompt window is missing");
-        }
-        const std::size_t prompt_offset =
-            static_cast<std::size_t>(workspace.encoder_vision_sequence()) *
-            2048 * sizeof(std::uint16_t);
-        rc_check = cudaMemcpyAsync(
-            static_cast<unsigned char*>(frt_buffer_dptr(encoder->buffer)) +
-                prompt_offset,
-            frt_buffer_dptr(prompt_buffer->buffer),
-            frt_buffer_bytes(prompt_buffer->buffer), cudaMemcpyDeviceToDevice,
-            stream);
-        if (rc_check != cudaSuccess) return backend(cudaGetErrorString(rc_check));
-
         st = prepare_native_calibration_noise(
             noise, n_noise,
             noise_seed + static_cast<std::uint64_t>(encoder_samples.size()),
@@ -280,22 +328,25 @@ struct NativeThorCalibrationSession::Impl {
 
         const std::uintptr_t native_stream =
             reinterpret_cast<std::uintptr_t>(stream);
-        st = forward.vision_begin(weights, &workspace, native_stream);
+        ThorCalibrationOperations operations(
+            forward, weights, workspace, weight_scales);
+        st = forward.calibration_encoder_begin(
+            &workspace, native_stream);
         if (!st.ok_status()) return st;
-        for (int layer = 0; layer < kVisionLayers; ++layer) {
-            st = forward.vision_layer(
-                layer, weights, &workspace, weight_scales, native_stream);
-            if (!st.ok_status()) return st;
-        }
-        st = forward.vision_end(weights, &workspace, native_stream);
+        st = record_pi05_context(operations, &workspace, stream);
         if (!st.ok_status()) return st;
         std::vector<float> encoder_scale;
-        st = forward.calibrate_encoder(
-            weights, &workspace, weight_scales, &encoder_scale, native_stream);
+        st = forward.calibration_encoder_end(
+            &workspace, &encoder_scale, native_stream);
+        if (!st.ok_status()) return st;
+        st = forward.calibration_decoder_begin(
+            &workspace, native_stream);
+        if (!st.ok_status()) return st;
+        st = record_pi05_decode(operations, config.num_steps, stream);
         if (!st.ok_status()) return st;
         std::vector<float> decoder_scale;
-        st = forward.calibrate_decoder(
-            weights, &workspace, &decoder_scale, native_stream);
+        st = forward.calibration_decoder_end(
+            &workspace, &decoder_scale, native_stream);
         if (!st.ok_status()) return st;
         encoder_samples.push_back(std::move(encoder_scale));
         decoder_samples.push_back(std::move(decoder_scale));

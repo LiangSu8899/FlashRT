@@ -63,7 +63,36 @@ modalities::Status resolve_pipeline_artifacts(
     NativeWeightDType embedding_dtype,
     PipelineArtifacts* artifacts);
 
-class Pi05Pipeline {
+// Physical operations consumed by the single PI0.5 semantic traversal.
+class Pi05Operations {
+public:
+    virtual ~Pi05Operations() = default;
+
+    virtual modalities::Status record_vision_begin(void* stream) = 0;
+    virtual modalities::Status record_vision_layer(int layer,
+                                                   void* stream) = 0;
+    virtual modalities::Status record_vision_end(void* stream) = 0;
+    virtual modalities::Status record_encoder_layer(int layer,
+                                                    void* stream) = 0;
+    virtual modalities::Status record_diffusion_begin(int step,
+                                                      void* stream) = 0;
+    virtual modalities::Status record_decoder_layer(int step, int layer,
+                                                    void* stream) = 0;
+    virtual modalities::Status record_diffusion_end(int step,
+                                                    void* stream) = 0;
+};
+
+modalities::Status record_pi05_context(
+    Pi05Operations& operations,
+    NativeWorkspace* workspace,
+    void* stream);
+
+modalities::Status record_pi05_decode(
+    Pi05Operations& operations,
+    int num_steps,
+    void* stream);
+
+class Pi05Pipeline : public Pi05Operations {
 public:
     Pi05Pipeline(frt_ctx context, const Pi05PipelineConfig& config);
     virtual ~Pi05Pipeline() = default;
@@ -88,25 +117,22 @@ protected:
     modalities::Status finish_prepare(bool warmup_before_capture);
     virtual NativeWorkspace& workspace() = 0;
     virtual const NativeWorkspace& workspace() const = 0;
-    virtual modalities::Status record_vision_begin(void* stream) = 0;
-    virtual modalities::Status record_vision_layer(int layer,
-                                                   void* stream) = 0;
-    virtual modalities::Status record_vision_end(void* stream) = 0;
-    virtual modalities::Status record_encoder_layer(int layer,
-                                                    void* stream) = 0;
-    virtual modalities::Status record_diffusion_begin(int step,
-                                                      void* stream) = 0;
-    virtual modalities::Status record_decoder_layer(int step, int layer,
-                                                    void* stream) = 0;
-    virtual modalities::Status record_diffusion_end(int step,
-                                                    void* stream) = 0;
+    modalities::Status record_vision_begin(void* stream) override = 0;
+    modalities::Status record_vision_layer(int layer,
+                                           void* stream) override = 0;
+    modalities::Status record_vision_end(void* stream) override = 0;
+    modalities::Status record_encoder_layer(int layer,
+                                            void* stream) override = 0;
+    modalities::Status record_diffusion_begin(int step,
+                                              void* stream) override = 0;
+    modalities::Status record_decoder_layer(int step, int layer,
+                                            void* stream) override = 0;
+    modalities::Status record_diffusion_end(int step,
+                                            void* stream) override = 0;
 
 private:
     modalities::Status initialize_capture_inputs();
     modalities::Status record(GraphKind kind, void* stream);
-    modalities::Status record_vision(void* stream);
-    modalities::Status record_encoder(void* stream);
-    modalities::Status record_diffusion_step(int step, void* stream);
     modalities::Status record_context(void* stream);
     modalities::Status record_decode(void* stream);
     static modalities::Status record_graph(

@@ -486,17 +486,37 @@ modalities::Status NativeThorFp8Forward::encoder_layer(
     return st;
 }
 
-modalities::Status NativeThorFp8Forward::calibrate_encoder(
+modalities::Status NativeThorFp8Forward::calibration_encoder_begin(
+    NativeWorkspace* workspace,
+    std::uintptr_t stream) const {
+    if (!driver_ || !driver_->status().ok_status() || !workspace ||
+        workspace->activation_dtype() != modalities::DType::kFloat16) {
+        return invalid("Thor encoder calibration owner is invalid");
+    }
+    const NativeWorkspaceBuffer* scales = buffer(
+        *workspace, "encoder_sample_scales", modalities::DType::kFloat32,
+        {kLayers, 4});
+    if (!scales) {
+        return invalid("Thor encoder calibration scales are incomplete");
+    }
+    const cudaError_t rc = cudaMemsetAsync(
+        dptr(scales), 0, kLayers * 4 * sizeof(float),
+        reinterpret_cast<cudaStream_t>(stream));
+    return rc == cudaSuccess ? modalities::Status::ok()
+                             : backend(cudaGetErrorString(rc));
+}
+
+modalities::Status NativeThorFp8Forward::calibration_encoder_layer(
+    int layer,
     const NativeDeviceWeightStore& weights,
     NativeWorkspace* workspace,
     const NativeThorWeightScales& weight_scales,
-    std::vector<float>* sample_scales,
     std::uintptr_t stream) const {
-    if (!driver_ || !driver_->status().ok_status() || !workspace ||
-        !sample_scales ||
+    if (layer < 0 || layer >= kLayers || !driver_ ||
+        !driver_->status().ok_status() || !workspace ||
         workspace->activation_dtype() != modalities::DType::kFloat16 ||
         weight_scales.encoder.size() != kLayers * 4) {
-        return invalid("Thor encoder calibration owner is invalid");
+        return invalid("Thor encoder calibration layer is invalid");
     }
     const std::uint64_t sequence = workspace->encoder_sequence();
     const std::uint64_t keys = workspace->total_keys();
@@ -565,153 +585,163 @@ modalities::Status NativeThorFp8Forward::calibrate_encoder(
         !scales || !dynamic_scale || !ones) {
         return invalid("Thor encoder calibration workspace is incomplete");
     }
-    cudaError_t rc = cudaMemsetAsync(
-        dptr(scales), 0, kLayers * 4 * sizeof(float),
-        reinterpret_cast<cudaStream_t>(stream));
-    if (rc != cudaSuccess) return backend(cudaGetErrorString(rc));
-
     const float attention_scale =
         1.0f / std::sqrt(static_cast<float>(kHeadDimension));
     const std::size_t cache_layer_elements = keys * kHeadDimension;
-    for (int layer = 0; layer < kLayers; ++layer) {
-        const std::string suffix = std::to_string(layer);
-        const NativeDeviceWeight* qkv_w = weight(
-            weights, "encoder_attn_qkv_w_" + suffix,
-            NativeWeightDType::kFp8E4M3, {2560, kEncoderWidth});
-        if (!qkv_w) return invalid("Thor encoder QKV weight is invalid");
-        const std::size_t site = static_cast<std::size_t>(layer) * 4;
-        modalities::Status st = driver_->rms_norm_fp16(
-            dptr(x), dptr(ones), dptr(norm_scratch),
-            static_cast<int>(sequence), kEncoderWidth, 1e-6f, stream);
-        if (!st.ok_status()) return st;
-        float qkv_scale = 0.0f;
-        st = measure_scale(
-            *driver_, dptr(norm_scratch), dptr(fp8_scratch),
-            static_cast<float*>(dptr(dynamic_scale)), scale_ptr(scales, site),
-            sequence * kEncoderWidth, stream, &qkv_scale);
-        if (!st.ok_status()) return st;
-        st = driver_->rms_norm_fp8_noweight(
-            dptr(x), dptr(x_fp8), static_cast<int>(sequence), kEncoderWidth,
-            scale_ptr(scales, site), stream);
-        if (!st.ok_status()) return st;
-        const float qkv_alpha = qkv_scale * weight_scales.encoder[site];
-        st = driver_->fp8_cutlass(
-            dptr(x_fp8), dptr(qkv_w), dptr(qkv), static_cast<int>(sequence),
-            2560, kEncoderWidth, qkv_alpha, 0.0f,
-            NativeThorFp8Tactic::kSquare, stream);
-        if (!st.ok_status()) return st;
-        st = driver_->qkv_rope_cache_fp16(
-            dptr(qkv), dptr(rope), dptr(attention), dptr(key_cache),
-            dptr(value_cache), static_cast<int>(sequence), kEncoderWidth,
-            kHeadDimension, kHeadDimension, 2560,
-            static_cast<int>(static_cast<std::size_t>(layer) *
-                             cache_layer_elements),
-            kHeadDimension, stream);
-        if (!st.ok_status()) return st;
-        if (layer == kLayers - 1) break;
+    const std::string suffix = std::to_string(layer);
+    const NativeDeviceWeight* qkv_w = weight(
+        weights, "encoder_attn_qkv_w_" + suffix,
+        NativeWeightDType::kFp8E4M3, {2560, kEncoderWidth});
+    if (!qkv_w) return invalid("Thor encoder QKV weight is invalid");
+    const std::size_t site = static_cast<std::size_t>(layer) * 4;
+    modalities::Status st = driver_->rms_norm_fp16(
+        dptr(x), dptr(ones), dptr(norm_scratch),
+        static_cast<int>(sequence), kEncoderWidth, 1e-6f, stream);
+    if (!st.ok_status()) return st;
+    float qkv_scale = 0.0f;
+    st = measure_scale(
+        *driver_, dptr(norm_scratch), dptr(fp8_scratch),
+        static_cast<float*>(dptr(dynamic_scale)), scale_ptr(scales, site),
+        sequence * kEncoderWidth, stream, &qkv_scale);
+    if (!st.ok_status()) return st;
+    st = driver_->rms_norm_fp8_noweight(
+        dptr(x), dptr(x_fp8), static_cast<int>(sequence), kEncoderWidth,
+        scale_ptr(scales, site), stream);
+    if (!st.ok_status()) return st;
+    const float qkv_alpha = qkv_scale * weight_scales.encoder[site];
+    st = driver_->fp8_cutlass(
+        dptr(x_fp8), dptr(qkv_w), dptr(qkv), static_cast<int>(sequence),
+        2560, kEncoderWidth, qkv_alpha, 0.0f,
+        NativeThorFp8Tactic::kSquare, stream);
+    if (!st.ok_status()) return st;
+    st = driver_->qkv_rope_cache_fp16(
+        dptr(qkv), dptr(rope), dptr(attention), dptr(key_cache),
+        dptr(value_cache), static_cast<int>(sequence), kEncoderWidth,
+        kHeadDimension, kHeadDimension, 2560,
+        static_cast<int>(static_cast<std::size_t>(layer) *
+                         cache_layer_elements),
+        kHeadDimension, stream);
+    if (!st.ok_status()) return st;
+    if (layer == kLayers - 1) return modalities::Status::ok();
 
-        void* layer_key = offset_bytes(
-            dptr(key_cache), static_cast<std::size_t>(layer) *
-                                 cache_layer_elements * 2);
-        void* layer_value = offset_bytes(
-            dptr(value_cache), static_cast<std::size_t>(layer) *
-                                   cache_layer_elements * 2);
-        st = driver_->attention_seqused_fp16(
-            dptr(attention), layer_key, layer_value, dptr(logits),
-            dptr(attention), static_cast<int>(sequence),
-            static_cast<int>(sequence), kHeads, kHeadDimension,
-            static_cast<const int*>(dptr(valid_keys)), attention_scale, stream);
-        if (!st.ok_status()) return st;
+    void* layer_key = offset_bytes(
+        dptr(key_cache), static_cast<std::size_t>(layer) *
+                             cache_layer_elements * 2);
+    void* layer_value = offset_bytes(
+        dptr(value_cache), static_cast<std::size_t>(layer) *
+                               cache_layer_elements * 2);
+    st = driver_->attention_seqused_fp16(
+        dptr(attention), layer_key, layer_value, dptr(logits),
+        dptr(attention), static_cast<int>(sequence),
+        static_cast<int>(sequence), kHeads, kHeadDimension,
+        static_cast<const int*>(dptr(valid_keys)), attention_scale, stream);
+    if (!st.ok_status()) return st;
 
-        const NativeDeviceWeight* o_w = weight(
-            weights, "encoder_attn_o_w_" + suffix,
-            NativeWeightDType::kFp8E4M3, {kEncoderWidth, kEncoderWidth});
-        const NativeDeviceWeight* gate_w = weight(
-            weights, "encoder_ffn_gate_up_w_" + suffix,
-            NativeWeightDType::kFp8E4M3,
-            {2 * kEncoderHidden, kEncoderWidth});
-        const NativeDeviceWeight* down_w = weight(
-            weights, "encoder_ffn_down_w_" + suffix,
-            NativeWeightDType::kFp8E4M3,
-            {kEncoderWidth, kEncoderHidden});
-        if (!o_w || !gate_w || !down_w) {
-            return invalid("Thor encoder calibration weights are incomplete");
-        }
-        float o_scale = 0.0f;
-        st = measure_scale(
-            *driver_, dptr(attention), dptr(fp8_scratch),
-            static_cast<float*>(dptr(dynamic_scale)),
-            scale_ptr(scales, site + 1), sequence * kEncoderWidth, stream,
-            &o_scale);
-        if (!st.ok_status()) return st;
-        st = driver_->quantize_fp8_static(
-            dptr(attention), dptr(o_fp8), scale_ptr(scales, site + 1),
-            sequence * kEncoderWidth, stream);
-        if (!st.ok_status()) return st;
-        st = driver_->fp8_cutlass(
-            dptr(o_fp8), dptr(o_w), dptr(fg), static_cast<int>(sequence),
-            kEncoderWidth, kEncoderWidth,
-            o_scale * weight_scales.encoder[site + 1], 0.0f,
-            NativeThorFp8Tactic::kSquare, stream);
-        if (!st.ok_status()) return st;
-
-        st = copy_device(dptr(x_scratch), dptr(x),
-                         sequence * kEncoderWidth * 2, stream);
-        if (!st.ok_status()) return st;
-        st = driver_->residual_add_fp16(
-            dptr(x_scratch), dptr(fg), sequence * kEncoderWidth, stream);
-        if (!st.ok_status()) return st;
-        st = driver_->rms_norm_fp16(
-            dptr(x_scratch), dptr(ones), dptr(norm_scratch),
-            static_cast<int>(sequence), kEncoderWidth, 1e-6f, stream);
-        if (!st.ok_status()) return st;
-        float gate_scale = 0.0f;
-        st = measure_scale(
-            *driver_, dptr(norm_scratch), dptr(fp8_scratch),
-            static_cast<float*>(dptr(dynamic_scale)),
-            scale_ptr(scales, site + 2), sequence * kEncoderWidth, stream,
-            &gate_scale);
-        if (!st.ok_status()) return st;
-        st = driver_->residual_rms_norm_fp8_noweight(
-            dptr(x), dptr(fg), dptr(x_fp8), static_cast<int>(sequence),
-            kEncoderWidth, scale_ptr(scales, site + 2), stream);
-        if (!st.ok_status()) return st;
-        st = driver_->fp8_cutlass(
-            dptr(x_fp8), dptr(gate_w), dptr(gate), static_cast<int>(sequence),
-            2 * kEncoderHidden, kEncoderWidth,
-            gate_scale * weight_scales.encoder[site + 2], 0.0f,
-            NativeThorFp8Tactic::kT1, stream);
-        if (!st.ok_status()) return st;
-        st = driver_->gate_gelu_fp16(
-            dptr(gate), dptr(hidden), static_cast<int>(sequence),
-            kEncoderHidden, stream);
-        if (!st.ok_status()) return st;
-        float down_scale = 0.0f;
-        st = measure_scale(
-            *driver_, dptr(hidden), dptr(fp8_scratch),
-            static_cast<float*>(dptr(dynamic_scale)),
-            scale_ptr(scales, site + 3), sequence * kEncoderHidden, stream,
-            &down_scale);
-        if (!st.ok_status()) return st;
-        st = driver_->gate_gelu_fp8(
-            dptr(gate), dptr(hidden_fp8), static_cast<int>(sequence),
-            kEncoderHidden, scale_ptr(scales, site + 3), stream);
-        if (!st.ok_status()) return st;
-        st = driver_->fp8_cutlass(
-            dptr(hidden_fp8), dptr(down_w), dptr(fg),
-            static_cast<int>(sequence), kEncoderWidth, kEncoderHidden,
-            down_scale * weight_scales.encoder[site + 3], 0.0f,
-            NativeThorFp8Tactic::kWide, stream);
-        if (!st.ok_status()) return st;
-        st = driver_->residual_add_fp16(
-            dptr(x), dptr(fg), sequence * kEncoderWidth, stream);
-        if (!st.ok_status()) return st;
+    const NativeDeviceWeight* o_w = weight(
+        weights, "encoder_attn_o_w_" + suffix,
+        NativeWeightDType::kFp8E4M3, {kEncoderWidth, kEncoderWidth});
+    const NativeDeviceWeight* gate_w = weight(
+        weights, "encoder_ffn_gate_up_w_" + suffix,
+        NativeWeightDType::kFp8E4M3,
+        {2 * kEncoderHidden, kEncoderWidth});
+    const NativeDeviceWeight* down_w = weight(
+        weights, "encoder_ffn_down_w_" + suffix,
+        NativeWeightDType::kFp8E4M3,
+        {kEncoderWidth, kEncoderHidden});
+    if (!o_w || !gate_w || !down_w) {
+        return invalid("Thor encoder calibration weights are incomplete");
     }
+    float o_scale = 0.0f;
+    st = measure_scale(
+        *driver_, dptr(attention), dptr(fp8_scratch),
+        static_cast<float*>(dptr(dynamic_scale)),
+        scale_ptr(scales, site + 1), sequence * kEncoderWidth, stream,
+        &o_scale);
+    if (!st.ok_status()) return st;
+    st = driver_->quantize_fp8_static(
+        dptr(attention), dptr(o_fp8), scale_ptr(scales, site + 1),
+        sequence * kEncoderWidth, stream);
+    if (!st.ok_status()) return st;
+    st = driver_->fp8_cutlass(
+        dptr(o_fp8), dptr(o_w), dptr(fg), static_cast<int>(sequence),
+        kEncoderWidth, kEncoderWidth,
+        o_scale * weight_scales.encoder[site + 1], 0.0f,
+        NativeThorFp8Tactic::kSquare, stream);
+    if (!st.ok_status()) return st;
 
+    st = copy_device(dptr(x_scratch), dptr(x),
+                     sequence * kEncoderWidth * 2, stream);
+    if (!st.ok_status()) return st;
+    st = driver_->residual_add_fp16(
+        dptr(x_scratch), dptr(fg), sequence * kEncoderWidth, stream);
+    if (!st.ok_status()) return st;
+    st = driver_->rms_norm_fp16(
+        dptr(x_scratch), dptr(ones), dptr(norm_scratch),
+        static_cast<int>(sequence), kEncoderWidth, 1e-6f, stream);
+    if (!st.ok_status()) return st;
+    float gate_scale = 0.0f;
+    st = measure_scale(
+        *driver_, dptr(norm_scratch), dptr(fp8_scratch),
+        static_cast<float*>(dptr(dynamic_scale)),
+        scale_ptr(scales, site + 2), sequence * kEncoderWidth, stream,
+        &gate_scale);
+    if (!st.ok_status()) return st;
+    st = driver_->residual_rms_norm_fp8_noweight(
+        dptr(x), dptr(fg), dptr(x_fp8), static_cast<int>(sequence),
+        kEncoderWidth, scale_ptr(scales, site + 2), stream);
+    if (!st.ok_status()) return st;
+    st = driver_->fp8_cutlass(
+        dptr(x_fp8), dptr(gate_w), dptr(gate), static_cast<int>(sequence),
+        2 * kEncoderHidden, kEncoderWidth,
+        gate_scale * weight_scales.encoder[site + 2], 0.0f,
+        NativeThorFp8Tactic::kT1, stream);
+    if (!st.ok_status()) return st;
+    st = driver_->gate_gelu_fp16(
+        dptr(gate), dptr(hidden), static_cast<int>(sequence),
+        kEncoderHidden, stream);
+    if (!st.ok_status()) return st;
+    float down_scale = 0.0f;
+    st = measure_scale(
+        *driver_, dptr(hidden), dptr(fp8_scratch),
+        static_cast<float*>(dptr(dynamic_scale)),
+        scale_ptr(scales, site + 3), sequence * kEncoderHidden, stream,
+        &down_scale);
+    if (!st.ok_status()) return st;
+    st = driver_->gate_gelu_fp8(
+        dptr(gate), dptr(hidden_fp8), static_cast<int>(sequence),
+        kEncoderHidden, scale_ptr(scales, site + 3), stream);
+    if (!st.ok_status()) return st;
+    st = driver_->fp8_cutlass(
+        dptr(hidden_fp8), dptr(down_w), dptr(fg),
+        static_cast<int>(sequence), kEncoderWidth, kEncoderHidden,
+        down_scale * weight_scales.encoder[site + 3], 0.0f,
+        NativeThorFp8Tactic::kWide, stream);
+    if (!st.ok_status()) return st;
+    st = driver_->residual_add_fp16(
+        dptr(x), dptr(fg), sequence * kEncoderWidth, stream);
+    if (!st.ok_status()) return st;
+    return modalities::Status::ok();
+}
+
+modalities::Status NativeThorFp8Forward::calibration_encoder_end(
+    NativeWorkspace* workspace,
+    std::vector<float>* sample_scales,
+    std::uintptr_t stream) const {
+    if (!driver_ || !driver_->status().ok_status() || !workspace ||
+        !sample_scales ||
+        workspace->activation_dtype() != modalities::DType::kFloat16) {
+        return invalid("Thor encoder calibration result is invalid");
+    }
+    const NativeWorkspaceBuffer* scales = buffer(
+        *workspace, "encoder_sample_scales", modalities::DType::kFloat32,
+        {kLayers, 4});
+    if (!scales) {
+        return invalid("Thor encoder calibration scales are incomplete");
+    }
     // The last encoder layer only writes Q/K/V. Canonical non-zero values keep
     // the artifact valid without advertising measurements for skipped sites.
     const float unused_scales[] = {1.0f, 1.0f, 1.0f};
-    rc = cudaMemcpyAsync(
+    cudaError_t rc = cudaMemcpyAsync(
         scale_ptr(scales, (kLayers - 1) * 4 + 1), unused_scales,
         sizeof(unused_scales), cudaMemcpyHostToDevice,
         reinterpret_cast<cudaStream_t>(stream));
@@ -726,22 +756,42 @@ modalities::Status NativeThorFp8Forward::calibrate_encoder(
                              : backend(cudaGetErrorString(rc));
 }
 
-modalities::Status NativeThorFp8Forward::calibrate_decoder(
-    const NativeDeviceWeightStore& weights,
+modalities::Status NativeThorFp8Forward::calibration_decoder_begin(
     NativeWorkspace* workspace,
-    std::vector<float>* sample_scales,
     std::uintptr_t stream) const {
     if (!driver_ || !driver_->status().ok_status() || !workspace ||
-        !sample_scales ||
         workspace->activation_dtype() != modalities::DType::kFloat16) {
         return invalid("Thor decoder calibration owner is invalid");
+    }
+    const std::uint64_t steps = workspace->num_steps();
+    const NativeWorkspaceBuffer* scales = buffer(
+        *workspace, "decoder_sample_scales", modalities::DType::kFloat32,
+        {steps, kLayers, 4});
+    if (!scales) {
+        return invalid("Thor decoder calibration scales are incomplete");
+    }
+    const std::size_t scale_count = steps * kLayers * 4;
+    const cudaError_t rc = cudaMemsetAsync(
+        dptr(scales), 0, scale_count * sizeof(float),
+        reinterpret_cast<cudaStream_t>(stream));
+    return rc == cudaSuccess ? modalities::Status::ok()
+                             : backend(cudaGetErrorString(rc));
+}
+
+modalities::Status NativeThorFp8Forward::calibration_decoder_layer(
+    int step,
+    int layer,
+    const NativeDeviceWeightStore& weights,
+    NativeWorkspace* workspace,
+    std::uintptr_t stream) const {
+    if (step < 0 || layer < 0 || layer >= kLayers || !driver_ ||
+        !driver_->status().ok_status() || !workspace ||
+        workspace->activation_dtype() != modalities::DType::kFloat16) {
+        return invalid("Thor decoder calibration layer is invalid");
     }
     const std::uint64_t sequence = workspace->chunk_size();
     const std::uint64_t steps = workspace->num_steps();
     const std::uint64_t keys = workspace->total_keys();
-    const NativeWorkspaceBuffer* noise = buffer(
-        *workspace, "diffusion_noise", modalities::DType::kFloat16,
-        {sequence, 32});
     const NativeWorkspaceBuffer* x = buffer(
         *workspace, "decoder_x", modalities::DType::kFloat16,
         {sequence, kDecoderWidth});
@@ -766,9 +816,6 @@ modalities::Status NativeThorFp8Forward::calibrate_decoder(
     const NativeWorkspaceBuffer* fg = buffer(
         *workspace, "decoder_fg", modalities::DType::kFloat16,
         {sequence, 2 * kDecoderHidden});
-    const NativeWorkspaceBuffer* action_f32 = buffer(
-        *workspace, "decoder_action_f32", modalities::DType::kFloat32,
-        {sequence, 32});
     const NativeWorkspaceBuffer* xn_fp8 = buffer(
         *workspace, "decoder_x_fp8", modalities::DType::kUInt8,
         {sequence, kDecoderWidth});
@@ -795,9 +842,6 @@ modalities::Status NativeThorFp8Forward::calibrate_decoder(
     const NativeWorkspaceBuffer* style_ffn = buffer(
         *workspace, "decoder_style_ffn", modalities::DType::kFloat16,
         {steps, kLayers, sequence, 3 * kDecoderWidth});
-    const NativeWorkspaceBuffer* style_final = buffer(
-        *workspace, "decoder_style_final", modalities::DType::kFloat16,
-        {steps, sequence, 3 * kDecoderWidth});
     const NativeWorkspaceBuffer* key_cache = buffer(
         *workspace, "encoder_k_cache", modalities::DType::kFloat16,
         {kLayers, keys, kHeadDimension});
@@ -813,253 +857,225 @@ modalities::Status NativeThorFp8Forward::calibrate_decoder(
     const NativeDeviceWeight* weight_scales = weight(
         weights, "decoder_weight_scales", NativeWeightDType::kFloat32,
         {kLayers * 4});
-    const NativeDeviceWeight* input_w = weight(
-        weights, "decoder_action_in_proj_w", NativeWeightDType::kFloat16,
-        {32, kDecoderWidth});
-    const NativeDeviceWeight* input_b = weight(
-        weights, "decoder_action_in_proj_b", NativeWeightDType::kFloat16,
-        {kDecoderWidth});
-    const NativeDeviceWeight* output_w = weight(
-        weights, "decoder_action_out_proj_w", NativeWeightDType::kFloat16,
-        {kDecoderWidth, 32});
-    const NativeDeviceWeight* output_b = weight(
-        weights, "decoder_action_out_proj_b", NativeWeightDType::kFloat16,
-        {32});
-    if (!noise || !x || !xn || !gate || !qkv || !logits || !attention ||
-        !hidden || !fg || !action_f32 || !xn_fp8 || !hidden_fp8 ||
+    if (static_cast<std::uint64_t>(step) >= steps ||
+        !x || !xn || !gate || !qkv || !logits || !attention ||
+        !hidden || !fg || !xn_fp8 || !hidden_fp8 ||
         !context_fp8 || !fp8_scratch || !sample_scale_buffer ||
         !dynamic_scale || !rope || !style_attn || !style_ffn ||
-        !style_final || !key_cache || !value_cache ||
-        !device_position || !weight_scales || !input_w || !input_b ||
-        !output_w || !output_b) {
+        !key_cache || !value_cache || !valid_keys || !device_position ||
+        !weight_scales) {
         return invalid("Thor decoder calibration workspace is incomplete");
     }
 
-    const std::size_t scale_count = steps * kLayers * 4;
-    cudaError_t rc = cudaMemsetAsync(
-        dptr(sample_scale_buffer), 0, scale_count * sizeof(float),
-        reinterpret_cast<cudaStream_t>(stream));
-    if (rc != cudaSuccess) return backend(cudaGetErrorString(rc));
-
     const float attention_scale =
         1.0f / std::sqrt(static_cast<float>(kHeadDimension));
-    const float dt = -1.0f / static_cast<float>(steps);
     const std::size_t cache_layer_elements = keys * kHeadDimension;
     const std::size_t style_row_elements = sequence * 3 * kDecoderWidth;
-    for (int step = 0; step < static_cast<int>(steps); ++step) {
-        modalities::Status st;
-        st = driver_->gmm_fp16(
-            dptr(noise), dptr(input_w), dptr(x), static_cast<int>(sequence),
-            kDecoderWidth, 32, 0.0f, stream);
-        if (!st.ok_status()) return st;
-        st = driver_->add_bias_fp16(
-            dptr(x), dptr(input_b), static_cast<int>(sequence),
-            kDecoderWidth, stream);
-        if (!st.ok_status()) return st;
+    modalities::Status st = modalities::Status::ok();
+    const std::string suffix = std::to_string(layer);
+    const NativeDeviceWeight* qkv_w = weight(
+        weights, "decoder_attn_qkv_w_" + suffix,
+        NativeWeightDType::kFp8E4M3, {kDecoderWidth, 2560});
+    const NativeDeviceWeight* o_w = weight(
+        weights, "decoder_attn_o_w_" + suffix,
+        NativeWeightDType::kFp8E4M3,
+        {kEncoderWidth, kDecoderWidth});
+    const NativeDeviceWeight* gate_w = weight(
+        weights, "decoder_ffn_gate_up_w_" + suffix,
+        NativeWeightDType::kFp8E4M3,
+        {kDecoderWidth, 2 * kDecoderHidden});
+    const NativeDeviceWeight* down_w = weight(
+        weights, "decoder_ffn_down_w_" + suffix,
+        NativeWeightDType::kFp8E4M3,
+        {kDecoderHidden, kDecoderWidth});
+    if (!qkv_w || !o_w || !gate_w || !down_w) {
+        return invalid("Thor decoder calibration weights are incomplete");
+    }
+    const std::size_t site =
+        (static_cast<std::size_t>(step) * kLayers + layer) * 4;
+    const std::size_t style_site =
+        (static_cast<std::size_t>(step) * kLayers + layer) *
+        style_row_elements;
+    const void* attn_style =
+        offset_bytes(dptr(style_attn), style_site * 2);
+    const void* ffn_style =
+        offset_bytes(dptr(style_ffn), style_site * 2);
 
-        for (int layer = 0; layer < kLayers; ++layer) {
-            const std::string suffix = std::to_string(layer);
-            const NativeDeviceWeight* qkv_w = weight(
-                weights, "decoder_attn_qkv_w_" + suffix,
-                NativeWeightDType::kFp8E4M3, {kDecoderWidth, 2560});
-            const NativeDeviceWeight* o_w = weight(
-                weights, "decoder_attn_o_w_" + suffix,
-                NativeWeightDType::kFp8E4M3,
-                {kEncoderWidth, kDecoderWidth});
-            const NativeDeviceWeight* gate_w = weight(
-                weights, "decoder_ffn_gate_up_w_" + suffix,
-                NativeWeightDType::kFp8E4M3,
-                {kDecoderWidth, 2 * kDecoderHidden});
-            const NativeDeviceWeight* down_w = weight(
-                weights, "decoder_ffn_down_w_" + suffix,
-                NativeWeightDType::kFp8E4M3,
-                {kDecoderHidden, kDecoderWidth});
-            if (!qkv_w || !o_w || !gate_w || !down_w) {
-                return invalid("Thor decoder calibration weights are incomplete");
-            }
-            const std::size_t site =
-                (static_cast<std::size_t>(step) * kLayers + layer) * 4;
-            const std::size_t style_site =
-                (static_cast<std::size_t>(step) * kLayers + layer) *
-                style_row_elements;
-            const void* attn_style =
-                offset_bytes(dptr(style_attn), style_site * 2);
-            const void* ffn_style =
-                offset_bytes(dptr(style_ffn), style_site * 2);
-
-            if (layer == 0) {
-                st = driver_->adarms_fp16(
-                    dptr(x), attn_style, dptr(xn), dptr(gate),
-                    static_cast<int>(sequence), kDecoderWidth, stream);
-                if (!st.ok_status()) return st;
-                st = measure_scale(
-                    *driver_, dptr(xn), dptr(fp8_scratch),
-                    static_cast<float*>(dptr(dynamic_scale)),
-                    scale_ptr(sample_scale_buffer, site),
-                    sequence * kDecoderWidth, stream);
-                if (!st.ok_status()) return st;
-                st = driver_->fused_adarms_fp8(
-                    dptr(x), attn_style, dptr(xn_fp8), dptr(gate),
-                    static_cast<int>(sequence), kDecoderWidth,
-                    scale_ptr(sample_scale_buffer, site), stream);
-                if (!st.ok_status()) return st;
-            }
-
-            st = driver_->fp8_descale(
-                dptr(xn_fp8), dptr(qkv_w), dptr(qkv),
-                static_cast<int>(sequence), 2560, kDecoderWidth,
-                scale_ptr(sample_scale_buffer, site),
-                scale_ptr(weight_scales, static_cast<std::size_t>(layer) * 4),
-                stream);
-            if (!st.ok_status()) return st;
-            st = driver_->qkv_rope_cache_devpos_fp16(
-                dptr(qkv), dptr(rope), dptr(attention), dptr(key_cache),
-                dptr(value_cache), static_cast<const int*>(dptr(device_position)),
-                static_cast<int>(sequence), kEncoderWidth, kHeadDimension,
-                kHeadDimension, 2560,
-                static_cast<int>(static_cast<std::size_t>(layer) *
-                                 cache_layer_elements),
-                kHeadDimension, stream);
-            if (!st.ok_status()) return st;
-            void* layer_key = offset_bytes(
-                dptr(key_cache), static_cast<std::size_t>(layer) *
-                                     cache_layer_elements * 2);
-            void* layer_value = offset_bytes(
-                dptr(value_cache), static_cast<std::size_t>(layer) *
-                                       cache_layer_elements * 2);
-            st = driver_->attention_seqused_fp16(
-                dptr(attention), layer_key, layer_value, dptr(logits),
-                dptr(attention), static_cast<int>(sequence),
-                static_cast<int>(keys), kHeads, kHeadDimension,
-                static_cast<const int*>(dptr(valid_keys)), attention_scale,
-                stream);
-            if (!st.ok_status()) return st;
-
-            st = measure_scale(
-                *driver_, dptr(attention), dptr(fp8_scratch),
-                static_cast<float*>(dptr(dynamic_scale)),
-                scale_ptr(sample_scale_buffer, site + 1),
-                sequence * kEncoderWidth, stream);
-            if (!st.ok_status()) return st;
-            st = driver_->quantize_fp8_static(
-                dptr(attention), dptr(context_fp8),
-                scale_ptr(sample_scale_buffer, site + 1),
-                sequence * kEncoderWidth, stream);
-            if (!st.ok_status()) return st;
-            st = driver_->fp8_descale(
-                dptr(context_fp8), dptr(o_w), dptr(fg),
-                static_cast<int>(sequence), kDecoderWidth, kEncoderWidth,
-                scale_ptr(sample_scale_buffer, site + 1),
-                scale_ptr(weight_scales,
-                          static_cast<std::size_t>(layer) * 4 + 1),
-                stream);
-            if (!st.ok_status()) return st;
-
-            st = driver_->gate_res_fp16(
-                dptr(fg), dptr(gate), dptr(x),
-                sequence * kDecoderWidth, stream);
-            if (!st.ok_status()) return st;
-            st = driver_->adarms_fp16(
-                dptr(x), ffn_style, dptr(xn), dptr(gate),
-                static_cast<int>(sequence), kDecoderWidth, stream);
-            if (!st.ok_status()) return st;
-            st = measure_scale(
-                *driver_, dptr(xn), dptr(fp8_scratch),
-                static_cast<float*>(dptr(dynamic_scale)),
-                scale_ptr(sample_scale_buffer, site + 2),
-                sequence * kDecoderWidth, stream);
-            if (!st.ok_status()) return st;
-            st = driver_->quantize_fp8_static(
-                dptr(xn), dptr(xn_fp8),
-                scale_ptr(sample_scale_buffer, site + 2),
-                sequence * kDecoderWidth, stream);
-            if (!st.ok_status()) return st;
-            st = driver_->fp8_descale(
-                dptr(xn_fp8), dptr(gate_w), dptr(fg),
-                static_cast<int>(sequence), 2 * kDecoderHidden,
-                kDecoderWidth, scale_ptr(sample_scale_buffer, site + 2),
-                scale_ptr(weight_scales,
-                          static_cast<std::size_t>(layer) * 4 + 2),
-                stream);
-            if (!st.ok_status()) return st;
-
-            st = driver_->gate_gelu_fp16(
-                dptr(fg), dptr(hidden), static_cast<int>(sequence),
-                kDecoderHidden, stream);
-            if (!st.ok_status()) return st;
-            st = measure_scale(
-                *driver_, dptr(hidden), dptr(fp8_scratch),
-                static_cast<float*>(dptr(dynamic_scale)),
-                scale_ptr(sample_scale_buffer, site + 3),
-                sequence * kDecoderHidden, stream);
-            if (!st.ok_status()) return st;
-            st = driver_->gate_gelu_fp8(
-                dptr(fg), dptr(hidden_fp8), static_cast<int>(sequence),
-                kDecoderHidden,
-                scale_ptr(sample_scale_buffer, site + 3), stream);
-            if (!st.ok_status()) return st;
-            st = driver_->fp8_descale(
-                dptr(hidden_fp8), dptr(down_w), dptr(fg),
-                static_cast<int>(sequence), kDecoderWidth, kDecoderHidden,
-                scale_ptr(sample_scale_buffer, site + 3),
-                scale_ptr(weight_scales,
-                          static_cast<std::size_t>(layer) * 4 + 3),
-                stream);
-            if (!st.ok_status()) return st;
-
-            if (layer + 1 < kLayers) {
-                const std::size_t next_style_site =
-                    style_site + style_row_elements;
-                const void* next_attn_style = offset_bytes(
-                    dptr(style_attn), next_style_site * 2);
-                st = driver_->gate_res_fp16(
-                    dptr(fg), dptr(gate), dptr(x),
-                    sequence * kDecoderWidth, stream);
-                if (!st.ok_status()) return st;
-                st = driver_->adarms_fp16(
-                    dptr(x), next_attn_style, dptr(xn), dptr(gate),
-                    static_cast<int>(sequence), kDecoderWidth, stream);
-                if (!st.ok_status()) return st;
-                st = measure_scale(
-                    *driver_, dptr(xn), dptr(fp8_scratch),
-                    static_cast<float*>(dptr(dynamic_scale)),
-                    scale_ptr(sample_scale_buffer, site + 4),
-                    sequence * kDecoderWidth, stream);
-                if (!st.ok_status()) return st;
-                st = driver_->quantize_fp8_static(
-                    dptr(xn), dptr(xn_fp8),
-                    scale_ptr(sample_scale_buffer, site + 4),
-                    sequence * kDecoderWidth, stream);
-            } else {
-                st = driver_->gate_res_fp16(
-                    dptr(fg), dptr(gate), dptr(x),
-                    sequence * kDecoderWidth, stream);
-            }
-            if (!st.ok_status()) return st;
-        }
-
-        const void* final_style = offset_bytes(
-            dptr(style_final), static_cast<std::size_t>(step) *
-                                   style_row_elements * 2);
+    if (layer == 0) {
         st = driver_->adarms_fp16(
-            dptr(x), final_style, dptr(xn), dptr(gate),
+            dptr(x), attn_style, dptr(xn), dptr(gate),
             static_cast<int>(sequence), kDecoderWidth, stream);
         if (!st.ok_status()) return st;
-        st = driver_->gmm_fp16_out_fp32(
-            dptr(xn), dptr(output_w), static_cast<float*>(dptr(action_f32)),
-            static_cast<int>(sequence), 32, kDecoderWidth, stream);
+        st = measure_scale(
+            *driver_, dptr(xn), dptr(fp8_scratch),
+            static_cast<float*>(dptr(dynamic_scale)),
+            scale_ptr(sample_scale_buffer, site),
+            sequence * kDecoderWidth, stream);
         if (!st.ok_status()) return st;
-        st = driver_->action_update_fp16(
-            static_cast<const float*>(dptr(action_f32)), dptr(output_b),
-            dptr(noise), static_cast<int>(sequence), 32, dt, stream);
+        st = driver_->fused_adarms_fp8(
+            dptr(x), attn_style, dptr(xn_fp8), dptr(gate),
+            static_cast<int>(sequence), kDecoderWidth,
+            scale_ptr(sample_scale_buffer, site), stream);
         if (!st.ok_status()) return st;
     }
 
+    st = driver_->fp8_descale(
+        dptr(xn_fp8), dptr(qkv_w), dptr(qkv),
+        static_cast<int>(sequence), 2560, kDecoderWidth,
+        scale_ptr(sample_scale_buffer, site),
+        scale_ptr(weight_scales, static_cast<std::size_t>(layer) * 4),
+        stream);
+    if (!st.ok_status()) return st;
+    st = driver_->qkv_rope_cache_devpos_fp16(
+        dptr(qkv), dptr(rope), dptr(attention), dptr(key_cache),
+        dptr(value_cache), static_cast<const int*>(dptr(device_position)),
+        static_cast<int>(sequence), kEncoderWidth, kHeadDimension,
+        kHeadDimension, 2560,
+        static_cast<int>(static_cast<std::size_t>(layer) *
+                         cache_layer_elements),
+        kHeadDimension, stream);
+    if (!st.ok_status()) return st;
+    void* layer_key = offset_bytes(
+        dptr(key_cache), static_cast<std::size_t>(layer) *
+                             cache_layer_elements * 2);
+    void* layer_value = offset_bytes(
+        dptr(value_cache), static_cast<std::size_t>(layer) *
+                               cache_layer_elements * 2);
+    st = driver_->attention_seqused_fp16(
+        dptr(attention), layer_key, layer_value, dptr(logits),
+        dptr(attention), static_cast<int>(sequence),
+        static_cast<int>(keys), kHeads, kHeadDimension,
+        static_cast<const int*>(dptr(valid_keys)), attention_scale,
+        stream);
+    if (!st.ok_status()) return st;
+
+    st = measure_scale(
+        *driver_, dptr(attention), dptr(fp8_scratch),
+        static_cast<float*>(dptr(dynamic_scale)),
+        scale_ptr(sample_scale_buffer, site + 1),
+        sequence * kEncoderWidth, stream);
+    if (!st.ok_status()) return st;
+    st = driver_->quantize_fp8_static(
+        dptr(attention), dptr(context_fp8),
+        scale_ptr(sample_scale_buffer, site + 1),
+        sequence * kEncoderWidth, stream);
+    if (!st.ok_status()) return st;
+    st = driver_->fp8_descale(
+        dptr(context_fp8), dptr(o_w), dptr(fg),
+        static_cast<int>(sequence), kDecoderWidth, kEncoderWidth,
+        scale_ptr(sample_scale_buffer, site + 1),
+        scale_ptr(weight_scales,
+                  static_cast<std::size_t>(layer) * 4 + 1),
+        stream);
+    if (!st.ok_status()) return st;
+
+    st = driver_->gate_res_fp16(
+        dptr(fg), dptr(gate), dptr(x),
+        sequence * kDecoderWidth, stream);
+    if (!st.ok_status()) return st;
+    st = driver_->adarms_fp16(
+        dptr(x), ffn_style, dptr(xn), dptr(gate),
+        static_cast<int>(sequence), kDecoderWidth, stream);
+    if (!st.ok_status()) return st;
+    st = measure_scale(
+        *driver_, dptr(xn), dptr(fp8_scratch),
+        static_cast<float*>(dptr(dynamic_scale)),
+        scale_ptr(sample_scale_buffer, site + 2),
+        sequence * kDecoderWidth, stream);
+    if (!st.ok_status()) return st;
+    st = driver_->quantize_fp8_static(
+        dptr(xn), dptr(xn_fp8),
+        scale_ptr(sample_scale_buffer, site + 2),
+        sequence * kDecoderWidth, stream);
+    if (!st.ok_status()) return st;
+    st = driver_->fp8_descale(
+        dptr(xn_fp8), dptr(gate_w), dptr(fg),
+        static_cast<int>(sequence), 2 * kDecoderHidden,
+        kDecoderWidth, scale_ptr(sample_scale_buffer, site + 2),
+        scale_ptr(weight_scales,
+                  static_cast<std::size_t>(layer) * 4 + 2),
+        stream);
+    if (!st.ok_status()) return st;
+
+    st = driver_->gate_gelu_fp16(
+        dptr(fg), dptr(hidden), static_cast<int>(sequence),
+        kDecoderHidden, stream);
+    if (!st.ok_status()) return st;
+    st = measure_scale(
+        *driver_, dptr(hidden), dptr(fp8_scratch),
+        static_cast<float*>(dptr(dynamic_scale)),
+        scale_ptr(sample_scale_buffer, site + 3),
+        sequence * kDecoderHidden, stream);
+    if (!st.ok_status()) return st;
+    st = driver_->gate_gelu_fp8(
+        dptr(fg), dptr(hidden_fp8), static_cast<int>(sequence),
+        kDecoderHidden,
+        scale_ptr(sample_scale_buffer, site + 3), stream);
+    if (!st.ok_status()) return st;
+    st = driver_->fp8_descale(
+        dptr(hidden_fp8), dptr(down_w), dptr(fg),
+        static_cast<int>(sequence), kDecoderWidth, kDecoderHidden,
+        scale_ptr(sample_scale_buffer, site + 3),
+        scale_ptr(weight_scales,
+                  static_cast<std::size_t>(layer) * 4 + 3),
+        stream);
+    if (!st.ok_status()) return st;
+
+    if (layer + 1 < kLayers) {
+        const std::size_t next_style_site =
+            style_site + style_row_elements;
+        const void* next_attn_style = offset_bytes(
+            dptr(style_attn), next_style_site * 2);
+        st = driver_->gate_res_fp16(
+            dptr(fg), dptr(gate), dptr(x),
+            sequence * kDecoderWidth, stream);
+        if (!st.ok_status()) return st;
+        st = driver_->adarms_fp16(
+            dptr(x), next_attn_style, dptr(xn), dptr(gate),
+            static_cast<int>(sequence), kDecoderWidth, stream);
+        if (!st.ok_status()) return st;
+        st = measure_scale(
+            *driver_, dptr(xn), dptr(fp8_scratch),
+            static_cast<float*>(dptr(dynamic_scale)),
+            scale_ptr(sample_scale_buffer, site + 4),
+            sequence * kDecoderWidth, stream);
+        if (!st.ok_status()) return st;
+        st = driver_->quantize_fp8_static(
+            dptr(xn), dptr(xn_fp8),
+            scale_ptr(sample_scale_buffer, site + 4),
+            sequence * kDecoderWidth, stream);
+    } else {
+        st = driver_->gate_res_fp16(
+            dptr(fg), dptr(gate), dptr(x),
+            sequence * kDecoderWidth, stream);
+    }
+    if (!st.ok_status()) return st;
+    return modalities::Status::ok();
+}
+
+modalities::Status NativeThorFp8Forward::calibration_decoder_end(
+    NativeWorkspace* workspace,
+    std::vector<float>* sample_scales,
+    std::uintptr_t stream) const {
+    if (!driver_ || !driver_->status().ok_status() || !workspace ||
+        !sample_scales ||
+        workspace->activation_dtype() != modalities::DType::kFloat16) {
+        return invalid("Thor decoder calibration result is invalid");
+    }
+    const std::uint64_t steps = workspace->num_steps();
+    const NativeWorkspaceBuffer* sample_scale_buffer = buffer(
+        *workspace, "decoder_sample_scales", modalities::DType::kFloat32,
+        {steps, kLayers, 4});
+    if (!sample_scale_buffer) {
+        return invalid("Thor decoder calibration scales are incomplete");
+    }
+    const std::size_t scale_count = steps * kLayers * 4;
     modalities::Status st = synchronize(stream);
     if (!st.ok_status()) return st;
     sample_scales->resize(scale_count);
-    rc = cudaMemcpy(sample_scales->data(), dptr(sample_scale_buffer),
-                    scale_count * sizeof(float), cudaMemcpyDeviceToHost);
+    const cudaError_t rc = cudaMemcpy(
+        sample_scales->data(), dptr(sample_scale_buffer),
+        scale_count * sizeof(float), cudaMemcpyDeviceToHost);
     return rc == cudaSuccess ? modalities::Status::ok()
                              : backend(cudaGetErrorString(rc));
 }
