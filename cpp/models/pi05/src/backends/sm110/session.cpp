@@ -59,8 +59,7 @@ bool calibration_matches(const NativeCalibrationArtifact& artifact,
 Sm110BackendSession::Sm110BackendSession(
     frt_ctx ctx,
     const BackendConfig& config)
-    : graphs_(ctx, static_cast<std::size_t>(GraphKind::kCount)),
-      config_(config),
+    : Pi05Pipeline(ctx, config),
       weights_(ctx),
       workspace_(ctx),
       forward_(&driver_) {}
@@ -137,7 +136,7 @@ modalities::Status Sm110BackendSession::initialize(
     report("header");
     NativeThorWeightMaterializer materializer(source, &weights_);
     NativeThorMaterializationOptions options;
-    options.num_steps = config_.num_steps;
+    options.num_steps = config().num_steps;
     options.include_embedding = true;
     modalities::Status st =
         materializer.materialize_all(options, &weight_scales_);
@@ -145,11 +144,11 @@ modalities::Status Sm110BackendSession::initialize(
     report("materialize");
 
     NativeWorkspaceConfig workspace_config;
-    workspace_config.num_views = config_.num_views;
-    workspace_config.max_prompt_tokens = config_.max_prompt_tokens;
-    workspace_config.chunk_size = config_.chunk_size;
-    workspace_config.num_steps = config_.num_steps;
-    workspace_config.vision_pool_factor = config_.vision_pool_factor;
+    workspace_config.num_views = config().num_views;
+    workspace_config.max_prompt_tokens = config().max_prompt_tokens;
+    workspace_config.chunk_size = config().chunk_size;
+    workspace_config.num_steps = config().num_steps;
+    workspace_config.vision_pool_factor = config().vision_pool_factor;
     workspace_config.flavor = NativeWorkspaceFlavor::kThorFp8;
     st = workspace_.allocate(workspace_config);
     if (!st.ok_status()) return st;
@@ -184,59 +183,9 @@ modalities::Status Sm110BackendSession::initialize(
         workspace_, weights_, NativeWeightDType::kFloat16, &artifacts_);
     if (!st.ok_status()) return st;
 
-    for (const char* name : {"observation_images_normalized",
-                             "prompt_embedding", "diffusion_noise"}) {
-        const NativeWorkspaceBuffer* input = workspace_.find(name);
-        if (!input ||
-            cudaMemset(frt_buffer_dptr(input->buffer), 0,
-                       frt_buffer_bytes(input->buffer)) != cudaSuccess) {
-            return backend("Thor graph input initialization failed");
-        }
-    }
-    if (cudaDeviceSynchronize() != cudaSuccess) {
-        return backend("Thor graph setup synchronization failed");
-    }
-
-    // CUTLASS, cuBLAS, and FMHA initialize tactics outside CUDA capture.
-    st = record(GraphKind::kInfer, nullptr);
+    st = finish_prepare(true);
     if (!st.ok_status()) return st;
-    if (cudaDeviceSynchronize() != cudaSuccess) {
-        return backend("Thor graph warmup synchronization failed");
-    }
-    const NativeWorkspaceBuffer* noise = workspace_.find("diffusion_noise");
-    if (!noise ||
-        cudaMemset(frt_buffer_dptr(noise->buffer), 0,
-                   frt_buffer_bytes(noise->buffer)) != cudaSuccess) {
-        return backend("Thor graph warmup reset failed");
-    }
-    report("warmup");
-
-    st = capture_backend_graph(
-        &graphs_,
-        GraphKind::kInfer, workspace_,
-        {"observation_images_normalized", "prompt_embedding", "encoder_x",
-         "diffusion_noise", "rtc_prev_action_chunk", "rtc_prefix_weights",
-         "rtc_guidance_weight"},
-        record_graph, this);
-    if (!st.ok_status()) return st;
-    st = capture_backend_graph(
-        &graphs_,
-        GraphKind::kDecodeOnly, workspace_,
-        {"encoder_x", "diffusion_noise", "rtc_prev_action_chunk",
-         "rtc_prefix_weights", "rtc_guidance_weight"},
-        record_graph, this);
-    if (!st.ok_status()) return st;
-    st = capture_backend_graph(
-        &graphs_,
-        GraphKind::kContext, workspace_,
-        {"observation_images_normalized", "prompt_embedding", "encoder_x"},
-        record_graph, this);
-    if (!st.ok_status()) return st;
-    report("capture");
-
-    st = graphs_.create_replay_stream();
-    if (!st.ok_status()) return st;
-    report("stream");
+    report("graph_prepare");
     if (profile_setup) {
         const auto now = std::chrono::steady_clock::now();
         std::fprintf(stderr, "native_thor_setup total_ms=%.3f\n",
@@ -246,48 +195,25 @@ modalities::Status Sm110BackendSession::initialize(
     return modalities::Status::ok();
 }
 
-modalities::Status Sm110BackendSession::record_context(void* stream) {
-    modalities::Status st = copy_prompt_to_encoder(&workspace_, stream);
-    if (!st.ok_status()) return st;
-    const std::uintptr_t stream_id = reinterpret_cast<std::uintptr_t>(stream);
-    st = forward_.vision(weights_, &workspace_, weight_scales_, stream_id);
-    if (!st.ok_status()) return st;
-    return forward_.encoder(
-        weights_, &workspace_, encoder_alphas_, stream_id);
+modalities::Status Sm110BackendSession::record_vision(void* stream) {
+    return forward_.vision(
+        weights_, &workspace_, weight_scales_,
+        reinterpret_cast<std::uintptr_t>(stream));
 }
 
-modalities::Status Sm110BackendSession::record_action(void* stream) {
+modalities::Status Sm110BackendSession::record_encoder(void* stream) {
+    return forward_.encoder(
+        weights_, &workspace_, encoder_alphas_,
+        reinterpret_cast<std::uintptr_t>(stream));
+}
+
+modalities::Status Sm110BackendSession::record_diffusion(void* stream) {
     return forward_.diffusion(
         weights_, &workspace_, reinterpret_cast<std::uintptr_t>(stream));
 }
 
-modalities::Status Sm110BackendSession::record(GraphKind kind,
-                                                 void* stream) {
-    if (kind == GraphKind::kContext) return record_context(stream);
-    if (kind == GraphKind::kDecodeOnly) return record_action(stream);
-    if (kind != GraphKind::kInfer) {
-        return invalid("Thor graph kind is invalid");
-    }
-    modalities::Status st = record_context(stream);
-    return st.ok_status() ? record_action(stream) : st;
-}
-
-modalities::Status Sm110BackendSession::record_graph(
-    void* user, std::size_t slot, void* stream) {
-    auto* session = static_cast<Sm110BackendSession*>(user);
-    return session->record(static_cast<GraphKind>(slot), stream);
-}
-
 modalities::Status Sm110BackendSession::set_prompt_length(int prompt_tokens) {
     return workspace_.set_fixed_prompt_length(prompt_tokens);
-}
-
-int Sm110BackendSession::replay(GraphKind kind) const {
-    return graphs_.replay(static_cast<std::size_t>(kind));
-}
-
-modalities::Status Sm110BackendSession::synchronize() const {
-    return graphs_.synchronize();
 }
 
 }  // namespace pi05

@@ -63,19 +63,44 @@ modalities::Status resolve_backend_artifacts(
     NativeWeightDType embedding_dtype,
     BackendArtifacts* artifacts);
 
-class BackendSession {
+class Pi05Pipeline {
 public:
-    virtual ~BackendSession() = default;
+    Pi05Pipeline(frt_ctx context, const BackendConfig& config);
+    virtual ~Pi05Pipeline() = default;
 
-    virtual frt_ctx context() const = 0;
-    virtual frt_graph graph(GraphKind kind) const = 0;
+    Pi05Pipeline(const Pi05Pipeline&) = delete;
+    Pi05Pipeline& operator=(const Pi05Pipeline&) = delete;
+
+    frt_ctx context() const { return graphs_.context(); }
+    frt_graph graph(GraphKind kind) const {
+        return graphs_.graph(static_cast<std::size_t>(kind));
+    }
     frt_graph infer_graph() const { return graph(GraphKind::kInfer); }
-    virtual int stream_id() const = 0;
-    virtual void* native_stream() const = 0;
+    int stream_id() const { return graphs_.stream_id(); }
+    void* native_stream() const { return graphs_.native_stream(); }
+    const BackendConfig& config() const { return config_; }
     virtual const BackendArtifacts& artifacts() const = 0;
     virtual modalities::Status set_prompt_length(int prompt_tokens) = 0;
-    virtual int replay(GraphKind kind = GraphKind::kInfer) const = 0;
-    virtual modalities::Status synchronize() const = 0;
+    int replay(GraphKind kind = GraphKind::kInfer) const;
+    modalities::Status synchronize() const;
+
+protected:
+    modalities::Status finish_prepare(bool warmup_before_capture);
+    virtual NativeWorkspace& workspace() = 0;
+    virtual const NativeWorkspace& workspace() const = 0;
+    virtual modalities::Status record_vision(void* stream) = 0;
+    virtual modalities::Status record_encoder(void* stream) = 0;
+    virtual modalities::Status record_diffusion(void* stream) = 0;
+
+private:
+    modalities::Status initialize_capture_inputs();
+    modalities::Status record(GraphKind kind, void* stream);
+    modalities::Status record_context(void* stream);
+    static modalities::Status record_graph(
+        void* owner, std::size_t slot, void* stream);
+
+    native::CudaGraphSet graphs_;
+    BackendConfig config_;
 };
 
 }  // namespace pi05

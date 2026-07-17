@@ -12,7 +12,7 @@ namespace flashrt {
 namespace models {
 namespace pi05 {
 
-class Sm120BackendSession final : public BackendSession {
+class Sm120BackendSession final : public Pi05Pipeline {
 public:
     static std::unique_ptr<Sm120BackendSession> create(
         const std::string& checkpoint_path, const BackendConfig& config,
@@ -30,17 +30,10 @@ public:
     Sm120BackendSession(const Sm120BackendSession&) = delete;
     Sm120BackendSession& operator=(const Sm120BackendSession&) = delete;
 
-    frt_ctx context() const override { return graphs_.context(); }
-    frt_graph graph(GraphKind kind) const override {
-        return graphs_.graph(static_cast<std::size_t>(kind));
-    }
-    int stream_id() const override { return graphs_.stream_id(); }
-    void* native_stream() const override { return graphs_.native_stream(); }
-    const BackendConfig& config() const { return config_; }
     NativeDeviceWeightStore& weights() { return weights_; }
     const NativeDeviceWeightStore& weights() const { return weights_; }
-    NativeWorkspace& workspace() { return workspace_; }
-    const NativeWorkspace& workspace() const { return workspace_; }
+    NativeWorkspace& workspace() override { return workspace_; }
+    const NativeWorkspace& workspace() const override { return workspace_; }
     const BackendArtifacts& artifacts() const override {
         return artifacts_;
     }
@@ -48,8 +41,6 @@ public:
     const NativeRtxAttentionWorkspace& attention() const { return attention_; }
 
     modalities::Status set_prompt_length(int prompt_tokens) override;
-    int replay(GraphKind kind = GraphKind::kInfer) const override;
-    modalities::Status synchronize() const override;
 
 private:
     Sm120BackendSession(frt_ctx ctx, const BackendConfig& config,
@@ -57,14 +48,10 @@ private:
     modalities::Status initialize(
         const std::string& checkpoint_path,
         const NativeCalibrationArtifact* calibration);
-    modalities::Status record(GraphKind kind, void* stream);
-    modalities::Status record_context(void* stream);
-    modalities::Status record_action(void* stream);
-    static modalities::Status record_graph(
-        void* user, std::size_t slot, void* stream);
+    modalities::Status record_vision(void* stream) override;
+    modalities::Status record_encoder(void* stream) override;
+    modalities::Status record_diffusion(void* stream) override;
 
-    native::CudaGraphSet graphs_;
-    BackendConfig config_;
     NativeDeviceWeightStore weights_;
     NativeWorkspace workspace_;
     BackendArtifacts artifacts_;

@@ -30,11 +30,11 @@ namespace pi05 {
 namespace {
 
 void release_backend_session(void* owner) {
-    delete static_cast<BackendSession*>(owner);
+    delete static_cast<Pi05Pipeline*>(owner);
 }
 
 int update_prompt_length(void* owner, std::uint64_t prompt_len) {
-    auto* graph = static_cast<BackendSession*>(owner);
+    auto* graph = static_cast<Pi05Pipeline*>(owner);
     if (!graph || prompt_len > static_cast<std::uint64_t>(INT_MAX)) return -1;
     return cface::status_code(
         graph->set_prompt_length(static_cast<int>(prompt_len)));
@@ -208,7 +208,7 @@ int build_native_model_runtime(const NativeOpenConfig& config,
                                  ? BackendPrecision::kFp8E4M3
                                  : BackendPrecision::kBf16;
     modalities::Status st;
-    std::unique_ptr<BackendSession> graph;
+    std::unique_ptr<Pi05Pipeline> graph;
     const bool thor_fp8 = precision == Precision::kFp8E4M3Fn &&
                           properties.major == 11;
     const bool rtx_fp8 = precision == Precision::kFp8E4M3Fn &&
@@ -414,7 +414,7 @@ int build_native_model_runtime(const NativeOpenConfig& config,
     }
     if (!ok) return fail_builder(builder, error, "native port/stage build failed");
 
-    BackendSession* raw_graph = graph.release();
+    Pi05Pipeline* raw_graph = graph.release();
     /* This base is retained only by the verb override below and is never
      * returned to a consumer. The published object always has real verbs. */
     frt_model_runtime_verbs base_verbs = unpublished_verbs();

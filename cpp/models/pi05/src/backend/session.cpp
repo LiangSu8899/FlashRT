@@ -23,6 +23,10 @@ modalities::Status backend(const char* message) {
 
 }  // namespace
 
+Pi05Pipeline::Pi05Pipeline(frt_ctx context, const BackendConfig& config)
+    : graphs_(context, static_cast<std::size_t>(GraphKind::kCount)),
+      config_(config) {}
+
 const char* backend_graph_name(GraphKind kind) {
     switch (kind) {
         case GraphKind::kInfer: return "infer";
@@ -109,6 +113,97 @@ modalities::Status resolve_backend_artifacts(
     }
     *artifacts = result;
     return modalities::Status::ok();
+}
+modalities::Status Pi05Pipeline::initialize_capture_inputs() {
+    for (const char* name : {"observation_images_normalized",
+                             "prompt_embedding", "encoder_x",
+                             "diffusion_noise"}) {
+        const NativeWorkspaceBuffer* buffer = workspace().find(name);
+        if (!buffer ||
+            cudaMemset(frt_buffer_dptr(buffer->buffer), 0,
+                       frt_buffer_bytes(buffer->buffer)) != cudaSuccess) {
+            return backend("Pi0.5 graph input initialization failed");
+        }
+    }
+    return cudaDeviceSynchronize() == cudaSuccess
+               ? modalities::Status::ok()
+               : backend("Pi0.5 graph setup synchronization failed");
+}
+
+modalities::Status Pi05Pipeline::record_context(void* stream) {
+    modalities::Status st = copy_prompt_to_encoder(&workspace(), stream);
+    if (!st.ok_status()) return st;
+    st = record_vision(stream);
+    return st.ok_status() ? record_encoder(stream) : st;
+}
+
+modalities::Status Pi05Pipeline::record(GraphKind kind, void* stream) {
+    if (kind == GraphKind::kContext) return record_context(stream);
+    if (kind == GraphKind::kDecodeOnly) return record_diffusion(stream);
+    if (kind != GraphKind::kInfer) {
+        return invalid("Pi0.5 graph kind is invalid");
+    }
+    modalities::Status st = record_context(stream);
+    return st.ok_status() ? record_diffusion(stream) : st;
+}
+
+modalities::Status Pi05Pipeline::record_graph(
+    void* owner, std::size_t slot, void* stream) {
+    auto* pipeline = static_cast<Pi05Pipeline*>(owner);
+    if (!pipeline || slot >= static_cast<std::size_t>(GraphKind::kCount)) {
+        return invalid("Pi0.5 graph record request is invalid");
+    }
+    return pipeline->record(static_cast<GraphKind>(slot), stream);
+}
+
+modalities::Status Pi05Pipeline::finish_prepare(
+    bool warmup_before_capture) {
+    modalities::Status st = initialize_capture_inputs();
+    if (!st.ok_status()) return st;
+
+    if (warmup_before_capture) {
+        // Initialize vendor-library tactics before entering CUDA capture.
+        st = record(GraphKind::kInfer, nullptr);
+        if (!st.ok_status()) return st;
+        if (cudaDeviceSynchronize() != cudaSuccess) {
+            return backend("Pi0.5 graph warmup synchronization failed");
+        }
+        const NativeWorkspaceBuffer* noise =
+            workspace().find("diffusion_noise");
+        if (!noise ||
+            cudaMemset(frt_buffer_dptr(noise->buffer), 0,
+                       frt_buffer_bytes(noise->buffer)) != cudaSuccess) {
+            return backend("Pi0.5 graph warmup reset failed");
+        }
+    }
+
+    st = capture_backend_graph(
+        &graphs_, GraphKind::kInfer, workspace(),
+        {"observation_images_normalized", "prompt_embedding", "encoder_x",
+         "diffusion_noise", "rtc_prev_action_chunk", "rtc_prefix_weights",
+         "rtc_guidance_weight"},
+        record_graph, this);
+    if (!st.ok_status()) return st;
+    st = capture_backend_graph(
+        &graphs_, GraphKind::kDecodeOnly, workspace(),
+        {"encoder_x", "diffusion_noise", "rtc_prev_action_chunk",
+         "rtc_prefix_weights", "rtc_guidance_weight"},
+        record_graph, this);
+    if (!st.ok_status()) return st;
+    st = capture_backend_graph(
+        &graphs_, GraphKind::kContext, workspace(),
+        {"observation_images_normalized", "prompt_embedding", "encoder_x"},
+        record_graph, this);
+    if (!st.ok_status()) return st;
+    return graphs_.create_replay_stream();
+}
+
+int Pi05Pipeline::replay(GraphKind kind) const {
+    return graphs_.replay(static_cast<std::size_t>(kind));
+}
+
+modalities::Status Pi05Pipeline::synchronize() const {
+    return graphs_.synchronize();
 }
 
 }  // namespace pi05

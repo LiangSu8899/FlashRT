@@ -55,8 +55,7 @@ Sm120BackendSession::Sm120BackendSession(
     frt_ctx ctx,
     const BackendConfig& config,
     NativeRtxLinearMode linear_mode)
-    : graphs_(ctx, static_cast<std::size_t>(GraphKind::kCount)),
-      config_(config),
+    : Pi05Pipeline(ctx, config),
       weights_(ctx),
       workspace_(ctx),
       attention_(ctx),
@@ -195,7 +194,7 @@ modalities::Status Sm120BackendSession::initialize(
     report("header");
     NativeWeightMaterializer materializer(source, &weights_);
     NativeMaterializationOptions options;
-    options.num_steps = config_.num_steps;
+    options.num_steps = config().num_steps;
     options.merge_decoder_gate_up = fp8;
     options.include_embedding = true;
     modalities::Status st = materializer.materialize_all(options);
@@ -209,11 +208,11 @@ modalities::Status Sm120BackendSession::initialize(
     }
 
     NativeWorkspaceConfig workspace_config;
-    workspace_config.num_views = config_.num_views;
-    workspace_config.max_prompt_tokens = config_.max_prompt_tokens;
-    workspace_config.chunk_size = config_.chunk_size;
-    workspace_config.num_steps = config_.num_steps;
-    workspace_config.vision_pool_factor = config_.vision_pool_factor;
+    workspace_config.num_views = config().num_views;
+    workspace_config.max_prompt_tokens = config().max_prompt_tokens;
+    workspace_config.chunk_size = config().chunk_size;
+    workspace_config.num_steps = config().num_steps;
+    workspace_config.vision_pool_factor = config().vision_pool_factor;
     workspace_config.flavor = fp8 ? NativeWorkspaceFlavor::kRtxFp8
                                   : NativeWorkspaceFlavor::kBf16;
     st = workspace_.allocate(workspace_config);
@@ -243,7 +242,7 @@ modalities::Status Sm120BackendSession::initialize(
         st = upload_scales(
             &workspace_, "rtx_fp8_decoder_scales",
             std::vector<float>(
-                static_cast<std::size_t>(config_.num_steps) * 18 * 4,
+                static_cast<std::size_t>(config().num_steps) * 18 * 4,
                 1.0f));
         if (!st.ok_status()) return st;
     }
@@ -251,11 +250,11 @@ modalities::Status Sm120BackendSession::initialize(
     if (!st.ok_status()) return st;
 
     NativeRtxAttentionConfig attention_config;
-    attention_config.num_views = config_.num_views;
+    attention_config.num_views = config().num_views;
     attention_config.encoder_sequence = workspace_.encoder_sequence();
     attention_config.encoder_vision_sequence =
         workspace_.encoder_vision_sequence();
-    attention_config.chunk_size = config_.chunk_size;
+    attention_config.chunk_size = config().chunk_size;
     st = attention_.allocate(attention_config);
     if (!st.ok_status()) return st;
     st = set_prompt_length(0);
@@ -273,8 +272,8 @@ modalities::Status Sm120BackendSession::initialize(
     if (!st.ok_status()) return st;
     if (fp8) {
         st = autotune_native_rtx_fp8(
-            weights_, &workspace_, linear_, config_.num_views,
-            config_.chunk_size);
+            weights_, &workspace_, linear_, config().num_views,
+            config().chunk_size);
         if (!st.ok_status()) return st;
         report("fp8_autotune");
     }
@@ -284,47 +283,9 @@ modalities::Status Sm120BackendSession::initialize(
         workspace_, weights_, NativeWeightDType::kBf16, &artifacts_);
     if (!st.ok_status()) return st;
 
-    for (const char* name : {"observation_images_normalized",
-                             "prompt_embedding", "encoder_x",
-                             "diffusion_noise"}) {
-        const NativeWorkspaceBuffer* buffer = workspace_.find(name);
-        if (!buffer ||
-            cudaMemset(frt_buffer_dptr(buffer->buffer), 0,
-                       frt_buffer_bytes(buffer->buffer)) != cudaSuccess) {
-            return backend("native graph input initialization failed");
-        }
-    }
-    if (cudaDeviceSynchronize() != cudaSuccess) {
-        return backend("native graph setup synchronization failed");
-    }
-    report("input_init");
-
-    st = capture_backend_graph(
-        &graphs_,
-        GraphKind::kInfer, workspace_,
-        {"observation_images_normalized", "prompt_embedding", "encoder_x",
-         "diffusion_noise", "rtc_prev_action_chunk", "rtc_prefix_weights",
-         "rtc_guidance_weight"},
-        record_graph, this);
+    st = finish_prepare(false);
     if (!st.ok_status()) return st;
-    st = capture_backend_graph(
-        &graphs_,
-        GraphKind::kDecodeOnly, workspace_,
-        {"encoder_x", "diffusion_noise", "rtc_prev_action_chunk",
-         "rtc_prefix_weights", "rtc_guidance_weight"},
-        record_graph, this);
-    if (!st.ok_status()) return st;
-    st = capture_backend_graph(
-        &graphs_,
-        GraphKind::kContext, workspace_,
-        {"observation_images_normalized", "prompt_embedding", "encoder_x"},
-        record_graph, this);
-    if (!st.ok_status()) return st;
-    report("capture");
-
-    st = graphs_.create_replay_stream();
-    if (!st.ok_status()) return st;
-    report("stream");
+    report("graph_prepare");
     if (profile_setup) {
         const auto now = std::chrono::steady_clock::now();
         std::fprintf(stderr, "native_setup total_ms=%.3f\n",
@@ -334,55 +295,28 @@ modalities::Status Sm120BackendSession::initialize(
     return modalities::Status::ok();
 }
 
-modalities::Status Sm120BackendSession::record_context(void* stream) {
-    modalities::Status st = copy_prompt_to_encoder(&workspace_, stream);
-    if (!st.ok_status()) return st;
-    st = forward_.vision(
+modalities::Status Sm120BackendSession::record_vision(void* stream) {
+    return forward_.vision(
         weights_, &workspace_, &attention_, attention_driver_.get(),
         reinterpret_cast<std::uintptr_t>(stream));
-    if (!st.ok_status()) return st;
-    st = forward_.encoder(weights_, &workspace_, &attention_,
-                          attention_driver_.get(),
-                          reinterpret_cast<std::uintptr_t>(stream));
-    if (!st.ok_status()) return st;
-    return st;
 }
 
-modalities::Status Sm120BackendSession::record_action(void* stream) {
+modalities::Status Sm120BackendSession::record_encoder(void* stream) {
+    return forward_.encoder(weights_, &workspace_, &attention_,
+                            attention_driver_.get(),
+                            reinterpret_cast<std::uintptr_t>(stream));
+}
+
+modalities::Status Sm120BackendSession::record_diffusion(void* stream) {
     return forward_.diffusion(weights_, &workspace_, &attention_,
                               attention_driver_.get(),
                               reinterpret_cast<std::uintptr_t>(stream));
-}
-
-modalities::Status Sm120BackendSession::record(GraphKind kind,
-                                             void* stream) {
-    if (kind == GraphKind::kContext) return record_context(stream);
-    if (kind == GraphKind::kDecodeOnly) return record_action(stream);
-    if (kind != GraphKind::kInfer) {
-        return invalid("native graph kind is invalid");
-    }
-    modalities::Status st = record_context(stream);
-    return st.ok_status() ? record_action(stream) : st;
-}
-
-modalities::Status Sm120BackendSession::record_graph(
-    void* user, std::size_t slot, void* stream) {
-    auto* session = static_cast<Sm120BackendSession*>(user);
-    return session->record(static_cast<GraphKind>(slot), stream);
 }
 
 modalities::Status Sm120BackendSession::set_prompt_length(int prompt_tokens) {
     modalities::Status st = attention_.set_fixed_prompt_length(prompt_tokens);
     if (!st.ok_status()) return st;
     return workspace_.update_decoder_rope(prompt_tokens);
-}
-
-int Sm120BackendSession::replay(GraphKind kind) const {
-    return graphs_.replay(static_cast<std::size_t>(kind));
-}
-
-modalities::Status Sm120BackendSession::synchronize() const {
-    return graphs_.synchronize();
 }
 
 }  // namespace pi05
