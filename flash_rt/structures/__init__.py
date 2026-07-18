@@ -22,6 +22,16 @@ def get(name):
     return _get(name)
 
 
+def capture(fn, **kwargs):
+    """Capture door: graph a hot stage with declared swap windows.
+
+    See :func:`flash_rt.structures.stages.capture`.
+    """
+    from flash_rt.structures.stages import capture as _capture
+
+    return _capture(fn, **kwargs)
+
+
 def attach(model, forward, **kwargs):
     """One-call front door: discover, calibrate, gate, activate.
 
@@ -33,4 +43,5 @@ def attach(model, forward, **kwargs):
     return _attach(model, forward, **kwargs)
 
 
-__all__ = ["StructureSpec", "attach", "get", "list_structures", "load"]
+__all__ = ["StructureSpec", "attach", "capture", "get", "list_structures",
+           "load"]
