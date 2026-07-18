@@ -1,4 +1,5 @@
 #include "quantize.cuh"
+#include "flashrt/runtime.h"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime_api.h>
@@ -28,16 +29,6 @@ bool has_cuda_device() {
     const cudaError_t status = cudaGetDeviceCount(&count);
     if (status != cudaSuccess) cudaGetLastError();
     return status == cudaSuccess && count > 0;
-}
-
-std::uint64_t fnv1a(const void* data, std::size_t bytes) {
-    std::uint64_t value = 14695981039346656037ull;
-    const auto* input = static_cast<const unsigned char*>(data);
-    for (std::size_t i = 0; i < bytes; ++i) {
-        value ^= input[i];
-        value *= 1099511628211ull;
-    }
-    return value;
 }
 
 std::vector<__nv_bfloat16> golden_input() {
@@ -114,7 +105,7 @@ int main() {
     std::memcpy(&scale_bits, &scale, sizeof(scale_bits));
     if (scale_bits != kScaleBits ||
         output[kMidpointIndex] != kMidpointOutput ||
-        fnv1a(output.data(), output.size()) != kOutputHash) {
+        frt_runtime_fingerprint(output.data(), output.size()) != kOutputHash) {
         std::fprintf(stderr,
                      "precise FP8 weight quantize golden mismatch\n");
         return 1;

@@ -348,7 +348,7 @@ if(BUILD_TESTING)
     add_executable(test_csrc_fp8_weight_quantize
       tests/test_csrc_fp8_weight_quantize.cu)
     target_link_libraries(test_csrc_fp8_weight_quantize PRIVATE
-      flashrt_cpp_csrc_core CUDA::cudart)
+      flashrt_cpp_csrc_core flashrt_runtime CUDA::cudart)
     set_target_properties(test_csrc_fp8_weight_quantize PROPERTIES
       CUDA_STANDARD 17
       CUDA_STANDARD_REQUIRED ON)
