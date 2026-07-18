@@ -17,6 +17,9 @@ void gate_silu_mul(const __nv_bfloat16* gate, const __nv_bfloat16* up,
 
 void gelu_inplace(__nv_bfloat16* x, int n, cudaStream_t stream = 0);
 
+void silu_inplace_bf16(__nv_bfloat16* x, int n,
+                       cudaStream_t stream = 0);
+
 // G7.11 — fused (bias add + GELU(tanh)) in-place on bf16 tensor.
 // x: (M, N) bf16; bias: (N,) bf16 broadcast over rows. Replaces
 // add_bias_bf16 + gelu_inplace pair (2 launches -> 1).

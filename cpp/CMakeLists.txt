@@ -302,6 +302,17 @@ if(BUILD_TESTING)
     add_test(NAME csrc_rope_table COMMAND test_csrc_rope_table)
   endif()
 
+  if(TARGET flashrt_cpp_csrc_core)
+    add_executable(test_csrc_bf16_operations
+      tests/test_csrc_bf16_operations.cu)
+    target_link_libraries(test_csrc_bf16_operations PRIVATE
+      flashrt_cpp_csrc_core CUDA::cudart)
+    set_target_properties(test_csrc_bf16_operations PROPERTIES
+      CUDA_STANDARD 17
+      CUDA_STANDARD_REQUIRED ON)
+    add_test(NAME csrc_bf16_operations COMMAND test_csrc_bf16_operations)
+  endif()
+
   add_executable(test_safetensors_loader tests/test_safetensors_loader.cpp)
   target_link_libraries(test_safetensors_loader PRIVATE flashrt_cpp_loader)
   add_test(NAME safetensors_loader COMMAND test_safetensors_loader)

@@ -2463,3 +2463,17 @@ void gpu_euler_step(float* actions, const __half* velocity,
     euler_step_kernel<<<(n + 255) / 256, 256, 0, stream>>>(
         actions, velocity, dt, n, vel_elem_offset);
 }
+
+__global__ void fill_negative_infinity_f32_kernel(float* values,
+                                                   std::size_t count) {
+    std::size_t index =
+        static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index < count) values[index] = __int_as_float(0xff800000);
+}
+
+void fill_negative_infinity_f32(float* values, std::size_t count,
+                                cudaStream_t stream) {
+    if (!count) return;
+    fill_negative_infinity_f32_kernel<<<(count + 255) / 256, 256, 0,
+                                        stream>>>(values, count);
+}

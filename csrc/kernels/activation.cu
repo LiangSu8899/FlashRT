@@ -332,9 +332,22 @@ __global__ void silu_inplace_kernel(T* __restrict__ x, int n) {
 
 template __global__ void silu_inplace_kernel<__half>(__half*, int);
 
+__global__ void silu_inplace_bf16_kernel(__nv_bfloat16* x, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        float value = __bfloat162float(x[idx]);
+        x[idx] = __float2bfloat16(value / (1.0f + expf(-value)));
+    }
+}
+
 void silu_inplace_fp16(__half* x, int n, cudaStream_t stream) {
     int n2 = n >> 1;
     silu_inplace_kernel<__half><<<(n2 + 255) / 256, 256, 0, stream>>>(x, n);
+}
+
+void silu_inplace_bf16(__nv_bfloat16* x, int n, cudaStream_t stream) {
+    if (n <= 0) return;
+    silu_inplace_bf16_kernel<<<(n + 255) / 256, 256, 0, stream>>>(x, n);
 }
 
 // ── Fused add + SiLU: a = silu(a + b), used by Pi0 action_time_mlp ──
