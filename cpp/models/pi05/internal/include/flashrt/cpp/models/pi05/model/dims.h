@@ -49,6 +49,18 @@ inline constexpr Pi05ModelDims kPi05ModelDims{
     32, 257152, 2048,
 };
 
+struct Pi05ModelNumerics final {
+    float vision_layer_norm_epsilon;
+    float encoder_rms_norm_epsilon;
+    float decoder_rms_norm_epsilon;
+};
+
+inline constexpr Pi05ModelNumerics kPi05ModelNumerics{
+    1.0e-5f,
+    1.0e-6f,
+    1.0e-6f,
+};
+
 static_assert(kPi05ModelDims.image_height % kPi05ModelDims.vision_patch == 0 &&
                   kPi05ModelDims.image_width %
                           kPi05ModelDims.vision_patch ==

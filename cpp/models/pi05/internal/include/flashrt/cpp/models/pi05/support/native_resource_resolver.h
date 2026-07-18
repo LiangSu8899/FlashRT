@@ -31,11 +31,24 @@ struct Pi05TargetBufferBindings final {
     Pi05ResolvedBuffer decoder_position;
 };
 
+struct Pi05NativeSupportBuffers final {
+    Pi05ResolvedBuffer vision_patches;
+    Pi05ResolvedBuffer pooled_vision_state;
+    Pi05ResolvedBuffer expanded_vision_position;
+    Pi05ResolvedBuffer encoder_rms_weight;
+    Pi05ResolvedBuffer decoder_rms_weight;
+};
+
 modalities::Status resolve_pi05_native_buffers(
     const NativeWorkspace& workspace,
     const Pi05TargetBufferBindings& target,
     const Pi05ResolvedShape& shape,
     Pi05ResolvedBuffers* out);
+
+modalities::Status resolve_pi05_native_support_buffers(
+    const NativeWorkspace& workspace,
+    const Pi05ResolvedShape& shape,
+    Pi05NativeSupportBuffers* out);
 
 modalities::Status resolve_pi05_materialized_weights(
     const NativeDeviceWeightStore& store,

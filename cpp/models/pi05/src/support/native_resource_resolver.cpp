@@ -1,5 +1,7 @@
 #include "flashrt/cpp/models/pi05/support/native_resource_resolver.h"
 
+#include <initializer_list>
+#include <limits>
 #include <string>
 
 namespace flashrt {
@@ -33,6 +35,34 @@ bool copy_shape(const std::vector<std::uint64_t>& source,
     }
     *destination = result;
     return true;
+}
+
+bool physical_buffer_is(const Pi05ResolvedBuffer& buffer,
+                        modalities::DType dtype,
+                        std::initializer_list<std::uint64_t> dimensions) {
+    if (!buffer.buffer || !buffer.storage_identity ||
+        buffer.physical_dtype != dtype ||
+        buffer.physical_shape.rank != dimensions.size() ||
+        buffer.physical_bytes != frt_buffer_bytes(buffer.buffer) ||
+        buffer.storage_bytes != buffer.physical_bytes ||
+        buffer.storage_offset != 0 ||
+        buffer.storage_identity != frt_buffer_dptr(buffer.buffer)) {
+        return false;
+    }
+    std::uint64_t elements = 1;
+    std::size_t index = 0;
+    for (const std::uint64_t dimension : dimensions) {
+        if (!dimension ||
+            buffer.physical_shape.dims[index++] != dimension ||
+            elements > std::numeric_limits<std::uint64_t>::max() / dimension) {
+            return false;
+        }
+        elements *= dimension;
+    }
+    const std::size_t width = modalities::dtype_size(dtype);
+    return width &&
+           elements <= std::numeric_limits<std::uint64_t>::max() / width &&
+           buffer.physical_bytes == elements * width;
 }
 
 bool weight_storage(NativeWeightDType source,
@@ -247,6 +277,72 @@ modalities::Status resolve_pi05_native_buffers(
     }
     status = validate_pi05_resolved_buffers(result, shape);
     if (!status.ok_status()) return status;
+    *out = result;
+    return modalities::Status::ok();
+}
+
+modalities::Status resolve_pi05_native_support_buffers(
+    const NativeWorkspace& workspace,
+    const Pi05ResolvedShape& shape,
+    Pi05NativeSupportBuffers* out) {
+    if (!out) {
+        return invalid("PI0.5 native support destination is null");
+    }
+    modalities::Status status = validate_pi05_resolved_shape(shape);
+    if (!status.ok_status()) return status;
+    const modalities::DType activation = workspace.activation_dtype();
+    if (workspace.vision_sequence() != shape.vision_sequence ||
+        workspace.encoder_vision_sequence() !=
+            shape.encoder_vision_sequence ||
+        (activation != modalities::DType::kBFloat16 &&
+         activation != modalities::DType::kFloat16)) {
+        return invalid("PI0.5 native support shape identity is invalid");
+    }
+
+    Pi05NativeSupportBuffers result;
+    const struct {
+        const char* name;
+        Pi05ResolvedBuffer* destination;
+    } entries[] = {
+        {"vision_patches", &result.vision_patches},
+        {"vision_x_pooled", &result.pooled_vision_state},
+        {"vision_pos_embed_expanded", &result.expanded_vision_position},
+        {"encoder_rms_ones", &result.encoder_rms_weight},
+        {"decoder_rms_ones", &result.decoder_rms_weight},
+    };
+    for (const auto& entry : entries) {
+        status = resolve_workspace_control(
+            workspace, entry.name, entry.destination);
+        if (!status.ok_status()) return status;
+    }
+
+    const std::uint64_t vision_sequence =
+        static_cast<std::uint64_t>(shape.vision_sequence);
+    const std::uint64_t encoder_vision_sequence =
+        static_cast<std::uint64_t>(shape.encoder_vision_sequence);
+    const std::uint64_t patch_width =
+        static_cast<std::uint64_t>(kPi05ModelDims.vision_patch) *
+        static_cast<std::uint64_t>(kPi05ModelDims.vision_patch) *
+        static_cast<std::uint64_t>(kPi05ModelDims.image_channels);
+    const std::uint64_t vision_width =
+        static_cast<std::uint64_t>(kPi05ModelDims.vision_width);
+    if (!physical_buffer_is(
+            result.vision_patches, activation,
+            {vision_sequence, patch_width}) ||
+        !physical_buffer_is(
+            result.pooled_vision_state, activation,
+            {encoder_vision_sequence, vision_width}) ||
+        !physical_buffer_is(
+            result.expanded_vision_position, activation,
+            {vision_sequence, vision_width}) ||
+        !physical_buffer_is(
+            result.encoder_rms_weight, activation,
+            {static_cast<std::uint64_t>(kPi05ModelDims.encoder_width)}) ||
+        !physical_buffer_is(
+            result.decoder_rms_weight, activation,
+            {static_cast<std::uint64_t>(kPi05ModelDims.decoder_width)})) {
+        return invalid("PI0.5 native support metadata is invalid");
+    }
     *out = result;
     return modalities::Status::ok();
 }

@@ -8,6 +8,7 @@
 #include "flashrt/cpp/models/pi05/targets/sm120/attention.h"
 #include "flashrt/cpp/models/pi05/targets/sm120/attention_driver.h"
 #include "flashrt/cpp/models/pi05/targets/sm120/bf16_linear.h"
+#include "flashrt/cpp/models/pi05/targets/sm120/bf16_operations.h"
 #include "flashrt/cpp/models/pi05/targets/sm120/bf16_scratch.h"
 
 #include <cuda_bf16.h>
@@ -238,7 +239,9 @@ struct Sm120TargetBundle::Impl final {
     Sm120Bf16ScratchBacking scratch;
     std::unique_ptr<Sm120Bf16Linear> linear;
     std::unique_ptr<Sm120AttentionDriver> attention_driver;
+    std::unique_ptr<Sm120Bf16Operations> operations;
     Pi05ResolvedResources resources;
+    Pi05NativeSupportBuffers support;
     std::size_t prepare_cursor = 0;
     int prompt_length = 0;
     State state = State::kConstructed;
@@ -366,10 +369,15 @@ modalities::Status Sm120TargetBundle::resolve_resources(
             impl_->weights, impl_->shape, modalities::DType::kBFloat16,
             layout, &resolved.weights);
         if (!status.ok_status()) return impl_->fail(std::move(status));
+        Pi05NativeSupportBuffers support;
+        status = resolve_pi05_native_support_buffers(
+            impl_->workspace, impl_->shape, &support);
+        if (!status.ok_status()) return impl_->fail(std::move(status));
         status = validate_pi05_resolved_resources(resolved, impl_->shape);
         if (!status.ok_status()) return impl_->fail(std::move(status));
 
         impl_->resources = resolved;
+        impl_->support = support;
         impl_->state = Impl::State::kResourcesResolved;
         *out = resolved;
         return modalities::Status::ok();
@@ -389,56 +397,81 @@ modalities::Status Sm120TargetBundle::record(
     }
     modalities::Status status = validate_pi05_operation_call(call, shape);
     if (!status.ok_status()) return status;
-    if (!prepare_operation(call.id)) {
-        return unsupported("SM120 forward operations are not installed");
-    }
-    if (impl_->state != Impl::State::kResourcesResolved) {
-        return invalid("SM120 prepare operation state is invalid");
+    if (prepare_operation(call.id)) {
+        if (impl_->state != Impl::State::kResourcesResolved) {
+            return invalid("SM120 prepare operation state is invalid");
+        }
+        switch (call.id) {
+            case Pi05OperationId::kTimeMlp:
+                status = record_time_mlp(
+                    call, shape, impl_->resources, impl_->scratch,
+                    *impl_->linear, stream);
+                break;
+            case Pi05OperationId::kAttentionStyle: {
+                const Pi05DecoderLayerWeights& layer =
+                    impl_->resources.weights.decoder_layers[
+                        static_cast<std::size_t>(call.layer)];
+                status = record_style(
+                    call, shape, impl_->resources,
+                    layer.attention_mod_weight, layer.attention_mod_bias,
+                    impl_->resources.buffers.attention_style, true,
+                    *impl_->linear, stream);
+                break;
+            }
+            case Pi05OperationId::kMlpStyle: {
+                const Pi05DecoderLayerWeights& layer =
+                    impl_->resources.weights.decoder_layers[
+                        static_cast<std::size_t>(call.layer)];
+                status = record_style(
+                    call, shape, impl_->resources, layer.mlp_mod_weight,
+                    layer.mlp_mod_bias, impl_->resources.buffers.mlp_style,
+                    true, *impl_->linear, stream);
+                break;
+            }
+            case Pi05OperationId::kFinalStyle:
+                status = record_style(
+                    call, shape, impl_->resources,
+                    impl_->resources.weights.decoder.final_norm_mod_weight,
+                    impl_->resources.weights.decoder.final_norm_mod_bias,
+                    impl_->resources.buffers.final_style, false,
+                    *impl_->linear, stream);
+                break;
+            default:
+                return unsupported("SM120 prepare operation is unsupported");
+        }
+        if (!status.ok_status()) return impl_->fail(std::move(status));
+        ++impl_->prepare_cursor;
+        if (call.id == Pi05OperationId::kFinalStyle &&
+            call.step == shape.num_steps - 1) {
+            impl_->state = Impl::State::kPrepareComplete;
+        }
+        return modalities::Status::ok();
     }
 
+    if (impl_->state != Impl::State::kCaptureInputsInitialized ||
+        !impl_->operations) {
+        return invalid("SM120 forward operation state is invalid");
+    }
     switch (call.id) {
-        case Pi05OperationId::kTimeMlp:
-            status = record_time_mlp(call, shape, impl_->resources,
-                                     impl_->scratch, *impl_->linear, stream);
+        case Pi05OperationId::kComposePrompt:
+            status = impl_->operations->compose_prompt(stream);
             break;
-        case Pi05OperationId::kAttentionStyle: {
-            const Pi05DecoderLayerWeights& layer =
-                impl_->resources.weights.decoder_layers[
-                    static_cast<std::size_t>(call.layer)];
-            status = record_style(
-                call, shape, impl_->resources, layer.attention_mod_weight,
-                layer.attention_mod_bias,
-                impl_->resources.buffers.attention_style, true,
-                *impl_->linear, stream);
+        case Pi05OperationId::kVisionEmbed:
+            status = impl_->operations->vision_embed(stream);
             break;
-        }
-        case Pi05OperationId::kMlpStyle: {
-            const Pi05DecoderLayerWeights& layer =
-                impl_->resources.weights.decoder_layers[
-                    static_cast<std::size_t>(call.layer)];
-            status = record_style(
-                call, shape, impl_->resources, layer.mlp_mod_weight,
-                layer.mlp_mod_bias, impl_->resources.buffers.mlp_style,
-                true, *impl_->linear, stream);
+        case Pi05OperationId::kVisionAttention:
+            status = impl_->operations->vision_attention(call.layer, stream);
             break;
-        }
-        case Pi05OperationId::kFinalStyle:
-            status = record_style(
-                call, shape, impl_->resources,
-                impl_->resources.weights.decoder.final_norm_mod_weight,
-                impl_->resources.weights.decoder.final_norm_mod_bias,
-                impl_->resources.buffers.final_style, false,
-                *impl_->linear, stream);
+        case Pi05OperationId::kVisionMlp:
+            status = impl_->operations->vision_mlp(call.layer, stream);
+            break;
+        case Pi05OperationId::kVisionProject:
+            status = impl_->operations->vision_project(stream);
             break;
         default:
-            return unsupported("SM120 prepare operation is unsupported");
+            return unsupported("SM120 forward operation is not installed");
     }
     if (!status.ok_status()) return impl_->fail(std::move(status));
-    ++impl_->prepare_cursor;
-    if (call.id == Pi05OperationId::kFinalStyle &&
-        call.step == shape.num_steps - 1) {
-        impl_->state = Impl::State::kPrepareComplete;
-    }
     return modalities::Status::ok();
 }
 
@@ -457,6 +490,12 @@ modalities::Status Sm120TargetBundle::finalize_setup() {
     }
     modalities::Status status = impl_->attention_driver->status();
     if (!status.ok_status()) return impl_->fail(std::move(status));
+    impl_->operations = Sm120Bf16Operations::create(
+        impl_->shape, impl_->resources, impl_->support, impl_->scratch,
+        impl_->attention, *impl_->attention_driver, *impl_->linear, &status);
+    if (!impl_->operations || !status.ok_status()) {
+        return impl_->fail(std::move(status));
+    }
     impl_->state = Impl::State::kSetupFinalized;
     return modalities::Status::ok();
 }

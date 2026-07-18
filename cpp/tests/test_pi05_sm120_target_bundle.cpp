@@ -37,6 +37,33 @@ std::int32_t read_control(
     return value;
 }
 
+class VisionOnlySink final
+    : public flashrt::models::pi05::Pi05OperationSink {
+public:
+    explicit VisionOnlySink(flashrt::models::pi05::Pi05OperationSink* target)
+        : target_(target) {}
+
+    flashrt::modalities::Status record(
+        const flashrt::models::pi05::Pi05OperationCall& call,
+        const flashrt::models::pi05::Pi05ResolvedShape& shape,
+        flashrt::models::pi05::Pi05Stream stream) override {
+        using flashrt::models::pi05::Pi05OperationId;
+        switch (call.id) {
+            case Pi05OperationId::kComposePrompt:
+            case Pi05OperationId::kVisionEmbed:
+            case Pi05OperationId::kVisionAttention:
+            case Pi05OperationId::kVisionMlp:
+            case Pi05OperationId::kVisionProject:
+                return target_->record(call, shape, stream);
+            default:
+                return flashrt::modalities::Status::ok();
+        }
+    }
+
+private:
+    flashrt::models::pi05::Pi05OperationSink* target_ = nullptr;
+};
+
 }  // namespace
 
 int main() {
@@ -126,6 +153,9 @@ int main() {
     assert(!target->initialize_capture_inputs().ok_status());
     assert(target->ready_for_capture());
     assert(target->reset_after_warmup().ok_status());
+    VisionOnlySink vision(target.get());
+    assert(pipeline.record_context(vision).ok_status());
+    assert(cudaDeviceSynchronize() == cudaSuccess);
     assert(!pipeline.record_context(*target).ok_status());
 
     target.reset();
