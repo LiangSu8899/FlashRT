@@ -164,6 +164,13 @@ if(OpenSSL_FOUND)
   target_link_libraries(flashrt_cpp_loader PRIVATE OpenSSL::Crypto)
 endif()
 
+set(FLASHRT_CPP_PI05_SUPPORT_SRCS
+  models/pi05/src/support/native_rope_unavailable.cpp)
+if(FLASHRT_CPP_WITH_CUDA_KERNELS)
+  set(FLASHRT_CPP_PI05_SUPPORT_SRCS
+    models/pi05/src/support/native_rope.cu)
+endif()
+
 add_library(flashrt_cpp_pi05 STATIC
   models/pi05/src/model/dims.cpp
   models/pi05/src/model/execution_plan.cpp
@@ -172,8 +179,12 @@ add_library(flashrt_cpp_pi05 STATIC
   models/pi05/src/model/resolved_resources.cpp
   models/pi05/src/model/semantic_pipeline.cpp
   models/pi05/src/support/native_calibration.cpp
+  models/pi05/src/support/native_device_weights.cpp
+  models/pi05/src/support/native_weight_materializer.cpp
   models/pi05/src/support/native_weight_ops.cpp
   models/pi05/src/support/native_weights.cpp
+  models/pi05/src/support/native_workspace.cpp
+  ${FLASHRT_CPP_PI05_SUPPORT_SRCS}
   models/pi05/src/spec.cpp
   models/pi05/src/io.cpp
   models/pi05/src/runtime.cpp)
@@ -190,6 +201,11 @@ endif()
 if(FLASHRT_CPP_WITH_CUDA_KERNELS)
   target_compile_definitions(flashrt_cpp_pi05
     PRIVATE FLASHRT_CPP_WITH_CUDA_KERNELS=1)
+  target_link_libraries(flashrt_cpp_pi05 PRIVATE
+    flashrt_cpp_csrc_precise_math CUDA::cudart)
+  set_target_properties(flashrt_cpp_pi05 PROPERTIES
+    CUDA_STANDARD 17
+    CUDA_STANDARD_REQUIRED ON)
 endif()
 
 if(TARGET flashrt_cpp_native_cuda)
