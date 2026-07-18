@@ -3,6 +3,7 @@
 
 #include "flashrt/cpp/models/pi05/model/resolved_resources.h"
 
+#include <cstddef>
 #include <cstdint>
 
 namespace flashrt {
@@ -39,6 +40,19 @@ struct Pi05LinearWeightGroup final {
     Pi05ResolvedWeight* fused = nullptr;
 };
 
+struct Pi05LinearScaleLayout final {
+    std::size_t vision = 0;
+    std::size_t encoder = 0;
+    std::size_t decoder = 0;
+
+    std::size_t total() const { return vision + encoder + decoder; }
+};
+
+struct Pi05LinearActivationSite final {
+    Pi05LinearDomain domain = Pi05LinearDomain::kVision;
+    std::size_t index = 0;
+};
+
 class Pi05LinearWeightGroupSink {
 public:
     virtual ~Pi05LinearWeightGroupSink() = default;
@@ -49,6 +63,16 @@ public:
 modalities::Status visit_pi05_linear_weight_groups(
     Pi05ResolvedWeights* weights,
     Pi05LinearWeightGroupSink* sink);
+
+modalities::Status resolve_pi05_linear_scale_layout(
+    const Pi05ResolvedShape& shape,
+    Pi05LinearScaleLayout* out);
+
+modalities::Status resolve_pi05_linear_activation_site(
+    const Pi05LinearWeightKey& key,
+    int step,
+    const Pi05ResolvedShape& shape,
+    Pi05LinearActivationSite* out);
 
 }  // namespace pi05
 }  // namespace models

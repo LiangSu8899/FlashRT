@@ -308,6 +308,7 @@ if(FLASHRT_CPP_WITH_PI05_SM120_TARGET)
     models/pi05/src/targets/sm120/bf16_linear.cpp
     models/pi05/src/targets/sm120/bf16_operations.cpp
     models/pi05/src/targets/sm120/bf16_scratch.cpp
+    models/pi05/src/targets/sm120/fp8_linear.cpp
     models/pi05/src/targets/sm120/fp8_weight_packer.cpp
     models/pi05/src/targets/sm120/target.cpp)
   target_include_directories(flashrt_cpp_pi05_target_sm120
@@ -475,6 +476,15 @@ if(BUILD_TESTING)
       flashrt_cpp_pi05_target_sm120 flashrt_exec CUDA::cudart)
     add_test(NAME pi05_sm120_fp8_weight_packer
       COMMAND test_pi05_sm120_fp8_weight_packer)
+
+    add_executable(test_pi05_sm120_fp8_linear
+      tests/test_pi05_sm120_fp8_linear.cpp)
+    target_include_directories(test_pi05_sm120_fp8_linear PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/internal/include)
+    target_link_libraries(test_pi05_sm120_fp8_linear PRIVATE
+      flashrt_cpp_pi05_target_sm120 flashrt_exec CUDA::cudart)
+    add_test(NAME pi05_sm120_fp8_linear
+      COMMAND test_pi05_sm120_fp8_linear)
 
     add_executable(test_pi05_sm120_target_bundle
       tests/test_pi05_sm120_target_bundle.cpp)

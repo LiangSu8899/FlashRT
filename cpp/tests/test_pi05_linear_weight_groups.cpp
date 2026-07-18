@@ -173,10 +173,124 @@ void test_failure_boundary() {
                .ok_status());
 }
 
+void check_site(
+    const pi05::Pi05ResolvedShape& shape,
+    pi05::Pi05LinearWeightKey key,
+    int step,
+    std::size_t expected) {
+    pi05::Pi05LinearActivationSite site;
+    CHECK(pi05::resolve_pi05_linear_activation_site(
+              key, step, shape, &site)
+              .ok_status());
+    CHECK(site.domain == key.domain);
+    CHECK(site.index == expected);
+}
+
+void test_activation_scale_layout() {
+    const pi05::Pi05ResolvedShape shape = fixture::canonical_shape();
+    pi05::Pi05LinearScaleLayout layout;
+    CHECK(pi05::resolve_pi05_linear_scale_layout(shape, &layout).ok_status());
+    CHECK(layout.vision == 109);
+    CHECK(layout.encoder == 72);
+    CHECK(layout.decoder ==
+          static_cast<std::size_t>(shape.num_steps) * 72);
+    CHECK(layout.total() == 181 + layout.decoder);
+
+    pi05::Pi05ResolvedWeights weights;
+    fixture::fill_weights(
+        &weights, reinterpret_cast<void*>(0x1000), shape,
+        flashrt::modalities::DType::kBFloat16, false);
+    TraceSink sink;
+    CHECK(pi05::visit_pi05_linear_weight_groups(&weights, &sink)
+              .ok_status());
+    std::size_t vision_index = 0;
+    std::size_t encoder_index = 0;
+    std::size_t decoder_index = 0;
+    for (const pi05::Pi05LinearWeightGroup& group : sink.groups) {
+        if (group.key.domain == pi05::Pi05LinearDomain::kVision) {
+            check_site(shape, group.key, -1, vision_index++);
+        } else if (group.key.domain == pi05::Pi05LinearDomain::kEncoder) {
+            check_site(shape, group.key, -1, encoder_index++);
+        } else {
+            for (int step = 0; step < shape.num_steps; ++step) {
+                check_site(
+                    shape, group.key, step,
+                    static_cast<std::size_t>(step) *
+                            (layout.decoder /
+                             static_cast<std::size_t>(shape.num_steps)) +
+                        decoder_index);
+            }
+            ++decoder_index;
+        }
+    }
+    CHECK(vision_index == layout.vision);
+    CHECK(encoder_index == layout.encoder);
+    CHECK(decoder_index * static_cast<std::size_t>(shape.num_steps) ==
+          layout.decoder);
+
+    check_site(
+        shape,
+        {pi05::Pi05LinearDomain::kVision,
+         pi05::Pi05LinearRole::kAttentionQkv, 0},
+        -1, 0);
+    check_site(
+        shape,
+        {pi05::Pi05LinearDomain::kVision,
+         pi05::Pi05LinearRole::kMlpDown,
+         pi05::kPi05ModelDims.vision_layers - 1},
+        -1, 107);
+    check_site(
+        shape,
+        {pi05::Pi05LinearDomain::kVision,
+         pi05::Pi05LinearRole::kProjector, -1},
+        -1, 108);
+    check_site(
+        shape,
+        {pi05::Pi05LinearDomain::kEncoder,
+         pi05::Pi05LinearRole::kMlpGateUpGroup, 4},
+        -1, 18);
+    check_site(
+        shape,
+        {pi05::Pi05LinearDomain::kDecoder,
+         pi05::Pi05LinearRole::kAttentionQkv, 0},
+        1, 72);
+    check_site(
+        shape,
+        {pi05::Pi05LinearDomain::kDecoder,
+         pi05::Pi05LinearRole::kMlpDown,
+         pi05::kPi05ModelDims.decoder_layers - 1},
+        shape.num_steps - 1, layout.decoder - 1);
+
+    pi05::Pi05LinearActivationSite site;
+    CHECK(!pi05::resolve_pi05_linear_activation_site(
+               {pi05::Pi05LinearDomain::kVision,
+                pi05::Pi05LinearRole::kMlpGateUpGroup, 0},
+               -1, shape, &site)
+               .ok_status());
+    CHECK(!pi05::resolve_pi05_linear_activation_site(
+               {pi05::Pi05LinearDomain::kEncoder,
+                pi05::Pi05LinearRole::kMlpUp, 0},
+               -1, shape, &site)
+               .ok_status());
+    CHECK(!pi05::resolve_pi05_linear_activation_site(
+               {pi05::Pi05LinearDomain::kDecoder,
+                pi05::Pi05LinearRole::kAttentionQkv, 0},
+               shape.num_steps, shape, &site)
+               .ok_status());
+    CHECK(!pi05::resolve_pi05_linear_activation_site(
+               {pi05::Pi05LinearDomain::kVision,
+                pi05::Pi05LinearRole::kProjector, 0},
+               -1, shape, &site)
+               .ok_status());
+    CHECK(!pi05::resolve_pi05_linear_scale_layout(shape, nullptr)
+               .ok_status());
+}
+
 }  // namespace
 
 int main() {
     test_canonical_order();
     test_failure_boundary();
+    test_activation_scale_layout();
     return 0;
 }
