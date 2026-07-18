@@ -2,41 +2,13 @@
 #define FLASHRT_CPP_MODELS_PI05_MODEL_NATIVE_SESSION_H
 
 #include "flashrt/cpp/models/pi05/model/captured_program.h"
-#include "flashrt/cpp/models/pi05/model/resolved_resources.h"
+#include "flashrt/cpp/models/pi05/model/target_bundle.h"
 
 #include <memory>
 
 namespace flashrt {
 namespace models {
 namespace pi05 {
-
-class Pi05TargetBundle : public Pi05OperationSink {
-public:
-    Pi05TargetBundle(frt_ctx context, bool warmup_before_capture)
-        : context_(context),
-          warmup_before_capture_(warmup_before_capture) {}
-    ~Pi05TargetBundle() override = default;
-
-    Pi05TargetBundle(const Pi05TargetBundle&) = delete;
-    Pi05TargetBundle& operator=(const Pi05TargetBundle&) = delete;
-
-    frt_ctx context() const { return context_; }
-    bool warmup_before_capture() const {
-        return warmup_before_capture_;
-    }
-
-    virtual modalities::Status initialize_resources() = 0;
-    virtual modalities::Status resolve_resources(
-        Pi05ResolvedResources* out) = 0;
-    virtual modalities::Status finalize_setup() = 0;
-    virtual modalities::Status initialize_capture_inputs() = 0;
-    virtual modalities::Status reset_after_warmup() = 0;
-    virtual modalities::Status set_prompt_length(int prompt_tokens) = 0;
-
-private:
-    frt_ctx context_ = nullptr;
-    bool warmup_before_capture_ = false;
-};
 
 class Pi05NativeSession final {
 public:

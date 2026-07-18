@@ -99,6 +99,21 @@ modalities::Status resolve_pi05_shape(const Pi05ShapeConfig& config,
 modalities::Status validate_pi05_resolved_shape(
     const Pi05ResolvedShape& shape);
 
+inline bool pi05_resolved_shape_equal(const Pi05ResolvedShape& lhs,
+                                      const Pi05ResolvedShape& rhs) {
+    return lhs.num_views == rhs.num_views &&
+           lhs.max_prompt_tokens == rhs.max_prompt_tokens &&
+           lhs.chunk == rhs.chunk && lhs.num_steps == rhs.num_steps &&
+           lhs.vision_pool_factor == rhs.vision_pool_factor &&
+           lhs.state_dim == rhs.state_dim &&
+           lhs.robot_action_dim == rhs.robot_action_dim &&
+           lhs.pool_area == rhs.pool_area &&
+           lhs.vision_sequence == rhs.vision_sequence &&
+           lhs.encoder_vision_sequence == rhs.encoder_vision_sequence &&
+           lhs.encoder_sequence == rhs.encoder_sequence &&
+           lhs.total_attention_keys == rhs.total_attention_keys;
+}
+
 }  // namespace pi05
 }  // namespace models
 }  // namespace flashrt
