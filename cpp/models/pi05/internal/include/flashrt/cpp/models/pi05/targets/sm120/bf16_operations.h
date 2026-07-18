@@ -31,6 +31,10 @@ public:
     modalities::Status vision_attention(int layer, Pi05Stream stream) const;
     modalities::Status vision_mlp(int layer, Pi05Stream stream) const;
     modalities::Status vision_project(Pi05Stream stream) const;
+    modalities::Status encoder_attention(int layer, Pi05Stream stream) const;
+    modalities::Status encoder_mlp(int layer, Pi05Stream stream) const;
+    modalities::Status encoder_cache_finalize(int layer,
+                                               Pi05Stream stream) const;
 
 private:
     Sm120Bf16Operations(const Pi05ResolvedShape& shape,

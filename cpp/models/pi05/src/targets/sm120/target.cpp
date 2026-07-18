@@ -468,6 +468,16 @@ modalities::Status Sm120TargetBundle::record(
         case Pi05OperationId::kVisionProject:
             status = impl_->operations->vision_project(stream);
             break;
+        case Pi05OperationId::kEncoderAttention:
+            status = impl_->operations->encoder_attention(call.layer, stream);
+            break;
+        case Pi05OperationId::kEncoderMlp:
+            status = impl_->operations->encoder_mlp(call.layer, stream);
+            break;
+        case Pi05OperationId::kEncoderCacheFinalize:
+            status = impl_->operations->encoder_cache_finalize(call.layer,
+                                                                stream);
+            break;
         default:
             return unsupported("SM120 forward operation is not installed");
     }

@@ -96,6 +96,64 @@ modalities::Status layer_norm(const void* values,
     return launch_status();
 }
 
+modalities::Status rms_norm(const void* values,
+                            const Pi05ResolvedBuffer& weight,
+                            void* output,
+                            int rows,
+                            int columns,
+                            float epsilon,
+                            Pi05Stream stream) {
+    ::rms_norm(
+        static_cast<const __nv_bfloat16*>(values),
+        static_cast<const __nv_bfloat16*>(data(weight)),
+        static_cast<__nv_bfloat16*>(output), rows, columns, epsilon,
+        cuda_stream(stream));
+    return launch_status();
+}
+
+modalities::Status add_residual(void* residual,
+                                const void* values,
+                                int elements,
+                                Pi05Stream stream) {
+    ::residual_add(static_cast<__nv_bfloat16*>(residual),
+                   static_cast<const __nv_bfloat16*>(values), elements,
+                   cuda_stream(stream));
+    return launch_status();
+}
+
+modalities::Status split_qkv_rope(const void* qkv,
+                                  const Pi05ResolvedBuffer& rope,
+                                  void* query,
+                                  void* key,
+                                  void* value,
+                                  int rows,
+                                  int query_width,
+                                  int key_width,
+                                  int value_width,
+                                  int head_width,
+                                  Pi05Stream stream) {
+    ::qkv_split_rope(
+        static_cast<const __nv_bfloat16*>(qkv),
+        static_cast<const __nv_bfloat16*>(data(rope)),
+        static_cast<__nv_bfloat16*>(query),
+        static_cast<__nv_bfloat16*>(key),
+        static_cast<__nv_bfloat16*>(value), rows, query_width, key_width,
+        value_width, head_width, cuda_stream(stream));
+    return launch_status();
+}
+
+modalities::Status gated_silu(const void* gate,
+                              const void* up,
+                              void* output,
+                              int elements,
+                              Pi05Stream stream) {
+    ::gate_silu_mul(static_cast<const __nv_bfloat16*>(gate),
+                    static_cast<const __nv_bfloat16*>(up),
+                    static_cast<__nv_bfloat16*>(output), elements,
+                    cuda_stream(stream));
+    return launch_status();
+}
+
 }  // namespace
 
 std::unique_ptr<Sm120Bf16Operations> Sm120Bf16Operations::create(
@@ -305,6 +363,119 @@ modalities::Status Sm120Bf16Operations::vision_project(
     return status.ok_status()
                ? add_bias(encoder, weights.projector_bias, rows,
                           kPi05ModelDims.encoder_width, stream)
+               : status;
+}
+
+modalities::Status Sm120Bf16Operations::encoder_attention(
+    int layer,
+    Pi05Stream stream) const {
+    if (layer < 0 || layer >= kPi05ModelDims.encoder_layers - 1) {
+        return invalid("SM120 encoder attention layer is invalid");
+    }
+    const int rows = shape_.encoder_sequence;
+    const int width = kPi05ModelDims.encoder_width;
+    const int key_width =
+        kPi05ModelDims.encoder_kv_heads * kPi05ModelDims.encoder_head_dim;
+    const int qkv_width = width + 2 * key_width;
+    const Pi05EncoderLayerWeights& weights =
+        resources_.weights.encoder_layers[static_cast<std::size_t>(layer)];
+    const Sm120EncoderAttentionBuffers& attention = attention_.encoder();
+    void* state = data(resources_.buffers.encoder_state);
+    void* normalized = scratch_.encoder().normalized.device_data();
+    void* qkv = scratch_.encoder().qkv.device_data();
+    void* key = attention_.key_layer_data(layer);
+    void* value = attention_.value_layer_data(layer);
+
+    modalities::Status status = rms_norm(
+        state, support_.encoder_rms_weight, normalized, rows, width,
+        kPi05ModelNumerics.encoder_rms_norm_epsilon, stream);
+    if (!status.ok_status()) return status;
+    status = linear_.run(weights.attention_qkv_weight, normalized, qkv, rows,
+                         width, qkv_width, stream);
+    if (!status.ok_status()) return status;
+    status = split_qkv_rope(
+        qkv, resources_.buffers.encoder_rope, attention.query.device_data(),
+        key, value, rows, width, key_width, key_width,
+        kPi05ModelDims.encoder_head_dim, stream);
+    if (!status.ok_status()) return status;
+    status = attention_driver_.encoder(layer, stream);
+    if (!status.ok_status()) return status;
+    status = linear_.run(
+        weights.attention_output_weight, attention_driver_.encoder_output(),
+        normalized, rows, width, width, stream);
+    if (!status.ok_status()) return status;
+    status = add_residual(state, normalized, rows * width, stream);
+    return status.ok_status()
+               ? rms_norm(state, support_.encoder_rms_weight, normalized,
+                          rows, width,
+                          kPi05ModelNumerics.encoder_rms_norm_epsilon, stream)
+               : status;
+}
+
+modalities::Status Sm120Bf16Operations::encoder_mlp(
+    int layer,
+    Pi05Stream stream) const {
+    if (layer < 0 || layer >= kPi05ModelDims.encoder_layers - 1) {
+        return invalid("SM120 encoder MLP layer is invalid");
+    }
+    const int rows = shape_.encoder_sequence;
+    const int width = kPi05ModelDims.encoder_width;
+    const int hidden_width = kPi05ModelDims.encoder_hidden;
+    const Pi05FeedForwardWeights& weights =
+        resources_.weights.encoder_layers[static_cast<std::size_t>(layer)].mlp;
+    void* state = data(resources_.buffers.encoder_state);
+    void* normalized = scratch_.encoder().normalized.device_data();
+    void* gate = scratch_.encoder().gate.device_data();
+    void* hidden = scratch_.encoder().hidden.device_data();
+
+    modalities::Status status = linear_.run(
+        weights.gate_weight, normalized, gate, rows, width, hidden_width,
+        stream);
+    if (!status.ok_status()) return status;
+    status = linear_.run(weights.up_weight, normalized, hidden, rows, width,
+                         hidden_width, stream);
+    if (!status.ok_status()) return status;
+    status = gated_silu(gate, hidden, hidden, rows * hidden_width, stream);
+    if (!status.ok_status()) return status;
+    status = linear_.run(weights.down_weight, hidden, normalized, rows,
+                         hidden_width, width, stream);
+    return status.ok_status()
+               ? add_residual(state, normalized, rows * width, stream)
+               : status;
+}
+
+modalities::Status Sm120Bf16Operations::encoder_cache_finalize(
+    int layer,
+    Pi05Stream stream) const {
+    if (layer != kPi05ModelDims.encoder_layers - 1) {
+        return invalid("SM120 encoder cache-finalize layer is invalid");
+    }
+    const int rows = shape_.encoder_sequence;
+    const int width = kPi05ModelDims.encoder_width;
+    const int key_width =
+        kPi05ModelDims.encoder_kv_heads * kPi05ModelDims.encoder_head_dim;
+    const int qkv_width = width + 2 * key_width;
+    const Pi05ResolvedWeight& weight =
+        resources_.weights.encoder_layers[static_cast<std::size_t>(layer)]
+            .attention_qkv_weight;
+    void* normalized = scratch_.encoder().normalized.device_data();
+    void* qkv = scratch_.encoder().qkv.device_data();
+    void* key = attention_.key_layer_data(layer);
+    void* value = attention_.value_layer_data(layer);
+
+    modalities::Status status = rms_norm(
+        data(resources_.buffers.encoder_state), support_.encoder_rms_weight,
+        normalized, rows, width,
+        kPi05ModelNumerics.encoder_rms_norm_epsilon, stream);
+    if (!status.ok_status()) return status;
+    status = linear_.run(weight, normalized, qkv, rows, width, qkv_width,
+                         stream);
+    return status.ok_status()
+               ? split_qkv_rope(
+                     qkv, resources_.buffers.encoder_rope,
+                     attention_.encoder().query.device_data(), key, value,
+                     rows, width, key_width, key_width,
+                     kPi05ModelDims.encoder_head_dim, stream)
                : status;
 }
 
