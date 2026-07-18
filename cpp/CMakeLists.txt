@@ -246,6 +246,7 @@ add_library(flashrt_cpp_pi05 STATIC
   models/pi05/src/support/native_calibration.cpp
   models/pi05/src/support/native_device_weights.cpp
   models/pi05/src/support/native_weight_materializer.cpp
+  models/pi05/src/support/native_resource_resolver.cpp
   models/pi05/src/support/native_weight_ops.cpp
   models/pi05/src/support/native_weights.cpp
   models/pi05/src/support/native_workspace.cpp
@@ -389,6 +390,15 @@ if(BUILD_TESTING)
   target_link_libraries(test_pi05_resolved_resources
     PRIVATE flashrt_cpp_pi05)
   add_test(NAME pi05_resolved_resources COMMAND test_pi05_resolved_resources)
+
+  add_executable(test_pi05_native_resource_resolver
+    tests/test_pi05_native_resource_resolver.cpp)
+  target_include_directories(test_pi05_native_resource_resolver PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/internal/include)
+  target_link_libraries(test_pi05_native_resource_resolver PRIVATE
+    flashrt_cpp_pi05)
+  add_test(NAME pi05_native_resource_resolver
+    COMMAND test_pi05_native_resource_resolver)
 
   if(TARGET flashrt_cpp_native_cuda)
     add_executable(test_native_cuda_graph_set
