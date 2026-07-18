@@ -8,8 +8,8 @@ namespace flashrt {
 namespace families {
 namespace vla {
 
-/* Common VLA runtime shape. Concrete models such as Pi0.5 bind this family
- * contract to their own buffers, tokenizer/prompt path, and action schema. */
+/* Common VLA runtime shape. Concrete model frontends bind this family
+ * contract to their own buffers, input path, and output schema. */
 class Runtime : public flashrt::runtime::ModelRuntime {
 public:
     ~Runtime() override = default;

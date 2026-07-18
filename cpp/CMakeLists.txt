@@ -160,6 +160,9 @@ add_library(flashrt_cpp_pi05 STATIC
   models/pi05/src/model/prompt_format.cpp
   models/pi05/src/model/resolved_resources.cpp
   models/pi05/src/model/semantic_pipeline.cpp
+  models/pi05/src/support/native_calibration.cpp
+  models/pi05/src/support/native_weight_ops.cpp
+  models/pi05/src/support/native_weights.cpp
   models/pi05/src/spec.cpp
   models/pi05/src/io.cpp
   models/pi05/src/runtime.cpp)
@@ -167,7 +170,12 @@ target_include_directories(flashrt_cpp_pi05
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/include
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/internal/include)
 target_link_libraries(flashrt_cpp_pi05
+  PRIVATE flashrt_cpp_loader
   PUBLIC flashrt_cpp_modalities flashrt_cpp_vla)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  set_property(SOURCE models/pi05/src/support/native_weight_ops.cpp
+    APPEND PROPERTY COMPILE_OPTIONS -ffp-contract=off)
+endif()
 if(FLASHRT_CPP_WITH_CUDA_KERNELS)
   target_compile_definitions(flashrt_cpp_pi05
     PRIVATE FLASHRT_CPP_WITH_CUDA_KERNELS=1)
@@ -237,6 +245,13 @@ if(BUILD_TESTING)
   endif()
   target_link_libraries(test_pi05_prompt_embed PRIVATE flashrt_cpp_pi05)
   add_test(NAME pi05_prompt_embed COMMAND test_pi05_prompt_embed)
+
+  add_executable(test_pi05_native_calibration
+    tests/test_pi05_native_calibration.cpp)
+  target_include_directories(test_pi05_native_calibration PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/internal/include)
+  target_link_libraries(test_pi05_native_calibration PRIVATE flashrt_cpp_pi05)
+  add_test(NAME pi05_native_calibration COMMAND test_pi05_native_calibration)
 
   add_executable(test_pi05_semantic_pipeline
     tests/test_pi05_semantic_pipeline.cpp)
