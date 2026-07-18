@@ -255,6 +255,7 @@ endif()
 add_library(flashrt_cpp_pi05 STATIC
   models/pi05/src/model/dims.cpp
   models/pi05/src/model/execution_plan.cpp
+  models/pi05/src/model/linear_weight_groups.cpp
   models/pi05/src/model/prompt_embed.cpp
   models/pi05/src/model/prompt_format.cpp
   models/pi05/src/model/resolved_resources.cpp
@@ -416,6 +417,15 @@ if(BUILD_TESTING)
   target_link_libraries(test_pi05_semantic_pipeline
     PRIVATE flashrt_cpp_pi05)
   add_test(NAME pi05_semantic_pipeline COMMAND test_pi05_semantic_pipeline)
+
+  add_executable(test_pi05_linear_weight_groups
+    tests/test_pi05_linear_weight_groups.cpp)
+  target_include_directories(test_pi05_linear_weight_groups PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/internal/include)
+  target_link_libraries(test_pi05_linear_weight_groups
+    PRIVATE flashrt_cpp_pi05)
+  add_test(NAME pi05_linear_weight_groups
+    COMMAND test_pi05_linear_weight_groups)
 
   add_executable(test_pi05_execution_plan
     tests/test_pi05_execution_plan.cpp)
