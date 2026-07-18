@@ -156,6 +156,18 @@ modalities::Status gated_silu(const void* gate,
     return launch_status();
 }
 
+modalities::Status gated_silu_merged(const void* merged,
+                                     void* output,
+                                     int rows,
+                                     int hidden,
+                                     Pi05Stream stream) {
+    ::gate_silu_mul_merged(
+        static_cast<const __nv_bfloat16*>(merged),
+        static_cast<__nv_bfloat16*>(output), rows, hidden,
+        cuda_stream(stream));
+    return launch_status();
+}
+
 modalities::Status adaptive_rms_norm(const void* values,
                                      const Pi05ResolvedBuffer& weight,
                                      const void* style,
@@ -389,7 +401,7 @@ private:
 
 }  // namespace
 
-modalities::Status Sm120Operations::autotune_static_fp8(
+modalities::Status Sm120Operations::autotune_fp8(
     const Pi05ResolvedShape& shape,
     Pi05ResolvedResources* resources,
     const Sm120Bf16ScratchBacking& scratch,
@@ -808,6 +820,21 @@ modalities::Status Sm120Operations::encoder_mlp(
                             hidden_width, width, stream, true)
                    : status;
     }
+    if (observed_fp8()) {
+        modalities::Status status = linear(
+            weights.gate_up_weight, gate_up_key, -1, normalized, gate, rows,
+            width, 2 * hidden_width, stream);
+        if (!status.ok_status()) return status;
+        status = gated_silu_merged(
+            gate, hidden, rows, hidden_width, stream);
+        if (!status.ok_status()) return status;
+        status = linear(
+            weights.down_weight, down_key, -1, hidden, normalized, rows,
+            hidden_width, width, stream);
+        return status.ok_status()
+                   ? add_residual(state, normalized, rows * width, stream)
+                   : status;
+    }
     modalities::Status status = bf16_linear_.run(
         weights.gate_weight, normalized, gate, rows, width, hidden_width,
         stream);
@@ -1064,6 +1091,22 @@ modalities::Status Sm120Operations::decoder_mlp(
         normalized, gate, rows, width,
         kPi05ModelNumerics.decoder_rms_norm_epsilon, stream);
     if (!status.ok_status()) return status;
+    if (observed_fp8()) {
+        status = linear(
+            weights.gate_up_weight, gate_up_key, step, normalized,
+            gate_projection, rows, width, 2 * hidden_width, stream);
+        if (!status.ok_status()) return status;
+        status = gated_silu_merged(
+            gate_projection, hidden, rows, hidden_width, stream);
+        if (!status.ok_status()) return status;
+        status = linear(
+            weights.down_weight, down_key, step, hidden, normalized, rows,
+            hidden_width, width, stream);
+        return status.ok_status()
+                   ? gated_residual(
+                         state, normalized, gate, rows * width, stream)
+                   : status;
+    }
     status = bf16_linear_.run(weights.gate_weight, normalized,
                               gate_projection, rows, width, hidden_width,
                               stream);

@@ -12,6 +12,7 @@
 #include <memory>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -41,7 +42,7 @@ flashrt::models::pi05::targets::sm120::Sm120TargetConfig target_config(
         NativeCalibrationArtifact artifact;
         assert(load_native_calibration_artifact(calibration_path, &artifact)
                    .ok_status());
-        config.precision = Sm120Precision::kStaticFp8E4M3;
+        config.execution_mode = Sm120ExecutionMode::kStaticFp8E4M3;
         config.calibration = std::move(artifact);
     }
     return config;
@@ -77,7 +78,7 @@ int main() {
 
     using namespace flashrt::models::pi05;
     using flashrt::models::pi05::targets::sm120::Sm120Fp8Linear;
-    using flashrt::models::pi05::targets::sm120::Sm120Precision;
+    using flashrt::models::pi05::targets::sm120::Sm120ExecutionMode;
     using flashrt::models::pi05::targets::sm120::Sm120TargetConfig;
     using flashrt::models::pi05::targets::sm120::Sm120TargetBundle;
 
@@ -98,7 +99,8 @@ int main() {
         context, shape, target_config(""), &status));
     assert(!status.ok_status());
     Sm120TargetConfig missing_artifact = target_config("missing");
-    missing_artifact.precision = Sm120Precision::kStaticFp8E4M3;
+    missing_artifact.execution_mode =
+        Sm120ExecutionMode::kStaticFp8E4M3;
     assert(!Sm120TargetBundle::create(
         context, shape, std::move(missing_artifact), &status));
     assert(!status.ok_status());
@@ -106,6 +108,13 @@ int main() {
     unexpected_artifact.calibration = NativeCalibrationArtifact{};
     assert(!Sm120TargetBundle::create(
         context, shape, std::move(unexpected_artifact), &status));
+    assert(!status.ok_status());
+    Sm120TargetConfig observed_with_artifact = target_config("missing");
+    observed_with_artifact.execution_mode =
+        Sm120ExecutionMode::kObservedFp8E4M3;
+    observed_with_artifact.calibration = NativeCalibrationArtifact{};
+    assert(!Sm120TargetBundle::create(
+        context, shape, std::move(observed_with_artifact), &status));
     assert(!status.ok_status());
 
     std::unique_ptr<Sm120TargetBundle> missing =
@@ -117,6 +126,14 @@ int main() {
     assert(!missing->finalize_setup().ok_status());
     assert(!missing->initialize_resources().ok_status());
     assert(!missing->initialize_resources().ok_status());
+    assert(missing->execution_mode() == Sm120ExecutionMode::kBf16);
+    std::vector<float> vision;
+    std::vector<float> encoder;
+    std::vector<float> decoder;
+    assert(!missing->reset_observer_scales(0).ok_status());
+    assert(!missing->download_observer_scales(
+                       &vision, &encoder, &decoder)
+                .ok_status());
     assert(frt_ctx_stream(context, 0) >= 0);
     missing.reset();
     frt_ctx_destroy(context);
@@ -131,7 +148,8 @@ int main() {
     assert(context);
     const char* calibration = std::getenv("FLASHRT_PI05_CALIBRATION");
     Sm120TargetConfig config = target_config(checkpoint, calibration);
-    const bool fp8 = config.precision == Sm120Precision::kStaticFp8E4M3;
+    const bool fp8 =
+        config.execution_mode == Sm120ExecutionMode::kStaticFp8E4M3;
     Pi05ResolvedShape runtime_shape = shape;
     if (config.calibration) {
         Pi05ShapeConfig runtime_config;

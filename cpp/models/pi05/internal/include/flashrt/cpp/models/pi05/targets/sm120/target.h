@@ -8,6 +8,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace flashrt {
 namespace models {
@@ -15,14 +16,15 @@ namespace pi05 {
 namespace targets {
 namespace sm120 {
 
-enum class Sm120Precision {
+enum class Sm120ExecutionMode {
     kBf16 = 0,
     kStaticFp8E4M3,
+    kObservedFp8E4M3,
 };
 
 struct Sm120TargetConfig final {
     std::string checkpoint_path;
-    Sm120Precision precision = Sm120Precision::kBf16;
+    Sm120ExecutionMode execution_mode = Sm120ExecutionMode::kBf16;
     std::optional<NativeCalibrationArtifact> calibration;
 };
 
@@ -53,7 +55,12 @@ public:
     std::size_t packed_weight_count() const;
     std::size_t autotuned_shape_count() const;
     std::size_t prepare_call_count() const;
-    Sm120Precision precision() const;
+    Sm120ExecutionMode execution_mode() const;
+    modalities::Status reset_observer_scales(Pi05Stream stream);
+    modalities::Status download_observer_scales(
+        std::vector<float>* vision,
+        std::vector<float>* encoder,
+        std::vector<float>* decoder) const;
     bool ready_for_capture() const;
 
 private:

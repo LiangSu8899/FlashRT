@@ -46,6 +46,11 @@ void dequantize_fp8_static_bf16_6(
 void quantize_fp8_device(const __nv_bfloat16* input, __nv_fp8_e4m3* output,
                          float* d_scale, int n, cudaStream_t stream = 0);
 
+// Device-only quantize with an IEEE round-to-nearest activation scale.
+void quantize_fp8_device_precise(
+    const __nv_bfloat16* input, __nv_fp8_e4m3* output,
+    float* d_scale, int n, cudaStream_t stream = 0);
+
 // Setup-only weight packing with producer-compatible FP32 rounding.
 void quantize_fp8_weight_device(
     const __nv_bfloat16* input, __nv_fp8_e4m3* output,

@@ -205,17 +205,28 @@ bool prepare_operation(Pi05OperationId id) {
            id == Pi05OperationId::kFinalStyle;
 }
 
-bool static_fp8(Sm120Precision precision) {
-    return precision == Sm120Precision::kStaticFp8E4M3;
+bool fp8(Sm120ExecutionMode mode) {
+    return mode == Sm120ExecutionMode::kStaticFp8E4M3 ||
+           mode == Sm120ExecutionMode::kObservedFp8E4M3;
+}
+
+bool static_fp8(Sm120ExecutionMode mode) {
+    return mode == Sm120ExecutionMode::kStaticFp8E4M3;
+}
+
+bool observed_fp8(Sm120ExecutionMode mode) {
+    return mode == Sm120ExecutionMode::kObservedFp8E4M3;
 }
 
 bool valid_config(const Sm120TargetConfig& config) {
     if (config.checkpoint_path.empty()) return false;
-    switch (config.precision) {
-        case Sm120Precision::kBf16:
+    switch (config.execution_mode) {
+        case Sm120ExecutionMode::kBf16:
             return !config.calibration.has_value();
-        case Sm120Precision::kStaticFp8E4M3:
+        case Sm120ExecutionMode::kStaticFp8E4M3:
             return config.calibration.has_value();
+        case Sm120ExecutionMode::kObservedFp8E4M3:
+            return !config.calibration.has_value();
     }
     return false;
 }
@@ -308,7 +319,7 @@ modalities::Status Sm120TargetBundle::initialize_resources() {
     try {
         modalities::Status status = validate_device();
         if (!status.ok_status()) return impl_->fail(std::move(status));
-        if (static_fp8(impl_->config.precision)) {
+        if (fp8(impl_->config.execution_mode)) {
             status = Sm120Fp8Linear::runtime_status();
             if (!status.ok_status()) return impl_->fail(std::move(status));
         }
@@ -347,7 +358,7 @@ modalities::Status Sm120TargetBundle::initialize_resources() {
         status = impl_->attention.allocate(impl_->shape);
         if (!status.ok_status()) return impl_->fail(std::move(status));
         status = impl_->scratch.allocate(
-            impl_->shape, static_fp8(impl_->config.precision));
+            impl_->shape, fp8(impl_->config.execution_mode));
         if (!status.ok_status()) return impl_->fail(std::move(status));
 
         impl_->bf16_linear.reset(new (std::nothrow) Sm120Bf16Linear());
@@ -398,7 +409,7 @@ modalities::Status Sm120TargetBundle::resolve_resources(
         status = resolve_pi05_native_support_buffers(
             impl_->workspace, impl_->shape, &support);
         if (!status.ok_status()) return impl_->fail(std::move(status));
-        if (static_fp8(impl_->config.precision)) {
+        if (fp8(impl_->config.execution_mode)) {
             impl_->fp8_packer.reset(new (std::nothrow)
                                         Sm120Fp8WeightPacker(context()));
             if (!impl_->fp8_packer) {
@@ -413,7 +424,7 @@ modalities::Status Sm120TargetBundle::resolve_resources(
         status = validate_pi05_resolved_resources(resolved, impl_->shape);
         if (!status.ok_status()) return impl_->fail(std::move(status));
 
-        if (static_fp8(impl_->config.precision)) {
+        if (fp8(impl_->config.execution_mode)) {
             impl_->fp8_activation.reset(new (std::nothrow)
                                             Sm120Fp8ActivationBacking(
                                                 context()));
@@ -421,12 +432,20 @@ modalities::Status Sm120TargetBundle::resolve_resources(
                 return impl_->fail(
                     backend("SM120 FP8 activation allocation failed"));
             }
-            status = impl_->fp8_activation->initialize_static(
-                impl_->shape, *impl_->config.calibration);
+            if (static_fp8(impl_->config.execution_mode)) {
+                status = impl_->fp8_activation->initialize_static(
+                    impl_->shape, *impl_->config.calibration);
+            } else {
+                status = impl_->fp8_activation->initialize_observer(
+                    impl_->shape);
+            }
             if (!status.ok_status()) return impl_->fail(std::move(status));
-            impl_->fp8_linear.reset(new (std::nothrow)
-                                        Sm120Fp8Linear(
-                                            impl_->fp8_activation.get()));
+            const Sm120Fp8ExecutionMode linear_mode =
+                observed_fp8(impl_->config.execution_mode)
+                    ? Sm120Fp8ExecutionMode::kObserve
+                    : Sm120Fp8ExecutionMode::kStatic;
+            impl_->fp8_linear.reset(new (std::nothrow) Sm120Fp8Linear(
+                impl_->fp8_activation.get(), linear_mode));
             if (!impl_->fp8_linear) {
                 return impl_->fail(
                     backend("SM120 FP8 linear allocation failed"));
@@ -578,7 +597,7 @@ modalities::Status Sm120TargetBundle::finalize_setup() {
     modalities::Status status = impl_->attention_driver->status();
     if (!status.ok_status()) return impl_->fail(std::move(status));
     if (impl_->fp8_linear) {
-        status = Sm120Operations::autotune_static_fp8(
+        status = Sm120Operations::autotune_fp8(
             impl_->shape, &impl_->resources, impl_->scratch,
             impl_->fp8_linear.get());
         if (!status.ok_status()) return impl_->fail(std::move(status));
@@ -681,8 +700,32 @@ std::size_t Sm120TargetBundle::prepare_call_count() const {
     return impl_ ? impl_->prepare_cursor : 0;
 }
 
-Sm120Precision Sm120TargetBundle::precision() const {
-    return impl_ ? impl_->config.precision : Sm120Precision::kBf16;
+Sm120ExecutionMode Sm120TargetBundle::execution_mode() const {
+    return impl_ ? impl_->config.execution_mode
+                 : Sm120ExecutionMode::kBf16;
+}
+
+modalities::Status Sm120TargetBundle::reset_observer_scales(
+    Pi05Stream stream) {
+    if (!impl_ || impl_->state != Impl::State::kCaptureInputsInitialized ||
+        !observed_fp8(impl_->config.execution_mode) ||
+        !impl_->fp8_activation) {
+        return invalid("SM120 observer reset state is invalid");
+    }
+    return impl_->fp8_activation->reset_observer_scales(stream);
+}
+
+modalities::Status Sm120TargetBundle::download_observer_scales(
+    std::vector<float>* vision,
+    std::vector<float>* encoder,
+    std::vector<float>* decoder) const {
+    if (!impl_ || impl_->state != Impl::State::kCaptureInputsInitialized ||
+        !observed_fp8(impl_->config.execution_mode) ||
+        !impl_->fp8_activation) {
+        return invalid("SM120 observer download state is invalid");
+    }
+    return impl_->fp8_activation->download_observer_scales(
+        vision, encoder, decoder);
 }
 
 bool Sm120TargetBundle::ready_for_capture() const {

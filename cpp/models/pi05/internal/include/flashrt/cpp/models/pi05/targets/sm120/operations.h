@@ -17,7 +17,7 @@ namespace sm120 {
 
 class Sm120Operations final {
 public:
-    static modalities::Status autotune_static_fp8(
+    static modalities::Status autotune_fp8(
         const Pi05ResolvedShape& shape,
         Pi05ResolvedResources* resources,
         const Sm120Bf16ScratchBacking& scratch,
@@ -84,7 +84,12 @@ private:
         Pi05Stream stream,
         bool prequantized = false) const;
     float* scale(Pi05LinearWeightKey key, int step) const;
-    bool static_fp8() const { return fp8_linear_ != nullptr; }
+    bool static_fp8() const {
+        return fp8_linear_ && !fp8_linear_->observing();
+    }
+    bool observed_fp8() const {
+        return fp8_linear_ && fp8_linear_->observing();
+    }
 
     const Pi05ResolvedShape& shape_;
     const Pi05ResolvedResources& resources_;

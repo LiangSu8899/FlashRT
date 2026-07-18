@@ -1,9 +1,12 @@
+#include "flashrt/cpp/models/pi05/model/linear_weight_groups.h"
 #include "flashrt/cpp/models/pi05/model/native_session.h"
 #include "flashrt/cpp/models/pi05/targets/sm120/target.h"
 
 #include <cuda_runtime_api.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -75,7 +78,7 @@ int main() {
 
     using namespace flashrt::models::pi05;
     using flashrt::models::pi05::targets::sm120::Sm120TargetBundle;
-    using flashrt::models::pi05::targets::sm120::Sm120Precision;
+    using flashrt::models::pi05::targets::sm120::Sm120ExecutionMode;
     using flashrt::models::pi05::targets::sm120::Sm120TargetConfig;
     Pi05ShapeConfig config;
     config.num_views = 3;
@@ -94,16 +97,23 @@ int main() {
     Sm120TargetConfig target_config;
     target_config.checkpoint_path = checkpoint;
     const char* calibration = std::getenv("FLASHRT_PI05_CALIBRATION");
-    if (calibration && calibration[0]) {
+    const bool observe = std::getenv("FLASHRT_PI05_OBSERVER") != nullptr;
+    CHECK(!observe || !calibration || !calibration[0]);
+    if (observe) {
+        target_config.execution_mode =
+            Sm120ExecutionMode::kObservedFp8E4M3;
+    } else if (calibration && calibration[0]) {
         NativeCalibrationArtifact artifact;
         CHECK(load_native_calibration_artifact(calibration, &artifact)
                   .ok_status());
-        target_config.precision = Sm120Precision::kStaticFp8E4M3;
+        target_config.execution_mode =
+            Sm120ExecutionMode::kStaticFp8E4M3;
         target_config.calibration = std::move(artifact);
     }
     std::unique_ptr<Sm120TargetBundle> concrete = Sm120TargetBundle::create(
         context, shape, std::move(target_config), &status);
     CHECK(concrete && status.ok_status());
+    Sm120TargetBundle* concrete_target = concrete.get();
     std::unique_ptr<Pi05TargetBundle> target(std::move(concrete));
     std::unique_ptr<Pi05NativeSession> session = Pi05NativeSession::create(
         context, shape, std::move(target), &status);
@@ -118,7 +128,21 @@ int main() {
     }
     CHECK(session->stream_id() >= 0);
     CHECK(session->native_stream() != nullptr);
+    const Pi05Stream pi05_stream =
+        reinterpret_cast<Pi05Stream>(session->native_stream());
     CHECK(session->set_prompt_length(37).ok_status());
+
+    Pi05LinearScaleLayout scale_layout;
+    std::vector<float> vision_scales;
+    std::vector<float> encoder_scales;
+    std::vector<float> decoder_scales;
+    if (observe) {
+        CHECK(resolve_pi05_linear_scale_layout(shape, &scale_layout)
+                  .ok_status());
+        vision_scales.resize(scale_layout.vision);
+        encoder_scales.resize(scale_layout.encoder);
+        decoder_scales.resize(scale_layout.decoder);
+    }
 
     const Pi05ResolvedBuffers& buffers = session->resources().buffers;
     std::vector<std::uint16_t> images(
@@ -150,8 +174,25 @@ int main() {
     CHECK(cudaMemcpy(frt_buffer_dptr(buffers.noise.buffer), noise.data(),
                      frt_buffer_bytes(buffers.noise.buffer),
                      cudaMemcpyHostToDevice) == cudaSuccess);
+    if (observe) {
+        CHECK(concrete_target->reset_observer_scales(
+                  pi05_stream).ok_status());
+    }
     CHECK(session->replay() == FRT_OK);
     CHECK(session->synchronize().ok_status());
+    if (observe) {
+        CHECK(concrete_target->download_observer_scales(
+                  &vision_scales, &encoder_scales, &decoder_scales)
+                  .ok_status());
+        const auto valid_scales = [](const std::vector<float>& values) {
+            return std::all_of(values.begin(), values.end(), [](float value) {
+                return std::isfinite(value) && value > 0.0f;
+            });
+        };
+        CHECK(valid_scales(vision_scales));
+        CHECK(valid_scales(encoder_scales));
+        CHECK(valid_scales(decoder_scales));
+    }
     const std::vector<std::uint16_t> expected = download(buffers.noise.buffer);
 
     const cudaStream_t stream =
@@ -159,6 +200,10 @@ int main() {
     CHECK(cudaMemcpyAsync(frt_buffer_dptr(buffers.noise.buffer), noise.data(),
                           frt_buffer_bytes(buffers.noise.buffer),
                           cudaMemcpyHostToDevice, stream) == cudaSuccess);
+    if (observe) {
+        CHECK(concrete_target->reset_observer_scales(
+                  pi05_stream).ok_status());
+    }
     CHECK(session->replay(Pi05GraphId::kContext) == FRT_OK);
     CHECK(session->replay(Pi05GraphId::kDecodeOnly) == FRT_OK);
     CHECK(session->synchronize().ok_status());
@@ -167,6 +212,10 @@ int main() {
     allocation_count.store(0, std::memory_order_relaxed);
     count_allocations.store(true, std::memory_order_relaxed);
     for (int replay = 0; replay < 100; ++replay) {
+        if (observe) {
+            CHECK(concrete_target->reset_observer_scales(
+                      pi05_stream).ok_status());
+        }
         CHECK(cudaMemcpyAsync(
                   frt_buffer_dptr(buffers.noise.buffer), noise.data(),
                   frt_buffer_bytes(buffers.noise.buffer),
@@ -179,6 +228,11 @@ int main() {
         }
     }
     CHECK(session->synchronize().ok_status());
+    if (observe) {
+        CHECK(concrete_target->download_observer_scales(
+                  &vision_scales, &encoder_scales, &decoder_scales)
+                  .ok_status());
+    }
     count_allocations.store(false, std::memory_order_relaxed);
     CHECK(allocation_count.load(std::memory_order_relaxed) == 0);
     CHECK(download(buffers.noise.buffer) == expected);

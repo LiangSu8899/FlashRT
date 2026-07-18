@@ -16,6 +16,11 @@ namespace pi05 {
 namespace targets {
 namespace sm120 {
 
+enum class Sm120Fp8ExecutionMode {
+    kStatic = 0,
+    kObserve,
+};
+
 class Sm120Fp8ActivationBacking final {
 public:
     explicit Sm120Fp8ActivationBacking(frt_ctx context) : context_(context) {}
@@ -27,6 +32,13 @@ public:
     modalities::Status initialize_static(
         const Pi05ResolvedShape& shape,
         const NativeCalibrationArtifact& artifact);
+    modalities::Status initialize_observer(
+        const Pi05ResolvedShape& shape);
+    modalities::Status reset_observer_scales(Pi05Stream stream) const;
+    modalities::Status download_observer_scales(
+        std::vector<float>* vision,
+        std::vector<float>* encoder,
+        std::vector<float>* decoder) const;
     modalities::Status download_scales(
         std::vector<float>* vision,
         std::vector<float>* encoder,
@@ -39,12 +51,13 @@ public:
     const Pi05ResolvedShape& shape() const { return shape_; }
     std::size_t allocation_count() const { return allocation_count_; }
     std::size_t allocated_bytes() const { return allocated_bytes_; }
+    bool observing() const { return observing_; }
     bool initialized() const { return initialized_; }
 
 private:
     modalities::Status initialize(
         const Pi05ResolvedShape& shape,
-        const NativeCalibrationArtifact& artifact);
+        const NativeCalibrationArtifact* artifact);
     modalities::Status add(
         const char* name,
         std::size_t elements,
@@ -54,6 +67,11 @@ private:
         const Sm120DeviceBuffer& destination,
         const std::vector<float>& values,
         Pi05Stream stream) const;
+    modalities::Status copy_scales(
+        std::vector<float>* vision,
+        std::vector<float>* encoder,
+        std::vector<float>* decoder,
+        bool resize) const;
     const Sm120DeviceBuffer* scale_buffer(Pi05LinearDomain domain) const;
 
     frt_ctx context_ = nullptr;
@@ -63,8 +81,12 @@ private:
     Sm120DeviceBuffer vision_scales_;
     Sm120DeviceBuffer encoder_scales_;
     Sm120DeviceBuffer decoder_scales_;
+    std::vector<float> vision_reset_;
+    std::vector<float> encoder_reset_;
+    std::vector<float> decoder_reset_;
     std::size_t allocation_count_ = 0;
     std::size_t allocated_bytes_ = 0;
+    bool observing_ = false;
     bool initialization_started_ = false;
     bool initialized_ = false;
 };
@@ -74,7 +96,8 @@ public:
     static modalities::Status runtime_status();
 
     explicit Sm120Fp8Linear(
-        Sm120Fp8ActivationBacking* activation) noexcept;
+        Sm120Fp8ActivationBacking* activation,
+        Sm120Fp8ExecutionMode mode = Sm120Fp8ExecutionMode::kStatic) noexcept;
     ~Sm120Fp8Linear();
 
     Sm120Fp8Linear(const Sm120Fp8Linear&) = delete;
@@ -113,6 +136,9 @@ public:
     void* scratch_data() const;
     std::size_t scratch_bytes() const;
     std::size_t autotuned_shape_count() const;
+    bool observing() const {
+        return mode_ == Sm120Fp8ExecutionMode::kObserve;
+    }
     bool autotune_frozen() const;
 
 private:
@@ -130,6 +156,7 @@ private:
         bool prequantized);
 
     Sm120Fp8ActivationBacking* activation_ = nullptr;
+    Sm120Fp8ExecutionMode mode_ = Sm120Fp8ExecutionMode::kStatic;
     std::unique_ptr<Impl> impl_;
     modalities::StatusCode error_code_ = modalities::StatusCode::kBackend;
     std::string error_;

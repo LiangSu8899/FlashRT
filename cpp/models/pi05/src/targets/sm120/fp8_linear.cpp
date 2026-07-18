@@ -127,12 +127,17 @@ modalities::Status Sm120Fp8ActivationBacking::upload(
 modalities::Status Sm120Fp8ActivationBacking::initialize_static(
     const Pi05ResolvedShape& shape,
     const NativeCalibrationArtifact& artifact) {
-    return initialize(shape, artifact);
+    return initialize(shape, &artifact);
+}
+
+modalities::Status Sm120Fp8ActivationBacking::initialize_observer(
+    const Pi05ResolvedShape& shape) {
+    return initialize(shape, nullptr);
 }
 
 modalities::Status Sm120Fp8ActivationBacking::initialize(
     const Pi05ResolvedShape& shape,
-    const NativeCalibrationArtifact& artifact) {
+    const NativeCalibrationArtifact* artifact) {
     if (initialization_started_ || !context_) {
         return invalid("SM120 FP8 backing state is invalid");
     }
@@ -141,9 +146,12 @@ modalities::Status Sm120Fp8ActivationBacking::initialize(
     modalities::Status status =
         resolve_pi05_linear_scale_layout(shape, &layout);
     if (!status.ok_status()) return status;
-    status = validate_native_calibration_artifact(artifact);
-    if (!status.ok_status() || !artifact_matches(artifact, shape, layout)) {
-        return invalid("SM120 FP8 calibration artifact is incompatible");
+    if (artifact) {
+        status = validate_native_calibration_artifact(*artifact);
+        if (!status.ok_status() ||
+            !artifact_matches(*artifact, shape, layout)) {
+            return invalid("SM120 FP8 calibration artifact is incompatible");
+        }
     }
 
     std::size_t vision_elements = 0;
@@ -177,12 +185,24 @@ modalities::Status Sm120Fp8ActivationBacking::initialize(
 
     shape_ = shape;
     layout_ = layout;
-    status = upload(vision_scales_, artifact.vision_scales, 0);
+    observing_ = artifact == nullptr;
+    if (observing_) {
+        vision_reset_.assign(layout.vision, 1.0f);
+        encoder_reset_.assign(layout.encoder, 1.0f);
+        decoder_reset_.assign(layout.decoder, 1.0f);
+    }
+    const std::vector<float>& vision =
+        observing_ ? vision_reset_ : artifact->vision_scales;
+    const std::vector<float>& encoder =
+        observing_ ? encoder_reset_ : artifact->encoder_scales;
+    const std::vector<float>& decoder =
+        observing_ ? decoder_reset_ : artifact->decoder_scales;
+    status = upload(vision_scales_, vision, 0);
     if (status.ok_status()) {
-        status = upload(encoder_scales_, artifact.encoder_scales, 0);
+        status = upload(encoder_scales_, encoder, 0);
     }
     if (status.ok_status()) {
-        status = upload(decoder_scales_, artifact.decoder_scales, 0);
+        status = upload(decoder_scales_, decoder, 0);
     }
     if (!status.ok_status()) return status;
     const cudaError_t synchronized = cudaStreamSynchronize(nullptr);
@@ -191,6 +211,21 @@ modalities::Status Sm120Fp8ActivationBacking::initialize(
     }
     initialized_ = true;
     return modalities::Status::ok();
+}
+
+modalities::Status Sm120Fp8ActivationBacking::reset_observer_scales(
+    Pi05Stream stream) const {
+    if (!initialized_ || !observing_) {
+        return invalid("SM120 FP8 observer reset state is invalid");
+    }
+    modalities::Status status =
+        upload(vision_scales_, vision_reset_, stream);
+    if (status.ok_status()) {
+        status = upload(encoder_scales_, encoder_reset_, stream);
+    }
+    return status.ok_status()
+               ? upload(decoder_scales_, decoder_reset_, stream)
+               : status;
 }
 
 const Sm120DeviceBuffer* Sm120Fp8ActivationBacking::scale_buffer(
@@ -217,6 +252,24 @@ modalities::Status Sm120Fp8ActivationBacking::download_scales(
     std::vector<float>* vision,
     std::vector<float>* encoder,
     std::vector<float>* decoder) const {
+    return copy_scales(vision, encoder, decoder, true);
+}
+
+modalities::Status Sm120Fp8ActivationBacking::download_observer_scales(
+    std::vector<float>* vision,
+    std::vector<float>* encoder,
+    std::vector<float>* decoder) const {
+    if (!observing_) {
+        return invalid("SM120 FP8 observer download state is invalid");
+    }
+    return copy_scales(vision, encoder, decoder, false);
+}
+
+modalities::Status Sm120Fp8ActivationBacking::copy_scales(
+    std::vector<float>* vision,
+    std::vector<float>* encoder,
+    std::vector<float>* decoder,
+    bool resize) const {
     if (!initialized_ || !vision || !encoder || !decoder) {
         return invalid("SM120 FP8 scale download is invalid");
     }
@@ -229,7 +282,13 @@ modalities::Status Sm120Fp8ActivationBacking::download_scales(
         {&decoder_scales_, decoder},
     };
     for (const Download& download : downloads) {
-        download.destination->resize(download.source->bytes() / sizeof(float));
+        const std::size_t elements =
+            download.source->bytes() / sizeof(float);
+        if (resize) {
+            download.destination->resize(elements);
+        } else if (download.destination->size() != elements) {
+            return invalid("SM120 FP8 observer output size is invalid");
+        }
         const cudaError_t result = cudaMemcpy(
             download.destination->data(), download.source->device_data(),
             download.source->bytes(), cudaMemcpyDeviceToHost);
@@ -247,8 +306,9 @@ struct Sm120Fp8Linear::Impl final {
 };
 
 Sm120Fp8Linear::Sm120Fp8Linear(
-    Sm120Fp8ActivationBacking* activation) noexcept
-    : activation_(activation) {
+    Sm120Fp8ActivationBacking* activation,
+    Sm120Fp8ExecutionMode mode) noexcept
+    : activation_(activation), mode_(mode) {
     const modalities::Status runtime = runtime_status();
     if (!runtime.ok_status()) {
         error_code_ = runtime.code;
@@ -275,7 +335,8 @@ modalities::Status Sm120Fp8Linear::runtime_status() {
 }
 
 modalities::Status Sm120Fp8Linear::status() const {
-    if (!activation_ || !activation_->initialized()) {
+    if (!activation_ || !activation_->initialized() ||
+        activation_->observing() != observing()) {
         return invalid("SM120 FP8 linear backing is incomplete");
     }
     return impl_ ? modalities::Status::ok()
@@ -375,6 +436,7 @@ modalities::Status Sm120Fp8Linear::launch(
     float* activation_scale = scale_data(site);
     if (!ready.ok_status()) return ready;
     if (!input || !output || rows <= 0 || !impl_->autotune_frozen ||
+        (prequantized && observing()) ||
         !multiply(static_cast<std::size_t>(rows),
                   static_cast<std::size_t>(input_width), &input_elements) ||
         (input_elements & 3u) != 0 ||
@@ -392,10 +454,17 @@ modalities::Status Sm120Fp8Linear::launch(
     }
     void* quantized = prequantized ? const_cast<void*>(input) : scratch_data();
     if (!prequantized) {
-        quantize_fp8_static(
-            static_cast<const __nv_bfloat16*>(input),
-            static_cast<__nv_fp8_e4m3*>(quantized), activation_scale,
-            static_cast<int>(input_elements), cuda_stream(stream));
+        if (observing()) {
+            quantize_fp8_device_precise(
+                static_cast<const __nv_bfloat16*>(input),
+                static_cast<__nv_fp8_e4m3*>(quantized), activation_scale,
+                static_cast<int>(input_elements), cuda_stream(stream));
+        } else {
+            quantize_fp8_static(
+                static_cast<const __nv_bfloat16*>(input),
+                static_cast<__nv_fp8_e4m3*>(quantized), activation_scale,
+                static_cast<int>(input_elements), cuda_stream(stream));
+        }
         const cudaError_t launched = cudaGetLastError();
         if (launched != cudaSuccess) return backend(cudaGetErrorString(launched));
     }

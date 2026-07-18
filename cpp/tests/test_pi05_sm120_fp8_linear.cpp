@@ -155,12 +155,59 @@ void test_backing_contract() {
     CHECK(vision == artifact.vision_scales);
     CHECK(encoder == artifact.encoder_scales);
     CHECK(decoder == artifact.decoder_scales);
+    CHECK(!backing.observing());
+    CHECK(!backing.reset_observer_scales(0).ok_status());
+    CHECK(!backing.download_observer_scales(
+                      &vision, &encoder, &decoder)
+               .ok_status());
     CHECK(!backing.initialize_static(shape, artifact).ok_status());
 
     pi05::NativeCalibrationArtifact incompatible = artifact;
     incompatible.num_views = shape.num_views - 1;
     sm120::Sm120Fp8ActivationBacking rejected(context);
     CHECK(!rejected.initialize_static(shape, incompatible).ok_status());
+    frt_ctx_destroy(context);
+}
+
+void test_observer_backing_contract() {
+    frt_ctx context = frt_ctx_create();
+    CHECK(context != nullptr);
+    const pi05::Pi05ResolvedShape shape = fixture::canonical_shape();
+    sm120::Sm120Fp8ActivationBacking backing(context);
+    CHECK_STATUS(backing.initialize_observer(shape));
+    CHECK(backing.initialized() && backing.observing());
+    CHECK(backing.allocation_count() == 4);
+
+    const pi05::Pi05LinearScaleLayout layout = backing.scale_layout();
+    std::vector<float> vision(layout.vision);
+    std::vector<float> encoder(layout.encoder);
+    std::vector<float> decoder(layout.decoder);
+    CHECK_STATUS(backing.download_observer_scales(
+        &vision, &encoder, &decoder));
+    const auto all_one = [](const std::vector<float>& values) {
+        return std::all_of(values.begin(), values.end(),
+                           [](float value) { return value == 1.0f; });
+    };
+    CHECK(all_one(vision) && all_one(encoder) && all_one(decoder));
+
+    std::vector<float> wrong_size;
+    CHECK(!backing.download_observer_scales(
+                      &wrong_size, &encoder, &decoder)
+               .ok_status());
+    for (const pi05::Pi05LinearDomain domain : {
+             pi05::Pi05LinearDomain::kVision,
+             pi05::Pi05LinearDomain::kEncoder,
+             pi05::Pi05LinearDomain::kDecoder}) {
+        float* scale = backing.scale_data({domain, 0});
+        CHECK(scale != nullptr);
+        CHECK(cudaMemset(scale, 0, sizeof(float)) == cudaSuccess);
+    }
+    CHECK_STATUS(backing.reset_observer_scales(0));
+    CHECK(cudaDeviceSynchronize() == cudaSuccess);
+    CHECK_STATUS(backing.download_observer_scales(
+        &vision, &encoder, &decoder));
+    CHECK(all_one(vision) && all_one(encoder) && all_one(decoder));
+    CHECK(!backing.initialize_observer(shape).ok_status());
     frt_ctx_destroy(context);
 }
 
@@ -282,6 +329,47 @@ void test_linear_contract() {
                frt_buffer_dptr(output_a), kRows - 1, kInputWidth,
                kOutputWidth, 0)
                .ok_status());
+
+    sm120::Sm120Fp8ActivationBacking observer_backing(context);
+    CHECK_STATUS(observer_backing.initialize_observer(shape));
+    sm120::Sm120Fp8Linear observer_linear(
+        &observer_backing, sm120::Sm120Fp8ExecutionMode::kObserve);
+    CHECK_STATUS(observer_linear.status());
+    CHECK(observer_linear.observing());
+    CHECK_STATUS(observer_linear.autotune(
+        weight, site, frt_buffer_dptr(input_buffer),
+        frt_buffer_dptr(output_a), kRows, kInputWidth, kOutputWidth));
+    CHECK_STATUS(observer_linear.freeze_autotune());
+    CHECK(!observer_linear.run_prequantized(
+                       weight, site, observer_linear.scratch_data(),
+                       frt_buffer_dptr(output_b), kRows, kInputWidth,
+                       kOutputWidth, 0)
+               .ok_status());
+    CHECK_STATUS(observer_linear.run(
+        weight, site, frt_buffer_dptr(input_buffer),
+        frt_buffer_dptr(output_a), kRows, kInputWidth, kOutputWidth, 0));
+    CHECK(cudaDeviceSynchronize() == cudaSuccess);
+    std::vector<float> observed_vision(
+        observer_backing.scale_layout().vision);
+    std::vector<float> observed_encoder(
+        observer_backing.scale_layout().encoder);
+    std::vector<float> observed_decoder(
+        observer_backing.scale_layout().decoder);
+    CHECK_STATUS(observer_backing.download_observer_scales(
+        &observed_vision, &observed_encoder, &observed_decoder));
+    CHECK(observed_vision[site.index] == 1.0f / 448.0f);
+    CHECK_STATUS(observer_backing.reset_observer_scales(0));
+    CHECK(cudaDeviceSynchronize() == cudaSuccess);
+    CHECK_STATUS(observer_backing.download_observer_scales(
+        &observed_vision, &observed_encoder, &observed_decoder));
+    CHECK(observed_vision[site.index] == 1.0f);
+
+    sm120::Sm120Fp8Linear mismatched_static(
+        &observer_backing, sm120::Sm120Fp8ExecutionMode::kStatic);
+    CHECK(!mismatched_static.status().ok_status());
+    sm120::Sm120Fp8Linear mismatched_observer(
+        &backing, sm120::Sm120Fp8ExecutionMode::kObserve);
+    CHECK(!mismatched_observer.status().ok_status());
     frt_ctx_destroy(context);
 }
 
@@ -293,6 +381,7 @@ int main() {
         return 0;
     }
     test_backing_contract();
+    test_observer_backing_contract();
     if (cublasLtGetVersion() < kMinimumSm120Fp8CublasVersion) {
         test_unsupported_runtime_contract();
         std::cout << "SKIP - SM120 FP8 requires cuBLAS 13.1 or newer\n";
