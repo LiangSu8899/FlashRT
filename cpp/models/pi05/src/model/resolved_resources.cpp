@@ -151,7 +151,8 @@ Pi05WeightStorage activation_storage(modalities::DType dtype) {
 }
 
 bool empty_weight(const Pi05ResolvedWeight& weight) {
-    return !weight.device_data && !weight.bytes && !weight.shape.rank;
+    return !weight.device_data && !weight.scale_data && !weight.bytes &&
+           !weight.shape.rank;
 }
 
 modalities::Status validate_weight(
@@ -160,9 +161,11 @@ modalities::Status validate_weight(
     Pi05WeightStorage activation,
     bool allow_fp8 = false) {
     std::uint64_t bytes = 0;
+    const bool fp8 = weight.storage == Pi05WeightStorage::kFp8E4M3;
     if (!weight.device_data || !same_shape(weight.shape, shape) ||
         (weight.storage != activation &&
-         !(allow_fp8 && weight.storage == Pi05WeightStorage::kFp8E4M3)) ||
+         !(allow_fp8 && fp8)) ||
+        (fp8 ? !weight.scale_data : weight.scale_data != nullptr) ||
         !byte_count(shape, weight_width(weight.storage), &bytes) ||
         weight.bytes != bytes) {
         return invalid("PI0.5 resolved weight metadata is invalid");

@@ -33,6 +33,8 @@ struct Pi05LinearWeightKey final {
 struct Pi05LinearWeightGroup final {
     Pi05LinearWeightKey key;
     Pi05ResolvedWeight* first = nullptr;
+    // Gate/up groups expose both logical inputs; the target chooses whether
+    // their physical layout remains separate or populates fused.
     Pi05ResolvedWeight* second = nullptr;
     Pi05ResolvedWeight* fused = nullptr;
 };

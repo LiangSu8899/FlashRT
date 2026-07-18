@@ -58,6 +58,7 @@ enum class Pi05WeightStorage : std::uint8_t {
 
 struct Pi05ResolvedWeight final {
     const void* device_data = nullptr;
+    const float* scale_data = nullptr;
     std::uint64_t bytes = 0;
     Pi05WeightStorage storage = Pi05WeightStorage::kBFloat16;
     modalities::Shape shape;

@@ -92,6 +92,9 @@ inline models::pi05::Pi05ResolvedWeight make_weight(
     models::pi05::Pi05WeightStorage type) {
     models::pi05::Pi05ResolvedWeight weight;
     weight.device_data = storage;
+    if (type == models::pi05::Pi05WeightStorage::kFp8E4M3) {
+        weight.scale_data = static_cast<const float*>(storage);
+    }
     weight.shape = shape;
     weight.storage = type;
     weight.bytes = shape.elements() * weight_width(type);
