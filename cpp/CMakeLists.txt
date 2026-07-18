@@ -452,6 +452,16 @@ if(BUILD_TESTING)
       flashrt_cpp_pi05_target_sm120 flashrt_exec CUDA::cudart)
     add_test(NAME pi05_sm120_target_bundle
       COMMAND test_pi05_sm120_target_bundle)
+
+    if(TARGET flashrt_cpp_pi05_capture)
+      add_executable(test_pi05_sm120_native_session
+        tests/test_pi05_sm120_native_session.cpp)
+      target_link_libraries(test_pi05_sm120_native_session PRIVATE
+        flashrt_cpp_pi05_target_sm120 flashrt_cpp_pi05_capture
+        flashrt_exec CUDA::cudart)
+      add_test(NAME pi05_sm120_native_session
+        COMMAND test_pi05_sm120_native_session)
+    endif()
   endif()
 
   if(TARGET flashrt_cpp_native_cuda)
