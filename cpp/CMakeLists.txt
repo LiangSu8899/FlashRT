@@ -103,7 +103,8 @@ target_link_libraries(flashrt_cpp_pi05
 
 if(TARGET flashrt_cpp_native_cuda)
   add_library(flashrt_cpp_pi05_capture STATIC
-    models/pi05/src/model/captured_program.cpp)
+    models/pi05/src/model/captured_program.cpp
+    models/pi05/src/model/native_session.cpp)
   target_include_directories(flashrt_cpp_pi05_capture
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/internal/include)
   target_link_libraries(flashrt_cpp_pi05_capture
@@ -165,6 +166,12 @@ if(BUILD_TESTING)
     target_link_libraries(test_pi05_captured_program
       PRIVATE flashrt_cpp_pi05_capture)
     add_test(NAME pi05_captured_program COMMAND test_pi05_captured_program)
+
+    add_executable(test_pi05_native_session
+      tests/test_pi05_native_session.cpp)
+    target_link_libraries(test_pi05_native_session
+      PRIVATE flashrt_cpp_pi05_capture)
+    add_test(NAME pi05_native_session COMMAND test_pi05_native_session)
   endif()
 
   if(FLASHRT_CPP_WITH_CUDA_STAGING)

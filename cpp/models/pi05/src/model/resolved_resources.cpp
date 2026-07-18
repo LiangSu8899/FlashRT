@@ -68,11 +68,22 @@ bool tensor_elements(const Pi05TensorSpec& spec, std::uint64_t* out) {
 }
 
 bool valid_storage_range(const Pi05ResolvedBuffer& buffer) {
-    return buffer.buffer && buffer.storage_identity && buffer.physical_bytes &&
-           buffer.storage_bytes &&
-           buffer.storage_offset <= buffer.storage_bytes &&
-           buffer.physical_bytes <=
-               buffer.storage_bytes - buffer.storage_offset;
+    if (!buffer.buffer || !buffer.storage_identity ||
+        !buffer.physical_bytes || !buffer.storage_bytes ||
+        buffer.storage_offset > buffer.storage_bytes ||
+        buffer.physical_bytes >
+            buffer.storage_bytes - buffer.storage_offset ||
+        !frt_buffer_dptr(buffer.buffer) ||
+        buffer.physical_bytes > frt_buffer_bytes(buffer.buffer)) {
+        return false;
+    }
+    const std::uintptr_t storage =
+        reinterpret_cast<std::uintptr_t>(buffer.storage_identity);
+    const std::uintptr_t data =
+        reinterpret_cast<std::uintptr_t>(frt_buffer_dptr(buffer.buffer));
+    return buffer.storage_offset <=
+               std::numeric_limits<std::uintptr_t>::max() - storage &&
+           storage + buffer.storage_offset == data;
 }
 
 modalities::Status validate_physical_buffer(
