@@ -75,6 +75,25 @@ __global__ void quantize_fp8_kernel_generic(const T* __restrict__ input,
 template __global__ void quantize_fp8_kernel_generic<__half>(const __half*, __nv_fp8_e4m3*, const float*, int);
 template __global__ void quantize_fp8_kernel_generic<__nv_bfloat16>(const __nv_bfloat16*, __nv_fp8_e4m3*, const float*, int);
 
+__global__ void quantize_fp8_weight_kernel(
+        const __nv_bfloat16* __restrict__ input,
+        __nv_fp8_e4m3* __restrict__ output,
+        const float* scale, int n) {
+    using T2 = typename packed2<__nv_bfloat16>::type;
+    const T2* in2 = reinterpret_cast<const T2*>(input);
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < (n >> 1)) {
+        const float inverse_scale = __fdiv_rn(1.0f, *scale);
+        const T2 value = in2[index];
+        const float v0 = __fmul_rn(to_f32(value.x), inverse_scale);
+        const float v1 = __fmul_rn(to_f32(value.y), inverse_scale);
+        output[2 * index] = __nv_fp8_e4m3(
+            fminf(fmaxf(v0, -448.0f), 448.0f));
+        output[2 * index + 1] = __nv_fp8_e4m3(
+            fminf(fmaxf(v1, -448.0f), 448.0f));
+    }
+}
+
 float quantize_fp8(const __nv_bfloat16* input, __nv_fp8_e4m3* output,
                    float* d_scale, int n, cudaStream_t stream) {
     float* d_max;
@@ -129,6 +148,13 @@ float quantize_fp8_fp16(const __half* input, __nv_fp8_e4m3* output,
 __global__ void compute_scale_kernel(const float* d_absmax, float* d_scale) {
     float amax = *d_absmax;
     float scale = amax / 448.0f;
+    if (scale < 1e-12f) scale = 1e-12f;
+    *d_scale = scale;
+}
+
+__global__ void compute_fp8_weight_scale_kernel(
+        const float* d_absmax, float* d_scale) {
+    float scale = __fdiv_rn(*d_absmax, 448.0f);
     if (scale < 1e-12f) scale = 1e-12f;
     *d_scale = scale;
 }
@@ -306,6 +332,24 @@ void quantize_fp8_device(const __nv_bfloat16* input, __nv_fp8_e4m3* output,
     int n2 = n >> 1;
     blocks = (n2 + threads - 1) / threads;
     quantize_fp8_kernel_generic<__nv_bfloat16><<<blocks, threads, 0, stream>>>(input, output, d_scale, n);
+}
+
+void quantize_fp8_weight_device(
+        const __nv_bfloat16* input, __nv_fp8_e4m3* output,
+        float* d_scale, int n, cudaStream_t stream) {
+    cudaMemsetAsync(d_scale, 0, sizeof(float), stream);
+
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    if (blocks > 1024) blocks = 1024;
+    absmax_kernel<__nv_bfloat16>
+        <<<blocks, threads, threads * sizeof(float), stream>>>(
+            input, d_scale, n);
+    compute_fp8_weight_scale_kernel<<<1, 1, 0, stream>>>(d_scale, d_scale);
+
+    blocks = ((n >> 1) + threads - 1) / threads;
+    quantize_fp8_weight_kernel<<<blocks, threads, 0, stream>>>(
+        input, output, d_scale, n);
 }
 
 void quantize_fp8_device_fp16(const __half* input, __nv_fp8_e4m3* output,

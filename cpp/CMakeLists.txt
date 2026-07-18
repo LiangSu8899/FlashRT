@@ -344,6 +344,16 @@ if(BUILD_TESTING)
       CUDA_STANDARD 17
       CUDA_STANDARD_REQUIRED ON)
     add_test(NAME csrc_bf16_operations COMMAND test_csrc_bf16_operations)
+
+    add_executable(test_csrc_fp8_weight_quantize
+      tests/test_csrc_fp8_weight_quantize.cu)
+    target_link_libraries(test_csrc_fp8_weight_quantize PRIVATE
+      flashrt_cpp_csrc_core CUDA::cudart)
+    set_target_properties(test_csrc_fp8_weight_quantize PROPERTIES
+      CUDA_STANDARD 17
+      CUDA_STANDARD_REQUIRED ON)
+    add_test(NAME csrc_fp8_weight_quantize
+      COMMAND test_csrc_fp8_weight_quantize)
   endif()
 
   add_executable(test_safetensors_loader tests/test_safetensors_loader.cpp)
