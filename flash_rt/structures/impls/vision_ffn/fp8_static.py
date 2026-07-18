@@ -64,10 +64,12 @@ class BoundVisionFfnFp8:
     eps: float
 
     def ffn(self, normed: torch.Tensor) -> torch.Tensor:
-        """The normed-input -> ffn-output slice (no norm, no residual)."""
+        """The normed-input -> ffn-output slice (no norm, no residual).
+
+        Input quantization is fused inside the kernel's BF16 entry."""
         shape = normed.shape
         out = self.fused_mlp(
-            _quantize(normed.reshape(-1, shape[-1]), self.input_scale),
+            normed.reshape(-1, shape[-1]).to(torch.bfloat16).contiguous(),
             self.fc1_fp8,
             self.b_fc1,
             self.fc2_fp8,
@@ -155,7 +157,7 @@ def _build(weights, input_scale, hidden_scale, eps):
     fc2_scale = _amax_scale(weights["w_fc2"])
     to_bf16 = lambda t: t.to(torch.bfloat16)
     return BoundVisionFfnFp8(
-        fused_mlp=_kernel().fp8_gelu_mlp_bf16,
+        fused_mlp=_kernel().bf16_fp8_gelu_mlp_bf16,
         w_norm=weights["w_norm"],
         b_norm=weights["b_norm"],
         fc1_fp8=_quantize(weights["w_fc1"], fc1_scale),

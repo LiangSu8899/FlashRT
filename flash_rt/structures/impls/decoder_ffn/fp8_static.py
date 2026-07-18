@@ -26,7 +26,8 @@ KERNEL_DEP = {
 
 _FP8 = torch.float8_e4m3fn
 _FP8_MAX = 448.0
-_ENTRYPOINTS = {"gelu": "fp8_geglu_mlp_bf16", "silu": "fp8_swiglu_mlp_bf16"}
+_ENTRYPOINTS = {"gelu": "bf16_fp8_geglu_mlp_bf16",
+                "silu": "bf16_fp8_swiglu_mlp_bf16"}
 
 SUPPORT = {
     "D": {"min": 512, "max": 16384},
@@ -143,10 +144,12 @@ class BoundDecoderFfnFp8:
     eps: float
 
     def ffn(self, normed: torch.Tensor) -> torch.Tensor:
-        """The normed-input -> ffn-output slice (no norm, no residual)."""
+        """The normed-input -> ffn-output slice (no norm, no residual).
+
+        Input quantization is fused inside the kernel's BF16 entry."""
         shape = normed.shape
         out = self.fused_mlp(
-            _quantize(normed.reshape(-1, shape[-1]), self.input_scale),
+            normed.reshape(-1, shape[-1]).to(torch.bfloat16).contiguous(),
             self.gate_up_fp8,
             self.down_fp8,
             self.input_scale.view(1),
