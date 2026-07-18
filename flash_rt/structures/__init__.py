@@ -10,6 +10,18 @@ the qualification harness build on top of these specifications.
 from flash_rt.structures.registry import StructureSpec, list_structures, load
 
 
+def get(name):
+    """Explicit door: pull one structure and bind it yourself.
+
+    Mirrors ``kernels.get_kernel``: ``get("decoder_ffn").bind(module,
+    calibration=[...])`` returns a gated drop-in replacement you plug in
+    where you choose. See :mod:`flash_rt.structures.handle`.
+    """
+    from flash_rt.structures.handle import get as _get
+
+    return _get(name)
+
+
 def attach(model, forward, **kwargs):
     """One-call front door: discover, calibrate, gate, activate.
 
@@ -21,4 +33,4 @@ def attach(model, forward, **kwargs):
     return _attach(model, forward, **kwargs)
 
 
-__all__ = ["StructureSpec", "attach", "list_structures", "load"]
+__all__ = ["StructureSpec", "attach", "get", "list_structures", "load"]
