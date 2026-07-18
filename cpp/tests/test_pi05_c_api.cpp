@@ -145,6 +145,27 @@ int main() {
     rc = frt_pi05_runtime_prepare_vision(rt, &frame, 1);
     assert(rc == 0);
 
+    const std::uint8_t bgr[] = {
+        255, 127, 0, 0, 127, 255,
+        30, 20, 10, 60, 50, 40,
+    };
+    frame.data = bgr;
+    frame.bytes = sizeof(bgr);
+    frame.pixel_format = FRT_PI05_PIXEL_BGR8;
+    rc = frt_pi05_runtime_prepare_vision(rt, &frame, 1);
+    assert(rc == 0);
+
+    const std::uint8_t gray[] = {0, 127, 255, 64};
+    frame.data = gray;
+    frame.bytes = sizeof(gray);
+    frame.pixel_format = FRT_PI05_PIXEL_GRAY8;
+    rc = frt_pi05_runtime_prepare_vision(rt, &frame, 1);
+    assert(rc == 0);
+
+    frame.pixel_format = 99;
+    rc = frt_pi05_runtime_prepare_vision(rt, &frame, 1);
+    assert(rc != 0);
+
     float out[3] = {};
     uint64_t n_written = 0;
     rc = frt_pi05_runtime_read_actions(rt, out, 3, &n_written);

@@ -16,8 +16,8 @@ modalities::VisionPreprocessSpec vision_preprocess_spec(int num_views) {
     spec.target_height = kImageSize;
     spec.output_dtype = modalities::DType::kBFloat16;
     spec.output_layout = modalities::Layout::kNHWC;
-    spec.normalize.mode = modalities::NormalizeMode::kScaleShift;
-    spec.normalize.scale = 1.0f / 127.5f;
+    spec.normalize.mode = modalities::NormalizeMode::kDivideShift;
+    spec.normalize.divisor = 127.5f;
     spec.normalize.shift = -1.0f;
     spec.require_exact_views = true;
     return spec;

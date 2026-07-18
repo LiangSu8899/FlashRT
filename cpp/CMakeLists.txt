@@ -156,6 +156,8 @@ endif()
 add_library(flashrt_cpp_pi05 STATIC
   models/pi05/src/model/dims.cpp
   models/pi05/src/model/execution_plan.cpp
+  models/pi05/src/model/prompt_embed.cpp
+  models/pi05/src/model/prompt_format.cpp
   models/pi05/src/model/resolved_resources.cpp
   models/pi05/src/model/semantic_pipeline.cpp
   models/pi05/src/spec.cpp
@@ -166,6 +168,10 @@ target_include_directories(flashrt_cpp_pi05
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/internal/include)
 target_link_libraries(flashrt_cpp_pi05
   PUBLIC flashrt_cpp_modalities flashrt_cpp_vla)
+if(FLASHRT_CPP_WITH_CUDA_KERNELS)
+  target_compile_definitions(flashrt_cpp_pi05
+    PRIVATE FLASHRT_CPP_WITH_CUDA_KERNELS=1)
+endif()
 
 if(TARGET flashrt_cpp_native_cuda)
   add_library(flashrt_cpp_pi05_capture STATIC
@@ -215,6 +221,22 @@ if(BUILD_TESTING)
   target_link_libraries(test_pi05_runtime
     PRIVATE flashrt_cpp_pi05 flashrt_cpp_modalities)
   add_test(NAME pi05_runtime COMMAND test_pi05_runtime)
+
+  add_executable(test_pi05_prompt_format tests/test_pi05_prompt_format.cpp)
+  target_include_directories(test_pi05_prompt_format PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/internal/include)
+  target_link_libraries(test_pi05_prompt_format PRIVATE flashrt_cpp_pi05)
+  add_test(NAME pi05_prompt_format COMMAND test_pi05_prompt_format)
+
+  add_executable(test_pi05_prompt_embed tests/test_pi05_prompt_embed.cpp)
+  target_include_directories(test_pi05_prompt_embed PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/internal/include)
+  if(FLASHRT_CPP_WITH_CUDA_KERNELS)
+    target_compile_definitions(test_pi05_prompt_embed PRIVATE
+      FLASHRT_CPP_TEST_WITH_CUDA_KERNELS=1)
+  endif()
+  target_link_libraries(test_pi05_prompt_embed PRIVATE flashrt_cpp_pi05)
+  add_test(NAME pi05_prompt_embed COMMAND test_pi05_prompt_embed)
 
   add_executable(test_pi05_semantic_pipeline
     tests/test_pi05_semantic_pipeline.cpp)

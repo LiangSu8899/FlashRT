@@ -3,7 +3,9 @@
 #include <cassert>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <vector>
 
 using flashrt::modalities::DType;
@@ -44,6 +46,13 @@ int fake_replay(frt_graph graph, frt_shape_key key, int stream_id, void* user) {
     assert(stream_id == p->expected_stream);
     return 0;
 }
+
+#ifdef FLASHRT_CPP_HAS_SENTENCEPIECE
+int update_prompt_length(void* user, std::uint64_t prompt_len) {
+    *static_cast<std::uint64_t*>(user) = prompt_len;
+    return 0;
+}
+#endif
 
 frt_runtime_export_v1 make_export(Owner* owner,
                                   frt_runtime_graph_desc* graph_desc) {
@@ -111,6 +120,7 @@ void test_adopted_export_runtime_flow() {
         assert(runtime.export_runtime() == &exp);
         assert(runtime.manifest().vision.view_order.size() == 1);
         assert(runtime.manifest().graphs.infer == "infer");
+        assert(runtime.set_prompt("pick up the cube") != 0);
 
         const std::uint8_t image_rgb[] = {
             0, 127, 255, 255, 127, 0,
@@ -127,6 +137,11 @@ void test_adopted_export_runtime_flow() {
 
         auto st = runtime.prepare_vision({image});
         assert(st.ok_status());
+        VisionFrame bgr = image;
+        bgr.format = PixelFormat::kBGR8;
+        st = runtime.prepare_vision({bgr});
+        assert(!st.ok_status());
+        assert(st.code == flashrt::modalities::StatusCode::kShapeMismatch);
         assert(runtime.replay_tick() == 0);
         assert(probe.calls == 1);
 
@@ -142,10 +157,105 @@ void test_adopted_export_runtime_flow() {
     assert(owner.release == 1);
 }
 
+void test_failed_bind_does_not_release_unretained_export() {
+    Owner owner;
+    frt_runtime_graph_desc graph{};
+    graph.name = "infer";
+    graph.handle = reinterpret_cast<frt_graph>(0x1800);
+    auto exp = make_export(&owner, &graph);
+    {
+        flashrt::models::pi05::Runtime runtime(&exp, {});
+        assert(!runtime.ok());
+        assert(owner.retain == 0);
+    }
+    assert(owner.release == 0);
+}
+
+void test_prompt_staging_when_configured() {
+#ifdef FLASHRT_CPP_HAS_SENTENCEPIECE
+    const char* tokenizer = std::getenv("FLASH_RT_PALIGEMMA_TOKENIZER");
+    if (!tokenizer || tokenizer[0] == '\0') {
+        std::cout << "SKIP - FLASH_RT_PALIGEMMA_TOKENIZER not set\n";
+        return;
+    }
+
+    Owner owner;
+    frt_runtime_graph_desc graph{};
+    graph.name = "infer";
+    graph.handle = reinterpret_cast<frt_graph>(0x2000);
+    graph.default_key = 9;
+    graph.stream_id = 5;
+    auto exp = make_export(&owner, &graph);
+
+    constexpr std::uint64_t vocab = 257152;
+    constexpr std::uint64_t hidden = 2;
+    constexpr std::uint64_t max_tokens = 32;
+    std::vector<float> table(vocab * hidden);
+    for (std::uint64_t i = 0; i < vocab; ++i) {
+        table[i * hidden] = static_cast<float>(i);
+        table[i * hidden + 1] = -static_cast<float>(i);
+    }
+    std::vector<float> prompt(max_tokens * hidden, 3.0f);
+    std::vector<std::uint16_t> image_input(1 * 224 * 224 * 3);
+    std::vector<float> action_model(4, 0.0f);
+    std::uint64_t staged_prompt_len = 0;
+
+    flashrt::models::pi05::RuntimeConfig cfg;
+    cfg.num_views = 1;
+    cfg.chunk = 1;
+    cfg.model_action_dim = 4;
+    cfg.robot_action_dim = 3;
+    cfg.image_input_override = TensorView{
+        image_input.data(), static_cast<std::uint64_t>(image_input.size() * 2),
+        DType::kBFloat16, MemoryPlace::kHost, Layout::kNHWC,
+        Shape{1, 224, 224, 3}};
+    cfg.action_output_override = TensorView{
+        action_model.data(), static_cast<std::uint64_t>(action_model.size() * 4),
+        DType::kFloat32, MemoryPlace::kHost, Layout::kFlat, Shape{1, 4}};
+    cfg.prompt_tokenizer_model_path = tokenizer;
+    cfg.prompt_vocab_size = vocab;
+    cfg.prompt_hidden_dim = hidden;
+    cfg.prompt_max_tokens = max_tokens;
+    cfg.prompt_embedding_scale = 0.5f;
+    cfg.prompt_embedding_table = TensorView{
+        table.data(), static_cast<std::uint64_t>(table.size() * 4),
+        DType::kFloat32, MemoryPlace::kHost, Layout::kFlat,
+        Shape{vocab, hidden}};
+    cfg.prompt_embedding_output = TensorView{
+        prompt.data(), static_cast<std::uint64_t>(prompt.size() * 4),
+        DType::kFloat32, MemoryPlace::kHost, Layout::kFlat,
+        Shape{max_tokens, hidden}};
+    cfg.state_q01 = {-1.0f, -1.0f, -1.0f};
+    cfg.state_q99 = {1.0f, 1.0f, 1.0f};
+    cfg.prompt_length_update_fn = update_prompt_length;
+    cfg.prompt_length_update_user = &staged_prompt_len;
+
+    flashrt::models::pi05::Runtime runtime(&exp, cfg);
+    assert(runtime.ok());
+    assert(runtime.prompt_staging_enabled());
+    assert(runtime.state_normalization_enabled());
+    const float state[] = {0.0f, 1.0f, -1.0f};
+    assert(runtime.set_prompt_state("pick_up_cube", state, 3) == 0);
+    assert(runtime.current_prompt_len() == 24);
+    assert(staged_prompt_len == 24);
+    assert(std::fabs(prompt[0] - 1.0f) < 0.001f);
+    assert(std::fabs(prompt[1] + 1.0f) < 0.001f);
+    assert(prompt[24 * hidden] == 0.0f);
+
+    const float invalid_state[] = {
+        0.0f, std::numeric_limits<float>::infinity(), -1.0f};
+    const std::vector<float> before = prompt;
+    assert(runtime.set_prompt_state("pick_up_cube", invalid_state, 3) != 0);
+    assert(prompt == before);
+#endif
+}
+
 }  // namespace
 
 int main() {
     test_adopted_export_runtime_flow();
+    test_failed_bind_does_not_release_unretained_export();
+    test_prompt_staging_when_configured();
     std::cout << "PASS - Pi05 C++ runtime flow\n";
     return 0;
 }

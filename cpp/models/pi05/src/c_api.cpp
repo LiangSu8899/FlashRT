@@ -9,6 +9,7 @@
 #include <memory>
 #include <new>
 #include <string>
+#include <utility>
 #include <vector>
 
 struct frt_pi05_runtime_s {
@@ -19,8 +20,10 @@ struct frt_pi05_runtime_s {
 namespace {
 
 using flashrt::models::pi05::cface::make_config;
+using flashrt::models::pi05::cface::pixel_channels;
 using flashrt::models::pi05::cface::pixel_format;
 using flashrt::models::pi05::cface::status_code;
+using flashrt::models::pi05::cface::valid_pixel_format;
 
 }  // namespace
 
@@ -38,8 +41,10 @@ extern "C" int frt_pi05_runtime_create(
     auto* h = new (std::nothrow) frt_pi05_runtime_s();
     if (!h) return -5;
     try {
+        auto runtime_config = make_config(config);
+        runtime_config.strict_rgb8 = false;
         h->runtime.reset(
-            new flashrt::models::pi05::Runtime(exp, make_config(config)));
+            new flashrt::models::pi05::Runtime(exp, std::move(runtime_config)));
     } catch (const std::exception& e) {
         h->last_error = e.what();
         delete h;
@@ -84,6 +89,10 @@ extern "C" int frt_pi05_runtime_prepare_vision(
             h->last_error = "invalid Pi05 vision frame";
             return -1;
         }
+        if (!valid_pixel_format(in.pixel_format)) {
+            h->last_error = "Pi05 vision pixel format is invalid";
+            return -4;
+        }
         flashrt::modalities::VisionFrame out;
         out.name = in.name;
         out.image.data = const_cast<void*>(in.data);
@@ -94,7 +103,7 @@ extern "C" int frt_pi05_runtime_prepare_vision(
         out.image.shape = flashrt::modalities::Shape{
             static_cast<uint64_t>(std::max(0, in.height)),
             static_cast<uint64_t>(std::max(0, in.width)),
-            3};
+            pixel_channels(in.pixel_format)};
         out.format = pixel_format(in.pixel_format);
         out.width = in.width;
         out.height = in.height;
