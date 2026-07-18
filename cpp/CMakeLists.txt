@@ -22,12 +22,38 @@ include(CTest)
 option(FLASHRT_CPP_WITH_EXEC "Build/link the exec layer for native replay" ON)
 option(FLASHRT_CPP_WITH_CUDA_STAGING "Enable conservative CUDA H2D/D2H modality staging" ON)
 option(FLASHRT_CPP_WITH_CUDA_KERNELS "Enable CUDA modality kernels" ON)
+option(FLASHRT_CPP_WITH_SENTENCEPIECE
+       "Enable native SentencePiece text tokenization" OFF)
 if(FLASHRT_CPP_WITH_CUDA_STAGING)
   find_package(CUDAToolkit REQUIRED)
 endif()
 if(FLASHRT_CPP_WITH_CUDA_KERNELS)
   enable_language(CUDA)
   find_package(CUDAToolkit REQUIRED)
+endif()
+if(FLASHRT_CPP_WITH_SENTENCEPIECE)
+  find_path(FLASHRT_SENTENCEPIECE_INCLUDE_DIR sentencepiece_processor.h)
+  find_library(FLASHRT_SENTENCEPIECE_LIBRARY sentencepiece)
+  if(FLASHRT_SENTENCEPIECE_INCLUDE_DIR AND FLASHRT_SENTENCEPIECE_LIBRARY)
+    add_library(flashrt_sentencepiece_external INTERFACE)
+    target_include_directories(flashrt_sentencepiece_external
+      INTERFACE ${FLASHRT_SENTENCEPIECE_INCLUDE_DIR})
+    target_link_libraries(flashrt_sentencepiece_external
+      INTERFACE ${FLASHRT_SENTENCEPIECE_LIBRARY})
+    set(FLASHRT_CPP_SENTENCEPIECE_TARGET flashrt_sentencepiece_external)
+  else()
+    include(FetchContent)
+    set(SPM_ENABLE_SHARED OFF CACHE BOOL "" FORCE)
+    set(SPM_BUILD_TEST OFF CACHE BOOL "" FORCE)
+    set(SPM_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    FetchContent_Declare(
+      sentencepiece
+      GIT_REPOSITORY https://github.com/google/sentencepiece.git
+      GIT_TAG v0.2.1)
+    FetchContent_MakeAvailable(sentencepiece)
+    set(FLASHRT_SENTENCEPIECE_INCLUDE_DIR ${sentencepiece_SOURCE_DIR}/src)
+    set(FLASHRT_CPP_SENTENCEPIECE_TARGET sentencepiece-static)
+  endif()
 endif()
 if(FLASHRT_CPP_WITH_EXEC AND NOT TARGET flashrt_exec)
   add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../exec
@@ -50,18 +76,40 @@ endif()
 set(FLASHRT_CPP_MODALITY_SRCS
   modalities/src/types.cpp
   modalities/src/vision_cpu.cpp
+  modalities/src/text_cpu.cpp
   modalities/src/action_cpu.cpp)
+if(FLASHRT_CPP_WITH_SENTENCEPIECE)
+  list(APPEND FLASHRT_CPP_MODALITY_SRCS
+    modalities/src/sentencepiece_tokenizer.cpp)
+else()
+  list(APPEND FLASHRT_CPP_MODALITY_SRCS
+    modalities/src/tokenizer_unavailable.cpp)
+endif()
 if(FLASHRT_CPP_WITH_CUDA_KERNELS)
-  list(APPEND FLASHRT_CPP_MODALITY_SRCS modalities/src/vision_cuda.cu)
+  list(APPEND FLASHRT_CPP_MODALITY_SRCS
+    modalities/src/vision_cuda.cu
+    modalities/src/text_cuda.cu)
 endif()
 
 add_library(flashrt_cpp_modalities STATIC ${FLASHRT_CPP_MODALITY_SRCS})
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  set_property(SOURCE modalities/src/vision_cpu.cpp APPEND PROPERTY
+    COMPILE_OPTIONS -ffp-contract=off)
+endif()
 target_include_directories(flashrt_cpp_modalities
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/modalities/include)
 if(FLASHRT_CPP_WITH_CUDA_STAGING)
   target_compile_definitions(flashrt_cpp_modalities
     PUBLIC FLASHRT_CPP_WITH_CUDA_STAGING=1)
   target_link_libraries(flashrt_cpp_modalities PUBLIC CUDA::cudart)
+endif()
+if(FLASHRT_CPP_WITH_SENTENCEPIECE)
+  target_compile_definitions(flashrt_cpp_modalities
+    PUBLIC FLASHRT_CPP_HAS_SENTENCEPIECE=1)
+  target_include_directories(flashrt_cpp_modalities
+    PUBLIC ${FLASHRT_SENTENCEPIECE_INCLUDE_DIR})
+  target_link_libraries(flashrt_cpp_modalities
+    PUBLIC ${FLASHRT_CPP_SENTENCEPIECE_TARGET})
 endif()
 if(FLASHRT_CPP_WITH_CUDA_KERNELS)
   target_compile_definitions(flashrt_cpp_modalities
@@ -78,6 +126,11 @@ target_include_directories(flashrt_cpp_vla
 target_link_libraries(flashrt_cpp_vla
   INTERFACE flashrt_cpp_modalities flashrt_cpp)
 
+add_library(flashrt_cpp_native STATIC
+  native/src/config_object.cpp)
+target_include_directories(flashrt_cpp_native
+  PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/native/include)
+
 if(FLASHRT_CPP_WITH_CUDA_KERNELS AND FLASHRT_CPP_WITH_EXEC)
   add_library(flashrt_cpp_native_cuda STATIC
     native/src/cuda_graph_set.cpp)
@@ -85,6 +138,19 @@ if(FLASHRT_CPP_WITH_CUDA_KERNELS AND FLASHRT_CPP_WITH_EXEC)
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/native/include)
   target_link_libraries(flashrt_cpp_native_cuda
     PUBLIC flashrt_cpp_modalities flashrt_exec CUDA::cudart)
+endif()
+
+add_library(flashrt_cpp_loader STATIC
+  loader/src/safetensors.cpp
+  loader/src/sha256.cpp)
+set_property(SOURCE loader/src/sha256.cpp APPEND PROPERTY COMPILE_OPTIONS -O2)
+target_include_directories(flashrt_cpp_loader
+  PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/loader/include)
+find_package(OpenSSL QUIET)
+if(OpenSSL_FOUND)
+  target_compile_definitions(flashrt_cpp_loader
+    PRIVATE FLASHRT_CPP_HAS_OPENSSL=1)
+  target_link_libraries(flashrt_cpp_loader PRIVATE OpenSSL::Crypto)
 endif()
 
 add_library(flashrt_cpp_pi05 STATIC
@@ -120,6 +186,26 @@ target_include_directories(flashrt_cpp_pi05_c
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/include)
 
 if(BUILD_TESTING)
+  add_executable(test_safetensors_loader tests/test_safetensors_loader.cpp)
+  target_link_libraries(test_safetensors_loader PRIVATE flashrt_cpp_loader)
+  add_test(NAME safetensors_loader COMMAND test_safetensors_loader)
+
+  add_executable(test_sha256 tests/test_sha256.cpp)
+  target_link_libraries(test_sha256 PRIVATE flashrt_cpp_loader)
+  add_test(NAME sha256 COMMAND test_sha256)
+
+  add_executable(test_native_config tests/test_native_config.cpp)
+  target_link_libraries(test_native_config PRIVATE flashrt_cpp_native)
+  add_test(NAME native_config COMMAND test_native_config)
+
+  add_executable(test_text_modalities tests/test_text_modalities.cpp)
+  target_link_libraries(test_text_modalities PRIVATE flashrt_cpp_modalities)
+  add_test(NAME text_modalities COMMAND test_text_modalities)
+
+  add_executable(test_text_tokenizer tests/test_text_tokenizer.cpp)
+  target_link_libraries(test_text_tokenizer PRIVATE flashrt_cpp_modalities)
+  add_test(NAME text_tokenizer COMMAND test_text_tokenizer)
+
   add_executable(test_cpp_modalities tests/test_modalities.cpp)
   target_link_libraries(test_cpp_modalities
     PRIVATE flashrt_cpp_pi05 flashrt_cpp_modalities)
@@ -176,6 +262,10 @@ if(BUILD_TESTING)
 
   if(FLASHRT_CPP_WITH_CUDA_STAGING)
     add_executable(test_device_staging tests/test_device_staging.cpp)
+    if(FLASHRT_CPP_WITH_CUDA_KERNELS)
+      target_compile_definitions(test_device_staging PRIVATE
+        FLASHRT_CPP_TEST_WITH_CUDA_KERNELS=1)
+    endif()
     target_link_libraries(test_device_staging
       PRIVATE flashrt_cpp_pi05 flashrt_cpp_modalities CUDA::cudart)
     add_test(NAME device_staging COMMAND test_device_staging)
@@ -189,5 +279,16 @@ if(BUILD_TESTING)
     target_link_libraries(test_pi05_model_runtime
       PRIVATE flashrt_cpp_pi05_c flashrt_exec flashrt_runtime CUDA::cudart)
     add_test(NAME pi05_model_runtime COMMAND test_pi05_model_runtime)
+  endif()
+
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    get_property(_flashrt_cpp_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+    foreach(_target IN LISTS _flashrt_cpp_targets)
+      if(_target MATCHES "^test_")
+        target_compile_options(${_target} PRIVATE
+          $<$<COMPILE_LANGUAGE:CXX>:-UNDEBUG>
+          $<$<COMPILE_LANGUAGE:CUDA>:-UNDEBUG>)
+      endif()
+    endforeach()
   endif()
 endif()

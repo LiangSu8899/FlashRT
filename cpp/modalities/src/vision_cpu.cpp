@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 #ifdef FLASHRT_CPP_WITH_CUDA_STAGING
@@ -26,6 +27,13 @@ Status vision_staging_create(VisionStaging* out, std::uint32_t n_views,
     if (!out || !n_views || !max_frame_bytes) {
         return Status::error(StatusCode::kInvalidArgument,
                              "invalid vision staging capacity");
+    }
+    if (max_frame_bytes >
+            std::numeric_limits<std::uint64_t>::max() / n_views ||
+        max_frame_bytes >
+            std::numeric_limits<std::size_t>::max() / n_views) {
+        return Status::error(StatusCode::kInvalidArgument,
+                             "vision staging capacity overflows size_t");
     }
     *out = VisionStaging{};
     const std::uint64_t total = max_frame_bytes * n_views;
@@ -111,6 +119,9 @@ float normalize_value(float raw, int c, const NormalizeSpec& spec) {
     if (spec.mode == NormalizeMode::kScaleShift) {
         return raw * spec.scale + spec.shift;
     }
+    if (spec.mode == NormalizeMode::kDivideShift) {
+        return raw / spec.divisor + spec.shift;
+    }
     return (raw / 255.0f - spec.mean[c]) * spec.inv_std[c];
 }
 
@@ -142,6 +153,13 @@ Status validate_frame(const VisionFrame& frame) {
         return Status::error(StatusCode::kUnsupported,
                              "unsupported pixel format");
     }
+    if (frame.width > std::numeric_limits<int>::max() / ch ||
+        frame.stride_bytes < 0 ||
+        (frame.stride_bytes > 0 &&
+         frame.stride_bytes < frame.width * ch)) {
+        return Status::error(StatusCode::kShapeMismatch,
+                             "vision frame stride is smaller than one row");
+    }
     const int stride = frame.stride_bytes > 0 ? frame.stride_bytes : frame.width * ch;
     const std::uint64_t need =
         static_cast<std::uint64_t>(stride) * static_cast<std::uint64_t>(frame.height);
@@ -156,6 +174,40 @@ Status validate_frame(const VisionFrame& frame) {
     }
     return Status::ok();
 }
+
+#if defined(FLASHRT_CPP_WITH_CUDA_STAGING) && \
+    !defined(FLASHRT_CPP_WITH_CUDA_KERNELS)
+Status validate_staging_frames(const VisionPreprocessSpec& spec,
+                               const std::vector<VisionFrame>& frames,
+                               const VisionStaging& staging) {
+    if (!staging.device || !staging.host_pinned ||
+        staging.slots < spec.view_order.size()) {
+        return Status::error(StatusCode::kInsufficientStorage,
+                             "vision staging has fewer slots than views");
+    }
+    for (const std::string& name : spec.view_order) {
+        const VisionFrame* frame = find_frame(frames, name);
+        if (!frame) {
+            return Status::error(StatusCode::kNotFound,
+                                 "missing required vision view: " + name);
+        }
+        Status status = validate_frame(*frame);
+        if (!status.ok_status()) return status;
+        const int stride = frame->stride_bytes > 0
+                               ? frame->stride_bytes
+                               : frame->width * channels(frame->format);
+        const std::uint64_t bytes =
+            static_cast<std::uint64_t>(stride) *
+            static_cast<std::uint64_t>(frame->height);
+        if (bytes > staging.slot_bytes) {
+            return Status::error(
+                StatusCode::kInsufficientStorage,
+                "vision frame exceeds the staging slot capacity: " + name);
+        }
+    }
+    return Status::ok();
+}
+#endif
 
 }  // namespace
 
@@ -228,7 +280,8 @@ Status preprocess_vision_cpu(const VisionPreprocessSpec& spec,
                 const int x1 = std::max(0, std::min(frame->width - 1, x0 + 1));
                 const float wx = std::max(0.0f, std::min(1.0f, fx - x0));
 
-                float p00[3], p01[3], p10[3], p11[3];
+                float p00[3] = {}, p01[3] = {};
+                float p10[3] = {}, p11[3] = {};
                 read_rgb(src + y0 * stride + x0 * ch, frame->format, p00);
                 read_rgb(src + y0 * stride + x1 * ch, frame->format, p01);
                 read_rgb(src + y1 * stride + x0 * ch, frame->format, p10);
@@ -265,6 +318,7 @@ Status preprocess_vision(const VisionPreprocessSpec& spec,
     }
 #ifndef FLASHRT_CPP_WITH_CUDA_STAGING
     (void)stream;
+    (void)staging;
     return Status::error(StatusCode::kUnsupported,
                          "device vision staging was not enabled at build time");
 #else
@@ -276,10 +330,13 @@ Status preprocess_vision(const VisionPreprocessSpec& spec,
 #ifdef FLASHRT_CPP_WITH_CUDA_KERNELS
     return preprocess_vision_cuda(spec, frames, output, stream, staging);
 #else
-    (void)staging;
-    std::vector<std::uint8_t> staging(static_cast<std::size_t>(bytes));
+    if (staging) {
+        Status status = validate_staging_frames(spec, frames, *staging);
+        if (!status.ok_status()) return status;
+    }
+    std::vector<std::uint8_t> host_staging(static_cast<std::size_t>(bytes));
     TensorView host_output;
-    host_output.data = staging.data();
+    host_output.data = host_staging.data();
     host_output.bytes = bytes;
     host_output.dtype = spec.output_dtype;
     host_output.place = MemoryPlace::kHost;
@@ -294,11 +351,11 @@ Status preprocess_vision(const VisionPreprocessSpec& spec,
     cudaError_t rc = cudaSuccess;
     if (stream) {
         auto* cuda_stream = reinterpret_cast<cudaStream_t>(stream);
-        rc = cudaMemcpyAsync(output.data, staging.data(), bytes,
+        rc = cudaMemcpyAsync(output.data, host_staging.data(), bytes,
                              cudaMemcpyHostToDevice, cuda_stream);
         if (rc == cudaSuccess) rc = cudaStreamSynchronize(cuda_stream);
     } else {
-        rc = cudaMemcpy(output.data, staging.data(), bytes,
+        rc = cudaMemcpy(output.data, host_staging.data(), bytes,
                         cudaMemcpyHostToDevice);
     }
     if (rc != cudaSuccess) {

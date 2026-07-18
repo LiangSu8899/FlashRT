@@ -31,6 +31,38 @@ bool has_dim(const std::vector<float>& v, int dim) {
 
 }  // namespace
 
+Status action_staging_create(ActionStaging* out, std::uint64_t bytes) {
+    if (!out || !bytes) {
+        return Status::error(StatusCode::kInvalidArgument,
+                             "invalid action staging capacity");
+    }
+    action_staging_destroy(out);
+#ifndef FLASHRT_CPP_WITH_CUDA_STAGING
+    return Status::error(StatusCode::kUnsupported,
+                         "action staging requires the CUDA build");
+#else
+    cudaError_t rc = cudaMallocHost(&out->host_pinned,
+                                    static_cast<std::size_t>(bytes));
+    if (rc != cudaSuccess) {
+        *out = ActionStaging{};
+        return Status::error(
+            StatusCode::kBackend,
+            std::string("cuda action host staging allocation failed: ") +
+                cudaGetErrorString(rc));
+    }
+    out->bytes = bytes;
+    return Status::ok();
+#endif
+}
+
+void action_staging_destroy(ActionStaging* staging) {
+    if (!staging) return;
+#ifdef FLASHRT_CPP_WITH_CUDA_STAGING
+    if (staging->host_pinned) cudaFreeHost(staging->host_pinned);
+#endif
+    *staging = ActionStaging{};
+}
+
 std::uint64_t required_action_output_bytes(const ActionPostprocessSpec& spec,
                                            DType dtype) {
     if (spec.chunk <= 0 || spec.model_dim <= 0) return 0;
@@ -97,7 +129,8 @@ Status postprocess_action_cpu(const ActionPostprocessSpec& spec,
 Status postprocess_action(const ActionPostprocessSpec& spec,
                           TensorView model_output,
                           std::vector<float>* robot_actions,
-                          void* stream) {
+                          void* stream,
+                          ActionStaging* persistent_staging) {
     if (model_output.place == MemoryPlace::kHost ||
         model_output.place == MemoryPlace::kHostPinned) {
         return postprocess_action_cpu(spec, model_output, robot_actions);
@@ -108,6 +141,7 @@ Status postprocess_action(const ActionPostprocessSpec& spec,
     }
 #ifndef FLASHRT_CPP_WITH_CUDA_STAGING
     (void)stream;
+    (void)persistent_staging;
     return Status::error(StatusCode::kUnsupported,
                          "device action staging was not enabled at build time");
 #else
@@ -117,15 +151,27 @@ Status postprocess_action(const ActionPostprocessSpec& spec,
         return Status::error(StatusCode::kInsufficientStorage,
                              "device action output storage is too small");
     }
-    std::vector<std::uint8_t> staging(static_cast<std::size_t>(bytes));
+    std::vector<std::uint8_t> fallback;
+    void* staging = nullptr;
+    if (persistent_staging) {
+        if (!persistent_staging->host_pinned ||
+            persistent_staging->bytes < bytes) {
+            return Status::error(StatusCode::kInsufficientStorage,
+                                 "action staging capacity is too small");
+        }
+        staging = persistent_staging->host_pinned;
+    } else {
+        fallback.resize(static_cast<std::size_t>(bytes));
+        staging = fallback.data();
+    }
     cudaError_t rc = cudaSuccess;
     if (stream) {
         auto* cuda_stream = reinterpret_cast<cudaStream_t>(stream);
-        rc = cudaMemcpyAsync(staging.data(), model_output.data, bytes,
+        rc = cudaMemcpyAsync(staging, model_output.data, bytes,
                              cudaMemcpyDeviceToHost, cuda_stream);
         if (rc == cudaSuccess) rc = cudaStreamSynchronize(cuda_stream);
     } else {
-        rc = cudaMemcpy(staging.data(), model_output.data, bytes,
+        rc = cudaMemcpy(staging, model_output.data, bytes,
                         cudaMemcpyDeviceToHost);
     }
     if (rc != cudaSuccess) {
@@ -134,7 +180,7 @@ Status postprocess_action(const ActionPostprocessSpec& spec,
                                  cudaGetErrorString(rc));
     }
     TensorView host;
-    host.data = staging.data();
+    host.data = staging;
     host.bytes = bytes;
     host.dtype = model_output.dtype;
     host.place = MemoryPlace::kHost;

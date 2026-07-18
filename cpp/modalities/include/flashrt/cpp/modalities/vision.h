@@ -11,12 +11,14 @@ namespace modalities {
 
 enum class NormalizeMode {
     kScaleShift,
+    kDivideShift,
     kMeanStd,
 };
 
 struct NormalizeSpec {
     NormalizeMode mode = NormalizeMode::kScaleShift;
     float scale = 1.0f / 127.5f;
+    float divisor = 127.5f;
     float shift = -1.0f;
     float mean[3] = {0.0f, 0.0f, 0.0f};
     float inv_std[3] = {1.0f, 1.0f, 1.0f};
