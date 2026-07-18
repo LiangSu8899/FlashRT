@@ -30,6 +30,17 @@ endif()
 if(FLASHRT_CPP_WITH_CUDA_KERNELS)
   enable_language(CUDA)
   find_package(CUDAToolkit REQUIRED)
+
+  add_library(flashrt_cpp_csrc_precise_math STATIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/../csrc/kernels/rope_table.cu)
+  target_include_directories(flashrt_cpp_csrc_precise_math PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/../csrc/kernels)
+  target_link_libraries(flashrt_cpp_csrc_precise_math PUBLIC CUDA::cudart)
+  target_compile_options(flashrt_cpp_csrc_precise_math PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:-O3>)
+  set_target_properties(flashrt_cpp_csrc_precise_math PROPERTIES
+    CUDA_STANDARD 17
+    CUDA_STANDARD_REQUIRED ON)
 endif()
 if(FLASHRT_CPP_WITH_SENTENCEPIECE)
   find_path(FLASHRT_SENTENCEPIECE_INCLUDE_DIR sentencepiece_processor.h)
@@ -200,6 +211,16 @@ target_include_directories(flashrt_cpp_pi05_c
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/include)
 
 if(BUILD_TESTING)
+  if(TARGET flashrt_cpp_csrc_precise_math)
+    add_executable(test_csrc_rope_table tests/test_csrc_rope_table.cu)
+    target_link_libraries(test_csrc_rope_table PRIVATE
+      flashrt_cpp_csrc_precise_math CUDA::cudart)
+    set_target_properties(test_csrc_rope_table PROPERTIES
+      CUDA_STANDARD 17
+      CUDA_STANDARD_REQUIRED ON)
+    add_test(NAME csrc_rope_table COMMAND test_csrc_rope_table)
+  endif()
+
   add_executable(test_safetensors_loader tests/test_safetensors_loader.cpp)
   target_link_libraries(test_safetensors_loader PRIVATE flashrt_cpp_loader)
   add_test(NAME safetensors_loader COMMAND test_safetensors_loader)
