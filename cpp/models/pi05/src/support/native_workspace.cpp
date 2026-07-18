@@ -404,6 +404,8 @@ modalities::Status NativeWorkspace::allocate(
             activation_dtype_);
     FRT_ADD("diffusion_noise", {ds, kPi05ModelDims.action_width},
             activation_dtype_);
+    FRT_ADD("decoder_action_buf", {ds, kPi05ModelDims.action_width},
+            activation_dtype_);
     FRT_ADD("rtc_prev_action_chunk", {ds, kPi05ModelDims.action_width},
             activation_dtype_);
     FRT_ADD("rtc_prefix_weights", {ds}, modalities::DType::kFloat32);

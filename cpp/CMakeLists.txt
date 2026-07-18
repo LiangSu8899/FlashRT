@@ -26,6 +26,8 @@ option(FLASHRT_CPP_WITH_SENTENCEPIECE
        "Enable native SentencePiece text tokenization" OFF)
 option(FLASHRT_CPP_WITH_FA2
        "Enable the Python-free vendored FA2 operation library" OFF)
+option(FLASHRT_CPP_WITH_PI05_SM120_TARGET
+       "Build the PI0.5 SM120 frontend target" OFF)
 set(FLASHRT_CPP_FA2_LIBRARY "" CACHE FILEPATH
     "Path to the Python-free libflashrt_fa2_raw shared library")
 if(FLASHRT_CPP_WITH_CUDA_STAGING)
@@ -66,6 +68,20 @@ if(FLASHRT_CPP_WITH_FA2)
   add_library(flashrt_cpp_fa2_external SHARED IMPORTED GLOBAL)
   set_target_properties(flashrt_cpp_fa2_external PROPERTIES
     IMPORTED_LOCATION ${FLASHRT_CPP_FA2_LIBRARY})
+endif()
+if(FLASHRT_CPP_WITH_PI05_SM120_TARGET)
+  if(NOT FLASHRT_CPP_WITH_FA2)
+    message(FATAL_ERROR
+      "FLASHRT_CPP_WITH_PI05_SM120_TARGET requires FLASHRT_CPP_WITH_FA2")
+  endif()
+  if(NOT FLASHRT_CPP_WITH_CUDA_STAGING)
+    message(FATAL_ERROR
+      "FLASHRT_CPP_WITH_PI05_SM120_TARGET requires CUDA staging")
+  endif()
+  if(NOT FLASHRT_CPP_WITH_EXEC)
+    message(FATAL_ERROR
+      "FLASHRT_CPP_WITH_PI05_SM120_TARGET requires the exec layer")
+  endif()
 endif()
 if(FLASHRT_CPP_WITH_SENTENCEPIECE)
   find_path(FLASHRT_SENTENCEPIECE_INCLUDE_DIR sentencepiece_processor.h)
@@ -284,6 +300,18 @@ if(TARGET flashrt_cpp_native_cuda)
     PUBLIC flashrt_cpp_pi05 flashrt_cpp_native_cuda CUDA::cudart)
 endif()
 
+if(FLASHRT_CPP_WITH_PI05_SM120_TARGET)
+  add_library(flashrt_cpp_pi05_target_sm120 STATIC
+    models/pi05/src/targets/sm120/attention.cpp
+    models/pi05/src/targets/sm120/attention_driver.cpp)
+  target_include_directories(flashrt_cpp_pi05_target_sm120
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/internal/include)
+  target_link_libraries(flashrt_cpp_pi05_target_sm120
+    PUBLIC flashrt_cpp_pi05
+    PRIVATE flashrt_cpp_csrc_core flashrt_cpp_csrc_sm120
+            flashrt_cpp_fa2_external CUDA::cudart)
+endif()
+
 add_library(flashrt_cpp_pi05_c SHARED
   models/pi05/src/c_api.cpp
   models/pi05/src/model_runtime.cpp)
@@ -399,6 +427,14 @@ if(BUILD_TESTING)
     flashrt_cpp_pi05)
   add_test(NAME pi05_native_resource_resolver
     COMMAND test_pi05_native_resource_resolver)
+
+  if(TARGET flashrt_cpp_pi05_target_sm120)
+    add_executable(test_pi05_sm120_attention
+      tests/test_pi05_sm120_attention.cpp)
+    target_link_libraries(test_pi05_sm120_attention PRIVATE
+      flashrt_cpp_pi05_target_sm120 flashrt_exec CUDA::cudart)
+    add_test(NAME pi05_sm120_attention COMMAND test_pi05_sm120_attention)
+  endif()
 
   if(TARGET flashrt_cpp_native_cuda)
     add_executable(test_native_cuda_graph_set
