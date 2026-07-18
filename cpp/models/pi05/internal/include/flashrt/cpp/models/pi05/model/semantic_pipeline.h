@@ -21,6 +21,10 @@ enum class Pi05ValueId : std::uint8_t {
     kNoise,
     kDecoderState,
     kActionDelta,
+    kTimeState,
+    kAttentionStyle,
+    kMlpStyle,
+    kFinalStyle,
     kCount,
 };
 
@@ -30,7 +34,11 @@ enum class Pi05ScalarKind : std::uint8_t {
 };
 
 enum class Pi05OperationId : std::uint8_t {
-    kComposePrompt = 0,
+    kTimeMlp = 0,
+    kAttentionStyle,
+    kMlpStyle,
+    kFinalStyle,
+    kComposePrompt,
     kVisionEmbed,
     kVisionAttention,
     kVisionMlp,
@@ -55,7 +63,7 @@ enum class Pi05IndexDomain : std::uint8_t {
     kDecoderLayer,
 };
 
-constexpr std::size_t kPi05MaxOperationValues = 3;
+constexpr std::size_t kPi05MaxOperationValues = 4;
 constexpr std::uint8_t kPi05NoAlias = 0xff;
 
 struct Pi05TensorSpec final {
@@ -112,6 +120,8 @@ public:
 
     const Pi05ResolvedShape& shape() const { return shape_; }
 
+    modalities::Status record_prepare(Pi05OperationSink& sink,
+                                      Pi05Stream stream = 0) const;
     modalities::Status record_context(Pi05OperationSink& sink,
                                       Pi05Stream stream = 0) const;
     modalities::Status record_decode(Pi05OperationSink& sink,

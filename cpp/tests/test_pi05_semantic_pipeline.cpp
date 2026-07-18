@@ -50,6 +50,21 @@ struct ExpectedCall {
     int step;
 };
 
+std::vector<ExpectedCall> expected_prepare(int steps) {
+    std::vector<ExpectedCall> expected;
+    for (int step = 0; step < steps; ++step) {
+        expected.push_back({pi05::Pi05OperationId::kTimeMlp, -1, step});
+        for (int layer = 0; layer < 18; ++layer) {
+            expected.push_back(
+                {pi05::Pi05OperationId::kAttentionStyle, layer, step});
+            expected.push_back(
+                {pi05::Pi05OperationId::kMlpStyle, layer, step});
+        }
+        expected.push_back({pi05::Pi05OperationId::kFinalStyle, -1, step});
+    }
+    return expected;
+}
+
 std::vector<ExpectedCall> expected_context() {
     std::vector<ExpectedCall> expected;
     expected.push_back({pi05::Pi05OperationId::kComposePrompt, -1, -1});
@@ -91,9 +106,22 @@ std::vector<ExpectedCall> expected_decode(int steps) {
 
 class TraceSink final : public pi05::Pi05OperationSink {
 public:
-    explicit TraceSink(bool has_context_cache = false,
-                       std::size_t fail_at = std::numeric_limits<std::size_t>::max())
+    explicit TraceSink(
+        int prepared_steps = 0,
+        bool has_context_cache = false,
+        std::size_t fail_at = std::numeric_limits<std::size_t>::max())
         : fail_at_(fail_at) {
+        CHECK(prepared_steps >= 0);
+        const std::uint64_t steps =
+            static_cast<std::uint64_t>(prepared_steps);
+        generation_[static_cast<std::size_t>(
+            pi05::Pi05ValueId::kTimeState)] = steps;
+        generation_[static_cast<std::size_t>(
+            pi05::Pi05ValueId::kAttentionStyle)] = steps * 18;
+        generation_[static_cast<std::size_t>(
+            pi05::Pi05ValueId::kMlpStyle)] = steps * 18;
+        generation_[static_cast<std::size_t>(
+            pi05::Pi05ValueId::kFinalStyle)] = steps;
         if (has_context_cache) {
             generation_[static_cast<std::size_t>(pi05::Pi05ValueId::kKeyCache)] =
                 18;
@@ -198,6 +226,21 @@ void test_model_dims_and_shape_resolution() {
               pooled.encoder_vision_sequence + 64);
     }
 
+    pi05::Pi05ShapeConfig variable;
+    variable.num_views = 1;
+    variable.max_prompt_tokens = 43;
+    variable.chunk = 4;
+    variable.num_steps = 3;
+    variable.vision_pool_factor = 2;
+    variable.state_dim = 16;
+    variable.robot_action_dim = 14;
+    pi05::Pi05ResolvedShape variable_shape;
+    CHECK(pi05::resolve_pi05_shape(variable, &variable_shape).ok_status());
+    CHECK(variable_shape.vision_sequence == 256);
+    CHECK(variable_shape.encoder_vision_sequence == 64);
+    CHECK(variable_shape.encoder_sequence == 107);
+    CHECK(variable_shape.total_attention_keys == 111);
+
     pi05::Pi05ShapeConfig invalid;
     invalid.num_views = 3;
     invalid.max_prompt_tokens = 64;
@@ -269,6 +312,14 @@ void test_value_specs() {
          pi05::Pi05ScalarKind::kActivation, 2, {10, 1024, 0, 0}},
         {pi05::Pi05ValueId::kActionDelta,
          pi05::Pi05ScalarKind::kActionUpdate, 2, {10, 32, 0, 0}},
+        {pi05::Pi05ValueId::kTimeState,
+         pi05::Pi05ScalarKind::kActivation, 3, {10, 10, 1024, 0}},
+        {pi05::Pi05ValueId::kAttentionStyle,
+         pi05::Pi05ScalarKind::kActivation, 4, {10, 18, 10, 3072}},
+        {pi05::Pi05ValueId::kMlpStyle,
+         pi05::Pi05ScalarKind::kActivation, 4, {10, 18, 10, 3072}},
+        {pi05::Pi05ValueId::kFinalStyle,
+         pi05::Pi05ScalarKind::kActivation, 3, {10, 10, 3072, 0}},
     };
     for (const Expected& item : expected) {
         pi05::Pi05TensorSpec spec;
@@ -297,6 +348,14 @@ void test_operation_contracts() {
         std::vector<std::uint8_t> aliases;
     };
     const Expected expected[] = {
+        {O::kTimeMlp, pi05::Pi05IndexDomain::kDiffusionStep,
+         {}, {V::kTimeState}, {pi05::kPi05NoAlias}},
+        {O::kAttentionStyle, pi05::Pi05IndexDomain::kDecoderLayer,
+         {V::kTimeState}, {V::kAttentionStyle}, {pi05::kPi05NoAlias}},
+        {O::kMlpStyle, pi05::Pi05IndexDomain::kDecoderLayer,
+         {V::kTimeState}, {V::kMlpStyle}, {pi05::kPi05NoAlias}},
+        {O::kFinalStyle, pi05::Pi05IndexDomain::kDiffusionStep,
+         {V::kTimeState}, {V::kFinalStyle}, {pi05::kPi05NoAlias}},
         {O::kComposePrompt, pi05::Pi05IndexDomain::kNone,
          {V::kPromptEmbedding}, {V::kEncoderState}, {pi05::kPi05NoAlias}},
         {O::kVisionEmbed, pi05::Pi05IndexDomain::kNone,
@@ -319,12 +378,14 @@ void test_operation_contracts() {
         {O::kDiffusionInputProject, pi05::Pi05IndexDomain::kDiffusionStep,
          {V::kNoise}, {V::kDecoderState}, {pi05::kPi05NoAlias}},
         {O::kDecoderAttention, pi05::Pi05IndexDomain::kDecoderLayer,
-         {V::kDecoderState, V::kKeyCache, V::kValueCache},
+         {V::kDecoderState, V::kKeyCache, V::kValueCache,
+          V::kAttentionStyle},
          {V::kDecoderState, V::kKeyCache, V::kValueCache}, {0, 1, 2}},
         {O::kDecoderMlp, pi05::Pi05IndexDomain::kDecoderLayer,
-         {V::kDecoderState}, {V::kDecoderState}, {0}},
+         {V::kDecoderState, V::kMlpStyle}, {V::kDecoderState}, {0}},
         {O::kActionProject, pi05::Pi05IndexDomain::kDiffusionStep,
-         {V::kDecoderState}, {V::kActionDelta}, {pi05::kPi05NoAlias}},
+         {V::kDecoderState, V::kFinalStyle}, {V::kActionDelta},
+         {pi05::kPi05NoAlias}},
         {O::kDiffusionUpdate, pi05::Pi05IndexDomain::kDiffusionStep,
          {V::kNoise, V::kActionDelta}, {V::kNoise}, {0}},
     };
@@ -353,19 +414,25 @@ void test_semantic_traces() {
     const pi05::Pi05ResolvedShape shape = canonical_shape();
     const pi05::Pi05SemanticPipeline pipeline(shape);
 
+    TraceSink prepare;
+    CHECK(pipeline.record_prepare(prepare, 73).ok_status());
+    const std::vector<ExpectedCall> prepare_expected = expected_prepare(10);
+    CHECK(prepare_expected.size() == 380);
+    check_sequence(prepare.calls, prepare_expected);
+
     TraceSink context;
     CHECK(pipeline.record_context(context, 73).ok_status());
     const std::vector<ExpectedCall> context_expected = expected_context();
     CHECK(context_expected.size() == 92);
     check_sequence(context.calls, context_expected);
 
-    TraceSink decode(true);
+    TraceSink decode(10, true);
     CHECK(pipeline.record_decode(decode, 73).ok_status());
     const std::vector<ExpectedCall> decode_expected = expected_decode(10);
     CHECK(decode_expected.size() == 390);
     check_sequence(decode.calls, decode_expected);
 
-    TraceSink full;
+    TraceSink full(10);
     CHECK(pipeline.record_full(full, 73).ok_status());
     std::vector<ExpectedCall> full_expected = context_expected;
     full_expected.insert(full_expected.end(), decode_expected.begin(),
@@ -380,9 +447,28 @@ void test_semantic_traces() {
         CHECK(same_call(full.calls[context.calls.size() + i], decode.calls[i]));
     }
 
-    TraceSink failure(false, 37);
-    const flashrt::modalities::Status status =
-        pipeline.record_full(failure, 73);
+    TraceSink prepared_and_full;
+    CHECK(pipeline.record_prepare(prepared_and_full, 73).ok_status());
+    CHECK(pipeline.record_full(prepared_and_full, 73).ok_status());
+    CHECK(prepared_and_full.calls.size() ==
+          prepare.calls.size() + full.calls.size());
+    for (std::size_t i = 0; i < prepare.calls.size(); ++i) {
+        CHECK(same_call(prepared_and_full.calls[i], prepare.calls[i]));
+    }
+    for (std::size_t i = 0; i < full.calls.size(); ++i) {
+        CHECK(same_call(prepared_and_full.calls[prepare.calls.size() + i],
+                        full.calls[i]));
+    }
+
+    TraceSink prepare_failure(0, false, 19);
+    flashrt::modalities::Status status =
+        pipeline.record_prepare(prepare_failure, 73);
+    CHECK(!status.ok_status());
+    CHECK(status.code == flashrt::modalities::StatusCode::kBackend);
+    CHECK(prepare_failure.calls.size() == 19);
+
+    TraceSink failure(10, false, 37);
+    status = pipeline.record_full(failure, 73);
     CHECK(!status.ok_status());
     CHECK(status.code == flashrt::modalities::StatusCode::kBackend);
     CHECK(failure.calls.size() == 37);
@@ -396,6 +482,19 @@ void test_semantic_traces() {
     bad = full.calls[0];
     bad.input_generation[1] = 1;
     CHECK(!pi05::validate_pi05_operation_call(bad, shape).ok_status());
+
+    for (const int steps : {1, 3}) {
+        const pi05::Pi05ResolvedShape variable_shape = canonical_shape(steps);
+        const pi05::Pi05SemanticPipeline variable_pipeline(variable_shape);
+        TraceSink variable_prepare;
+        CHECK(variable_pipeline.record_prepare(variable_prepare, 73)
+                  .ok_status());
+        check_sequence(variable_prepare.calls, expected_prepare(steps));
+        TraceSink variable_decode(steps, true);
+        CHECK(variable_pipeline.record_decode(variable_decode, 73)
+                  .ok_status());
+        check_sequence(variable_decode.calls, expected_decode(steps));
+    }
 }
 
 }  // namespace

@@ -17,18 +17,36 @@ constexpr Pi05ValueId kUnusedValue = Pi05ValueId::kCount;
 constexpr std::array<std::uint8_t, kPi05MaxOperationValues> aliases(
     std::uint8_t first = kPi05NoAlias,
     std::uint8_t second = kPi05NoAlias,
-    std::uint8_t third = kPi05NoAlias) {
-    return {first, second, third};
+    std::uint8_t third = kPi05NoAlias,
+    std::uint8_t fourth = kPi05NoAlias) {
+    return {first, second, third, fourth};
 }
 
 constexpr std::array<Pi05ValueId, kPi05MaxOperationValues> values(
     Pi05ValueId first = kUnusedValue,
     Pi05ValueId second = kUnusedValue,
-    Pi05ValueId third = kUnusedValue) {
-    return {first, second, third};
+    Pi05ValueId third = kUnusedValue,
+    Pi05ValueId fourth = kUnusedValue) {
+    return {first, second, third, fourth};
 }
 
 constexpr Pi05OperationContract kContracts[] = {
+    {Pi05OperationId::kTimeMlp, "time_mlp",
+     Pi05IndexDomain::kDiffusionStep,
+     values(), 0,
+     values(Pi05ValueId::kTimeState), 1, aliases()},
+    {Pi05OperationId::kAttentionStyle, "attention_style",
+     Pi05IndexDomain::kDecoderLayer,
+     values(Pi05ValueId::kTimeState), 1,
+     values(Pi05ValueId::kAttentionStyle), 1, aliases()},
+    {Pi05OperationId::kMlpStyle, "mlp_style",
+     Pi05IndexDomain::kDecoderLayer,
+     values(Pi05ValueId::kTimeState), 1,
+     values(Pi05ValueId::kMlpStyle), 1, aliases()},
+    {Pi05OperationId::kFinalStyle, "final_style",
+     Pi05IndexDomain::kDiffusionStep,
+     values(Pi05ValueId::kTimeState), 1,
+     values(Pi05ValueId::kFinalStyle), 1, aliases()},
     {Pi05OperationId::kComposePrompt, "compose_prompt",
      Pi05IndexDomain::kNone,
      values(Pi05ValueId::kPromptEmbedding), 1,
@@ -73,17 +91,17 @@ constexpr Pi05OperationContract kContracts[] = {
     {Pi05OperationId::kDecoderAttention, "decoder_attention",
      Pi05IndexDomain::kDecoderLayer,
      values(Pi05ValueId::kDecoderState, Pi05ValueId::kKeyCache,
-            Pi05ValueId::kValueCache), 3,
+            Pi05ValueId::kValueCache, Pi05ValueId::kAttentionStyle), 4,
      values(Pi05ValueId::kDecoderState, Pi05ValueId::kKeyCache,
             Pi05ValueId::kValueCache), 3,
      aliases(0, 1, 2)},
     {Pi05OperationId::kDecoderMlp, "decoder_mlp",
      Pi05IndexDomain::kDecoderLayer,
-     values(Pi05ValueId::kDecoderState), 1,
+     values(Pi05ValueId::kDecoderState, Pi05ValueId::kMlpStyle), 2,
      values(Pi05ValueId::kDecoderState), 1, aliases(0)},
     {Pi05OperationId::kActionProject, "action_project",
      Pi05IndexDomain::kDiffusionStep,
-     values(Pi05ValueId::kDecoderState), 1,
+     values(Pi05ValueId::kDecoderState, Pi05ValueId::kFinalStyle), 2,
      values(Pi05ValueId::kActionDelta), 1, aliases()},
     {Pi05OperationId::kDiffusionUpdate, "diffusion_update",
      Pi05IndexDomain::kDiffusionStep,
@@ -117,8 +135,9 @@ modalities::Status emit(
 std::array<std::uint64_t, kPi05MaxOperationValues> generations(
     std::uint64_t first = 0,
     std::uint64_t second = 0,
-    std::uint64_t third = 0) {
-    return {first, second, third};
+    std::uint64_t third = 0,
+    std::uint64_t fourth = 0) {
+    return {first, second, third, fourth};
 }
 
 }  // namespace
@@ -127,7 +146,8 @@ const char* pi05_value_name(Pi05ValueId id) {
     static constexpr const char* kNames[] = {
         "images", "prompt_embedding", "vision_state", "encoder_state",
         "key_cache", "value_cache", "noise", "decoder_state",
-        "action_delta",
+        "action_delta", "time_state", "attention_style", "mlp_style",
+        "final_style",
     };
     static_assert(sizeof(kNames) / sizeof(kNames[0]) ==
                       static_cast<std::size_t>(Pi05ValueId::kCount),
@@ -221,6 +241,33 @@ modalities::Status pi05_value_spec(Pi05ValueId id,
                 static_cast<std::uint64_t>(kPi05ModelDims.action_width),
                 0, 0};
             break;
+        case Pi05ValueId::kTimeState:
+            spec.rank = 3;
+            spec.dimensions = {
+                static_cast<std::uint64_t>(shape.num_steps),
+                static_cast<std::uint64_t>(shape.chunk),
+                static_cast<std::uint64_t>(kPi05ModelDims.decoder_width),
+                0};
+            break;
+        case Pi05ValueId::kAttentionStyle:
+        case Pi05ValueId::kMlpStyle:
+            spec.rank = 4;
+            spec.dimensions = {
+                static_cast<std::uint64_t>(shape.num_steps),
+                static_cast<std::uint64_t>(kPi05ModelDims.decoder_layers),
+                static_cast<std::uint64_t>(shape.chunk),
+                static_cast<std::uint64_t>(
+                    3 * kPi05ModelDims.decoder_width)};
+            break;
+        case Pi05ValueId::kFinalStyle:
+            spec.rank = 3;
+            spec.dimensions = {
+                static_cast<std::uint64_t>(shape.num_steps),
+                static_cast<std::uint64_t>(shape.chunk),
+                static_cast<std::uint64_t>(
+                    3 * kPi05ModelDims.decoder_width),
+                0};
+            break;
         case Pi05ValueId::kCount:
             return invalid("PI0.5 logical value id is invalid");
     }
@@ -305,6 +352,42 @@ modalities::Status validate_pi05_operation_call(
     return modalities::Status::ok();
 }
 
+modalities::Status Pi05SemanticPipeline::record_prepare(
+    Pi05OperationSink& sink,
+    Pi05Stream stream) const {
+    modalities::Status status = validate_pi05_resolved_shape(shape_);
+    if (!status.ok_status()) return status;
+
+    std::uint64_t time_state = 0;
+    std::uint64_t attention_style = 0;
+    std::uint64_t mlp_style = 0;
+    std::uint64_t final_style = 0;
+    for (int step = 0; step < shape_.num_steps; ++step) {
+        status = emit(sink, shape_, Pi05OperationId::kTimeMlp, -1, step,
+                      generations(), generations(time_state + 1), stream);
+        if (!status.ok_status()) return status;
+        ++time_state;
+        for (int layer = 0; layer < kPi05ModelDims.decoder_layers; ++layer) {
+            status = emit(sink, shape_, Pi05OperationId::kAttentionStyle,
+                          layer, step, generations(time_state),
+                          generations(attention_style + 1), stream);
+            if (!status.ok_status()) return status;
+            ++attention_style;
+            status = emit(sink, shape_, Pi05OperationId::kMlpStyle,
+                          layer, step, generations(time_state),
+                          generations(mlp_style + 1), stream);
+            if (!status.ok_status()) return status;
+            ++mlp_style;
+        }
+        status = emit(sink, shape_, Pi05OperationId::kFinalStyle, -1, step,
+                      generations(time_state), generations(final_style + 1),
+                      stream);
+        if (!status.ok_status()) return status;
+        ++final_style;
+    }
+    return modalities::Status::ok();
+}
+
 modalities::Status Pi05SemanticPipeline::record_context(
     Pi05OperationSink& sink,
     Pi05Stream stream) const {
@@ -373,6 +456,12 @@ modalities::Status Pi05SemanticPipeline::record_decode(
     std::uint64_t key_cache =
         static_cast<std::uint64_t>(kPi05ModelDims.encoder_layers);
     std::uint64_t value_cache = key_cache;
+    const std::uint64_t attention_style =
+        static_cast<std::uint64_t>(shape_.num_steps) *
+        static_cast<std::uint64_t>(kPi05ModelDims.decoder_layers);
+    const std::uint64_t mlp_style = attention_style;
+    const std::uint64_t final_style =
+        static_cast<std::uint64_t>(shape_.num_steps);
 
     for (int step = 0; step < shape_.num_steps; ++step) {
         status = emit(sink, shape_, Pi05OperationId::kDiffusionInputProject,
@@ -383,7 +472,7 @@ modalities::Status Pi05SemanticPipeline::record_decode(
         for (int layer = 0; layer < kPi05ModelDims.decoder_layers; ++layer) {
             status = emit(
                 sink, shape_, Pi05OperationId::kDecoderAttention, layer, step,
-                generations(decoder, key_cache, value_cache),
+                generations(decoder, key_cache, value_cache, attention_style),
                 generations(decoder + 1, key_cache + 1, value_cache + 1),
                 stream);
             if (!status.ok_status()) return status;
@@ -391,13 +480,13 @@ modalities::Status Pi05SemanticPipeline::record_decode(
             ++key_cache;
             ++value_cache;
             status = emit(sink, shape_, Pi05OperationId::kDecoderMlp,
-                          layer, step, generations(decoder),
+                          layer, step, generations(decoder, mlp_style),
                           generations(decoder + 1), stream);
             if (!status.ok_status()) return status;
             ++decoder;
         }
         status = emit(sink, shape_, Pi05OperationId::kActionProject, -1,
-                      step, generations(decoder),
+                      step, generations(decoder, final_style),
                       generations(action_delta + 1), stream);
         if (!status.ok_status()) return status;
         ++action_delta;
