@@ -2,6 +2,7 @@
 #define FLASHRT_CPP_MODELS_PI05_TARGETS_SM120_ATTENTION_H
 
 #include "flashrt/cpp/models/pi05/support/native_resource_resolver.h"
+#include "flashrt/cpp/models/pi05/targets/sm120/device_buffer.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -12,18 +13,7 @@ namespace pi05 {
 namespace targets {
 namespace sm120 {
 
-struct Sm120AttentionBuffer final {
-    frt_buffer buffer = nullptr;
-    modalities::DType dtype = modalities::DType::kUInt8;
-    modalities::Shape shape;
-
-    void* device_data() const {
-        return buffer ? frt_buffer_dptr(buffer) : nullptr;
-    }
-    std::size_t bytes() const {
-        return buffer ? frt_buffer_bytes(buffer) : 0;
-    }
-};
+using Sm120AttentionBuffer = Sm120DeviceBuffer;
 
 struct Sm120VisionAttentionBuffers final {
     Sm120AttentionBuffer query;

@@ -303,7 +303,9 @@ endif()
 if(FLASHRT_CPP_WITH_PI05_SM120_TARGET)
   add_library(flashrt_cpp_pi05_target_sm120 STATIC
     models/pi05/src/targets/sm120/attention.cpp
-    models/pi05/src/targets/sm120/attention_driver.cpp)
+    models/pi05/src/targets/sm120/attention_driver.cpp
+    models/pi05/src/targets/sm120/bf16_linear.cpp
+    models/pi05/src/targets/sm120/bf16_scratch.cpp)
   target_include_directories(flashrt_cpp_pi05_target_sm120
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/internal/include)
   target_link_libraries(flashrt_cpp_pi05_target_sm120
@@ -434,6 +436,13 @@ if(BUILD_TESTING)
     target_link_libraries(test_pi05_sm120_attention PRIVATE
       flashrt_cpp_pi05_target_sm120 flashrt_exec CUDA::cudart)
     add_test(NAME pi05_sm120_attention COMMAND test_pi05_sm120_attention)
+
+    add_executable(test_pi05_sm120_bf16_target
+      tests/test_pi05_sm120_bf16_target.cpp)
+    target_link_libraries(test_pi05_sm120_bf16_target PRIVATE
+      flashrt_cpp_pi05_target_sm120 flashrt_exec CUDA::cudart)
+    add_test(NAME pi05_sm120_bf16_target
+      COMMAND test_pi05_sm120_bf16_target)
   endif()
 
   if(TARGET flashrt_cpp_native_cuda)
