@@ -20,7 +20,14 @@ _CATALOG_DIR = pathlib.Path(__file__).resolve().parent / "catalog"
 
 @dataclass(frozen=True)
 class StructureSpec:
-    """One catalog entry, as declared in ``catalog/<name>/structure.yaml``."""
+    """One catalog entry, as declared in ``catalog/<name>/structure.yaml``.
+
+    Two kinds exist. ``region`` structures declare a tensor boundary,
+    weight slots and a torch reference. ``stage_pipeline`` structures
+    declare a stage graph with cadence attributes; their parity reference
+    is the host's own eager path, so ``boundary``/``weights``/``reference``
+    are empty for them and ``stages`` is populated instead.
+    """
 
     name: str
     version: int
@@ -31,6 +38,10 @@ class StructureSpec:
     calibration: Mapping[str, Any]
     gates: Mapping[str, Any]
     _reference: Mapping[str, str] = field(repr=False)
+    kind: str = "region"
+    family: str = ""
+    stages: Sequence[Mapping[str, Any]] = ()
+    conformance: Sequence[str] = ()
 
     @property
     def symbolic_dims(self) -> Sequence[str]:
@@ -42,6 +53,12 @@ class StructureSpec:
 
     def reference(self) -> Callable[..., Any]:
         """Resolve the reference entrypoint (ground truth for gates)."""
+        if not self._reference:
+            raise LookupError(
+                f"structure {self.name!r} (kind={self.kind!r}) has no "
+                "standalone reference; its parity ground truth is the "
+                "host's own eager path under the same noise window"
+            )
         module = importlib.import_module(
             f"{__package__}.catalog.{self._reference['module']}"
         )
@@ -62,16 +79,24 @@ def load(name: str) -> StructureSpec:
         raise KeyError(f"unknown structure: {name!r}")
     with open(path, "r", encoding="utf-8") as handle:
         data = yaml.safe_load(handle)
+    kind = data.get("kind", "region")
     spec = StructureSpec(
         name=data["structure"],
         version=int(data["version"]),
         description=str(data.get("description", "")).strip(),
-        boundary=data["boundary"],
-        weights=data["weights"],
+        boundary=data.get("boundary", {}) if kind != "region"
+        else data["boundary"],
+        weights=data.get("weights", ()) if kind != "region"
+        else data["weights"],
         variants=data.get("variants", {}),
         calibration=data.get("calibration", {}),
         gates=data["gates"],
-        _reference=data["reference"],
+        _reference=data.get("reference", {}) if kind != "region"
+        else data["reference"],
+        kind=kind,
+        family=str(data.get("family", "")),
+        stages=data.get("stages", ()),
+        conformance=data.get("conformance", ()),
     )
     if spec.name != name:
         raise ValueError(
