@@ -24,6 +24,10 @@ option(FLASHRT_CPP_WITH_CUDA_STAGING "Enable conservative CUDA H2D/D2H modality 
 option(FLASHRT_CPP_WITH_CUDA_KERNELS "Enable CUDA modality kernels" ON)
 option(FLASHRT_CPP_WITH_SENTENCEPIECE
        "Enable native SentencePiece text tokenization" OFF)
+option(FLASHRT_CPP_WITH_FA2
+       "Enable the Python-free vendored FA2 operation library" OFF)
+set(FLASHRT_CPP_FA2_LIBRARY "" CACHE FILEPATH
+    "Path to the Python-free libflashrt_fa2_raw shared library")
 if(FLASHRT_CPP_WITH_CUDA_STAGING)
   find_package(CUDAToolkit REQUIRED)
 endif()
@@ -41,6 +45,27 @@ if(FLASHRT_CPP_WITH_CUDA_KERNELS)
   set_target_properties(flashrt_cpp_csrc_precise_math PROPERTIES
     CUDA_STANDARD 17
     CUDA_STANDARD_REQUIRED ON)
+endif()
+if(FLASHRT_CPP_WITH_FA2)
+  if(NOT FLASHRT_CPP_WITH_CUDA_KERNELS)
+    message(FATAL_ERROR
+      "FLASHRT_CPP_WITH_FA2 requires FLASHRT_CPP_WITH_CUDA_KERNELS")
+  endif()
+  if(NOT FLASHRT_CPP_FA2_LIBRARY)
+    find_library(FLASHRT_CPP_FA2_LIBRARY
+      NAMES flashrt_fa2_raw
+      PATHS ${CMAKE_CURRENT_SOURCE_DIR}/../flash_rt
+      NO_DEFAULT_PATH)
+  endif()
+  if(NOT FLASHRT_CPP_FA2_LIBRARY OR
+     NOT EXISTS "${FLASHRT_CPP_FA2_LIBRARY}")
+    message(FATAL_ERROR
+      "FLASHRT_CPP_WITH_FA2 requires libflashrt_fa2_raw; build the root "
+      "flashrt_fa2_raw target or set FLASHRT_CPP_FA2_LIBRARY")
+  endif()
+  add_library(flashrt_cpp_fa2_external SHARED IMPORTED GLOBAL)
+  set_target_properties(flashrt_cpp_fa2_external PROPERTIES
+    IMPORTED_LOCATION ${FLASHRT_CPP_FA2_LIBRARY})
 endif()
 if(FLASHRT_CPP_WITH_SENTENCEPIECE)
   find_path(FLASHRT_SENTENCEPIECE_INCLUDE_DIR sentencepiece_processor.h)
@@ -149,6 +174,46 @@ if(FLASHRT_CPP_WITH_CUDA_KERNELS AND FLASHRT_CPP_WITH_EXEC)
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/native/include)
   target_link_libraries(flashrt_cpp_native_cuda
     PUBLIC flashrt_cpp_modalities flashrt_exec CUDA::cudart)
+endif()
+
+if(FLASHRT_CPP_WITH_FA2)
+  set(_flashrt_csrc_dir "${CMAKE_CURRENT_SOURCE_DIR}/../csrc")
+
+  function(_flashrt_configure_csrc_target target)
+    target_include_directories(${target} PUBLIC
+      ${_flashrt_csrc_dir}
+      ${_flashrt_csrc_dir}/attention
+      ${_flashrt_csrc_dir}/gemm
+      ${_flashrt_csrc_dir}/kernels)
+    target_link_libraries(${target} PUBLIC
+      CUDA::cublas CUDA::cublasLt CUDA::cudart)
+    target_compile_options(${target} PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:
+        --expt-relaxed-constexpr -O3
+        --ftz=true --prec-div=false --prec-sqrt=false>)
+    set_target_properties(${target} PROPERTIES
+      CUDA_STANDARD 17
+      CUDA_STANDARD_REQUIRED ON)
+  endfunction()
+
+  add_library(flashrt_cpp_csrc_core STATIC
+    ${_flashrt_csrc_dir}/gemm/gemm_runner.cu
+    ${_flashrt_csrc_dir}/kernels/activation.cu
+    ${_flashrt_csrc_dir}/kernels/elementwise.cu
+    ${_flashrt_csrc_dir}/kernels/norm.cu
+    ${_flashrt_csrc_dir}/kernels/patch_embed.cu
+    ${_flashrt_csrc_dir}/kernels/quantize.cu
+    ${_flashrt_csrc_dir}/kernels/rope.cu)
+  _flashrt_configure_csrc_target(flashrt_cpp_csrc_core)
+  target_link_libraries(flashrt_cpp_csrc_core PUBLIC
+    flashrt_cpp_csrc_precise_math)
+
+  add_library(flashrt_cpp_csrc_sm120 STATIC
+    ${_flashrt_csrc_dir}/kernels/dit_bf16.cu
+    ${_flashrt_csrc_dir}/kernels/fusion.cu)
+  _flashrt_configure_csrc_target(flashrt_cpp_csrc_sm120)
+  target_link_libraries(flashrt_cpp_csrc_sm120 PUBLIC
+    flashrt_cpp_csrc_core)
 endif()
 
 add_library(flashrt_cpp_loader STATIC
