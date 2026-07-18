@@ -127,6 +127,7 @@ int main() {
     assert(target->ready_for_capture());
     assert(target->reset_after_warmup().ok_status());
     assert(pipeline.record_context(*target).ok_status());
+    assert(pipeline.record_decode(*target).ok_status());
     assert(cudaDeviceSynchronize() == cudaSuccess);
 
     target.reset();

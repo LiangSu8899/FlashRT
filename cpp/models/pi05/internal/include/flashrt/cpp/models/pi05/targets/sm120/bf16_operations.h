@@ -35,6 +35,16 @@ public:
     modalities::Status encoder_mlp(int layer, Pi05Stream stream) const;
     modalities::Status encoder_cache_finalize(int layer,
                                                Pi05Stream stream) const;
+    modalities::Status diffusion_input_project(int step,
+                                                Pi05Stream stream) const;
+    modalities::Status decoder_attention(int layer,
+                                         int step,
+                                         Pi05Stream stream) const;
+    modalities::Status decoder_mlp(int layer,
+                                   int step,
+                                   Pi05Stream stream) const;
+    modalities::Status action_project(int step, Pi05Stream stream) const;
+    modalities::Status diffusion_update(int step, Pi05Stream stream) const;
 
 private:
     Sm120Bf16Operations(const Pi05ResolvedShape& shape,

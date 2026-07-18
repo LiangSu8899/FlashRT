@@ -478,6 +478,24 @@ modalities::Status Sm120TargetBundle::record(
             status = impl_->operations->encoder_cache_finalize(call.layer,
                                                                 stream);
             break;
+        case Pi05OperationId::kDiffusionInputProject:
+            status = impl_->operations->diffusion_input_project(call.step,
+                                                                 stream);
+            break;
+        case Pi05OperationId::kDecoderAttention:
+            status = impl_->operations->decoder_attention(
+                call.layer, call.step, stream);
+            break;
+        case Pi05OperationId::kDecoderMlp:
+            status = impl_->operations->decoder_mlp(call.layer, call.step,
+                                                     stream);
+            break;
+        case Pi05OperationId::kActionProject:
+            status = impl_->operations->action_project(call.step, stream);
+            break;
+        case Pi05OperationId::kDiffusionUpdate:
+            status = impl_->operations->diffusion_update(call.step, stream);
+            break;
         default:
             return unsupported("SM120 forward operation is not installed");
     }
