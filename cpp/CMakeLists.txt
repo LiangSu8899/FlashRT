@@ -78,6 +78,15 @@ target_include_directories(flashrt_cpp_vla
 target_link_libraries(flashrt_cpp_vla
   INTERFACE flashrt_cpp_modalities flashrt_cpp)
 
+if(FLASHRT_CPP_WITH_CUDA_KERNELS AND FLASHRT_CPP_WITH_EXEC)
+  add_library(flashrt_cpp_native_cuda STATIC
+    native/src/cuda_graph_set.cpp)
+  target_include_directories(flashrt_cpp_native_cuda
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/native/include)
+  target_link_libraries(flashrt_cpp_native_cuda
+    PUBLIC flashrt_cpp_modalities flashrt_exec CUDA::cudart)
+endif()
+
 add_library(flashrt_cpp_pi05 STATIC
   models/pi05/src/model/dims.cpp
   models/pi05/src/model/semantic_pipeline.cpp
@@ -116,6 +125,14 @@ if(BUILD_TESTING)
   target_link_libraries(test_pi05_semantic_pipeline
     PRIVATE flashrt_cpp_pi05)
   add_test(NAME pi05_semantic_pipeline COMMAND test_pi05_semantic_pipeline)
+
+  if(TARGET flashrt_cpp_native_cuda)
+    add_executable(test_native_cuda_graph_set
+      tests/test_native_cuda_graph_set.cpp)
+    target_link_libraries(test_native_cuda_graph_set
+      PRIVATE flashrt_cpp_native_cuda)
+    add_test(NAME native_cuda_graph_set COMMAND test_native_cuda_graph_set)
+  endif()
 
   if(FLASHRT_CPP_WITH_CUDA_STAGING)
     add_executable(test_device_staging tests/test_device_staging.cpp)
