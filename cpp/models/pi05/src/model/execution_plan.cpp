@@ -61,6 +61,24 @@ static_assert(sizeof(kGraphCatalog) / sizeof(kGraphCatalog[0]) ==
 
 }  // namespace
 
+modalities::Status Pi05ResolvedGraphBindings::bind(
+    Pi05GraphBindingId id,
+    frt_buffer buffer) {
+    const std::size_t index = static_cast<std::size_t>(id);
+    if (index >= buffers_.size() || !buffer || buffers_[index]) {
+        return modalities::Status::error(
+            modalities::StatusCode::kInvalidArgument,
+            "PI0.5 graph binding request is invalid");
+    }
+    buffers_[index] = buffer;
+    return modalities::Status::ok();
+}
+
+frt_buffer Pi05ResolvedGraphBindings::get(Pi05GraphBindingId id) const {
+    const std::size_t index = static_cast<std::size_t>(id);
+    return index < buffers_.size() ? buffers_[index] : nullptr;
+}
+
 const char* pi05_graph_binding_name(Pi05GraphBindingId id) {
     static constexpr const char* kNames[] = {
         "observation_images_normalized",

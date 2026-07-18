@@ -26,22 +26,6 @@ modalities::Status backend(const char* message) {
 
 }  // namespace
 
-modalities::Status Pi05ResolvedGraphBindings::bind(
-    Pi05GraphBindingId id,
-    frt_buffer buffer) {
-    const std::size_t index = static_cast<std::size_t>(id);
-    if (index >= buffers_.size() || !buffer || buffers_[index]) {
-        return invalid("PI0.5 graph binding request is invalid");
-    }
-    buffers_[index] = buffer;
-    return modalities::Status::ok();
-}
-
-frt_buffer Pi05ResolvedGraphBindings::get(Pi05GraphBindingId id) const {
-    const std::size_t index = static_cast<std::size_t>(id);
-    return index < buffers_.size() ? buffers_[index] : nullptr;
-}
-
 struct Pi05CapturedProgram::RecordCall {
     const Pi05SemanticPipeline* pipeline = nullptr;
     Pi05OperationSink* operations = nullptr;

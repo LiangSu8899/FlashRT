@@ -5,23 +5,11 @@
 #include "flashrt/cpp/models/pi05/model/semantic_pipeline.h"
 #include "flashrt/cpp/native/cuda_graph_set.h"
 
-#include <array>
 #include <cstddef>
 
 namespace flashrt {
 namespace models {
 namespace pi05 {
-
-class Pi05ResolvedGraphBindings final {
-public:
-    modalities::Status bind(Pi05GraphBindingId id, frt_buffer buffer);
-    frt_buffer get(Pi05GraphBindingId id) const;
-
-private:
-    std::array<frt_buffer,
-               static_cast<std::size_t>(Pi05GraphBindingId::kCount)>
-        buffers_{};
-};
 
 class Pi05CapturedProgram final {
 public:

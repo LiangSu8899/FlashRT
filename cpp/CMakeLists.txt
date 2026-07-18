@@ -90,6 +90,7 @@ endif()
 add_library(flashrt_cpp_pi05 STATIC
   models/pi05/src/model/dims.cpp
   models/pi05/src/model/execution_plan.cpp
+  models/pi05/src/model/resolved_resources.cpp
   models/pi05/src/model/semantic_pipeline.cpp
   models/pi05/src/spec.cpp
   models/pi05/src/io.cpp
@@ -143,6 +144,14 @@ if(BUILD_TESTING)
   target_link_libraries(test_pi05_execution_plan
     PRIVATE flashrt_cpp_pi05)
   add_test(NAME pi05_execution_plan COMMAND test_pi05_execution_plan)
+
+  add_executable(test_pi05_resolved_resources
+    tests/test_pi05_resolved_resources.cpp)
+  target_include_directories(test_pi05_resolved_resources PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/internal/include)
+  target_link_libraries(test_pi05_resolved_resources
+    PRIVATE flashrt_cpp_pi05)
+  add_test(NAME pi05_resolved_resources COMMAND test_pi05_resolved_resources)
 
   if(TARGET flashrt_cpp_native_cuda)
     add_executable(test_native_cuda_graph_set

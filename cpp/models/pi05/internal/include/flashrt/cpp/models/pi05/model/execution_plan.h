@@ -1,6 +1,10 @@
 #ifndef FLASHRT_CPP_MODELS_PI05_MODEL_EXECUTION_PLAN_H
 #define FLASHRT_CPP_MODELS_PI05_MODEL_EXECUTION_PLAN_H
 
+#include "flashrt/cpp/modalities/types.h"
+#include "flashrt/exec.h"
+
+#include <array>
 #include <cstddef>
 #include <cstdint>
 
@@ -32,6 +36,17 @@ enum class Pi05GraphBindingId : std::uint8_t {
     kPrefixWeights,
     kGuidanceWeight,
     kCount,
+};
+
+class Pi05ResolvedGraphBindings final {
+public:
+    modalities::Status bind(Pi05GraphBindingId id, frt_buffer buffer);
+    frt_buffer get(Pi05GraphBindingId id) const;
+
+private:
+    std::array<frt_buffer,
+               static_cast<std::size_t>(Pi05GraphBindingId::kCount)>
+        buffers_{};
 };
 
 struct Pi05GraphDescriptor final {
