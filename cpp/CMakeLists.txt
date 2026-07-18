@@ -79,11 +79,14 @@ target_link_libraries(flashrt_cpp_vla
   INTERFACE flashrt_cpp_modalities flashrt_cpp)
 
 add_library(flashrt_cpp_pi05 STATIC
+  models/pi05/src/model/dims.cpp
+  models/pi05/src/model/semantic_pipeline.cpp
   models/pi05/src/spec.cpp
   models/pi05/src/io.cpp
   models/pi05/src/runtime.cpp)
 target_include_directories(flashrt_cpp_pi05
-  PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/include)
+  PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/include
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/internal/include)
 target_link_libraries(flashrt_cpp_pi05
   PUBLIC flashrt_cpp_modalities flashrt_cpp_vla)
 
@@ -105,6 +108,14 @@ if(BUILD_TESTING)
   target_link_libraries(test_pi05_runtime
     PRIVATE flashrt_cpp_pi05 flashrt_cpp_modalities)
   add_test(NAME pi05_runtime COMMAND test_pi05_runtime)
+
+  add_executable(test_pi05_semantic_pipeline
+    tests/test_pi05_semantic_pipeline.cpp)
+  target_include_directories(test_pi05_semantic_pipeline PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/internal/include)
+  target_link_libraries(test_pi05_semantic_pipeline
+    PRIVATE flashrt_cpp_pi05)
+  add_test(NAME pi05_semantic_pipeline COMMAND test_pi05_semantic_pipeline)
 
   if(FLASHRT_CPP_WITH_CUDA_STAGING)
     add_executable(test_device_staging tests/test_device_staging.cpp)
