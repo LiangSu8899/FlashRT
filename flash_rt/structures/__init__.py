@@ -9,4 +9,16 @@ the qualification harness build on top of these specifications.
 
 from flash_rt.structures.registry import StructureSpec, list_structures, load
 
-__all__ = ["StructureSpec", "list_structures", "load"]
+
+def attach(model, forward, **kwargs):
+    """One-call front door: discover, calibrate, gate, activate.
+
+    See :func:`flash_rt.structures.frontdoor.attach`. Imported lazily so
+    that spec-only consumers do not pay for torch-side machinery.
+    """
+    from flash_rt.structures.frontdoor import attach as _attach
+
+    return _attach(model, forward, **kwargs)
+
+
+__all__ = ["StructureSpec", "attach", "list_structures", "load"]
