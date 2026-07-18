@@ -89,6 +89,7 @@ endif()
 
 add_library(flashrt_cpp_pi05 STATIC
   models/pi05/src/model/dims.cpp
+  models/pi05/src/model/execution_plan.cpp
   models/pi05/src/model/semantic_pipeline.cpp
   models/pi05/src/spec.cpp
   models/pi05/src/io.cpp
@@ -98,6 +99,15 @@ target_include_directories(flashrt_cpp_pi05
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/internal/include)
 target_link_libraries(flashrt_cpp_pi05
   PUBLIC flashrt_cpp_modalities flashrt_cpp_vla)
+
+if(TARGET flashrt_cpp_native_cuda)
+  add_library(flashrt_cpp_pi05_capture STATIC
+    models/pi05/src/model/captured_program.cpp)
+  target_include_directories(flashrt_cpp_pi05_capture
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/internal/include)
+  target_link_libraries(flashrt_cpp_pi05_capture
+    PUBLIC flashrt_cpp_pi05 flashrt_cpp_native_cuda CUDA::cudart)
+endif()
 
 add_library(flashrt_cpp_pi05_c SHARED
   models/pi05/src/c_api.cpp
@@ -126,12 +136,26 @@ if(BUILD_TESTING)
     PRIVATE flashrt_cpp_pi05)
   add_test(NAME pi05_semantic_pipeline COMMAND test_pi05_semantic_pipeline)
 
+  add_executable(test_pi05_execution_plan
+    tests/test_pi05_execution_plan.cpp)
+  target_include_directories(test_pi05_execution_plan PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/internal/include)
+  target_link_libraries(test_pi05_execution_plan
+    PRIVATE flashrt_cpp_pi05)
+  add_test(NAME pi05_execution_plan COMMAND test_pi05_execution_plan)
+
   if(TARGET flashrt_cpp_native_cuda)
     add_executable(test_native_cuda_graph_set
       tests/test_native_cuda_graph_set.cpp)
     target_link_libraries(test_native_cuda_graph_set
       PRIVATE flashrt_cpp_native_cuda)
     add_test(NAME native_cuda_graph_set COMMAND test_native_cuda_graph_set)
+
+    add_executable(test_pi05_captured_program
+      tests/test_pi05_captured_program.cpp)
+    target_link_libraries(test_pi05_captured_program
+      PRIVATE flashrt_cpp_pi05_capture)
+    add_test(NAME pi05_captured_program COMMAND test_pi05_captured_program)
   endif()
 
   if(FLASHRT_CPP_WITH_CUDA_STAGING)
