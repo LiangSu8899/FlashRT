@@ -306,7 +306,7 @@ if(FLASHRT_CPP_WITH_PI05_SM120_TARGET)
     models/pi05/src/targets/sm120/attention.cpp
     models/pi05/src/targets/sm120/attention_driver.cpp
     models/pi05/src/targets/sm120/bf16_linear.cpp
-    models/pi05/src/targets/sm120/bf16_operations.cpp
+    models/pi05/src/targets/sm120/operations.cpp
     models/pi05/src/targets/sm120/bf16_scratch.cpp
     models/pi05/src/targets/sm120/fp8_linear.cpp
     models/pi05/src/targets/sm120/fp8_weight_packer.cpp

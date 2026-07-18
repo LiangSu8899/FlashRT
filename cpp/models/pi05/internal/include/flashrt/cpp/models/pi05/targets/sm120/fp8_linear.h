@@ -71,6 +71,8 @@ private:
 
 class Sm120Fp8Linear final {
 public:
+    static modalities::Status runtime_status();
+
     explicit Sm120Fp8Linear(
         Sm120Fp8ActivationBacking* activation) noexcept;
     ~Sm120Fp8Linear();

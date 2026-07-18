@@ -1,8 +1,9 @@
-#include "flashrt/cpp/models/pi05/targets/sm120/bf16_operations.h"
+#include "flashrt/cpp/models/pi05/targets/sm120/operations.h"
 
 #include "activation.cuh"
 #include "dit_bf16.cuh"
 #include "elementwise.cuh"
+#include "fusion.cuh"
 #include "norm.cuh"
 #include "patch_embed.cuh"
 #include "rope.cuh"
@@ -11,6 +12,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime_api.h>
 
+#include <limits>
 #include <new>
 #include <utility>
 
@@ -226,30 +228,216 @@ const void* style_slice(const Pi05ResolvedBuffer& styles,
            index * elements_per_style;
 }
 
+bool bf16_span_fits(const void* pointer,
+                    std::size_t bytes,
+                    int rows,
+                    int columns) {
+    return pointer && rows > 0 && columns > 0 &&
+           static_cast<std::size_t>(rows) <=
+               std::numeric_limits<std::size_t>::max() /
+                   static_cast<std::size_t>(columns) &&
+           static_cast<std::size_t>(rows) *
+                   static_cast<std::size_t>(columns) <=
+               bytes / sizeof(std::uint16_t);
+}
+
+class Sm120Fp8AutotuneSink final : public Pi05LinearWeightGroupSink {
+public:
+    Sm120Fp8AutotuneSink(const Pi05ResolvedShape& shape,
+                         Pi05ResolvedResources* resources,
+                         const Sm120Bf16ScratchBacking& scratch,
+                         Sm120Fp8Linear* linear)
+        : shape_(shape),
+          resources_(resources),
+          scratch_(scratch),
+          linear_(linear) {}
+
+    modalities::Status record(
+        const Pi05LinearWeightGroup& group) override {
+        const Pi05ResolvedWeight* weight =
+            group.fused && group.fused->device_data ? group.fused
+                                                    : group.first;
+        if (!resources_ || !linear_ || !weight || !weight->device_data ||
+            weight->shape.rank != 2 ||
+            weight->shape.dims[0] >
+                static_cast<std::uint64_t>(std::numeric_limits<int>::max()) ||
+            weight->shape.dims[1] >
+                static_cast<std::uint64_t>(std::numeric_limits<int>::max())) {
+            return invalid("SM120 FP8 autotune weight is invalid");
+        }
+
+        const void* input = nullptr;
+        std::size_t input_bytes = 0;
+        void* output = nullptr;
+        std::size_t output_bytes = 0;
+        int rows = 0;
+        switch (group.key.domain) {
+            case Pi05LinearDomain::kVision: {
+                rows = shape_.vision_sequence;
+                input = scratch_.vision().normalized.device_data();
+                input_bytes = scratch_.vision().normalized.bytes();
+                output = scratch_.vision().normalized.device_data();
+                output_bytes = scratch_.vision().normalized.bytes();
+                switch (group.key.role) {
+                    case Pi05LinearRole::kAttentionQkv:
+                        output = scratch_.vision().qkv.device_data();
+                        output_bytes = scratch_.vision().qkv.bytes();
+                        break;
+                    case Pi05LinearRole::kMlpUp:
+                        output = scratch_.vision().hidden.device_data();
+                        output_bytes = scratch_.vision().hidden.bytes();
+                        break;
+                    case Pi05LinearRole::kMlpDown:
+                        input = scratch_.vision().hidden.device_data();
+                        input_bytes = scratch_.vision().hidden.bytes();
+                        break;
+                    case Pi05LinearRole::kProjector:
+                        rows = shape_.encoder_vision_sequence;
+                        output = data(resources_->buffers.encoder_state);
+                        output_bytes = static_cast<std::size_t>(
+                            resources_->buffers.encoder_state.physical_bytes);
+                        break;
+                    case Pi05LinearRole::kAttentionOutput:
+                        break;
+                    case Pi05LinearRole::kMlpGateUpGroup:
+                        return invalid("SM120 vision autotune role is invalid");
+                }
+                break;
+            }
+            case Pi05LinearDomain::kEncoder: {
+                rows = shape_.encoder_sequence;
+                input = scratch_.encoder().normalized.device_data();
+                input_bytes = scratch_.encoder().normalized.bytes();
+                output = scratch_.encoder().normalized.device_data();
+                output_bytes = scratch_.encoder().normalized.bytes();
+                switch (group.key.role) {
+                    case Pi05LinearRole::kAttentionQkv:
+                        output = scratch_.encoder().qkv.device_data();
+                        output_bytes = scratch_.encoder().qkv.bytes();
+                        break;
+                    case Pi05LinearRole::kMlpGateUpGroup:
+                        output = scratch_.encoder().gate.device_data();
+                        output_bytes = scratch_.encoder().gate.bytes();
+                        break;
+                    case Pi05LinearRole::kMlpDown:
+                        input = scratch_.encoder().hidden.device_data();
+                        input_bytes = scratch_.encoder().hidden.bytes();
+                        break;
+                    case Pi05LinearRole::kAttentionOutput:
+                        break;
+                    case Pi05LinearRole::kMlpUp:
+                    case Pi05LinearRole::kProjector:
+                        return invalid("SM120 encoder autotune role is invalid");
+                }
+                break;
+            }
+            case Pi05LinearDomain::kDecoder: {
+                rows = shape_.chunk;
+                input = scratch_.decoder().normalized.device_data();
+                input_bytes = scratch_.decoder().normalized.bytes();
+                output = scratch_.decoder().normalized.device_data();
+                output_bytes = scratch_.decoder().normalized.bytes();
+                switch (group.key.role) {
+                    case Pi05LinearRole::kAttentionQkv:
+                        output = scratch_.decoder().qkv.device_data();
+                        output_bytes = scratch_.decoder().qkv.bytes();
+                        break;
+                    case Pi05LinearRole::kAttentionOutput:
+                        input = scratch_.decoder().qkv.device_data();
+                        input_bytes = scratch_.decoder().qkv.bytes();
+                        break;
+                    case Pi05LinearRole::kMlpGateUpGroup:
+                        output = scratch_.decoder().gate_projection.device_data();
+                        output_bytes = scratch_.decoder().gate_projection.bytes();
+                        break;
+                    case Pi05LinearRole::kMlpDown:
+                        input = scratch_.decoder().hidden.device_data();
+                        input_bytes = scratch_.decoder().hidden.bytes();
+                        break;
+                    case Pi05LinearRole::kMlpUp:
+                    case Pi05LinearRole::kProjector:
+                        return invalid("SM120 decoder autotune role is invalid");
+                }
+                break;
+            }
+        }
+
+        const int input_width = static_cast<int>(weight->shape.dims[0]);
+        const int output_width = static_cast<int>(weight->shape.dims[1]);
+        if (!bf16_span_fits(input, input_bytes, rows, input_width) ||
+            !bf16_span_fits(output, output_bytes, rows, output_width)) {
+            return invalid("SM120 FP8 autotune scratch is too small");
+        }
+        Pi05LinearActivationSite site;
+        const int step = group.key.domain == Pi05LinearDomain::kDecoder
+                             ? 0
+                             : -1;
+        modalities::Status status = resolve_pi05_linear_activation_site(
+            group.key, step, shape_, &site);
+        return status.ok_status()
+                   ? linear_->autotune(*weight, site, input, output, rows,
+                                       input_width, output_width)
+                   : status;
+    }
+
+private:
+    const Pi05ResolvedShape& shape_;
+    Pi05ResolvedResources* resources_ = nullptr;
+    const Sm120Bf16ScratchBacking& scratch_;
+    Sm120Fp8Linear* linear_ = nullptr;
+};
+
 }  // namespace
 
-std::unique_ptr<Sm120Bf16Operations> Sm120Bf16Operations::create(
+modalities::Status Sm120Operations::autotune_static_fp8(
+    const Pi05ResolvedShape& shape,
+    Pi05ResolvedResources* resources,
+    const Sm120Bf16ScratchBacking& scratch,
+    Sm120Fp8Linear* linear) {
+    if (!resources || !linear || !scratch.allocated() ||
+        !scratch.fused_gate_up() ||
+        !pi05_resolved_shape_equal(shape, scratch.shape()) ||
+        linear->autotune_frozen()) {
+        return invalid("SM120 FP8 autotune state is invalid");
+    }
+    modalities::Status status =
+        validate_pi05_resolved_resources(*resources, shape);
+    if (!status.ok_status()) return status;
+    Sm120Fp8AutotuneSink sink(shape, resources, scratch, linear);
+    status = visit_pi05_linear_weight_groups(&resources->weights, &sink);
+    return status.ok_status() ? linear->freeze_autotune() : status;
+}
+
+std::unique_ptr<Sm120Operations> Sm120Operations::create(
     const Pi05ResolvedShape& shape,
     const Pi05ResolvedResources& resources,
     const Pi05NativeSupportBuffers& support,
     const Sm120Bf16ScratchBacking& scratch,
     const Sm120AttentionBacking& attention,
     const Sm120AttentionDriver& attention_driver,
-    const Sm120Bf16Linear& linear,
+    const Sm120Bf16Linear& bf16_linear,
+    Sm120Fp8Linear* fp8_linear,
     modalities::Status* status) {
     modalities::Status validation =
         validate_pi05_resolved_resources(resources, shape);
     if (!validation.ok_status() || !scratch.allocated() ||
         !attention.allocated() ||
         !pi05_resolved_shape_equal(shape, scratch.shape()) ||
-        !pi05_resolved_shape_equal(shape, attention.shape())) {
+        !pi05_resolved_shape_equal(shape, attention.shape()) ||
+        scratch.fused_gate_up() != (fp8_linear != nullptr)) {
         set_status(status, validation.ok_status()
-                               ? invalid("SM120 BF16 operation resources are invalid")
+                               ? invalid("SM120 operation resources are invalid")
                                : validation);
         return nullptr;
     }
     validation = attention_driver.status();
-    if (validation.ok_status()) validation = linear.status();
+    if (validation.ok_status()) validation = bf16_linear.status();
+    if (validation.ok_status() && fp8_linear) {
+        validation = fp8_linear->status();
+        if (validation.ok_status() && !fp8_linear->autotune_frozen()) {
+            validation = invalid("SM120 FP8 operation autotune is incomplete");
+        }
+    }
     if (!validation.ok_status()) {
         set_status(status, std::move(validation));
         return nullptr;
@@ -259,18 +447,56 @@ std::unique_ptr<Sm120Bf16Operations> Sm120Bf16Operations::create(
         !data(support.expanded_vision_position) ||
         !data(support.encoder_rms_weight) ||
         !data(support.decoder_rms_weight)) {
-        set_status(status, invalid("SM120 BF16 support handles are invalid"));
+        set_status(status, invalid("SM120 support handles are invalid"));
         return nullptr;
     }
-    std::unique_ptr<Sm120Bf16Operations> result(new (std::nothrow)
-        Sm120Bf16Operations(shape, resources, support, scratch, attention,
-                            attention_driver, linear));
+    std::unique_ptr<Sm120Operations> result(new (std::nothrow)
+        Sm120Operations(shape, resources, support, scratch, attention,
+                        attention_driver, bf16_linear, fp8_linear));
     set_status(status, result ? modalities::Status::ok()
-                              : backend("SM120 BF16 operation allocation failed"));
+                              : backend("SM120 operation allocation failed"));
     return result;
 }
 
-modalities::Status Sm120Bf16Operations::compose_prompt(
+modalities::Status Sm120Operations::linear(
+    const Pi05ResolvedWeight& weight,
+    Pi05LinearWeightKey key,
+    int step,
+    const void* input,
+    void* output,
+    int rows,
+    int input_width,
+    int output_width,
+    Pi05Stream stream,
+    bool prequantized) const {
+    if (!fp8_linear_) {
+        return prequantized
+                   ? invalid("SM120 BF16 input cannot be prequantized")
+                   : bf16_linear_.run(weight, input, output, rows,
+                                      input_width, output_width, stream);
+    }
+    Pi05LinearActivationSite site;
+    modalities::Status status = resolve_pi05_linear_activation_site(
+        key, step, shape_, &site);
+    if (!status.ok_status()) return status;
+    return prequantized
+               ? fp8_linear_->run_prequantized(
+                     weight, site, input, output, rows, input_width,
+                     output_width, stream)
+               : fp8_linear_->run(weight, site, input, output, rows,
+                                  input_width, output_width, stream);
+}
+
+float* Sm120Operations::scale(Pi05LinearWeightKey key, int step) const {
+    Pi05LinearActivationSite site;
+    return fp8_linear_ &&
+                   resolve_pi05_linear_activation_site(
+                       key, step, shape_, &site).ok_status()
+               ? fp8_linear_->scale_data(site)
+               : nullptr;
+}
+
+modalities::Status Sm120Operations::compose_prompt(
     Pi05Stream stream) const {
     const Pi05ResolvedBuffer& prompt = resources_.buffers.prompt_embedding;
     const Pi05ResolvedBuffer& encoder = resources_.buffers.encoder_state;
@@ -292,7 +518,7 @@ modalities::Status Sm120Bf16Operations::compose_prompt(
                : backend("SM120 prompt composition failed");
 }
 
-modalities::Status Sm120Bf16Operations::vision_embed(
+modalities::Status Sm120Operations::vision_embed(
     Pi05Stream stream) const {
     const int rows = shape_.vision_sequence;
     const int width = kPi05ModelDims.vision_width;
@@ -308,8 +534,8 @@ modalities::Status Sm120Bf16Operations::vision_embed(
         static_cast<__half*>(patches), shape_.num_views, cuda_stream(stream));
     modalities::Status status = launch_status();
     if (!status.ok_status()) return status;
-    status = linear_.run(weights.patch_weight, patches, state, rows,
-                         patch_width, width, stream);
+    status = bf16_linear_.run(weights.patch_weight, patches, state, rows,
+                              patch_width, width, stream);
     if (!status.ok_status()) return status;
     status = bias_residual(state, data(support_.expanded_vision_position),
                            weights.patch_bias, rows, width, stream);
@@ -320,7 +546,7 @@ modalities::Status Sm120Bf16Operations::vision_embed(
                       kPi05ModelNumerics.vision_layer_norm_epsilon, stream);
 }
 
-modalities::Status Sm120Bf16Operations::vision_attention(
+modalities::Status Sm120Operations::vision_attention(
     int layer,
     Pi05Stream stream) const {
     if (layer < 0 || layer >= kPi05ModelDims.vision_layers) {
@@ -335,9 +561,10 @@ modalities::Status Sm120Bf16Operations::vision_attention(
     void* normalized = scratch_.vision().normalized.device_data();
     void* qkv = scratch_.vision().qkv.device_data();
 
-    modalities::Status status = linear_.run(
-        weights.attention_qkv_weight, normalized, qkv, rows, width,
-        3 * width, stream);
+    modalities::Status status = linear(
+        weights.attention_qkv_weight,
+        {Pi05LinearDomain::kVision, Pi05LinearRole::kAttentionQkv, layer},
+        -1, normalized, qkv, rows, width, 3 * width, stream);
     if (!status.ok_status()) return status;
     status = add_bias(qkv, weights.attention_qkv_bias, rows, 3 * width,
                       stream);
@@ -352,9 +579,11 @@ modalities::Status Sm120Bf16Operations::vision_attention(
     if (!status.ok_status()) return status;
     status = attention_driver_.vision(stream);
     if (!status.ok_status()) return status;
-    status = linear_.run(
-        weights.attention_output_weight, attention_driver_.vision_output(),
-        normalized, rows, width, width, stream);
+    status = linear(
+        weights.attention_output_weight,
+        {Pi05LinearDomain::kVision, Pi05LinearRole::kAttentionOutput, layer},
+        -1, attention_driver_.vision_output(), normalized, rows, width, width,
+        stream);
     if (!status.ok_status()) return status;
     status = bias_residual(state, normalized, weights.attention_output_bias,
                            rows, width, stream);
@@ -366,7 +595,7 @@ modalities::Status Sm120Bf16Operations::vision_attention(
                : status;
 }
 
-modalities::Status Sm120Bf16Operations::vision_mlp(
+modalities::Status Sm120Operations::vision_mlp(
     int layer,
     Pi05Stream stream) const {
     if (layer < 0 || layer >= kPi05ModelDims.vision_layers) {
@@ -381,9 +610,10 @@ modalities::Status Sm120Bf16Operations::vision_mlp(
     void* normalized = scratch_.vision().normalized.device_data();
     void* hidden = scratch_.vision().hidden.device_data();
 
-    modalities::Status status = linear_.run(
-        weights.mlp_up_weight, normalized, hidden, rows, width, hidden_width,
-        stream);
+    modalities::Status status = linear(
+        weights.mlp_up_weight,
+        {Pi05LinearDomain::kVision, Pi05LinearRole::kMlpUp, layer}, -1,
+        normalized, hidden, rows, width, hidden_width, stream);
     if (!status.ok_status()) return status;
     status = add_bias(hidden, weights.mlp_up_bias, rows, hidden_width, stream);
     if (!status.ok_status()) return status;
@@ -391,8 +621,10 @@ modalities::Status Sm120Bf16Operations::vision_mlp(
                    cuda_stream(stream));
     status = launch_status();
     if (!status.ok_status()) return status;
-    status = linear_.run(weights.mlp_down_weight, hidden, normalized, rows,
-                         hidden_width, width, stream);
+    status = linear(
+        weights.mlp_down_weight,
+        {Pi05LinearDomain::kVision, Pi05LinearRole::kMlpDown, layer}, -1,
+        hidden, normalized, rows, hidden_width, width, stream);
     if (!status.ok_status()) return status;
     status = bias_residual(state, normalized, weights.mlp_down_bias, rows,
                            width, stream);
@@ -406,7 +638,7 @@ modalities::Status Sm120Bf16Operations::vision_mlp(
                       kPi05ModelNumerics.vision_layer_norm_epsilon, stream);
 }
 
-modalities::Status Sm120Bf16Operations::vision_project(
+modalities::Status Sm120Operations::vision_project(
     Pi05Stream stream) const {
     const int rows = shape_.encoder_vision_sequence;
     const int width = kPi05ModelDims.vision_width;
@@ -430,15 +662,18 @@ modalities::Status Sm120Bf16Operations::vision_project(
                         weights.final_norm_bias, normalized, rows, width,
                         kPi05ModelNumerics.vision_layer_norm_epsilon, stream);
     if (!status.ok_status()) return status;
-    status = linear_.run(weights.projector_weight, normalized, encoder, rows,
-                         width, kPi05ModelDims.encoder_width, stream);
+    status = linear(
+        weights.projector_weight,
+        {Pi05LinearDomain::kVision, Pi05LinearRole::kProjector, -1}, -1,
+        normalized, encoder, rows, width, kPi05ModelDims.encoder_width,
+        stream);
     return status.ok_status()
                ? add_bias(encoder, weights.projector_bias, rows,
                           kPi05ModelDims.encoder_width, stream)
                : status;
 }
 
-modalities::Status Sm120Bf16Operations::encoder_attention(
+modalities::Status Sm120Operations::encoder_attention(
     int layer,
     Pi05Stream stream) const {
     if (layer < 0 || layer >= kPi05ModelDims.encoder_layers - 1) {
@@ -458,12 +693,45 @@ modalities::Status Sm120Bf16Operations::encoder_attention(
     void* key = attention_.key_layer_data(layer);
     void* value = attention_.value_layer_data(layer);
 
-    modalities::Status status = rms_norm(
-        state, support_.encoder_rms_weight, normalized, rows, width,
-        kPi05ModelNumerics.encoder_rms_norm_epsilon, stream);
+    const Pi05LinearWeightKey qkv_key{
+        Pi05LinearDomain::kEncoder, Pi05LinearRole::kAttentionQkv, layer};
+    const Pi05LinearWeightKey output_key{
+        Pi05LinearDomain::kEncoder, Pi05LinearRole::kAttentionOutput, layer};
+    const Pi05LinearWeightKey gate_up_key{
+        Pi05LinearDomain::kEncoder, Pi05LinearRole::kMlpGateUpGroup, layer};
+    modalities::Status status;
+    const void* qkv_input = normalized;
+    if (static_fp8()) {
+        float* qkv_scale = scale(qkv_key, -1);
+        if (!qkv_scale) return invalid("SM120 encoder QKV scale is invalid");
+        if (layer == 0) {
+            ::rms_norm_fp8(
+                static_cast<const __nv_bfloat16*>(state),
+                static_cast<const __nv_bfloat16*>(
+                    data(support_.encoder_rms_weight)),
+                static_cast<__nv_fp8_e4m3*>(fp8_linear_->scratch_data()),
+                rows, width, kPi05ModelNumerics.encoder_rms_norm_epsilon,
+                qkv_scale, cuda_stream(stream));
+        } else {
+            ::residual_add_rms_norm_fp8(
+                static_cast<__nv_bfloat16*>(state),
+                static_cast<const __nv_bfloat16*>(normalized),
+                static_cast<const __nv_bfloat16*>(
+                    data(support_.encoder_rms_weight)),
+                static_cast<__nv_fp8_e4m3*>(fp8_linear_->scratch_data()),
+                rows, width, kPi05ModelNumerics.encoder_rms_norm_epsilon,
+                qkv_scale, cuda_stream(stream));
+        }
+        status = launch_status();
+        qkv_input = fp8_linear_->scratch_data();
+    } else {
+        status = rms_norm(
+            state, support_.encoder_rms_weight, normalized, rows, width,
+            kPi05ModelNumerics.encoder_rms_norm_epsilon, stream);
+    }
     if (!status.ok_status()) return status;
-    status = linear_.run(weights.attention_qkv_weight, normalized, qkv, rows,
-                         width, qkv_width, stream);
+    status = linear(weights.attention_qkv_weight, qkv_key, -1, qkv_input,
+                    qkv, rows, width, qkv_width, stream, static_fp8());
     if (!status.ok_status()) return status;
     status = split_qkv_rope(
         qkv, resources_.buffers.encoder_rope, attention.query.device_data(),
@@ -472,10 +740,25 @@ modalities::Status Sm120Bf16Operations::encoder_attention(
     if (!status.ok_status()) return status;
     status = attention_driver_.encoder(layer, stream);
     if (!status.ok_status()) return status;
-    status = linear_.run(
-        weights.attention_output_weight, attention_driver_.encoder_output(),
-        normalized, rows, width, width, stream);
+    status = linear(weights.attention_output_weight, output_key, -1,
+                    attention_driver_.encoder_output(), normalized, rows,
+                    width, width, stream);
     if (!status.ok_status()) return status;
+    if (static_fp8()) {
+        float* gate_up_scale = scale(gate_up_key, -1);
+        if (!gate_up_scale) {
+            return invalid("SM120 encoder gate-up scale is invalid");
+        }
+        ::residual_add_rms_norm_fp8(
+            static_cast<__nv_bfloat16*>(state),
+            static_cast<const __nv_bfloat16*>(normalized),
+            static_cast<const __nv_bfloat16*>(
+                data(support_.encoder_rms_weight)),
+            static_cast<__nv_fp8_e4m3*>(fp8_linear_->scratch_data()), rows,
+            width, kPi05ModelNumerics.encoder_rms_norm_epsilon,
+            gate_up_scale, cuda_stream(stream));
+        return launch_status();
+    }
     status = add_residual(state, normalized, rows * width, stream);
     return status.ok_status()
                ? rms_norm(state, support_.encoder_rms_weight, normalized,
@@ -484,7 +767,7 @@ modalities::Status Sm120Bf16Operations::encoder_attention(
                : status;
 }
 
-modalities::Status Sm120Bf16Operations::encoder_mlp(
+modalities::Status Sm120Operations::encoder_mlp(
     int layer,
     Pi05Stream stream) const {
     if (layer < 0 || layer >= kPi05ModelDims.encoder_layers - 1) {
@@ -500,23 +783,48 @@ modalities::Status Sm120Bf16Operations::encoder_mlp(
     void* gate = scratch_.encoder().gate.device_data();
     void* hidden = scratch_.encoder().hidden.device_data();
 
-    modalities::Status status = linear_.run(
+    const Pi05LinearWeightKey gate_up_key{
+        Pi05LinearDomain::kEncoder, Pi05LinearRole::kMlpGateUpGroup, layer};
+    const Pi05LinearWeightKey down_key{
+        Pi05LinearDomain::kEncoder, Pi05LinearRole::kMlpDown, layer};
+    if (static_fp8()) {
+        float* down_scale = scale(down_key, -1);
+        if (!down_scale || !weights.gate_up_weight.device_data) {
+            return invalid("SM120 encoder fused FP8 storage is invalid");
+        }
+        modalities::Status status = linear(
+            weights.gate_up_weight, gate_up_key, -1,
+            fp8_linear_->scratch_data(), gate, rows, width,
+            2 * hidden_width, stream, true);
+        if (!status.ok_status()) return status;
+        ::gate_silu_mul_merged_fp8(
+            static_cast<const __nv_bfloat16*>(gate),
+            static_cast<__nv_fp8_e4m3*>(fp8_linear_->scratch_data()), rows,
+            hidden_width, down_scale, cuda_stream(stream));
+        status = launch_status();
+        return status.ok_status()
+                   ? linear(weights.down_weight, down_key, -1,
+                            fp8_linear_->scratch_data(), normalized, rows,
+                            hidden_width, width, stream, true)
+                   : status;
+    }
+    modalities::Status status = bf16_linear_.run(
         weights.gate_weight, normalized, gate, rows, width, hidden_width,
         stream);
     if (!status.ok_status()) return status;
-    status = linear_.run(weights.up_weight, normalized, hidden, rows, width,
-                         hidden_width, stream);
+    status = bf16_linear_.run(weights.up_weight, normalized, hidden, rows,
+                              width, hidden_width, stream);
     if (!status.ok_status()) return status;
     status = gated_silu(gate, hidden, hidden, rows * hidden_width, stream);
     if (!status.ok_status()) return status;
-    status = linear_.run(weights.down_weight, hidden, normalized, rows,
-                         hidden_width, width, stream);
+    status = bf16_linear_.run(weights.down_weight, hidden, normalized, rows,
+                              hidden_width, width, stream);
     return status.ok_status()
                ? add_residual(state, normalized, rows * width, stream)
                : status;
 }
 
-modalities::Status Sm120Bf16Operations::encoder_cache_finalize(
+modalities::Status Sm120Operations::encoder_cache_finalize(
     int layer,
     Pi05Stream stream) const {
     if (layer != kPi05ModelDims.encoder_layers - 1) {
@@ -535,13 +843,33 @@ modalities::Status Sm120Bf16Operations::encoder_cache_finalize(
     void* key = attention_.key_layer_data(layer);
     void* value = attention_.value_layer_data(layer);
 
-    modalities::Status status = rms_norm(
-        data(resources_.buffers.encoder_state), support_.encoder_rms_weight,
-        normalized, rows, width,
-        kPi05ModelNumerics.encoder_rms_norm_epsilon, stream);
+    const Pi05LinearWeightKey qkv_key{
+        Pi05LinearDomain::kEncoder, Pi05LinearRole::kAttentionQkv, layer};
+    modalities::Status status;
+    const void* qkv_input = normalized;
+    if (static_fp8()) {
+        float* qkv_scale = scale(qkv_key, -1);
+        if (!qkv_scale) return invalid("SM120 encoder QKV scale is invalid");
+        ::residual_add_rms_norm_fp8(
+            static_cast<__nv_bfloat16*>(
+                data(resources_.buffers.encoder_state)),
+            static_cast<const __nv_bfloat16*>(normalized),
+            static_cast<const __nv_bfloat16*>(
+                data(support_.encoder_rms_weight)),
+            static_cast<__nv_fp8_e4m3*>(fp8_linear_->scratch_data()), rows,
+            width, kPi05ModelNumerics.encoder_rms_norm_epsilon, qkv_scale,
+            cuda_stream(stream));
+        status = launch_status();
+        qkv_input = fp8_linear_->scratch_data();
+    } else {
+        status = rms_norm(
+            data(resources_.buffers.encoder_state),
+            support_.encoder_rms_weight, normalized, rows, width,
+            kPi05ModelNumerics.encoder_rms_norm_epsilon, stream);
+    }
     if (!status.ok_status()) return status;
-    status = linear_.run(weight, normalized, qkv, rows, width, qkv_width,
-                         stream);
+    status = linear(weight, qkv_key, -1, qkv_input, qkv, rows, width,
+                    qkv_width, stream, static_fp8());
     return status.ok_status()
                ? split_qkv_rope(
                      qkv, resources_.buffers.encoder_rope,
@@ -551,14 +879,14 @@ modalities::Status Sm120Bf16Operations::encoder_cache_finalize(
                : status;
 }
 
-modalities::Status Sm120Bf16Operations::diffusion_input_project(
+modalities::Status Sm120Operations::diffusion_input_project(
     int step,
     Pi05Stream stream) const {
     if (step < 0 || step >= shape_.num_steps) {
         return invalid("SM120 diffusion input step is invalid");
     }
     const Pi05DecoderGlobalWeights& weights = resources_.weights.decoder;
-    modalities::Status status = linear_.run(
+    modalities::Status status = bf16_linear_.run(
         weights.action_in_weight, data(resources_.buffers.noise),
         data(resources_.buffers.decoder_state), shape_.chunk,
         kPi05ModelDims.action_width, kPi05ModelDims.decoder_width, stream);
@@ -569,7 +897,7 @@ modalities::Status Sm120Bf16Operations::diffusion_input_project(
                : status;
 }
 
-modalities::Status Sm120Bf16Operations::decoder_attention(
+modalities::Status Sm120Operations::decoder_attention(
     int layer,
     int step,
     Pi05Stream stream) const {
@@ -592,14 +920,42 @@ modalities::Status Sm120Bf16Operations::decoder_attention(
     void* gate = scratch_.decoder().gate.device_data();
     void* qkv = scratch_.decoder().qkv.device_data();
 
-    modalities::Status status = adaptive_rms_norm(
-        state, support_.decoder_rms_weight,
-        style_slice(resources_.buffers.attention_style, shape_, step, layer),
-        normalized, gate, rows, width,
-        kPi05ModelNumerics.decoder_rms_norm_epsilon, stream);
+    const Pi05LinearWeightKey qkv_key{
+        Pi05LinearDomain::kDecoder, Pi05LinearRole::kAttentionQkv, layer};
+    const Pi05LinearWeightKey output_key{
+        Pi05LinearDomain::kDecoder, Pi05LinearRole::kAttentionOutput, layer};
+    modalities::Status status = modalities::Status::ok();
+    const void* qkv_input = normalized;
+    if (static_fp8()) {
+        if (layer == 0) {
+            float* qkv_scale = scale(qkv_key, step);
+            if (!qkv_scale) {
+                return invalid("SM120 decoder QKV scale is invalid");
+            }
+            ::ada_rms_norm_style_fp8(
+                static_cast<const __nv_bfloat16*>(state),
+                static_cast<const __nv_bfloat16*>(
+                    data(support_.decoder_rms_weight)),
+                static_cast<const __nv_bfloat16*>(style_slice(
+                    resources_.buffers.attention_style, shape_, step, layer)),
+                static_cast<__nv_fp8_e4m3*>(fp8_linear_->scratch_data()),
+                static_cast<__nv_bfloat16*>(gate), rows, width,
+                kPi05ModelNumerics.decoder_rms_norm_epsilon, qkv_scale,
+                cuda_stream(stream));
+            status = launch_status();
+        }
+        qkv_input = fp8_linear_->scratch_data();
+    } else {
+        status = adaptive_rms_norm(
+            state, support_.decoder_rms_weight,
+            style_slice(resources_.buffers.attention_style, shape_, step,
+                        layer),
+            normalized, gate, rows, width,
+            kPi05ModelNumerics.decoder_rms_norm_epsilon, stream);
+    }
     if (!status.ok_status()) return status;
-    status = linear_.run(weights.attention_qkv_weight, normalized, qkv, rows,
-                         width, qkv_width, stream);
+    status = linear(weights.attention_qkv_weight, qkv_key, step, qkv_input,
+                    qkv, rows, width, qkv_width, stream, static_fp8());
     if (!status.ok_status()) return status;
     status = split_qkv_rope_at_position(
         qkv, resources_.buffers.decoder_rope, attention.query.device_data(),
@@ -609,16 +965,14 @@ modalities::Status Sm120Bf16Operations::decoder_attention(
     if (!status.ok_status()) return status;
     status = attention_driver_.decoder(layer, stream);
     if (!status.ok_status()) return status;
-    status = linear_.run(
-        weights.attention_output_weight, attention_driver_.decoder_output(),
-        normalized, rows, query_width, width, stream);
-    return status.ok_status()
-               ? gated_residual(state, normalized, gate, rows * width,
-                                stream)
-               : status;
+    status = linear(weights.attention_output_weight, output_key, step,
+                    attention_driver_.decoder_output(), normalized, rows,
+                    query_width, width, stream);
+    if (!status.ok_status() || static_fp8()) return status;
+    return gated_residual(state, normalized, gate, rows * width, stream);
 }
 
-modalities::Status Sm120Bf16Operations::decoder_mlp(
+modalities::Status Sm120Operations::decoder_mlp(
     int layer,
     int step,
     Pi05Stream stream) const {
@@ -638,30 +992,97 @@ modalities::Status Sm120Bf16Operations::decoder_mlp(
         scratch_.decoder().gate_projection.device_data();
     void* hidden = scratch_.decoder().hidden.device_data();
 
+    const Pi05LinearWeightKey gate_up_key{
+        Pi05LinearDomain::kDecoder, Pi05LinearRole::kMlpGateUpGroup, layer};
+    const Pi05LinearWeightKey down_key{
+        Pi05LinearDomain::kDecoder, Pi05LinearRole::kMlpDown, layer};
+    if (static_fp8()) {
+        float* gate_up_scale = scale(gate_up_key, step);
+        float* down_scale = scale(down_key, step);
+        if (!gate_up_scale || !down_scale ||
+            !weights.gate_up_weight.device_data) {
+            return invalid("SM120 decoder fused FP8 storage is invalid");
+        }
+        ::gate_residual_ada_norm_fp8(
+            static_cast<__nv_bfloat16*>(state),
+            static_cast<const __nv_bfloat16*>(normalized),
+            static_cast<const __nv_bfloat16*>(gate),
+            static_cast<const __nv_bfloat16*>(
+                data(support_.decoder_rms_weight)),
+            static_cast<const __nv_bfloat16*>(
+                style_slice(resources_.buffers.mlp_style, shape_, step,
+                            layer)),
+            static_cast<__nv_fp8_e4m3*>(fp8_linear_->scratch_data()),
+            static_cast<__nv_bfloat16*>(gate), rows, width,
+            kPi05ModelNumerics.decoder_rms_norm_epsilon, gate_up_scale,
+            cuda_stream(stream));
+        modalities::Status status = launch_status();
+        if (!status.ok_status()) return status;
+        status = linear(weights.gate_up_weight, gate_up_key, step,
+                        fp8_linear_->scratch_data(), gate_projection, rows,
+                        width, 2 * hidden_width, stream, true);
+        if (!status.ok_status()) return status;
+        ::gate_silu_mul_merged_fp8(
+            static_cast<const __nv_bfloat16*>(gate_projection),
+            static_cast<__nv_fp8_e4m3*>(fp8_linear_->scratch_data()), rows,
+            hidden_width, down_scale, cuda_stream(stream));
+        status = launch_status();
+        if (!status.ok_status()) return status;
+        status = linear(weights.down_weight, down_key, step,
+                        fp8_linear_->scratch_data(), normalized, rows,
+                        hidden_width, width, stream, true);
+        if (!status.ok_status()) return status;
+        if (layer + 1 == kPi05ModelDims.decoder_layers) {
+            return gated_residual(state, normalized, gate, rows * width,
+                                  stream);
+        }
+        const Pi05LinearWeightKey next_qkv_key{
+            Pi05LinearDomain::kDecoder, Pi05LinearRole::kAttentionQkv,
+            layer + 1};
+        float* next_qkv_scale = scale(next_qkv_key, step);
+        if (!next_qkv_scale) {
+            return invalid("SM120 decoder next QKV scale is invalid");
+        }
+        ::gate_residual_ada_norm_fp8(
+            static_cast<__nv_bfloat16*>(state),
+            static_cast<const __nv_bfloat16*>(normalized),
+            static_cast<const __nv_bfloat16*>(gate),
+            static_cast<const __nv_bfloat16*>(
+                data(support_.decoder_rms_weight)),
+            static_cast<const __nv_bfloat16*>(
+                style_slice(resources_.buffers.attention_style, shape_, step,
+                            layer + 1)),
+            static_cast<__nv_fp8_e4m3*>(fp8_linear_->scratch_data()),
+            static_cast<__nv_bfloat16*>(gate), rows, width,
+            kPi05ModelNumerics.decoder_rms_norm_epsilon, next_qkv_scale,
+            cuda_stream(stream));
+        return launch_status();
+    }
     modalities::Status status = adaptive_rms_norm(
         state, support_.decoder_rms_weight,
         style_slice(resources_.buffers.mlp_style, shape_, step, layer),
         normalized, gate, rows, width,
         kPi05ModelNumerics.decoder_rms_norm_epsilon, stream);
     if (!status.ok_status()) return status;
-    status = linear_.run(weights.gate_weight, normalized, gate_projection,
-                         rows, width, hidden_width, stream);
+    status = bf16_linear_.run(weights.gate_weight, normalized,
+                              gate_projection, rows, width, hidden_width,
+                              stream);
     if (!status.ok_status()) return status;
-    status = linear_.run(weights.up_weight, normalized, hidden, rows, width,
-                         hidden_width, stream);
+    status = bf16_linear_.run(weights.up_weight, normalized, hidden, rows,
+                              width, hidden_width, stream);
     if (!status.ok_status()) return status;
     status = gated_silu(gate_projection, hidden, hidden,
                         rows * hidden_width, stream);
     if (!status.ok_status()) return status;
-    status = linear_.run(weights.down_weight, hidden, normalized, rows,
-                         hidden_width, width, stream);
+    status = bf16_linear_.run(weights.down_weight, hidden, normalized, rows,
+                              hidden_width, width, stream);
     return status.ok_status()
                ? gated_residual(state, normalized, gate, rows * width,
                                 stream)
                : status;
 }
 
-modalities::Status Sm120Bf16Operations::action_project(
+modalities::Status Sm120Operations::action_project(
     int step,
     Pi05Stream stream) const {
     if (step < 0 || step >= shape_.num_steps) {
@@ -680,15 +1101,16 @@ modalities::Status Sm120Bf16Operations::action_project(
         normalized, gate, rows, width,
         kPi05ModelNumerics.decoder_rms_norm_epsilon, stream);
     if (!status.ok_status()) return status;
-    status = linear_.run(weights.action_out_weight, normalized, action, rows,
-                         width, kPi05ModelDims.action_width, stream);
+    status = bf16_linear_.run(weights.action_out_weight, normalized, action,
+                              rows, width, kPi05ModelDims.action_width,
+                              stream);
     return status.ok_status()
                ? add_bias(action, weights.action_out_bias, rows,
                           kPi05ModelDims.action_width, stream)
                : status;
 }
 
-modalities::Status Sm120Bf16Operations::diffusion_update(
+modalities::Status Sm120Operations::diffusion_update(
     int step,
     Pi05Stream stream) const {
     if (step < 0 || step >= shape_.num_steps) {

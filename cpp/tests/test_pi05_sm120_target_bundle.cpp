@@ -1,4 +1,5 @@
 #include "flashrt/cpp/models/pi05/model/semantic_pipeline.h"
+#include "flashrt/cpp/models/pi05/targets/sm120/fp8_linear.h"
 #include "flashrt/cpp/models/pi05/targets/sm120/target.h"
 #include "flashrt/exec.h"
 
@@ -9,6 +10,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
+#include <string>
+#include <utility>
 
 namespace {
 
@@ -25,6 +28,23 @@ flashrt::models::pi05::Pi05ResolvedShape canonical_shape() {
     assert(flashrt::models::pi05::resolve_pi05_shape(config, &shape)
                .ok_status());
     return shape;
+}
+
+flashrt::models::pi05::targets::sm120::Sm120TargetConfig target_config(
+    std::string checkpoint,
+    const char* calibration_path = nullptr) {
+    using namespace flashrt::models::pi05;
+    using namespace flashrt::models::pi05::targets::sm120;
+    Sm120TargetConfig config;
+    config.checkpoint_path = std::move(checkpoint);
+    if (calibration_path && calibration_path[0]) {
+        NativeCalibrationArtifact artifact;
+        assert(load_native_calibration_artifact(calibration_path, &artifact)
+                   .ok_status());
+        config.precision = Sm120Precision::kStaticFp8E4M3;
+        config.calibration = std::move(artifact);
+    }
+    return config;
 }
 
 std::int32_t read_control(
@@ -56,25 +76,41 @@ int main() {
     }
 
     using namespace flashrt::models::pi05;
+    using flashrt::models::pi05::targets::sm120::Sm120Fp8Linear;
+    using flashrt::models::pi05::targets::sm120::Sm120Precision;
+    using flashrt::models::pi05::targets::sm120::Sm120TargetConfig;
     using flashrt::models::pi05::targets::sm120::Sm120TargetBundle;
 
     const Pi05ResolvedShape shape = canonical_shape();
     flashrt::modalities::Status status;
-    assert(!Sm120TargetBundle::create(nullptr, shape, "missing", &status));
+    assert(!Sm120TargetBundle::create(
+        nullptr, shape, target_config("missing"), &status));
     assert(!status.ok_status());
 
     frt_ctx context = frt_ctx_create();
     assert(context);
     Pi05ResolvedShape invalid_shape = shape;
     ++invalid_shape.encoder_sequence;
-    assert(!Sm120TargetBundle::create(context, invalid_shape, "missing",
-                                      &status));
+    assert(!Sm120TargetBundle::create(
+        context, invalid_shape, target_config("missing"), &status));
     assert(!status.ok_status());
-    assert(!Sm120TargetBundle::create(context, shape, "", &status));
+    assert(!Sm120TargetBundle::create(
+        context, shape, target_config(""), &status));
+    assert(!status.ok_status());
+    Sm120TargetConfig missing_artifact = target_config("missing");
+    missing_artifact.precision = Sm120Precision::kStaticFp8E4M3;
+    assert(!Sm120TargetBundle::create(
+        context, shape, std::move(missing_artifact), &status));
+    assert(!status.ok_status());
+    Sm120TargetConfig unexpected_artifact = target_config("missing");
+    unexpected_artifact.calibration = NativeCalibrationArtifact{};
+    assert(!Sm120TargetBundle::create(
+        context, shape, std::move(unexpected_artifact), &status));
     assert(!status.ok_status());
 
     std::unique_ptr<Sm120TargetBundle> missing =
-        Sm120TargetBundle::create(context, shape, "missing", &status);
+        Sm120TargetBundle::create(
+            context, shape, target_config("missing"), &status);
     assert(missing);
     Pi05ResolvedResources resources;
     assert(!missing->resolve_resources(&resources).ok_status());
@@ -93,32 +129,68 @@ int main() {
 
     context = frt_ctx_create();
     assert(context);
+    const char* calibration = std::getenv("FLASHRT_PI05_CALIBRATION");
+    Sm120TargetConfig config = target_config(checkpoint, calibration);
+    const bool fp8 = config.precision == Sm120Precision::kStaticFp8E4M3;
+    Pi05ResolvedShape runtime_shape = shape;
+    if (config.calibration) {
+        Pi05ShapeConfig runtime_config;
+        runtime_config.num_views = config.calibration->num_views;
+        runtime_config.max_prompt_tokens =
+            config.calibration->max_prompt_tokens;
+        runtime_config.chunk = config.calibration->chunk_size;
+        runtime_config.num_steps = config.calibration->num_steps;
+        runtime_config.vision_pool_factor =
+            config.calibration->vision_pool_factor;
+        runtime_config.state_dim = config.calibration->state_dim;
+        runtime_config.robot_action_dim = shape.robot_action_dim;
+        assert(resolve_pi05_shape(runtime_config, &runtime_shape).ok_status());
+    }
     std::unique_ptr<Sm120TargetBundle> target =
-        Sm120TargetBundle::create(context, shape, checkpoint, &status);
+        Sm120TargetBundle::create(
+            context, runtime_shape, std::move(config), &status);
     assert(target && status.ok_status());
-    assert(target->initialize_resources().ok_status());
+    status = target->initialize_resources();
+    if (fp8 && !Sm120Fp8Linear::runtime_status().ok_status()) {
+        assert(!status.ok_status());
+        assert(status.code == flashrt::modalities::StatusCode::kUnsupported);
+        target.reset();
+        frt_ctx_destroy(context);
+        std::printf("PASS - PI0.5 SM120 target FP8 runtime rejection\n");
+        return 0;
+    }
+    assert(status.ok_status());
     assert(!target->initialize_resources().ok_status());
     assert(target->materialized_weight_count() > 0);
-    assert(target->resolve_resources(&resources).ok_status());
+    status = target->resolve_resources(&resources);
+    if (!status.ok_status()) {
+        std::fprintf(stderr, "resolve_resources failed: %s\n",
+                     status.message.c_str());
+    }
+    assert(status.ok_status());
     assert(!target->resolve_resources(&resources).ok_status());
-    assert(validate_pi05_resolved_resources(resources, shape).ok_status());
+    assert(validate_pi05_resolved_resources(resources, runtime_shape)
+               .ok_status());
+    assert(target->packed_weight_count() == (fp8 ? 253u : 0u));
     assert(!target->finalize_setup().ok_status());
 
-    Pi05SemanticPipeline pipeline(shape);
+    Pi05SemanticPipeline pipeline(runtime_shape);
     assert(pipeline.record_prepare(*target).ok_status());
     assert(target->prepare_call_count() ==
-           static_cast<std::size_t>(shape.num_steps) *
+           static_cast<std::size_t>(runtime_shape.num_steps) *
                (2 + 2 * kPi05ModelDims.decoder_layers));
     assert(target->finalize_setup().ok_status());
+    assert(target->autotuned_shape_count() == (fp8 ? 13u : 0u));
     assert(!target->finalize_setup().ok_status());
 
     assert(target->set_prompt_length(0).ok_status());
-    assert(target->set_prompt_length(shape.max_prompt_tokens).ok_status());
+    assert(target->set_prompt_length(runtime_shape.max_prompt_tokens)
+               .ok_status());
     const std::int32_t committed =
         read_control(resources.buffers.encoder_valid_tokens);
-    assert(committed == shape.encoder_vision_sequence +
-                            shape.max_prompt_tokens);
-    assert(!target->set_prompt_length(shape.max_prompt_tokens + 1)
+    assert(committed == runtime_shape.encoder_vision_sequence +
+                            runtime_shape.max_prompt_tokens);
+    assert(!target->set_prompt_length(runtime_shape.max_prompt_tokens + 1)
                 .ok_status());
     assert(read_control(resources.buffers.encoder_valid_tokens) == committed);
 

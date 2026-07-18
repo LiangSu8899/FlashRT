@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <memory>
 #include <new>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -74,6 +75,8 @@ int main() {
 
     using namespace flashrt::models::pi05;
     using flashrt::models::pi05::targets::sm120::Sm120TargetBundle;
+    using flashrt::models::pi05::targets::sm120::Sm120Precision;
+    using flashrt::models::pi05::targets::sm120::Sm120TargetConfig;
     Pi05ShapeConfig config;
     config.num_views = 3;
     config.max_prompt_tokens = 200;
@@ -88,8 +91,18 @@ int main() {
     frt_ctx context = frt_ctx_create();
     CHECK(context != nullptr);
     flashrt::modalities::Status status;
+    Sm120TargetConfig target_config;
+    target_config.checkpoint_path = checkpoint;
+    const char* calibration = std::getenv("FLASHRT_PI05_CALIBRATION");
+    if (calibration && calibration[0]) {
+        NativeCalibrationArtifact artifact;
+        CHECK(load_native_calibration_artifact(calibration, &artifact)
+                  .ok_status());
+        target_config.precision = Sm120Precision::kStaticFp8E4M3;
+        target_config.calibration = std::move(artifact);
+    }
     std::unique_ptr<Sm120TargetBundle> concrete = Sm120TargetBundle::create(
-        context, shape, checkpoint, &status);
+        context, shape, std::move(target_config), &status);
     CHECK(concrete && status.ok_status());
     std::unique_ptr<Pi05TargetBundle> target(std::move(concrete));
     std::unique_ptr<Pi05NativeSession> session = Pi05NativeSession::create(

@@ -8,8 +8,10 @@
 #include "flashrt/cpp/models/pi05/targets/sm120/attention.h"
 #include "flashrt/cpp/models/pi05/targets/sm120/attention_driver.h"
 #include "flashrt/cpp/models/pi05/targets/sm120/bf16_linear.h"
-#include "flashrt/cpp/models/pi05/targets/sm120/bf16_operations.h"
 #include "flashrt/cpp/models/pi05/targets/sm120/bf16_scratch.h"
+#include "flashrt/cpp/models/pi05/targets/sm120/fp8_linear.h"
+#include "flashrt/cpp/models/pi05/targets/sm120/fp8_weight_packer.h"
+#include "flashrt/cpp/models/pi05/targets/sm120/operations.h"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime_api.h>
@@ -203,6 +205,21 @@ bool prepare_operation(Pi05OperationId id) {
            id == Pi05OperationId::kFinalStyle;
 }
 
+bool static_fp8(Sm120Precision precision) {
+    return precision == Sm120Precision::kStaticFp8E4M3;
+}
+
+bool valid_config(const Sm120TargetConfig& config) {
+    if (config.checkpoint_path.empty()) return false;
+    switch (config.precision) {
+        case Sm120Precision::kBf16:
+            return !config.calibration.has_value();
+        case Sm120Precision::kStaticFp8E4M3:
+            return config.calibration.has_value();
+    }
+    return false;
+}
+
 }  // namespace
 
 struct Sm120TargetBundle::Impl final {
@@ -218,9 +235,9 @@ struct Sm120TargetBundle::Impl final {
 
     Impl(frt_ctx context,
          Pi05ResolvedShape resolved_shape,
-         std::string checkpoint)
+         Sm120TargetConfig target_config)
         : shape(resolved_shape),
-          checkpoint_path(std::move(checkpoint)),
+          config(std::move(target_config)),
           weights(context),
           workspace(context),
           attention(context),
@@ -232,14 +249,17 @@ struct Sm120TargetBundle::Impl final {
     }
 
     Pi05ResolvedShape shape;
-    std::string checkpoint_path;
+    Sm120TargetConfig config;
     NativeDeviceWeightStore weights;
     NativeWorkspace workspace;
     Sm120AttentionBacking attention;
     Sm120Bf16ScratchBacking scratch;
-    std::unique_ptr<Sm120Bf16Linear> linear;
+    std::unique_ptr<Sm120Bf16Linear> bf16_linear;
+    std::unique_ptr<Sm120Fp8WeightPacker> fp8_packer;
+    std::unique_ptr<Sm120Fp8ActivationBacking> fp8_activation;
+    std::unique_ptr<Sm120Fp8Linear> fp8_linear;
     std::unique_ptr<Sm120AttentionDriver> attention_driver;
-    std::unique_ptr<Sm120Bf16Operations> operations;
+    std::unique_ptr<Sm120Operations> operations;
     Pi05ResolvedResources resources;
     Pi05NativeSupportBuffers support;
     std::size_t prepare_cursor = 0;
@@ -256,10 +276,10 @@ Sm120TargetBundle::~Sm120TargetBundle() = default;
 std::unique_ptr<Sm120TargetBundle> Sm120TargetBundle::create(
     frt_ctx context,
     const Pi05ResolvedShape& shape,
-    std::string checkpoint_path,
+    Sm120TargetConfig config,
     modalities::Status* status) {
     modalities::Status validation = validate_pi05_resolved_shape(shape);
-    if (!context || checkpoint_path.empty() || !validation.ok_status()) {
+    if (!context || !valid_config(config) || !validation.ok_status()) {
         set_status(status,
                    context && !validation.ok_status()
                        ? validation
@@ -268,7 +288,7 @@ std::unique_ptr<Sm120TargetBundle> Sm120TargetBundle::create(
     }
     try {
         std::unique_ptr<Impl> impl(
-            new Impl(context, shape, std::move(checkpoint_path)));
+            new Impl(context, shape, std::move(config)));
         std::unique_ptr<Sm120TargetBundle> target(
             new Sm120TargetBundle(context, std::move(impl)));
         set_status(status, modalities::Status::ok());
@@ -288,9 +308,13 @@ modalities::Status Sm120TargetBundle::initialize_resources() {
     try {
         modalities::Status status = validate_device();
         if (!status.ok_status()) return impl_->fail(std::move(status));
+        if (static_fp8(impl_->config.precision)) {
+            status = Sm120Fp8Linear::runtime_status();
+            if (!status.ok_status()) return impl_->fail(std::move(status));
+        }
 
         const std::filesystem::path checkpoint =
-            std::filesystem::path(impl_->checkpoint_path) /
+            std::filesystem::path(impl_->config.checkpoint_path) /
             "model.safetensors";
         loader::SafetensorsFile source;
         if (!source.open(checkpoint.string())) {
@@ -322,14 +346,15 @@ modalities::Status Sm120TargetBundle::initialize_resources() {
         if (!status.ok_status()) return impl_->fail(std::move(status));
         status = impl_->attention.allocate(impl_->shape);
         if (!status.ok_status()) return impl_->fail(std::move(status));
-        status = impl_->scratch.allocate(impl_->shape);
+        status = impl_->scratch.allocate(
+            impl_->shape, static_fp8(impl_->config.precision));
         if (!status.ok_status()) return impl_->fail(std::move(status));
 
-        impl_->linear.reset(new (std::nothrow) Sm120Bf16Linear());
-        if (!impl_->linear) {
+        impl_->bf16_linear.reset(new (std::nothrow) Sm120Bf16Linear());
+        if (!impl_->bf16_linear) {
             return impl_->fail(backend("SM120 BF16 linear allocation failed"));
         }
-        status = impl_->linear->status();
+        status = impl_->bf16_linear->status();
         if (!status.ok_status()) return impl_->fail(std::move(status));
         status = impl_->attention.set_prompt_length(0);
         if (!status.ok_status()) return impl_->fail(std::move(status));
@@ -373,8 +398,42 @@ modalities::Status Sm120TargetBundle::resolve_resources(
         status = resolve_pi05_native_support_buffers(
             impl_->workspace, impl_->shape, &support);
         if (!status.ok_status()) return impl_->fail(std::move(status));
+        if (static_fp8(impl_->config.precision)) {
+            impl_->fp8_packer.reset(new (std::nothrow)
+                                        Sm120Fp8WeightPacker(context()));
+            if (!impl_->fp8_packer) {
+                return impl_->fail(
+                    backend("SM120 FP8 weight packer allocation failed"));
+            }
+            status = visit_pi05_linear_weight_groups(
+                &resolved.weights, impl_->fp8_packer.get());
+            if (status.ok_status()) status = impl_->fp8_packer->finish();
+            if (!status.ok_status()) return impl_->fail(std::move(status));
+        }
         status = validate_pi05_resolved_resources(resolved, impl_->shape);
         if (!status.ok_status()) return impl_->fail(std::move(status));
+
+        if (static_fp8(impl_->config.precision)) {
+            impl_->fp8_activation.reset(new (std::nothrow)
+                                            Sm120Fp8ActivationBacking(
+                                                context()));
+            if (!impl_->fp8_activation) {
+                return impl_->fail(
+                    backend("SM120 FP8 activation allocation failed"));
+            }
+            status = impl_->fp8_activation->initialize_static(
+                impl_->shape, *impl_->config.calibration);
+            if (!status.ok_status()) return impl_->fail(std::move(status));
+            impl_->fp8_linear.reset(new (std::nothrow)
+                                        Sm120Fp8Linear(
+                                            impl_->fp8_activation.get()));
+            if (!impl_->fp8_linear) {
+                return impl_->fail(
+                    backend("SM120 FP8 linear allocation failed"));
+            }
+            status = impl_->fp8_linear->status();
+            if (!status.ok_status()) return impl_->fail(std::move(status));
+        }
 
         impl_->resources = resolved;
         impl_->support = support;
@@ -405,7 +464,7 @@ modalities::Status Sm120TargetBundle::record(
             case Pi05OperationId::kTimeMlp:
                 status = record_time_mlp(
                     call, shape, impl_->resources, impl_->scratch,
-                    *impl_->linear, stream);
+                    *impl_->bf16_linear, stream);
                 break;
             case Pi05OperationId::kAttentionStyle: {
                 const Pi05DecoderLayerWeights& layer =
@@ -415,7 +474,7 @@ modalities::Status Sm120TargetBundle::record(
                     call, shape, impl_->resources,
                     layer.attention_mod_weight, layer.attention_mod_bias,
                     impl_->resources.buffers.attention_style, true,
-                    *impl_->linear, stream);
+                    *impl_->bf16_linear, stream);
                 break;
             }
             case Pi05OperationId::kMlpStyle: {
@@ -425,7 +484,7 @@ modalities::Status Sm120TargetBundle::record(
                 status = record_style(
                     call, shape, impl_->resources, layer.mlp_mod_weight,
                     layer.mlp_mod_bias, impl_->resources.buffers.mlp_style,
-                    true, *impl_->linear, stream);
+                    true, *impl_->bf16_linear, stream);
                 break;
             }
             case Pi05OperationId::kFinalStyle:
@@ -434,7 +493,7 @@ modalities::Status Sm120TargetBundle::record(
                     impl_->resources.weights.decoder.final_norm_mod_weight,
                     impl_->resources.weights.decoder.final_norm_mod_bias,
                     impl_->resources.buffers.final_style, false,
-                    *impl_->linear, stream);
+                    *impl_->bf16_linear, stream);
                 break;
             default:
                 return unsupported("SM120 prepare operation is unsupported");
@@ -518,9 +577,16 @@ modalities::Status Sm120TargetBundle::finalize_setup() {
     }
     modalities::Status status = impl_->attention_driver->status();
     if (!status.ok_status()) return impl_->fail(std::move(status));
-    impl_->operations = Sm120Bf16Operations::create(
+    if (impl_->fp8_linear) {
+        status = Sm120Operations::autotune_static_fp8(
+            impl_->shape, &impl_->resources, impl_->scratch,
+            impl_->fp8_linear.get());
+        if (!status.ok_status()) return impl_->fail(std::move(status));
+    }
+    impl_->operations = Sm120Operations::create(
         impl_->shape, impl_->resources, impl_->support, impl_->scratch,
-        impl_->attention, *impl_->attention_driver, *impl_->linear, &status);
+        impl_->attention, *impl_->attention_driver, *impl_->bf16_linear,
+        impl_->fp8_linear.get(), &status);
     if (!impl_->operations || !status.ok_status()) {
         return impl_->fail(std::move(status));
     }
@@ -601,8 +667,22 @@ std::size_t Sm120TargetBundle::materialized_weight_count() const {
     return impl_ ? impl_->weights.size() : 0;
 }
 
+std::size_t Sm120TargetBundle::packed_weight_count() const {
+    return impl_ && impl_->fp8_packer ? impl_->fp8_packer->size() : 0;
+}
+
+std::size_t Sm120TargetBundle::autotuned_shape_count() const {
+    return impl_ && impl_->fp8_linear
+               ? impl_->fp8_linear->autotuned_shape_count()
+               : 0;
+}
+
 std::size_t Sm120TargetBundle::prepare_call_count() const {
     return impl_ ? impl_->prepare_cursor : 0;
+}
+
+Sm120Precision Sm120TargetBundle::precision() const {
+    return impl_ ? impl_->config.precision : Sm120Precision::kBf16;
 }
 
 bool Sm120TargetBundle::ready_for_capture() const {

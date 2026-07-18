@@ -249,9 +249,10 @@ struct Sm120Fp8Linear::Impl final {
 Sm120Fp8Linear::Sm120Fp8Linear(
     Sm120Fp8ActivationBacking* activation) noexcept
     : activation_(activation) {
-    if (cublasLtGetVersion() < kMinimumSm120Fp8CublasVersion) {
-        error_code_ = modalities::StatusCode::kUnsupported;
-        error_ = "SM120 FP8 requires cuBLAS 13.1 or newer";
+    const modalities::Status runtime = runtime_status();
+    if (!runtime.ok_status()) {
+        error_code_ = runtime.code;
+        error_ = runtime.message;
         return;
     }
     try {
@@ -264,6 +265,14 @@ Sm120Fp8Linear::Sm120Fp8Linear(
 }
 
 Sm120Fp8Linear::~Sm120Fp8Linear() = default;
+
+modalities::Status Sm120Fp8Linear::runtime_status() {
+    return cublasLtGetVersion() >= kMinimumSm120Fp8CublasVersion
+               ? modalities::Status::ok()
+               : modalities::Status::error(
+                     modalities::StatusCode::kUnsupported,
+                     "SM120 FP8 requires cuBLAS 13.1 or newer");
+}
 
 modalities::Status Sm120Fp8Linear::status() const {
     if (!activation_ || !activation_->initialized()) {

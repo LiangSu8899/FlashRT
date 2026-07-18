@@ -67,7 +67,8 @@ modalities::Status Sm120Bf16ScratchBacking::add(
 }
 
 modalities::Status Sm120Bf16ScratchBacking::allocate(
-    const Pi05ResolvedShape& shape) {
+    const Pi05ResolvedShape& shape,
+    bool fused_gate_up) {
     if (!context_ || allocation_started_) {
         return invalid("SM120 BF16 scratch cannot be allocated");
     }
@@ -75,6 +76,7 @@ modalities::Status Sm120Bf16ScratchBacking::allocate(
     if (!status.ok_status()) return status;
     allocation_started_ = true;
     shape_ = shape;
+    fused_gate_up_ = fused_gate_up;
 
     const std::uint64_t vision_sequence = dim(shape.vision_sequence);
     const std::uint64_t encoder_sequence = dim(shape.encoder_sequence);
@@ -112,7 +114,9 @@ modalities::Status Sm120Bf16ScratchBacking::allocate(
             modalities::Shape({encoder_sequence, encoder_qkv}));
     FRT_ADD(encoder_.gate, "sm120_bf16_encoder_gate",
             modalities::Shape(
-                {encoder_sequence, dim(kPi05ModelDims.encoder_hidden)}));
+                {encoder_sequence,
+                 dim(kPi05ModelDims.encoder_hidden) *
+                     (fused_gate_up ? 2 : 1)}));
     FRT_ADD(encoder_.hidden, "sm120_bf16_encoder_hidden",
             modalities::Shape(
                 {encoder_sequence, dim(kPi05ModelDims.encoder_hidden)}));
@@ -125,7 +129,9 @@ modalities::Status Sm120Bf16ScratchBacking::allocate(
             modalities::Shape({decoder_sequence, decoder_qkv}));
     FRT_ADD(decoder_.gate_projection, "sm120_bf16_decoder_gate_projection",
             modalities::Shape(
-                {decoder_sequence, dim(kPi05ModelDims.decoder_hidden)}));
+                {decoder_sequence,
+                 dim(kPi05ModelDims.decoder_hidden) *
+                     (fused_gate_up ? 2 : 1)}));
     FRT_ADD(decoder_.hidden, "sm120_bf16_decoder_hidden",
             modalities::Shape(
                 {decoder_sequence, dim(kPi05ModelDims.decoder_hidden)}));

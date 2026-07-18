@@ -40,7 +40,8 @@ public:
     Sm120Bf16ScratchBacking(const Sm120Bf16ScratchBacking&) = delete;
     Sm120Bf16ScratchBacking& operator=(const Sm120Bf16ScratchBacking&) = delete;
 
-    modalities::Status allocate(const Pi05ResolvedShape& shape);
+    modalities::Status allocate(const Pi05ResolvedShape& shape,
+                                bool fused_gate_up = false);
 
     const Sm120VisionBf16Scratch& vision() const { return vision_; }
     const Sm120EncoderBf16Scratch& encoder() const { return encoder_; }
@@ -50,6 +51,7 @@ public:
     std::size_t allocation_count() const { return allocation_count_; }
     std::size_t allocated_bytes() const { return allocated_bytes_; }
     bool allocated() const { return allocated_; }
+    bool fused_gate_up() const { return fused_gate_up_; }
 
 private:
     modalities::Status add(const char* name,
@@ -63,6 +65,7 @@ private:
     Sm120DecoderBf16Scratch decoder_;
     std::size_t allocation_count_ = 0;
     std::size_t allocated_bytes_ = 0;
+    bool fused_gate_up_ = false;
     bool allocation_started_ = false;
     bool allocated_ = false;
 };

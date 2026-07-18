@@ -2,9 +2,11 @@
 #define FLASHRT_CPP_MODELS_PI05_TARGETS_SM120_TARGET_H
 
 #include "flashrt/cpp/models/pi05/model/target_bundle.h"
+#include "flashrt/cpp/models/pi05/support/native_calibration.h"
 
 #include <cstddef>
 #include <memory>
+#include <optional>
 #include <string>
 
 namespace flashrt {
@@ -13,12 +15,23 @@ namespace pi05 {
 namespace targets {
 namespace sm120 {
 
+enum class Sm120Precision {
+    kBf16 = 0,
+    kStaticFp8E4M3,
+};
+
+struct Sm120TargetConfig final {
+    std::string checkpoint_path;
+    Sm120Precision precision = Sm120Precision::kBf16;
+    std::optional<NativeCalibrationArtifact> calibration;
+};
+
 class Sm120TargetBundle final : public Pi05TargetBundle {
 public:
     static std::unique_ptr<Sm120TargetBundle> create(
         frt_ctx context,
         const Pi05ResolvedShape& shape,
-        std::string checkpoint_path,
+        Sm120TargetConfig config,
         modalities::Status* status);
     ~Sm120TargetBundle() override;
 
@@ -37,7 +50,10 @@ public:
 
     const Pi05ResolvedResources* resolved_resources() const;
     std::size_t materialized_weight_count() const;
+    std::size_t packed_weight_count() const;
+    std::size_t autotuned_shape_count() const;
     std::size_t prepare_call_count() const;
+    Sm120Precision precision() const;
     bool ready_for_capture() const;
 
 private:
