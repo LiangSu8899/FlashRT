@@ -6,6 +6,7 @@
 
 #include "quantize.cuh"
 #include "common.cuh"
+#include "fp8_exact.cuh"
 
 
 // ── FP8 Quantize ──
@@ -101,6 +102,11 @@ __global__ void quantize_fp8_kernel_generic(const T* __restrict__ input,
 template __global__ void quantize_fp8_kernel_generic<__half>(const __half*, __nv_fp8_e4m3*, const float*, int);
 template __global__ void quantize_fp8_kernel_generic<__nv_bfloat16>(const __nv_bfloat16*, __nv_fp8_e4m3*, const float*, int);
 
+__device__ __forceinline__ __nv_fp8_storage_t
+quantize_fp8_weight_exact(float value) {
+    return flashrt_fp8_e4m3_storage_rn(value);
+}
+
 __global__ void quantize_fp8_weight_kernel(
         const __nv_bfloat16* __restrict__ input,
         __nv_fp8_e4m3* __restrict__ output,
@@ -113,10 +119,10 @@ __global__ void quantize_fp8_weight_kernel(
         const T2 value = in2[index];
         const float v0 = __fmul_rn(to_f32(value.x), inverse_scale);
         const float v1 = __fmul_rn(to_f32(value.y), inverse_scale);
-        output[2 * index] = __nv_fp8_e4m3(
-            fminf(fmaxf(v0, -448.0f), 448.0f));
-        output[2 * index + 1] = __nv_fp8_e4m3(
-            fminf(fmaxf(v1, -448.0f), 448.0f));
+        reinterpret_cast<__nv_fp8_storage_t*>(output)[2 * index] =
+            quantize_fp8_weight_exact(fminf(fmaxf(v0, -448.0f), 448.0f));
+        reinterpret_cast<__nv_fp8_storage_t*>(output)[2 * index + 1] =
+            quantize_fp8_weight_exact(fminf(fmaxf(v1, -448.0f), 448.0f));
     }
 }
 
@@ -173,8 +179,9 @@ __global__ void quantize_fp8_weight_f16_layout_kernel(
         const float value = __fmul_rn(
             __half2float(source[source_row * columns + source_column]),
             inverse_scale);
-        output[destination] = __nv_fp8_e4m3(
-            fminf(fmaxf(value, -448.0f), 448.0f));
+        reinterpret_cast<__nv_fp8_storage_t*>(output)[destination] =
+            quantize_fp8_weight_exact(
+                fminf(fmaxf(value, -448.0f), 448.0f));
     }
 }
 

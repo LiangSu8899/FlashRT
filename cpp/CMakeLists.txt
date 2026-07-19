@@ -30,6 +30,17 @@ option(FLASHRT_CPP_WITH_PI05_SM120_TARGET
        "Build the PI0.5 SM120 frontend target" OFF)
 option(FLASHRT_CPP_WITH_PI05_SM110_TARGET
        "Build the PI0.5 SM110 frontend target" OFF)
+if(FLASHRT_CPP_WITH_PI05_SM120_TARGET AND
+   FLASHRT_CPP_WITH_PI05_SM110_TARGET)
+  message(FATAL_ERROR
+    "PI0.5 SM110 and SM120 targets use different CUDA compilation profiles; "
+    "build one deployment target per build tree")
+endif()
+if(FLASHRT_CPP_WITH_PI05_SM110_TARGET)
+  set(FLASHRT_CPP_PI05_CUDA_ARCH 110)
+elseif(FLASHRT_CPP_WITH_PI05_SM120_TARGET)
+  set(FLASHRT_CPP_PI05_CUDA_ARCH 120)
+endif()
 set(FLASHRT_CPP_FA2_LIBRARY "" CACHE FILEPATH
     "Path to the Python-free libflashrt_fa2_raw shared library")
 set(FLASHRT_CPP_CUTLASS_DIR
@@ -52,6 +63,10 @@ if(FLASHRT_CPP_WITH_CUDA_KERNELS)
   set_target_properties(flashrt_cpp_csrc_precise_math PROPERTIES
     CUDA_STANDARD 17
     CUDA_STANDARD_REQUIRED ON)
+  if(FLASHRT_CPP_PI05_CUDA_ARCH)
+    set_target_properties(flashrt_cpp_csrc_precise_math PROPERTIES
+      CUDA_ARCHITECTURES ${FLASHRT_CPP_PI05_CUDA_ARCH})
+  endif()
 endif()
 if(FLASHRT_CPP_WITH_FA2)
   if(NOT FLASHRT_CPP_WITH_CUDA_KERNELS)
@@ -195,6 +210,10 @@ if(FLASHRT_CPP_WITH_CUDA_KERNELS)
   set_target_properties(flashrt_cpp_modalities PROPERTIES
     CUDA_STANDARD 17
     CUDA_STANDARD_REQUIRED ON)
+  if(FLASHRT_CPP_PI05_CUDA_ARCH)
+    set_target_properties(flashrt_cpp_modalities PROPERTIES
+      CUDA_ARCHITECTURES ${FLASHRT_CPP_PI05_CUDA_ARCH})
+  endif()
 endif()
 
 add_library(flashrt_cpp_vla INTERFACE)
@@ -235,6 +254,10 @@ if(FLASHRT_CPP_WITH_FA2 OR FLASHRT_CPP_WITH_PI05_SM110_TARGET)
     set_target_properties(${target} PROPERTIES
       CUDA_STANDARD 17
       CUDA_STANDARD_REQUIRED ON)
+    if(FLASHRT_CPP_PI05_CUDA_ARCH)
+      set_target_properties(${target} PROPERTIES
+        CUDA_ARCHITECTURES ${FLASHRT_CPP_PI05_CUDA_ARCH})
+    endif()
   endfunction()
 
   add_library(flashrt_cpp_csrc_core STATIC
@@ -354,6 +377,10 @@ if(FLASHRT_CPP_WITH_CUDA_KERNELS)
   set_target_properties(flashrt_cpp_pi05 PROPERTIES
     CUDA_STANDARD 17
     CUDA_STANDARD_REQUIRED ON)
+  if(FLASHRT_CPP_PI05_CUDA_ARCH)
+    set_target_properties(flashrt_cpp_pi05 PROPERTIES
+      CUDA_ARCHITECTURES ${FLASHRT_CPP_PI05_CUDA_ARCH})
+  endif()
 endif()
 
 if(TARGET flashrt_cpp_native_cuda)
@@ -406,6 +433,7 @@ endif()
 add_library(flashrt_cpp_pi05_c SHARED
   models/pi05/src/c_api.cpp
   models/pi05/src/model_runtime.cpp
+  models/pi05/src/native_calibration_c_api.cpp
   models/pi05/src/native_model_runtime.cpp
   models/pi05/src/native_open.cpp)
 target_link_libraries(flashrt_cpp_pi05_c
@@ -416,6 +444,13 @@ target_include_directories(flashrt_cpp_pi05_c
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/internal/include)
 if(TARGET flashrt_cpp_pi05_capture)
   target_link_libraries(flashrt_cpp_pi05_c PRIVATE flashrt_cpp_pi05_capture)
+endif()
+if(TARGET flashrt_cpp_pi05_capture AND
+   (TARGET flashrt_cpp_pi05_target_sm120 OR
+    TARGET flashrt_cpp_pi05_target_sm110))
+  target_sources(flashrt_cpp_pi05_c PRIVATE
+    models/pi05/src/native_calibration_session.cpp
+    models/pi05/src/native_session_factory.cpp)
 endif()
 if(TARGET flashrt_cpp_pi05_target_sm120)
   target_compile_definitions(flashrt_cpp_pi05_c
@@ -476,6 +511,10 @@ if(BUILD_TESTING)
     set_target_properties(test_csrc_fp8_weight_quantize PROPERTIES
       CUDA_STANDARD 17
       CUDA_STANDARD_REQUIRED ON)
+    if(FLASHRT_CPP_PI05_CUDA_ARCH)
+      set_target_properties(test_csrc_fp8_weight_quantize PROPERTIES
+        CUDA_ARCHITECTURES ${FLASHRT_CPP_PI05_CUDA_ARCH})
+    endif()
     add_test(NAME csrc_fp8_weight_quantize
       COMMAND test_csrc_fp8_weight_quantize)
   elseif(TARGET flashrt_cpp_csrc_precise_math)
@@ -493,6 +532,10 @@ if(BUILD_TESTING)
     set_target_properties(test_csrc_fp8_weight_quantize PROPERTIES
       CUDA_STANDARD 17
       CUDA_STANDARD_REQUIRED ON)
+    if(FLASHRT_CPP_PI05_CUDA_ARCH)
+      set_target_properties(test_csrc_fp8_weight_quantize PROPERTIES
+        CUDA_ARCHITECTURES ${FLASHRT_CPP_PI05_CUDA_ARCH})
+    endif()
     add_test(NAME csrc_fp8_weight_quantize
       COMMAND test_csrc_fp8_weight_quantize)
   endif()

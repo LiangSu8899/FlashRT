@@ -6,6 +6,7 @@
 
 #include "norm.cuh"
 #include "common.cuh"
+#include "fp8_exact.cuh"
 
 // ── RMSNorm ──
 template<typename T>
@@ -186,7 +187,7 @@ __global__ void layer_norm_fp8_kernel_fp16(const __half* in, __nv_fp8_e4m3* out,
     for(int i=threadIdx.x;i<C;i+=blockDim.x){
         float v=(__half2float(row[i])-mean)*rstd;
         float normed = v*__half2float(gamma[i])+__half2float(beta[i]);
-        orow[i]=__nv_fp8_e4m3(normed);
+        orow[i] = flashrt_fp8_e4m3_rn(normed);
     }
 }
 

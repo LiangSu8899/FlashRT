@@ -10,10 +10,10 @@ cannot promise. This document is the structure map; the interface reference is
 ## One struct, two producers
 
 Everything converges on `frt_model_runtime_v1` (the standard face of one
-deployed, tickable model). The Python setup bridge produces it today; a native
-model-runtime `.so` (`frt_model_runtime_open_v1`) produces the same struct
-later. Consumers — FlashRT-Nexus, robot loops, FFI hosts — never change when
-the producer does.
+deployed, tickable model). Either the Python setup bridge or a native
+model-runtime `.so` (`frt_model_runtime_open_v1`) produces the same struct.
+Consumers — FlashRT-Nexus, robot loops, FFI hosts — never change when the
+producer does.
 
 The clean hybrid path is **verb override**: the setup producer exports the
 authoritative ports, stage DAG, graph streams, identity and fingerprint; a
@@ -36,18 +36,19 @@ cpp/                         native implementation layers (NOT frozen)
                              preprocess (CPU + CUDA), action postprocess,
                              the persistent VisionStaging pool
   families/<family>/         model-family contracts (e.g. VLA manifest)
-  models/<model>/            thin adapters binding family + modality
-                             primitives to concrete buffer names, shapes,
-                             normalization, action schemas — and presenting
-                             the generic face (frt_<model>_model_runtime_create)
+  models/<model>/            semantic pipeline, model specs and adapters
+                             binding family + modality primitives to concrete
+                             buffers, normalization, action schemas and the
+                             generic model-runtime face
 
 flash_rt/runtime/export.py   the Python producer (same face, GIL-safe verbs)
 ```
 
 Rule of altitude: `modalities/` knows pixels and tensors, never models;
-`families/` knows a model class's IO shape, never buffer names; `models/`
-binds names and constants, never re-implements a transform. Nothing under
-`cpp/` is ABI — the struct in `runtime/` is the deployment surface.
+`families/` knows a model class's IO shape, never buffer names; `models/` owns
+one semantic pipeline and binds model names/constants without re-implementing
+kernel primitives. Nothing under `cpp/` is ABI — the struct in `runtime/` is
+the deployment surface.
 
 ## Model and hardware binding
 
@@ -59,19 +60,33 @@ GROOT runtime would export its own model factory, and so on. That code owns the
 model's hot-path transforms: image normalization, state packing, action
 postprocess, and the names/shapes of public ports it supports.
 
-The **hardware** is selected before the C++ runtime sees the model: the Python
-or native setup producer chooses the hardware pipeline, captures the graphs,
-allocates live buffers, calibrates precision-specific paths, and writes the
-canonical identity/fingerprint. The C++ overlay then inherits those graph,
-stream, stage, and buffer declarations with `frt_model_runtime_override_verbs`.
+The **hardware** is selected by the setup producer. In the hybrid path, Python
+chooses and captures the hardware pipeline before the C++ overlay inherits its
+declarations with `frt_model_runtime_override_verbs`. In the fully native path,
+the model factory queries capabilities, binds the model's one semantic pipeline
+to target operations, loads/calibrates during setup, captures graphs and
+publishes the same declarations. Hardware targets own kernel binding, packing
+and private scratch; they do not own model topology, stage policy or a second
+calibration forward.
 
-So the expected setup shape is:
+The hybrid setup shape is:
 
 1. The hardware-specific pipeline builds a ready model instance.
 2. `flash_rt/models/<model>/runtime_export.py` exports that instance as the
    model family's standard `frt_model_runtime_v1` face.
 3. `cpp/models/<model>/` overlays native hot verbs on that exact declaration.
 4. Nexus or a robot loop consumes only the resulting model-runtime handle.
+
+The fully native setup shape is:
+
+1. `frt_model_runtime_open_v1` parses and validates model configuration.
+2. The model factory resolves the device target and constructs the shared
+   semantic pipeline.
+3. The producer captures and publishes ports, stages, regions and identity.
+4. Nexus or a robot loop consumes the same model-runtime handle.
+
+PI0.5 native checkpoint loading and FP8 calibration usage are documented in
+[`pi05_native_cpp.md`](pi05_native_cpp.md).
 
 If two hardware pipelines expose the same logical ports and stage DAG, they can
 share one native C++ overlay. If their visible contract differs, the difference

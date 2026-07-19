@@ -1,4 +1,5 @@
 #include "quantize.cuh"
+#include "fp8_exact.cuh"
 #include "flashrt/runtime.h"
 
 #include <cuda_bf16.h>
@@ -20,6 +21,29 @@ constexpr std::uint64_t kOutputHash = 0x68ea83e06e2dce5cull;
 constexpr int kMidpointIndex = 402;
 constexpr std::uint8_t kMidpointOutput = 0xf2u;
 
+__global__ void check_exact_e4m3_conversion_kernel(
+    const float* values, int count, int* result) {
+    for (int index = 0; index < count; ++index) {
+        const float value = values[index];
+        const unsigned int bits = __float_as_uint(value);
+        const float canonical = (bits & 0x7fffffffu) > 0x7f800000u
+                                    ? __uint_as_float(0x7fffffffu)
+                                    : value;
+        const __nv_fp8_storage_t expected = __nv_cvt_double_to_fp8(
+            static_cast<double>(canonical), __NV_SATFINITE, __NV_E4M3);
+        const __nv_fp8_storage_t actual =
+            flashrt_fp8_e4m3_storage_rn(value);
+        if (actual != expected) {
+            if (result[0] == 0) {
+                result[1] = index;
+                result[2] = actual;
+                result[3] = expected;
+            }
+            ++result[0];
+        }
+    }
+}
+
 bool check_cuda(cudaError_t status, const char* operation) {
     if (status == cudaSuccess) return true;
     std::fprintf(stderr, "%s failed: %s\n", operation,
@@ -32,6 +56,69 @@ bool has_cuda_device() {
     const cudaError_t status = cudaGetDeviceCount(&count);
     if (status != cudaSuccess) cudaGetLastError();
     return status == cudaSuccess && count > 0;
+}
+
+bool check_exact_e4m3_conversion() {
+    std::vector<float> values;
+    values.reserve(65536 + 8192 + 16);
+    for (std::uint32_t bits = 0; bits <= 0xffffu; ++bits) {
+        __half value;
+        const std::uint16_t storage = static_cast<std::uint16_t>(bits);
+        std::memcpy(&value, &storage, sizeof(storage));
+        values.push_back(__half2float(value));
+    }
+    const float boundaries[] = {
+        -INFINITY, -464.0f, -448.0f, -1.0f / 64.0f,
+        -1.0f / 1024.0f, -0.0f, 0.0f, 1.0f / 1024.0f,
+        1.0f / 64.0f, 448.0f, 464.0f, INFINITY, NAN,
+    };
+    values.insert(values.end(), std::begin(boundaries), std::end(boundaries));
+    std::uint32_t state = 0x243f6a88u;
+    for (int index = 0; index < 8192; ++index) {
+        state = state * 1664525u + 1013904223u;
+        float value = 0.0f;
+        std::memcpy(&value, &state, sizeof(value));
+        values.push_back(value);
+    }
+
+    float* device_values = nullptr;
+    int* device_result = nullptr;
+    const std::size_t bytes = values.size() * sizeof(float);
+    if (!check_cuda(cudaMalloc(&device_values, bytes),
+                    "cudaMalloc(exact conversion values)") ||
+        !check_cuda(cudaMalloc(&device_result, 4 * sizeof(int)),
+                    "cudaMalloc(exact conversion result)") ||
+        !check_cuda(cudaMemcpy(device_values, values.data(), bytes,
+                               cudaMemcpyHostToDevice),
+                    "copy exact conversion values") ||
+        !check_cuda(cudaMemset(device_result, 0, 4 * sizeof(int)),
+                    "clear exact conversion result")) {
+        cudaFree(device_values);
+        cudaFree(device_result);
+        return false;
+    }
+    check_exact_e4m3_conversion_kernel<<<1, 1>>>(
+        device_values, static_cast<int>(values.size()), device_result);
+    int result[4] = {};
+    const bool copied =
+        check_cuda(cudaGetLastError(), "exact conversion launch") &&
+        check_cuda(cudaMemcpy(result, device_result, sizeof(result),
+                              cudaMemcpyDeviceToHost),
+                   "copy exact conversion result");
+    cudaFree(device_values);
+    cudaFree(device_result);
+    if (!copied) return false;
+    if (result[0] != 0) {
+        std::uint32_t bits = 0;
+        std::memcpy(&bits, &values[static_cast<std::size_t>(result[1])],
+                    sizeof(bits));
+        std::fprintf(stderr,
+                     "exact E4M3 conversion mismatches: %d; first=%08x "
+                     "actual=%02x expected=%02x\n",
+                     result[0], bits, result[2], result[3]);
+        return false;
+    }
+    return true;
 }
 
 std::vector<__nv_bfloat16> golden_input() {
@@ -271,6 +358,7 @@ int main() {
         std::printf("SKIP - no CUDA device\n");
         return 0;
     }
+    if (!check_exact_e4m3_conversion()) return 1;
 
     const std::vector<__nv_bfloat16> input = golden_input();
     __nv_bfloat16* device_input = nullptr;

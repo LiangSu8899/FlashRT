@@ -7,17 +7,9 @@
 #include "flashrt/cpp/loader/sha256.h"
 #include "flashrt/cpp/models/pi05/model_runtime.h"
 #include "flashrt/cpp/models/pi05/support/native_calibration.h"
-#include "flashrt/cpp/models/pi05/model/native_session.h"
 #include "flashrt/cpp/models/pi05/model/dims.h"
 #include "flashrt/cpp/models/pi05/model/execution_plan.h"
-#if defined(FLASHRT_CPP_WITH_PI05_SM120_TARGET)
-#include "flashrt/cpp/models/pi05/targets/sm120/target.h"
-#endif
-#if defined(FLASHRT_CPP_WITH_PI05_SM110_TARGET)
-#include "flashrt/cpp/models/pi05/targets/sm110/target.h"
-#endif
-
-#include <cuda_runtime_api.h>
+#include "native_session_factory.h"
 
 #include <climits>
 #include <cmath>
@@ -80,27 +72,21 @@ int build_native_model_runtime(const NativeOpenConfig& config,
                                std::string* error) {
     if (!out) return -1;
     *out = nullptr;
-    int device = 0;
-    cudaDeviceProp properties{};
-    cudaError_t cuda_rc = cudaGetDevice(&device);
-    if (cuda_rc == cudaSuccess) {
-        cuda_rc = cudaGetDeviceProperties(&properties, device);
+    NativeDeviceProfile device;
+    modalities::Status st = query_native_device(&device);
+    if (!st.ok_status()) {
+        if (error) *error = st.message;
+        return cface::status_code(st);
     }
-    if (cuda_rc != cudaSuccess) {
-        if (error) *error = cudaGetErrorString(cuda_rc);
-        return -6;
-    }
-    const std::string hardware_id =
-        "sm" + std::to_string(properties.major * 10 + properties.minor);
-    enum class Precision { kBf16, kFp8E4M3Fn };
-    Precision precision;
+    const std::string& hardware_id = device.hardware;
+    NativeSessionPrecision precision;
     if (config.precision == "auto") {
-        if (properties.major == 12 && properties.minor == 0) {
+        if (device.major == 12 && device.minor == 0) {
             precision = config.calibration_path.empty()
-                            ? Precision::kBf16
-                            : Precision::kFp8E4M3Fn;
-        } else if (properties.major == 11 && properties.minor == 0) {
-            precision = Precision::kFp8E4M3Fn;
+                            ? NativeSessionPrecision::kBf16
+                            : NativeSessionPrecision::kFp8E4M3Fn;
+        } else if (device.major == 11 && device.minor == 0) {
+            precision = NativeSessionPrecision::kFp8E4M3Fn;
         } else {
             if (error) {
                 *error = "Pi0.5 native_v2 has no backend for " + hardware_id;
@@ -108,43 +94,24 @@ int build_native_model_runtime(const NativeOpenConfig& config,
             return -3;
         }
     } else if (config.precision == "bf16") {
-        precision = Precision::kBf16;
+        precision = NativeSessionPrecision::kBf16;
     } else if (config.precision == "fp8_e4m3fn") {
-        precision = Precision::kFp8E4M3Fn;
+        precision = NativeSessionPrecision::kFp8E4M3Fn;
     } else {
         if (error) *error = "Pi0.5 native precision is invalid";
         return -1;
     }
-    if (precision == Precision::kBf16 &&
-        (properties.major != 12 || properties.minor != 0)) {
+    if (precision == NativeSessionPrecision::kBf16 &&
+        (device.major != 12 || device.minor != 0)) {
         if (error) *error = "Pi0.5 native BF16 requires SM120";
         return -3;
     }
-    if (precision == Precision::kFp8E4M3Fn &&
-        !((properties.major == 11 || properties.major == 12) &&
-          properties.minor == 0)) {
+    if (precision == NativeSessionPrecision::kFp8E4M3Fn &&
+        !((device.major == 11 || device.major == 12) &&
+          device.minor == 0)) {
         if (error) *error = "Pi0.5 native FP8 requires SM110 or SM120";
         return -3;
     }
-#if !defined(FLASHRT_CPP_WITH_PI05_SM120_TARGET)
-    if (precision == Precision::kBf16) {
-        if (error) *error = "Pi0.5 native BF16 backend is not built";
-        return -3;
-    }
-#endif
-#if !defined(FLASHRT_CPP_WITH_PI05_SM110_TARGET)
-    if (precision == Precision::kFp8E4M3Fn && properties.major == 11) {
-        if (error) *error = "Pi0.5 native Thor FP8 backend is not built";
-        return -3;
-    }
-#endif
-#if !defined(FLASHRT_CPP_WITH_PI05_SM120_TARGET)
-    if (precision == Precision::kFp8E4M3Fn && properties.major == 12) {
-        if (error) *error = "Pi0.5 native RTX FP8 backend is not built";
-        return -3;
-    }
-#endif
-
     struct HashResult {
         bool ok = false;
         std::string digest;
@@ -169,7 +136,7 @@ int build_native_model_runtime(const NativeOpenConfig& config,
 
     NativeCalibrationArtifact calibration;
     std::string calibration_sha256;
-    if (precision == Precision::kFp8E4M3Fn) {
+    if (precision == NativeSessionPrecision::kFp8E4M3Fn) {
         if (config.calibration_path.empty()) {
             if (error) *error = "Pi0.5 native FP8 requires calibration_path";
             return -1;
@@ -183,7 +150,7 @@ int build_native_model_runtime(const NativeOpenConfig& config,
         }
         if (calibration.hardware != hardware_id ||
             calibration.activation_dtype !=
-                (properties.major == 11 ? "float16" : "bfloat16") ||
+                (device.major == 11 ? "float16" : "bfloat16") ||
             calibration.tokenizer_sha256 != tokenizer_sha256 ||
             calibration.num_views != config.num_views ||
             calibration.max_prompt_tokens != config.max_prompt_tokens ||
@@ -210,7 +177,6 @@ int build_native_model_runtime(const NativeOpenConfig& config,
     shape_config.state_dim = config.state_dim;
     shape_config.robot_action_dim =
         static_cast<std::int64_t>(config.action_q01.size());
-    modalities::Status st;
     Pi05ResolvedShape shape;
     st = resolve_pi05_shape(shape_config, &shape);
     if (!st.ok_status()) {
@@ -218,44 +184,18 @@ int build_native_model_runtime(const NativeOpenConfig& config,
         return cface::status_code(st);
     }
 
-    const bool thor_fp8 = precision == Precision::kFp8E4M3Fn &&
-                          properties.major == 11;
-    const bool rtx_fp8 = precision == Precision::kFp8E4M3Fn &&
-                         properties.major == 12;
-    frt_ctx context = frt_ctx_create();
-    if (!context) {
-        if (error) *error = "native execution context creation failed";
-        return -6;
+    const bool thor_fp8 =
+        precision == NativeSessionPrecision::kFp8E4M3Fn && device.major == 11;
+    const bool rtx_fp8 =
+        precision == NativeSessionPrecision::kFp8E4M3Fn && device.major == 12;
+    std::optional<NativeCalibrationArtifact> session_calibration;
+    if (precision == NativeSessionPrecision::kFp8E4M3Fn) {
+        session_calibration = calibration;
     }
-    std::unique_ptr<Pi05TargetBundle> target;
-    if (precision == Precision::kBf16 || rtx_fp8) {
-#if defined(FLASHRT_CPP_WITH_PI05_SM120_TARGET)
-        targets::sm120::Sm120TargetConfig target_config;
-        target_config.checkpoint_path = config.checkpoint_path;
-        if (rtx_fp8) {
-            target_config.execution_mode =
-                targets::sm120::Sm120ExecutionMode::kStaticFp8E4M3;
-            target_config.calibration = calibration;
-        }
-        target = targets::sm120::Sm120TargetBundle::create(
-            context, shape, std::move(target_config), &st);
-#endif
-    } else if (thor_fp8) {
-#if defined(FLASHRT_CPP_WITH_PI05_SM110_TARGET)
-        targets::sm110::Sm110TargetConfig target_config;
-        target_config.checkpoint_path = config.checkpoint_path;
-        target_config.calibration = calibration;
-        target = targets::sm110::Sm110TargetBundle::create(
-            context, shape, std::move(target_config), &st);
-#endif
-    }
-    if (!target) {
-        frt_ctx_destroy(context);
-        if (error) *error = st.message;
-        return cface::status_code(st);
-    }
-    std::unique_ptr<Pi05NativeSession> session = Pi05NativeSession::create(
-        context, shape, std::move(target), &st);
+    std::unique_ptr<Pi05NativeSession> session = create_native_session(
+        config.checkpoint_path, shape, precision,
+        std::move(session_calibration), Pi05SessionMode::kCaptured, nullptr,
+        &st);
     if (!session) {
         if (error) *error = st.message;
         return cface::status_code(st);
@@ -265,7 +205,7 @@ int build_native_model_runtime(const NativeOpenConfig& config,
         if (error) *error = weights_sha256.error;
         return -2;
     }
-    if (precision == Precision::kFp8E4M3Fn &&
+    if (precision == NativeSessionPrecision::kFp8E4M3Fn &&
         calibration.weights_sha256 != weights_sha256.digest) {
         if (error) *error = "Pi0.5 calibration checkpoint digest mismatch";
         return -2;
@@ -340,7 +280,7 @@ int build_native_model_runtime(const NativeOpenConfig& config,
              FRT_RT_REGION_SNAPSHOT | FRT_RT_REGION_RESTORE) == 0;
     if (!ok) return fail_builder(builder, error, "native region build failed");
 
-    const bool fp8 = precision == Precision::kFp8E4M3Fn;
+    const bool fp8 = precision == NativeSessionPrecision::kFp8E4M3Fn;
     const std::string precision_id = fp8 ? "fp8_e4m3fn" : "bf16";
     const std::string pipeline_id = thor_fp8
                                         ? "NativeThorFp8"

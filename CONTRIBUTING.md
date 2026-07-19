@@ -172,8 +172,9 @@ live in [`docs/exec_contract.md`](docs/exec_contract.md) §9; the essentials:
   host, never in the contract.
 - GPU/model state stays owned by the frontend. The serving layer holds metadata
   only (token journal, cache plan, episode bookkeeping).
-- Capture, calibration, and warmup stay in the Python frontend; the contract
-  only **adopts** the resulting instantiated graph and owns replay-time.
+- Capture, calibration, and warmup stay in the setup producer or model
+  frontend, which may be Python or native C++; `exec/`, `runtime/`, Nexus and
+  serving hosts only adopt or consume the resulting graph/runtime handle.
 - `exec/` is a top-level sibling of `csrc/` with zero `csrc` dependency. It must
   not include or link kernel sources.
 - Integration is additive and opt-in (e.g. `FLASHRT_QWEN36_USE_EXEC`): the
@@ -234,6 +235,12 @@ calibration, or graph capture behavior, include a precision comparison:
 - cosine vs the relevant reference when a fixture exists
 - action sanity check for quickstart-only paths
 - latency before/after for performance-sensitive changes
+
+A native calibration path must replay the model's one semantic pipeline. The
+target may provide observers, packing and private scratch, but must not own a
+second model forward. Dataset iteration and sample selection stay in the host;
+artifact identity must bind checkpoint, tokenizer, hardware, dtype and all
+shape-affecting setup fields.
 
 ### Performance Measurement
 

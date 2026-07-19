@@ -70,8 +70,7 @@ private:
     modalities::Status copy_scales(
         std::vector<float>* vision,
         std::vector<float>* encoder,
-        std::vector<float>* decoder,
-        bool resize) const;
+        std::vector<float>* decoder) const;
     const Sm120DeviceBuffer* scale_buffer(Pi05LinearDomain domain) const;
 
     frt_ctx context_ = nullptr;

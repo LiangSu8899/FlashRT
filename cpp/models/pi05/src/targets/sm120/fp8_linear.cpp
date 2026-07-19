@@ -252,7 +252,7 @@ modalities::Status Sm120Fp8ActivationBacking::download_scales(
     std::vector<float>* vision,
     std::vector<float>* encoder,
     std::vector<float>* decoder) const {
-    return copy_scales(vision, encoder, decoder, true);
+    return copy_scales(vision, encoder, decoder);
 }
 
 modalities::Status Sm120Fp8ActivationBacking::download_observer_scales(
@@ -262,14 +262,13 @@ modalities::Status Sm120Fp8ActivationBacking::download_observer_scales(
     if (!observing_) {
         return invalid("SM120 FP8 observer download state is invalid");
     }
-    return copy_scales(vision, encoder, decoder, false);
+    return copy_scales(vision, encoder, decoder);
 }
 
 modalities::Status Sm120Fp8ActivationBacking::copy_scales(
     std::vector<float>* vision,
     std::vector<float>* encoder,
-    std::vector<float>* decoder,
-    bool resize) const {
+    std::vector<float>* decoder) const {
     if (!initialized_ || !vision || !encoder || !decoder) {
         return invalid("SM120 FP8 scale download is invalid");
     }
@@ -284,11 +283,7 @@ modalities::Status Sm120Fp8ActivationBacking::copy_scales(
     for (const Download& download : downloads) {
         const std::size_t elements =
             download.source->bytes() / sizeof(float);
-        if (resize) {
-            download.destination->resize(elements);
-        } else if (download.destination->size() != elements) {
-            return invalid("SM120 FP8 observer output size is invalid");
-        }
+        download.destination->resize(elements);
         const cudaError_t result = cudaMemcpy(
             download.destination->data(), download.source->device_data(),
             download.source->bytes(), cudaMemcpyDeviceToHost);

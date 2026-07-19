@@ -35,13 +35,15 @@ int main() {
 
     struct stat original {};
     assert(::stat(path, &original) == 0);
+    const std::string replacement = std::string(path) + ".replacement";
     {
-        std::ofstream file(path, std::ios::binary | std::ios::trunc);
+        std::ofstream file(replacement, std::ios::binary | std::ios::trunc);
         file << "abd";
         assert(file.good());
     }
     const timespec restore_times[2] = {original.st_atim, original.st_mtim};
-    assert(::utimensat(AT_FDCWD, path, restore_times, 0) == 0);
+    assert(::utimensat(AT_FDCWD, replacement.c_str(), restore_times, 0) == 0);
+    assert(::rename(replacement.c_str(), path) == 0);
     assert(flashrt::loader::sha256_file_cached(
         path, &digest, &cache_hit, &error));
     assert(!cache_hit);

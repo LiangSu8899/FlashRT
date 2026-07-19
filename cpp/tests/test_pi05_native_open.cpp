@@ -1,4 +1,5 @@
 #include "flashrt/model_runtime.h"
+#include "flashrt/cpp/models/pi05/c_api.h"
 #include "flashrt/cpp/models/pi05/support/native_weights.h"
 
 #include <algorithm>
@@ -165,6 +166,12 @@ std::string config(const std::string& ckpt,
 }  // namespace
 
 int main() {
+    assert(frt_pi05_calibration_create_v1(nullptr, 99.9, nullptr) == -1);
+    assert(std::strstr(frt_pi05_calibration_create_last_error_v1(), "out"));
+    assert(frt_pi05_calibration_sample_count_v1(nullptr) == 0);
+    assert(std::strstr(frt_pi05_calibration_last_error_v1(nullptr), "out"));
+    frt_pi05_calibration_destroy_v1(nullptr);
+
     const auto& inventory =
         flashrt::models::pi05::native_tensor_requirements();
     assert(inventory.size() == 812);

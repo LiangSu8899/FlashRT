@@ -159,11 +159,14 @@ rely on the final unsupported stub as its implementation.
 **Reference producers**: `Pi05Pipeline.export_model_runtime()`
 (`flash_rt/models/pi05/runtime_export.py`, via
 `flash_rt.runtime.export.build_model_runtime`) and the native Pi0.5 verb
-overlay `frt_pi05_model_runtime_create_over` (`cpp/models/pi05/`).
+overlay `frt_pi05_model_runtime_create_over` (`cpp/models/pi05/`). PI0.5 also
+implements a fully native `io="native_v2"` checkpoint producer through
+`frt_model_runtime_open_v1`; see
+[`pi05_native_cpp.md`](pi05_native_cpp.md).
 
-## Producer layout: model contract vs hardware pipeline
+## Producer layout: model contract vs target lowering
 
-The clean default is one export module per logical model family contract:
+The Python producer keeps one export module per logical model family contract:
 
 ```
 flash_rt/models/<model>/runtime_export.py     ports, stages, identity, export helpers
@@ -178,6 +181,13 @@ ports, graph/stage descriptors, stream placement, identity fields, and optional
 stage-plan selection. Each hardware pipeline owns its graph capture, buffers,
 kernel choices, calibration, and setup policy, then delegates
 `export_model_runtime(...)` to that model export module.
+
+A fully native producer follows the same ownership rule: one model semantic
+pipeline declares model order and logical buffers; target lowering supplies
+kernel binding, precision packing, optional private scratch and observers. A
+target must not duplicate model layer loops, stage plans, checkpoint mapping or
+calibration traversal. Different precisions may produce different lowered
+execution plans while preserving the same semantic pipeline.
 
 The C++ runtime consumes the resulting declaration. It distinguishes the model
 by the native factory/overlay it loads (`cpp/models/<model>/...`) and by the

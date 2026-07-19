@@ -10,6 +10,8 @@ extern "C" {
 #endif
 
 typedef struct frt_pi05_runtime_s frt_pi05_runtime;
+typedef struct frt_pi05_calibration_session_s
+    frt_pi05_calibration_session;
 
 enum frt_pi05_pixel_format {
     FRT_PI05_PIXEL_RGB8  = 0,
@@ -92,6 +94,22 @@ typedef struct frt_pi05_vision_frame {
     uint64_t timestamp_ns;
 } frt_pi05_vision_frame;
 
+/* One observation. Dataset calibration calls observe repeatedly; dataset
+ * iteration and decoding remain host policy. Noise is optional f32
+ * [chunk, 32]; omitted noise is generated deterministically from noise_seed
+ * and the committed sample count. */
+typedef struct frt_pi05_calibration_sample_v1 {
+    uint32_t struct_size;
+    const char* prompt;
+    const float* state;
+    uint64_t n_state;
+    const frt_pi05_vision_frame* frames;
+    uint64_t n_frames;
+    const float* noise;
+    uint64_t n_noise;
+    uint64_t noise_seed;
+} frt_pi05_calibration_sample_v1;
+
 int frt_pi05_runtime_create(const frt_runtime_export_v1* exp,
                             const frt_pi05_runtime_config* config,
                             frt_pi05_runtime** out);
@@ -111,6 +129,26 @@ int frt_pi05_runtime_read_actions(frt_pi05_runtime*,
 
 const frt_runtime_export_v1* frt_pi05_runtime_export(frt_pi05_runtime*);
 const char* frt_pi05_runtime_last_error(frt_pi05_runtime*);
+
+/* Native FP8 calibration uses the same checkpoint, tokenizer, shape, and
+ * state-normalization fields as frt_model_runtime_open_v1. The model forward
+ * is the regular uncaptured semantic pipeline with target observers enabled. */
+int frt_pi05_calibration_create_v1(
+    const char* config_json,
+    double percentile,
+    frt_pi05_calibration_session** out);
+int frt_pi05_calibration_observe_v1(
+    frt_pi05_calibration_session*,
+    const frt_pi05_calibration_sample_v1* sample);
+int frt_pi05_calibration_finalize_v1(
+    frt_pi05_calibration_session*,
+    const char* artifact_path);
+uint64_t frt_pi05_calibration_sample_count_v1(
+    const frt_pi05_calibration_session*);
+const char* frt_pi05_calibration_last_error_v1(
+    const frt_pi05_calibration_session*);
+const char* frt_pi05_calibration_create_last_error_v1(void);
+void frt_pi05_calibration_destroy_v1(frt_pi05_calibration_session*);
 
 #ifdef __cplusplus
 }

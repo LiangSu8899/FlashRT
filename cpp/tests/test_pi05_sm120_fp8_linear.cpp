@@ -190,10 +190,14 @@ void test_observer_backing_contract() {
     };
     CHECK(all_one(vision) && all_one(encoder) && all_one(decoder));
 
-    std::vector<float> wrong_size;
-    CHECK(!backing.download_observer_scales(
-                      &wrong_size, &encoder, &decoder)
-               .ok_status());
+    vision.clear();
+    encoder.clear();
+    decoder.clear();
+    CHECK_STATUS(backing.download_observer_scales(
+        &vision, &encoder, &decoder));
+    CHECK(vision.size() == layout.vision);
+    CHECK(encoder.size() == layout.encoder);
+    CHECK(decoder.size() == layout.decoder);
     for (const pi05::Pi05LinearDomain domain : {
              pi05::Pi05LinearDomain::kVision,
              pi05::Pi05LinearDomain::kEncoder,
