@@ -602,7 +602,7 @@ modalities::Status execute_vision_project(
     status = ops.layer_norm(
         ops.state, execution.vision.pooled, weights.final_norm_weight,
         weights.final_norm_bias, execution.vision.normalized, rows, width,
-        kPi05ModelNumerics.vision_layer_norm_epsilon, false,
+        execution.ops->profile.vision_final_norm_epsilon, false,
         &projector_input, stream);
     if (!status.ok_status() || !projector_input.data ||
         projector_input.prequantized) {

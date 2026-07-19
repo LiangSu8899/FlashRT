@@ -1104,6 +1104,8 @@ modalities::Status Sm120TargetBundle::resolve_resources(
                            nullptr};
         impl_->frontend_ops.profile.activation_dtype =
             modalities::DType::kBFloat16;
+        impl_->frontend_ops.profile.vision_final_norm_epsilon =
+            kPi05ModelNumerics.vision_layer_norm_epsilon;
         Pi05PrimitiveSet& primitives = impl_->frontend_ops.bf16;
         primitives.state = &impl_->frontend;
         primitives.linear = frontend_linear;

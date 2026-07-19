@@ -637,6 +637,7 @@ modalities::Status initialize_sm110_frontend_ops(
     }
     Pi05FrontendOps result;
     result.profile.activation_dtype = modalities::DType::kFloat16;
+    result.profile.vision_final_norm_epsilon = 1.0e-6f;
     Pi05PrimitiveSet& ops = result.f16;
     ops.state = state;
     ops.linear = frontend_linear;

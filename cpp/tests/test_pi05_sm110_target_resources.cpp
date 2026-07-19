@@ -180,6 +180,7 @@ void run_real_resource_contract(const char* checkpoint,
     assert(forward.resources == target->resolved_resources());
     assert(forward.ops && forward.vision.qkv && forward.encoder.qkv &&
            forward.decoder.qkv);
+    assert(forward.ops->profile.vision_final_norm_epsilon == 1.0e-6f);
     assert(target->initialize_capture_inputs().ok_status());
     assert(target->resources_ready());
     assert(target->set_prompt_length(2).ok_status());

@@ -11,6 +11,10 @@ namespace pi05 {
 
 struct Pi05TargetProfile final {
     modalities::DType activation_dtype = modalities::DType::kUInt8;
+    // Lowered numerical policy can differ while the semantic operation stays
+    // the same. Targets provide data here; the pipeline owns the operation.
+    float vision_final_norm_epsilon =
+        kPi05ModelNumerics.vision_layer_norm_epsilon;
 };
 
 enum class Pi05LinearEpilogueKind {
