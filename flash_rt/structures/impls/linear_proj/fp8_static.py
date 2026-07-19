@@ -65,6 +65,11 @@ class FusedLinearProj(torch.nn.Module):
         self._input_scale = input_scale
         self._weight_scale = weight_scale
         self._bufs: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        # resolve the op at bind time: calling the hub loader inside
+        # forward makes dynamo trace through kernels.get_kernel's
+        # version resolution (network + inspect.Signature) — 26 graph
+        # breaks that fragment the surrounding compiled region
+        self._fn = _kernel().bf16_fp8_linear_bias_bf16
         if original is not None:
             self.host_linear = original
 
@@ -87,7 +92,7 @@ class FusedLinearProj(torch.nn.Module):
                                 dtype=torch.bfloat16))
             self._bufs[m] = bufs
         x_fp8, out = bufs
-        y = _kernel().bf16_fp8_linear_bias_bf16(
+        y = self._fn(
             flat.to(torch.bfloat16).contiguous(), self._w_fp8, self._bias,
             self._input_scale, self._weight_scale,
             input_fp8=x_fp8, out=out)
