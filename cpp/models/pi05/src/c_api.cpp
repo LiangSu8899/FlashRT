@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <exception>
 #include <memory>
@@ -15,6 +16,9 @@
 struct frt_pi05_runtime_s {
     std::unique_ptr<flashrt::models::pi05::Runtime> runtime;
     std::string last_error;
+    std::vector<flashrt::modalities::VisionFrame> vision_frames;
+    std::vector<std::uint8_t> vision_seen;
+    std::vector<float> action_values;
 };
 
 namespace {
@@ -59,6 +63,14 @@ extern "C" int frt_pi05_runtime_create(
         delete h;
         return rc;
     }
+    const auto& manifest = h->runtime->manifest();
+    h->vision_frames.resize(manifest.vision.view_order.size());
+    h->vision_seen.resize(manifest.vision.view_order.size());
+    for (std::size_t i = 0; i < h->vision_frames.size(); ++i) {
+        h->vision_frames[i].name = manifest.vision.view_order[i];
+    }
+    h->action_values.resize(static_cast<std::size_t>(
+        manifest.action.chunk * manifest.action.robot_dim));
     *out = h;
     return 0;
 }
@@ -71,7 +83,32 @@ extern "C" int frt_pi05_runtime_set_prompt(frt_pi05_runtime* h,
                                            const char* text) {
     if (!h || !h->runtime) return -1;
     int rc = h->runtime->set_prompt(text);
-    if (rc != 0) h->last_error = "prompt updates are not supported by adopted-export Pi05 runtime";
+    if (rc != 0) {
+        const auto& st = h->runtime->prompt_status();
+        h->last_error = st.message.empty()
+                            ? "prompt updates are not supported by this Pi05 runtime"
+                            : st.message;
+    } else {
+        h->last_error.clear();
+    }
+    return rc;
+}
+
+extern "C" int frt_pi05_runtime_set_prompt_state(
+    frt_pi05_runtime* h,
+    const char* text,
+    const float* state,
+    uint64_t n_state) {
+    if (!h || !h->runtime || (!state && n_state)) return -1;
+    int rc = h->runtime->set_prompt_state(text, state, n_state);
+    if (rc != 0) {
+        const auto& st = h->runtime->prompt_status();
+        h->last_error = st.message.empty()
+                            ? "prompt updates are not supported by this Pi05 runtime"
+                            : st.message;
+    } else {
+        h->last_error.clear();
+    }
     return rc;
 }
 
@@ -80,8 +117,11 @@ extern "C" int frt_pi05_runtime_prepare_vision(
     const frt_pi05_vision_frame* frames,
     uint64_t n_frames) {
     if (!h || !h->runtime || (!frames && n_frames)) return -1;
-    std::vector<flashrt::modalities::VisionFrame> v;
-    v.reserve(static_cast<std::size_t>(n_frames));
+    if (n_frames != h->vision_frames.size()) {
+        h->last_error = "Pi05 vision frame count does not match the runtime";
+        return -4;
+    }
+    std::fill(h->vision_seen.begin(), h->vision_seen.end(), 0);
     for (uint64_t i = 0; i < n_frames; ++i) {
         const frt_pi05_vision_frame& in = frames[i];
         if (in.struct_size < sizeof(frt_pi05_vision_frame) ||
@@ -93,8 +133,19 @@ extern "C" int frt_pi05_runtime_prepare_vision(
             h->last_error = "Pi05 vision pixel format is invalid";
             return -4;
         }
-        flashrt::modalities::VisionFrame out;
-        out.name = in.name;
+        std::size_t slot = h->vision_frames.size();
+        for (std::size_t j = 0; j < h->vision_frames.size(); ++j) {
+            if (h->vision_frames[j].name == in.name) {
+                slot = j;
+                break;
+            }
+        }
+        if (slot == h->vision_frames.size() || h->vision_seen[slot]) {
+            h->last_error = "Pi05 vision frame name is unknown or duplicated";
+            return -4;
+        }
+        h->vision_seen[slot] = 1;
+        auto& out = h->vision_frames[slot];
         out.image.data = const_cast<void*>(in.data);
         out.image.bytes = in.bytes;
         out.image.dtype = flashrt::modalities::DType::kUInt8;
@@ -109,9 +160,8 @@ extern "C" int frt_pi05_runtime_prepare_vision(
         out.height = in.height;
         out.stride_bytes = in.stride_bytes;
         out.timestamp_ns = in.timestamp_ns;
-        v.push_back(std::move(out));
     }
-    auto st = h->runtime->prepare_vision(v);
+    auto st = h->runtime->prepare_vision(h->vision_frames);
     if (!st.ok_status()) {
         h->last_error = st.message;
         return status_code(st);
@@ -132,19 +182,19 @@ extern "C" int frt_pi05_runtime_read_actions(frt_pi05_runtime* h,
                                              uint64_t out_capacity,
                                              uint64_t* n_written) {
     if (!h || !h->runtime || !out_actions) return -1;
-    std::vector<float> actions;
-    auto st = h->runtime->read_actions(&actions);
+    auto st = h->runtime->read_actions(&h->action_values);
     if (!st.ok_status()) {
         h->last_error = st.message;
         return status_code(st);
     }
-    if (out_capacity < actions.size()) {
+    if (out_capacity < h->action_values.size()) {
         h->last_error = "action output buffer is too small";
-        if (n_written) *n_written = actions.size();
+        if (n_written) *n_written = h->action_values.size();
         return -5;
     }
-    std::memcpy(out_actions, actions.data(), actions.size() * sizeof(float));
-    if (n_written) *n_written = actions.size();
+    std::memcpy(out_actions, h->action_values.data(),
+                h->action_values.size() * sizeof(float));
+    if (n_written) *n_written = h->action_values.size();
     h->last_error.clear();
     return 0;
 }

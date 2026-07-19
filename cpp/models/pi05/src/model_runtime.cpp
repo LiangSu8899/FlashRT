@@ -31,6 +31,15 @@ struct Adapter {
     uint32_t images_port = kPortImages;
     uint32_t noise_port = kPortNoise;
     uint32_t actions_port = kPortActions;
+    uint32_t prompt_port = kNoPort;
+    uint32_t state_port = kNoPort;
+    bool has_prompt_text = false;
+    bool has_state = false;
+    std::size_t prompt_text_limit = 0;
+    std::string prompt_text;
+    std::vector<float> state_values;
+    std::vector<flashrt::modalities::VisionFrame> vision_frames;
+    std::vector<float> action_values;
 
     int64_t image_shape[4] = {0, 0, 0, 3};
     int64_t noise_shape[2] = {0, 0};
@@ -119,18 +128,21 @@ int set_input(void* self, uint32_t port, const void* data, uint64_t bytes,
             }
             const auto* views = static_cast<const frt_image_view*>(data);
             const uint64_t n = bytes / sizeof(frt_image_view);
-            std::vector<flashrt::modalities::VisionFrame> frames;
-            frames.reserve(n);
+            if (n != a->vision_frames.size()) {
+                a->last_error = "image view count does not match the runtime";
+                return -4;
+            }
             for (uint64_t i = 0; i < n; ++i) {
                 const frt_image_view& in = views[i];
                 if (in.struct_size < sizeof(frt_image_view) || !in.data) {
                     a->last_error = "invalid image view";
                     return -1;
                 }
-                flashrt::modalities::VisionFrame f;
-                /* generic views carry no names: positional, declared order */
-                f.name = i < a->view_order.size() ? a->view_order[i]
-                                                  : "view" + std::to_string(i);
+                if (in.pixel_format > FRT_RT_PIXEL_GRAY8) {
+                    a->last_error = "image pixel format is invalid";
+                    return -4;
+                }
+                auto& f = a->vision_frames[static_cast<std::size_t>(i)];
                 f.image.data = const_cast<void*>(in.data);
                 f.image.bytes = in.bytes;
                 f.image.dtype = flashrt::modalities::DType::kUInt8;
@@ -144,9 +156,8 @@ int set_input(void* self, uint32_t port, const void* data, uint64_t bytes,
                 f.height = in.height;
                 f.stride_bytes = in.stride_bytes;
                 f.timestamp_ns = in.timestamp_ns;
-                frames.push_back(std::move(f));
             }
-            Status st = a->runtime->prepare_vision(frames);
+            Status st = a->runtime->prepare_vision(a->vision_frames);
             if (!st.ok_status()) {
                 a->last_error = st.message;
                 return status_code(st);
@@ -158,6 +169,69 @@ int set_input(void* self, uint32_t port, const void* data, uint64_t bytes,
         a->last_error =
             "noise is a SWAP port: write its buffer window directly";
         return -3;
+    }
+    if (port == a->prompt_port) {
+        if (!data && bytes) {
+            a->last_error = "prompt payload is null";
+            return -1;
+        }
+        if (bytes > a->prompt_text_limit) {
+            a->last_error = "prompt payload exceeds the hot-path capacity";
+            return -4;
+        }
+        const char* begin = static_cast<const char*>(data);
+        if (bytes) {
+            a->prompt_text.assign(begin, begin + bytes);
+        } else {
+            a->prompt_text.clear();
+        }
+        a->has_prompt_text = true;
+        const int rc = a->has_state
+                           ? a->runtime->set_prompt_state(
+                                 a->prompt_text.c_str(),
+                                 a->state_values.data(),
+                                 a->state_values.size())
+                           : a->runtime->set_prompt(a->prompt_text.c_str());
+        if (rc != 0) {
+            const auto& st = a->runtime->prompt_status();
+            a->last_error = st.message.empty()
+                                ? "prompt staging is not configured"
+                                : st.message;
+            return status_code(st);
+        }
+        a->last_error.clear();
+        return 0;
+    }
+    if (port == a->state_port) {
+        if (!data || !bytes || bytes % sizeof(float)) {
+            a->last_error = "state payload must be f32[]";
+            return -1;
+        }
+        const uint64_t n = bytes / sizeof(float);
+        if (n != a->state_values.size()) {
+            a->last_error = "state dimension does not match the runtime";
+            return -4;
+        }
+        const auto* values = static_cast<const float*>(data);
+        std::memcpy(a->state_values.data(), values,
+                    static_cast<std::size_t>(bytes));
+        a->has_state = true;
+        if (!a->has_prompt_text) {
+            a->last_error.clear();
+            return 0;
+        }
+        const int rc = a->runtime->set_prompt_state(
+            a->prompt_text.c_str(), a->state_values.data(),
+            a->state_values.size());
+        if (rc != 0) {
+            const auto& st = a->runtime->prompt_status();
+            a->last_error = st.message.empty()
+                                ? "state staging failed"
+                                : st.message;
+            return status_code(st);
+        }
+        a->last_error.clear();
+        return 0;
     }
     a->last_error = "unknown or non-input port";
     return -1;
@@ -172,29 +246,40 @@ int get_output(void* self, uint32_t port, void* out, uint64_t capacity,
         a->last_error = "unknown or non-output port";
         return -1;
     }
-    std::vector<float> actions;
-    Status st = a->runtime->read_actions(&actions);
+    Status st = a->runtime->read_actions(&a->action_values);
     if (!st.ok_status()) {
         a->last_error = st.message;
         return status_code(st);
     }
-    const uint64_t need = actions.size() * sizeof(float);
+    const uint64_t need = a->action_values.size() * sizeof(float);
     if (written) *written = need;
     if (capacity < need) {
         a->last_error = "action output buffer is too small";
         return -5;
     }
-    std::memcpy(out, actions.data(), need);
+    std::memcpy(out, a->action_values.data(), need);
     a->last_error.clear();
     return 0;
 }
 
 int prepare(void* self, uint32_t graph, frt_shape_key key) {
-    (void)graph;
-    (void)key;
     auto* a = static_cast<Adapter*>(self);
-    if (a) a->last_error = "adopted-export Pi05 runtime has fixed variants";
-    return -3;
+    if (!a) return -1;
+    if (!a->source_model || !a->source_model->exp) {
+        a->last_error = "Pi05 fixed graph variants are captured at setup";
+        return -3;
+    }
+    const frt_runtime_export_v1* exp = a->source_model->exp;
+    if (graph >= exp->n_graphs) {
+        a->last_error = "Pi05 prepare graph index is out of range";
+        return -2;
+    }
+    if (!frt_graph_has_variant(exp->graphs[graph].handle, key)) {
+        a->last_error = "Pi05 fixed graph variant was not captured";
+        return -2;
+    }
+    a->last_error.clear();
+    return 0;
 }
 
 int step(void* self) {
@@ -306,6 +391,12 @@ extern "C" int frt_pi05_model_runtime_create(
 
     const auto& manifest = a->runtime->manifest();
     a->view_order = manifest.vision.view_order;
+    a->vision_frames.resize(a->view_order.size());
+    for (std::size_t i = 0; i < a->view_order.size(); ++i) {
+        a->vision_frames[i].name = a->view_order[i];
+    }
+    a->action_values.resize(static_cast<std::size_t>(
+        manifest.action.chunk * manifest.action.robot_dim));
     a->image_shape[0] = static_cast<int64_t>(a->view_order.size());
     a->image_shape[1] = manifest.vision.target_height;
     a->image_shape[2] = manifest.vision.target_width;
@@ -335,11 +426,12 @@ extern "C" int frt_pi05_model_runtime_create(
                          FRT_RT_PORT_SWAP, 0, a->noise_shape, 2, 0,
                          action_buf ? action_buf->handle : nullptr, 0,
                          action_buf ? action_buf->bytes : 0};
-    ports[kPortActions] = {"actions", FRT_RT_MOD_ACTION, io_dtype,
+    ports[kPortActions] = {"actions", FRT_RT_MOD_ACTION, FRT_RT_DTYPE_F32,
                            FRT_RT_LAYOUT_FLAT, FRT_RT_PORT_OUT,
                            FRT_RT_PORT_STAGED, 0, a->action_shape, 2, 0,
-                           action_buf ? action_buf->handle : nullptr, 0,
-                           action_buf ? action_buf->bytes : 0};
+                           nullptr, 0,
+                           static_cast<uint64_t>(manifest.action.chunk) *
+                               manifest.action.robot_dim * sizeof(float)};
 
     const std::string graph_name =
         config && config->graph_name ? config->graph_name : "infer";
@@ -393,15 +485,34 @@ extern "C" int frt_pi05_model_runtime_create_over(
     const uint32_t images = find_port_index(model, "images");
     const uint32_t noise = find_port_index(model, "noise");
     const uint32_t actions = find_port_index(model, "actions");
+    const uint32_t actions_raw = find_port_index(model, "actions_raw");
+    const uint32_t prompt = find_port_index(model, "prompt");
+    const uint32_t state = find_port_index(model, "state");
     if (!compatible_port(model, images, FRT_RT_MOD_IMAGE, FRT_RT_PORT_IN,
                          FRT_RT_PORT_STAGED) ||
         !compatible_port(model, actions, FRT_RT_MOD_ACTION, FRT_RT_PORT_OUT,
-                         FRT_RT_PORT_STAGED)) {
+                         FRT_RT_PORT_STAGED) ||
+        model->ports[actions].dtype != FRT_RT_DTYPE_F32) {
         return -2;
     }
     if (noise != kNoPort &&
         !compatible_port(model, noise, FRT_RT_MOD_TENSOR, FRT_RT_PORT_IN,
                          FRT_RT_PORT_SWAP)) {
+        return -2;
+    }
+    if (actions_raw != kNoPort &&
+        !compatible_port(model, actions_raw, FRT_RT_MOD_TENSOR,
+                         FRT_RT_PORT_OUT, FRT_RT_PORT_SWAP)) {
+        return -2;
+    }
+    if (prompt != kNoPort &&
+        !compatible_port(model, prompt, FRT_RT_MOD_TEXT, FRT_RT_PORT_IN,
+                         FRT_RT_PORT_STAGED)) {
+        return -2;
+    }
+    if (state != kNoPort &&
+        !compatible_port(model, state, FRT_RT_MOD_STATE, FRT_RT_PORT_IN,
+                         FRT_RT_PORT_STAGED)) {
         return -2;
     }
 
@@ -412,7 +523,8 @@ extern "C" int frt_pi05_model_runtime_create_over(
         cfg.graph_name = graph->name;
     }
     cfg.image_input_override = tensor_from_port(model->ports[images]);
-    cfg.action_output_override = tensor_from_port(model->ports[actions]);
+    cfg.action_output_override = tensor_from_port(
+        model->ports[actions_raw != kNoPort ? actions_raw : actions]);
 
     auto a = std::unique_ptr<Adapter>(new (std::nothrow) Adapter());
     if (!a) return -5;
@@ -420,11 +532,36 @@ extern "C" int frt_pi05_model_runtime_create_over(
                          flashrt::models::pi05::Runtime(model->exp, cfg));
     if (!a->runtime) return -5;
     if (!a->runtime->ok()) return status_code(a->runtime->status());
+    if (prompt != kNoPort && !a->runtime->prompt_staging_enabled()) {
+        return -2;
+    }
+    if (state != kNoPort &&
+        (!a->runtime->prompt_staging_enabled() ||
+         !a->runtime->state_normalization_enabled())) {
+        return -2;
+    }
     a->source_model = model;
     a->images_port = images;
     a->noise_port = noise;
     a->actions_port = actions;
+    a->prompt_port = prompt;
+    a->state_port = state;
     a->view_order = a->runtime->manifest().vision.view_order;
+    a->vision_frames.resize(a->view_order.size());
+    for (std::size_t i = 0; i < a->view_order.size(); ++i) {
+        a->vision_frames[i].name = a->view_order[i];
+    }
+    const auto& action = a->runtime->manifest().action;
+    a->action_values.resize(static_cast<std::size_t>(action.chunk *
+                                                     action.robot_dim));
+    if (cfg.prompt_max_tokens) {
+        a->prompt_text_limit = static_cast<std::size_t>(
+            cfg.prompt_max_tokens * 8ull);
+        a->prompt_text.reserve(a->prompt_text_limit);
+    }
+    if (state != kNoPort) {
+        a->state_values.resize(cfg.state_q01.size());
+    }
 
     frt_model_runtime_verbs verbs{};
     verbs.struct_size = sizeof(verbs);

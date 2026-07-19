@@ -405,11 +405,30 @@ endif()
 
 add_library(flashrt_cpp_pi05_c SHARED
   models/pi05/src/c_api.cpp
-  models/pi05/src/model_runtime.cpp)
+  models/pi05/src/model_runtime.cpp
+  models/pi05/src/native_model_runtime.cpp
+  models/pi05/src/native_open.cpp)
 target_link_libraries(flashrt_cpp_pi05_c
-  PUBLIC flashrt_cpp_pi05 flashrt_runtime)
+  PUBLIC flashrt_cpp_pi05 flashrt_runtime
+  PRIVATE flashrt_cpp_loader flashrt_cpp_native)
 target_include_directories(flashrt_cpp_pi05_c
-  PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/include)
+  PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/include
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/internal/include)
+if(TARGET flashrt_cpp_pi05_capture)
+  target_link_libraries(flashrt_cpp_pi05_c PRIVATE flashrt_cpp_pi05_capture)
+endif()
+if(TARGET flashrt_cpp_pi05_target_sm120)
+  target_compile_definitions(flashrt_cpp_pi05_c
+    PRIVATE FLASHRT_CPP_WITH_PI05_SM120_TARGET=1)
+  target_link_libraries(flashrt_cpp_pi05_c
+    PRIVATE flashrt_cpp_pi05_target_sm120)
+endif()
+if(TARGET flashrt_cpp_pi05_target_sm110)
+  target_compile_definitions(flashrt_cpp_pi05_c
+    PRIVATE FLASHRT_CPP_WITH_PI05_SM110_TARGET=1)
+  target_link_libraries(flashrt_cpp_pi05_c
+    PRIVATE flashrt_cpp_pi05_target_sm110)
+endif()
 
 if(BUILD_TESTING)
   if(TARGET flashrt_cpp_csrc_precise_math)
@@ -672,6 +691,19 @@ if(BUILD_TESTING)
     target_link_libraries(test_pi05_model_runtime
       PRIVATE flashrt_cpp_pi05_c flashrt_exec flashrt_runtime CUDA::cudart)
     add_test(NAME pi05_model_runtime COMMAND test_pi05_model_runtime)
+
+    add_executable(test_pi05_native_open tests/test_pi05_native_open.cpp)
+    target_include_directories(test_pi05_native_open PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/internal/include)
+    target_link_libraries(test_pi05_native_open
+      PRIVATE flashrt_cpp_pi05_c flashrt_runtime)
+    if(FLASHRT_CPP_WITH_SENTENCEPIECE AND
+       (FLASHRT_CPP_WITH_PI05_SM120_TARGET OR
+        FLASHRT_CPP_WITH_PI05_SM110_TARGET))
+      target_compile_definitions(test_pi05_native_open
+        PRIVATE FLASHRT_CPP_PI05_NATIVE_OPEN_ENABLED=1)
+    endif()
+    add_test(NAME pi05_native_open COMMAND test_pi05_native_open)
   endif()
 
   if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")

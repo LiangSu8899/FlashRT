@@ -43,9 +43,9 @@ typedef struct frt_pi05_runtime_config {
     const char* image_buffer_name;
     const char* action_buffer_name;
 
-    /* Optional ABI extension. Zero keeps the v1 default: BF16 buffers, which
-     * is the production FP8 Pi0.5 path. FP16 reference exports set both to
-     * FRT_PI05_DTYPE_FLOAT16. */
+    /* Optional ABI extension. Zero keeps the legacy v1 BF16 default. Complete
+     * producers set these from their declared tensor windows: BF16 on SM120,
+     * F16 on the SM110 FP8 producer. */
     int image_dtype;
     int action_dtype;
 
@@ -55,6 +55,29 @@ typedef struct frt_pi05_runtime_config {
      * capacity is a per-call error, never a fallback allocation. */
     int max_frame_width;
     int max_frame_height;
+
+    /* Optional native prompt/state staging. All fields are ABI-tail
+     * extensions; older adopted-export callers may stop before this block. */
+    const char* prompt_tokenizer_model_path;
+    const void* prompt_embedding_table_data;
+    uint64_t prompt_embedding_table_bytes;
+    int prompt_embedding_table_dtype;
+    uint64_t prompt_embedding_vocab_size;
+    uint64_t prompt_embedding_hidden_dim;
+    void* prompt_embedding_data;
+    uint64_t prompt_embedding_bytes;
+    int prompt_embedding_dtype;
+    uint64_t max_prompt_tokens;
+    float prompt_embedding_scale;
+
+    const float* state_q01;
+    uint64_t n_state_q01;
+    const float* state_q99;
+    uint64_t n_state_q99;
+
+    int (*prompt_length_update)(void* user, uint64_t prompt_len);
+    void* prompt_length_update_user;
+    int prompt_embedding_on_device;
 } frt_pi05_runtime_config;
 
 typedef struct frt_pi05_vision_frame {
@@ -75,6 +98,8 @@ int frt_pi05_runtime_create(const frt_runtime_export_v1* exp,
 void frt_pi05_runtime_destroy(frt_pi05_runtime*);
 
 int frt_pi05_runtime_set_prompt(frt_pi05_runtime*, const char* text);
+int frt_pi05_runtime_set_prompt_state(frt_pi05_runtime*, const char* text,
+                                      const float* state, uint64_t n_state);
 int frt_pi05_runtime_prepare_vision(frt_pi05_runtime*,
                                     const frt_pi05_vision_frame* frames,
                                     uint64_t n_frames);

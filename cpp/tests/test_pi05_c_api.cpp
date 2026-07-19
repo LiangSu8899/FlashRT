@@ -144,27 +144,33 @@ int main() {
     frame.pixel_format = FRT_PI05_PIXEL_RGB8;
     rc = frt_pi05_runtime_prepare_vision(rt, &frame, 1);
     assert(rc == 0);
-
+    std::vector<std::uint16_t> rgb_staged(image_bytes / 2);
+    assert(cudaMemcpy(rgb_staged.data(), frt_buffer_dptr(image), image_bytes,
+                      cudaMemcpyDeviceToHost) == cudaSuccess);
+    frt_pi05_vision_frame invalid = frame;
+    invalid.pixel_format = 999;
+    rc = frt_pi05_runtime_prepare_vision(rt, &invalid, 1);
+    assert(rc == -4);
+    assert(std::strstr(frt_pi05_runtime_last_error(rt), "pixel format"));
     const std::uint8_t bgr[] = {
         255, 127, 0, 0, 127, 255,
         30, 20, 10, 60, 50, 40,
     };
-    frame.data = bgr;
-    frame.bytes = sizeof(bgr);
-    frame.pixel_format = FRT_PI05_PIXEL_BGR8;
-    rc = frt_pi05_runtime_prepare_vision(rt, &frame, 1);
+    invalid = frame;
+    invalid.data = bgr;
+    invalid.bytes = sizeof(bgr);
+    invalid.pixel_format = FRT_PI05_PIXEL_BGR8;
+    rc = frt_pi05_runtime_prepare_vision(rt, &invalid, 1);
     assert(rc == 0);
-
-    const std::uint8_t gray[] = {0, 127, 255, 64};
-    frame.data = gray;
-    frame.bytes = sizeof(gray);
-    frame.pixel_format = FRT_PI05_PIXEL_GRAY8;
-    rc = frt_pi05_runtime_prepare_vision(rt, &frame, 1);
-    assert(rc == 0);
-
-    frame.pixel_format = 99;
-    rc = frt_pi05_runtime_prepare_vision(rt, &frame, 1);
-    assert(rc != 0);
+    std::vector<std::uint16_t> bgr_staged(image_bytes / 2);
+    assert(cudaMemcpy(bgr_staged.data(), frt_buffer_dptr(image), image_bytes,
+                      cudaMemcpyDeviceToHost) == cudaSuccess);
+    assert(bgr_staged == rgb_staged);
+    invalid = frame;
+    invalid.stride_bytes = 5;
+    rc = frt_pi05_runtime_prepare_vision(rt, &invalid, 1);
+    assert(rc == -4);
+    assert(std::strstr(frt_pi05_runtime_last_error(rt), "stride"));
 
     float out[3] = {};
     uint64_t n_written = 0;
