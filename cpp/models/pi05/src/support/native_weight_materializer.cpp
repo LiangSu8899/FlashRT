@@ -2,10 +2,16 @@
 
 #include "flashrt/cpp/models/pi05/model/dims.h"
 
+#include <algorithm>
+#include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <string>
+#include <thread>
+#include <vector>
 
 namespace flashrt {
 namespace models {
@@ -15,6 +21,71 @@ namespace {
 modalities::Status invalid(const char* message) {
     return modalities::Status::error(modalities::StatusCode::kInvalidArgument,
                                      message);
+}
+
+modalities::Status backend(const std::string& message) {
+    return modalities::Status::error(modalities::StatusCode::kBackend,
+                                     message);
+}
+
+int materialization_workers(int layers) {
+    int workers = std::min(layers, 8);
+    const char* setting = std::getenv("FLASHRT_NATIVE_WEIGHT_WORKERS");
+    if (!setting || !setting[0]) return workers;
+    errno = 0;
+    char* end = nullptr;
+    const long parsed = std::strtol(setting, &end, 10);
+    if (errno || !end || *end || parsed < 1 || parsed > 64) return workers;
+    return std::min(layers, static_cast<int>(parsed));
+}
+
+template <typename Materialize>
+modalities::Status materialize_layers_parallel(int layers,
+                                               Materialize materialize) {
+    if (layers <= 0) return invalid("parallel materialization is empty");
+    std::vector<modalities::Status> statuses(
+        static_cast<std::size_t>(layers), modalities::Status::ok());
+    std::atomic<int> next{0};
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> threads;
+    threads.reserve(static_cast<std::size_t>(
+        materialization_workers(layers)));
+    try {
+        for (int worker = 0; worker < materialization_workers(layers);
+             ++worker) {
+            threads.emplace_back([&] {
+                while (!stop.load(std::memory_order_relaxed)) {
+                    const int layer = next.fetch_add(1);
+                    if (layer >= layers) break;
+                    try {
+                        statuses[static_cast<std::size_t>(layer)] =
+                            materialize(layer);
+                    } catch (const std::exception& error) {
+                        statuses[static_cast<std::size_t>(layer)] = backend(
+                            std::string("weight worker failed: ") +
+                            error.what());
+                    } catch (...) {
+                        statuses[static_cast<std::size_t>(layer)] =
+                            backend("weight worker failed");
+                    }
+                    if (!statuses[static_cast<std::size_t>(layer)]
+                             .ok_status()) {
+                        stop.store(true, std::memory_order_relaxed);
+                    }
+                }
+            });
+        }
+    } catch (const std::exception& error) {
+        stop.store(true, std::memory_order_relaxed);
+        for (auto& thread : threads) thread.join();
+        return backend(std::string("weight worker creation failed: ") +
+                       error.what());
+    }
+    for (auto& thread : threads) thread.join();
+    for (const modalities::Status& status : statuses) {
+        if (!status.ok_status()) return status;
+    }
+    return modalities::Status::ok();
 }
 
 std::string encoder_prefix(int layer) {
@@ -458,20 +529,20 @@ modalities::Status NativeWeightMaterializer::materialize_all(
     };
     modalities::Status st = materialize_vision_globals();
     if (!st.ok_status()) return st;
-    for (int layer = 0; layer < kPi05ModelDims.vision_layers; ++layer) {
-        st = materialize_vision_layer(layer);
-        if (!st.ok_status()) return st;
-    }
+    st = materialize_layers_parallel(
+        kPi05ModelDims.vision_layers,
+        [this](int layer) { return materialize_vision_layer(layer); });
+    if (!st.ok_status()) return st;
     report("vision");
-    for (int layer = 0; layer < kPi05ModelDims.encoder_layers; ++layer) {
-        st = materialize_encoder_layer(layer);
-        if (!st.ok_status()) return st;
-    }
+    st = materialize_layers_parallel(
+        kPi05ModelDims.encoder_layers,
+        [this](int layer) { return materialize_encoder_layer(layer); });
+    if (!st.ok_status()) return st;
     report("encoder");
-    for (int layer = 0; layer < kPi05ModelDims.decoder_layers; ++layer) {
-        st = materialize_decoder_layer(layer);
-        if (!st.ok_status()) return st;
-    }
+    st = materialize_layers_parallel(
+        kPi05ModelDims.decoder_layers,
+        [this](int layer) { return materialize_decoder_layer(layer); });
+    if (!st.ok_status()) return st;
     report("decoder");
     st = materialize_decoder_globals(options.num_steps);
     if (!st.ok_status() || !options.include_embedding) return st;
