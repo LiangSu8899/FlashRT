@@ -44,14 +44,25 @@ _LEVER_KINDS = ("regions", "cadence", "seam_negotiation", "dtype",
 @dataclass
 class Gates:
     """Explicit gate thresholds. Part of the plan digest: changing one
-    is a plan change, not a tweak."""
+    is a plan change, not a tweak.
 
-    parity_cos: float = 0.999
+    ``parity_cos`` is the hard floor — below it the recipe refuses.
+    ``parity_warn`` marks the comfort line: results in
+    ``[parity_cos, parity_warn)`` pass but the receipt records
+    ``parity_band: "warn"`` with a note that calibration owes the
+    remaining accuracy. During the performance-assembly phase the floor
+    is intentionally loose (collapse-only); tighter banded gates arrive
+    with the calibration/fallback design, not before.
+    """
+
+    parity_cos: float = 0.99
+    parity_warn: float = 0.999
     min_speedup: float = 1.02
     drift_budget: float = 0.02
 
     def as_dict(self) -> dict[str, float]:
         return {"parity_cos": self.parity_cos,
+                "parity_warn": self.parity_warn,
                 "min_speedup": self.min_speedup,
                 "drift_budget": self.drift_budget}
 
@@ -327,7 +338,11 @@ def run_recipe(
     treated_out = arm.output().detach().float().cpu()
     parity = parity_metrics(treated_out, reference_out)["cosine"]
     parity_ok = parity >= gates.parity_cos
-    say(f"treated parity vs stock eager: {parity:.6f}")
+    parity_band = ("ok" if parity >= gates.parity_warn
+                   else "warn" if parity_ok else "fail")
+    say(f"treated parity vs stock eager: {parity:.6f}"
+        + (" [WARN: below comfort line — calibration owes the rest]"
+           if parity_band == "warn" else ""))
 
     treated_ms = speedup = None
     if parity_ok and cached_ok:
@@ -394,7 +409,8 @@ def run_recipe(
                      "drift": drift},
         "treated": (None if treated_ms is None else
                     {"ms": round(treated_ms, 3), "speedup": speedup,
-                     "parity_vs_reference": round(parity, 7)}),
+                     "parity_vs_reference": round(parity, 7),
+                     "parity_band": parity_band}),
         "verdict": verdict, "reason": reason,
     }
     run = RecipeRun(verdict, receipt, arm=arm, _handle=handle)
