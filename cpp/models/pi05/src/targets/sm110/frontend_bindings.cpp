@@ -31,7 +31,8 @@ Sm110FrontendBindings* bindings(void* state) {
 }
 
 bool ready(const Sm110FrontendBindings* value) {
-    return value && value->shape && value->calibration && value->physical &&
+    return value && value->shape &&
+           (value->observing || value->calibration) && value->physical &&
            value->weights && value->weights->finished() && value->driver &&
            value->driver->status().ok_status();
 }
@@ -59,14 +60,18 @@ modalities::Status activation_site(
                 state.physical->vision().unit_scale.device_data());
             break;
         case Pi05LinearDomain::kEncoder:
-            if (site->index >= state.calibration->encoder_scales.size()) {
+            if (site->index >=
+                state.physical->encoder().activation_scales.bytes() /
+                    sizeof(float)) {
                 return invalid("SM110 encoder activation site is invalid");
             }
             *device_scale = scale_data(
                 state.physical->encoder().activation_scales, site->index);
             break;
         case Pi05LinearDomain::kDecoder:
-            if (site->index >= state.calibration->decoder_scales.size()) {
+            if (site->index >=
+                state.physical->decoder().activation_scales.bytes() /
+                    sizeof(float)) {
                 return invalid("SM110 decoder activation site is invalid");
             }
             *device_scale = scale_data(
@@ -75,6 +80,47 @@ modalities::Status activation_site(
     }
     return *device_scale ? modalities::Status::ok()
                          : invalid("SM110 activation scale is unavailable");
+}
+
+modalities::Status observe_quantize(
+    Sm110FrontendBindings* binding,
+    const void* input,
+    void* output,
+    const float* scale,
+    std::size_t elements,
+    Pi05Stream stream) {
+    if (!binding || !binding->observing || !scale) {
+        return invalid("SM110 observer quantization state is invalid");
+    }
+    return binding->driver->quantize_fp8_dynamic(
+        input, output, const_cast<float*>(scale), elements, stream);
+}
+
+modalities::Status activation_host_scale(
+    const Sm110FrontendBindings& binding,
+    const Pi05LinearActivationSite& site,
+    const float* device_scale,
+    Pi05Stream stream,
+    float* out) {
+    if (!out || !device_scale) {
+        return invalid("SM110 activation host scale is invalid");
+    }
+    if (!binding.observing) {
+        if (!binding.calibration ||
+            site.index >= binding.calibration->encoder_scales.size()) {
+            return invalid("SM110 static activation scale is invalid");
+        }
+        *out = binding.calibration->encoder_scales[site.index];
+        return modalities::Status::ok();
+    }
+    cudaStream_t native = reinterpret_cast<cudaStream_t>(stream);
+    cudaError_t result = cudaStreamSynchronize(native);
+    if (result == cudaSuccess) {
+        result = cudaMemcpy(
+            out, device_scale, sizeof(*out), cudaMemcpyDeviceToHost);
+    }
+    return result == cudaSuccess ? modalities::Status::ok()
+                                 : backend(cudaGetErrorString(result));
 }
 
 bool empty_epilogue(const Pi05LinearEpilogue& epilogue) {
@@ -216,15 +262,24 @@ modalities::Status frontend_projected_linear(
         void* fp8 = key.domain == Pi05LinearDomain::kEncoder
                         ? binding->physical->encoder().output_fp8.device_data()
                         : binding->physical->decoder().context_fp8.device_data();
-        status = binding->driver->quantize_fp8_static(
-            input, fp8, activation_scale,
-            static_cast<std::size_t>(rows) * input_width, stream);
+        status = binding->observing
+                     ? observe_quantize(
+                           binding, input, fp8, activation_scale,
+                           static_cast<std::size_t>(rows) * input_width,
+                           stream)
+                     : binding->driver->quantize_fp8_static(
+                           input, fp8, activation_scale,
+                           static_cast<std::size_t>(rows) * input_width,
+                           stream);
         if (!status.ok_status()) return status;
         linear_input = fp8;
     }
     if (key.domain == Pi05LinearDomain::kEncoder) {
-        float alpha = packed->host_scale *
-                      binding->calibration->encoder_scales[site.index];
+        float activation = 0.0f;
+        status = activation_host_scale(
+            *binding, site, activation_scale, stream, &activation);
+        if (!status.ok_status()) return status;
+        float alpha = packed->host_scale * activation;
         if (!std::isfinite(alpha) || !(alpha > 0.0f)) {
             return invalid("SM110 encoder GEMM scale is invalid");
         }
@@ -357,8 +412,8 @@ modalities::Status frontend_normalize_for_linear(
     void* state,
     void* residual,
     const void* update,
-    const Pi05ResolvedBuffer&,
-    void*,
+    const Pi05ResolvedBuffer& weight,
+    void* normalized,
     Pi05LinearWeightKey key,
     int step,
     int rows,
@@ -368,7 +423,7 @@ modalities::Status frontend_normalize_for_linear(
     bool* prequantized,
     Pi05Stream stream) {
     Sm110FrontendBindings* binding = bindings(state);
-    if (!ready(binding) || !linear_input || !prequantized ||
+    if (!ready(binding) || !linear_input || !prequantized || !normalized ||
         key.domain != Pi05LinearDomain::kEncoder) {
         return invalid("SM110 encoder normalization binding is invalid");
     }
@@ -378,6 +433,35 @@ modalities::Status frontend_normalize_for_linear(
         *binding, key, step, &site, &scale);
     if (!status.ok_status()) return status;
     void* fp8 = binding->physical->encoder().state_fp8.device_data();
+    if (binding->observing) {
+        const Sm110ObserverResources& observer =
+            binding->physical->observer();
+        const void* observed_values = residual;
+        if (update) {
+            status = frontend_copy(
+                nullptr, observer.encoder_residual.device_data(), residual,
+                static_cast<std::size_t>(rows) * columns *
+                    sizeof(std::uint16_t),
+                stream);
+            if (!status.ok_status()) return status;
+            status = binding->driver->residual_add_fp16(
+                observer.encoder_residual.device_data(), update,
+                static_cast<std::size_t>(rows) * columns, stream);
+            if (!status.ok_status()) return status;
+            observed_values = observer.encoder_residual.device_data();
+        }
+        status = binding->driver->rms_norm_fp16(
+            observed_values, data(weight),
+            observer.encoder_normalized.device_data(), rows, columns,
+            1.0e-6f, stream);
+        if (status.ok_status()) {
+            status = observe_quantize(
+                binding, observer.encoder_normalized.device_data(), fp8,
+                scale,
+                static_cast<std::size_t>(rows) * columns, stream);
+        }
+        if (!status.ok_status()) return status;
+    }
     if (!update) {
         status = binding->driver->rms_norm_fp8_noweight(
             residual, fp8, rows, columns, scale, stream);
@@ -517,6 +601,42 @@ modalities::Status frontend_adaptive_normalize(
     status = activation_site(*binding, key, step, &site, &scale);
     if (!status.ok_status()) return status;
     void* fp8 = binding->physical->decoder().state_fp8.device_data();
+    if (binding->observing) {
+        if (!update) {
+            status = binding->driver->adarms_fp16(
+                residual, style, normalized, gate, rows, columns, stream);
+            if (status.ok_status()) {
+                status = observe_quantize(
+                    binding, normalized, fp8, scale,
+                    static_cast<std::size_t>(rows) * columns, stream);
+            }
+            if (!status.ok_status()) return status;
+            status = binding->driver->fused_adarms_fp8(
+                residual, style, fp8, gate, rows, columns, scale, stream);
+        } else {
+            status = binding->driver->gate_res_fp16(
+                update, update_gate, residual,
+                static_cast<std::size_t>(rows) * columns, stream);
+            if (!status.ok_status()) return status;
+            status = binding->driver->adarms_fp16(
+                residual, style, normalized, gate, rows, columns, stream);
+            if (status.ok_status()) {
+                status = observe_quantize(
+                    binding, normalized, fp8, scale,
+                    static_cast<std::size_t>(rows) * columns, stream);
+            }
+            if (status.ok_status()) {
+                status = binding->driver->quantize_fp8_static(
+                    normalized, fp8, scale,
+                    static_cast<std::size_t>(rows) * columns, stream);
+            }
+        }
+        if (status.ok_status()) {
+            *linear_input = fp8;
+            *prequantized = true;
+        }
+        return status;
+    }
     status = update
         ? binding->driver->gate_res_adarms_fp8(
               update, update_gate, residual, style, fp8, gate, rows,
@@ -577,7 +697,7 @@ modalities::Status frontend_gated_activation(
     const void* gate,
     const void*,
     bool merged,
-    void*,
+    void* output,
     int rows,
     int hidden_width,
     Pi05LinearWeightKey output_key,
@@ -586,7 +706,8 @@ modalities::Status frontend_gated_activation(
     bool* prequantized,
     Pi05Stream stream) {
     Sm110FrontendBindings* binding = bindings(state);
-    if (!ready(binding) || !merged || !linear_input || !prequantized) {
+    if (!ready(binding) || !merged || !output || !linear_input ||
+        !prequantized) {
         return invalid("SM110 gated activation binding is invalid");
     }
     Pi05LinearActivationSite site;
@@ -594,13 +715,30 @@ modalities::Status frontend_gated_activation(
     modalities::Status status = activation_site(
         *binding, output_key, step, &site, &scale);
     if (!status.ok_status()) return status;
-    void* output = output_key.domain == Pi05LinearDomain::kEncoder
-                       ? binding->physical->encoder().hidden_fp8.device_data()
-                       : binding->physical->decoder().hidden_fp8.device_data();
-    status = binding->driver->gate_gelu_fp8(
-        gate, output, rows, hidden_width, scale, stream);
+    void* fp8_output =
+        output_key.domain == Pi05LinearDomain::kEncoder
+            ? binding->physical->encoder().hidden_fp8.device_data()
+            : binding->physical->decoder().hidden_fp8.device_data();
+    if (binding->observing) {
+        status = binding->driver->gate_gelu_fp16(
+            gate, output, rows, hidden_width, stream);
+        if (status.ok_status()) {
+            status = observe_quantize(
+                binding, output, fp8_output,
+                scale, static_cast<std::size_t>(rows) * hidden_width,
+                stream);
+        }
+        if (status.ok_status()) {
+            status = binding->driver->gate_gelu_fp8(
+                gate, fp8_output,
+                rows, hidden_width, scale, stream);
+        }
+    } else {
+        status = binding->driver->gate_gelu_fp8(
+            gate, fp8_output, rows, hidden_width, scale, stream);
+    }
     if (status.ok_status()) {
-        *linear_input = output;
+        *linear_input = fp8_output;
         *prequantized = true;
     }
     return status;

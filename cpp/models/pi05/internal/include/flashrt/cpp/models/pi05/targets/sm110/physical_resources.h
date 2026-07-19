@@ -6,6 +6,7 @@
 #include "flashrt/cpp/models/pi05/support/native_resource_resolver.h"
 
 #include <cstddef>
+#include <vector>
 
 namespace flashrt {
 namespace models {
@@ -71,6 +72,13 @@ struct Sm110ControlResources final {
     Sm110Buffer decoder_position;
 };
 
+struct Sm110ObserverResources final {
+    Sm110Buffer encoder_normalized;
+    Sm110Buffer encoder_residual;
+    Sm110Buffer encoder_hidden;
+    Sm110Buffer decoder_hidden;
+};
+
 class Sm110PhysicalResources final {
 public:
     explicit Sm110PhysicalResources(frt_ctx context) : context_(context) {}
@@ -78,9 +86,15 @@ public:
     Sm110PhysicalResources(const Sm110PhysicalResources&) = delete;
     Sm110PhysicalResources& operator=(const Sm110PhysicalResources&) = delete;
 
-    modalities::Status allocate(const Pi05ResolvedShape& shape);
+    modalities::Status allocate(const Pi05ResolvedShape& shape,
+                                bool observing);
     modalities::Status initialize_static(
         const NativeCalibrationArtifact& calibration);
+    modalities::Status initialize_observer();
+    modalities::Status reset_observer(Pi05Stream stream) const;
+    modalities::Status download_observer(
+        std::vector<float>* encoder,
+        std::vector<float>* decoder) const;
     modalities::Status set_prompt_length(int prompt_tokens);
     modalities::Status make_target_bindings(
         Pi05TargetBufferBindings* out) const;
@@ -89,6 +103,7 @@ public:
     const Sm110EncoderResources& encoder() const { return encoder_; }
     const Sm110DecoderResources& decoder() const { return decoder_; }
     const Sm110ControlResources& controls() const { return controls_; }
+    const Sm110ObserverResources& observer() const { return observer_; }
     const Pi05ResolvedShape& shape() const { return shape_; }
 
     std::size_t allocation_count() const { return allocation_count_; }
@@ -109,12 +124,16 @@ private:
     Sm110EncoderResources encoder_;
     Sm110DecoderResources decoder_;
     Sm110ControlResources controls_;
+    Sm110ObserverResources observer_;
     std::size_t allocation_count_ = 0;
     std::size_t allocated_bytes_ = 0;
     int padded_key_stride_ = 0;
     bool allocation_started_ = false;
     bool allocated_ = false;
     bool initialized_ = false;
+    bool observing_ = false;
+    std::vector<float> encoder_reset_;
+    std::vector<float> decoder_reset_;
 };
 
 }  // namespace sm110

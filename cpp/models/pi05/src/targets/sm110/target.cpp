@@ -170,12 +170,13 @@ std::unique_ptr<Sm110TargetBundle> Sm110TargetBundle::create(
     Sm110TargetConfig config,
     modalities::Status* status) {
     modalities::Status validation = validate_pi05_resolved_shape(shape);
-    if (validation.ok_status()) {
-        validation = validate_native_calibration_artifact(config.calibration);
+    if (validation.ok_status() && config.calibration) {
+        validation = validate_native_calibration_artifact(*config.calibration);
     }
     if (!context || config.checkpoint_path.empty() ||
         !validation.ok_status() || !valid_shape_for_target(shape) ||
-        !calibration_matches(config.calibration, shape)) {
+        (config.calibration &&
+         !calibration_matches(*config.calibration, shape))) {
         set_status(status,
                    context && !validation.ok_status()
                        ? validation
@@ -245,10 +246,13 @@ modalities::Status Sm110TargetBundle::initialize_resources() {
             impl_->weights);
         if (!status.ok_status()) return impl_->fail(std::move(status));
 
-        status = impl_->physical.allocate(impl_->shape);
+        const bool observing = !impl_->config.calibration.has_value();
+        status = impl_->physical.allocate(impl_->shape, observing);
         if (!status.ok_status()) return impl_->fail(std::move(status));
-        status = impl_->physical.initialize_static(
-            impl_->config.calibration);
+        status = observing
+                     ? impl_->physical.initialize_observer()
+                     : impl_->physical.initialize_static(
+                           *impl_->config.calibration);
         if (!status.ok_status()) return impl_->fail(std::move(status));
 
         impl_->state = Impl::State::kResourcesInitialized;
@@ -300,9 +304,13 @@ modalities::Status Sm110TargetBundle::resolve_resources(
         if (!status.ok_status()) return impl_->fail(std::move(status));
 
         impl_->resources = resolved;
-        impl_->frontend = {&impl_->shape, &impl_->config.calibration,
-                           &impl_->physical, impl_->packer.get(),
-                           impl_->driver.get()};
+        impl_->frontend = {
+            &impl_->shape,
+            impl_->config.calibration ? &*impl_->config.calibration : nullptr,
+            !impl_->config.calibration.has_value(),
+            &impl_->physical,
+            impl_->packer.get(),
+            impl_->driver.get()};
         status = initialize_sm110_frontend_ops(
             &impl_->frontend, &impl_->frontend_ops);
         if (!status.ok_status()) return impl_->fail(std::move(status));
@@ -388,7 +396,9 @@ modalities::Status Sm110TargetBundle::make_forward_execution(
         encoder.residual_output.device_data(),
         encoder.qkv.device_data(),
         encoder.gate_up.device_data(),
-        encoder.hidden_fp8.device_data(),
+        impl_->config.calibration
+            ? encoder.hidden_fp8.device_data()
+            : impl_->physical.observer().encoder_hidden.device_data(),
         encoder.attention.device_data(),
         encoder.attention.device_data(),
     };
@@ -398,7 +408,9 @@ modalities::Status Sm110TargetBundle::make_forward_execution(
         decoder.gate.device_data(),
         decoder.qkv.device_data(),
         decoder.projection.device_data(),
-        decoder.hidden_fp8.device_data(),
+        impl_->config.calibration
+            ? decoder.hidden_fp8.device_data()
+            : impl_->physical.observer().decoder_hidden.device_data(),
         decoder.attention.device_data(),
         decoder.attention.device_data(),
     };
@@ -497,6 +509,29 @@ modalities::Status Sm110TargetBundle::set_prompt_length(
     }
     impl_->committed_prompt_length = rounded_prompt;
     return modalities::Status::ok();
+}
+
+bool Sm110TargetBundle::observes_activations() const {
+    return impl_ && !impl_->config.calibration.has_value();
+}
+
+modalities::Status Sm110TargetBundle::reset_observer(Pi05Stream stream) {
+    if (!impl_ || impl_->state != Impl::State::kCaptureInputsInitialized ||
+        impl_->config.calibration) {
+        return invalid("SM110 observer reset state is invalid");
+    }
+    return impl_->physical.reset_observer(stream);
+}
+
+modalities::Status Sm110TargetBundle::download_observer(
+    Pi05ObservedScales* out) const {
+    if (!impl_ || impl_->state != Impl::State::kCaptureInputsInitialized ||
+        impl_->config.calibration || !out) {
+        return invalid("SM110 observer download state is invalid");
+    }
+    out->vision.clear();
+    return impl_->physical.download_observer(
+        &out->encoder, &out->decoder);
 }
 
 const Pi05ResolvedResources* Sm110TargetBundle::resolved_resources() const {

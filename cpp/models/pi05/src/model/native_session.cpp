@@ -2,6 +2,8 @@
 
 #include "flashrt/cpp/models/pi05/model/frontend_ops.h"
 
+#include <cuda_runtime_api.h>
+
 #include <new>
 #include <utility>
 
@@ -30,14 +32,19 @@ void set_status(modalities::Status* destination,
 Pi05NativeSession::Pi05NativeSession(
     frt_ctx context,
     Pi05ResolvedShape shape,
-    std::unique_ptr<Pi05TargetBundle> target)
-    : pipeline_(shape), program_(context), target_(std::move(target)) {}
+    std::unique_ptr<Pi05TargetBundle> target,
+    Pi05SessionMode mode)
+    : pipeline_(shape),
+      program_(context),
+      target_(std::move(target)),
+      mode_(mode) {}
 
 std::unique_ptr<Pi05NativeSession> Pi05NativeSession::create(
     frt_ctx context,
     Pi05ResolvedShape shape,
     std::unique_ptr<Pi05TargetBundle> target,
-    modalities::Status* status) {
+    modalities::Status* status,
+    Pi05SessionMode mode) {
     if (!context || !target || target->context() != context) {
         target.reset();
         if (context) frt_ctx_destroy(context);
@@ -48,7 +55,7 @@ std::unique_ptr<Pi05NativeSession> Pi05NativeSession::create(
     Pi05NativeSession* allocated = nullptr;
     try {
         allocated = new (std::nothrow) Pi05NativeSession(
-            context, shape, std::move(target));
+            context, shape, std::move(target), mode);
     } catch (const std::bad_alloc&) {
         target.reset();
         frt_ctx_destroy(context);
@@ -106,6 +113,12 @@ modalities::Status Pi05NativeSession::initialize() {
     result = target_->initialize_capture_inputs();
     if (!result.ok_status()) return result;
 
+    if (mode_ == Pi05SessionMode::kUncaptured) {
+        return target_->observes_activations()
+                   ? modalities::Status::ok()
+                   : invalid("PI0.5 uncaptured session requires an observer");
+    }
+
     if (target_->warmup_before_capture()) {
         result = program_.warmup(pipeline_, forward_);
         if (!result.ok_status()) return result;
@@ -117,6 +130,49 @@ modalities::Status Pi05NativeSession::initialize() {
     result = make_pi05_graph_bindings(resources_.buffers, &bindings);
     if (!result.ok_status()) return result;
     return program_.capture(pipeline_, forward_, bindings);
+}
+
+modalities::Status Pi05NativeSession::execute(Pi05GraphId id) {
+    if (mode_ == Pi05SessionMode::kCaptured) {
+        return replay(id) == FRT_OK
+                   ? modalities::Status::ok()
+                   : backend("PI0.5 graph replay failed");
+    }
+    if (!target_ || !target_->observes_activations()) {
+        return invalid("PI0.5 uncaptured execution state is invalid");
+    }
+    const Pi05GraphDescriptor* graph = pi05_graph_descriptor(id);
+    if (!graph) return invalid("PI0.5 execution graph is invalid");
+    switch (graph->body) {
+        case Pi05RecordBody::kFull:
+            return pipeline_.record_full(forward_, 0);
+        case Pi05RecordBody::kDecode:
+            return pipeline_.record_decode(forward_, 0);
+        case Pi05RecordBody::kContext:
+            return pipeline_.record_context(forward_, 0);
+    }
+    return invalid("PI0.5 execution body is invalid");
+}
+
+modalities::Status Pi05NativeSession::synchronize() const {
+    if (mode_ == Pi05SessionMode::kCaptured) return program_.synchronize();
+    const cudaError_t result = cudaDeviceSynchronize();
+    return result == cudaSuccess
+               ? modalities::Status::ok()
+               : backend(cudaGetErrorString(result));
+}
+
+modalities::Status Pi05NativeSession::reset_observer() {
+    return target_ && target_->observes_activations()
+               ? target_->reset_observer(0)
+               : invalid("PI0.5 observer is unavailable");
+}
+
+modalities::Status Pi05NativeSession::download_observer(
+    Pi05ObservedScales* out) const {
+    return target_ && target_->observes_activations()
+               ? target_->download_observer(out)
+               : invalid("PI0.5 observer is unavailable");
 }
 
 modalities::Status Pi05NativeSession::set_prompt_length(

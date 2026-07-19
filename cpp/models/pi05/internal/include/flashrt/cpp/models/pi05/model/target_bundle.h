@@ -3,11 +3,19 @@
 
 #include "flashrt/cpp/models/pi05/model/resolved_resources.h"
 
+#include <vector>
+
 namespace flashrt {
 namespace models {
 namespace pi05 {
 
 struct Pi05ForwardExecution;
+
+struct Pi05ObservedScales final {
+    std::vector<float> vision;
+    std::vector<float> encoder;
+    std::vector<float> decoder;
+};
 
 class Pi05TargetBundle {
 public:
@@ -36,6 +44,18 @@ public:
     virtual modalities::Status initialize_capture_inputs() = 0;
     virtual modalities::Status reset_after_warmup() = 0;
     virtual modalities::Status set_prompt_length(int prompt_tokens) = 0;
+    virtual bool observes_activations() const { return false; }
+    virtual modalities::Status reset_observer(Pi05Stream) {
+        return modalities::Status::error(
+            modalities::StatusCode::kUnsupported,
+            "target activation observer is unavailable");
+    }
+    virtual modalities::Status download_observer(
+        Pi05ObservedScales*) const {
+        return modalities::Status::error(
+            modalities::StatusCode::kUnsupported,
+            "target activation observer is unavailable");
+    }
 
 private:
     frt_ctx context_ = nullptr;

@@ -129,13 +129,9 @@ int main() {
     assert(!missing->initialize_resources().ok_status());
     assert(!missing->initialize_resources().ok_status());
     assert(missing->execution_mode() == Sm120ExecutionMode::kBf16);
-    std::vector<float> vision;
-    std::vector<float> encoder;
-    std::vector<float> decoder;
-    assert(!missing->reset_observer_scales(0).ok_status());
-    assert(!missing->download_observer_scales(
-                       &vision, &encoder, &decoder)
-                .ok_status());
+    Pi05ObservedScales observed;
+    assert(!missing->reset_observer(0).ok_status());
+    assert(!missing->download_observer(&observed).ok_status());
     assert(frt_ctx_stream(context, 0) >= 0);
     missing.reset();
     frt_ctx_destroy(context);

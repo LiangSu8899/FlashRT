@@ -11,13 +11,19 @@ namespace flashrt {
 namespace models {
 namespace pi05 {
 
+enum class Pi05SessionMode {
+    kCaptured = 0,
+    kUncaptured,
+};
+
 class Pi05NativeSession final {
 public:
     static std::unique_ptr<Pi05NativeSession> create(
         frt_ctx context,
         Pi05ResolvedShape shape,
         std::unique_ptr<Pi05TargetBundle> target,
-        modalities::Status* status);
+        modalities::Status* status,
+        Pi05SessionMode mode = Pi05SessionMode::kCaptured);
     ~Pi05NativeSession() = default;
 
     Pi05NativeSession(const Pi05NativeSession&) = delete;
@@ -33,21 +39,27 @@ public:
     int replay(Pi05GraphId id = Pi05GraphId::kInfer) const {
         return program_.replay(id);
     }
-    modalities::Status synchronize() const {
-        return program_.synchronize();
-    }
+    modalities::Status execute(Pi05GraphId id = Pi05GraphId::kInfer);
+    modalities::Status synchronize() const;
     modalities::Status set_prompt_length(int prompt_tokens);
+    modalities::Status reset_observer();
+    modalities::Status download_observer(Pi05ObservedScales* out) const;
+    bool observes_activations() const {
+        return target_ && target_->observes_activations();
+    }
 
 private:
     Pi05NativeSession(frt_ctx context,
                       Pi05ResolvedShape shape,
-                      std::unique_ptr<Pi05TargetBundle> target);
+                      std::unique_ptr<Pi05TargetBundle> target,
+                      Pi05SessionMode mode);
     modalities::Status initialize();
 
     // Reverse destruction tears down the target before the owned context.
     Pi05SemanticPipeline pipeline_;
     Pi05CapturedProgram program_;
     std::unique_ptr<Pi05TargetBundle> target_;
+    Pi05SessionMode mode_ = Pi05SessionMode::kCaptured;
     Pi05ResolvedResources resources_;
     Pi05ForwardExecution forward_;
 };

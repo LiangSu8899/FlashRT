@@ -269,7 +269,7 @@ int main() {
         context, invalid_shape, config, &status));
     assert(!status.ok_status());
     Sm110TargetConfig wrong_hardware = config;
-    wrong_hardware.calibration.hardware = "sm120";
+    wrong_hardware.calibration->hardware = "sm120";
     assert(!Sm110TargetBundle::create(
         context, shape, std::move(wrong_hardware), &status));
     assert(!status.ok_status());

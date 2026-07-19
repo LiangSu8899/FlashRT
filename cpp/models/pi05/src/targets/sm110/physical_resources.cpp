@@ -121,7 +121,8 @@ modalities::Status Sm110PhysicalResources::add(
 }
 
 modalities::Status Sm110PhysicalResources::allocate(
-    const Pi05ResolvedShape& shape) {
+    const Pi05ResolvedShape& shape,
+    bool observing) {
     if (!context_ || allocation_started_) {
         return invalid("SM110 physical resources cannot be allocated");
     }
@@ -129,6 +130,7 @@ modalities::Status Sm110PhysicalResources::allocate(
     modalities::Status status = validate_pi05_resolved_shape(shape);
     if (!status.ok_status()) return status;
     shape_ = shape;
+    observing_ = observing;
     padded_key_stride_ = shape.total_attention_keys +
                          (shape.total_attention_keys & 1);
 
@@ -267,6 +269,29 @@ modalities::Status Sm110PhysicalResources::allocate(
                 {steps, decoder_layers, kPi05LinearScalesPerLayer}),
             modalities::DType::kFloat32);
 
+    if (observing_) {
+        FRT_ADD(observer_.encoder_normalized,
+                "pi05_sm110_observer_encoder_normalized",
+                modalities::Shape({encoder_sequence, encoder_width}),
+                modalities::DType::kFloat16);
+        FRT_ADD(observer_.encoder_residual,
+                "pi05_sm110_observer_encoder_residual",
+                modalities::Shape({encoder_sequence, encoder_width}),
+                modalities::DType::kFloat16);
+        FRT_ADD(observer_.encoder_hidden,
+                "pi05_sm110_observer_encoder_hidden",
+                modalities::Shape(
+                    {encoder_sequence,
+                     dim(kPi05ModelDims.encoder_hidden)}),
+                modalities::DType::kFloat16);
+        FRT_ADD(observer_.decoder_hidden,
+                "pi05_sm110_observer_decoder_hidden",
+                modalities::Shape(
+                    {decoder_sequence,
+                     dim(kPi05ModelDims.decoder_hidden)}),
+                modalities::DType::kFloat16);
+    }
+
     const modalities::Shape control_shape({sizeof(std::int32_t)});
     FRT_ADD(controls_.encoder_valid_tokens,
             "pi05_sm110_encoder_valid_tokens", control_shape,
@@ -281,6 +306,75 @@ modalities::Status Sm110PhysicalResources::allocate(
 
     allocated_ = true;
     return modalities::Status::ok();
+}
+
+modalities::Status Sm110PhysicalResources::initialize_observer() {
+    if (!allocated_ || initialized_ || !observing_) {
+        return invalid("SM110 observer resource state is invalid");
+    }
+    const float unit = 1.0f;
+    encoder_reset_.assign(
+        encoder_.activation_scales.bytes() / sizeof(float), unit);
+    decoder_reset_.assign(
+        decoder_.activation_scales.bytes() / sizeof(float), unit);
+    if (cudaMemcpy(vision_.unit_scale.device_data(), &unit, sizeof(unit),
+                   cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(encoder_.activation_scales.device_data(),
+                   encoder_reset_.data(),
+                   encoder_.activation_scales.bytes(),
+                   cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(decoder_.activation_scales.device_data(),
+                   decoder_reset_.data(),
+                   decoder_.activation_scales.bytes(),
+                   cudaMemcpyHostToDevice) != cudaSuccess) {
+        return backend("SM110 observer resource upload failed");
+    }
+    modalities::Status status = set_prompt_length(0);
+    if (!status.ok_status()) return status;
+    initialized_ = true;
+    return modalities::Status::ok();
+}
+
+modalities::Status Sm110PhysicalResources::reset_observer(
+    Pi05Stream stream) const {
+    if (!initialized_ || !observing_) {
+        return invalid("SM110 observer reset state is invalid");
+    }
+    if (encoder_reset_.empty() || decoder_reset_.empty()) {
+        return invalid("SM110 observer reset values are unavailable");
+    }
+    cudaStream_t native = reinterpret_cast<cudaStream_t>(stream);
+    cudaError_t result = cudaMemcpyAsync(
+        encoder_.activation_scales.device_data(), encoder_reset_.data(),
+        encoder_.activation_scales.bytes(), cudaMemcpyHostToDevice, native);
+    if (result == cudaSuccess) {
+        result = cudaMemcpyAsync(
+            decoder_.activation_scales.device_data(), decoder_reset_.data(),
+            decoder_.activation_scales.bytes(), cudaMemcpyHostToDevice,
+            native);
+    }
+    return result == cudaSuccess ? modalities::Status::ok()
+                                 : backend(cudaGetErrorString(result));
+}
+
+modalities::Status Sm110PhysicalResources::download_observer(
+    std::vector<float>* encoder,
+    std::vector<float>* decoder) const {
+    if (!initialized_ || !observing_ || !encoder || !decoder) {
+        return invalid("SM110 observer download state is invalid");
+    }
+    encoder->resize(encoder_.activation_scales.bytes() / sizeof(float));
+    decoder->resize(decoder_.activation_scales.bytes() / sizeof(float));
+    cudaError_t result = cudaMemcpy(
+        encoder->data(), encoder_.activation_scales.device_data(),
+        encoder_.activation_scales.bytes(), cudaMemcpyDeviceToHost);
+    if (result == cudaSuccess) {
+        result = cudaMemcpy(
+            decoder->data(), decoder_.activation_scales.device_data(),
+            decoder_.activation_scales.bytes(), cudaMemcpyDeviceToHost);
+    }
+    return result == cudaSuccess ? modalities::Status::ok()
+                                 : backend(cudaGetErrorString(result));
 }
 
 modalities::Status Sm110PhysicalResources::initialize_static(

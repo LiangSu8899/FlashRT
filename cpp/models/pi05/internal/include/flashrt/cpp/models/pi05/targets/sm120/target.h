@@ -51,17 +51,16 @@ public:
     modalities::Status initialize_capture_inputs() override;
     modalities::Status reset_after_warmup() override;
     modalities::Status set_prompt_length(int prompt_tokens) override;
+    bool observes_activations() const override;
+    modalities::Status reset_observer(Pi05Stream stream) override;
+    modalities::Status download_observer(
+        Pi05ObservedScales* out) const override;
     const Pi05ResolvedResources* resolved_resources() const;
     std::size_t materialized_weight_count() const;
     std::size_t packed_weight_count() const;
     std::size_t autotuned_shape_count() const;
     std::size_t prepare_call_count() const;
     Sm120ExecutionMode execution_mode() const;
-    modalities::Status reset_observer_scales(Pi05Stream stream);
-    modalities::Status download_observer_scales(
-        std::vector<float>* vision,
-        std::vector<float>* encoder,
-        std::vector<float>* decoder) const;
     bool ready_for_capture() const;
 
 private:

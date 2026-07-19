@@ -1334,8 +1334,11 @@ Sm120ExecutionMode Sm120TargetBundle::execution_mode() const {
                  : Sm120ExecutionMode::kBf16;
 }
 
-modalities::Status Sm120TargetBundle::reset_observer_scales(
-    Pi05Stream stream) {
+bool Sm120TargetBundle::observes_activations() const {
+    return impl_ && observed_fp8(impl_->config.execution_mode);
+}
+
+modalities::Status Sm120TargetBundle::reset_observer(Pi05Stream stream) {
     if (!impl_ || impl_->state != Impl::State::kCaptureInputsInitialized ||
         !observed_fp8(impl_->config.execution_mode) ||
         !impl_->fp8_activation) {
@@ -1344,17 +1347,15 @@ modalities::Status Sm120TargetBundle::reset_observer_scales(
     return impl_->fp8_activation->reset_observer_scales(stream);
 }
 
-modalities::Status Sm120TargetBundle::download_observer_scales(
-    std::vector<float>* vision,
-    std::vector<float>* encoder,
-    std::vector<float>* decoder) const {
+modalities::Status Sm120TargetBundle::download_observer(
+    Pi05ObservedScales* out) const {
     if (!impl_ || impl_->state != Impl::State::kCaptureInputsInitialized ||
         !observed_fp8(impl_->config.execution_mode) ||
-        !impl_->fp8_activation) {
+        !impl_->fp8_activation || !out) {
         return invalid("SM120 observer download state is invalid");
     }
     return impl_->fp8_activation->download_observer_scales(
-        vision, encoder, decoder);
+        &out->vision, &out->encoder, &out->decoder);
 }
 
 bool Sm120TargetBundle::ready_for_capture() const {

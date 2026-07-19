@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <memory>
+#include <optional>
 #include <string>
 
 namespace flashrt {
@@ -23,7 +24,7 @@ class Sm110PhysicalResources;
 
 struct Sm110TargetConfig final {
     std::string checkpoint_path;
-    NativeCalibrationArtifact calibration;
+    std::optional<NativeCalibrationArtifact> calibration;
 };
 
 // SM110 owns loading and physical bindings; model flow remains in the shared
@@ -51,6 +52,10 @@ public:
     modalities::Status initialize_capture_inputs() override;
     modalities::Status reset_after_warmup() override;
     modalities::Status set_prompt_length(int prompt_tokens) override;
+    bool observes_activations() const override;
+    modalities::Status reset_observer(Pi05Stream stream) override;
+    modalities::Status download_observer(
+        Pi05ObservedScales* out) const override;
     const Pi05ResolvedResources* resolved_resources() const;
     const Pi05NativeSupportBuffers* support_buffers() const;
     const Sm110PhysicalResources* physical_resources() const;

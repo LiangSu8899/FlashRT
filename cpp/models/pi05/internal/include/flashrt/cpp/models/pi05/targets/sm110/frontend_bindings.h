@@ -17,6 +17,7 @@ class Sm110PhysicalResources;
 struct Sm110FrontendBindings final {
     const Pi05ResolvedShape* shape = nullptr;
     const NativeCalibrationArtifact* calibration = nullptr;
+    bool observing = false;
     const Sm110PhysicalResources* physical = nullptr;
     const Sm110Fp8WeightPacker* weights = nullptr;
     Sm110OperationDriver* driver = nullptr;

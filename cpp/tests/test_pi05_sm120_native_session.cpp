@@ -175,15 +175,16 @@ int main() {
                      frt_buffer_bytes(buffers.noise.buffer),
                      cudaMemcpyHostToDevice) == cudaSuccess);
     if (observe) {
-        CHECK(concrete_target->reset_observer_scales(
-                  pi05_stream).ok_status());
+        CHECK(concrete_target->reset_observer(pi05_stream).ok_status());
     }
     CHECK(session->replay() == FRT_OK);
     CHECK(session->synchronize().ok_status());
     if (observe) {
-        CHECK(concrete_target->download_observer_scales(
-                  &vision_scales, &encoder_scales, &decoder_scales)
-                  .ok_status());
+        Pi05ObservedScales scales;
+        CHECK(concrete_target->download_observer(&scales).ok_status());
+        vision_scales = std::move(scales.vision);
+        encoder_scales = std::move(scales.encoder);
+        decoder_scales = std::move(scales.decoder);
         const auto valid_scales = [](const std::vector<float>& values) {
             return std::all_of(values.begin(), values.end(), [](float value) {
                 return std::isfinite(value) && value > 0.0f;
@@ -201,8 +202,7 @@ int main() {
                           frt_buffer_bytes(buffers.noise.buffer),
                           cudaMemcpyHostToDevice, stream) == cudaSuccess);
     if (observe) {
-        CHECK(concrete_target->reset_observer_scales(
-                  pi05_stream).ok_status());
+        CHECK(concrete_target->reset_observer(pi05_stream).ok_status());
     }
     CHECK(session->replay(Pi05GraphId::kContext) == FRT_OK);
     CHECK(session->replay(Pi05GraphId::kDecodeOnly) == FRT_OK);
@@ -213,8 +213,7 @@ int main() {
     count_allocations.store(true, std::memory_order_relaxed);
     for (int replay = 0; replay < 100; ++replay) {
         if (observe) {
-            CHECK(concrete_target->reset_observer_scales(
-                      pi05_stream).ok_status());
+            CHECK(concrete_target->reset_observer(pi05_stream).ok_status());
         }
         CHECK(cudaMemcpyAsync(
                   frt_buffer_dptr(buffers.noise.buffer), noise.data(),
@@ -229,9 +228,11 @@ int main() {
     }
     CHECK(session->synchronize().ok_status());
     if (observe) {
-        CHECK(concrete_target->download_observer_scales(
-                  &vision_scales, &encoder_scales, &decoder_scales)
-                  .ok_status());
+        Pi05ObservedScales scales;
+        CHECK(concrete_target->download_observer(&scales).ok_status());
+        vision_scales = std::move(scales.vision);
+        encoder_scales = std::move(scales.encoder);
+        decoder_scales = std::move(scales.decoder);
     }
     count_allocations.store(false, std::memory_order_relaxed);
     CHECK(allocation_count.load(std::memory_order_relaxed) == 0);
