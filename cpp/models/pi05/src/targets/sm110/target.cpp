@@ -8,6 +8,7 @@
 #include "flashrt/cpp/models/pi05/support/native_workspace.h"
 #include "flashrt/cpp/models/pi05/targets/sm110/fp8_weight_packer.h"
 #include "flashrt/cpp/models/pi05/targets/sm110/operation_driver.h"
+#include "flashrt/cpp/models/pi05/targets/sm110/operations.h"
 #include "flashrt/cpp/models/pi05/targets/sm110/physical_resources.h"
 
 #include <cuda_runtime_api.h>
@@ -74,6 +75,46 @@ bool valid_shape_for_target(const Pi05ResolvedShape& shape) {
            (shape.max_prompt_tokens & 1) == 0;
 }
 
+bool prepare_operation(Pi05OperationId id) {
+    return id == Pi05OperationId::kTimeMlp ||
+           id == Pi05OperationId::kAttentionStyle ||
+           id == Pi05OperationId::kMlpStyle ||
+           id == Pi05OperationId::kFinalStyle;
+}
+
+modalities::Status zero_prepare_storage(
+    const Pi05ResolvedResources& resources,
+    const Sm110PhysicalResources& physical) {
+    const Pi05ResolvedBuffer* outputs[] = {
+        &resources.buffers.time_state,
+        &resources.buffers.attention_style,
+        &resources.buffers.mlp_style,
+        &resources.buffers.final_style,
+    };
+    for (const Pi05ResolvedBuffer* output : outputs) {
+        if (!output->buffer || !output->physical_bytes ||
+            cudaMemset(frt_buffer_dptr(output->buffer), 0,
+                       output->physical_bytes) != cudaSuccess) {
+            return backend("SM110 prepare output initialization failed");
+        }
+    }
+    const Sm110Buffer* scratch[] = {
+        &physical.decoder().normalized,
+        &physical.decoder().gate,
+    };
+    for (const Sm110Buffer* buffer : scratch) {
+        if (!buffer->device_data() || !buffer->bytes() ||
+            cudaMemset(buffer->device_data(), 0, buffer->bytes()) !=
+                cudaSuccess) {
+            return backend("SM110 prepare scratch initialization failed");
+        }
+    }
+    const cudaError_t synchronized = cudaDeviceSynchronize();
+    return synchronized == cudaSuccess
+               ? modalities::Status::ok()
+               : backend(cudaGetErrorString(synchronized));
+}
+
 }  // namespace
 
 struct Sm110TargetBundle::Impl final {
@@ -81,6 +122,7 @@ struct Sm110TargetBundle::Impl final {
         kConstructed = 0,
         kResourcesInitialized,
         kResourcesResolved,
+        kPrepareComplete,
         kFailed,
     };
 
@@ -98,6 +140,11 @@ struct Sm110TargetBundle::Impl final {
         return status;
     }
 
+    bool resources_available() const {
+        return state == State::kResourcesResolved ||
+               state == State::kPrepareComplete;
+    }
+
     Pi05ResolvedShape shape;
     Sm110TargetConfig config;
     NativeDeviceWeightStore weights;
@@ -105,6 +152,7 @@ struct Sm110TargetBundle::Impl final {
     Sm110PhysicalResources physical;
     std::unique_ptr<Sm110Fp8WeightPacker> packer;
     std::unique_ptr<Sm110OperationDriver> driver;
+    std::unique_ptr<Sm110Operations> operations;
     Pi05ResolvedResources resources;
     Pi05NativeSupportBuffers support;
     int committed_prompt_length = 0;
@@ -253,8 +301,16 @@ modalities::Status Sm110TargetBundle::resolve_resources(
         if (!status.ok_status()) return impl_->fail(std::move(status));
 
         impl_->resources = resolved;
+        impl_->operations = Sm110Operations::create(
+            impl_->shape, impl_->resources, impl_->support, impl_->physical,
+            *impl_->packer, *impl_->driver, &status);
+        if (!impl_->operations || !status.ok_status()) {
+            return impl_->fail(std::move(status));
+        }
+        status = zero_prepare_storage(impl_->resources, impl_->physical);
+        if (!status.ok_status()) return impl_->fail(std::move(status));
         impl_->state = Impl::State::kResourcesResolved;
-        *out = resolved;
+        *out = impl_->resources;
         return modalities::Status::ok();
     } catch (const std::exception& error) {
         return impl_->fail(backend(error.what()));
@@ -276,18 +332,50 @@ modalities::Status Sm110TargetBundle::reset_after_warmup() {
 }
 
 modalities::Status Sm110TargetBundle::record(
-    const Pi05OperationCall&,
+    const Pi05OperationCall& call,
     const Pi05ResolvedShape& shape,
-    Pi05Stream) {
+    Pi05Stream stream) {
     if (!impl_ || !pi05_resolved_shape_equal(shape, impl_->shape)) {
         return invalid("SM110 target operation shape is invalid");
     }
-    return unsupported("SM110 operation composition is not connected");
+    modalities::Status status = validate_pi05_operation_call(call, shape);
+    if (!status.ok_status()) return status;
+    if (!prepare_operation(call.id)) {
+        return unsupported("SM110 forward operation is not connected");
+    }
+    if (impl_->state != Impl::State::kResourcesResolved ||
+        !impl_->operations) {
+        return invalid("SM110 prepare operation state is invalid");
+    }
+    switch (call.id) {
+        case Pi05OperationId::kTimeMlp:
+            status = impl_->operations->time_mlp(call.step, stream);
+            break;
+        case Pi05OperationId::kAttentionStyle:
+            status = impl_->operations->attention_style(
+                call.layer, call.step, stream);
+            break;
+        case Pi05OperationId::kMlpStyle:
+            status = impl_->operations->mlp_style(
+                call.layer, call.step, stream);
+            break;
+        case Pi05OperationId::kFinalStyle:
+            status = impl_->operations->final_style(call.step, stream);
+            break;
+        default:
+            return unsupported("SM110 prepare operation is unsupported");
+    }
+    if (!status.ok_status()) return impl_->fail(std::move(status));
+    if (call.id == Pi05OperationId::kFinalStyle &&
+        call.step == shape.num_steps - 1) {
+        impl_->state = Impl::State::kPrepareComplete;
+    }
+    return modalities::Status::ok();
 }
 
 modalities::Status Sm110TargetBundle::set_prompt_length(
     int prompt_tokens) {
-    if (!impl_ || impl_->state != Impl::State::kResourcesResolved ||
+    if (!impl_ || !impl_->resources_available() ||
         prompt_tokens < 0 ||
         prompt_tokens > impl_->shape.max_prompt_tokens) {
         return invalid("SM110 prompt length is invalid");
@@ -341,13 +429,13 @@ modalities::Status Sm110TargetBundle::set_prompt_length(
 }
 
 const Pi05ResolvedResources* Sm110TargetBundle::resolved_resources() const {
-    return impl_ && impl_->state == Impl::State::kResourcesResolved
+    return impl_ && impl_->resources_available()
                ? &impl_->resources
                : nullptr;
 }
 
 const Pi05NativeSupportBuffers* Sm110TargetBundle::support_buffers() const {
-    return impl_ && impl_->state == Impl::State::kResourcesResolved
+    return impl_ && impl_->resources_available()
                ? &impl_->support
                : nullptr;
 }
@@ -381,7 +469,7 @@ std::size_t Sm110TargetBundle::logical_workspace_bytes() const {
 }
 
 bool Sm110TargetBundle::resources_ready() const {
-    return impl_ && impl_->state == Impl::State::kResourcesResolved;
+    return impl_ && impl_->resources_available();
 }
 
 }  // namespace sm110

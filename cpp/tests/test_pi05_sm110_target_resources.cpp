@@ -14,6 +14,7 @@
 #include <memory>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -147,6 +148,24 @@ void run_real_resource_contract(const char* checkpoint,
     assert(!target->set_prompt_length(shape.max_prompt_tokens + 1)
                 .ok_status());
     assert(read_control(resources.buffers.decoder_valid_tokens) == committed);
+
+    assert(resources.buffers.decoder_state.buffer);
+    const std::size_t decoder_bytes =
+        frt_buffer_bytes(resources.buffers.decoder_state.buffer);
+    assert(cudaMemset(frt_buffer_dptr(resources.buffers.decoder_state.buffer),
+                      0x5a, decoder_bytes) == cudaSuccess);
+    Pi05SemanticPipeline pipeline(shape);
+    assert(pipeline.record_prepare(*target).ok_status());
+    assert(cudaDeviceSynchronize() == cudaSuccess);
+    std::vector<unsigned char> decoder_state(decoder_bytes);
+    assert(cudaMemcpy(decoder_state.data(),
+                      frt_buffer_dptr(resources.buffers.decoder_state.buffer),
+                      decoder_bytes, cudaMemcpyDeviceToHost) == cudaSuccess);
+    for (unsigned char value : decoder_state) assert(value == 0x5a);
+    assert(target->resources_ready());
+    assert(target->resolved_resources());
+    assert(!pipeline.record_prepare(*target).ok_status());
+    assert(!target->finalize_setup().ok_status());
 
     target.reset();
     frt_ctx_destroy(context);
