@@ -15,6 +15,7 @@ namespace {
 
 constexpr int kCount = 4096;
 constexpr std::uint32_t kScaleBits = 0x3d092492u;
+constexpr std::uint32_t kDynamicF16ScaleBits = 0x3d979249u;
 constexpr std::uint64_t kOutputHash = 0x68ea83e06e2dce5cull;
 constexpr int kMidpointIndex = 402;
 constexpr std::uint8_t kMidpointOutput = 0xf2u;
@@ -103,6 +104,51 @@ bool check_setup_scale(const std::vector<__nv_bfloat16>& input) {
                          i, output[i], expected);
             return false;
         }
+    }
+    return true;
+}
+
+bool check_dynamic_f16_scale() {
+    const __half input[] = {
+        __float2half_rn(33.15625f),
+        __float2half_rn(-1.0f),
+    };
+    __half* device_input = nullptr;
+    __nv_fp8_e4m3* device_output = nullptr;
+    float* device_scale = nullptr;
+    if (!check_cuda(cudaMalloc(&device_input, sizeof(input)),
+                    "cudaMalloc(dynamic F16 input)") ||
+        !check_cuda(cudaMalloc(&device_output, sizeof(input) / sizeof(__half)),
+                    "cudaMalloc(dynamic F16 output)") ||
+        !check_cuda(cudaMalloc(&device_scale, sizeof(float)),
+                    "cudaMalloc(dynamic F16 scale)") ||
+        !check_cuda(cudaMemcpy(device_input, input, sizeof(input),
+                               cudaMemcpyHostToDevice),
+                    "copy dynamic F16 input")) {
+        cudaFree(device_input);
+        cudaFree(device_output);
+        cudaFree(device_scale);
+        return false;
+    }
+
+    quantize_fp8_device_fp16(device_input, device_output, device_scale, 2);
+    float scale = 0.0f;
+    const bool copied =
+        check_cuda(cudaGetLastError(), "dynamic F16 quantize launch") &&
+        check_cuda(cudaMemcpy(&scale, device_scale, sizeof(scale),
+                              cudaMemcpyDeviceToHost),
+                   "copy dynamic F16 scale");
+    cudaFree(device_input);
+    cudaFree(device_output);
+    cudaFree(device_scale);
+    if (!copied) return false;
+
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, &scale, sizeof(bits));
+    if (bits != kDynamicF16ScaleBits) {
+        std::fprintf(stderr, "dynamic F16 scale mismatch: %08x != %08x\n",
+                     bits, kDynamicF16ScaleBits);
+        return false;
     }
     return true;
 }
@@ -280,7 +326,7 @@ int main() {
                      "precise FP8 weight quantize golden mismatch\n");
         return 1;
     }
-    return check_setup_scale(input) &&
+    return check_setup_scale(input) && check_dynamic_f16_scale() &&
                    check_f16_pack(false, false) &&
                    check_f16_pack(false, true) &&
                    check_f16_pack(true, false) &&

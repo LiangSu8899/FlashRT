@@ -282,7 +282,8 @@ float quantize_fp8_fp16(const __half* input, __nv_fp8_e4m3* output,
 // ── FP8 Quantize Device-Only (CUDA Graph compatible) ──
 __global__ void compute_scale_kernel(const float* d_absmax, float* d_scale) {
     float amax = *d_absmax;
-    float scale = amax / 448.0f;
+    // Preserve producer scale semantics under --use_fast_math.
+    float scale = __fdiv_rn(amax, 448.0f);
     if (scale < 1e-12f) scale = 1e-12f;
     *d_scale = scale;
 }
