@@ -32,6 +32,18 @@ def capture(fn, **kwargs):
     return _capture(fn, **kwargs)
 
 
+def run_recipe(recipe, model, ctx=None, **kwargs):
+    """Recipe door: assemble declared levers, audit same-process on the
+    graph, certify or refuse — one call, one receipt.
+
+    See :mod:`flash_rt.structures.recipe` for ``Recipe``/``Lever``/
+    ``Gates`` and the switch lifecycle.
+    """
+    from flash_rt.structures.recipe import run_recipe as _run
+
+    return _run(recipe, model, ctx, **kwargs)
+
+
 def attach(model, forward, **kwargs):
     """One-call front door: discover, calibrate, gate, activate.
 
@@ -44,4 +56,4 @@ def attach(model, forward, **kwargs):
 
 
 __all__ = ["StructureSpec", "attach", "capture", "get", "list_structures",
-           "load"]
+           "load", "run_recipe"]
