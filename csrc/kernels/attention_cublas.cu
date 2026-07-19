@@ -68,30 +68,32 @@ void attention_qkv_fp16(
         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
 }
 
-// Mask rows [seqused_k[0], S_kv_max) in every logits column.
-// logits is col-major [S_kv_max, S*NH].
+// Mask rows [seqused_k[0], S_kv_stride) in every logits column.
+// logits is col-major [S_kv_stride, S*NH]. S_kv_stride may include one
+// physical pad row for half-aligned cuBLAS accesses.
 __global__ void mask_seqused_logits_kernel(
-    __half* logits, int S_kv_max, int S_NH, const int* __restrict__ seqused_k)
+    __half* logits, int S_kv_actual, int S_kv_stride, int S_NH,
+    const int* __restrict__ seqused_k)
 {
     int valid = seqused_k[0];
     if (valid < 0) valid = 0;
-    if (valid > S_kv_max) valid = S_kv_max;
-    int mask_rows = S_kv_max - valid;
+    if (valid > S_kv_actual) valid = S_kv_actual;
+    int mask_rows = S_kv_stride - valid;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = S_NH * mask_rows;
     if (idx >= total) return;
     int col = idx / mask_rows;
     int row = valid + (idx % mask_rows);
-    logits[col * S_kv_max + row] = __float2half(-65504.0f);
+    logits[col * S_kv_stride + row] = __float2half(-65504.0f);
 }
 
-void mask_seqused_logits_fp16(__half* logits, int S_kv_max, int S_NH,
+void mask_seqused_logits_fp16(__half* logits, int S_kv_actual,
+                              int S_kv_stride, int S_NH,
                               const int* seqused_k, cudaStream_t stream) {
-    // Launch even when valid == S_kv_max; the kernel exits with total=0.
-    int total = S_NH * S_kv_max;
+    int total = S_NH * S_kv_stride;
     if (total > 0) {
         mask_seqused_logits_kernel<<<(total + 255) / 256, 256, 0, stream>>>(
-            logits, S_kv_max, S_NH, seqused_k);
+            logits, S_kv_actual, S_kv_stride, S_NH, seqused_k);
     }
 }
 
@@ -108,6 +110,7 @@ void attention_qkv_fp16_seqused(
     cudaStream_t stream)
 {
     cublasSetStream(handle, stream);
+    const int S_kv_stride = S_kv_max + (S_kv_max & 1);
 
     float zero = 0.0f;
     cublasGemmEx(handle,
@@ -117,11 +120,12 @@ void attention_qkv_fp16_seqused(
         K, CUDA_R_16F, HD,
         Q, CUDA_R_16F, HD,
         &zero,
-        logits, CUDA_R_16F, S_kv_max,
+        logits, CUDA_R_16F, S_kv_stride,
         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
 
-    mask_seqused_logits_fp16(logits, S_kv_max, S * NH, seqused_k, stream);
-    softmax_fp16(logits, S * NH, S_kv_max, stream);
+    mask_seqused_logits_fp16(
+        logits, S_kv_max, S_kv_stride, S * NH, seqused_k, stream);
+    softmax_fp16(logits, S * NH, S_kv_stride, stream);
 
     float one = 1.0f;
     cublasGemmEx(handle,
@@ -129,7 +133,7 @@ void attention_qkv_fp16_seqused(
         HD, S * NH, S_kv_max,
         &one,
         V, CUDA_R_16F, HD,
-        logits, CUDA_R_16F, S_kv_max,
+        logits, CUDA_R_16F, S_kv_stride,
         &zero,
         out, CUDA_R_16F, HD,
         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);

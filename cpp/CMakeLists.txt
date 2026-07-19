@@ -336,6 +336,24 @@ if(BUILD_TESTING)
       CUDA_STANDARD 17
       CUDA_STANDARD_REQUIRED ON)
     add_test(NAME csrc_rope_table COMMAND test_csrc_rope_table)
+
+    add_executable(test_csrc_attention_seqused
+      tests/test_csrc_attention_seqused.cu
+      ${CMAKE_CURRENT_SOURCE_DIR}/../csrc/kernels/attention_cublas.cu
+      ${CMAKE_CURRENT_SOURCE_DIR}/../csrc/kernels/softmax.cu)
+    target_include_directories(test_csrc_attention_seqused PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/../csrc/kernels)
+    target_link_libraries(test_csrc_attention_seqused PRIVATE
+      CUDA::cublas CUDA::cudart)
+    target_compile_options(test_csrc_attention_seqused PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:
+        --expt-relaxed-constexpr -O3
+        --ftz=true --prec-div=false --prec-sqrt=false>)
+    set_target_properties(test_csrc_attention_seqused PROPERTIES
+      CUDA_STANDARD 17
+      CUDA_STANDARD_REQUIRED ON)
+    add_test(NAME csrc_attention_seqused
+      COMMAND test_csrc_attention_seqused)
   endif()
 
   if(TARGET flashrt_cpp_csrc_core)

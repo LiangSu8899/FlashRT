@@ -24,13 +24,14 @@ void attention_qkv_fp16(
 
 // Fixed-shape attention with a device-side valid K/V length.
 // QK and PV keep the graph-captured S_kv_max shape; logits rows
-// [seqused_k[0], S_kv_max) are masked before softmax.
+// [seqused_k[0], S_kv_max) are masked before softmax. The physical logits
+// stride is round_up_even(S_kv_max), and the pad row is masked as well.
 void attention_qkv_fp16_seqused(
     cublasHandle_t handle,
     const __half* Q,         // (S*NH, HD)
     const __half* K,         // (S_kv_max, HD)
     const __half* V,         // (S_kv_max, HD)
-    __half* logits,          // scratch: (S*NH, S_kv_max)
+    __half* logits,          // scratch: S*NH * round_up_even(S_kv_max)
     __half* out,             // (S*NH, HD)
     int S, int S_kv_max, int NH, int HD,
     const int* seqused_k,    // device int32[1], valid K/V rows
