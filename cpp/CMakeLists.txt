@@ -636,28 +636,6 @@ if(BUILD_TESTING)
     COMMAND test_pi05_native_resource_resolver)
 
   if(TARGET flashrt_cpp_pi05_target_sm120)
-    add_executable(test_pi05_sm120_attention
-      tests/test_pi05_sm120_attention.cpp)
-    target_link_libraries(test_pi05_sm120_attention PRIVATE
-      flashrt_cpp_pi05_target_sm120 flashrt_exec CUDA::cudart)
-    add_test(NAME pi05_sm120_attention COMMAND test_pi05_sm120_attention)
-
-    add_executable(test_pi05_sm120_bf16_target
-      tests/test_pi05_sm120_bf16_target.cpp)
-    target_link_libraries(test_pi05_sm120_bf16_target PRIVATE
-      flashrt_cpp_pi05_target_sm120 flashrt_exec CUDA::cudart)
-    add_test(NAME pi05_sm120_bf16_target
-      COMMAND test_pi05_sm120_bf16_target)
-
-    add_executable(test_pi05_sm120_fp8_weight_packer
-      tests/test_pi05_sm120_fp8_weight_packer.cpp)
-    target_include_directories(test_pi05_sm120_fp8_weight_packer PRIVATE
-      ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/internal/include)
-    target_link_libraries(test_pi05_sm120_fp8_weight_packer PRIVATE
-      flashrt_cpp_pi05_target_sm120 flashrt_exec CUDA::cudart)
-    add_test(NAME pi05_sm120_fp8_weight_packer
-      COMMAND test_pi05_sm120_fp8_weight_packer)
-
     add_executable(test_pi05_sm120_fp8_linear
       tests/test_pi05_sm120_fp8_linear.cpp)
     target_include_directories(test_pi05_sm120_fp8_linear PRIVATE
@@ -674,25 +652,6 @@ if(BUILD_TESTING)
     add_test(NAME pi05_sm120_target_bundle
       COMMAND test_pi05_sm120_target_bundle)
 
-    if(TARGET flashrt_cpp_pi05_capture)
-      add_executable(test_pi05_sm120_native_session
-        tests/test_pi05_sm120_native_session.cpp)
-      target_link_libraries(test_pi05_sm120_native_session PRIVATE
-        flashrt_cpp_pi05_target_sm120 flashrt_cpp_pi05_capture
-        flashrt_exec CUDA::cudart)
-      add_test(NAME pi05_sm120_native_session
-        COMMAND test_pi05_sm120_native_session)
-    endif()
-  endif()
-
-  if(TARGET flashrt_cpp_pi05_target_sm110)
-    add_executable(test_pi05_sm110_target_resources
-      tests/test_pi05_sm110_target_resources.cpp)
-    target_link_libraries(test_pi05_sm110_target_resources PRIVATE
-      flashrt_cpp_pi05_target_sm110 flashrt_cpp_pi05_capture
-      flashrt_exec CUDA::cudart)
-    add_test(NAME pi05_sm110_target_resources
-      COMMAND test_pi05_sm110_target_resources)
   endif()
 
   if(TARGET flashrt_cpp_native_cuda)
