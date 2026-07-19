@@ -26,6 +26,7 @@ struct Pi05NativeWeightLayout final {
 struct Pi05TargetBufferBindings final {
     Pi05ResolvedBuffer key_cache;
     Pi05ResolvedBuffer value_cache;
+    Pi05ResolvedBuffer action_delta;
     Pi05ResolvedBuffer encoder_valid_tokens;
     Pi05ResolvedBuffer decoder_valid_tokens;
     Pi05ResolvedBuffer decoder_position;

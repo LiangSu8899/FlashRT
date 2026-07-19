@@ -10,6 +10,8 @@ namespace flashrt {
 namespace models {
 namespace pi05 {
 
+inline constexpr std::size_t kPi05LinearScalesPerLayer = 4;
+
 enum class Pi05LinearDomain : std::uint8_t {
     kVision = 0,
     kEncoder,

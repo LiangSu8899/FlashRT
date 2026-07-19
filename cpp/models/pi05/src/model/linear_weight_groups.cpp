@@ -143,23 +143,23 @@ modalities::Status resolve_pi05_linear_scale_layout(
     if (!out) return invalid("PI0.5 linear scale layout output is null");
     modalities::Status status = validate_pi05_resolved_shape(shape);
     if (!status.ok_status()) return status;
-    constexpr std::size_t kSlotsPerLayer = 4;
     const std::size_t decoder_layers =
         static_cast<std::size_t>(kPi05ModelDims.decoder_layers);
     const std::size_t steps = static_cast<std::size_t>(shape.num_steps);
     if (steps > std::numeric_limits<std::size_t>::max() /
-                    decoder_layers / kSlotsPerLayer) {
+                    decoder_layers / kPi05LinearScalesPerLayer) {
         return invalid("PI0.5 decoder scale layout overflows");
     }
     Pi05LinearScaleLayout layout;
     layout.vision =
         static_cast<std::size_t>(kPi05ModelDims.vision_layers) *
-            kSlotsPerLayer +
+            kPi05LinearScalesPerLayer +
         1;
     layout.encoder =
         static_cast<std::size_t>(kPi05ModelDims.encoder_layers) *
-        kSlotsPerLayer;
-    layout.decoder = steps * decoder_layers * kSlotsPerLayer;
+        kPi05LinearScalesPerLayer;
+    layout.decoder =
+        steps * decoder_layers * kPi05LinearScalesPerLayer;
     *out = layout;
     return modalities::Status::ok();
 }
@@ -174,7 +174,6 @@ modalities::Status resolve_pi05_linear_activation_site(
     modalities::Status status =
         resolve_pi05_linear_scale_layout(shape, &layout);
     if (!status.ok_status()) return status;
-    constexpr std::size_t kSlotsPerLayer = 4;
     Pi05LinearActivationSite site;
     site.domain = key.domain;
     if (key.domain == Pi05LinearDomain::kVision &&
@@ -215,7 +214,7 @@ modalities::Status resolve_pi05_linear_activation_site(
         linear_layer += static_cast<std::size_t>(step) *
                         static_cast<std::size_t>(layers);
     }
-    site.index = linear_layer * kSlotsPerLayer +
+    site.index = linear_layer * kPi05LinearScalesPerLayer +
                  static_cast<std::size_t>(slot);
     const std::size_t count =
         key.domain == Pi05LinearDomain::kVision

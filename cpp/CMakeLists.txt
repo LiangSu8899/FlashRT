@@ -28,8 +28,13 @@ option(FLASHRT_CPP_WITH_FA2
        "Enable the Python-free vendored FA2 operation library" OFF)
 option(FLASHRT_CPP_WITH_PI05_SM120_TARGET
        "Build the PI0.5 SM120 frontend target" OFF)
+option(FLASHRT_CPP_WITH_PI05_SM110_TARGET
+       "Build the PI0.5 SM110 frontend target" OFF)
 set(FLASHRT_CPP_FA2_LIBRARY "" CACHE FILEPATH
     "Path to the Python-free libflashrt_fa2_raw shared library")
+set(FLASHRT_CPP_CUTLASS_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/cutlass" CACHE PATH
+    "Path to CUTLASS for the PI0.5 SM110 frontend target")
 if(FLASHRT_CPP_WITH_CUDA_STAGING)
   find_package(CUDAToolkit REQUIRED)
 endif()
@@ -81,6 +86,26 @@ if(FLASHRT_CPP_WITH_PI05_SM120_TARGET)
   if(NOT FLASHRT_CPP_WITH_EXEC)
     message(FATAL_ERROR
       "FLASHRT_CPP_WITH_PI05_SM120_TARGET requires the exec layer")
+  endif()
+endif()
+if(FLASHRT_CPP_WITH_PI05_SM110_TARGET)
+  if(NOT FLASHRT_CPP_WITH_CUDA_KERNELS)
+    message(FATAL_ERROR
+      "FLASHRT_CPP_WITH_PI05_SM110_TARGET requires CUDA kernels")
+  endif()
+  if(NOT FLASHRT_CPP_WITH_CUDA_STAGING)
+    message(FATAL_ERROR
+      "FLASHRT_CPP_WITH_PI05_SM110_TARGET requires CUDA staging")
+  endif()
+  if(NOT FLASHRT_CPP_WITH_EXEC)
+    message(FATAL_ERROR
+      "FLASHRT_CPP_WITH_PI05_SM110_TARGET requires the exec layer")
+  endif()
+  if(NOT EXISTS
+     "${FLASHRT_CPP_CUTLASS_DIR}/include/cutlass/cutlass.h")
+    message(FATAL_ERROR
+      "FLASHRT_CPP_WITH_PI05_SM110_TARGET requires CUTLASS; set "
+      "FLASHRT_CPP_CUTLASS_DIR to a compatible checkout")
   endif()
 endif()
 if(FLASHRT_CPP_WITH_SENTENCEPIECE)
@@ -192,7 +217,7 @@ if(FLASHRT_CPP_WITH_CUDA_KERNELS AND FLASHRT_CPP_WITH_EXEC)
     PUBLIC flashrt_cpp_modalities flashrt_exec CUDA::cudart)
 endif()
 
-if(FLASHRT_CPP_WITH_FA2)
+if(FLASHRT_CPP_WITH_FA2 OR FLASHRT_CPP_WITH_PI05_SM110_TARGET)
   set(_flashrt_csrc_dir "${CMAKE_CURRENT_SOURCE_DIR}/../csrc")
 
   function(_flashrt_configure_csrc_target target)
@@ -224,12 +249,52 @@ if(FLASHRT_CPP_WITH_FA2)
   target_link_libraries(flashrt_cpp_csrc_core PUBLIC
     flashrt_cpp_csrc_precise_math)
 
-  add_library(flashrt_cpp_csrc_sm120 STATIC
-    ${_flashrt_csrc_dir}/kernels/dit_bf16.cu
-    ${_flashrt_csrc_dir}/kernels/fusion.cu)
-  _flashrt_configure_csrc_target(flashrt_cpp_csrc_sm120)
-  target_link_libraries(flashrt_cpp_csrc_sm120 PUBLIC
-    flashrt_cpp_csrc_core)
+  if(FLASHRT_CPP_WITH_FA2)
+    add_library(flashrt_cpp_csrc_sm120 STATIC
+      ${_flashrt_csrc_dir}/kernels/dit_bf16.cu
+      ${_flashrt_csrc_dir}/kernels/fusion.cu)
+    _flashrt_configure_csrc_target(flashrt_cpp_csrc_sm120)
+    target_link_libraries(flashrt_cpp_csrc_sm120 PUBLIC
+      flashrt_cpp_csrc_core)
+  endif()
+
+  if(FLASHRT_CPP_WITH_PI05_SM110_TARGET)
+    add_library(flashrt_cpp_csrc_sm110_precise OBJECT
+      ${_flashrt_csrc_dir}/attention/fmha_fp16_strided.cu
+      ${_flashrt_csrc_dir}/kernels/silu_precise.cu)
+    target_include_directories(flashrt_cpp_csrc_sm110_precise PRIVATE
+      ${_flashrt_csrc_dir}/attention
+      ${FLASHRT_CPP_CUTLASS_DIR}/examples/77_blackwell_fmha
+      ${FLASHRT_CPP_CUTLASS_DIR}/include
+      ${FLASHRT_CPP_CUTLASS_DIR}/tools/util/include)
+    target_compile_options(flashrt_cpp_csrc_sm110_precise PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:
+        --expt-relaxed-constexpr --expt-extended-lambda -O3>)
+    set_target_properties(flashrt_cpp_csrc_sm110_precise PROPERTIES
+      CUDA_ARCHITECTURES 110a
+      CUDA_STANDARD 17
+      CUDA_STANDARD_REQUIRED ON)
+
+    add_library(flashrt_cpp_csrc_sm110 STATIC
+      $<TARGET_OBJECTS:flashrt_cpp_csrc_sm110_precise>
+      ${_flashrt_csrc_dir}/gemm/cutlass_sm100.cu
+      ${_flashrt_csrc_dir}/kernels/attention_cublas.cu
+      ${_flashrt_csrc_dir}/kernels/decoder_fused.cu
+      ${_flashrt_csrc_dir}/kernels/softmax.cu)
+    _flashrt_configure_csrc_target(flashrt_cpp_csrc_sm110)
+    target_include_directories(flashrt_cpp_csrc_sm110 PRIVATE
+      ${FLASHRT_CPP_CUTLASS_DIR}/examples/77_blackwell_fmha
+      ${FLASHRT_CPP_CUTLASS_DIR}/include
+      ${FLASHRT_CPP_CUTLASS_DIR}/tools/util/include)
+    target_compile_options(flashrt_cpp_csrc_sm110 PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:
+        --expt-extended-lambda --use_fast_math>)
+    set_target_properties(flashrt_cpp_csrc_sm110 PROPERTIES
+      CUDA_ARCHITECTURES 110a
+      CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+    target_link_libraries(flashrt_cpp_csrc_sm110 PUBLIC
+      flashrt_cpp_csrc_core)
+  endif()
 endif()
 
 add_library(flashrt_cpp_loader STATIC
@@ -317,6 +382,24 @@ if(FLASHRT_CPP_WITH_PI05_SM120_TARGET)
     PUBLIC flashrt_cpp_pi05
     PRIVATE flashrt_cpp_loader flashrt_cpp_csrc_core flashrt_cpp_csrc_sm120
             flashrt_cpp_fa2_external CUDA::cudart)
+endif()
+
+if(FLASHRT_CPP_WITH_PI05_SM110_TARGET)
+  add_library(flashrt_cpp_pi05_target_sm110 STATIC
+    models/pi05/src/targets/sm110/fp8_weight_packer.cpp
+    models/pi05/src/targets/sm110/operation_driver.cu
+    models/pi05/src/targets/sm110/physical_resources.cpp
+    models/pi05/src/targets/sm110/target.cpp)
+  target_include_directories(flashrt_cpp_pi05_target_sm110
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/internal/include)
+  target_link_libraries(flashrt_cpp_pi05_target_sm110
+    PUBLIC flashrt_cpp_pi05
+    PRIVATE flashrt_cpp_loader flashrt_cpp_csrc_core
+            flashrt_cpp_csrc_sm110 CUDA::cublas CUDA::cudart)
+  set_target_properties(flashrt_cpp_pi05_target_sm110 PROPERTIES
+    CUDA_ARCHITECTURES 110a
+    CUDA_STANDARD 17
+    CUDA_STANDARD_REQUIRED ON)
 endif()
 
 add_library(flashrt_cpp_pi05_c SHARED
@@ -537,6 +620,15 @@ if(BUILD_TESTING)
       add_test(NAME pi05_sm120_native_session
         COMMAND test_pi05_sm120_native_session)
     endif()
+  endif()
+
+  if(TARGET flashrt_cpp_pi05_target_sm110)
+    add_executable(test_pi05_sm110_target_resources
+      tests/test_pi05_sm110_target_resources.cpp)
+    target_link_libraries(test_pi05_sm110_target_resources PRIVATE
+      flashrt_cpp_pi05_target_sm110 flashrt_exec CUDA::cudart)
+    add_test(NAME pi05_sm110_target_resources
+      COMMAND test_pi05_sm110_target_resources)
   endif()
 
   if(TARGET flashrt_cpp_native_cuda)

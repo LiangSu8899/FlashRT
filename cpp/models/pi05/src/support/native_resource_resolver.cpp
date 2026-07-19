@@ -239,8 +239,6 @@ modalities::Status resolve_pi05_native_buffers(
         {"encoder_x", Pi05ValueId::kEncoderState, &result.encoder_state},
         {"diffusion_noise", Pi05ValueId::kNoise, &result.noise},
         {"decoder_x", Pi05ValueId::kDecoderState, &result.decoder_state},
-        {"decoder_action_buf", Pi05ValueId::kActionDelta,
-         &result.action_delta},
         {"decoder_time_emb", Pi05ValueId::kTimeState, &result.time_state},
         {"decoder_style_attn", Pi05ValueId::kAttentionStyle,
          &result.attention_style},
@@ -256,6 +254,14 @@ modalities::Status resolve_pi05_native_buffers(
 
     result.key_cache = target.key_cache;
     result.value_cache = target.value_cache;
+    if (target.action_delta.buffer) {
+        result.action_delta = target.action_delta;
+    } else {
+        status = resolve_workspace_buffer(
+            workspace, "decoder_action_buf", Pi05ValueId::kActionDelta,
+            shape, &result.action_delta);
+        if (!status.ok_status()) return status;
+    }
     result.encoder_valid_tokens = target.encoder_valid_tokens;
     result.decoder_valid_tokens = target.decoder_valid_tokens;
     result.decoder_position = target.decoder_position;
