@@ -13,6 +13,24 @@ struct Pi05TargetProfile final {
     modalities::DType activation_dtype = modalities::DType::kUInt8;
 };
 
+enum class Pi05LinearEpilogueKind {
+    kNone = 0,
+    kBias,
+    kBiasGelu,
+    kBiasResidual,
+};
+
+struct Pi05LinearEpilogue final {
+    Pi05LinearEpilogueKind kind = Pi05LinearEpilogueKind::kNone;
+    const Pi05ResolvedWeight* bias = nullptr;
+    void* residual = nullptr;
+};
+
+struct Pi05LinearInput final {
+    const void* data = nullptr;
+    bool prequantized = false;
+};
+
 using Pi05LinearPrimitive = modalities::Status (*)(
     void* state,
     const Pi05ResolvedWeight& weight,
@@ -33,6 +51,7 @@ using Pi05ProjectedLinearPrimitive = modalities::Status (*)(
     int input_width,
     int output_width,
     bool prequantized,
+    const Pi05LinearEpilogue& epilogue,
     Pi05Stream stream);
 using Pi05BiasPrimitive = modalities::Status (*)(
     void* state,
@@ -75,6 +94,8 @@ using Pi05LayerNormPrimitive = modalities::Status (*)(
     int rows,
     int columns,
     float epsilon,
+    bool quantize,
+    Pi05LinearInput* linear_input,
     Pi05Stream stream);
 using Pi05QkvSplitPrimitive = modalities::Status (*)(
     void* state,
@@ -133,12 +154,14 @@ using Pi05AdaptiveNormalizePrimitive = modalities::Status (*)(
     const void** linear_input,
     bool* prequantized,
     Pi05Stream stream);
-using Pi05ResidualUpdatePrimitive = modalities::Status (*)(
+using Pi05DiffusionUpdatePrimitive = modalities::Status (*)(
     void* state,
     void* residual,
     const void* update,
-    const void* gate,
-    std::size_t elements,
+    const Pi05ResolvedWeight& bias,
+    int rows,
+    int columns,
+    int num_steps,
     Pi05Stream stream);
 using Pi05AttentionPrimitive = modalities::Status (*)(
     void* state,
@@ -212,7 +235,7 @@ struct Pi05PrimitiveSet final {
     Pi05NormalizeForLinearPrimitive normalize_for_linear = nullptr;
     Pi05QkvRopePrimitive qkv_rope = nullptr;
     Pi05AdaptiveNormalizePrimitive adaptive_normalize = nullptr;
-    Pi05ResidualUpdatePrimitive residual_update = nullptr;
+    Pi05DiffusionUpdatePrimitive diffusion_update = nullptr;
     Pi05AttentionPrimitive attention = nullptr;
     Pi05GateUpPrimitive gate_up = nullptr;
     Pi05GatedActivationPrimitive gated_activation = nullptr;
@@ -249,6 +272,7 @@ struct Pi05VisionExecution final {
     void* key = nullptr;
     void* value = nullptr;
     void* attention_output = nullptr;
+    Pi05LinearInput normalized_input;
 };
 
 struct Pi05EncoderExecution final {

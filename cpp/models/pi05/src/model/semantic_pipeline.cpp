@@ -368,7 +368,7 @@ bool complete_encoder(const Pi05EncoderExecution& encoder) {
 }
 
 bool complete_decoder(const Pi05PrimitiveSet* ops) {
-    return ops && ops->adaptive_normalize && ops->residual_update;
+    return ops && ops->adaptive_normalize && ops->diffusion_update;
 }
 
 bool complete_decoder(const Pi05DecoderExecution& decoder) {
@@ -453,7 +453,8 @@ modalities::Status execute_vision_embed(
     return ops.layer_norm(
         ops.state, state, first.pre_attention_norm_weight,
         first.pre_attention_norm_bias, execution.vision.normalized, rows,
-        width, kPi05ModelNumerics.vision_layer_norm_epsilon, stream);
+        width, kPi05ModelNumerics.vision_layer_norm_epsilon, true,
+        &execution.vision.normalized_input, stream);
 }
 
 modalities::Status execute_compose_prompt(
@@ -495,11 +496,12 @@ modalities::Status execute_vision_attention(
         ops.state, weights.attention_qkv_weight,
         {Pi05LinearDomain::kVision, Pi05LinearRole::kAttentionQkv,
          call.layer},
-        -1, execution.vision.normalized, execution.vision.qkv, rows, width,
-        3 * width, false, stream);
-    if (!status.ok_status()) return status;
-    status = ops.add_bias(ops.state, execution.vision.qkv,
-                          weights.attention_qkv_bias, rows, 3 * width, stream);
+        -1, execution.vision.normalized_input.data, execution.vision.qkv,
+        rows, width, 3 * width,
+        execution.vision.normalized_input.prequantized,
+        {Pi05LinearEpilogueKind::kBias,
+         &weights.attention_qkv_bias, nullptr},
+        stream);
     if (!status.ok_status()) return status;
     status = ops.qkv_split(
         ops.state, execution.vision.qkv, execution.vision.query,
@@ -519,17 +521,17 @@ modalities::Status execute_vision_attention(
         {Pi05LinearDomain::kVision, Pi05LinearRole::kAttentionOutput,
          call.layer},
         -1, execution.vision.attention_output, execution.vision.normalized,
-        rows, width, width, false, stream);
-    if (!status.ok_status()) return status;
-    status = ops.bias_residual(
-        ops.state, state, execution.vision.normalized,
-        weights.attention_output_bias, rows, width, stream);
+        rows, width, width, false,
+        {Pi05LinearEpilogueKind::kBiasResidual,
+         &weights.attention_output_bias, state},
+        stream);
     return status.ok_status()
                ? ops.layer_norm(
                      ops.state, state, weights.pre_mlp_norm_weight,
                      weights.pre_mlp_norm_bias, execution.vision.normalized,
                      rows, width,
-                     kPi05ModelNumerics.vision_layer_norm_epsilon, stream)
+                     kPi05ModelNumerics.vision_layer_norm_epsilon, true,
+                     &execution.vision.normalized_input, stream)
                : status;
 }
 
@@ -549,23 +551,20 @@ modalities::Status execute_vision_mlp(
     modalities::Status status = ops.projected_linear(
         ops.state, weights.mlp_up_weight,
         {Pi05LinearDomain::kVision, Pi05LinearRole::kMlpUp, call.layer}, -1,
-        execution.vision.normalized, execution.vision.hidden, rows, width,
-        hidden_width, false, stream);
-    if (!status.ok_status()) return status;
-    status = ops.add_bias(ops.state, execution.vision.hidden,
-                          weights.mlp_up_bias, rows, hidden_width, stream);
-    if (!status.ok_status()) return status;
-    status = ops.gelu(ops.state, execution.vision.hidden,
-                      static_cast<std::size_t>(rows) * hidden_width, stream);
+        execution.vision.normalized_input.data, execution.vision.hidden,
+        rows, width, hidden_width,
+        execution.vision.normalized_input.prequantized,
+        {Pi05LinearEpilogueKind::kBiasGelu, &weights.mlp_up_bias, nullptr},
+        stream);
     if (!status.ok_status()) return status;
     status = ops.projected_linear(
         ops.state, weights.mlp_down_weight,
         {Pi05LinearDomain::kVision, Pi05LinearRole::kMlpDown, call.layer}, -1,
         execution.vision.hidden, execution.vision.normalized, rows,
-        hidden_width, width, false, stream);
-    if (!status.ok_status()) return status;
-    status = ops.bias_residual(ops.state, state, execution.vision.normalized,
-                               weights.mlp_down_bias, rows, width, stream);
+        hidden_width, width, false,
+        {Pi05LinearEpilogueKind::kBiasResidual,
+         &weights.mlp_down_bias, state},
+        stream);
     if (!status.ok_status() ||
         call.layer + 1 == kPi05ModelDims.vision_layers) {
         return status;
@@ -576,7 +575,8 @@ modalities::Status execute_vision_mlp(
     return ops.layer_norm(
         ops.state, state, next.pre_attention_norm_weight,
         next.pre_attention_norm_bias, execution.vision.normalized, rows,
-        width, kPi05ModelNumerics.vision_layer_norm_epsilon, stream);
+        width, kPi05ModelNumerics.vision_layer_norm_epsilon, true,
+        &execution.vision.normalized_input, stream);
 }
 
 modalities::Status execute_vision_project(
@@ -598,21 +598,26 @@ modalities::Status execute_vision_project(
             shape.vision_pool_factor, stream);
         if (!status.ok_status()) return status;
     }
+    Pi05LinearInput projector_input;
     status = ops.layer_norm(
         ops.state, execution.vision.pooled, weights.final_norm_weight,
         weights.final_norm_bias, execution.vision.normalized, rows, width,
-        kPi05ModelNumerics.vision_layer_norm_epsilon, stream);
-    if (!status.ok_status()) return status;
+        kPi05ModelNumerics.vision_layer_norm_epsilon, false,
+        &projector_input, stream);
+    if (!status.ok_status() || !projector_input.data ||
+        projector_input.prequantized) {
+        return status.ok_status()
+                   ? invalid("PI0.5 vision projector input is quantized")
+                   : status;
+    }
     void* encoder = buffer_data(execution.resources->buffers.encoder_state);
-    status = ops.projected_linear(
+    return ops.projected_linear(
         ops.state, weights.projector_weight,
         {Pi05LinearDomain::kVision, Pi05LinearRole::kProjector, -1}, -1,
-        execution.vision.normalized, encoder, rows, width,
-        kPi05ModelDims.encoder_width, false, stream);
-    return status.ok_status()
-               ? ops.add_bias(ops.state, encoder, weights.projector_bias,
-                              rows, kPi05ModelDims.encoder_width, stream)
-               : status;
+        projector_input.data, encoder, rows, width,
+        kPi05ModelDims.encoder_width, false,
+        {Pi05LinearEpilogueKind::kBias, &weights.projector_bias, nullptr},
+        stream);
 }
 
 modalities::Status execute_encoder_attention(
@@ -660,7 +665,7 @@ modalities::Status execute_encoder_attention(
     status = ops.projected_linear(
         ops.state, weights.attention_qkv_weight, qkv_key, -1, qkv_input,
         execution.encoder.qkv, rows, width, width + 2 * key_width,
-        qkv_prequantized, stream);
+        qkv_prequantized, {}, stream);
     if (!status.ok_status()) return status;
     status = ops.qkv_rope(
         ops.state, execution.encoder.qkv,
@@ -678,7 +683,7 @@ modalities::Status execute_encoder_attention(
     status = ops.projected_linear(
         ops.state, weights.attention_output_weight, output_key, -1,
         execution.encoder.attention_output, execution.encoder.normalized,
-        rows, width, width, false, stream);
+        rows, width, width, false, {}, stream);
     if (!status.ok_status()) return status;
     return ops.normalize_for_linear(
         ops.state, state, execution.encoder.normalized,
@@ -724,7 +729,7 @@ modalities::Status execute_encoder_mlp(
         ops.state, weights.down_weight, down_key, -1, down_input,
         execution.encoder.normalized, shape.encoder_sequence,
         kPi05ModelDims.encoder_hidden, kPi05ModelDims.encoder_width,
-        down_prequantized, stream);
+        down_prequantized, {}, stream);
     if (status.ok_status()) {
         execution.encoder.pending_update = execution.encoder.normalized;
     }
@@ -760,7 +765,7 @@ modalities::Status execute_encoder_cache_finalize(
             static_cast<std::size_t>(call.layer)].attention_qkv_weight;
     status = ops.projected_linear(
         ops.state, weight, qkv_key, -1, qkv_input, execution.encoder.qkv,
-        rows, width, width + 2 * key_width, prequantized, stream);
+        rows, width, width + 2 * key_width, prequantized, {}, stream);
     if (!status.ok_status()) return status;
     void* key = cache_layer_data(
         execution.resources->buffers.key_cache, shape,
@@ -837,7 +842,7 @@ modalities::Status execute_decoder_attention(
     status = ops.projected_linear(
         ops.state, weights.attention_qkv_weight, qkv_key, call.step,
         qkv_input, execution.decoder.qkv, rows, width,
-        query_width + 2 * key_width, qkv_prequantized, stream);
+        query_width + 2 * key_width, qkv_prequantized, {}, stream);
     if (!status.ok_status()) return status;
     void* key = cache_layer_data(
         execution.resources->buffers.key_cache, shape,
@@ -863,7 +868,7 @@ modalities::Status execute_decoder_attention(
     status = ops.projected_linear(
         ops.state, weights.attention_output_weight, output_key, call.step,
         execution.decoder.attention_output, execution.decoder.normalized,
-        rows, query_width, width, false, stream);
+        rows, query_width, width, false, {}, stream);
     if (status.ok_status()) {
         execution.decoder.pending_update = execution.decoder.normalized;
         execution.decoder.pending_gate = execution.decoder.gate;
@@ -922,7 +927,7 @@ modalities::Status execute_decoder_mlp(
     status = ops.projected_linear(
         ops.state, weights.down_weight, down_key, call.step, down_input,
         execution.decoder.normalized, rows, hidden_width, width,
-        down_prequantized, stream);
+        down_prequantized, {}, stream);
     if (status.ok_status()) {
         execution.decoder.pending_update = execution.decoder.normalized;
         execution.decoder.pending_gate = execution.decoder.gate;
@@ -961,15 +966,10 @@ modalities::Status execute_action_project(
     execution.decoder.pending_gate = nullptr;
     void* action =
         buffer_data(execution.resources->buffers.action_delta);
-    status = ops.linear(
+    return ops.linear(
         ops.state, weights.action_out_weight, normalized, action,
         shape.chunk, kPi05ModelDims.decoder_width,
         kPi05ModelDims.action_width, stream);
-    return status.ok_status()
-               ? ops.add_bias(ops.state, action, weights.action_out_bias,
-                              shape.chunk, kPi05ModelDims.action_width,
-                              stream)
-               : status;
 }
 
 modalities::Status execute_diffusion_update(
@@ -977,11 +977,12 @@ modalities::Status execute_diffusion_update(
     Pi05ForwardExecution& execution,
     Pi05Stream stream) {
     const Pi05PrimitiveSet& ops = *active_primitives(*execution.ops);
-    return ops.residual_update(
+    return ops.diffusion_update(
         ops.state, buffer_data(execution.resources->buffers.noise),
-        buffer_data(execution.resources->buffers.action_delta), nullptr,
-        static_cast<std::size_t>(shape.chunk) *
-            kPi05ModelDims.action_width,
+        buffer_data(execution.resources->buffers.action_delta),
+        execution.resources->weights.decoder.action_out_bias, shape.chunk,
+        kPi05ModelDims.action_width,
+        shape.num_steps,
         stream);
 }
 

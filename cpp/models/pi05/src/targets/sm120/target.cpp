@@ -204,6 +204,59 @@ modalities::Status frontend_linear(
         weight, input, output, rows, input_width, output_width, stream);
 }
 
+modalities::Status apply_projected_epilogue(
+    const Pi05LinearEpilogue& epilogue,
+    void* output,
+    int rows,
+    int columns,
+    Pi05Stream stream) {
+    const bool has_bias = epilogue.bias != nullptr;
+    const bool has_residual = epilogue.residual != nullptr;
+    if (!output || rows <= 0 || columns <= 0 ||
+        (has_bias && !vector_weight(*epilogue.bias, columns))) {
+        return invalid("SM120 projected-linear epilogue is invalid");
+    }
+    const cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    switch (epilogue.kind) {
+        case Pi05LinearEpilogueKind::kNone:
+            return !has_bias && !has_residual
+                       ? modalities::Status::ok()
+                       : invalid("SM120 empty epilogue has operands");
+        case Pi05LinearEpilogueKind::kBias:
+            if (!has_bias || has_residual) break;
+            add_bias_bf16(
+                static_cast<__nv_bfloat16*>(output),
+                static_cast<const __nv_bfloat16*>(
+                    epilogue.bias->device_data),
+                rows, columns, cuda_stream);
+            return launch_status();
+        case Pi05LinearEpilogueKind::kBiasGelu:
+            if (!has_bias || has_residual) break;
+            add_bias_bf16(
+                static_cast<__nv_bfloat16*>(output),
+                static_cast<const __nv_bfloat16*>(
+                    epilogue.bias->device_data),
+                rows, columns, cuda_stream);
+            {
+                modalities::Status status = launch_status();
+                if (!status.ok_status()) return status;
+            }
+            ::gelu_inplace(static_cast<__nv_bfloat16*>(output),
+                           rows * columns, cuda_stream);
+            return launch_status();
+        case Pi05LinearEpilogueKind::kBiasResidual:
+            if (!has_bias || !has_residual) break;
+            ::bias_residual(
+                static_cast<__nv_bfloat16*>(epilogue.residual),
+                static_cast<const __nv_bfloat16*>(output),
+                static_cast<const __nv_bfloat16*>(
+                    epilogue.bias->device_data),
+                rows, columns, cuda_stream);
+            return launch_status();
+    }
+    return invalid("SM120 projected-linear epilogue operands are invalid");
+}
+
 modalities::Status frontend_projected_linear(
     void* state,
     const Pi05ResolvedWeight& weight,
@@ -215,29 +268,37 @@ modalities::Status frontend_projected_linear(
     int input_width,
     int output_width,
     bool prequantized,
+    const Pi05LinearEpilogue& epilogue,
     Pi05Stream stream) {
     Sm120FrontendBindings* binding = frontend(state);
     if (!binding || !binding->shape || !binding->bf16_linear) {
         return invalid("SM120 projected-linear binding is invalid");
     }
+    modalities::Status status;
     if (!binding->fp8_linear) {
-        return prequantized
-                   ? invalid("SM120 BF16 input cannot be prequantized")
-                   : binding->bf16_linear->run(
-                         weight, input, output, rows, input_width,
-                         output_width, stream);
+        status = prequantized
+                     ? invalid("SM120 BF16 input cannot be prequantized")
+                     : binding->bf16_linear->run(
+                           weight, input, output, rows, input_width,
+                           output_width, stream);
+    } else {
+        Pi05LinearActivationSite site;
+        status = resolve_pi05_linear_activation_site(
+            key, step, *binding->shape, &site);
+        if (status.ok_status()) {
+            status = prequantized
+                         ? binding->fp8_linear->run_prequantized(
+                               weight, site, input, output, rows,
+                               input_width, output_width, stream)
+                         : binding->fp8_linear->run(
+                               weight, site, input, output, rows,
+                               input_width, output_width, stream);
+        }
     }
-    Pi05LinearActivationSite site;
-    modalities::Status status = resolve_pi05_linear_activation_site(
-        key, step, *binding->shape, &site);
-    if (!status.ok_status()) return status;
-    return prequantized
-               ? binding->fp8_linear->run_prequantized(
-                     weight, site, input, output, rows, input_width,
-                     output_width, stream)
-               : binding->fp8_linear->run(
-                     weight, site, input, output, rows, input_width,
-                     output_width, stream);
+    return status.ok_status()
+               ? apply_projected_epilogue(
+                     epilogue, output, rows, output_width, stream)
+               : status;
 }
 
 modalities::Status frontend_add_bias(void*,
@@ -321,9 +382,11 @@ modalities::Status frontend_layer_norm(
     int rows,
     int columns,
     float epsilon,
+    bool,
+    Pi05LinearInput* linear_input,
     Pi05Stream stream) {
     if (!values || !output || !vector_weight(weight, columns) ||
-        !vector_weight(bias, columns)) {
+        !vector_weight(bias, columns) || !linear_input) {
         return invalid("SM120 layer-norm binding is invalid");
     }
     ::layer_norm(
@@ -332,6 +395,7 @@ modalities::Status frontend_layer_norm(
         static_cast<const __nv_bfloat16*>(bias.device_data),
         static_cast<__nv_bfloat16*>(output), rows, columns, epsilon,
         reinterpret_cast<cudaStream_t>(stream));
+    *linear_input = {output, false};
     return launch_status();
 }
 
@@ -457,7 +521,7 @@ modalities::Status frontend_qkv_rope(
     return launch_status();
 }
 
-modalities::Status frontend_residual_update(
+modalities::Status frontend_residual_accumulate(
     void*,
     void* residual,
     const void* update,
@@ -483,6 +547,31 @@ modalities::Status frontend_residual_update(
             reinterpret_cast<cudaStream_t>(stream));
     }
     return launch_status();
+}
+
+modalities::Status frontend_diffusion_update(
+    void* state,
+    void* residual,
+    const void* update,
+    const Pi05ResolvedWeight& bias,
+    int rows,
+    int columns,
+    int num_steps,
+    Pi05Stream stream) {
+    if (!update || num_steps <= 0 || !vector_weight(bias, columns)) {
+        return invalid("SM120 diffusion update is invalid");
+    }
+    add_bias_bf16(
+        const_cast<__nv_bfloat16*>(
+            static_cast<const __nv_bfloat16*>(update)),
+        static_cast<const __nv_bfloat16*>(bias.device_data), rows, columns,
+        reinterpret_cast<cudaStream_t>(stream));
+    modalities::Status status = launch_status();
+    return status.ok_status()
+               ? frontend_residual_accumulate(
+                     state, residual, update, nullptr,
+                     static_cast<std::size_t>(rows) * columns, stream)
+               : status;
 }
 
 modalities::Status frontend_adaptive_normalize(
@@ -541,7 +630,7 @@ modalities::Status frontend_adaptive_normalize(
         return launch_status();
     }
     if (update) {
-        modalities::Status status = frontend_residual_update(
+        modalities::Status status = frontend_residual_accumulate(
             state, residual, update, update_gate,
             static_cast<std::size_t>(rows) * columns, stream);
         if (!status.ok_status()) return status;
@@ -659,7 +748,7 @@ modalities::Status frontend_gate_up(
         *merged = true;
         return frontend_projected_linear(
             state, weights.gate_up_weight, key, step, input, gate, rows,
-            width, 2 * hidden_width, prequantized, stream);
+            width, 2 * hidden_width, prequantized, {}, stream);
     }
     *merged = false;
     modalities::Status status = binding->bf16_linear->run(
@@ -1029,7 +1118,7 @@ modalities::Status Sm120TargetBundle::resolve_resources(
         primitives.normalize_for_linear = frontend_normalize_for_linear;
         primitives.qkv_rope = frontend_qkv_rope;
         primitives.adaptive_normalize = frontend_adaptive_normalize;
-        primitives.residual_update = frontend_residual_update;
+        primitives.diffusion_update = frontend_diffusion_update;
         primitives.attention = frontend_attention;
         primitives.gate_up = frontend_gate_up;
         primitives.gated_activation = frontend_gated_activation;

@@ -82,7 +82,8 @@ modalities::Status noop_bias(
 
 modalities::Status noop_projected_linear(
     void*, const pi05::Pi05ResolvedWeight&, pi05::Pi05LinearWeightKey, int,
-    const void*, void*, int, int, int, bool, pi05::Pi05Stream) {
+    const void*, void*, int, int, int, bool,
+    const pi05::Pi05LinearEpilogue&, pi05::Pi05Stream) {
     return modalities::Status::ok();
 }
 
@@ -113,8 +114,10 @@ modalities::Status noop_bias_residual(
 
 modalities::Status noop_layer_norm(
     void*, const void*, const pi05::Pi05ResolvedWeight&,
-    const pi05::Pi05ResolvedWeight&, void*, int, int, float,
+    const pi05::Pi05ResolvedWeight&, void* output, int, int, float, bool,
+    pi05::Pi05LinearInput* linear_input,
     pi05::Pi05Stream) {
+    if (linear_input) *linear_input = {output, false};
     return modalities::Status::ok();
 }
 
@@ -154,8 +157,9 @@ modalities::Status noop_adaptive_normalize(
     return modalities::Status::ok();
 }
 
-modalities::Status noop_residual_update(
-    void*, void*, const void*, const void*, std::size_t,
+modalities::Status noop_diffusion_update(
+    void*, void*, const void*, const pi05::Pi05ResolvedWeight&, int, int,
+    int,
     pi05::Pi05Stream) {
     return modalities::Status::ok();
 }
@@ -204,7 +208,7 @@ pi05::Pi05PrimitiveSet fake_primitives(Probe* probe) {
     result.normalize_for_linear = noop_normalize;
     result.qkv_rope = noop_qkv_rope;
     result.adaptive_normalize = noop_adaptive_normalize;
-    result.residual_update = noop_residual_update;
+    result.diffusion_update = noop_diffusion_update;
     result.attention = noop_attention;
     result.gate_up = noop_gate_up;
     result.gated_activation = noop_gated_activation;
