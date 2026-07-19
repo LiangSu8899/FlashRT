@@ -205,8 +205,22 @@ modalities::Status frontend_projected_linear(
         return invalid("SM110 vision epilogue is invalid");
     }
 
-    if (!prequantized || !empty_epilogue(epilogue)) {
-        return invalid("SM110 transformer linear input is not FP8");
+    if (!empty_epilogue(epilogue)) {
+        return invalid("SM110 transformer linear epilogue is invalid");
+    }
+    const void* linear_input = input;
+    if (!prequantized) {
+        if (key.role != Pi05LinearRole::kAttentionOutput) {
+            return invalid("SM110 transformer linear input is not FP8");
+        }
+        void* fp8 = key.domain == Pi05LinearDomain::kEncoder
+                        ? binding->physical->encoder().output_fp8.device_data()
+                        : binding->physical->decoder().context_fp8.device_data();
+        status = binding->driver->quantize_fp8_static(
+            input, fp8, activation_scale,
+            static_cast<std::size_t>(rows) * input_width, stream);
+        if (!status.ok_status()) return status;
+        linear_input = fp8;
     }
     if (key.domain == Pi05LinearDomain::kEncoder) {
         float alpha = packed->host_scale *
@@ -221,12 +235,14 @@ modalities::Status frontend_projected_linear(
             tactic = Sm110Fp8Tactic::kWide;
         }
         return binding->driver->fp8_cutlass(
-            const_cast<void*>(input), const_cast<void*>(weight.device_data),
+            const_cast<void*>(linear_input),
+            const_cast<void*>(weight.device_data),
             output, rows, output_width, input_width, alpha, 0.0f, tactic,
             stream);
     }
     return binding->driver->fp8_descale(
-        const_cast<void*>(input), const_cast<void*>(weight.device_data),
+        const_cast<void*>(linear_input),
+        const_cast<void*>(weight.device_data),
         output, rows, output_width, input_width, activation_scale,
         weight.scale_data, stream);
 }
