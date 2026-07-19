@@ -2,10 +2,14 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <fstream>
 #include <iomanip>
 #include <sstream>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <vector>
 
 #ifdef FLASHRT_CPP_HAS_OPENSSL
@@ -140,6 +144,97 @@ private:
     std::uint64_t total_bytes_ = 0;
 };
 
+struct FileIdentity {
+    std::uint64_t device = 0;
+    std::uint64_t inode = 0;
+    std::uint64_t bytes = 0;
+    std::int64_t mtime_seconds = 0;
+    std::int64_t mtime_nanoseconds = 0;
+    std::int64_t ctime_seconds = 0;
+    std::int64_t ctime_nanoseconds = 0;
+};
+
+bool file_identity(const std::string& path, FileIdentity* out) {
+    if (!out) return false;
+    struct stat value {};
+    if (::stat(path.c_str(), &value) != 0 || !S_ISREG(value.st_mode) ||
+        value.st_size < 0) {
+        return false;
+    }
+    out->device = static_cast<std::uint64_t>(value.st_dev);
+    out->inode = static_cast<std::uint64_t>(value.st_ino);
+    out->bytes = static_cast<std::uint64_t>(value.st_size);
+    out->mtime_seconds = value.st_mtim.tv_sec;
+    out->mtime_nanoseconds = value.st_mtim.tv_nsec;
+    out->ctime_seconds = value.st_ctim.tv_sec;
+    out->ctime_nanoseconds = value.st_ctim.tv_nsec;
+    return true;
+}
+
+bool same_identity(const FileIdentity& left, const FileIdentity& right) {
+    return left.device == right.device && left.inode == right.inode &&
+           left.bytes == right.bytes &&
+           left.mtime_seconds == right.mtime_seconds &&
+           left.mtime_nanoseconds == right.mtime_nanoseconds &&
+           left.ctime_seconds == right.ctime_seconds &&
+           left.ctime_nanoseconds == right.ctime_nanoseconds;
+}
+
+bool valid_hex_digest(const std::string& value) {
+    if (value.size() != 64) return false;
+    return std::all_of(value.begin(), value.end(), [](char c) {
+        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+    });
+}
+
+std::string cache_path(const std::string& path) {
+    return path + ".flashrt.sha256";
+}
+
+bool read_cache(const std::string& path, const FileIdentity& identity,
+                std::string* digest) {
+    std::ifstream input(cache_path(path));
+    std::string magic;
+    FileIdentity cached;
+    std::string value;
+    if (!(input >> magic >> cached.device >> cached.inode >> cached.bytes >>
+          cached.mtime_seconds >> cached.mtime_nanoseconds >>
+          cached.ctime_seconds >> cached.ctime_nanoseconds >> value) ||
+        magic != "flashrt-sha256-v1" || !same_identity(identity, cached) ||
+        !valid_hex_digest(value)) {
+        return false;
+    }
+    if (digest) *digest = std::move(value);
+    return true;
+}
+
+void write_cache(const std::string& path, const FileIdentity& identity,
+                 const std::string& digest) {
+    static std::atomic<std::uint64_t> sequence{0};
+    const std::string destination = cache_path(path);
+    const std::string temporary =
+        destination + ".tmp." + std::to_string(::getpid()) + "." +
+        std::to_string(sequence.fetch_add(1, std::memory_order_relaxed));
+    {
+        std::ofstream output(temporary, std::ios::trunc);
+        if (!output) return;
+        output << "flashrt-sha256-v1 " << identity.device << ' '
+               << identity.inode << ' ' << identity.bytes << ' '
+               << identity.mtime_seconds << ' '
+               << identity.mtime_nanoseconds << ' '
+               << identity.ctime_seconds << ' '
+               << identity.ctime_nanoseconds << ' ' << digest << '\n';
+        if (!output) {
+            output.close();
+            std::remove(temporary.c_str());
+            return;
+        }
+    }
+    if (std::rename(temporary.c_str(), destination.c_str()) != 0) {
+        std::remove(temporary.c_str());
+    }
+}
+
 }  // namespace
 
 bool sha256_file(const std::string& path, std::string* hex,
@@ -204,6 +299,36 @@ bool sha256_file(const std::string& path, std::string* hex,
     output << std::hex << std::setfill('0');
     for (unsigned char byte : digest) output << std::setw(2) << unsigned(byte);
     *hex = output.str();
+    if (error) error->clear();
+    return true;
+}
+
+bool sha256_file_cached(const std::string& path, std::string* hex,
+                        bool* cache_hit, std::string* error) {
+    if (cache_hit) *cache_hit = false;
+    if (!hex) {
+        if (error) *error = "SHA-256 output is null";
+        return false;
+    }
+    FileIdentity before;
+    if (!file_identity(path, &before)) {
+        if (error) *error = "unable to stat file for SHA-256: " + path;
+        return false;
+    }
+    if (read_cache(path, before, hex)) {
+        if (cache_hit) *cache_hit = true;
+        if (error) error->clear();
+        return true;
+    }
+    std::string digest;
+    if (!sha256_file(path, &digest, error)) return false;
+    FileIdentity after;
+    if (!file_identity(path, &after) || !same_identity(before, after)) {
+        if (error) *error = "file changed while hashing: " + path;
+        return false;
+    }
+    write_cache(path, after, digest);
+    *hex = std::move(digest);
     if (error) error->clear();
     return true;
 }

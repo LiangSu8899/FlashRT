@@ -155,8 +155,8 @@ int build_native_model_runtime(const NativeOpenConfig& config,
     std::future<HashResult> weights_hash = std::async(
         std::launch::async, [weights_path] {
             HashResult result;
-            result.ok = loader::sha256_file(
-                weights_path, &result.digest, &result.error);
+            result.ok = loader::sha256_file_cached(
+                weights_path, &result.digest, nullptr, &result.error);
             return result;
         });
     std::string tokenizer_sha256;
