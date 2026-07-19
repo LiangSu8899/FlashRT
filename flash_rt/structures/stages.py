@@ -64,6 +64,32 @@ class CapturedStage:
         """Rewrite one declared window in place."""
         self.windows[name].copy_(value)
 
+    def export(self, *, ports, regions=(), stages=None, roles=None,
+               identity=None, manifest_extra=None):
+        """One call from this captured stage to ``frt_model_runtime_v1``.
+
+        The declared windows become the contract's boundary windows
+        (name -> device pointer + bytes); ``ports`` reference them by
+        name exactly as in
+        :func:`flash_rt.structures.provider.export_captured_runtime`.
+        This is the absorption edge: a stage captured out of any torch
+        host becomes a runtime the FlashRT serving mechanisms (Nexus
+        tick, capsule snapshot/restore) consume like a whitebox one.
+        """
+        from .provider import export_captured_runtime
+
+        window_map = {
+            name: (t.data_ptr(), t.numel() * t.element_size())
+            for name, t in self.windows.items()}
+        return export_captured_runtime(
+            stream_handle=self.stream.cuda_stream,
+            graphs=[("infer", self.graph.raw_cuda_graph_exec())],
+            windows=window_map,
+            ports=ports, regions=regions,
+            stages=tuple(stages) if stages else ("infer",),
+            roles=roles, identity=identity,
+            manifest_extra=manifest_extra)
+
 
 def capture(
     fn: Callable[[], Any],
