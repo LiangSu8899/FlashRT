@@ -166,6 +166,26 @@ Sm120FrontendBindings* frontend(void* state) {
     return static_cast<Sm120FrontendBindings*>(state);
 }
 
+void* frontend_data(const Pi05ResolvedBuffer& buffer) {
+    return buffer.buffer ? frt_buffer_dptr(buffer.buffer) : nullptr;
+}
+
+bool frontend_static_fp8(const Sm120FrontendBindings* binding) {
+    return binding && binding->fp8_linear &&
+           !binding->fp8_linear->observing();
+}
+
+float* frontend_scale(Sm120FrontendBindings* binding,
+                      Pi05LinearWeightKey key,
+                      int step) {
+    Pi05LinearActivationSite site;
+    return binding && binding->fp8_linear && binding->shape &&
+                   resolve_pi05_linear_activation_site(
+                       key, step, *binding->shape, &site).ok_status()
+               ? binding->fp8_linear->scale_data(site)
+               : nullptr;
+}
+
 modalities::Status frontend_linear(
     void* state,
     const Pi05ResolvedWeight& weight,
@@ -334,15 +354,104 @@ modalities::Status frontend_qkv_split(
     return launch_status();
 }
 
-modalities::Status frontend_vision_attention(
+modalities::Status frontend_normalize_for_linear(
     void* state,
+    void* residual,
+    const void* update,
+    const Pi05ResolvedBuffer& weight,
+    void* normalized,
+    Pi05LinearWeightKey key,
+    int step,
+    int rows,
+    int columns,
+    float epsilon,
+    const void** linear_input,
+    bool* prequantized,
+    Pi05Stream stream) {
+    Sm120FrontendBindings* binding = frontend(state);
+    if (!binding || !residual || !frontend_data(weight) || !normalized ||
+        !linear_input || !prequantized || rows <= 0 || columns <= 0) {
+        return invalid("SM120 normalization binding is invalid");
+    }
+    const cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    if (frontend_static_fp8(binding)) {
+        float* scale = frontend_scale(binding, key, step);
+        if (!scale) return invalid("SM120 normalization scale is invalid");
+        void* output = binding->fp8_linear->scratch_data();
+        if (update) {
+            ::residual_add_rms_norm_fp8(
+                static_cast<__nv_bfloat16*>(residual),
+                static_cast<const __nv_bfloat16*>(update),
+                static_cast<const __nv_bfloat16*>(frontend_data(weight)),
+                static_cast<__nv_fp8_e4m3*>(output), rows, columns, epsilon,
+                scale, cuda_stream);
+        } else {
+            ::rms_norm_fp8(
+                static_cast<const __nv_bfloat16*>(residual),
+                static_cast<const __nv_bfloat16*>(frontend_data(weight)),
+                static_cast<__nv_fp8_e4m3*>(output), rows, columns, epsilon,
+                scale, cuda_stream);
+        }
+        *linear_input = output;
+        *prequantized = true;
+        return launch_status();
+    }
+    if (update) {
+        ::residual_add(static_cast<__nv_bfloat16*>(residual),
+                       static_cast<const __nv_bfloat16*>(update),
+                       rows * columns, cuda_stream);
+        modalities::Status status = launch_status();
+        if (!status.ok_status()) return status;
+    }
+    ::rms_norm(
+        static_cast<const __nv_bfloat16*>(residual),
+        static_cast<const __nv_bfloat16*>(frontend_data(weight)),
+        static_cast<__nv_bfloat16*>(normalized), rows, columns, epsilon,
+        cuda_stream);
+    *linear_input = normalized;
+    *prequantized = false;
+    return launch_status();
+}
+
+modalities::Status frontend_qkv_rope(
+    void*,
+    const void* qkv,
+    const Pi05ResolvedBuffer& rope,
+    void* query,
+    void* key,
+    void* value,
+    int rows,
+    int query_width,
+    int key_width,
+    int value_width,
+    int head_width,
+    Pi05Stream stream) {
+    if (!qkv || !frontend_data(rope) || !query || !key || !value) {
+        return invalid("SM120 QKV/RoPE binding is invalid");
+    }
+    ::qkv_split_rope(
+        static_cast<const __nv_bfloat16*>(qkv),
+        static_cast<const __nv_bfloat16*>(frontend_data(rope)),
+        static_cast<__nv_bfloat16*>(query),
+        static_cast<__nv_bfloat16*>(key),
+        static_cast<__nv_bfloat16*>(value), rows, query_width, key_width,
+        value_width, head_width, reinterpret_cast<cudaStream_t>(stream));
+    return launch_status();
+}
+
+modalities::Status frontend_attention(
+    void* state,
+    Pi05LinearDomain domain,
+    int layer,
     const void* query,
     const void* key,
     const void* value,
     void* output,
-    int views,
-    int rows,
-    int heads,
+    int batches,
+    int query_rows,
+    int key_rows,
+    int query_heads,
+    int key_heads,
     int head_width,
     Pi05Stream stream) {
     Sm120FrontendBindings* binding = frontend(state);
@@ -350,19 +459,132 @@ modalities::Status frontend_vision_attention(
         !binding->attention) {
         return invalid("SM120 vision-attention binding is invalid");
     }
-    const Sm120VisionAttentionBuffers& buffers =
-        binding->attention_buffers->vision();
-    if (query != buffers.query.device_data() ||
-        key != buffers.key.device_data() ||
-        value != buffers.value.device_data() ||
-        output != binding->attention->vision_output() ||
-        views != binding->shape->num_views ||
-        rows != binding->shape->vision_sequence ||
-        heads != kPi05ModelDims.vision_heads ||
-        head_width != kPi05ModelDims.vision_head_dim) {
-        return invalid("SM120 vision-attention contract is invalid");
+    if (domain == Pi05LinearDomain::kVision) {
+        const Sm120VisionAttentionBuffers& buffers =
+            binding->attention_buffers->vision();
+        if (layer != -1 || query != buffers.query.device_data() ||
+            key != buffers.key.device_data() ||
+            value != buffers.value.device_data() ||
+            output != binding->attention->vision_output() ||
+            batches != binding->shape->num_views ||
+            query_rows * batches != binding->shape->vision_sequence ||
+            key_rows != query_rows ||
+            query_heads != kPi05ModelDims.vision_heads ||
+            key_heads != query_heads ||
+            head_width != kPi05ModelDims.vision_head_dim) {
+            return invalid("SM120 vision-attention contract is invalid");
+        }
+        return binding->attention->vision(stream);
     }
-    return binding->attention->vision(stream);
+    if (domain == Pi05LinearDomain::kEncoder) {
+        const Sm120EncoderAttentionBuffers& buffers =
+            binding->attention_buffers->encoder();
+        if (layer < 0 || layer >= kPi05ModelDims.encoder_layers - 1 ||
+            query != buffers.query.device_data() ||
+            key != binding->attention_buffers->key_layer_data(layer) ||
+            value != binding->attention_buffers->value_layer_data(layer) ||
+            output != binding->attention->encoder_output() || batches != 1 ||
+            query_rows != binding->shape->encoder_sequence ||
+            key_rows != query_rows ||
+            query_heads != kPi05ModelDims.encoder_heads ||
+            key_heads != kPi05ModelDims.encoder_kv_heads ||
+            head_width != kPi05ModelDims.encoder_head_dim) {
+            return invalid("SM120 encoder-attention contract is invalid");
+        }
+        return binding->attention->encoder(layer, stream);
+    }
+    return unsupported("SM120 attention domain is not installed");
+}
+
+modalities::Status frontend_gate_up(
+    void* state,
+    const Pi05FeedForwardWeights& weights,
+    Pi05LinearWeightKey key,
+    int step,
+    const void* input,
+    bool prequantized,
+    void* gate,
+    void* up,
+    int rows,
+    int width,
+    int hidden_width,
+    bool* merged,
+    Pi05Stream stream) {
+    Sm120FrontendBindings* binding = frontend(state);
+    if (!binding || !binding->bf16_linear || !input || !gate || !up ||
+        !merged) {
+        return invalid("SM120 gate-up binding is invalid");
+    }
+    const bool static_fp8 = frontend_static_fp8(binding);
+    if (prequantized != static_fp8) {
+        return invalid("SM120 gate-up input storage is invalid");
+    }
+    if (static_fp8 || binding->fp8_linear) {
+        *merged = true;
+        return frontend_projected_linear(
+            state, weights.gate_up_weight, key, step, input, gate, rows,
+            width, 2 * hidden_width, prequantized, stream);
+    }
+    *merged = false;
+    modalities::Status status = binding->bf16_linear->run(
+        weights.gate_weight, input, gate, rows, width, hidden_width, stream);
+    return status.ok_status()
+               ? binding->bf16_linear->run(
+                     weights.up_weight, input, up, rows, width, hidden_width,
+                     stream)
+               : status;
+}
+
+modalities::Status frontend_gated_activation(
+    void* state,
+    const void* gate,
+    const void* up,
+    bool merged,
+    void* output,
+    int rows,
+    int hidden_width,
+    Pi05LinearWeightKey output_key,
+    int step,
+    const void** linear_input,
+    bool* prequantized,
+    Pi05Stream stream) {
+    Sm120FrontendBindings* binding = frontend(state);
+    if (!binding || !gate || !up || !output || !linear_input ||
+        !prequantized) {
+        return invalid("SM120 gated-activation binding is invalid");
+    }
+    const cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    if (frontend_static_fp8(binding)) {
+        if (!merged) {
+            return invalid("SM120 static FP8 gate-up layout is invalid");
+        }
+        float* scale = frontend_scale(binding, output_key, step);
+        if (!scale) return invalid("SM120 gated-activation scale is invalid");
+        *linear_input = binding->fp8_linear->scratch_data();
+        *prequantized = true;
+        ::gate_silu_mul_merged_fp8(
+            static_cast<const __nv_bfloat16*>(gate),
+            static_cast<__nv_fp8_e4m3*>(
+                binding->fp8_linear->scratch_data()),
+            rows, hidden_width, scale, cuda_stream);
+        return launch_status();
+    }
+    *linear_input = output;
+    *prequantized = false;
+    if (merged) {
+        ::gate_silu_mul_merged(
+            static_cast<const __nv_bfloat16*>(gate),
+            static_cast<__nv_bfloat16*>(output), rows, hidden_width,
+            cuda_stream);
+    } else {
+        ::gate_silu_mul(
+            static_cast<const __nv_bfloat16*>(gate),
+            static_cast<const __nv_bfloat16*>(up),
+            static_cast<__nv_bfloat16*>(output), rows * hidden_width,
+            cuda_stream);
+    }
+    const modalities::Status status = launch_status();
+    return status;
 }
 
 modalities::Status frontend_gelu(void*,
@@ -669,7 +891,11 @@ modalities::Status Sm120TargetBundle::resolve_resources(
         primitives.bias_residual = frontend_bias_residual;
         primitives.layer_norm = frontend_layer_norm;
         primitives.qkv_split = frontend_qkv_split;
-        primitives.vision_attention = frontend_vision_attention;
+        primitives.normalize_for_linear = frontend_normalize_for_linear;
+        primitives.qkv_rope = frontend_qkv_rope;
+        primitives.attention = frontend_attention;
+        primitives.gate_up = frontend_gate_up;
+        primitives.gated_activation = frontend_gated_activation;
         primitives.gelu = frontend_gelu;
         primitives.vision_pool = frontend_vision_pool;
         impl_->state = Impl::State::kResourcesResolved;
@@ -721,19 +947,6 @@ modalities::Status Sm120TargetBundle::record(
         return invalid("SM120 forward operation state is invalid");
     }
     switch (call.id) {
-        case Pi05OperationId::kComposePrompt:
-            status = impl_->operations->compose_prompt(stream);
-            break;
-        case Pi05OperationId::kEncoderAttention:
-            status = impl_->operations->encoder_attention(call.layer, stream);
-            break;
-        case Pi05OperationId::kEncoderMlp:
-            status = impl_->operations->encoder_mlp(call.layer, stream);
-            break;
-        case Pi05OperationId::kEncoderCacheFinalize:
-            status = impl_->operations->encoder_cache_finalize(call.layer,
-                                                                stream);
-            break;
         case Pi05OperationId::kDiffusionInputProject:
             status = impl_->operations->diffusion_input_project(call.step,
                                                                  stream);
@@ -800,6 +1013,10 @@ modalities::Status Sm120TargetBundle::make_forward_execution(
     }
     const Sm120VisionBf16Scratch& scratch = impl_->scratch.vision();
     const Sm120VisionAttentionBuffers& attention = impl_->attention.vision();
+    const Sm120EncoderBf16Scratch& encoder_scratch =
+        impl_->scratch.encoder();
+    const Sm120EncoderAttentionBuffers& encoder_attention =
+        impl_->attention.encoder();
     auto data = [](const Pi05ResolvedBuffer& buffer) {
         return buffer.buffer ? frt_buffer_dptr(buffer.buffer) : nullptr;
     };
@@ -816,6 +1033,15 @@ modalities::Status Sm120TargetBundle::make_forward_execution(
         attention.key.device_data(),
         attention.value.device_data(),
         impl_->attention_driver->vision_output(),
+    };
+    out->encoder = {
+        impl_->support.encoder_rms_weight,
+        encoder_scratch.normalized.device_data(),
+        encoder_scratch.qkv.device_data(),
+        encoder_scratch.gate.device_data(),
+        encoder_scratch.hidden.device_data(),
+        encoder_attention.query.device_data(),
+        impl_->attention_driver->encoder_output(),
     };
     out->fallback = this;
     return modalities::Status::ok();

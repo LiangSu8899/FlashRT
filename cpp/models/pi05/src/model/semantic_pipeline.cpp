@@ -345,7 +345,7 @@ modalities::Status execute_prepare_call(
 bool complete_vision(const Pi05PrimitiveSet* ops) {
     return ops && ops->linear && ops->projected_linear && ops->add_bias &&
            ops->patchify && ops->bias_residual && ops->layer_norm &&
-           ops->qkv_split && ops->vision_attention && ops->gelu &&
+           ops->qkv_split && ops->attention && ops->gelu &&
            ops->vision_pool;
 }
 
@@ -353,6 +353,35 @@ bool complete_vision(const Pi05VisionExecution& vision) {
     return vision.patches && vision.expanded_position && vision.pooled &&
            vision.normalized && vision.qkv && vision.hidden && vision.query &&
            vision.key && vision.value && vision.attention_output;
+}
+
+bool complete_encoder(const Pi05PrimitiveSet* ops) {
+    return ops && ops->projected_linear && ops->normalize_for_linear &&
+           ops->qkv_rope && ops->attention && ops->gate_up &&
+           ops->gated_activation;
+}
+
+bool complete_encoder(const Pi05EncoderExecution& encoder) {
+    return buffer_data(encoder.rms_weight) && encoder.normalized &&
+           encoder.qkv && encoder.gate &&
+           encoder.hidden && encoder.query && encoder.attention_output;
+}
+
+void* cache_layer_data(const Pi05ResolvedBuffer& cache,
+                       const Pi05ResolvedShape& shape,
+                       modalities::DType dtype,
+                       int layer) {
+    const std::size_t scalar_bytes = modalities::dtype_size(dtype);
+    const std::size_t layer_bytes =
+        static_cast<std::size_t>(shape.total_attention_keys) *
+        kPi05ModelDims.encoder_kv_heads * kPi05ModelDims.encoder_head_dim *
+        scalar_bytes;
+    const std::size_t offset = static_cast<std::size_t>(layer) * layer_bytes;
+    return scalar_bytes && layer >= 0 && buffer_data(cache) &&
+                   offset <= cache.physical_bytes &&
+                   layer_bytes <= cache.physical_bytes - offset
+               ? byte_offset(buffer_data(cache), offset)
+               : nullptr;
 }
 
 modalities::Status execute_vision_embed(
@@ -388,6 +417,29 @@ modalities::Status execute_vision_embed(
         width, kPi05ModelNumerics.vision_layer_norm_epsilon, stream);
 }
 
+modalities::Status execute_compose_prompt(
+    const Pi05ResolvedShape& shape,
+    Pi05ForwardExecution& execution,
+    Pi05Stream stream) {
+    const Pi05PrimitiveSet& ops = *active_primitives(*execution.ops);
+    const Pi05ResolvedBuffer& prompt =
+        execution.resources->buffers.prompt_embedding;
+    const Pi05ResolvedBuffer& encoder =
+        execution.resources->buffers.encoder_state;
+    const std::size_t scalar_bytes =
+        modalities::dtype_size(execution.ops->profile.activation_dtype);
+    const std::size_t offset =
+        static_cast<std::size_t>(shape.encoder_vision_sequence) *
+        kPi05ModelDims.encoder_width * scalar_bytes;
+    if (!scalar_bytes || !buffer_data(prompt) || !buffer_data(encoder) ||
+        offset > encoder.physical_bytes ||
+        prompt.physical_bytes > encoder.physical_bytes - offset) {
+        return invalid("PI0.5 prompt composition buffers are invalid");
+    }
+    return ops.copy(ops.state, byte_offset(buffer_data(encoder), offset),
+                    buffer_data(prompt), prompt.physical_bytes, stream);
+}
+
 modalities::Status execute_vision_attention(
     const Pi05OperationCall& call,
     const Pi05ResolvedShape& shape,
@@ -415,10 +467,12 @@ modalities::Status execute_vision_attention(
         execution.vision.key, execution.vision.value, rows, width, width,
         width, stream);
     if (!status.ok_status()) return status;
-    status = ops.vision_attention(
-        ops.state, execution.vision.query, execution.vision.key,
-        execution.vision.value, execution.vision.attention_output,
-        shape.num_views, rows, kPi05ModelDims.vision_heads,
+    status = ops.attention(
+        ops.state, Pi05LinearDomain::kVision, -1, execution.vision.query,
+        execution.vision.key, execution.vision.value,
+        execution.vision.attention_output, shape.num_views,
+        rows / shape.num_views, rows / shape.num_views,
+        kPi05ModelDims.vision_heads, kPi05ModelDims.vision_heads,
         kPi05ModelDims.vision_head_dim, stream);
     if (!status.ok_status()) return status;
     status = ops.projected_linear(
@@ -522,6 +576,166 @@ modalities::Status execute_vision_project(
                : status;
 }
 
+modalities::Status execute_encoder_attention(
+    const Pi05OperationCall& call,
+    const Pi05ResolvedShape& shape,
+    Pi05ForwardExecution& execution,
+    Pi05Stream stream) {
+    const Pi05PrimitiveSet& ops = *active_primitives(*execution.ops);
+    const Pi05EncoderLayerWeights& weights =
+        execution.resources->weights.encoder_layers[
+            static_cast<std::size_t>(call.layer)];
+    const int rows = shape.encoder_sequence;
+    const int width = kPi05ModelDims.encoder_width;
+    const int key_width =
+        kPi05ModelDims.encoder_kv_heads * kPi05ModelDims.encoder_head_dim;
+    void* state = buffer_data(execution.resources->buffers.encoder_state);
+    void* key = cache_layer_data(
+        execution.resources->buffers.key_cache, shape,
+        execution.ops->profile.activation_dtype, call.layer);
+    void* value = cache_layer_data(
+        execution.resources->buffers.value_cache, shape,
+        execution.ops->profile.activation_dtype, call.layer);
+    const Pi05LinearWeightKey qkv_key{
+        Pi05LinearDomain::kEncoder, Pi05LinearRole::kAttentionQkv,
+        call.layer};
+    const Pi05LinearWeightKey output_key{
+        Pi05LinearDomain::kEncoder, Pi05LinearRole::kAttentionOutput,
+        call.layer};
+    const Pi05LinearWeightKey gate_up_key{
+        Pi05LinearDomain::kEncoder, Pi05LinearRole::kMlpGateUpGroup,
+        call.layer};
+    if (call.layer == 0) {
+        execution.encoder.pending_update = nullptr;
+    }
+    const void* qkv_input = nullptr;
+    bool qkv_prequantized = false;
+    const void* pending = execution.encoder.pending_update;
+    modalities::Status status = ops.normalize_for_linear(
+        ops.state, state, pending, execution.encoder.rms_weight,
+        execution.encoder.normalized, qkv_key, -1, rows, width,
+        kPi05ModelNumerics.encoder_rms_norm_epsilon, &qkv_input,
+        &qkv_prequantized, stream);
+    if (!status.ok_status()) return status;
+    execution.encoder.pending_update = nullptr;
+    status = ops.projected_linear(
+        ops.state, weights.attention_qkv_weight, qkv_key, -1, qkv_input,
+        execution.encoder.qkv, rows, width, width + 2 * key_width,
+        qkv_prequantized, stream);
+    if (!status.ok_status()) return status;
+    status = ops.qkv_rope(
+        ops.state, execution.encoder.qkv,
+        execution.resources->buffers.encoder_rope, execution.encoder.query,
+        key, value, rows, width, key_width, key_width,
+        kPi05ModelDims.encoder_head_dim, stream);
+    if (!status.ok_status()) return status;
+    status = ops.attention(
+        ops.state, Pi05LinearDomain::kEncoder, call.layer,
+        execution.encoder.query, key, value,
+        execution.encoder.attention_output, 1, rows, rows,
+        kPi05ModelDims.encoder_heads, kPi05ModelDims.encoder_kv_heads,
+        kPi05ModelDims.encoder_head_dim, stream);
+    if (!status.ok_status()) return status;
+    status = ops.projected_linear(
+        ops.state, weights.attention_output_weight, output_key, -1,
+        execution.encoder.attention_output, execution.encoder.normalized,
+        rows, width, width, false, stream);
+    if (!status.ok_status()) return status;
+    return ops.normalize_for_linear(
+        ops.state, state, execution.encoder.normalized,
+        execution.encoder.rms_weight,
+        execution.encoder.normalized, gate_up_key, -1, rows, width,
+        kPi05ModelNumerics.encoder_rms_norm_epsilon,
+        &execution.encoder.mlp_input,
+        &execution.encoder.mlp_input_prequantized, stream);
+}
+
+modalities::Status execute_encoder_mlp(
+    const Pi05OperationCall& call,
+    const Pi05ResolvedShape& shape,
+    Pi05ForwardExecution& execution,
+    Pi05Stream stream) {
+    const Pi05PrimitiveSet& ops = *active_primitives(*execution.ops);
+    const Pi05FeedForwardWeights& weights =
+        execution.resources->weights.encoder_layers[
+            static_cast<std::size_t>(call.layer)].mlp;
+    const Pi05LinearWeightKey gate_up_key{
+        Pi05LinearDomain::kEncoder, Pi05LinearRole::kMlpGateUpGroup,
+        call.layer};
+    const Pi05LinearWeightKey down_key{
+        Pi05LinearDomain::kEncoder, Pi05LinearRole::kMlpDown, call.layer};
+    bool merged = false;
+    modalities::Status status = ops.gate_up(
+        ops.state, weights,
+        gate_up_key, -1, execution.encoder.mlp_input,
+        execution.encoder.mlp_input_prequantized, execution.encoder.gate,
+        execution.encoder.hidden, shape.encoder_sequence,
+        kPi05ModelDims.encoder_width, kPi05ModelDims.encoder_hidden,
+        &merged, stream);
+    if (!status.ok_status()) return status;
+    const void* down_input = nullptr;
+    bool down_prequantized = false;
+    status = ops.gated_activation(
+        ops.state, execution.encoder.gate, execution.encoder.hidden, merged,
+        execution.encoder.hidden, shape.encoder_sequence,
+        kPi05ModelDims.encoder_hidden, down_key, -1, &down_input,
+        &down_prequantized, stream);
+    if (!status.ok_status()) return status;
+    status = ops.projected_linear(
+        ops.state, weights.down_weight, down_key, -1, down_input,
+        execution.encoder.normalized, shape.encoder_sequence,
+        kPi05ModelDims.encoder_hidden, kPi05ModelDims.encoder_width,
+        down_prequantized, stream);
+    if (status.ok_status()) {
+        execution.encoder.pending_update = execution.encoder.normalized;
+    }
+    return status;
+}
+
+modalities::Status execute_encoder_cache_finalize(
+    const Pi05OperationCall& call,
+    const Pi05ResolvedShape& shape,
+    Pi05ForwardExecution& execution,
+    Pi05Stream stream) {
+    const Pi05PrimitiveSet& ops = *active_primitives(*execution.ops);
+    const int rows = shape.encoder_sequence;
+    const int width = kPi05ModelDims.encoder_width;
+    const int key_width =
+        kPi05ModelDims.encoder_kv_heads * kPi05ModelDims.encoder_head_dim;
+    const Pi05LinearWeightKey qkv_key{
+        Pi05LinearDomain::kEncoder, Pi05LinearRole::kAttentionQkv,
+        call.layer};
+    const void* qkv_input = nullptr;
+    bool prequantized = false;
+    const void* pending = execution.encoder.pending_update;
+    modalities::Status status = ops.normalize_for_linear(
+        ops.state, buffer_data(execution.resources->buffers.encoder_state),
+        pending, execution.encoder.rms_weight,
+        execution.encoder.normalized, qkv_key, -1, rows, width,
+        kPi05ModelNumerics.encoder_rms_norm_epsilon, &qkv_input,
+        &prequantized, stream);
+    if (!status.ok_status()) return status;
+    execution.encoder.pending_update = nullptr;
+    const Pi05ResolvedWeight& weight =
+        execution.resources->weights.encoder_layers[
+            static_cast<std::size_t>(call.layer)].attention_qkv_weight;
+    status = ops.projected_linear(
+        ops.state, weight, qkv_key, -1, qkv_input, execution.encoder.qkv,
+        rows, width, width + 2 * key_width, prequantized, stream);
+    if (!status.ok_status()) return status;
+    void* key = cache_layer_data(
+        execution.resources->buffers.key_cache, shape,
+        execution.ops->profile.activation_dtype, call.layer);
+    void* value = cache_layer_data(
+        execution.resources->buffers.value_cache, shape,
+        execution.ops->profile.activation_dtype, call.layer);
+    return ops.qkv_rope(
+        ops.state, execution.encoder.qkv,
+        execution.resources->buffers.encoder_rope, execution.encoder.query,
+        key, value, rows, width, key_width, key_width,
+        kPi05ModelDims.encoder_head_dim, stream);
+}
+
 }  // namespace
 
 modalities::Status Pi05ForwardExecution::record(
@@ -531,10 +745,14 @@ modalities::Status Pi05ForwardExecution::record(
     modalities::Status status = validate_pi05_operation_call(call, shape);
     if (!status.ok_status()) return status;
     if (!resources || !ops || !complete_vision(vision) ||
-        !complete_vision(active_primitives(*ops))) {
+        !complete_encoder(encoder) ||
+        !complete_vision(active_primitives(*ops)) ||
+        !complete_encoder(active_primitives(*ops))) {
         return invalid("PI0.5 forward execution is incomplete");
     }
     switch (call.id) {
+        case Pi05OperationId::kComposePrompt:
+            return execute_compose_prompt(shape, *this, stream);
         case Pi05OperationId::kVisionEmbed:
             return execute_vision_embed(shape, *this, stream);
         case Pi05OperationId::kVisionAttention:
@@ -543,6 +761,12 @@ modalities::Status Pi05ForwardExecution::record(
             return execute_vision_mlp(call, shape, *this, stream);
         case Pi05OperationId::kVisionProject:
             return execute_vision_project(shape, *this, stream);
+        case Pi05OperationId::kEncoderAttention:
+            return execute_encoder_attention(call, shape, *this, stream);
+        case Pi05OperationId::kEncoderMlp:
+            return execute_encoder_mlp(call, shape, *this, stream);
+        case Pi05OperationId::kEncoderCacheFinalize:
+            return execute_encoder_cache_finalize(call, shape, *this, stream);
         default:
             return fallback ? fallback->record(call, shape, stream)
                             : invalid("PI0.5 forward operation is unavailable");

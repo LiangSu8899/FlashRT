@@ -87,16 +87,74 @@ using Pi05QkvSplitPrimitive = modalities::Status (*)(
     int key_width,
     int value_width,
     Pi05Stream stream);
-using Pi05VisionAttentionPrimitive = modalities::Status (*)(
+using Pi05NormalizeForLinearPrimitive = modalities::Status (*)(
     void* state,
+    void* residual,
+    const void* update,
+    const Pi05ResolvedBuffer& weight,
+    void* normalized,
+    Pi05LinearWeightKey key,
+    int step,
+    int rows,
+    int columns,
+    float epsilon,
+    const void** linear_input,
+    bool* prequantized,
+    Pi05Stream stream);
+using Pi05QkvRopePrimitive = modalities::Status (*)(
+    void* state,
+    const void* qkv,
+    const Pi05ResolvedBuffer& rope,
+    void* query,
+    void* key,
+    void* value,
+    int rows,
+    int query_width,
+    int key_width,
+    int value_width,
+    int head_width,
+    Pi05Stream stream);
+using Pi05AttentionPrimitive = modalities::Status (*)(
+    void* state,
+    Pi05LinearDomain domain,
+    int layer,
     const void* query,
     const void* key,
     const void* value,
     void* output,
-    int views,
-    int rows,
-    int heads,
+    int batches,
+    int query_rows,
+    int key_rows,
+    int query_heads,
+    int key_heads,
     int head_width,
+    Pi05Stream stream);
+using Pi05GateUpPrimitive = modalities::Status (*)(
+    void* state,
+    const Pi05FeedForwardWeights& weights,
+    Pi05LinearWeightKey key,
+    int step,
+    const void* input,
+    bool prequantized,
+    void* gate,
+    void* up,
+    int rows,
+    int width,
+    int hidden_width,
+    bool* merged,
+    Pi05Stream stream);
+using Pi05GatedActivationPrimitive = modalities::Status (*)(
+    void* state,
+    const void* gate,
+    const void* up,
+    bool merged,
+    void* output,
+    int rows,
+    int hidden_width,
+    Pi05LinearWeightKey output_key,
+    int step,
+    const void** linear_input,
+    bool* prequantized,
     Pi05Stream stream);
 using Pi05GeluPrimitive = modalities::Status (*)(
     void* state,
@@ -125,7 +183,11 @@ struct Pi05PrimitiveSet final {
     Pi05BiasResidualPrimitive bias_residual = nullptr;
     Pi05LayerNormPrimitive layer_norm = nullptr;
     Pi05QkvSplitPrimitive qkv_split = nullptr;
-    Pi05VisionAttentionPrimitive vision_attention = nullptr;
+    Pi05NormalizeForLinearPrimitive normalize_for_linear = nullptr;
+    Pi05QkvRopePrimitive qkv_rope = nullptr;
+    Pi05AttentionPrimitive attention = nullptr;
+    Pi05GateUpPrimitive gate_up = nullptr;
+    Pi05GatedActivationPrimitive gated_activation = nullptr;
     Pi05GeluPrimitive gelu = nullptr;
     Pi05VisionPoolPrimitive vision_pool = nullptr;
 };
@@ -161,10 +223,24 @@ struct Pi05VisionExecution final {
     void* attention_output = nullptr;
 };
 
+struct Pi05EncoderExecution final {
+    Pi05ResolvedBuffer rms_weight;
+    void* normalized = nullptr;
+    void* qkv = nullptr;
+    void* gate = nullptr;
+    void* hidden = nullptr;
+    void* query = nullptr;
+    void* attention_output = nullptr;
+    const void* mlp_input = nullptr;
+    bool mlp_input_prequantized = false;
+    const void* pending_update = nullptr;
+};
+
 struct Pi05ForwardExecution final : Pi05OperationSink {
     const Pi05ResolvedResources* resources = nullptr;
     const Pi05FrontendOps* ops = nullptr;
     Pi05VisionExecution vision;
+    Pi05EncoderExecution encoder;
     Pi05OperationSink* fallback = nullptr;
 
     modalities::Status record(const Pi05OperationCall& call,

@@ -34,13 +34,8 @@ public:
         Sm120Fp8Linear* fp8_linear,
         modalities::Status* status);
 
-    modalities::Status compose_prompt(Pi05Stream stream) const;
-    modalities::Status encoder_attention(int layer, Pi05Stream stream) const;
-    modalities::Status encoder_mlp(int layer, Pi05Stream stream) const;
-    modalities::Status encoder_cache_finalize(int layer,
-                                               Pi05Stream stream) const;
     modalities::Status diffusion_input_project(int step,
-                                                Pi05Stream stream) const;
+                                               Pi05Stream stream) const;
     modalities::Status decoder_attention(int layer,
                                          int step,
                                          Pi05Stream stream) const;

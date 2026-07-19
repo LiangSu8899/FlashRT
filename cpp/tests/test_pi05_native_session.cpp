@@ -61,10 +61,19 @@ struct Probe final {
     std::size_t default_stream_calls = 0;
     std::size_t capture_stream_calls = 0;
     std::size_t fail_record_at = std::numeric_limits<std::size_t>::max();
+    bool fail_frontend_primitive = false;
+    std::size_t layer0_pending_updates = 0;
     int prompt_length = -1;
     bool target_destroyed = false;
     bool context_alive_at_target_destroy = false;
 };
+
+constexpr std::size_t kDecodeTargetOperations = 390;
+constexpr std::size_t kContextTargetOperations = 0;
+constexpr std::size_t kInferTargetOperations = kDecodeTargetOperations;
+constexpr std::size_t kCapturedTargetOperations =
+    kInferTargetOperations + kDecodeTargetOperations +
+    kContextTargetOperations;
 
 modalities::Status injected(const char* message) {
     return modalities::Status::error(modalities::StatusCode::kBackend,
@@ -94,8 +103,12 @@ modalities::Status noop_unary(void*, void*, std::size_t,
     return modalities::Status::ok();
 }
 
-modalities::Status noop_copy(void*, void*, const void*, std::size_t,
+modalities::Status noop_copy(void* state, void*, const void*, std::size_t,
                              pi05::Pi05Stream) {
+    Probe* probe = static_cast<Probe*>(state);
+    if (probe && probe->fail_frontend_primitive) {
+        return injected("injected frontend primitive failure");
+    }
     return modalities::Status::ok();
 }
 
@@ -122,8 +135,29 @@ modalities::Status noop_qkv_split(void*, const void*, void*, void*, void*, int,
     return modalities::Status::ok();
 }
 
-modalities::Status noop_attention(void*, const void*, const void*, const void*,
-                                  void*, int, int, int, int,
+modalities::Status noop_normalize(
+    void* state, void*, const void* update, const pi05::Pi05ResolvedBuffer&,
+    void* output, pi05::Pi05LinearWeightKey key, int, int, int, float,
+    const void** linear_input, bool* prequantized, pi05::Pi05Stream) {
+    Probe* probe = static_cast<Probe*>(state);
+    if (probe && update && key.domain == pi05::Pi05LinearDomain::kEncoder &&
+        key.role == pi05::Pi05LinearRole::kAttentionQkv && key.layer == 0) {
+        ++probe->layer0_pending_updates;
+    }
+    if (linear_input) *linear_input = output;
+    if (prequantized) *prequantized = false;
+    return modalities::Status::ok();
+}
+
+modalities::Status noop_qkv_rope(
+    void*, const void*, const pi05::Pi05ResolvedBuffer&, void*, void*, void*,
+    int, int, int, int, int, pi05::Pi05Stream) {
+    return modalities::Status::ok();
+}
+
+modalities::Status noop_attention(void*, pi05::Pi05LinearDomain, int,
+                                  const void*, const void*, const void*, void*,
+                                  int, int, int, int, int, int,
                                   pi05::Pi05Stream) {
     return modalities::Status::ok();
 }
@@ -133,8 +167,26 @@ modalities::Status noop_pool(void*, const void*, void*, int, int, int, int,
     return modalities::Status::ok();
 }
 
-pi05::Pi05PrimitiveSet fake_primitives() {
+modalities::Status noop_gate_up(
+    void*, const pi05::Pi05FeedForwardWeights&, pi05::Pi05LinearWeightKey,
+    int, const void*, bool, void*, void*, int, int, int, bool* merged,
+    pi05::Pi05Stream) {
+    if (merged) *merged = false;
+    return modalities::Status::ok();
+}
+
+modalities::Status noop_gated_activation(
+    void*, const void*, const void*, bool, void* output, int, int,
+    pi05::Pi05LinearWeightKey, int, const void** linear_input,
+    bool* prequantized, pi05::Pi05Stream) {
+    if (linear_input) *linear_input = output;
+    if (prequantized) *prequantized = false;
+    return modalities::Status::ok();
+}
+
+pi05::Pi05PrimitiveSet fake_primitives(Probe* probe) {
     pi05::Pi05PrimitiveSet result;
+    result.state = probe;
     result.linear = noop_linear;
     result.projected_linear = noop_projected_linear;
     result.add_bias = noop_bias;
@@ -144,7 +196,11 @@ pi05::Pi05PrimitiveSet fake_primitives() {
     result.bias_residual = noop_bias_residual;
     result.layer_norm = noop_layer_norm;
     result.qkv_split = noop_qkv_split;
-    result.vision_attention = noop_attention;
+    result.normalize_for_linear = noop_normalize;
+    result.qkv_rope = noop_qkv_rope;
+    result.attention = noop_attention;
+    result.gate_up = noop_gate_up;
+    result.gated_activation = noop_gated_activation;
     result.gelu = noop_unary;
     result.vision_pool = noop_pool;
     return result;
@@ -162,7 +218,7 @@ public:
         CHECK(probe_ != nullptr);
         frontend_ops_.profile.activation_dtype =
             modalities::DType::kBFloat16;
-        frontend_ops_.bf16 = fake_primitives();
+        frontend_ops_.bf16 = fake_primitives(probe_);
     }
 
     ~FakeTarget() override {
@@ -241,6 +297,8 @@ public:
         out->ops = &frontend_ops_;
         out->vision = {data, data, data, data, data, data,
                        data, data, data, data};
+        out->encoder = {resources_.buffers.images, data, data, data,
+                        data, data, data};
         out->fallback = this;
         return modalities::Status::ok();
     }
@@ -353,9 +411,10 @@ void test_success_without_warmup() {
         LifecycleStep::kFinalize,
         LifecycleStep::kForwardExecution,
         LifecycleStep::kCaptureInputs}));
-    CHECK(probe.record_calls == 426 + 390 + 36);
+    CHECK(probe.record_calls == kCapturedTargetOperations);
     CHECK(probe.default_stream_calls == 0);
-    CHECK(probe.capture_stream_calls == 426 + 390 + 36);
+    CHECK(probe.capture_stream_calls == kCapturedTargetOperations);
+    CHECK(probe.layer0_pending_updates == 0);
     check_graphs(*session);
 
     CHECK(session->set_prompt_length(43).ok_status());
@@ -392,9 +451,11 @@ void test_success_with_warmup() {
         LifecycleStep::kForwardExecution,
         LifecycleStep::kCaptureInputs,
         LifecycleStep::kReset}));
-    CHECK(probe.record_calls == 426 + 426 + 390 + 36);
-    CHECK(probe.default_stream_calls == 426);
-    CHECK(probe.capture_stream_calls == 426 + 390 + 36);
+    CHECK(probe.record_calls ==
+          kInferTargetOperations + kCapturedTargetOperations);
+    CHECK(probe.default_stream_calls == kInferTargetOperations);
+    CHECK(probe.capture_stream_calls == kCapturedTargetOperations);
+    CHECK(probe.layer0_pending_updates == 0);
     check_graphs(*session);
     session.reset();
     CHECK(probe.target_destroyed);
@@ -461,9 +522,17 @@ void test_failure_matrix() {
     expect_create_failure(true, FailPoint::kNone, 11);
     expect_create_failure(true, FailPoint::kReset);
     expect_create_failure(false, FailPoint::kNone, 11);
-    expect_create_failure(false, FailPoint::kNone, 426 + 11);
     expect_create_failure(
-        false, FailPoint::kNone, 426 + 390 + 11);
+        false, FailPoint::kNone, kInferTargetOperations + 11);
+
+    Probe primitive_probe;
+    primitive_probe.fail_frontend_primitive = true;
+    modalities::Status primitive_status;
+    CHECK(create_session(false, FailPoint::kNone,
+                         &primitive_probe, &primitive_status) == nullptr);
+    CHECK(!primitive_status.ok_status());
+    CHECK(primitive_probe.record_calls == 0);
+    CHECK(primitive_probe.target_destroyed);
 
     pi05::Pi05ResolvedShape invalid_shape = fixture::canonical_shape();
     invalid_shape.chunk = 0;
