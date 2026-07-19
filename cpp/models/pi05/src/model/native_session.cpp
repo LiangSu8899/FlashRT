@@ -101,11 +101,13 @@ modalities::Status Pi05NativeSession::initialize() {
     if (!result.ok_status()) return result;
     result = target_->finalize_setup();
     if (!result.ok_status()) return result;
+    result = target_->make_forward_execution(&forward_);
+    if (!result.ok_status()) return result;
     result = target_->initialize_capture_inputs();
     if (!result.ok_status()) return result;
 
     if (target_->warmup_before_capture()) {
-        result = program_.warmup(pipeline_, *target_);
+        result = program_.warmup(pipeline_, forward_);
         if (!result.ok_status()) return result;
         result = target_->reset_after_warmup();
         if (!result.ok_status()) return result;
@@ -114,7 +116,7 @@ modalities::Status Pi05NativeSession::initialize() {
     Pi05ResolvedGraphBindings bindings;
     result = make_pi05_graph_bindings(resources_.buffers, &bindings);
     if (!result.ok_status()) return result;
-    return program_.capture(pipeline_, *target_, bindings);
+    return program_.capture(pipeline_, forward_, bindings);
 }
 
 modalities::Status Pi05NativeSession::set_prompt_length(

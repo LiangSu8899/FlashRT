@@ -344,9 +344,12 @@ modalities::Status Sm110TargetBundle::resolve_resources(
         impl_->resources = resolved;
         impl_->frontend_ops.profile.activation_dtype =
             modalities::DType::kFloat16;
-        impl_->frontend_ops.f16 = {
-            impl_->driver.get(), frontend_linear, frontend_add_bias,
-            frontend_silu, frontend_copy};
+        Pi05PrimitiveSet& primitives = impl_->frontend_ops.f16;
+        primitives.state = impl_->driver.get();
+        primitives.linear = frontend_linear;
+        primitives.add_bias = frontend_add_bias;
+        primitives.silu = frontend_silu;
+        primitives.copy = frontend_copy;
         status = zero_prepare_storage(impl_->resources, impl_->physical);
         if (!status.ok_status()) return impl_->fail(std::move(status));
         impl_->state = Impl::State::kResourcesResolved;
@@ -382,6 +385,11 @@ modalities::Status Sm110TargetBundle::complete_prepare() {
 }
 
 modalities::Status Sm110TargetBundle::finalize_setup() {
+    return unsupported("SM110 operation composition is not connected");
+}
+
+modalities::Status Sm110TargetBundle::make_forward_execution(
+    Pi05ForwardExecution*) {
     return unsupported("SM110 operation composition is not connected");
 }
 

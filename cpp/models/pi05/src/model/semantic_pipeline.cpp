@@ -342,7 +342,212 @@ modalities::Status execute_prepare_call(
     }
 }
 
+bool complete_vision(const Pi05PrimitiveSet* ops) {
+    return ops && ops->linear && ops->projected_linear && ops->add_bias &&
+           ops->patchify && ops->bias_residual && ops->layer_norm &&
+           ops->qkv_split && ops->vision_attention && ops->gelu &&
+           ops->vision_pool;
+}
+
+bool complete_vision(const Pi05VisionExecution& vision) {
+    return vision.patches && vision.expanded_position && vision.pooled &&
+           vision.normalized && vision.qkv && vision.hidden && vision.query &&
+           vision.key && vision.value && vision.attention_output;
+}
+
+modalities::Status execute_vision_embed(
+    const Pi05ResolvedShape& shape,
+    Pi05ForwardExecution& execution,
+    Pi05Stream stream) {
+    const Pi05PrimitiveSet& ops = *active_primitives(*execution.ops);
+    const Pi05VisionGlobalWeights& weights =
+        execution.resources->weights.vision;
+    const int rows = shape.vision_sequence;
+    const int width = kPi05ModelDims.vision_width;
+    const int patch_width = kPi05ModelDims.vision_patch *
+                            kPi05ModelDims.vision_patch *
+                            kPi05ModelDims.image_channels;
+    void* state = buffer_data(execution.resources->buffers.vision_state);
+    modalities::Status status = ops.patchify(
+        ops.state, buffer_data(execution.resources->buffers.images),
+        execution.vision.patches, shape.num_views, stream);
+    if (!status.ok_status()) return status;
+    status = ops.linear(ops.state, weights.patch_weight,
+                        execution.vision.patches, state, rows, patch_width,
+                        width, stream);
+    if (!status.ok_status()) return status;
+    status = ops.bias_residual(
+        ops.state, state, execution.vision.expanded_position,
+        weights.patch_bias, rows, width, stream);
+    if (!status.ok_status()) return status;
+    const Pi05VisionLayerWeights& first =
+        execution.resources->weights.vision_layers[0];
+    return ops.layer_norm(
+        ops.state, state, first.pre_attention_norm_weight,
+        first.pre_attention_norm_bias, execution.vision.normalized, rows,
+        width, kPi05ModelNumerics.vision_layer_norm_epsilon, stream);
+}
+
+modalities::Status execute_vision_attention(
+    const Pi05OperationCall& call,
+    const Pi05ResolvedShape& shape,
+    Pi05ForwardExecution& execution,
+    Pi05Stream stream) {
+    const Pi05PrimitiveSet& ops = *active_primitives(*execution.ops);
+    const Pi05VisionLayerWeights& weights =
+        execution.resources->weights.vision_layers[
+            static_cast<std::size_t>(call.layer)];
+    const int rows = shape.vision_sequence;
+    const int width = kPi05ModelDims.vision_width;
+    void* state = buffer_data(execution.resources->buffers.vision_state);
+    modalities::Status status = ops.projected_linear(
+        ops.state, weights.attention_qkv_weight,
+        {Pi05LinearDomain::kVision, Pi05LinearRole::kAttentionQkv,
+         call.layer},
+        -1, execution.vision.normalized, execution.vision.qkv, rows, width,
+        3 * width, false, stream);
+    if (!status.ok_status()) return status;
+    status = ops.add_bias(ops.state, execution.vision.qkv,
+                          weights.attention_qkv_bias, rows, 3 * width, stream);
+    if (!status.ok_status()) return status;
+    status = ops.qkv_split(
+        ops.state, execution.vision.qkv, execution.vision.query,
+        execution.vision.key, execution.vision.value, rows, width, width,
+        width, stream);
+    if (!status.ok_status()) return status;
+    status = ops.vision_attention(
+        ops.state, execution.vision.query, execution.vision.key,
+        execution.vision.value, execution.vision.attention_output,
+        shape.num_views, rows, kPi05ModelDims.vision_heads,
+        kPi05ModelDims.vision_head_dim, stream);
+    if (!status.ok_status()) return status;
+    status = ops.projected_linear(
+        ops.state, weights.attention_output_weight,
+        {Pi05LinearDomain::kVision, Pi05LinearRole::kAttentionOutput,
+         call.layer},
+        -1, execution.vision.attention_output, execution.vision.normalized,
+        rows, width, width, false, stream);
+    if (!status.ok_status()) return status;
+    status = ops.bias_residual(
+        ops.state, state, execution.vision.normalized,
+        weights.attention_output_bias, rows, width, stream);
+    return status.ok_status()
+               ? ops.layer_norm(
+                     ops.state, state, weights.pre_mlp_norm_weight,
+                     weights.pre_mlp_norm_bias, execution.vision.normalized,
+                     rows, width,
+                     kPi05ModelNumerics.vision_layer_norm_epsilon, stream)
+               : status;
+}
+
+modalities::Status execute_vision_mlp(
+    const Pi05OperationCall& call,
+    const Pi05ResolvedShape& shape,
+    Pi05ForwardExecution& execution,
+    Pi05Stream stream) {
+    const Pi05PrimitiveSet& ops = *active_primitives(*execution.ops);
+    const Pi05VisionLayerWeights& weights =
+        execution.resources->weights.vision_layers[
+            static_cast<std::size_t>(call.layer)];
+    const int rows = shape.vision_sequence;
+    const int width = kPi05ModelDims.vision_width;
+    const int hidden_width = kPi05ModelDims.vision_hidden;
+    void* state = buffer_data(execution.resources->buffers.vision_state);
+    modalities::Status status = ops.projected_linear(
+        ops.state, weights.mlp_up_weight,
+        {Pi05LinearDomain::kVision, Pi05LinearRole::kMlpUp, call.layer}, -1,
+        execution.vision.normalized, execution.vision.hidden, rows, width,
+        hidden_width, false, stream);
+    if (!status.ok_status()) return status;
+    status = ops.add_bias(ops.state, execution.vision.hidden,
+                          weights.mlp_up_bias, rows, hidden_width, stream);
+    if (!status.ok_status()) return status;
+    status = ops.gelu(ops.state, execution.vision.hidden,
+                      static_cast<std::size_t>(rows) * hidden_width, stream);
+    if (!status.ok_status()) return status;
+    status = ops.projected_linear(
+        ops.state, weights.mlp_down_weight,
+        {Pi05LinearDomain::kVision, Pi05LinearRole::kMlpDown, call.layer}, -1,
+        execution.vision.hidden, execution.vision.normalized, rows,
+        hidden_width, width, false, stream);
+    if (!status.ok_status()) return status;
+    status = ops.bias_residual(ops.state, state, execution.vision.normalized,
+                               weights.mlp_down_bias, rows, width, stream);
+    if (!status.ok_status() ||
+        call.layer + 1 == kPi05ModelDims.vision_layers) {
+        return status;
+    }
+    const Pi05VisionLayerWeights& next =
+        execution.resources->weights.vision_layers[
+            static_cast<std::size_t>(call.layer + 1)];
+    return ops.layer_norm(
+        ops.state, state, next.pre_attention_norm_weight,
+        next.pre_attention_norm_bias, execution.vision.normalized, rows,
+        width, kPi05ModelNumerics.vision_layer_norm_epsilon, stream);
+}
+
+modalities::Status execute_vision_project(
+    const Pi05ResolvedShape& shape,
+    Pi05ForwardExecution& execution,
+    Pi05Stream stream) {
+    const Pi05PrimitiveSet& ops = *active_primitives(*execution.ops);
+    const Pi05VisionGlobalWeights& weights =
+        execution.resources->weights.vision;
+    const int rows = shape.encoder_vision_sequence;
+    const int width = kPi05ModelDims.vision_width;
+    void* state = buffer_data(execution.resources->buffers.vision_state);
+    modalities::Status status = modalities::Status::ok();
+    if (shape.vision_pool_factor > 1) {
+        status = ops.vision_pool(
+            ops.state, state, execution.vision.pooled, shape.num_views,
+            kPi05ModelDims.image_height / kPi05ModelDims.vision_patch,
+            kPi05ModelDims.image_width / kPi05ModelDims.vision_patch, width,
+            shape.vision_pool_factor, stream);
+        if (!status.ok_status()) return status;
+    }
+    status = ops.layer_norm(
+        ops.state, execution.vision.pooled, weights.final_norm_weight,
+        weights.final_norm_bias, execution.vision.normalized, rows, width,
+        kPi05ModelNumerics.vision_layer_norm_epsilon, stream);
+    if (!status.ok_status()) return status;
+    void* encoder = buffer_data(execution.resources->buffers.encoder_state);
+    status = ops.projected_linear(
+        ops.state, weights.projector_weight,
+        {Pi05LinearDomain::kVision, Pi05LinearRole::kProjector, -1}, -1,
+        execution.vision.normalized, encoder, rows, width,
+        kPi05ModelDims.encoder_width, false, stream);
+    return status.ok_status()
+               ? ops.add_bias(ops.state, encoder, weights.projector_bias,
+                              rows, kPi05ModelDims.encoder_width, stream)
+               : status;
+}
+
 }  // namespace
+
+modalities::Status Pi05ForwardExecution::record(
+    const Pi05OperationCall& call,
+    const Pi05ResolvedShape& shape,
+    Pi05Stream stream) {
+    modalities::Status status = validate_pi05_operation_call(call, shape);
+    if (!status.ok_status()) return status;
+    if (!resources || !ops || !complete_vision(vision) ||
+        !complete_vision(active_primitives(*ops))) {
+        return invalid("PI0.5 forward execution is incomplete");
+    }
+    switch (call.id) {
+        case Pi05OperationId::kVisionEmbed:
+            return execute_vision_embed(shape, *this, stream);
+        case Pi05OperationId::kVisionAttention:
+            return execute_vision_attention(call, shape, *this, stream);
+        case Pi05OperationId::kVisionMlp:
+            return execute_vision_mlp(call, shape, *this, stream);
+        case Pi05OperationId::kVisionProject:
+            return execute_vision_project(shape, *this, stream);
+        default:
+            return fallback ? fallback->record(call, shape, stream)
+                            : invalid("PI0.5 forward operation is unavailable");
+    }
+}
 
 const char* pi05_value_name(Pi05ValueId id) {
     static constexpr const char* kNames[] = {

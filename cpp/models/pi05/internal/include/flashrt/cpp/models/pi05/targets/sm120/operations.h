@@ -35,10 +35,6 @@ public:
         modalities::Status* status);
 
     modalities::Status compose_prompt(Pi05Stream stream) const;
-    modalities::Status vision_embed(Pi05Stream stream) const;
-    modalities::Status vision_attention(int layer, Pi05Stream stream) const;
-    modalities::Status vision_mlp(int layer, Pi05Stream stream) const;
-    modalities::Status vision_project(Pi05Stream stream) const;
     modalities::Status encoder_attention(int layer, Pi05Stream stream) const;
     modalities::Status encoder_mlp(int layer, Pi05Stream stream) const;
     modalities::Status encoder_cache_finalize(int layer,

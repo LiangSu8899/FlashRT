@@ -2,6 +2,7 @@
 #define FLASHRT_CPP_MODELS_PI05_MODEL_NATIVE_SESSION_H
 
 #include "flashrt/cpp/models/pi05/model/captured_program.h"
+#include "flashrt/cpp/models/pi05/model/frontend_ops.h"
 #include "flashrt/cpp/models/pi05/model/target_bundle.h"
 
 #include <memory>
@@ -48,6 +49,7 @@ private:
     Pi05CapturedProgram program_;
     std::unique_ptr<Pi05TargetBundle> target_;
     Pi05ResolvedResources resources_;
+    Pi05ForwardExecution forward_;
 };
 
 }  // namespace pi05

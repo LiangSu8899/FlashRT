@@ -37,6 +37,7 @@ enum class FailPoint {
     kPrepareExecution,
     kCompletePrepare,
     kFinalize,
+    kForwardExecution,
     kCaptureInputs,
     kReset,
     kSetPrompt,
@@ -48,6 +49,7 @@ enum class LifecycleStep {
     kPrepareExecution,
     kCompletePrepare,
     kFinalize,
+    kForwardExecution,
     kCaptureInputs,
     kReset,
     kSetPrompt,
@@ -81,6 +83,12 @@ modalities::Status noop_bias(
     return modalities::Status::ok();
 }
 
+modalities::Status noop_projected_linear(
+    void*, const pi05::Pi05ResolvedWeight&, pi05::Pi05LinearWeightKey, int,
+    const void*, void*, int, int, int, bool, pi05::Pi05Stream) {
+    return modalities::Status::ok();
+}
+
 modalities::Status noop_unary(void*, void*, std::size_t,
                               pi05::Pi05Stream) {
     return modalities::Status::ok();
@@ -91,8 +99,55 @@ modalities::Status noop_copy(void*, void*, const void*, std::size_t,
     return modalities::Status::ok();
 }
 
+modalities::Status noop_patchify(void*, const void*, void*, int,
+                                 pi05::Pi05Stream) {
+    return modalities::Status::ok();
+}
+
+modalities::Status noop_bias_residual(
+    void*, void*, const void*, const pi05::Pi05ResolvedWeight&, int, int,
+    pi05::Pi05Stream) {
+    return modalities::Status::ok();
+}
+
+modalities::Status noop_layer_norm(
+    void*, const void*, const pi05::Pi05ResolvedWeight&,
+    const pi05::Pi05ResolvedWeight&, void*, int, int, float,
+    pi05::Pi05Stream) {
+    return modalities::Status::ok();
+}
+
+modalities::Status noop_qkv_split(void*, const void*, void*, void*, void*, int,
+                                  int, int, int, pi05::Pi05Stream) {
+    return modalities::Status::ok();
+}
+
+modalities::Status noop_attention(void*, const void*, const void*, const void*,
+                                  void*, int, int, int, int,
+                                  pi05::Pi05Stream) {
+    return modalities::Status::ok();
+}
+
+modalities::Status noop_pool(void*, const void*, void*, int, int, int, int,
+                             int, pi05::Pi05Stream) {
+    return modalities::Status::ok();
+}
+
 pi05::Pi05PrimitiveSet fake_primitives() {
-    return {nullptr, noop_linear, noop_bias, noop_unary, noop_copy};
+    pi05::Pi05PrimitiveSet result;
+    result.linear = noop_linear;
+    result.projected_linear = noop_projected_linear;
+    result.add_bias = noop_bias;
+    result.silu = noop_unary;
+    result.copy = noop_copy;
+    result.patchify = noop_patchify;
+    result.bias_residual = noop_bias_residual;
+    result.layer_norm = noop_layer_norm;
+    result.qkv_split = noop_qkv_split;
+    result.vision_attention = noop_attention;
+    result.gelu = noop_unary;
+    result.vision_pool = noop_pool;
+    return result;
 }
 
 class FakeTarget final : public pi05::Pi05TargetBundle {
@@ -103,10 +158,11 @@ public:
                Probe* probe)
         : Pi05TargetBundle(context, warmup),
           fail_point_(fail_point),
-          probe_(probe),
-          frontend_ops_{{modalities::DType::kBFloat16},
-                        fake_primitives(), {}} {
+          probe_(probe) {
         CHECK(probe_ != nullptr);
+        frontend_ops_.profile.activation_dtype =
+            modalities::DType::kBFloat16;
+        frontend_ops_.bf16 = fake_primitives();
     }
 
     ~FakeTarget() override {
@@ -172,6 +228,21 @@ public:
         return fail_point_ == FailPoint::kFinalize
                    ? injected("injected setup finalization failure")
                    : modalities::Status::ok();
+    }
+
+    modalities::Status make_forward_execution(
+        pi05::Pi05ForwardExecution* out) override {
+        probe_->lifecycle.push_back(LifecycleStep::kForwardExecution);
+        if (!out || fail_point_ == FailPoint::kForwardExecution) {
+            return injected("injected forward execution failure");
+        }
+        void* data = frt_buffer_dptr(anchor_);
+        out->resources = &resources_;
+        out->ops = &frontend_ops_;
+        out->vision = {data, data, data, data, data, data,
+                       data, data, data, data};
+        out->fallback = this;
+        return modalities::Status::ok();
     }
 
     modalities::Status initialize_capture_inputs() override {
@@ -280,10 +351,11 @@ void test_success_without_warmup() {
         LifecycleStep::kPrepareExecution,
         LifecycleStep::kCompletePrepare,
         LifecycleStep::kFinalize,
+        LifecycleStep::kForwardExecution,
         LifecycleStep::kCaptureInputs}));
-    CHECK(probe.record_calls == 482 + 390 + 92);
+    CHECK(probe.record_calls == 426 + 390 + 36);
     CHECK(probe.default_stream_calls == 0);
-    CHECK(probe.capture_stream_calls == 482 + 390 + 92);
+    CHECK(probe.capture_stream_calls == 426 + 390 + 36);
     check_graphs(*session);
 
     CHECK(session->set_prompt_length(43).ok_status());
@@ -317,11 +389,12 @@ void test_success_with_warmup() {
         LifecycleStep::kPrepareExecution,
         LifecycleStep::kCompletePrepare,
         LifecycleStep::kFinalize,
+        LifecycleStep::kForwardExecution,
         LifecycleStep::kCaptureInputs,
         LifecycleStep::kReset}));
-    CHECK(probe.record_calls == 482 + 482 + 390 + 92);
-    CHECK(probe.default_stream_calls == 482);
-    CHECK(probe.capture_stream_calls == 482 + 390 + 92);
+    CHECK(probe.record_calls == 426 + 426 + 390 + 36);
+    CHECK(probe.default_stream_calls == 426);
+    CHECK(probe.capture_stream_calls == 426 + 390 + 36);
     check_graphs(*session);
     session.reset();
     CHECK(probe.target_destroyed);
@@ -361,6 +434,9 @@ void expect_create_failure(
         case FailPoint::kFinalize:
             CHECK(probe.lifecycle.back() == LifecycleStep::kFinalize);
             break;
+        case FailPoint::kForwardExecution:
+            CHECK(probe.lifecycle.back() == LifecycleStep::kForwardExecution);
+            break;
         case FailPoint::kCaptureInputs:
             CHECK(probe.lifecycle.back() == LifecycleStep::kCaptureInputs);
             break;
@@ -380,13 +456,14 @@ void test_failure_matrix() {
     expect_create_failure(false, FailPoint::kPrepareExecution);
     expect_create_failure(false, FailPoint::kCompletePrepare);
     expect_create_failure(false, FailPoint::kFinalize);
+    expect_create_failure(false, FailPoint::kForwardExecution);
     expect_create_failure(false, FailPoint::kCaptureInputs);
     expect_create_failure(true, FailPoint::kNone, 11);
     expect_create_failure(true, FailPoint::kReset);
     expect_create_failure(false, FailPoint::kNone, 11);
-    expect_create_failure(false, FailPoint::kNone, 482 + 11);
+    expect_create_failure(false, FailPoint::kNone, 426 + 11);
     expect_create_failure(
-        false, FailPoint::kNone, 482 + 390 + 11);
+        false, FailPoint::kNone, 426 + 390 + 11);
 
     pi05::Pi05ResolvedShape invalid_shape = fixture::canonical_shape();
     invalid_shape.chunk = 0;

@@ -7,6 +7,8 @@ namespace flashrt {
 namespace models {
 namespace pi05 {
 
+struct Pi05ForwardExecution;
+
 class Pi05TargetBundle : public Pi05OperationSink {
 public:
     Pi05TargetBundle(frt_ctx context, bool warmup_before_capture)
@@ -29,6 +31,8 @@ public:
         Pi05PrepareExecution* out) = 0;
     virtual modalities::Status complete_prepare() = 0;
     virtual modalities::Status finalize_setup() = 0;
+    virtual modalities::Status make_forward_execution(
+        Pi05ForwardExecution* out) = 0;
     virtual modalities::Status initialize_capture_inputs() = 0;
     virtual modalities::Status reset_after_warmup() = 0;
     virtual modalities::Status set_prompt_length(int prompt_tokens) = 0;

@@ -46,6 +46,8 @@ public:
         Pi05PrepareExecution* out) override;
     modalities::Status complete_prepare() override;
     modalities::Status finalize_setup() override;
+    modalities::Status make_forward_execution(
+        Pi05ForwardExecution* out) override;
     modalities::Status initialize_capture_inputs() override;
     modalities::Status reset_after_warmup() override;
     modalities::Status set_prompt_length(int prompt_tokens) override;

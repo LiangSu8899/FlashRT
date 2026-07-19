@@ -2,6 +2,7 @@
 
 #include "activation.cuh"
 #include "dit_bf16.cuh"
+#include "elementwise.cuh"
 #include "flashrt/cpp/loader/safetensors.h"
 #include "flashrt/cpp/models/pi05/model/frontend_ops.h"
 #include "flashrt/cpp/models/pi05/support/native_resource_resolver.h"
@@ -13,7 +14,10 @@
 #include "flashrt/cpp/models/pi05/targets/sm120/fp8_linear.h"
 #include "flashrt/cpp/models/pi05/targets/sm120/fp8_weight_packer.h"
 #include "flashrt/cpp/models/pi05/targets/sm120/operations.h"
+#include "norm.cuh"
+#include "patch_embed.cuh"
 #include "quantize.cuh"
+#include "rope.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime_api.h>
@@ -150,6 +154,18 @@ modalities::Status derive_action_step_weights(
     return modalities::Status::ok();
 }
 
+struct Sm120FrontendBindings final {
+    const Pi05ResolvedShape* shape = nullptr;
+    Sm120Bf16Linear* bf16_linear = nullptr;
+    Sm120Fp8Linear* fp8_linear = nullptr;
+    Sm120AttentionBacking* attention_buffers = nullptr;
+    Sm120AttentionDriver* attention = nullptr;
+};
+
+Sm120FrontendBindings* frontend(void* state) {
+    return static_cast<Sm120FrontendBindings*>(state);
+}
+
 modalities::Status frontend_linear(
     void* state,
     const Pi05ResolvedWeight& weight,
@@ -159,9 +175,48 @@ modalities::Status frontend_linear(
     int input_width,
     int output_width,
     Pi05Stream stream) {
-    if (!state) return invalid("SM120 BF16 linear binding is invalid");
-    return static_cast<Sm120Bf16Linear*>(state)->run(
+    Sm120FrontendBindings* binding = frontend(state);
+    if (!binding || !binding->bf16_linear) {
+        return invalid("SM120 BF16 linear binding is invalid");
+    }
+    return binding->bf16_linear->run(
         weight, input, output, rows, input_width, output_width, stream);
+}
+
+modalities::Status frontend_projected_linear(
+    void* state,
+    const Pi05ResolvedWeight& weight,
+    Pi05LinearWeightKey key,
+    int step,
+    const void* input,
+    void* output,
+    int rows,
+    int input_width,
+    int output_width,
+    bool prequantized,
+    Pi05Stream stream) {
+    Sm120FrontendBindings* binding = frontend(state);
+    if (!binding || !binding->shape || !binding->bf16_linear) {
+        return invalid("SM120 projected-linear binding is invalid");
+    }
+    if (!binding->fp8_linear) {
+        return prequantized
+                   ? invalid("SM120 BF16 input cannot be prequantized")
+                   : binding->bf16_linear->run(
+                         weight, input, output, rows, input_width,
+                         output_width, stream);
+    }
+    Pi05LinearActivationSite site;
+    modalities::Status status = resolve_pi05_linear_activation_site(
+        key, step, *binding->shape, &site);
+    if (!status.ok_status()) return status;
+    return prequantized
+               ? binding->fp8_linear->run_prequantized(
+                     weight, site, input, output, rows, input_width,
+                     output_width, stream)
+               : binding->fp8_linear->run(
+                     weight, site, input, output, rows, input_width,
+                     output_width, stream);
 }
 
 modalities::Status frontend_add_bias(void*,
@@ -204,6 +259,140 @@ modalities::Status frontend_copy(void*,
     return result == cudaSuccess
                ? modalities::Status::ok()
                : backend(cudaGetErrorString(result));
+}
+
+modalities::Status frontend_patchify(void*,
+                                     const void* images,
+                                     void* patches,
+                                     int views,
+                                     Pi05Stream stream) {
+    ::patch_im2col(
+        static_cast<const __half*>(images), static_cast<__half*>(patches),
+        views, reinterpret_cast<cudaStream_t>(stream));
+    return launch_status();
+}
+
+modalities::Status frontend_bias_residual(
+    void*,
+    void* residual,
+    const void* values,
+    const Pi05ResolvedWeight& bias,
+    int rows,
+    int columns,
+    Pi05Stream stream) {
+    if (!residual || !values || !vector_weight(bias, columns)) {
+        return invalid("SM120 bias-residual binding is invalid");
+    }
+    ::bias_residual(
+        static_cast<__nv_bfloat16*>(residual),
+        static_cast<const __nv_bfloat16*>(values),
+        static_cast<const __nv_bfloat16*>(bias.device_data), rows, columns,
+        reinterpret_cast<cudaStream_t>(stream));
+    return launch_status();
+}
+
+modalities::Status frontend_layer_norm(
+    void*,
+    const void* values,
+    const Pi05ResolvedWeight& weight,
+    const Pi05ResolvedWeight& bias,
+    void* output,
+    int rows,
+    int columns,
+    float epsilon,
+    Pi05Stream stream) {
+    if (!values || !output || !vector_weight(weight, columns) ||
+        !vector_weight(bias, columns)) {
+        return invalid("SM120 layer-norm binding is invalid");
+    }
+    ::layer_norm(
+        static_cast<const __nv_bfloat16*>(values),
+        static_cast<const __nv_bfloat16*>(weight.device_data),
+        static_cast<const __nv_bfloat16*>(bias.device_data),
+        static_cast<__nv_bfloat16*>(output), rows, columns, epsilon,
+        reinterpret_cast<cudaStream_t>(stream));
+    return launch_status();
+}
+
+modalities::Status frontend_qkv_split(
+    void*,
+    const void* qkv,
+    void* query,
+    void* key,
+    void* value,
+    int rows,
+    int query_width,
+    int key_width,
+    int value_width,
+    Pi05Stream stream) {
+    ::qkv_split(
+        static_cast<const __nv_bfloat16*>(qkv),
+        static_cast<__nv_bfloat16*>(query),
+        static_cast<__nv_bfloat16*>(key),
+        static_cast<__nv_bfloat16*>(value), rows, query_width, key_width,
+        value_width, reinterpret_cast<cudaStream_t>(stream));
+    return launch_status();
+}
+
+modalities::Status frontend_vision_attention(
+    void* state,
+    const void* query,
+    const void* key,
+    const void* value,
+    void* output,
+    int views,
+    int rows,
+    int heads,
+    int head_width,
+    Pi05Stream stream) {
+    Sm120FrontendBindings* binding = frontend(state);
+    if (!binding || !binding->shape || !binding->attention_buffers ||
+        !binding->attention) {
+        return invalid("SM120 vision-attention binding is invalid");
+    }
+    const Sm120VisionAttentionBuffers& buffers =
+        binding->attention_buffers->vision();
+    if (query != buffers.query.device_data() ||
+        key != buffers.key.device_data() ||
+        value != buffers.value.device_data() ||
+        output != binding->attention->vision_output() ||
+        views != binding->shape->num_views ||
+        rows != binding->shape->vision_sequence ||
+        heads != kPi05ModelDims.vision_heads ||
+        head_width != kPi05ModelDims.vision_head_dim) {
+        return invalid("SM120 vision-attention contract is invalid");
+    }
+    return binding->attention->vision(stream);
+}
+
+modalities::Status frontend_gelu(void*,
+                                 void* values,
+                                 std::size_t elements,
+                                 Pi05Stream stream) {
+    if (!values || !elements ||
+        elements > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        return invalid("SM120 GELU binding is invalid");
+    }
+    ::gelu_inplace(static_cast<__nv_bfloat16*>(values),
+                   static_cast<int>(elements),
+                   reinterpret_cast<cudaStream_t>(stream));
+    return launch_status();
+}
+
+modalities::Status frontend_vision_pool(void*,
+                                        const void* input,
+                                        void* output,
+                                        int views,
+                                        int grid_height,
+                                        int grid_width,
+                                        int columns,
+                                        int factor,
+                                        Pi05Stream stream) {
+    ::avg_pool_vision_tokens(
+        static_cast<const __nv_bfloat16*>(input),
+        static_cast<__nv_bfloat16*>(output), views, grid_height, grid_width,
+        columns, factor, reinterpret_cast<cudaStream_t>(stream));
+    return launch_status();
 }
 
 bool fp8(Sm120ExecutionMode mode) {
@@ -269,6 +458,7 @@ struct Sm120TargetBundle::Impl final {
     Sm120AttentionBacking attention;
     Sm120Bf16ScratchBacking scratch;
     std::unique_ptr<Sm120Bf16Linear> bf16_linear;
+    Sm120FrontendBindings frontend;
     Pi05FrontendOps frontend_ops;
     std::unique_ptr<Sm120Fp8WeightPacker> fp8_packer;
     std::unique_ptr<Sm120Fp8ActivationBacking> fp8_activation;
@@ -463,11 +653,25 @@ modalities::Status Sm120TargetBundle::resolve_resources(
 
         impl_->resources = resolved;
         impl_->support = support;
+        impl_->frontend = {&impl_->shape, impl_->bf16_linear.get(),
+                           impl_->fp8_linear.get(), &impl_->attention,
+                           nullptr};
         impl_->frontend_ops.profile.activation_dtype =
             modalities::DType::kBFloat16;
-        impl_->frontend_ops.bf16 = {
-            impl_->bf16_linear.get(), frontend_linear, frontend_add_bias,
-            frontend_silu, frontend_copy};
+        Pi05PrimitiveSet& primitives = impl_->frontend_ops.bf16;
+        primitives.state = &impl_->frontend;
+        primitives.linear = frontend_linear;
+        primitives.projected_linear = frontend_projected_linear;
+        primitives.add_bias = frontend_add_bias;
+        primitives.silu = frontend_silu;
+        primitives.copy = frontend_copy;
+        primitives.patchify = frontend_patchify;
+        primitives.bias_residual = frontend_bias_residual;
+        primitives.layer_norm = frontend_layer_norm;
+        primitives.qkv_split = frontend_qkv_split;
+        primitives.vision_attention = frontend_vision_attention;
+        primitives.gelu = frontend_gelu;
+        primitives.vision_pool = frontend_vision_pool;
         impl_->state = Impl::State::kResourcesResolved;
         *out = resolved;
         return modalities::Status::ok();
@@ -520,18 +724,6 @@ modalities::Status Sm120TargetBundle::record(
         case Pi05OperationId::kComposePrompt:
             status = impl_->operations->compose_prompt(stream);
             break;
-        case Pi05OperationId::kVisionEmbed:
-            status = impl_->operations->vision_embed(stream);
-            break;
-        case Pi05OperationId::kVisionAttention:
-            status = impl_->operations->vision_attention(call.layer, stream);
-            break;
-        case Pi05OperationId::kVisionMlp:
-            status = impl_->operations->vision_mlp(call.layer, stream);
-            break;
-        case Pi05OperationId::kVisionProject:
-            status = impl_->operations->vision_project(stream);
-            break;
         case Pi05OperationId::kEncoderAttention:
             status = impl_->operations->encoder_attention(call.layer, stream);
             break;
@@ -582,6 +774,7 @@ modalities::Status Sm120TargetBundle::finalize_setup() {
     }
     modalities::Status status = impl_->attention_driver->status();
     if (!status.ok_status()) return impl_->fail(std::move(status));
+    impl_->frontend.attention = impl_->attention_driver.get();
     if (impl_->fp8_linear) {
         status = Sm120Operations::autotune_fp8(
             impl_->shape, &impl_->resources, impl_->scratch,
@@ -596,6 +789,35 @@ modalities::Status Sm120TargetBundle::finalize_setup() {
         return impl_->fail(std::move(status));
     }
     impl_->state = Impl::State::kSetupFinalized;
+    return modalities::Status::ok();
+}
+
+modalities::Status Sm120TargetBundle::make_forward_execution(
+    Pi05ForwardExecution* out) {
+    if (!impl_ || !out || impl_->state != Impl::State::kSetupFinalized ||
+        !impl_->attention_driver || !impl_->operations) {
+        return invalid("SM120 forward execution state is invalid");
+    }
+    const Sm120VisionBf16Scratch& scratch = impl_->scratch.vision();
+    const Sm120VisionAttentionBuffers& attention = impl_->attention.vision();
+    auto data = [](const Pi05ResolvedBuffer& buffer) {
+        return buffer.buffer ? frt_buffer_dptr(buffer.buffer) : nullptr;
+    };
+    out->resources = &impl_->resources;
+    out->ops = &impl_->frontend_ops;
+    out->vision = {
+        data(impl_->support.vision_patches),
+        data(impl_->support.expanded_vision_position),
+        data(impl_->support.pooled_vision_state),
+        scratch.normalized.device_data(),
+        scratch.qkv.device_data(),
+        scratch.hidden.device_data(),
+        attention.query.device_data(),
+        attention.key.device_data(),
+        attention.value.device_data(),
+        impl_->attention_driver->vision_output(),
+    };
+    out->fallback = this;
     return modalities::Status::ok();
 }
 
