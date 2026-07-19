@@ -3,6 +3,7 @@
 #include "activation.cuh"
 #include "dit_bf16.cuh"
 #include "flashrt/cpp/loader/safetensors.h"
+#include "flashrt/cpp/models/pi05/model/frontend_ops.h"
 #include "flashrt/cpp/models/pi05/support/native_resource_resolver.h"
 #include "flashrt/cpp/models/pi05/support/native_weight_materializer.h"
 #include "flashrt/cpp/models/pi05/targets/sm120/attention.h"
@@ -149,21 +150,26 @@ modalities::Status derive_action_step_weights(
     return modalities::Status::ok();
 }
 
-void* offset(void* base, std::size_t elements) {
-    return static_cast<unsigned char*>(base) +
-           elements * sizeof(std::uint16_t);
+modalities::Status frontend_linear(
+    void* state,
+    const Pi05ResolvedWeight& weight,
+    const void* input,
+    void* output,
+    int rows,
+    int input_width,
+    int output_width,
+    Pi05Stream stream) {
+    if (!state) return invalid("SM120 BF16 linear binding is invalid");
+    return static_cast<Sm120Bf16Linear*>(state)->run(
+        weight, input, output, rows, input_width, output_width, stream);
 }
 
-const void* offset(const void* base, std::size_t elements) {
-    return static_cast<const unsigned char*>(base) +
-           elements * sizeof(std::uint16_t);
-}
-
-modalities::Status add_bias(void* values,
-                            const Pi05ResolvedWeight& bias,
-                            int rows,
-                            int columns,
-                            Pi05Stream stream) {
+modalities::Status frontend_add_bias(void*,
+                                     void* values,
+                                     const Pi05ResolvedWeight& bias,
+                                     int rows,
+                                     int columns,
+                                     Pi05Stream stream) {
     if (!values || rows <= 0 || !vector_weight(bias, columns)) {
         return invalid("SM120 BF16 bias arguments are invalid");
     }
@@ -174,108 +180,30 @@ modalities::Status add_bias(void* values,
     return launch_status();
 }
 
-modalities::Status silu(void* values,
-                       int elements,
-                       Pi05Stream stream) {
+modalities::Status frontend_silu(void*,
+                                void* values,
+                                std::size_t elements,
+                                Pi05Stream stream) {
     if (!values || elements <= 0) {
         return invalid("SM120 BF16 SiLU arguments are invalid");
     }
-    silu_inplace_bf16(static_cast<__nv_bfloat16*>(values), elements,
+    silu_inplace_bf16(static_cast<__nv_bfloat16*>(values),
+                      static_cast<int>(elements),
                       reinterpret_cast<cudaStream_t>(stream));
     return launch_status();
 }
 
-modalities::Status record_time_mlp(
-    const Pi05OperationCall& call,
-    const Pi05ResolvedShape& shape,
-    const Pi05ResolvedResources& resources,
-    const Sm120Bf16ScratchBacking& scratch,
-    const Sm120Bf16Linear& linear,
-    Pi05Stream stream) {
-    const int width = kPi05ModelDims.decoder_width;
-    const Pi05DecoderGlobalWeights& weights = resources.weights.decoder;
-    void* scratch_a = scratch.decoder().normalized.device_data();
-    void* scratch_b = scratch.decoder().gate.device_data();
-    void* output = frt_buffer_dptr(resources.buffers.time_state.buffer);
-    if (!scratch_a || !scratch_b || !output) {
-        return invalid("SM120 time MLP buffers are invalid");
-    }
-
-    const void* source = offset(
-        weights.time_embeddings.device_data,
-        static_cast<std::size_t>(call.step) * width);
-    modalities::Status status = linear.run(
-        weights.time_mlp_in_weight, source, scratch_a, 1, width, width,
-        stream);
-    if (!status.ok_status()) return status;
-    status = add_bias(scratch_a, weights.time_mlp_in_bias, 1, width, stream);
-    if (!status.ok_status()) return status;
-    status = silu(scratch_a, width, stream);
-    if (!status.ok_status()) return status;
-    status = linear.run(weights.time_mlp_out_weight, scratch_a, scratch_b, 1,
-                        width, width, stream);
-    if (!status.ok_status()) return status;
-    status = add_bias(scratch_b, weights.time_mlp_out_bias, 1, width, stream);
-    if (!status.ok_status()) return status;
-    status = silu(scratch_b, width, stream);
-    if (!status.ok_status()) return status;
-
-    void* step_output = offset(
-        output, static_cast<std::size_t>(call.step) * shape.chunk * width);
-    const std::size_t row_bytes =
-        static_cast<std::size_t>(width) * sizeof(std::uint16_t);
-    const cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
-    for (int row = 0; row < shape.chunk; ++row) {
-        const cudaError_t result = cudaMemcpyAsync(
-            offset(step_output, static_cast<std::size_t>(row) * width),
-            scratch_b, row_bytes, cudaMemcpyDeviceToDevice, cuda_stream);
-        if (result != cudaSuccess) {
-            return backend("SM120 time state expansion failed");
-        }
-    }
-    return modalities::Status::ok();
-}
-
-modalities::Status record_style(
-    const Pi05OperationCall& call,
-    const Pi05ResolvedShape& shape,
-    const Pi05ResolvedResources& resources,
-    const Pi05ResolvedWeight& weight,
-    const Pi05ResolvedWeight& bias,
-    const Pi05ResolvedBuffer& destination,
-    bool layered,
-    const Sm120Bf16Linear& linear,
-    Pi05Stream stream) {
-    const int input_width = kPi05ModelDims.decoder_width;
-    const int output_width = 3 * input_width;
-    const void* time_state = frt_buffer_dptr(resources.buffers.time_state.buffer);
-    void* output = frt_buffer_dptr(destination.buffer);
-    if (!time_state || !output) {
-        return invalid("SM120 style buffers are invalid");
-    }
-    const std::size_t input_offset =
-        static_cast<std::size_t>(call.step) * shape.chunk * input_width;
-    std::size_t output_index = static_cast<std::size_t>(call.step);
-    if (layered) {
-        output_index = output_index * kPi05ModelDims.decoder_layers +
-                       static_cast<std::size_t>(call.layer);
-    }
-    const std::size_t output_offset =
-        output_index * shape.chunk * output_width;
-    void* target = offset(output, output_offset);
-    modalities::Status status = linear.run(
-        weight, offset(time_state, input_offset), target, shape.chunk,
-        input_width, output_width, stream);
-    return status.ok_status()
-               ? add_bias(target, bias, shape.chunk, output_width, stream)
-               : status;
-}
-
-bool prepare_operation(Pi05OperationId id) {
-    return id == Pi05OperationId::kTimeMlp ||
-           id == Pi05OperationId::kAttentionStyle ||
-           id == Pi05OperationId::kMlpStyle ||
-           id == Pi05OperationId::kFinalStyle;
+modalities::Status frontend_copy(void*,
+                                 void* destination,
+                                 const void* source,
+                                 std::size_t bytes,
+                                 Pi05Stream stream) {
+    const cudaError_t result = cudaMemcpyAsync(
+        destination, source, bytes, cudaMemcpyDeviceToDevice,
+        reinterpret_cast<cudaStream_t>(stream));
+    return result == cudaSuccess
+               ? modalities::Status::ok()
+               : backend(cudaGetErrorString(result));
 }
 
 bool fp8(Sm120ExecutionMode mode) {
@@ -341,6 +269,7 @@ struct Sm120TargetBundle::Impl final {
     Sm120AttentionBacking attention;
     Sm120Bf16ScratchBacking scratch;
     std::unique_ptr<Sm120Bf16Linear> bf16_linear;
+    Pi05FrontendOps frontend_ops;
     std::unique_ptr<Sm120Fp8WeightPacker> fp8_packer;
     std::unique_ptr<Sm120Fp8ActivationBacking> fp8_activation;
     std::unique_ptr<Sm120Fp8Linear> fp8_linear;
@@ -534,6 +463,11 @@ modalities::Status Sm120TargetBundle::resolve_resources(
 
         impl_->resources = resolved;
         impl_->support = support;
+        impl_->frontend_ops.profile.activation_dtype =
+            modalities::DType::kBFloat16;
+        impl_->frontend_ops.bf16 = {
+            impl_->bf16_linear.get(), frontend_linear, frontend_add_bias,
+            frontend_silu, frontend_copy};
         impl_->state = Impl::State::kResourcesResolved;
         *out = resolved;
         return modalities::Status::ok();
@@ -542,6 +476,31 @@ modalities::Status Sm120TargetBundle::resolve_resources(
     } catch (...) {
         return impl_->fail(backend("SM120 resource resolution failed"));
     }
+}
+
+modalities::Status Sm120TargetBundle::make_prepare_execution(
+    Pi05PrepareExecution* out) {
+    if (!impl_ || !out || impl_->state != Impl::State::kResourcesResolved ||
+        !impl_->frontend_ops.bf16.linear) {
+        return invalid("SM120 prepare execution state is invalid");
+    }
+    const Sm120DecoderBf16Scratch& decoder = impl_->scratch.decoder();
+    *out = {&impl_->resources,
+            &impl_->frontend_ops,
+            {decoder.normalized.device_data(), decoder.gate.device_data(),
+             decoder.normalized.bytes()}};
+    return modalities::Status::ok();
+}
+
+modalities::Status Sm120TargetBundle::complete_prepare() {
+    if (!impl_ || impl_->state != Impl::State::kResourcesResolved) {
+        return invalid("SM120 prepare completion state is invalid");
+    }
+    impl_->prepare_cursor =
+        static_cast<std::size_t>(impl_->shape.num_steps) *
+        (2 + 2 * kPi05ModelDims.decoder_layers);
+    impl_->state = Impl::State::kPrepareComplete;
+    return modalities::Status::ok();
 }
 
 modalities::Status Sm120TargetBundle::record(
@@ -553,57 +512,6 @@ modalities::Status Sm120TargetBundle::record(
     }
     modalities::Status status = validate_pi05_operation_call(call, shape);
     if (!status.ok_status()) return status;
-    if (prepare_operation(call.id)) {
-        if (impl_->state != Impl::State::kResourcesResolved) {
-            return invalid("SM120 prepare operation state is invalid");
-        }
-        switch (call.id) {
-            case Pi05OperationId::kTimeMlp:
-                status = record_time_mlp(
-                    call, shape, impl_->resources, impl_->scratch,
-                    *impl_->bf16_linear, stream);
-                break;
-            case Pi05OperationId::kAttentionStyle: {
-                const Pi05DecoderLayerWeights& layer =
-                    impl_->resources.weights.decoder_layers[
-                        static_cast<std::size_t>(call.layer)];
-                status = record_style(
-                    call, shape, impl_->resources,
-                    layer.attention_mod_weight, layer.attention_mod_bias,
-                    impl_->resources.buffers.attention_style, true,
-                    *impl_->bf16_linear, stream);
-                break;
-            }
-            case Pi05OperationId::kMlpStyle: {
-                const Pi05DecoderLayerWeights& layer =
-                    impl_->resources.weights.decoder_layers[
-                        static_cast<std::size_t>(call.layer)];
-                status = record_style(
-                    call, shape, impl_->resources, layer.mlp_mod_weight,
-                    layer.mlp_mod_bias, impl_->resources.buffers.mlp_style,
-                    true, *impl_->bf16_linear, stream);
-                break;
-            }
-            case Pi05OperationId::kFinalStyle:
-                status = record_style(
-                    call, shape, impl_->resources,
-                    impl_->resources.weights.decoder.final_norm_mod_weight,
-                    impl_->resources.weights.decoder.final_norm_mod_bias,
-                    impl_->resources.buffers.final_style, false,
-                    *impl_->bf16_linear, stream);
-                break;
-            default:
-                return unsupported("SM120 prepare operation is unsupported");
-        }
-        if (!status.ok_status()) return impl_->fail(std::move(status));
-        ++impl_->prepare_cursor;
-        if (call.id == Pi05OperationId::kFinalStyle &&
-            call.step == shape.num_steps - 1) {
-            impl_->state = Impl::State::kPrepareComplete;
-        }
-        return modalities::Status::ok();
-    }
-
     if (impl_->state != Impl::State::kCaptureInputsInitialized ||
         !impl_->operations) {
         return invalid("SM120 forward operation state is invalid");

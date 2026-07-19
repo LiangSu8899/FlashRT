@@ -3,6 +3,8 @@
 #include "flashrt/cpp/models/pi05/targets/sm110/fp8_weight_packer.h"
 #include "flashrt/cpp/models/pi05/targets/sm110/physical_resources.h"
 #include "flashrt/cpp/models/pi05/targets/sm110/target.h"
+
+#include "flashrt/cpp/models/pi05/model/frontend_ops.h"
 #include "flashrt/exec.h"
 
 #include <cuda_runtime_api.h>
@@ -155,7 +157,10 @@ void run_real_resource_contract(const char* checkpoint,
     assert(cudaMemset(frt_buffer_dptr(resources.buffers.decoder_state.buffer),
                       0x5a, decoder_bytes) == cudaSuccess);
     Pi05SemanticPipeline pipeline(shape);
-    assert(pipeline.record_prepare(*target).ok_status());
+    Pi05PrepareExecution prepare;
+    assert(target->make_prepare_execution(&prepare).ok_status());
+    assert(pipeline.record_prepare(prepare).ok_status());
+    assert(target->complete_prepare().ok_status());
     assert(cudaDeviceSynchronize() == cudaSuccess);
     std::vector<unsigned char> decoder_state(decoder_bytes);
     assert(cudaMemcpy(decoder_state.data(),
@@ -164,7 +169,7 @@ void run_real_resource_contract(const char* checkpoint,
     for (unsigned char value : decoder_state) assert(value == 0x5a);
     assert(target->resources_ready());
     assert(target->resolved_resources());
-    assert(!pipeline.record_prepare(*target).ok_status());
+    assert(!target->make_prepare_execution(&prepare).ok_status());
     assert(!target->finalize_setup().ok_status());
 
     target.reset();

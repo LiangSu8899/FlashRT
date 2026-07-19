@@ -11,6 +11,8 @@ namespace flashrt {
 namespace models {
 namespace pi05 {
 
+struct Pi05PrepareExecution;
+
 enum class Pi05ValueId : std::uint8_t {
     kImages = 0,
     kPromptEmbedding,
@@ -121,6 +123,8 @@ public:
     const Pi05ResolvedShape& shape() const { return shape_; }
 
     modalities::Status record_prepare(Pi05OperationSink& sink,
+                                      Pi05Stream stream = 0) const;
+    modalities::Status record_prepare(Pi05PrepareExecution& execution,
                                       Pi05Stream stream = 0) const;
     modalities::Status record_context(Pi05OperationSink& sink,
                                       Pi05Stream stream = 0) const;

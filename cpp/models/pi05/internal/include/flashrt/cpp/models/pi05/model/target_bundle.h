@@ -25,6 +25,9 @@ public:
     virtual modalities::Status initialize_resources() = 0;
     virtual modalities::Status resolve_resources(
         Pi05ResolvedResources* out) = 0;
+    virtual modalities::Status make_prepare_execution(
+        Pi05PrepareExecution* out) = 0;
+    virtual modalities::Status complete_prepare() = 0;
     virtual modalities::Status finalize_setup() = 0;
     virtual modalities::Status initialize_capture_inputs() = 0;
     virtual modalities::Status reset_after_warmup() = 0;

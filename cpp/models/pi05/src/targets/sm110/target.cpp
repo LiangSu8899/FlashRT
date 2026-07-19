@@ -1,6 +1,7 @@
 #include "flashrt/cpp/models/pi05/targets/sm110/target.h"
 
 #include "flashrt/cpp/loader/safetensors.h"
+#include "flashrt/cpp/models/pi05/model/frontend_ops.h"
 #include "flashrt/cpp/models/pi05/model/linear_weight_groups.h"
 #include "flashrt/cpp/models/pi05/support/native_device_weights.h"
 #include "flashrt/cpp/models/pi05/support/native_resource_resolver.h"
@@ -8,7 +9,6 @@
 #include "flashrt/cpp/models/pi05/support/native_workspace.h"
 #include "flashrt/cpp/models/pi05/targets/sm110/fp8_weight_packer.h"
 #include "flashrt/cpp/models/pi05/targets/sm110/operation_driver.h"
-#include "flashrt/cpp/models/pi05/targets/sm110/operations.h"
 #include "flashrt/cpp/models/pi05/targets/sm110/physical_resources.h"
 
 #include <cuda_runtime_api.h>
@@ -75,11 +75,52 @@ bool valid_shape_for_target(const Pi05ResolvedShape& shape) {
            (shape.max_prompt_tokens & 1) == 0;
 }
 
-bool prepare_operation(Pi05OperationId id) {
-    return id == Pi05OperationId::kTimeMlp ||
-           id == Pi05OperationId::kAttentionStyle ||
-           id == Pi05OperationId::kMlpStyle ||
-           id == Pi05OperationId::kFinalStyle;
+modalities::Status frontend_linear(
+    void* state,
+    const Pi05ResolvedWeight& weight,
+    const void* input,
+    void* output,
+    int rows,
+    int input_width,
+    int output_width,
+    Pi05Stream stream) {
+    if (!state) return invalid("SM110 F16 linear binding is invalid");
+    return static_cast<Sm110OperationDriver*>(state)->fp16_nn(
+        const_cast<void*>(input), const_cast<void*>(weight.device_data),
+        output, rows, output_width, input_width, stream);
+}
+
+modalities::Status frontend_add_bias(void* state,
+                                     void* values,
+                                     const Pi05ResolvedWeight& bias,
+                                     int rows,
+                                     int columns,
+                                     Pi05Stream stream) {
+    if (!state) return invalid("SM110 F16 bias binding is invalid");
+    return static_cast<Sm110OperationDriver*>(state)->add_bias_fp16(
+        values, bias.device_data, rows, columns, stream);
+}
+
+modalities::Status frontend_silu(void* state,
+                                void* values,
+                                std::size_t elements,
+                                Pi05Stream stream) {
+    if (!state) return invalid("SM110 F16 SiLU binding is invalid");
+    return static_cast<Sm110OperationDriver*>(state)->precise_silu_fp16(
+        values, elements, stream);
+}
+
+modalities::Status frontend_copy(void*,
+                                 void* destination,
+                                 const void* source,
+                                 std::size_t bytes,
+                                 Pi05Stream stream) {
+    const cudaError_t result = cudaMemcpyAsync(
+        destination, source, bytes, cudaMemcpyDeviceToDevice,
+        reinterpret_cast<cudaStream_t>(stream));
+    return result == cudaSuccess
+               ? modalities::Status::ok()
+               : backend(cudaGetErrorString(result));
 }
 
 modalities::Status zero_prepare_storage(
@@ -152,7 +193,7 @@ struct Sm110TargetBundle::Impl final {
     Sm110PhysicalResources physical;
     std::unique_ptr<Sm110Fp8WeightPacker> packer;
     std::unique_ptr<Sm110OperationDriver> driver;
-    std::unique_ptr<Sm110Operations> operations;
+    Pi05FrontendOps frontend_ops;
     Pi05ResolvedResources resources;
     Pi05NativeSupportBuffers support;
     int committed_prompt_length = 0;
@@ -301,12 +342,11 @@ modalities::Status Sm110TargetBundle::resolve_resources(
         if (!status.ok_status()) return impl_->fail(std::move(status));
 
         impl_->resources = resolved;
-        impl_->operations = Sm110Operations::create(
-            impl_->shape, impl_->resources, impl_->support, impl_->physical,
-            *impl_->packer, *impl_->driver, &status);
-        if (!impl_->operations || !status.ok_status()) {
-            return impl_->fail(std::move(status));
-        }
+        impl_->frontend_ops.profile.activation_dtype =
+            modalities::DType::kFloat16;
+        impl_->frontend_ops.f16 = {
+            impl_->driver.get(), frontend_linear, frontend_add_bias,
+            frontend_silu, frontend_copy};
         status = zero_prepare_storage(impl_->resources, impl_->physical);
         if (!status.ok_status()) return impl_->fail(std::move(status));
         impl_->state = Impl::State::kResourcesResolved;
@@ -317,6 +357,28 @@ modalities::Status Sm110TargetBundle::resolve_resources(
     } catch (...) {
         return impl_->fail(backend("SM110 resource resolution failed"));
     }
+}
+
+modalities::Status Sm110TargetBundle::make_prepare_execution(
+    Pi05PrepareExecution* out) {
+    if (!impl_ || !out || impl_->state != Impl::State::kResourcesResolved ||
+        !impl_->frontend_ops.f16.linear) {
+        return invalid("SM110 prepare execution state is invalid");
+    }
+    const Sm110DecoderResources& decoder = impl_->physical.decoder();
+    *out = {&impl_->resources,
+            &impl_->frontend_ops,
+            {decoder.normalized.device_data(), decoder.gate.device_data(),
+             decoder.normalized.bytes()}};
+    return modalities::Status::ok();
+}
+
+modalities::Status Sm110TargetBundle::complete_prepare() {
+    if (!impl_ || impl_->state != Impl::State::kResourcesResolved) {
+        return invalid("SM110 prepare completion state is invalid");
+    }
+    impl_->state = Impl::State::kPrepareComplete;
+    return modalities::Status::ok();
 }
 
 modalities::Status Sm110TargetBundle::finalize_setup() {
@@ -340,37 +402,8 @@ modalities::Status Sm110TargetBundle::record(
     }
     modalities::Status status = validate_pi05_operation_call(call, shape);
     if (!status.ok_status()) return status;
-    if (!prepare_operation(call.id)) {
-        return unsupported("SM110 forward operation is not connected");
-    }
-    if (impl_->state != Impl::State::kResourcesResolved ||
-        !impl_->operations) {
-        return invalid("SM110 prepare operation state is invalid");
-    }
-    switch (call.id) {
-        case Pi05OperationId::kTimeMlp:
-            status = impl_->operations->time_mlp(call.step, stream);
-            break;
-        case Pi05OperationId::kAttentionStyle:
-            status = impl_->operations->attention_style(
-                call.layer, call.step, stream);
-            break;
-        case Pi05OperationId::kMlpStyle:
-            status = impl_->operations->mlp_style(
-                call.layer, call.step, stream);
-            break;
-        case Pi05OperationId::kFinalStyle:
-            status = impl_->operations->final_style(call.step, stream);
-            break;
-        default:
-            return unsupported("SM110 prepare operation is unsupported");
-    }
-    if (!status.ok_status()) return impl_->fail(std::move(status));
-    if (call.id == Pi05OperationId::kFinalStyle &&
-        call.step == shape.num_steps - 1) {
-        impl_->state = Impl::State::kPrepareComplete;
-    }
-    return modalities::Status::ok();
+    (void)stream;
+    return unsupported("SM110 forward operation is not connected");
 }
 
 modalities::Status Sm110TargetBundle::set_prompt_length(

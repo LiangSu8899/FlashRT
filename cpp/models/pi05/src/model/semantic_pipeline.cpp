@@ -1,5 +1,8 @@
 #include "flashrt/cpp/models/pi05/model/semantic_pipeline.h"
 
+#include "flashrt/cpp/models/pi05/model/frontend_ops.h"
+
+#include <cstddef>
 #include <limits>
 
 namespace flashrt {
@@ -138,6 +141,205 @@ std::array<std::uint64_t, kPi05MaxOperationValues> generations(
     std::uint64_t third = 0,
     std::uint64_t fourth = 0) {
     return {first, second, third, fourth};
+}
+
+template <typename Visitor>
+modalities::Status traverse_prepare(const Pi05ResolvedShape& shape,
+                                    Visitor&& visitor) {
+    std::uint64_t time_state = 0;
+    std::uint64_t attention_style = 0;
+    std::uint64_t mlp_style = 0;
+    std::uint64_t final_style = 0;
+    auto visit = [&](Pi05OperationId id,
+                     int layer,
+                     int step,
+                     std::array<std::uint64_t, kPi05MaxOperationValues> inputs,
+                     std::array<std::uint64_t, kPi05MaxOperationValues> outputs) {
+        Pi05OperationCall call;
+        call.id = id;
+        call.layer = layer;
+        call.step = step;
+        call.input_generation = inputs;
+        call.output_generation = outputs;
+        modalities::Status status = validate_pi05_operation_call(call, shape);
+        return status.ok_status() ? visitor(call) : status;
+    };
+
+    for (int step = 0; step < shape.num_steps; ++step) {
+        modalities::Status status = visit(
+            Pi05OperationId::kTimeMlp, -1, step, generations(),
+            generations(time_state + 1));
+        if (!status.ok_status()) return status;
+        ++time_state;
+        for (int layer = 0; layer < kPi05ModelDims.decoder_layers; ++layer) {
+            status = visit(Pi05OperationId::kAttentionStyle, layer, step,
+                           generations(time_state),
+                           generations(attention_style + 1));
+            if (!status.ok_status()) return status;
+            ++attention_style;
+            status = visit(Pi05OperationId::kMlpStyle, layer, step,
+                           generations(time_state),
+                           generations(mlp_style + 1));
+            if (!status.ok_status()) return status;
+            ++mlp_style;
+        }
+        status = visit(Pi05OperationId::kFinalStyle, -1, step,
+                       generations(time_state),
+                       generations(final_style + 1));
+        if (!status.ok_status()) return status;
+        ++final_style;
+    }
+    return modalities::Status::ok();
+}
+
+void* buffer_data(const Pi05ResolvedBuffer& buffer) {
+    return buffer.buffer ? frt_buffer_dptr(buffer.buffer) : nullptr;
+}
+
+const Pi05PrimitiveSet* active_primitives(const Pi05FrontendOps& ops) {
+    switch (ops.profile.activation_dtype) {
+        case modalities::DType::kBFloat16: return &ops.bf16;
+        case modalities::DType::kFloat16: return &ops.f16;
+        default: return nullptr;
+    }
+}
+
+bool complete(const Pi05PrimitiveSet* ops) {
+    return ops && ops->linear && ops->add_bias && ops->silu && ops->copy;
+}
+
+void* byte_offset(void* base, std::size_t bytes) {
+    return static_cast<unsigned char*>(base) + bytes;
+}
+
+const void* byte_offset(const void* base, std::size_t bytes) {
+    return static_cast<const unsigned char*>(base) + bytes;
+}
+
+modalities::Status execute_time_mlp(
+    const Pi05OperationCall& call,
+    const Pi05ResolvedShape& shape,
+    Pi05PrepareExecution& execution,
+    Pi05Stream stream) {
+    const int width = kPi05ModelDims.decoder_width;
+    const Pi05PrimitiveSet& ops = *active_primitives(*execution.ops);
+    const std::size_t scalar_bytes =
+        modalities::dtype_size(execution.ops->profile.activation_dtype);
+    const std::size_t row_bytes = static_cast<std::size_t>(width) *
+                                  scalar_bytes;
+    if (!scalar_bytes || execution.scratch.bytes < row_bytes) {
+        return invalid("PI0.5 prepare scratch is too small");
+    }
+    const Pi05DecoderGlobalWeights& weights =
+        execution.resources->weights.decoder;
+    void* output = buffer_data(execution.resources->buffers.time_state);
+    const void* source = byte_offset(
+        weights.time_embeddings.device_data,
+        static_cast<std::size_t>(call.step) * row_bytes);
+
+    modalities::Status status = ops.linear(
+        ops.state, weights.time_mlp_in_weight, source,
+        execution.scratch.mlp_hidden,
+        1, width, width, stream);
+    if (!status.ok_status()) return status;
+    status = ops.add_bias(ops.state, execution.scratch.mlp_hidden,
+                          weights.time_mlp_in_bias, 1, width, stream);
+    if (!status.ok_status()) return status;
+    status = ops.silu(ops.state, execution.scratch.mlp_hidden, width, stream);
+    if (!status.ok_status()) return status;
+    status = ops.linear(ops.state, weights.time_mlp_out_weight,
+                        execution.scratch.mlp_hidden,
+                        execution.scratch.mlp_output, 1, width, width, stream);
+    if (!status.ok_status()) return status;
+    status = ops.add_bias(ops.state, execution.scratch.mlp_output,
+                          weights.time_mlp_out_bias, 1, width, stream);
+    if (!status.ok_status()) return status;
+    status = ops.silu(ops.state, execution.scratch.mlp_output, width, stream);
+    if (!status.ok_status()) return status;
+
+    void* step_output = byte_offset(
+        output, static_cast<std::size_t>(call.step) * shape.chunk * row_bytes);
+    for (int row = 0; row < shape.chunk; ++row) {
+        status = ops.copy(
+            ops.state,
+            byte_offset(step_output, static_cast<std::size_t>(row) * row_bytes),
+            execution.scratch.mlp_output, row_bytes, stream);
+        if (!status.ok_status()) return status;
+    }
+    return modalities::Status::ok();
+}
+
+modalities::Status execute_style(
+    const Pi05OperationCall& call,
+    const Pi05ResolvedShape& shape,
+    const Pi05ResolvedWeight& weight,
+    const Pi05ResolvedWeight& bias,
+    const Pi05ResolvedBuffer& destination,
+    Pi05PrepareExecution& execution,
+    Pi05Stream stream) {
+    const int input_width = kPi05ModelDims.decoder_width;
+    const int output_width = 3 * input_width;
+    const Pi05PrimitiveSet& ops = *active_primitives(*execution.ops);
+    const std::size_t scalar_bytes =
+        modalities::dtype_size(execution.ops->profile.activation_dtype);
+    const std::size_t input_offset =
+        static_cast<std::size_t>(call.step) * shape.chunk * input_width *
+        scalar_bytes;
+    std::size_t output_index = static_cast<std::size_t>(call.step);
+    if (call.layer >= 0) {
+        output_index = output_index * kPi05ModelDims.decoder_layers +
+                       static_cast<std::size_t>(call.layer);
+    }
+    void* output = byte_offset(
+        buffer_data(destination),
+        output_index * shape.chunk * output_width * scalar_bytes);
+    const void* input = byte_offset(
+        buffer_data(execution.resources->buffers.time_state), input_offset);
+    modalities::Status status = ops.linear(
+        ops.state, weight, input, output, shape.chunk, input_width,
+        output_width, stream);
+    return status.ok_status()
+               ? ops.add_bias(ops.state, output, bias, shape.chunk,
+                              output_width, stream)
+               : status;
+}
+
+modalities::Status execute_prepare_call(
+    const Pi05OperationCall& call,
+    const Pi05ResolvedShape& shape,
+    Pi05PrepareExecution& execution,
+    Pi05Stream stream) {
+    const Pi05ResolvedResources& resources = *execution.resources;
+    switch (call.id) {
+        case Pi05OperationId::kTimeMlp:
+            return execute_time_mlp(call, shape, execution, stream);
+        case Pi05OperationId::kAttentionStyle: {
+            const Pi05DecoderLayerWeights& layer =
+                resources.weights.decoder_layers[
+                    static_cast<std::size_t>(call.layer)];
+            return execute_style(call, shape, layer.attention_mod_weight,
+                                 layer.attention_mod_bias,
+                                 resources.buffers.attention_style, execution,
+                                 stream);
+        }
+        case Pi05OperationId::kMlpStyle: {
+            const Pi05DecoderLayerWeights& layer =
+                resources.weights.decoder_layers[
+                    static_cast<std::size_t>(call.layer)];
+            return execute_style(call, shape, layer.mlp_mod_weight,
+                                 layer.mlp_mod_bias,
+                                 resources.buffers.mlp_style, execution,
+                                 stream);
+        }
+        case Pi05OperationId::kFinalStyle:
+            return execute_style(
+                call, shape,
+                resources.weights.decoder.final_norm_mod_weight,
+                resources.weights.decoder.final_norm_mod_bias,
+                resources.buffers.final_style, execution, stream);
+        default:
+            return invalid("PI0.5 prepare operation is invalid");
+    }
 }
 
 }  // namespace
@@ -357,35 +559,28 @@ modalities::Status Pi05SemanticPipeline::record_prepare(
     Pi05Stream stream) const {
     modalities::Status status = validate_pi05_resolved_shape(shape_);
     if (!status.ok_status()) return status;
+    return traverse_prepare(shape_, [&](const Pi05OperationCall& call) {
+        return sink.record(call, shape_, stream);
+    });
+}
 
-    std::uint64_t time_state = 0;
-    std::uint64_t attention_style = 0;
-    std::uint64_t mlp_style = 0;
-    std::uint64_t final_style = 0;
-    for (int step = 0; step < shape_.num_steps; ++step) {
-        status = emit(sink, shape_, Pi05OperationId::kTimeMlp, -1, step,
-                      generations(), generations(time_state + 1), stream);
-        if (!status.ok_status()) return status;
-        ++time_state;
-        for (int layer = 0; layer < kPi05ModelDims.decoder_layers; ++layer) {
-            status = emit(sink, shape_, Pi05OperationId::kAttentionStyle,
-                          layer, step, generations(time_state),
-                          generations(attention_style + 1), stream);
-            if (!status.ok_status()) return status;
-            ++attention_style;
-            status = emit(sink, shape_, Pi05OperationId::kMlpStyle,
-                          layer, step, generations(time_state),
-                          generations(mlp_style + 1), stream);
-            if (!status.ok_status()) return status;
-            ++mlp_style;
-        }
-        status = emit(sink, shape_, Pi05OperationId::kFinalStyle, -1, step,
-                      generations(time_state), generations(final_style + 1),
-                      stream);
-        if (!status.ok_status()) return status;
-        ++final_style;
+modalities::Status Pi05SemanticPipeline::record_prepare(
+    Pi05PrepareExecution& execution,
+    Pi05Stream stream) const {
+    modalities::Status status = validate_pi05_resolved_shape(shape_);
+    if (!status.ok_status()) return status;
+    if (!execution.resources || !execution.ops ||
+        !execution.scratch.mlp_hidden || !execution.scratch.mlp_output) {
+        return invalid("PI0.5 prepare execution is invalid");
     }
-    return modalities::Status::ok();
+    status = validate_pi05_resolved_resources(*execution.resources, shape_);
+    if (!status.ok_status()) return status;
+    if (!complete(active_primitives(*execution.ops))) {
+        return invalid("PI0.5 prepare primitive profile is invalid");
+    }
+    return traverse_prepare(shape_, [&](const Pi05OperationCall& call) {
+        return execute_prepare_call(call, shape_, execution, stream);
+    });
 }
 
 modalities::Status Pi05SemanticPipeline::record_context(

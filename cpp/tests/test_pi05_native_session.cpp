@@ -1,5 +1,7 @@
 #include "flashrt/cpp/models/pi05/model/native_session.h"
 
+#include "flashrt/cpp/models/pi05/model/frontend_ops.h"
+
 #include "pi05_resolved_fixture.h"
 
 #include <cuda_runtime_api.h>
@@ -32,6 +34,8 @@ enum class FailPoint {
     kInitialize,
     kResolve,
     kInvalidResources,
+    kPrepareExecution,
+    kCompletePrepare,
     kFinalize,
     kCaptureInputs,
     kReset,
@@ -41,6 +45,8 @@ enum class FailPoint {
 enum class LifecycleStep {
     kInitialize = 0,
     kResolve,
+    kPrepareExecution,
+    kCompletePrepare,
     kFinalize,
     kCaptureInputs,
     kReset,
@@ -63,6 +69,32 @@ modalities::Status injected(const char* message) {
                                      message);
 }
 
+modalities::Status noop_linear(
+    void*, const pi05::Pi05ResolvedWeight&, const void*, void*, int, int, int,
+    pi05::Pi05Stream) {
+    return modalities::Status::ok();
+}
+
+modalities::Status noop_bias(
+    void*, void*, const pi05::Pi05ResolvedWeight&, int, int,
+    pi05::Pi05Stream) {
+    return modalities::Status::ok();
+}
+
+modalities::Status noop_unary(void*, void*, std::size_t,
+                              pi05::Pi05Stream) {
+    return modalities::Status::ok();
+}
+
+modalities::Status noop_copy(void*, void*, const void*, std::size_t,
+                             pi05::Pi05Stream) {
+    return modalities::Status::ok();
+}
+
+pi05::Pi05PrimitiveSet fake_primitives() {
+    return {nullptr, noop_linear, noop_bias, noop_unary, noop_copy};
+}
+
 class FakeTarget final : public pi05::Pi05TargetBundle {
 public:
     FakeTarget(frt_ctx context,
@@ -71,7 +103,9 @@ public:
                Probe* probe)
         : Pi05TargetBundle(context, warmup),
           fail_point_(fail_point),
-          probe_(probe) {
+          probe_(probe),
+          frontend_ops_{{modalities::DType::kBFloat16},
+                        fake_primitives(), {}} {
         CHECK(probe_ != nullptr);
     }
 
@@ -80,7 +114,7 @@ public:
         if (anchor_) {
             probe_->context_alive_at_target_destroy =
                 frt_buffer_dptr(anchor_) != nullptr &&
-                frt_buffer_bytes(anchor_) == 1;
+                frt_buffer_bytes(anchor_) >= prepare_storage_bytes_;
         } else {
             probe_->context_alive_at_target_destroy =
                 frt_ctx_stream(context(), 0) >= 0;
@@ -89,7 +123,8 @@ public:
 
     modalities::Status initialize_resources() override {
         probe_->lifecycle.push_back(LifecycleStep::kInitialize);
-        anchor_ = frt_buffer_alloc(context(), "pi05_session_anchor", 1);
+        anchor_ = frt_buffer_alloc(context(), "pi05_session_anchor",
+                                   prepare_storage_bytes_);
         if (!anchor_) return injected("fake target anchor allocation failed");
         if (fail_point_ == FailPoint::kInitialize) {
             return injected("injected resource initialization failure");
@@ -110,6 +145,26 @@ public:
             out->buffers.noise.buffer = nullptr;
         }
         return modalities::Status::ok();
+    }
+
+    modalities::Status make_prepare_execution(
+        pi05::Pi05PrepareExecution* out) override {
+        probe_->lifecycle.push_back(LifecycleStep::kPrepareExecution);
+        if (!out || fail_point_ == FailPoint::kPrepareExecution) {
+            return injected("injected prepare execution failure");
+        }
+        *out = {&resources_,
+                &frontend_ops_,
+                {frt_buffer_dptr(anchor_), frt_buffer_dptr(anchor_),
+                 prepare_storage_bytes_}};
+        return modalities::Status::ok();
+    }
+
+    modalities::Status complete_prepare() override {
+        probe_->lifecycle.push_back(LifecycleStep::kCompletePrepare);
+        return fail_point_ == FailPoint::kCompletePrepare
+                   ? injected("injected prepare completion failure")
+                   : modalities::Status::ok();
     }
 
     modalities::Status finalize_setup() override {
@@ -179,8 +234,10 @@ private:
 
     FailPoint fail_point_ = FailPoint::kNone;
     Probe* probe_ = nullptr;
+    static constexpr std::size_t prepare_storage_bytes_ = 16 * 1024 * 1024;
     frt_buffer anchor_ = nullptr;
     pi05::Pi05ResolvedResources resources_;
+    pi05::Pi05FrontendOps frontend_ops_;
 };
 
 std::unique_ptr<pi05::Pi05NativeSession> create_session(
@@ -220,10 +277,12 @@ void test_success_without_warmup() {
     CHECK(probe.lifecycle == std::vector<LifecycleStep>({
         LifecycleStep::kInitialize,
         LifecycleStep::kResolve,
+        LifecycleStep::kPrepareExecution,
+        LifecycleStep::kCompletePrepare,
         LifecycleStep::kFinalize,
         LifecycleStep::kCaptureInputs}));
-    CHECK(probe.record_calls == 380 + 482 + 390 + 92);
-    CHECK(probe.default_stream_calls == 380);
+    CHECK(probe.record_calls == 482 + 390 + 92);
+    CHECK(probe.default_stream_calls == 0);
     CHECK(probe.capture_stream_calls == 482 + 390 + 92);
     check_graphs(*session);
 
@@ -255,11 +314,13 @@ void test_success_with_warmup() {
     CHECK(probe.lifecycle == std::vector<LifecycleStep>({
         LifecycleStep::kInitialize,
         LifecycleStep::kResolve,
+        LifecycleStep::kPrepareExecution,
+        LifecycleStep::kCompletePrepare,
         LifecycleStep::kFinalize,
         LifecycleStep::kCaptureInputs,
         LifecycleStep::kReset}));
-    CHECK(probe.record_calls == 380 + 482 + 482 + 390 + 92);
-    CHECK(probe.default_stream_calls == 380 + 482);
+    CHECK(probe.record_calls == 482 + 482 + 390 + 92);
+    CHECK(probe.default_stream_calls == 482);
     CHECK(probe.capture_stream_calls == 482 + 390 + 92);
     check_graphs(*session);
     session.reset();
@@ -291,6 +352,12 @@ void expect_create_failure(
         case FailPoint::kInvalidResources:
             CHECK(probe.lifecycle.back() == LifecycleStep::kResolve);
             break;
+        case FailPoint::kPrepareExecution:
+            CHECK(probe.lifecycle.back() == LifecycleStep::kPrepareExecution);
+            break;
+        case FailPoint::kCompletePrepare:
+            CHECK(probe.lifecycle.back() == LifecycleStep::kCompletePrepare);
+            break;
         case FailPoint::kFinalize:
             CHECK(probe.lifecycle.back() == LifecycleStep::kFinalize);
             break;
@@ -310,15 +377,16 @@ void test_failure_matrix() {
     expect_create_failure(false, FailPoint::kInitialize);
     expect_create_failure(false, FailPoint::kResolve);
     expect_create_failure(false, FailPoint::kInvalidResources);
-    expect_create_failure(false, FailPoint::kNone, 11);
+    expect_create_failure(false, FailPoint::kPrepareExecution);
+    expect_create_failure(false, FailPoint::kCompletePrepare);
     expect_create_failure(false, FailPoint::kFinalize);
     expect_create_failure(false, FailPoint::kCaptureInputs);
-    expect_create_failure(true, FailPoint::kNone, 380 + 11);
+    expect_create_failure(true, FailPoint::kNone, 11);
     expect_create_failure(true, FailPoint::kReset);
-    expect_create_failure(false, FailPoint::kNone, 380 + 11);
-    expect_create_failure(false, FailPoint::kNone, 380 + 482 + 11);
+    expect_create_failure(false, FailPoint::kNone, 11);
+    expect_create_failure(false, FailPoint::kNone, 482 + 11);
     expect_create_failure(
-        false, FailPoint::kNone, 380 + 482 + 390 + 11);
+        false, FailPoint::kNone, 482 + 390 + 11);
 
     pi05::Pi05ResolvedShape invalid_shape = fixture::canonical_shape();
     invalid_shape.chunk = 0;

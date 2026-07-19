@@ -1,5 +1,7 @@
 #include "flashrt/cpp/models/pi05/model/native_session.h"
 
+#include "flashrt/cpp/models/pi05/model/frontend_ops.h"
+
 #include <new>
 #include <utility>
 
@@ -90,7 +92,12 @@ modalities::Status Pi05NativeSession::initialize() {
     if (!result.ok_status()) return result;
     resources_ = resolved;
 
-    result = pipeline_.record_prepare(*target_);
+    Pi05PrepareExecution prepare;
+    result = target_->make_prepare_execution(&prepare);
+    if (!result.ok_status()) return result;
+    result = pipeline_.record_prepare(prepare);
+    if (!result.ok_status()) return result;
+    result = target_->complete_prepare();
     if (!result.ok_status()) return result;
     result = target_->finalize_setup();
     if (!result.ok_status()) return result;

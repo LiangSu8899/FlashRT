@@ -42,6 +42,9 @@ public:
 
     modalities::Status initialize_resources() override;
     modalities::Status resolve_resources(Pi05ResolvedResources* out) override;
+    modalities::Status make_prepare_execution(
+        Pi05PrepareExecution* out) override;
+    modalities::Status complete_prepare() override;
     modalities::Status finalize_setup() override;
     modalities::Status initialize_capture_inputs() override;
     modalities::Status reset_after_warmup() override;

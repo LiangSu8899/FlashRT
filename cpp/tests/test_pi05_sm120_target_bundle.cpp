@@ -1,6 +1,8 @@
 #include "flashrt/cpp/models/pi05/model/semantic_pipeline.h"
 #include "flashrt/cpp/models/pi05/targets/sm120/fp8_linear.h"
 #include "flashrt/cpp/models/pi05/targets/sm120/target.h"
+
+#include "flashrt/cpp/models/pi05/model/frontend_ops.h"
 #include "flashrt/exec.h"
 
 #include <cuda_runtime_api.h>
@@ -193,7 +195,11 @@ int main() {
     assert(!target->finalize_setup().ok_status());
 
     Pi05SemanticPipeline pipeline(runtime_shape);
-    assert(pipeline.record_prepare(*target).ok_status());
+    Pi05PrepareExecution prepare;
+    assert(target->make_prepare_execution(&prepare).ok_status());
+    assert(pipeline.record_prepare(prepare).ok_status());
+    assert(target->complete_prepare().ok_status());
+    assert(!target->complete_prepare().ok_status());
     assert(target->prepare_call_count() ==
            static_cast<std::size_t>(runtime_shape.num_steps) *
                (2 + 2 * kPi05ModelDims.decoder_layers));
