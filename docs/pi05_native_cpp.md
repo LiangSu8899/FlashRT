@@ -76,6 +76,15 @@ mismatch is a hard error.
 
 ## FP8 calibration
 
+For the complete single-view, multi-view, and dataset workflow, including a
+reusable C++ loop, input lifetime rules, artifact reuse, and troubleshooting,
+see [`pi05_native_calibration.md`](pi05_native_calibration.md).
+
+The key distinction is that one observation contains the exact configured set
+of synchronized camera views, while dataset calibration calls `observe`
+multiple times. A three-view runtime always requires three frames per
+observation, even when calibrating from only one observation.
+
 Include `flashrt/cpp/models/pi05/c_api.h`. Create one session, call `observe`
 once per selected dataset sample, then finalize the reduced artifact:
 
@@ -114,6 +123,10 @@ The host deliberately owns the dataset loop. The calibration session owns only
 the model traversal, per-operation observation and deterministic reduction, so
 single-frame, multi-view and dataset calibration do not create separate model
 pipelines.
+
+Native FP8 open never performs an implicit first-inference calibration. The
+host must produce or select an artifact before open. BF16 does not use this
+artifact path.
 
 The artifact records checkpoint and tokenizer digests, hardware, activation
 dtype, view count, prompt/state/chunk/step dimensions, pool factor, percentile

@@ -863,6 +863,13 @@ FLASHRT_FP8_NT_AUTOTUNE=safe   # always skip FP8 NT top-N autotune
 
 FP8 inference requires calibrated activation scales — per-layer maximum values that determine the FP8 quantization range. Incorrect scales cause precision loss.
 
+> **Native PI0.5 C++ producer:** the Python cache and first-`predict()` flow
+> below do not apply to `io="native_v2"`. Native C++ calibration explicitly
+> creates a session, observes one or more samples, finalizes a safetensors
+> artifact, and passes that artifact to runtime open. See
+> [`docs/pi05_native_calibration.md`](docs/pi05_native_calibration.md) for
+> complete one-view, synchronized multi-view, and dataset examples.
+
 ### How it works
 
 **Phase 1: Initial calibration** (during `set_prompt()`):

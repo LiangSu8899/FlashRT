@@ -218,7 +218,7 @@ First call: ~3 s (calibration + CUDA Graph capture). Every subsequent call: 44 m
 | **Know what kernels ship and whether they fit your model** | [`docs/kernel_catalog.md`](docs/kernel_catalog.md) — the "parts list" with a re-use decision tree |
 | **See which fusion patterns exist and why some were rejected** | [`docs/kernel_fusion.md`](docs/kernel_fusion.md) |
 | **Understand FP8 calibration mechanics** | [`docs/calibration.md`](docs/calibration.md) |
-| **Run the PI0.5 native C++ checkpoint and calibration path** | [`docs/pi05_native_cpp.md`](docs/pi05_native_cpp.md) |
+| **Run the PI0.5 native C++ checkpoint and calibration path** | [`docs/pi05_native_cpp.md`](docs/pi05_native_cpp.md) · [`docs/pi05_native_calibration.md`](docs/pi05_native_calibration.md) |
 | **Train a Pi0.5 LoRA fine-tune (FP8 + LoRA, plain or RECAP/ACP-conditioned, PyTorch *or* JAX)** | [`training/README.md`](training/README.md). JAX companion at [`training/jax/README.md`](training/jax/README.md) |
 | **Run advantage-conditioned (RECAP / π\*0.6) policies with classifier-free guidance** | [`docs/rl_inference.md`](docs/rl_inference.md) — PyTorch + JAX frontends both supported |
 | **See how FlashRT differs from TensorRT / vLLM / SGLang** | [`docs/inference_engine_differences.md`](docs/inference_engine_differences.md) |
@@ -243,6 +243,8 @@ Full details by topic:
   why the current fusion set converged where it did.
 - [`docs/calibration.md`](docs/calibration.md) — FP8 static
   calibration mechanics.
+- [`docs/pi05_native_calibration.md`](docs/pi05_native_calibration.md) —
+  native PI0.5 single-view, multi-view and dataset artifact workflow.
 - [`docs/optimization-details.md`](docs/optimization-details.md) —
   line-by-line Pi0.5 latency breakdown (44 ms vs 70 ms baseline).
 
