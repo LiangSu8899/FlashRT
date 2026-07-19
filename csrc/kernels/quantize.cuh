@@ -56,6 +56,24 @@ void quantize_fp8_weight_device(
     const __nv_bfloat16* input, __nv_fp8_e4m3* output,
     float* d_scale, int n, cudaStream_t stream = 0);
 
+// Setup-only BF16 transform with explicit IEEE round-to-nearest multiply.
+void scale_bf16_weight_device(
+    const __nv_bfloat16* input, __nv_bfloat16* output,
+    float scale, int n, cudaStream_t stream = 0);
+
+// Setup-only per-tensor E4M3 packing. Input is row-major [rows, columns].
+// Pair packing concatenates columns before an optional final transpose.
+void quantize_fp8_weight_f16_device(
+    const __half* input, __nv_fp8_e4m3* output,
+    float* d_scale, int rows, int columns, bool transpose,
+    cudaStream_t stream = 0);
+
+void quantize_fp8_weight_f16_pair_device(
+    const __half* first, const __half* second,
+    __nv_fp8_e4m3* output, float* d_scale,
+    int rows, int columns, bool transpose,
+    cudaStream_t stream = 0);
+
 void fp8_accumulate_scale_max(const float* src_scale, float* dst_scale,
                               cudaStream_t stream = 0);
 

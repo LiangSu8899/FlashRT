@@ -558,6 +558,51 @@ modalities::Status native_source_patch_oihw_to_hwio_f16(
     return modalities::Status::ok();
 }
 
+modalities::Status native_source_fold_rms_columns_to_f16(
+    const NativeSourceTensorView& weight,
+    const NativeFloatTensor& norm,
+    bool transpose,
+    NativeF16Tensor* out) {
+    std::size_t count = 0;
+    if (!out || weight.shape.size() != 2 ||
+        !element_count(weight.shape, &count) || !valid_tensor(norm) ||
+        norm.shape.size() != 1 || weight.shape[1] != norm.shape[0]) {
+        return invalid("invalid FP16 source RMS fold input");
+    }
+    const std::size_t rows = static_cast<std::size_t>(weight.shape[0]);
+    const std::size_t cols = static_cast<std::size_t>(weight.shape[1]);
+    NativeF16Tensor folded;
+    folded.shape = transpose
+        ? std::vector<std::uint64_t>{weight.shape[1], weight.shape[0]}
+        : weight.shape;
+    folded.values.resize(count);
+    modalities::Status st = dispatch_source(weight, [&](const auto& reader) {
+        const auto value = [&](std::size_t row, std::size_t col) {
+            return modalities::float_to_float16(
+                reader[row * cols + col] * (1.0f + norm.values[col]));
+        };
+        if (transpose) {
+            tiled_transform_transpose(
+                rows, cols, rows, 0, folded.values.data(), value);
+        } else {
+            parallel_ranges(rows, 16,
+                            [&](std::size_t begin, std::size_t end) {
+                for (std::size_t row = begin; row < end; ++row) {
+                    std::uint16_t* destination =
+                        folded.values.data() + row * cols;
+                    for (std::size_t col = 0; col < cols; ++col) {
+                        destination[col] = value(row, col);
+                    }
+                }
+            });
+        }
+        return modalities::Status::ok();
+    });
+    if (!st.ok_status()) return st;
+    *out = std::move(folded);
+    return modalities::Status::ok();
+}
+
 modalities::Status native_source_fold_rms_columns_transpose(
     const NativeSourceTensorView& weight,
     const NativeFloatTensor& norm,

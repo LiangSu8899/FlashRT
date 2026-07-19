@@ -375,6 +375,23 @@ if(BUILD_TESTING)
       CUDA_STANDARD_REQUIRED ON)
     add_test(NAME csrc_fp8_weight_quantize
       COMMAND test_csrc_fp8_weight_quantize)
+  elseif(TARGET flashrt_cpp_csrc_precise_math)
+    add_executable(test_csrc_fp8_weight_quantize
+      tests/test_csrc_fp8_weight_quantize.cu
+      ${CMAKE_CURRENT_SOURCE_DIR}/../csrc/kernels/quantize.cu)
+    target_include_directories(test_csrc_fp8_weight_quantize PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/../csrc/kernels)
+    target_link_libraries(test_csrc_fp8_weight_quantize PRIVATE
+      flashrt_runtime CUDA::cudart)
+    target_compile_options(test_csrc_fp8_weight_quantize PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:
+        --expt-relaxed-constexpr -O3
+        --ftz=true --prec-div=false --prec-sqrt=false>)
+    set_target_properties(test_csrc_fp8_weight_quantize PROPERTIES
+      CUDA_STANDARD 17
+      CUDA_STANDARD_REQUIRED ON)
+    add_test(NAME csrc_fp8_weight_quantize
+      COMMAND test_csrc_fp8_weight_quantize)
   endif()
 
   add_executable(test_safetensors_loader tests/test_safetensors_loader.cpp)

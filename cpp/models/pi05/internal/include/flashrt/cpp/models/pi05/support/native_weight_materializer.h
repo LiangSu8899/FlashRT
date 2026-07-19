@@ -11,19 +11,21 @@ namespace pi05 {
 
 struct NativeMaterializationOptions {
     int num_steps = 10;
-    bool merge_decoder_gate_up = true;
     bool include_embedding = true;
 };
 
 class NativeWeightMaterializer {
 public:
     NativeWeightMaterializer(const loader::SafetensorsFile& source,
-                             NativeDeviceWeightStore* destination)
-        : source_(source), destination_(destination) {}
+                             NativeDeviceWeightStore* destination,
+                             modalities::DType logical_scalar =
+                                 modalities::DType::kBFloat16)
+        : source_(source),
+          destination_(destination),
+          logical_scalar_(logical_scalar) {}
 
     modalities::Status materialize_encoder_layer(int layer);
-    modalities::Status materialize_decoder_layer(int layer,
-                                                  bool merge_gate_up);
+    modalities::Status materialize_decoder_layer(int layer);
     modalities::Status materialize_vision_layer(int layer);
     modalities::Status materialize_vision_globals();
     modalities::Status materialize_decoder_globals(int num_steps);
@@ -35,24 +37,18 @@ private:
     modalities::Status load(const std::string& key, NativeFloatTensor* out);
     modalities::Status upload(const std::string& name,
                               const NativeFloatTensor& tensor);
-    modalities::Status upload_rounded_transpose(
+    modalities::Status upload_source(
         const std::string& source_key,
-        const std::string& destination_name);
-    modalities::Status upload_rounded_copy(
-        const std::string& source_key,
-        const std::string& destination_name);
+        const std::string& destination_name,
+        bool transpose);
     modalities::Status upload_folded_transpose(
         const std::string& source_key,
         const NativeFloatTensor& norm,
         const std::string& destination_name);
-    modalities::Status upload_rounded_scaled(
-        const std::string& source_key,
-        const std::string& destination_name,
-        float scale,
-        bool transpose);
 
     const loader::SafetensorsFile& source_;
     NativeDeviceWeightStore* destination_ = nullptr;
+    modalities::DType logical_scalar_ = modalities::DType::kBFloat16;
 };
 
 }  // namespace pi05

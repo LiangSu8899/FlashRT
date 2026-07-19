@@ -79,6 +79,12 @@ modalities::Status native_source_patch_oihw_to_hwio_f16(
     const NativeSourceTensorView& input,
     NativeF16Tensor* out);
 
+modalities::Status native_source_fold_rms_columns_to_f16(
+    const NativeSourceTensorView& weight,
+    const NativeFloatTensor& norm,
+    bool transpose,
+    NativeF16Tensor* out);
+
 modalities::Status native_source_fold_rms_columns_transpose(
     const NativeSourceTensorView& weight,
     const NativeFloatTensor& norm,

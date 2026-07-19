@@ -12,12 +12,14 @@
 #include "flashrt/cpp/models/pi05/targets/sm120/fp8_linear.h"
 #include "flashrt/cpp/models/pi05/targets/sm120/fp8_weight_packer.h"
 #include "flashrt/cpp/models/pi05/targets/sm120/operations.h"
+#include "quantize.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime_api.h>
 
 #include <exception>
 #include <filesystem>
+#include <limits>
 #include <new>
 #include <utility>
 
@@ -74,6 +76,77 @@ bool vector_weight(const Pi05ResolvedWeight& weight, int width) {
            weight.shape.dims[0] == static_cast<std::uint64_t>(width) &&
            weight.bytes ==
                static_cast<std::uint64_t>(width) * sizeof(std::uint16_t);
+}
+
+bool matrix_weight(const Pi05ResolvedWeight& weight,
+                   int rows,
+                   int columns) {
+    return rows > 0 && columns > 0 && weight.device_data &&
+           weight.storage == Pi05WeightStorage::kBFloat16 &&
+           weight.shape.rank == 2 &&
+           weight.shape.dims[0] == static_cast<std::uint64_t>(rows) &&
+           weight.shape.dims[1] == static_cast<std::uint64_t>(columns) &&
+           static_cast<std::uint64_t>(rows) <=
+               std::numeric_limits<std::uint64_t>::max() /
+                   static_cast<std::uint64_t>(columns) &&
+           weight.bytes == static_cast<std::uint64_t>(rows) *
+                               static_cast<std::uint64_t>(columns) *
+                               sizeof(std::uint16_t);
+}
+
+modalities::Status derive_action_step_weights(
+    frt_ctx context,
+    const Pi05ResolvedShape& shape,
+    Pi05ResolvedWeights* weights,
+    frt_buffer* weight_backing,
+    frt_buffer* bias_backing) {
+    if (!context || !weights || !weight_backing || !bias_backing ||
+        shape.num_steps <= 0 ||
+        !matrix_weight(weights->decoder.action_out_weight,
+                       kPi05ModelDims.decoder_width,
+                       kPi05ModelDims.action_width) ||
+        !vector_weight(weights->decoder.action_out_bias,
+                       kPi05ModelDims.action_width)) {
+        return invalid("SM120 action weight derivation is invalid");
+    }
+    const std::uint64_t weight_bytes =
+        weights->decoder.action_out_weight.bytes;
+    const std::uint64_t bias_bytes = weights->decoder.action_out_bias.bytes;
+    frt_buffer derived_weight = frt_buffer_alloc(
+        context, "pi05_sm120_action_out_step_weight", weight_bytes);
+    frt_buffer derived_bias = frt_buffer_alloc(
+        context, "pi05_sm120_action_out_step_bias", bias_bytes);
+    if (!derived_weight || !derived_bias ||
+        !frt_buffer_dptr(derived_weight) || !frt_buffer_dptr(derived_bias)) {
+        return backend("SM120 action weight derivation allocation failed");
+    }
+    const float scale = -1.0f / static_cast<float>(shape.num_steps);
+    scale_bf16_weight_device(
+        static_cast<const __nv_bfloat16*>(
+            weights->decoder.action_out_weight.device_data),
+        static_cast<__nv_bfloat16*>(frt_buffer_dptr(derived_weight)), scale,
+        kPi05ModelDims.decoder_width * kPi05ModelDims.action_width);
+    scale_bf16_weight_device(
+        static_cast<const __nv_bfloat16*>(
+            weights->decoder.action_out_bias.device_data),
+        static_cast<__nv_bfloat16*>(frt_buffer_dptr(derived_bias)), scale,
+        kPi05ModelDims.action_width);
+    const cudaError_t launched = cudaGetLastError();
+    if (launched != cudaSuccess) return backend(cudaGetErrorString(launched));
+    const cudaError_t synchronized = cudaStreamSynchronize(nullptr);
+    if (synchronized != cudaSuccess) {
+        return backend(cudaGetErrorString(synchronized));
+    }
+
+    Pi05ResolvedWeight private_weight = weights->decoder.action_out_weight;
+    Pi05ResolvedWeight private_bias = weights->decoder.action_out_bias;
+    private_weight.device_data = frt_buffer_dptr(derived_weight);
+    private_bias.device_data = frt_buffer_dptr(derived_bias);
+    weights->decoder.action_out_weight = private_weight;
+    weights->decoder.action_out_bias = private_bias;
+    *weight_backing = derived_weight;
+    *bias_backing = derived_bias;
+    return modalities::Status::ok();
 }
 
 void* offset(void* base, std::size_t elements) {
@@ -262,6 +335,8 @@ struct Sm120TargetBundle::Impl final {
     Pi05ResolvedShape shape;
     Sm120TargetConfig config;
     NativeDeviceWeightStore weights;
+    frt_buffer action_out_step_weight = nullptr;
+    frt_buffer action_out_step_bias = nullptr;
     NativeWorkspace workspace;
     Sm120AttentionBacking attention;
     Sm120Bf16ScratchBacking scratch;
@@ -335,7 +410,6 @@ modalities::Status Sm120TargetBundle::initialize_resources() {
         NativeWeightMaterializer materializer(source, &impl_->weights);
         NativeMaterializationOptions options;
         options.num_steps = impl_->shape.num_steps;
-        options.merge_decoder_gate_up = false;
         options.include_embedding = true;
         status = materializer.materialize_all(options);
         if (!status.ok_status()) return impl_->fail(std::move(status));
@@ -404,6 +478,10 @@ modalities::Status Sm120TargetBundle::resolve_resources(
         status = resolve_pi05_materialized_weights(
             impl_->weights, impl_->shape, modalities::DType::kBFloat16,
             layout, &resolved.weights);
+        if (!status.ok_status()) return impl_->fail(std::move(status));
+        status = derive_action_step_weights(
+            context(), impl_->shape, &resolved.weights,
+            &impl_->action_out_step_weight, &impl_->action_out_step_bias);
         if (!status.ok_status()) return impl_->fail(std::move(status));
         Pi05NativeSupportBuffers support;
         status = resolve_pi05_native_support_buffers(
