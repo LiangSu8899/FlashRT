@@ -314,8 +314,22 @@ def run_recipe(
     # ---- engage levers (one transaction) ----
     swaps: dict[str, torch.nn.Module] = {}
     updates: list[Callable[[], None]] = []
+    refused_build: list[Lever] = []
     for lever in engaged:
-        built = lever.build(model, ctx) if lever.build else {}
+        try:
+            built = lever.build(model, ctx) if lever.build else {}
+        except ValueError as refusal:
+            # a lever may disqualify itself at build time (calibration
+            # shows its precondition does not hold on this host) —
+            # that is an outcome to record, not a reason to abort the
+            # other levers
+            lever_stats[lever.name]["state_out"] = "refused"
+            lever_stats[lever.name]["reason"] = str(refusal)[:120]
+            lever_stats[lever.name]["seams"] = 0
+            refused_build.append(lever)
+            say(f"{lever.name}: refused at build "
+                f"[{str(refusal)[:80]}]")
+            continue
         if isinstance(built, tuple):
             lever_swaps, update = built
         else:
@@ -376,6 +390,8 @@ def run_recipe(
     elif not win:
         reason = f"no net win ({speedup}x < {gates.min_speedup})"
     for lever in engaged:
+        if lever in refused_build:
+            continue
         lever_stats[lever.name]["state_out"] = (
             "certified" if win else "candidate")
     for name, stat in lever_stats.items():
