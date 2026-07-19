@@ -26,8 +26,8 @@ struct Sm110TargetConfig final {
     NativeCalibrationArtifact calibration;
 };
 
-// C2 exposes resource construction for validation only. Operation recording is
-// connected to the semantic pipeline in C3 before this target is published.
+// SM110 owns loading and physical bindings; model flow remains in the shared
+// semantic pipeline.
 class Sm110TargetBundle final : public Pi05TargetBundle {
 public:
     static std::unique_ptr<Sm110TargetBundle> create(

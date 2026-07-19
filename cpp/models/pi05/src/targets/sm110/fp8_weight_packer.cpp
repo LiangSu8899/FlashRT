@@ -200,6 +200,18 @@ const Sm110Fp8PackedWeight* Sm110Fp8WeightPacker::packed_weight(
     return index < packed_.size() ? &packed_[index] : nullptr;
 }
 
+const Sm110Fp8PackedWeight* Sm110Fp8WeightPacker::packed_weight(
+    const Pi05LinearWeightKey& key) const {
+    for (const Sm110Fp8PackedWeight& weight : packed_) {
+        if (weight.key.domain == key.domain &&
+            weight.key.role == key.role &&
+            weight.key.layer == key.layer) {
+            return &weight;
+        }
+    }
+    return nullptr;
+}
+
 }  // namespace sm110
 }  // namespace targets
 }  // namespace pi05

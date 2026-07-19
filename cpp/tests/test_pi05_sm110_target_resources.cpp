@@ -128,6 +128,9 @@ void run_real_resource_contract(const char* checkpoint,
         kPi05LinearScalesPerLayer;
     assert(packer->size() == expected_packed);
     assert(!packer->packed_weight(expected_packed));
+    const Sm110Fp8PackedWeight* first_packed = packer->packed_weight(0);
+    assert(first_packed);
+    assert(packer->packed_weight(first_packed->key) == first_packed);
     const Sm110PhysicalResources* physical =
         target->physical_resources();
     assert(physical && physical->initialized());
@@ -170,7 +173,16 @@ void run_real_resource_contract(const char* checkpoint,
     assert(target->resources_ready());
     assert(target->resolved_resources());
     assert(!target->make_prepare_execution(&prepare).ok_status());
-    assert(!target->finalize_setup().ok_status());
+    assert(target->finalize_setup().ok_status());
+    Pi05ForwardExecution forward;
+    assert(target->make_forward_execution(&forward).ok_status());
+    assert(forward.resources == target->resolved_resources());
+    assert(forward.ops && forward.vision.qkv && forward.encoder.qkv &&
+           forward.decoder.qkv);
+    assert(target->initialize_capture_inputs().ok_status());
+    assert(target->resources_ready());
+    assert(target->set_prompt_length(2).ok_status());
+    assert(target->reset_after_warmup().ok_status());
 
     target.reset();
     frt_ctx_destroy(context);

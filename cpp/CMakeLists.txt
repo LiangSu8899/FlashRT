@@ -386,6 +386,7 @@ endif()
 
 if(FLASHRT_CPP_WITH_PI05_SM110_TARGET)
   add_library(flashrt_cpp_pi05_target_sm110 STATIC
+    models/pi05/src/targets/sm110/frontend_bindings.cpp
     models/pi05/src/targets/sm110/fp8_weight_packer.cpp
     models/pi05/src/targets/sm110/operation_driver.cu
     models/pi05/src/targets/sm110/physical_resources.cpp

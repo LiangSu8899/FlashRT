@@ -7,6 +7,7 @@
 #include "flashrt/cpp/models/pi05/support/native_resource_resolver.h"
 #include "flashrt/cpp/models/pi05/support/native_weight_materializer.h"
 #include "flashrt/cpp/models/pi05/support/native_workspace.h"
+#include "flashrt/cpp/models/pi05/targets/sm110/frontend_bindings.h"
 #include "flashrt/cpp/models/pi05/targets/sm110/fp8_weight_packer.h"
 #include "flashrt/cpp/models/pi05/targets/sm110/operation_driver.h"
 #include "flashrt/cpp/models/pi05/targets/sm110/physical_resources.h"
@@ -75,54 +76,6 @@ bool valid_shape_for_target(const Pi05ResolvedShape& shape) {
            (shape.max_prompt_tokens & 1) == 0;
 }
 
-modalities::Status frontend_linear(
-    void* state,
-    const Pi05ResolvedWeight& weight,
-    const void* input,
-    void* output,
-    int rows,
-    int input_width,
-    int output_width,
-    Pi05Stream stream) {
-    if (!state) return invalid("SM110 F16 linear binding is invalid");
-    return static_cast<Sm110OperationDriver*>(state)->fp16_nn(
-        const_cast<void*>(input), const_cast<void*>(weight.device_data),
-        output, rows, output_width, input_width, stream);
-}
-
-modalities::Status frontend_add_bias(void* state,
-                                     void* values,
-                                     const Pi05ResolvedWeight& bias,
-                                     int rows,
-                                     int columns,
-                                     Pi05Stream stream) {
-    if (!state) return invalid("SM110 F16 bias binding is invalid");
-    return static_cast<Sm110OperationDriver*>(state)->add_bias_fp16(
-        values, bias.device_data, rows, columns, stream);
-}
-
-modalities::Status frontend_silu(void* state,
-                                void* values,
-                                std::size_t elements,
-                                Pi05Stream stream) {
-    if (!state) return invalid("SM110 F16 SiLU binding is invalid");
-    return static_cast<Sm110OperationDriver*>(state)->precise_silu_fp16(
-        values, elements, stream);
-}
-
-modalities::Status frontend_copy(void*,
-                                 void* destination,
-                                 const void* source,
-                                 std::size_t bytes,
-                                 Pi05Stream stream) {
-    const cudaError_t result = cudaMemcpyAsync(
-        destination, source, bytes, cudaMemcpyDeviceToDevice,
-        reinterpret_cast<cudaStream_t>(stream));
-    return result == cudaSuccess
-               ? modalities::Status::ok()
-               : backend(cudaGetErrorString(result));
-}
-
 modalities::Status zero_prepare_storage(
     const Pi05ResolvedResources& resources,
     const Sm110PhysicalResources& physical) {
@@ -164,6 +117,8 @@ struct Sm110TargetBundle::Impl final {
         kResourcesInitialized,
         kResourcesResolved,
         kPrepareComplete,
+        kSetupFinalized,
+        kCaptureInputsInitialized,
         kFailed,
     };
 
@@ -183,7 +138,9 @@ struct Sm110TargetBundle::Impl final {
 
     bool resources_available() const {
         return state == State::kResourcesResolved ||
-               state == State::kPrepareComplete;
+               state == State::kPrepareComplete ||
+               state == State::kSetupFinalized ||
+               state == State::kCaptureInputsInitialized;
     }
 
     Pi05ResolvedShape shape;
@@ -193,6 +150,7 @@ struct Sm110TargetBundle::Impl final {
     Sm110PhysicalResources physical;
     std::unique_ptr<Sm110Fp8WeightPacker> packer;
     std::unique_ptr<Sm110OperationDriver> driver;
+    Sm110FrontendBindings frontend;
     Pi05FrontendOps frontend_ops;
     Pi05ResolvedResources resources;
     Pi05NativeSupportBuffers support;
@@ -342,14 +300,12 @@ modalities::Status Sm110TargetBundle::resolve_resources(
         if (!status.ok_status()) return impl_->fail(std::move(status));
 
         impl_->resources = resolved;
-        impl_->frontend_ops.profile.activation_dtype =
-            modalities::DType::kFloat16;
-        Pi05PrimitiveSet& primitives = impl_->frontend_ops.f16;
-        primitives.state = impl_->driver.get();
-        primitives.linear = frontend_linear;
-        primitives.add_bias = frontend_add_bias;
-        primitives.silu = frontend_silu;
-        primitives.copy = frontend_copy;
+        impl_->frontend = {&impl_->shape, &impl_->config.calibration,
+                           &impl_->physical, impl_->packer.get(),
+                           impl_->driver.get()};
+        status = initialize_sm110_frontend_ops(
+            &impl_->frontend, &impl_->frontend_ops);
+        if (!status.ok_status()) return impl_->fail(std::move(status));
         status = zero_prepare_storage(impl_->resources, impl_->physical);
         if (!status.ok_status()) return impl_->fail(std::move(status));
         impl_->state = Impl::State::kResourcesResolved;
@@ -385,20 +341,107 @@ modalities::Status Sm110TargetBundle::complete_prepare() {
 }
 
 modalities::Status Sm110TargetBundle::finalize_setup() {
-    return unsupported("SM110 operation composition is not connected");
+    if (!impl_ || impl_->state != Impl::State::kPrepareComplete) {
+        return invalid("SM110 target prepare is incomplete");
+    }
+    const cudaError_t synchronized = cudaDeviceSynchronize();
+    if (synchronized != cudaSuccess) {
+        return impl_->fail(backend(cudaGetErrorString(synchronized)));
+    }
+    impl_->state = Impl::State::kSetupFinalized;
+    return modalities::Status::ok();
 }
 
 modalities::Status Sm110TargetBundle::make_forward_execution(
-    Pi05ForwardExecution*) {
-    return unsupported("SM110 operation composition is not connected");
+    Pi05ForwardExecution* out) {
+    if (!impl_ || !out || impl_->state != Impl::State::kSetupFinalized) {
+        return invalid("SM110 forward execution state is invalid");
+    }
+    const Sm110VisionResources& vision = impl_->physical.vision();
+    const Sm110EncoderResources& encoder = impl_->physical.encoder();
+    const Sm110DecoderResources& decoder = impl_->physical.decoder();
+    auto support_data = [](const Pi05ResolvedBuffer& buffer) {
+        return buffer.buffer ? frt_buffer_dptr(buffer.buffer) : nullptr;
+    };
+    auto offset = [](void* base, std::size_t bytes) {
+        return static_cast<unsigned char*>(base) + bytes;
+    };
+    const std::size_t vision_column_bytes =
+        static_cast<std::size_t>(kPi05ModelDims.vision_width) *
+        sizeof(std::uint16_t);
+    out->resources = &impl_->resources;
+    out->ops = &impl_->frontend_ops;
+    out->vision = {
+        support_data(impl_->support.vision_patches),
+        support_data(impl_->support.expanded_vision_position),
+        support_data(impl_->support.pooled_vision_state),
+        vision.post_norm.device_data(),
+        vision.qkv.device_data(),
+        vision.hidden.device_data(),
+        vision.qkv.device_data(),
+        offset(vision.qkv.device_data(), vision_column_bytes),
+        offset(vision.qkv.device_data(), 2 * vision_column_bytes),
+        vision.attention.device_data(),
+    };
+    out->encoder = {
+        impl_->support.encoder_rms_weight,
+        encoder.residual_output.device_data(),
+        encoder.qkv.device_data(),
+        encoder.gate_up.device_data(),
+        encoder.hidden_fp8.device_data(),
+        encoder.attention.device_data(),
+        encoder.attention.device_data(),
+    };
+    out->decoder = {
+        impl_->support.decoder_rms_weight,
+        decoder.normalized.device_data(),
+        decoder.gate.device_data(),
+        decoder.qkv.device_data(),
+        decoder.projection.device_data(),
+        decoder.hidden_fp8.device_data(),
+        decoder.attention.device_data(),
+        decoder.attention.device_data(),
+    };
+    return modalities::Status::ok();
 }
 
 modalities::Status Sm110TargetBundle::initialize_capture_inputs() {
-    return unsupported("SM110 operation composition is not connected");
+    if (!impl_ || impl_->state != Impl::State::kSetupFinalized) {
+        return invalid("SM110 capture input state is invalid");
+    }
+    const Pi05ResolvedBuffer* buffers[] = {
+        &impl_->resources.buffers.images,
+        &impl_->resources.buffers.prompt_embedding,
+        &impl_->resources.buffers.encoder_state,
+        &impl_->resources.buffers.noise,
+    };
+    for (const Pi05ResolvedBuffer* buffer : buffers) {
+        if (!buffer->buffer ||
+            cudaMemset(frt_buffer_dptr(buffer->buffer), 0,
+                       frt_buffer_bytes(buffer->buffer)) != cudaSuccess) {
+            return impl_->fail(
+                backend("SM110 capture input reset failed"));
+        }
+    }
+    const cudaError_t synchronized = cudaDeviceSynchronize();
+    if (synchronized != cudaSuccess) {
+        return impl_->fail(backend(cudaGetErrorString(synchronized)));
+    }
+    impl_->state = Impl::State::kCaptureInputsInitialized;
+    return modalities::Status::ok();
 }
 
 modalities::Status Sm110TargetBundle::reset_after_warmup() {
-    return unsupported("SM110 operation composition is not connected");
+    if (!impl_ || impl_->state != Impl::State::kCaptureInputsInitialized ||
+        !impl_->resources.buffers.noise.buffer) {
+        return invalid("SM110 warmup reset state is invalid");
+    }
+    const cudaError_t result = cudaMemset(
+        frt_buffer_dptr(impl_->resources.buffers.noise.buffer), 0,
+        frt_buffer_bytes(impl_->resources.buffers.noise.buffer));
+    return result == cudaSuccess
+               ? modalities::Status::ok()
+               : impl_->fail(backend(cudaGetErrorString(result)));
 }
 
 modalities::Status Sm110TargetBundle::set_prompt_length(

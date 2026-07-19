@@ -33,6 +33,8 @@ public:
 
     std::size_t size() const { return packed_.size(); }
     const Sm110Fp8PackedWeight* packed_weight(std::size_t index) const;
+    const Sm110Fp8PackedWeight* packed_weight(
+        const Pi05LinearWeightKey& key) const;
     bool finished() const { return finished_; }
 
 private:
