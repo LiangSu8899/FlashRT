@@ -38,6 +38,10 @@ def _bind_seam(seam: Seam, weights, calib, original):
         from .impls.decoder_ffn import fp8_static as impl
     elif seam.structure == "vision_ffn":
         from .impls.vision_ffn import fp8_static as impl
+    elif seam.structure == "linear_proj":
+        from .impls.linear_proj import fp8_static as proj_impl
+        return proj_impl.bind_proj_seam(weights, calibration=calib,
+                                        original=original)
     else:
         raise ValueError(f"no auto impl for structure {seam.structure!r}")
     return impl.bind_mlp_seam(weights, variant=seam.variant,
@@ -205,9 +209,13 @@ def attach(
                 {int(t.reshape(-1, t.shape[-1]).shape[0])
                  for t in cap["in"]})
             from .discover import _resolve
-            bound = _bind_seam(seam, seam_weights(model, seam),
-                               [t for t in cap["in"]],
-                               original=_resolve(model, seam.path))
+            try:
+                bound = _bind_seam(seam, seam_weights(model, seam),
+                                   [t for t in cap["in"]],
+                                   original=_resolve(model, seam.path))
+            except ValueError as refusal:
+                refused.append((seam.layer_index, str(refusal)[:80]))
+                continue
             layer_worst = 1.0
             with torch.no_grad():
                 for k in range(len(cap["in"])):

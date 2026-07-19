@@ -36,9 +36,9 @@ SUPPORT = {
 
 @lru_cache(maxsize=1)
 def _kernel():
-    from kernels import get_kernel
+    from flash_rt.structures.impls import hub_kernel
 
-    return get_kernel(KERNEL_DEP["repo"], version=KERNEL_DEP["version"])
+    return hub_kernel(KERNEL_DEP["repo"], KERNEL_DEP["version"])
 
 
 def _entrypoint(variant: Mapping[str, str]):

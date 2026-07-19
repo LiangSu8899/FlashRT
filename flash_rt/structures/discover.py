@@ -19,6 +19,10 @@ from torch import nn
 _DECODER_PROJ = ("gate_proj", "up_proj", "down_proj")
 _VISION_PROJ = (("fc1", "fc2"), ("linear_fc1", "linear_fc2"))
 _NORM_ATTRS = ("post_attention_layernorm", "layer_norm2", "norm2")
+_ATTN_PROJ = (("q_proj", "k_proj", "v_proj", "o_proj"),
+              ("q_proj", "k_proj", "v_proj", "out_proj"))
+_PROJ_WEIGHT_FLOOR = 262144  # candidacy filter only; impls add their own
+                             # work-based qualification and gates decide
 
 
 @dataclass
@@ -32,6 +36,7 @@ class Seam:
     dims: dict[str, int]
     variant: dict[str, str]
     fc_attrs: tuple[str, str] | None = None
+    proj_attr: str | None = None      # linear_proj: attr name in parent
     family: str = ""
     layer_index: int = -1
     m_profile: list[int] = field(default_factory=list)
@@ -107,6 +112,26 @@ def discover(
                 variant={"activation": act, "norm_weight_mode": "direct"},
                 family=family, layer_index=idx))
             continue
+        if "linear_proj" in structures:
+            for group in _ATTN_PROJ:
+                projs = [getattr(module, a, None) for a in group]
+                if not all(isinstance(p, nn.Linear) for p in projs):
+                    continue
+                for attr, proj in zip(group, projs):
+                    if proj.weight.numel() < _PROJ_WEIGHT_FLOOR:
+                        continue
+                    family, idx = _family_key(path)
+                    seams.append(Seam(
+                        structure="linear_proj",
+                        path=path + "." + attr, parent_path=path,
+                        norm_attr=None, proj_attr=attr,
+                        dims={"K": proj.in_features,
+                              "N": proj.out_features},
+                        variant={"bias": ("add" if proj.bias is not None
+                                          else "none"),
+                                 "epilogue": "none", "in_dtype": "bf16"},
+                        family=family + "." + attr, layer_index=idx))
+                break
         if "vision_ffn" in structures:
             for fc1_attr, fc2_attr in _VISION_PROJ:
                 fc1 = getattr(module, fc1_attr, None)
@@ -148,6 +173,10 @@ def seam_weights(model: nn.Module, seam: Seam) -> dict[str, torch.Tensor]:
     module = _resolve(model, seam.path)
     norm = (_resolve(model, seam.parent_path + "." + seam.norm_attr)
             if seam.norm_attr else None)
+    if seam.structure == "linear_proj":
+        return {"w": module.weight.detach(),
+                "b": (module.bias.detach()
+                      if module.bias is not None else None)}
     if seam.structure == "decoder_ffn":
         w_norm = (norm.weight.detach() if norm is not None
                   and getattr(norm, "weight", None) is not None
