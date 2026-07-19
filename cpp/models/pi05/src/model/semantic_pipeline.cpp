@@ -367,6 +367,45 @@ bool complete_encoder(const Pi05EncoderExecution& encoder) {
            encoder.hidden && encoder.query && encoder.attention_output;
 }
 
+bool complete_decoder(const Pi05PrimitiveSet* ops) {
+    return ops && ops->adaptive_normalize && ops->residual_update;
+}
+
+bool complete_decoder(const Pi05DecoderExecution& decoder) {
+    return buffer_data(decoder.rms_weight) && decoder.normalized &&
+           decoder.gate && decoder.qkv && decoder.gate_projection &&
+           decoder.hidden && decoder.query && decoder.attention_output;
+}
+
+const void* style_slice(const Pi05ResolvedBuffer& styles,
+                        const Pi05ResolvedShape& shape,
+                        modalities::DType dtype,
+                        int step,
+                        int layer) {
+    const std::size_t scalar_bytes = modalities::dtype_size(dtype);
+    const std::size_t width = kPi05ModelDims.decoder_width;
+    const std::size_t maximum = std::numeric_limits<std::size_t>::max();
+    if (!scalar_bytes || shape.chunk <= 0 || step < 0 ||
+        static_cast<std::size_t>(shape.chunk) > maximum / 3 / width /
+                                                   scalar_bytes) {
+        return nullptr;
+    }
+    const std::size_t style_bytes =
+        static_cast<std::size_t>(shape.chunk) * 3 * width * scalar_bytes;
+    std::size_t index = static_cast<std::size_t>(step);
+    if (layer >= 0) {
+        index = index * kPi05ModelDims.decoder_layers +
+                static_cast<std::size_t>(layer);
+    }
+    if (index > maximum / style_bytes) return nullptr;
+    const std::size_t offset = index * style_bytes;
+    return buffer_data(styles) &&
+                   offset <= styles.physical_bytes &&
+                   style_bytes <= styles.physical_bytes - offset
+               ? byte_offset(buffer_data(styles), offset)
+               : nullptr;
+}
+
 void* cache_layer_data(const Pi05ResolvedBuffer& cache,
                        const Pi05ResolvedShape& shape,
                        modalities::DType dtype,
@@ -625,8 +664,8 @@ modalities::Status execute_encoder_attention(
     if (!status.ok_status()) return status;
     status = ops.qkv_rope(
         ops.state, execution.encoder.qkv,
-        execution.resources->buffers.encoder_rope, execution.encoder.query,
-        key, value, rows, width, key_width, key_width,
+        execution.resources->buffers.encoder_rope, nullptr,
+        execution.encoder.query, key, value, rows, width, key_width, key_width,
         kPi05ModelDims.encoder_head_dim, stream);
     if (!status.ok_status()) return status;
     status = ops.attention(
@@ -731,9 +770,219 @@ modalities::Status execute_encoder_cache_finalize(
         execution.ops->profile.activation_dtype, call.layer);
     return ops.qkv_rope(
         ops.state, execution.encoder.qkv,
-        execution.resources->buffers.encoder_rope, execution.encoder.query,
-        key, value, rows, width, key_width, key_width,
+        execution.resources->buffers.encoder_rope, nullptr,
+        execution.encoder.query, key, value, rows, width, key_width, key_width,
         kPi05ModelDims.encoder_head_dim, stream);
+}
+
+modalities::Status execute_diffusion_input_project(
+    const Pi05ResolvedShape& shape,
+    Pi05ForwardExecution& execution,
+    Pi05Stream stream) {
+    const Pi05PrimitiveSet& ops = *active_primitives(*execution.ops);
+    const Pi05DecoderGlobalWeights& weights =
+        execution.resources->weights.decoder;
+    void* decoder =
+        buffer_data(execution.resources->buffers.decoder_state);
+    modalities::Status status = ops.linear(
+        ops.state, weights.action_in_weight,
+        buffer_data(execution.resources->buffers.noise), decoder,
+        shape.chunk, kPi05ModelDims.action_width,
+        kPi05ModelDims.decoder_width, stream);
+    if (!status.ok_status()) return status;
+    execution.decoder.pending_update = nullptr;
+    execution.decoder.pending_gate = nullptr;
+    return ops.add_bias(
+        ops.state, decoder, weights.action_in_bias, shape.chunk,
+        kPi05ModelDims.decoder_width, stream);
+}
+
+modalities::Status execute_decoder_attention(
+    const Pi05OperationCall& call,
+    const Pi05ResolvedShape& shape,
+    Pi05ForwardExecution& execution,
+    Pi05Stream stream) {
+    const Pi05PrimitiveSet& ops = *active_primitives(*execution.ops);
+    const Pi05DecoderLayerWeights& weights =
+        execution.resources->weights.decoder_layers[
+            static_cast<std::size_t>(call.layer)];
+    const int rows = shape.chunk;
+    const int width = kPi05ModelDims.decoder_width;
+    const int query_width =
+        kPi05ModelDims.decoder_heads * kPi05ModelDims.decoder_head_dim;
+    const int key_width =
+        kPi05ModelDims.decoder_kv_heads * kPi05ModelDims.decoder_head_dim;
+    const Pi05LinearWeightKey qkv_key{
+        Pi05LinearDomain::kDecoder, Pi05LinearRole::kAttentionQkv,
+        call.layer};
+    const Pi05LinearWeightKey output_key{
+        Pi05LinearDomain::kDecoder, Pi05LinearRole::kAttentionOutput,
+        call.layer};
+    const void* style = style_slice(
+        execution.resources->buffers.attention_style, shape,
+        execution.ops->profile.activation_dtype, call.step, call.layer);
+    const void* qkv_input = nullptr;
+    bool qkv_prequantized = false;
+    modalities::Status status = ops.adaptive_normalize(
+        ops.state,
+        buffer_data(execution.resources->buffers.decoder_state),
+        execution.decoder.pending_update, execution.decoder.pending_gate,
+        execution.decoder.rms_weight, style, execution.decoder.normalized,
+        execution.decoder.gate, qkv_key, call.step, rows, width,
+        kPi05ModelNumerics.decoder_rms_norm_epsilon, true, &qkv_input,
+        &qkv_prequantized, stream);
+    if (!status.ok_status()) return status;
+    execution.decoder.pending_update = nullptr;
+    execution.decoder.pending_gate = nullptr;
+    status = ops.projected_linear(
+        ops.state, weights.attention_qkv_weight, qkv_key, call.step,
+        qkv_input, execution.decoder.qkv, rows, width,
+        query_width + 2 * key_width, qkv_prequantized, stream);
+    if (!status.ok_status()) return status;
+    void* key = cache_layer_data(
+        execution.resources->buffers.key_cache, shape,
+        execution.ops->profile.activation_dtype, call.layer);
+    void* value = cache_layer_data(
+        execution.resources->buffers.value_cache, shape,
+        execution.ops->profile.activation_dtype, call.layer);
+    status = ops.qkv_rope(
+        ops.state, execution.decoder.qkv,
+        execution.resources->buffers.decoder_rope,
+        &execution.resources->buffers.decoder_position,
+        execution.decoder.query, key, value, rows, query_width, key_width,
+        key_width, kPi05ModelDims.decoder_head_dim, stream);
+    if (!status.ok_status()) return status;
+    status = ops.attention(
+        ops.state, Pi05LinearDomain::kDecoder, call.layer,
+        execution.decoder.query, key, value,
+        execution.decoder.attention_output, 1, rows,
+        shape.total_attention_keys, kPi05ModelDims.decoder_heads,
+        kPi05ModelDims.decoder_kv_heads, kPi05ModelDims.decoder_head_dim,
+        stream);
+    if (!status.ok_status()) return status;
+    status = ops.projected_linear(
+        ops.state, weights.attention_output_weight, output_key, call.step,
+        execution.decoder.attention_output, execution.decoder.normalized,
+        rows, query_width, width, false, stream);
+    if (status.ok_status()) {
+        execution.decoder.pending_update = execution.decoder.normalized;
+        execution.decoder.pending_gate = execution.decoder.gate;
+    }
+    return status;
+}
+
+modalities::Status execute_decoder_mlp(
+    const Pi05OperationCall& call,
+    const Pi05ResolvedShape& shape,
+    Pi05ForwardExecution& execution,
+    Pi05Stream stream) {
+    const Pi05PrimitiveSet& ops = *active_primitives(*execution.ops);
+    const Pi05FeedForwardWeights& weights =
+        execution.resources->weights.decoder_layers[
+            static_cast<std::size_t>(call.layer)].mlp;
+    const int rows = shape.chunk;
+    const int width = kPi05ModelDims.decoder_width;
+    const int hidden_width = kPi05ModelDims.decoder_hidden;
+    const Pi05LinearWeightKey gate_up_key{
+        Pi05LinearDomain::kDecoder, Pi05LinearRole::kMlpGateUpGroup,
+        call.layer};
+    const Pi05LinearWeightKey down_key{
+        Pi05LinearDomain::kDecoder, Pi05LinearRole::kMlpDown, call.layer};
+    const void* style = style_slice(
+        execution.resources->buffers.mlp_style, shape,
+        execution.ops->profile.activation_dtype, call.step, call.layer);
+    const void* gate_up_input = nullptr;
+    bool gate_up_prequantized = false;
+    modalities::Status status = ops.adaptive_normalize(
+        ops.state,
+        buffer_data(execution.resources->buffers.decoder_state),
+        execution.decoder.pending_update, execution.decoder.pending_gate,
+        execution.decoder.rms_weight, style, execution.decoder.normalized,
+        execution.decoder.gate, gate_up_key, call.step, rows, width,
+        kPi05ModelNumerics.decoder_rms_norm_epsilon, true, &gate_up_input,
+        &gate_up_prequantized, stream);
+    if (!status.ok_status()) return status;
+    execution.decoder.pending_update = nullptr;
+    execution.decoder.pending_gate = nullptr;
+    bool merged = false;
+    status = ops.gate_up(
+        ops.state, weights, gate_up_key, call.step, gate_up_input,
+        gate_up_prequantized, execution.decoder.gate_projection,
+        execution.decoder.hidden, rows, width, hidden_width, &merged,
+        stream);
+    if (!status.ok_status()) return status;
+    const void* down_input = nullptr;
+    bool down_prequantized = false;
+    status = ops.gated_activation(
+        ops.state, execution.decoder.gate_projection,
+        execution.decoder.hidden, merged, execution.decoder.hidden, rows,
+        hidden_width, down_key, call.step, &down_input,
+        &down_prequantized, stream);
+    if (!status.ok_status()) return status;
+    status = ops.projected_linear(
+        ops.state, weights.down_weight, down_key, call.step, down_input,
+        execution.decoder.normalized, rows, hidden_width, width,
+        down_prequantized, stream);
+    if (status.ok_status()) {
+        execution.decoder.pending_update = execution.decoder.normalized;
+        execution.decoder.pending_gate = execution.decoder.gate;
+    }
+    return status;
+}
+
+modalities::Status execute_action_project(
+    const Pi05OperationCall& call,
+    const Pi05ResolvedShape& shape,
+    Pi05ForwardExecution& execution,
+    Pi05Stream stream) {
+    const Pi05PrimitiveSet& ops = *active_primitives(*execution.ops);
+    const Pi05DecoderGlobalWeights& weights =
+        execution.resources->weights.decoder;
+    const void* style = style_slice(
+        execution.resources->buffers.final_style, shape,
+        execution.ops->profile.activation_dtype, call.step, -1);
+    const void* normalized = nullptr;
+    bool prequantized = false;
+    modalities::Status status = ops.adaptive_normalize(
+        ops.state,
+        buffer_data(execution.resources->buffers.decoder_state),
+        execution.decoder.pending_update, execution.decoder.pending_gate,
+        execution.decoder.rms_weight, style, execution.decoder.normalized,
+        execution.decoder.gate, {}, call.step, shape.chunk,
+        kPi05ModelDims.decoder_width,
+        kPi05ModelNumerics.decoder_rms_norm_epsilon, false, &normalized,
+        &prequantized, stream);
+    if (!status.ok_status() || prequantized) {
+        return status.ok_status()
+                   ? invalid("PI0.5 action projection input is quantized")
+                   : status;
+    }
+    execution.decoder.pending_update = nullptr;
+    execution.decoder.pending_gate = nullptr;
+    void* action =
+        buffer_data(execution.resources->buffers.action_delta);
+    status = ops.linear(
+        ops.state, weights.action_out_weight, normalized, action,
+        shape.chunk, kPi05ModelDims.decoder_width,
+        kPi05ModelDims.action_width, stream);
+    return status.ok_status()
+               ? ops.add_bias(ops.state, action, weights.action_out_bias,
+                              shape.chunk, kPi05ModelDims.action_width,
+                              stream)
+               : status;
+}
+
+modalities::Status execute_diffusion_update(
+    const Pi05ResolvedShape& shape,
+    Pi05ForwardExecution& execution,
+    Pi05Stream stream) {
+    const Pi05PrimitiveSet& ops = *active_primitives(*execution.ops);
+    return ops.residual_update(
+        ops.state, buffer_data(execution.resources->buffers.noise),
+        buffer_data(execution.resources->buffers.action_delta), nullptr,
+        static_cast<std::size_t>(shape.chunk) *
+            kPi05ModelDims.action_width,
+        stream);
 }
 
 }  // namespace
@@ -745,9 +994,10 @@ modalities::Status Pi05ForwardExecution::record(
     modalities::Status status = validate_pi05_operation_call(call, shape);
     if (!status.ok_status()) return status;
     if (!resources || !ops || !complete_vision(vision) ||
-        !complete_encoder(encoder) ||
+        !complete_encoder(encoder) || !complete_decoder(decoder) ||
         !complete_vision(active_primitives(*ops)) ||
-        !complete_encoder(active_primitives(*ops))) {
+        !complete_encoder(active_primitives(*ops)) ||
+        !complete_decoder(active_primitives(*ops))) {
         return invalid("PI0.5 forward execution is incomplete");
     }
     switch (call.id) {
@@ -767,9 +1017,18 @@ modalities::Status Pi05ForwardExecution::record(
             return execute_encoder_mlp(call, shape, *this, stream);
         case Pi05OperationId::kEncoderCacheFinalize:
             return execute_encoder_cache_finalize(call, shape, *this, stream);
+        case Pi05OperationId::kDiffusionInputProject:
+            return execute_diffusion_input_project(shape, *this, stream);
+        case Pi05OperationId::kDecoderAttention:
+            return execute_decoder_attention(call, shape, *this, stream);
+        case Pi05OperationId::kDecoderMlp:
+            return execute_decoder_mlp(call, shape, *this, stream);
+        case Pi05OperationId::kActionProject:
+            return execute_action_project(call, shape, *this, stream);
+        case Pi05OperationId::kDiffusionUpdate:
+            return execute_diffusion_update(shape, *this, stream);
         default:
-            return fallback ? fallback->record(call, shape, stream)
-                            : invalid("PI0.5 forward operation is unavailable");
+            return invalid("PI0.5 forward operation is unavailable");
     }
 }
 

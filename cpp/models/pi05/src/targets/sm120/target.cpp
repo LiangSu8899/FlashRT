@@ -13,7 +13,8 @@
 #include "flashrt/cpp/models/pi05/targets/sm120/bf16_scratch.h"
 #include "flashrt/cpp/models/pi05/targets/sm120/fp8_linear.h"
 #include "flashrt/cpp/models/pi05/targets/sm120/fp8_weight_packer.h"
-#include "flashrt/cpp/models/pi05/targets/sm120/operations.h"
+#include "flashrt/cpp/models/pi05/targets/sm120/fp8_autotune.h"
+#include "fusion.cuh"
 #include "norm.cuh"
 #include "patch_embed.cuh"
 #include "quantize.cuh"
@@ -417,6 +418,7 @@ modalities::Status frontend_qkv_rope(
     void*,
     const void* qkv,
     const Pi05ResolvedBuffer& rope,
+    const Pi05ResolvedBuffer* position,
     void* query,
     void* key,
     void* value,
@@ -429,13 +431,130 @@ modalities::Status frontend_qkv_rope(
     if (!qkv || !frontend_data(rope) || !query || !key || !value) {
         return invalid("SM120 QKV/RoPE binding is invalid");
     }
-    ::qkv_split_rope(
-        static_cast<const __nv_bfloat16*>(qkv),
-        static_cast<const __nv_bfloat16*>(frontend_data(rope)),
-        static_cast<__nv_bfloat16*>(query),
-        static_cast<__nv_bfloat16*>(key),
-        static_cast<__nv_bfloat16*>(value), rows, query_width, key_width,
-        value_width, head_width, reinterpret_cast<cudaStream_t>(stream));
+    if (position) {
+        if (!frontend_data(*position)) {
+            return invalid("SM120 QKV/RoPE position is invalid");
+        }
+        ::qkv_split_rope_devpos(
+            static_cast<const __nv_bfloat16*>(qkv),
+            static_cast<const __nv_bfloat16*>(frontend_data(rope)),
+            static_cast<__nv_bfloat16*>(query),
+            static_cast<__nv_bfloat16*>(key),
+            static_cast<__nv_bfloat16*>(value),
+            static_cast<const int*>(frontend_data(*position)), rows,
+            query_width, key_width, value_width, head_width,
+            reinterpret_cast<cudaStream_t>(stream));
+    } else {
+        ::qkv_split_rope(
+            static_cast<const __nv_bfloat16*>(qkv),
+            static_cast<const __nv_bfloat16*>(frontend_data(rope)),
+            static_cast<__nv_bfloat16*>(query),
+            static_cast<__nv_bfloat16*>(key),
+            static_cast<__nv_bfloat16*>(value), rows, query_width, key_width,
+            value_width, head_width,
+            reinterpret_cast<cudaStream_t>(stream));
+    }
+    return launch_status();
+}
+
+modalities::Status frontend_residual_update(
+    void*,
+    void* residual,
+    const void* update,
+    const void* gate,
+    std::size_t elements,
+    Pi05Stream stream) {
+    if (!residual || !update || !elements ||
+        elements > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        return invalid("SM120 residual update is invalid");
+    }
+    if (gate) {
+        ::gate_mul_residual(
+            static_cast<__nv_bfloat16*>(residual),
+            static_cast<const __nv_bfloat16*>(update),
+            static_cast<const __nv_bfloat16*>(gate),
+            static_cast<int>(elements),
+            reinterpret_cast<cudaStream_t>(stream));
+    } else {
+        ::residual_add(
+            static_cast<__nv_bfloat16*>(residual),
+            static_cast<const __nv_bfloat16*>(update),
+            static_cast<int>(elements),
+            reinterpret_cast<cudaStream_t>(stream));
+    }
+    return launch_status();
+}
+
+modalities::Status frontend_adaptive_normalize(
+    void* state,
+    void* residual,
+    const void* update,
+    const void* update_gate,
+    const Pi05ResolvedBuffer& weight,
+    const void* style,
+    void* normalized,
+    void* gate,
+    Pi05LinearWeightKey key,
+    int step,
+    int rows,
+    int columns,
+    float epsilon,
+    bool quantize,
+    const void** linear_input,
+    bool* prequantized,
+    Pi05Stream stream) {
+    Sm120FrontendBindings* binding = frontend(state);
+    if (!binding || !residual || !frontend_data(weight) || !style ||
+        !normalized || !gate || !linear_input || !prequantized || rows <= 0 ||
+        columns <= 0 || ((update == nullptr) != (update_gate == nullptr))) {
+        return invalid("SM120 adaptive normalization is invalid");
+    }
+    const cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    const bool static_quantized = quantize && frontend_static_fp8(binding);
+    if (static_quantized) {
+        float* scale = frontend_scale(binding, key, step);
+        if (!scale) {
+            return invalid("SM120 adaptive normalization scale is invalid");
+        }
+        void* output = binding->fp8_linear->scratch_data();
+        if (update) {
+            ::gate_residual_ada_norm_fp8(
+                static_cast<__nv_bfloat16*>(residual),
+                static_cast<const __nv_bfloat16*>(update),
+                static_cast<const __nv_bfloat16*>(update_gate),
+                static_cast<const __nv_bfloat16*>(frontend_data(weight)),
+                static_cast<const __nv_bfloat16*>(style),
+                static_cast<__nv_fp8_e4m3*>(output),
+                static_cast<__nv_bfloat16*>(gate), rows, columns, epsilon,
+                scale, cuda_stream);
+        } else {
+            ::ada_rms_norm_style_fp8(
+                static_cast<const __nv_bfloat16*>(residual),
+                static_cast<const __nv_bfloat16*>(frontend_data(weight)),
+                static_cast<const __nv_bfloat16*>(style),
+                static_cast<__nv_fp8_e4m3*>(output),
+                static_cast<__nv_bfloat16*>(gate), rows, columns, epsilon,
+                scale, cuda_stream);
+        }
+        *linear_input = output;
+        *prequantized = true;
+        return launch_status();
+    }
+    if (update) {
+        modalities::Status status = frontend_residual_update(
+            state, residual, update, update_gate,
+            static_cast<std::size_t>(rows) * columns, stream);
+        if (!status.ok_status()) return status;
+    }
+    ::ada_rms_norm_style(
+        static_cast<const __nv_bfloat16*>(residual),
+        static_cast<const __nv_bfloat16*>(frontend_data(weight)),
+        static_cast<const __nv_bfloat16*>(style),
+        static_cast<__nv_bfloat16*>(normalized),
+        static_cast<__nv_bfloat16*>(gate), rows, columns, epsilon,
+        cuda_stream);
+    *linear_input = normalized;
+    *prequantized = false;
     return launch_status();
 }
 
@@ -457,7 +576,7 @@ modalities::Status frontend_attention(
     Sm120FrontendBindings* binding = frontend(state);
     if (!binding || !binding->shape || !binding->attention_buffers ||
         !binding->attention) {
-        return invalid("SM120 vision-attention binding is invalid");
+        return invalid("SM120 attention binding is invalid");
     }
     if (domain == Pi05LinearDomain::kVision) {
         const Sm120VisionAttentionBuffers& buffers =
@@ -492,6 +611,23 @@ modalities::Status frontend_attention(
             return invalid("SM120 encoder-attention contract is invalid");
         }
         return binding->attention->encoder(layer, stream);
+    }
+    if (domain == Pi05LinearDomain::kDecoder) {
+        const Sm120DecoderAttentionBuffers& buffers =
+            binding->attention_buffers->decoder();
+        if (layer < 0 || layer >= kPi05ModelDims.decoder_layers ||
+            query != buffers.query.device_data() ||
+            key != binding->attention_buffers->key_layer_data(layer) ||
+            value != binding->attention_buffers->value_layer_data(layer) ||
+            output != binding->attention->decoder_output() || batches != 1 ||
+            query_rows != binding->shape->chunk ||
+            key_rows != binding->shape->total_attention_keys ||
+            query_heads != kPi05ModelDims.decoder_heads ||
+            key_heads != kPi05ModelDims.decoder_kv_heads ||
+            head_width != kPi05ModelDims.decoder_head_dim) {
+            return invalid("SM120 decoder-attention contract is invalid");
+        }
+        return binding->attention->decoder(layer, stream);
     }
     return unsupported("SM120 attention domain is not installed");
 }
@@ -686,7 +822,6 @@ struct Sm120TargetBundle::Impl final {
     std::unique_ptr<Sm120Fp8ActivationBacking> fp8_activation;
     std::unique_ptr<Sm120Fp8Linear> fp8_linear;
     std::unique_ptr<Sm120AttentionDriver> attention_driver;
-    std::unique_ptr<Sm120Operations> operations;
     Pi05ResolvedResources resources;
     Pi05NativeSupportBuffers support;
     std::size_t prepare_cursor = 0;
@@ -893,6 +1028,8 @@ modalities::Status Sm120TargetBundle::resolve_resources(
         primitives.qkv_split = frontend_qkv_split;
         primitives.normalize_for_linear = frontend_normalize_for_linear;
         primitives.qkv_rope = frontend_qkv_rope;
+        primitives.adaptive_normalize = frontend_adaptive_normalize;
+        primitives.residual_update = frontend_residual_update;
         primitives.attention = frontend_attention;
         primitives.gate_up = frontend_gate_up;
         primitives.gated_activation = frontend_gated_activation;
@@ -933,45 +1070,6 @@ modalities::Status Sm120TargetBundle::complete_prepare() {
     return modalities::Status::ok();
 }
 
-modalities::Status Sm120TargetBundle::record(
-    const Pi05OperationCall& call,
-    const Pi05ResolvedShape& shape,
-    Pi05Stream stream) {
-    if (!impl_ || !pi05_resolved_shape_equal(shape, impl_->shape)) {
-        return invalid("SM120 target operation shape is invalid");
-    }
-    modalities::Status status = validate_pi05_operation_call(call, shape);
-    if (!status.ok_status()) return status;
-    if (impl_->state != Impl::State::kCaptureInputsInitialized ||
-        !impl_->operations) {
-        return invalid("SM120 forward operation state is invalid");
-    }
-    switch (call.id) {
-        case Pi05OperationId::kDiffusionInputProject:
-            status = impl_->operations->diffusion_input_project(call.step,
-                                                                 stream);
-            break;
-        case Pi05OperationId::kDecoderAttention:
-            status = impl_->operations->decoder_attention(
-                call.layer, call.step, stream);
-            break;
-        case Pi05OperationId::kDecoderMlp:
-            status = impl_->operations->decoder_mlp(call.layer, call.step,
-                                                     stream);
-            break;
-        case Pi05OperationId::kActionProject:
-            status = impl_->operations->action_project(call.step, stream);
-            break;
-        case Pi05OperationId::kDiffusionUpdate:
-            status = impl_->operations->diffusion_update(call.step, stream);
-            break;
-        default:
-            return unsupported("SM120 forward operation is not installed");
-    }
-    if (!status.ok_status()) return impl_->fail(std::move(status));
-    return modalities::Status::ok();
-}
-
 modalities::Status Sm120TargetBundle::finalize_setup() {
     if (!impl_ || impl_->state != Impl::State::kPrepareComplete) {
         return invalid("SM120 target prepare is incomplete");
@@ -989,17 +1087,10 @@ modalities::Status Sm120TargetBundle::finalize_setup() {
     if (!status.ok_status()) return impl_->fail(std::move(status));
     impl_->frontend.attention = impl_->attention_driver.get();
     if (impl_->fp8_linear) {
-        status = Sm120Operations::autotune_fp8(
+        status = autotune_sm120_fp8(
             impl_->shape, &impl_->resources, impl_->scratch,
             impl_->fp8_linear.get());
         if (!status.ok_status()) return impl_->fail(std::move(status));
-    }
-    impl_->operations = Sm120Operations::create(
-        impl_->shape, impl_->resources, impl_->support, impl_->scratch,
-        impl_->attention, *impl_->attention_driver, *impl_->bf16_linear,
-        impl_->fp8_linear.get(), &status);
-    if (!impl_->operations || !status.ok_status()) {
-        return impl_->fail(std::move(status));
     }
     impl_->state = Impl::State::kSetupFinalized;
     return modalities::Status::ok();
@@ -1008,7 +1099,7 @@ modalities::Status Sm120TargetBundle::finalize_setup() {
 modalities::Status Sm120TargetBundle::make_forward_execution(
     Pi05ForwardExecution* out) {
     if (!impl_ || !out || impl_->state != Impl::State::kSetupFinalized ||
-        !impl_->attention_driver || !impl_->operations) {
+        !impl_->attention_driver) {
         return invalid("SM120 forward execution state is invalid");
     }
     const Sm120VisionBf16Scratch& scratch = impl_->scratch.vision();
@@ -1017,6 +1108,10 @@ modalities::Status Sm120TargetBundle::make_forward_execution(
         impl_->scratch.encoder();
     const Sm120EncoderAttentionBuffers& encoder_attention =
         impl_->attention.encoder();
+    const Sm120DecoderBf16Scratch& decoder_scratch =
+        impl_->scratch.decoder();
+    const Sm120DecoderAttentionBuffers& decoder_attention =
+        impl_->attention.decoder();
     auto data = [](const Pi05ResolvedBuffer& buffer) {
         return buffer.buffer ? frt_buffer_dptr(buffer.buffer) : nullptr;
     };
@@ -1043,7 +1138,16 @@ modalities::Status Sm120TargetBundle::make_forward_execution(
         encoder_attention.query.device_data(),
         impl_->attention_driver->encoder_output(),
     };
-    out->fallback = this;
+    out->decoder = {
+        impl_->support.decoder_rms_weight,
+        decoder_scratch.normalized.device_data(),
+        decoder_scratch.gate.device_data(),
+        decoder_scratch.qkv.device_data(),
+        decoder_scratch.gate_projection.device_data(),
+        decoder_scratch.hidden.device_data(),
+        decoder_attention.query.device_data(),
+        impl_->attention_driver->decoder_output(),
+    };
     return modalities::Status::ok();
 }
 

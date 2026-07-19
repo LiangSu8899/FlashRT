@@ -105,6 +105,7 @@ using Pi05QkvRopePrimitive = modalities::Status (*)(
     void* state,
     const void* qkv,
     const Pi05ResolvedBuffer& rope,
+    const Pi05ResolvedBuffer* position,
     void* query,
     void* key,
     void* value,
@@ -113,6 +114,31 @@ using Pi05QkvRopePrimitive = modalities::Status (*)(
     int key_width,
     int value_width,
     int head_width,
+    Pi05Stream stream);
+using Pi05AdaptiveNormalizePrimitive = modalities::Status (*)(
+    void* state,
+    void* residual,
+    const void* update,
+    const void* update_gate,
+    const Pi05ResolvedBuffer& weight,
+    const void* style,
+    void* normalized,
+    void* gate,
+    Pi05LinearWeightKey key,
+    int step,
+    int rows,
+    int columns,
+    float epsilon,
+    bool quantize,
+    const void** linear_input,
+    bool* prequantized,
+    Pi05Stream stream);
+using Pi05ResidualUpdatePrimitive = modalities::Status (*)(
+    void* state,
+    void* residual,
+    const void* update,
+    const void* gate,
+    std::size_t elements,
     Pi05Stream stream);
 using Pi05AttentionPrimitive = modalities::Status (*)(
     void* state,
@@ -185,6 +211,8 @@ struct Pi05PrimitiveSet final {
     Pi05QkvSplitPrimitive qkv_split = nullptr;
     Pi05NormalizeForLinearPrimitive normalize_for_linear = nullptr;
     Pi05QkvRopePrimitive qkv_rope = nullptr;
+    Pi05AdaptiveNormalizePrimitive adaptive_normalize = nullptr;
+    Pi05ResidualUpdatePrimitive residual_update = nullptr;
     Pi05AttentionPrimitive attention = nullptr;
     Pi05GateUpPrimitive gate_up = nullptr;
     Pi05GatedActivationPrimitive gated_activation = nullptr;
@@ -236,13 +264,25 @@ struct Pi05EncoderExecution final {
     const void* pending_update = nullptr;
 };
 
+struct Pi05DecoderExecution final {
+    Pi05ResolvedBuffer rms_weight;
+    void* normalized = nullptr;
+    void* gate = nullptr;
+    void* qkv = nullptr;
+    void* gate_projection = nullptr;
+    void* hidden = nullptr;
+    void* query = nullptr;
+    void* attention_output = nullptr;
+    const void* pending_update = nullptr;
+    const void* pending_gate = nullptr;
+};
+
 struct Pi05ForwardExecution final : Pi05OperationSink {
     const Pi05ResolvedResources* resources = nullptr;
     const Pi05FrontendOps* ops = nullptr;
     Pi05VisionExecution vision;
     Pi05EncoderExecution encoder;
-    Pi05OperationSink* fallback = nullptr;
-
+    Pi05DecoderExecution decoder;
     modalities::Status record(const Pi05OperationCall& call,
                               const Pi05ResolvedShape& shape,
                               Pi05Stream stream) override;

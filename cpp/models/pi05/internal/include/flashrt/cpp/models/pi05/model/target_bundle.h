@@ -9,12 +9,12 @@ namespace pi05 {
 
 struct Pi05ForwardExecution;
 
-class Pi05TargetBundle : public Pi05OperationSink {
+class Pi05TargetBundle {
 public:
     Pi05TargetBundle(frt_ctx context, bool warmup_before_capture)
         : context_(context),
           warmup_before_capture_(warmup_before_capture) {}
-    ~Pi05TargetBundle() override = default;
+    virtual ~Pi05TargetBundle() = default;
 
     Pi05TargetBundle(const Pi05TargetBundle&) = delete;
     Pi05TargetBundle& operator=(const Pi05TargetBundle&) = delete;

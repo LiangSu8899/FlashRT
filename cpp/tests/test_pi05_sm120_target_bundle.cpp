@@ -206,6 +206,8 @@ int main() {
     assert(target->finalize_setup().ok_status());
     assert(target->autotuned_shape_count() == (fp8 ? 13u : 0u));
     assert(!target->finalize_setup().ok_status());
+    Pi05ForwardExecution forward;
+    assert(target->make_forward_execution(&forward).ok_status());
 
     assert(target->set_prompt_length(0).ok_status());
     assert(target->set_prompt_length(runtime_shape.max_prompt_tokens)
@@ -222,8 +224,8 @@ int main() {
     assert(!target->initialize_capture_inputs().ok_status());
     assert(target->ready_for_capture());
     assert(target->reset_after_warmup().ok_status());
-    assert(pipeline.record_context(*target).ok_status());
-    assert(pipeline.record_decode(*target).ok_status());
+    assert(pipeline.record_context(forward).ok_status());
+    assert(pipeline.record_decode(forward).ok_status());
     assert(cudaDeviceSynchronize() == cudaSuccess);
 
     target.reset();

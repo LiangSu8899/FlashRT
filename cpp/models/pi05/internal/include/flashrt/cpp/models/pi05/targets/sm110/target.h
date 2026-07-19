@@ -51,10 +51,6 @@ public:
     modalities::Status initialize_capture_inputs() override;
     modalities::Status reset_after_warmup() override;
     modalities::Status set_prompt_length(int prompt_tokens) override;
-    modalities::Status record(const Pi05OperationCall& call,
-                              const Pi05ResolvedShape& shape,
-                              Pi05Stream stream) override;
-
     const Pi05ResolvedResources* resolved_resources() const;
     const Pi05NativeSupportBuffers* support_buffers() const;
     const Sm110PhysicalResources* physical_resources() const;

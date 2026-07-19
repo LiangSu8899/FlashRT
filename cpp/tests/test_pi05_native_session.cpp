@@ -9,7 +9,6 @@
 #include <cstddef>
 #include <cstdlib>
 #include <iostream>
-#include <limits>
 #include <memory>
 #include <vector>
 
@@ -57,23 +56,12 @@ enum class LifecycleStep {
 
 struct Probe final {
     std::vector<LifecycleStep> lifecycle;
-    std::size_t record_calls = 0;
-    std::size_t default_stream_calls = 0;
-    std::size_t capture_stream_calls = 0;
-    std::size_t fail_record_at = std::numeric_limits<std::size_t>::max();
     bool fail_frontend_primitive = false;
     std::size_t layer0_pending_updates = 0;
     int prompt_length = -1;
     bool target_destroyed = false;
     bool context_alive_at_target_destroy = false;
 };
-
-constexpr std::size_t kDecodeTargetOperations = 390;
-constexpr std::size_t kContextTargetOperations = 0;
-constexpr std::size_t kInferTargetOperations = kDecodeTargetOperations;
-constexpr std::size_t kCapturedTargetOperations =
-    kInferTargetOperations + kDecodeTargetOperations +
-    kContextTargetOperations;
 
 modalities::Status injected(const char* message) {
     return modalities::Status::error(modalities::StatusCode::kBackend,
@@ -150,8 +138,25 @@ modalities::Status noop_normalize(
 }
 
 modalities::Status noop_qkv_rope(
-    void*, const void*, const pi05::Pi05ResolvedBuffer&, void*, void*, void*,
-    int, int, int, int, int, pi05::Pi05Stream) {
+    void*, const void*, const pi05::Pi05ResolvedBuffer&,
+    const pi05::Pi05ResolvedBuffer*, void*, void*, void*, int, int, int, int,
+    int, pi05::Pi05Stream) {
+    return modalities::Status::ok();
+}
+
+modalities::Status noop_adaptive_normalize(
+    void*, void*, const void*, const void*, const pi05::Pi05ResolvedBuffer&,
+    const void*, void* normalized, void*, pi05::Pi05LinearWeightKey, int,
+    int, int, float, bool, const void** linear_input, bool* prequantized,
+    pi05::Pi05Stream) {
+    if (linear_input) *linear_input = normalized;
+    if (prequantized) *prequantized = false;
+    return modalities::Status::ok();
+}
+
+modalities::Status noop_residual_update(
+    void*, void*, const void*, const void*, std::size_t,
+    pi05::Pi05Stream) {
     return modalities::Status::ok();
 }
 
@@ -198,6 +203,8 @@ pi05::Pi05PrimitiveSet fake_primitives(Probe* probe) {
     result.qkv_split = noop_qkv_split;
     result.normalize_for_linear = noop_normalize;
     result.qkv_rope = noop_qkv_rope;
+    result.adaptive_normalize = noop_adaptive_normalize;
+    result.residual_update = noop_residual_update;
     result.attention = noop_attention;
     result.gate_up = noop_gate_up;
     result.gated_activation = noop_gated_activation;
@@ -299,7 +306,8 @@ public:
                        data, data, data, data};
         out->encoder = {resources_.buffers.images, data, data, data,
                         data, data, data};
-        out->fallback = this;
+        out->decoder = {resources_.buffers.images, data, data, data,
+                        data, data, data, data};
         return modalities::Status::ok();
     }
 
@@ -326,30 +334,6 @@ public:
         }
         probe_->prompt_length = prompt_tokens;
         return modalities::Status::ok();
-    }
-
-    modalities::Status record(
-        const pi05::Pi05OperationCall& call,
-        const pi05::Pi05ResolvedShape& shape,
-        pi05::Pi05Stream stream) override {
-        modalities::Status status =
-            pi05::validate_pi05_operation_call(call, shape);
-        if (!status.ok_status()) return status;
-        const std::size_t index = probe_->record_calls++;
-        if (stream) {
-            ++probe_->capture_stream_calls;
-        } else {
-            ++probe_->default_stream_calls;
-        }
-        if (index == probe_->fail_record_at) {
-            return injected("injected operation record failure");
-        }
-        const cudaError_t result = cudaMemsetAsync(
-            frt_buffer_dptr(anchor_), static_cast<int>(call.id) + 1, 1,
-            reinterpret_cast<cudaStream_t>(stream));
-        return result == cudaSuccess
-                   ? modalities::Status::ok()
-                   : injected(cudaGetErrorString(result));
     }
 
 private:
@@ -411,9 +395,6 @@ void test_success_without_warmup() {
         LifecycleStep::kFinalize,
         LifecycleStep::kForwardExecution,
         LifecycleStep::kCaptureInputs}));
-    CHECK(probe.record_calls == kCapturedTargetOperations);
-    CHECK(probe.default_stream_calls == 0);
-    CHECK(probe.capture_stream_calls == kCapturedTargetOperations);
     CHECK(probe.layer0_pending_updates == 0);
     check_graphs(*session);
 
@@ -451,10 +432,6 @@ void test_success_with_warmup() {
         LifecycleStep::kForwardExecution,
         LifecycleStep::kCaptureInputs,
         LifecycleStep::kReset}));
-    CHECK(probe.record_calls ==
-          kInferTargetOperations + kCapturedTargetOperations);
-    CHECK(probe.default_stream_calls == kInferTargetOperations);
-    CHECK(probe.capture_stream_calls == kCapturedTargetOperations);
     CHECK(probe.layer0_pending_updates == 0);
     check_graphs(*session);
     session.reset();
@@ -464,10 +441,8 @@ void test_success_with_warmup() {
 
 void expect_create_failure(
     bool warmup,
-    FailPoint fail_point,
-    std::size_t fail_record_at = std::numeric_limits<std::size_t>::max()) {
+    FailPoint fail_point) {
     Probe probe;
-    probe.fail_record_at = fail_record_at;
     modalities::Status status;
     std::unique_ptr<pi05::Pi05NativeSession> session =
         create_session(warmup, fail_point, &probe, &status);
@@ -475,9 +450,6 @@ void expect_create_failure(
     CHECK(!status.ok_status());
     CHECK(probe.target_destroyed);
     CHECK(probe.context_alive_at_target_destroy);
-    if (fail_record_at != std::numeric_limits<std::size_t>::max()) {
-        CHECK(probe.record_calls == fail_record_at + 1);
-    }
     switch (fail_point) {
         case FailPoint::kInitialize:
             CHECK(probe.lifecycle.back() == LifecycleStep::kInitialize);
@@ -519,20 +491,16 @@ void test_failure_matrix() {
     expect_create_failure(false, FailPoint::kFinalize);
     expect_create_failure(false, FailPoint::kForwardExecution);
     expect_create_failure(false, FailPoint::kCaptureInputs);
-    expect_create_failure(true, FailPoint::kNone, 11);
     expect_create_failure(true, FailPoint::kReset);
-    expect_create_failure(false, FailPoint::kNone, 11);
-    expect_create_failure(
-        false, FailPoint::kNone, kInferTargetOperations + 11);
-
-    Probe primitive_probe;
-    primitive_probe.fail_frontend_primitive = true;
-    modalities::Status primitive_status;
-    CHECK(create_session(false, FailPoint::kNone,
-                         &primitive_probe, &primitive_status) == nullptr);
-    CHECK(!primitive_status.ok_status());
-    CHECK(primitive_probe.record_calls == 0);
-    CHECK(primitive_probe.target_destroyed);
+    for (bool warmup : {false, true}) {
+        Probe primitive_probe;
+        primitive_probe.fail_frontend_primitive = true;
+        modalities::Status primitive_status;
+        CHECK(create_session(warmup, FailPoint::kNone,
+                             &primitive_probe, &primitive_status) == nullptr);
+        CHECK(!primitive_status.ok_status());
+        CHECK(primitive_probe.target_destroyed);
+    }
 
     pi05::Pi05ResolvedShape invalid_shape = fixture::canonical_shape();
     invalid_shape.chunk = 0;

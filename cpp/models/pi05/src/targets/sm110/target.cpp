@@ -401,19 +401,6 @@ modalities::Status Sm110TargetBundle::reset_after_warmup() {
     return unsupported("SM110 operation composition is not connected");
 }
 
-modalities::Status Sm110TargetBundle::record(
-    const Pi05OperationCall& call,
-    const Pi05ResolvedShape& shape,
-    Pi05Stream stream) {
-    if (!impl_ || !pi05_resolved_shape_equal(shape, impl_->shape)) {
-        return invalid("SM110 target operation shape is invalid");
-    }
-    modalities::Status status = validate_pi05_operation_call(call, shape);
-    if (!status.ok_status()) return status;
-    (void)stream;
-    return unsupported("SM110 forward operation is not connected");
-}
-
 modalities::Status Sm110TargetBundle::set_prompt_length(
     int prompt_tokens) {
     if (!impl_ || !impl_->resources_available() ||
