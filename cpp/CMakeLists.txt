@@ -627,7 +627,8 @@ if(BUILD_TESTING)
     add_executable(test_pi05_sm110_target_resources
       tests/test_pi05_sm110_target_resources.cpp)
     target_link_libraries(test_pi05_sm110_target_resources PRIVATE
-      flashrt_cpp_pi05_target_sm110 flashrt_exec CUDA::cudart)
+      flashrt_cpp_pi05_target_sm110 flashrt_cpp_pi05_capture
+      flashrt_exec CUDA::cudart)
     add_test(NAME pi05_sm110_target_resources
       COMMAND test_pi05_sm110_target_resources)
   endif()

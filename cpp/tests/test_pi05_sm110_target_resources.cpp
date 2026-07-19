@@ -1,4 +1,5 @@
 #include "flashrt/cpp/models/pi05/model/linear_weight_groups.h"
+#include "flashrt/cpp/models/pi05/model/native_session.h"
 #include "flashrt/cpp/models/pi05/support/native_calibration.h"
 #include "flashrt/cpp/models/pi05/targets/sm110/fp8_weight_packer.h"
 #include "flashrt/cpp/models/pi05/targets/sm110/physical_resources.h"
@@ -188,6 +189,57 @@ void run_real_resource_contract(const char* checkpoint,
     frt_ctx_destroy(context);
 }
 
+void run_real_session_contract(const char* checkpoint,
+                               const char* calibration) {
+    using namespace flashrt::models::pi05;
+    using namespace flashrt::models::pi05::targets::sm110;
+
+    NativeCalibrationArtifact artifact;
+    assert(load_native_calibration_artifact(calibration, &artifact)
+               .ok_status());
+    const Pi05ResolvedShape shape = shape_from(artifact);
+    Sm110TargetConfig config;
+    config.checkpoint_path = checkpoint;
+    config.calibration = std::move(artifact);
+    frt_ctx context = frt_ctx_create();
+    assert(context);
+    flashrt::modalities::Status status;
+    std::unique_ptr<Sm110TargetBundle> concrete =
+        Sm110TargetBundle::create(
+            context, shape, std::move(config), &status);
+    assert(concrete && status.ok_status());
+    std::unique_ptr<Pi05TargetBundle> target(std::move(concrete));
+    std::unique_ptr<Pi05NativeSession> session = Pi05NativeSession::create(
+        context, shape, std::move(target), &status);
+    if (!session || !status.ok_status()) {
+        std::fprintf(stderr, "%s\n", status.message.c_str());
+        assert(false);
+    }
+    assert(session->set_prompt_length(2).ok_status());
+    const Pi05ResolvedBuffers& buffers = session->resources().buffers;
+    const Pi05ResolvedBuffer* inputs[] = {
+        &buffers.images, &buffers.prompt_embedding, &buffers.noise};
+    for (const Pi05ResolvedBuffer* input : inputs) {
+        assert(input->buffer);
+        assert(cudaMemset(frt_buffer_dptr(input->buffer), 0,
+                          input->physical_bytes) == cudaSuccess);
+    }
+    assert(session->replay(Pi05GraphId::kInfer) == FRT_OK);
+    assert(session->synchronize().ok_status());
+    std::vector<unsigned char> full(buffers.noise.physical_bytes);
+    assert(cudaMemcpy(full.data(), frt_buffer_dptr(buffers.noise.buffer),
+                      full.size(), cudaMemcpyDeviceToHost) == cudaSuccess);
+    assert(cudaMemset(frt_buffer_dptr(buffers.noise.buffer), 0,
+                      buffers.noise.physical_bytes) == cudaSuccess);
+    assert(session->replay(Pi05GraphId::kContext) == FRT_OK);
+    assert(session->replay(Pi05GraphId::kDecodeOnly) == FRT_OK);
+    assert(session->synchronize().ok_status());
+    std::vector<unsigned char> split(buffers.noise.physical_bytes);
+    assert(cudaMemcpy(split.data(), frt_buffer_dptr(buffers.noise.buffer),
+                      split.size(), cudaMemcpyDeviceToHost) == cudaSuccess);
+    assert(full == split);
+}
+
 }  // namespace
 
 int main() {
@@ -249,7 +301,7 @@ int main() {
     }
 
     run_real_resource_contract(checkpoint, calibration);
-    run_real_resource_contract(checkpoint, calibration);
+    run_real_session_contract(checkpoint, calibration);
     std::printf("PASS - PI0.5 SM110 target resource contract\n");
     return 0;
 }
