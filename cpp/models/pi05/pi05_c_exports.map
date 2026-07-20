@@ -1,0 +1,25 @@
+{
+  global:
+    frt_model_runtime_open_v1;
+    frt_pi05_calibration_create_last_error_v1;
+    frt_pi05_calibration_create_v1;
+    frt_pi05_calibration_destroy_v1;
+    frt_pi05_calibration_finalize_v1;
+    frt_pi05_calibration_last_error_v1;
+    frt_pi05_calibration_observe_v1;
+    frt_pi05_calibration_sample_count_v1;
+    frt_pi05_model_runtime_create;
+    frt_pi05_model_runtime_create_over;
+    frt_pi05_native_open_last_error;
+    frt_pi05_runtime_create;
+    frt_pi05_runtime_destroy;
+    frt_pi05_runtime_export;
+    frt_pi05_runtime_last_error;
+    frt_pi05_runtime_prepare_vision;
+    frt_pi05_runtime_read_actions;
+    frt_pi05_runtime_replay_tick;
+    frt_pi05_runtime_set_prompt;
+    frt_pi05_runtime_set_prompt_state;
+  local:
+    *;
+};

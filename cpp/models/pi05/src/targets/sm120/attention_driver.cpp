@@ -1,8 +1,8 @@
 #include "flashrt/cpp/models/pi05/targets/sm120/attention_driver.h"
 
 #include "attention/fa2_wrapper.h"
-#include "elementwise.cuh"
 #include "flashrt/cpp/models/pi05/model/dims.h"
+#include "flashrt/native_cpp/operations.h"
 
 #include <cuda_runtime_api.h>
 
@@ -140,7 +140,7 @@ modalities::Status Sm120AttentionDriver::decoder(
     const Sm120AttentionControlBuffers& controls = backing_->controls();
     const std::size_t accumulator_count =
         buffers.logsumexp_accumulator.bytes() / sizeof(float);
-    fill_negative_infinity_f32(
+    flashrt_native_fill_negative_infinity_f32(
         static_cast<float*>(buffers.logsumexp_accumulator.device_data()),
         accumulator_count, reinterpret_cast<cudaStream_t>(stream));
     modalities::Status status = launch_status();

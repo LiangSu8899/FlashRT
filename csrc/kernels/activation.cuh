@@ -5,8 +5,6 @@
 // ================================================================
 #pragma once
 
-#include <cstddef>
-
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
@@ -18,9 +16,6 @@ void gate_silu_mul(const __nv_bfloat16* gate, const __nv_bfloat16* up,
                    __nv_bfloat16* out, int n, cudaStream_t stream = 0);
 
 void gelu_inplace(__nv_bfloat16* x, int n, cudaStream_t stream = 0);
-
-void silu_inplace_bf16(__nv_bfloat16* x, int n,
-                       cudaStream_t stream = 0);
 
 // G7.11 — fused (bias add + GELU(tanh)) in-place on bf16 tensor.
 // x: (M, N) bf16; bias: (N,) bf16 broadcast over rows. Replaces
@@ -47,11 +42,6 @@ void gate_silu_mul_fp16(const __half* gate, const __half* up,
                         __half* out, int n, cudaStream_t stream = 0);
 
 void gelu_inplace_fp16(__half* x, int n, cudaStream_t stream = 0);
-
-void silu_inplace_fp16(__half* x, int n, cudaStream_t stream = 0);
-
-extern "C" cudaError_t flashrt_silu_inplace_fp16_precise(
-    __half* values, std::size_t elements, cudaStream_t stream);
 
 void gate_silu_mul_merged_fp16(const __half* merged, __half* out,
                                 int seq, int half_dim, cudaStream_t stream = 0);

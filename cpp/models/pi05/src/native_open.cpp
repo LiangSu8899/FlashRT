@@ -1,4 +1,4 @@
-#include "flashrt/model_runtime.h"
+#include "flashrt/cpp/models/pi05/model_runtime.h"
 #include "flashrt/cpp/loader/safetensors.h"
 #include "flashrt/cpp/models/pi05/model/execution_plan.h"
 #include "flashrt/cpp/models/pi05/support/native_weights.h"

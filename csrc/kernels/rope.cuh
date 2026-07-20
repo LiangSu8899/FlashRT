@@ -8,11 +8,6 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
-void generate_rope_table_f16(__half* output, int start_position,
-                             int positions, int frequencies,
-                             float theta,
-                             cudaStream_t stream = 0);
-
 // RoPE: apply rotary position embeddings to Q and K
 void rope_apply(const __nv_bfloat16* rope_weights,
                 __nv_bfloat16* Q, __nv_bfloat16* K,

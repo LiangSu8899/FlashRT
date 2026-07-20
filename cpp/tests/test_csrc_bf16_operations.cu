@@ -1,5 +1,4 @@
-#include "activation.cuh"
-#include "elementwise.cuh"
+#include "flashrt/native_cpp/operations.h"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime_api.h>
@@ -59,7 +58,7 @@ bool test_silu() {
         return false;
     }
 
-    silu_inplace_bf16(actual, kCount);
+    flashrt_native_silu_inplace_bf16(actual, kCount);
     reference_silu_bf16<<<1, 256>>>(expected, kCount);
     if (!check_cuda(cudaGetLastError(), "SiLU launches") ||
         !check_cuda(cudaDeviceSynchronize(), "SiLU synchronize")) {
@@ -88,8 +87,8 @@ bool test_negative_infinity() {
                     "cudaMalloc(negative infinity)")) {
         return false;
     }
-    fill_negative_infinity_f32(nullptr, 0);
-    fill_negative_infinity_f32(values, kCount);
+    flashrt_native_fill_negative_infinity_f32(nullptr, 0);
+    flashrt_native_fill_negative_infinity_f32(values, kCount);
     if (!check_cuda(cudaGetLastError(), "negative infinity launch") ||
         !check_cuda(cudaDeviceSynchronize(),
                     "negative infinity synchronize")) {

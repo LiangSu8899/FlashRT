@@ -1,7 +1,4 @@
 #include "gemm_runner.h"
-
-#include <cstdlib>
-#include <cstring>
 #include <iostream>
 #include <vector>
 
@@ -146,11 +143,6 @@ void GemmRunner::autotune_cached(CachedGemm& entry, void* A, void* B, void* D,
             CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &d_scale_a, sizeof(d_scale_a)));
         CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(entry.matmul_desc,
             CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &d_scale_b, sizeof(d_scale_b)));
-    }
-    const char* disable_autotune =
-        std::getenv("FLASHRT_DISABLE_GEMM_AUTOTUNE");
-    if (disable_autotune && std::strcmp(disable_autotune, "1") == 0) {
-        return;
     }
 
     auto C_layout = entry.has_C_desc ? entry.C_desc : entry.D_desc;

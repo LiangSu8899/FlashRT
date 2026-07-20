@@ -22,14 +22,26 @@ include(CTest)
 option(FLASHRT_CPP_WITH_EXEC "Build/link the exec layer for native replay" ON)
 option(FLASHRT_CPP_WITH_CUDA_STAGING "Enable conservative CUDA H2D/D2H modality staging" ON)
 option(FLASHRT_CPP_WITH_CUDA_KERNELS "Enable CUDA modality kernels" ON)
+option(FLASHRT_ENABLE_NATIVE_CPP
+       "Build opt-in native C++ operation and model extensions" OFF)
 option(FLASHRT_CPP_WITH_SENTENCEPIECE
        "Enable native SentencePiece text tokenization" OFF)
-option(FLASHRT_CPP_WITH_FA2
-       "Enable the Python-free vendored FA2 operation library" OFF)
 option(FLASHRT_CPP_WITH_PI05_SM120_TARGET
        "Build the PI0.5 SM120 frontend target" OFF)
 option(FLASHRT_CPP_WITH_PI05_SM110_TARGET
        "Build the PI0.5 SM110 frontend target" OFF)
+if((FLASHRT_CPP_WITH_PI05_SM120_TARGET OR
+    FLASHRT_CPP_WITH_PI05_SM110_TARGET OR
+    FLASHRT_CPP_WITH_SENTENCEPIECE) AND
+   NOT FLASHRT_ENABLE_NATIVE_CPP)
+  message(FATAL_ERROR
+    "Native tokenizer and PI0.5 targets require "
+    "FLASHRT_ENABLE_NATIVE_CPP=ON")
+endif()
+if(FLASHRT_ENABLE_NATIVE_CPP AND NOT FLASHRT_CPP_WITH_EXEC)
+  message(FATAL_ERROR
+    "FLASHRT_ENABLE_NATIVE_CPP requires FLASHRT_CPP_WITH_EXEC=ON")
+endif()
 if(FLASHRT_CPP_WITH_PI05_SM120_TARGET AND
    FLASHRT_CPP_WITH_PI05_SM110_TARGET)
   message(FATAL_ERROR
@@ -52,47 +64,11 @@ endif()
 if(FLASHRT_CPP_WITH_CUDA_KERNELS)
   enable_language(CUDA)
   find_package(CUDAToolkit REQUIRED)
-
-  add_library(flashrt_cpp_csrc_precise_math STATIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/../csrc/kernels/rope_table.cu)
-  target_include_directories(flashrt_cpp_csrc_precise_math PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/../csrc/kernels)
-  target_link_libraries(flashrt_cpp_csrc_precise_math PUBLIC CUDA::cudart)
-  target_compile_options(flashrt_cpp_csrc_precise_math PRIVATE
-    $<$<COMPILE_LANGUAGE:CUDA>:-O3>)
-  set_target_properties(flashrt_cpp_csrc_precise_math PROPERTIES
-    CUDA_STANDARD 17
-    CUDA_STANDARD_REQUIRED ON)
-  if(FLASHRT_CPP_PI05_CUDA_ARCH)
-    set_target_properties(flashrt_cpp_csrc_precise_math PROPERTIES
-      CUDA_ARCHITECTURES ${FLASHRT_CPP_PI05_CUDA_ARCH})
-  endif()
-endif()
-if(FLASHRT_CPP_WITH_FA2)
-  if(NOT FLASHRT_CPP_WITH_CUDA_KERNELS)
-    message(FATAL_ERROR
-      "FLASHRT_CPP_WITH_FA2 requires FLASHRT_CPP_WITH_CUDA_KERNELS")
-  endif()
-  if(NOT FLASHRT_CPP_FA2_LIBRARY)
-    find_library(FLASHRT_CPP_FA2_LIBRARY
-      NAMES flashrt_fa2_raw
-      PATHS ${CMAKE_CURRENT_SOURCE_DIR}/../flash_rt
-      NO_DEFAULT_PATH)
-  endif()
-  if(NOT FLASHRT_CPP_FA2_LIBRARY OR
-     NOT EXISTS "${FLASHRT_CPP_FA2_LIBRARY}")
-    message(FATAL_ERROR
-      "FLASHRT_CPP_WITH_FA2 requires libflashrt_fa2_raw; build the root "
-      "flashrt_fa2_raw target or set FLASHRT_CPP_FA2_LIBRARY")
-  endif()
-  add_library(flashrt_cpp_fa2_external SHARED IMPORTED GLOBAL)
-  set_target_properties(flashrt_cpp_fa2_external PROPERTIES
-    IMPORTED_LOCATION ${FLASHRT_CPP_FA2_LIBRARY})
 endif()
 if(FLASHRT_CPP_WITH_PI05_SM120_TARGET)
-  if(NOT FLASHRT_CPP_WITH_FA2)
+  if(NOT FLASHRT_CPP_WITH_CUDA_KERNELS)
     message(FATAL_ERROR
-      "FLASHRT_CPP_WITH_PI05_SM120_TARGET requires FLASHRT_CPP_WITH_FA2")
+      "FLASHRT_CPP_WITH_PI05_SM120_TARGET requires CUDA kernels")
   endif()
   if(NOT FLASHRT_CPP_WITH_CUDA_STAGING)
     message(FATAL_ERROR
@@ -101,6 +77,25 @@ if(FLASHRT_CPP_WITH_PI05_SM120_TARGET)
   if(NOT FLASHRT_CPP_WITH_EXEC)
     message(FATAL_ERROR
       "FLASHRT_CPP_WITH_PI05_SM120_TARGET requires the exec layer")
+  endif()
+  if(TARGET flashrt_fa2_raw)
+    add_library(flashrt_cpp_fa2_external ALIAS flashrt_fa2_raw)
+  else()
+    if(NOT FLASHRT_CPP_FA2_LIBRARY)
+      find_library(FLASHRT_CPP_FA2_LIBRARY
+        NAMES flashrt_fa2_raw
+        PATHS ${CMAKE_CURRENT_SOURCE_DIR}/../flash_rt
+        NO_DEFAULT_PATH)
+    endif()
+    if(NOT FLASHRT_CPP_FA2_LIBRARY OR
+       NOT EXISTS "${FLASHRT_CPP_FA2_LIBRARY}")
+      message(FATAL_ERROR
+        "The PI0.5 SM120 target requires the opt-in FA2 native C library; "
+        "build flashrt_fa2_raw or set FLASHRT_CPP_FA2_LIBRARY")
+    endif()
+    add_library(flashrt_cpp_fa2_external SHARED IMPORTED GLOBAL)
+    set_target_properties(flashrt_cpp_fa2_external PROPERTIES
+      IMPORTED_LOCATION ${FLASHRT_CPP_FA2_LIBRARY})
   endif()
 endif()
 if(FLASHRT_CPP_WITH_PI05_SM110_TARGET)
@@ -168,19 +163,22 @@ endif()
 set(FLASHRT_CPP_MODALITY_SRCS
   modalities/src/types.cpp
   modalities/src/vision_cpu.cpp
-  modalities/src/text_cpu.cpp
   modalities/src/action_cpu.cpp)
-if(FLASHRT_CPP_WITH_SENTENCEPIECE)
-  list(APPEND FLASHRT_CPP_MODALITY_SRCS
-    modalities/src/sentencepiece_tokenizer.cpp)
-else()
-  list(APPEND FLASHRT_CPP_MODALITY_SRCS
-    modalities/src/tokenizer_unavailable.cpp)
+if(FLASHRT_ENABLE_NATIVE_CPP)
+  list(APPEND FLASHRT_CPP_MODALITY_SRCS modalities/src/text_cpu.cpp)
+  if(FLASHRT_CPP_WITH_SENTENCEPIECE)
+    list(APPEND FLASHRT_CPP_MODALITY_SRCS
+      modalities/src/sentencepiece_tokenizer.cpp)
+  else()
+    list(APPEND FLASHRT_CPP_MODALITY_SRCS
+      modalities/src/tokenizer_unavailable.cpp)
+  endif()
 endif()
 if(FLASHRT_CPP_WITH_CUDA_KERNELS)
-  list(APPEND FLASHRT_CPP_MODALITY_SRCS
-    modalities/src/vision_cuda.cu
-    modalities/src/text_cuda.cu)
+  list(APPEND FLASHRT_CPP_MODALITY_SRCS modalities/src/vision_cuda.cu)
+  if(FLASHRT_ENABLE_NATIVE_CPP)
+    list(APPEND FLASHRT_CPP_MODALITY_SRCS modalities/src/text_cuda.cu)
+  endif()
 endif()
 
 add_library(flashrt_cpp_modalities STATIC ${FLASHRT_CPP_MODALITY_SRCS})
@@ -222,21 +220,24 @@ target_include_directories(flashrt_cpp_vla
 target_link_libraries(flashrt_cpp_vla
   INTERFACE flashrt_cpp_modalities flashrt_cpp)
 
-add_library(flashrt_cpp_native STATIC
-  native/src/config_object.cpp)
-target_include_directories(flashrt_cpp_native
-  PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/native/include)
-
-if(FLASHRT_CPP_WITH_CUDA_KERNELS AND FLASHRT_CPP_WITH_EXEC)
-  add_library(flashrt_cpp_native_cuda STATIC
-    native/src/cuda_graph_set.cpp)
-  target_include_directories(flashrt_cpp_native_cuda
+if(FLASHRT_ENABLE_NATIVE_CPP)
+  add_library(flashrt_cpp_native STATIC
+    native/src/config_object.cpp)
+  target_include_directories(flashrt_cpp_native
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/native/include)
-  target_link_libraries(flashrt_cpp_native_cuda
-    PUBLIC flashrt_cpp_modalities flashrt_exec CUDA::cudart)
+
+  if(FLASHRT_CPP_WITH_CUDA_KERNELS AND FLASHRT_CPP_WITH_EXEC)
+    add_library(flashrt_cpp_native_cuda STATIC
+      native/src/cuda_graph_set.cpp)
+    target_include_directories(flashrt_cpp_native_cuda
+      PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/native/include)
+    target_link_libraries(flashrt_cpp_native_cuda
+      PUBLIC flashrt_cpp_modalities flashrt_exec CUDA::cudart)
+  endif()
 endif()
 
-if(FLASHRT_CPP_WITH_FA2 OR FLASHRT_CPP_WITH_PI05_SM110_TARGET)
+if(FLASHRT_CPP_WITH_PI05_SM120_TARGET OR
+   FLASHRT_CPP_WITH_PI05_SM110_TARGET)
   set(_flashrt_csrc_dir "${CMAKE_CURRENT_SOURCE_DIR}/../csrc")
 
   function(_flashrt_configure_csrc_target target)
@@ -260,6 +261,20 @@ if(FLASHRT_CPP_WITH_FA2 OR FLASHRT_CPP_WITH_PI05_SM110_TARGET)
     endif()
   endfunction()
 
+  add_library(flashrt_native_cpp_cuda_support STATIC
+    ${_flashrt_csrc_dir}/native_cpp/operations.cu
+    ${_flashrt_csrc_dir}/native_cpp/fp8_quantize.cu
+    ${_flashrt_csrc_dir}/native_cpp/layer_norm.cu
+    ${_flashrt_csrc_dir}/native_cpp/attention_seqused.cu)
+  _flashrt_configure_csrc_target(flashrt_native_cpp_cuda_support)
+  target_include_directories(flashrt_native_cpp_cuda_support
+    PUBLIC ${_flashrt_csrc_dir}/native_cpp/include
+    PRIVATE ${_flashrt_csrc_dir}/native_cpp)
+  set_target_properties(flashrt_native_cpp_cuda_support PROPERTIES
+    CXX_VISIBILITY_PRESET hidden
+    CUDA_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN YES)
+
   add_library(flashrt_cpp_csrc_core STATIC
     ${_flashrt_csrc_dir}/gemm/gemm_runner.cu
     ${_flashrt_csrc_dir}/kernels/activation.cu
@@ -269,10 +284,8 @@ if(FLASHRT_CPP_WITH_FA2 OR FLASHRT_CPP_WITH_PI05_SM110_TARGET)
     ${_flashrt_csrc_dir}/kernels/quantize.cu
     ${_flashrt_csrc_dir}/kernels/rope.cu)
   _flashrt_configure_csrc_target(flashrt_cpp_csrc_core)
-  target_link_libraries(flashrt_cpp_csrc_core PUBLIC
-    flashrt_cpp_csrc_precise_math)
 
-  if(FLASHRT_CPP_WITH_FA2)
+  if(FLASHRT_CPP_WITH_PI05_SM120_TARGET)
     add_library(flashrt_cpp_csrc_sm120 STATIC
       ${_flashrt_csrc_dir}/kernels/dit_bf16.cu
       ${_flashrt_csrc_dir}/kernels/fusion.cu)
@@ -283,8 +296,7 @@ if(FLASHRT_CPP_WITH_FA2 OR FLASHRT_CPP_WITH_PI05_SM110_TARGET)
 
   if(FLASHRT_CPP_WITH_PI05_SM110_TARGET)
     add_library(flashrt_cpp_csrc_sm110_precise OBJECT
-      ${_flashrt_csrc_dir}/attention/fmha_fp16_strided.cu
-      ${_flashrt_csrc_dir}/kernels/silu_precise.cu)
+      ${_flashrt_csrc_dir}/attention/fmha_fp16_strided.cu)
     target_include_directories(flashrt_cpp_csrc_sm110_precise PRIVATE
       ${_flashrt_csrc_dir}/attention
       ${FLASHRT_CPP_CUTLASS_DIR}/examples/77_blackwell_fmha
@@ -320,80 +332,86 @@ if(FLASHRT_CPP_WITH_FA2 OR FLASHRT_CPP_WITH_PI05_SM110_TARGET)
   endif()
 endif()
 
-add_library(flashrt_cpp_loader STATIC
-  loader/src/safetensors.cpp
-  loader/src/sha256.cpp)
-set_property(SOURCE loader/src/sha256.cpp APPEND PROPERTY COMPILE_OPTIONS -O2)
-target_include_directories(flashrt_cpp_loader
-  PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/loader/include)
-find_package(OpenSSL QUIET)
-if(OpenSSL_FOUND)
-  target_compile_definitions(flashrt_cpp_loader
-    PRIVATE FLASHRT_CPP_HAS_OPENSSL=1)
-  target_link_libraries(flashrt_cpp_loader PRIVATE OpenSSL::Crypto)
-endif()
-
-set(FLASHRT_CPP_PI05_SUPPORT_SRCS
-  models/pi05/src/support/native_rope_unavailable.cpp)
-if(FLASHRT_CPP_WITH_CUDA_KERNELS)
-  set(FLASHRT_CPP_PI05_SUPPORT_SRCS
-    models/pi05/src/support/native_rope.cu)
-endif()
-
-add_library(flashrt_cpp_pi05 STATIC
-  models/pi05/src/model/dims.cpp
-  models/pi05/src/model/execution_plan.cpp
-  models/pi05/src/model/linear_weight_groups.cpp
-  models/pi05/src/model/prompt_embed.cpp
-  models/pi05/src/model/prompt_format.cpp
-  models/pi05/src/model/resolved_resources.cpp
-  models/pi05/src/model/semantic_pipeline.cpp
-  models/pi05/src/support/native_calibration.cpp
-  models/pi05/src/support/native_device_weights.cpp
-  models/pi05/src/support/native_weight_materializer.cpp
-  models/pi05/src/support/native_resource_resolver.cpp
-  models/pi05/src/support/native_weight_ops.cpp
-  models/pi05/src/support/native_weights.cpp
-  models/pi05/src/support/native_workspace.cpp
-  ${FLASHRT_CPP_PI05_SUPPORT_SRCS}
-  models/pi05/src/spec.cpp
-  models/pi05/src/io.cpp
-  models/pi05/src/runtime.cpp)
-target_include_directories(flashrt_cpp_pi05
-  PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/include
-  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/internal/include)
-target_link_libraries(flashrt_cpp_pi05
-  PRIVATE flashrt_cpp_loader
-  PUBLIC flashrt_cpp_modalities flashrt_cpp_vla)
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  set_property(SOURCE models/pi05/src/support/native_weight_ops.cpp
-    APPEND PROPERTY COMPILE_OPTIONS -ffp-contract=off)
-endif()
-if(FLASHRT_CPP_WITH_CUDA_KERNELS)
-  target_compile_definitions(flashrt_cpp_pi05
-    PRIVATE FLASHRT_CPP_WITH_CUDA_KERNELS=1)
-  target_link_libraries(flashrt_cpp_pi05 PRIVATE
-    flashrt_cpp_csrc_precise_math CUDA::cudart)
-  set_target_properties(flashrt_cpp_pi05 PROPERTIES
-    CUDA_STANDARD 17
-    CUDA_STANDARD_REQUIRED ON)
-  if(FLASHRT_CPP_PI05_CUDA_ARCH)
-    set_target_properties(flashrt_cpp_pi05 PROPERTIES
-      CUDA_ARCHITECTURES ${FLASHRT_CPP_PI05_CUDA_ARCH})
+if(FLASHRT_ENABLE_NATIVE_CPP)
+  add_library(flashrt_cpp_loader STATIC
+    loader/src/safetensors.cpp
+    loader/src/sha256.cpp)
+  set_property(SOURCE loader/src/sha256.cpp APPEND PROPERTY COMPILE_OPTIONS -O2)
+  target_include_directories(flashrt_cpp_loader
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/loader/include)
+  find_package(OpenSSL QUIET)
+  if(OpenSSL_FOUND)
+    target_compile_definitions(flashrt_cpp_loader
+      PRIVATE FLASHRT_CPP_HAS_OPENSSL=1)
+    target_link_libraries(flashrt_cpp_loader PRIVATE OpenSSL::Crypto)
   endif()
 endif()
 
-if(TARGET flashrt_cpp_native_cuda)
-  add_library(flashrt_cpp_pi05_capture STATIC
-    models/pi05/src/model/captured_program.cpp
-    models/pi05/src/model/native_session.cpp)
-  target_include_directories(flashrt_cpp_pi05_capture
-    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/internal/include)
-  target_link_libraries(flashrt_cpp_pi05_capture
-    PUBLIC flashrt_cpp_pi05 flashrt_cpp_native_cuda CUDA::cudart)
-endif()
+if(FLASHRT_ENABLE_NATIVE_CPP)
+  set(FLASHRT_CPP_PI05_SUPPORT_SRCS
+    models/pi05/src/support/native_rope_unavailable.cpp)
+  if(FLASHRT_CPP_WITH_PI05_SM120_TARGET OR
+     FLASHRT_CPP_WITH_PI05_SM110_TARGET)
+    set(FLASHRT_CPP_PI05_SUPPORT_SRCS
+      models/pi05/src/support/native_rope.cu)
+  endif()
 
-if(FLASHRT_CPP_WITH_PI05_SM120_TARGET)
+  add_library(flashrt_cpp_pi05 STATIC
+    models/pi05/src/spec.cpp
+    models/pi05/src/io.cpp
+    models/pi05/src/runtime.cpp
+    models/pi05/src/model/dims.cpp
+    models/pi05/src/model/execution_plan.cpp
+    models/pi05/src/model/linear_weight_groups.cpp
+    models/pi05/src/model/prompt_embed.cpp
+    models/pi05/src/model/prompt_format.cpp
+    models/pi05/src/model/resolved_resources.cpp
+    models/pi05/src/model/semantic_pipeline.cpp
+    models/pi05/src/support/native_calibration.cpp
+    models/pi05/src/support/native_device_weights.cpp
+    models/pi05/src/support/native_weight_materializer.cpp
+    models/pi05/src/support/native_resource_resolver.cpp
+    models/pi05/src/support/native_weight_ops.cpp
+    models/pi05/src/support/native_weights.cpp
+    models/pi05/src/support/native_workspace.cpp
+    ${FLASHRT_CPP_PI05_SUPPORT_SRCS})
+  target_include_directories(flashrt_cpp_pi05
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/include
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/internal/include)
+  target_link_libraries(flashrt_cpp_pi05
+    PRIVATE flashrt_cpp_loader
+    PUBLIC flashrt_cpp_modalities flashrt_cpp_vla)
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    set_property(SOURCE models/pi05/src/support/native_weight_ops.cpp
+      APPEND PROPERTY COMPILE_OPTIONS -ffp-contract=off)
+  endif()
+  if(FLASHRT_CPP_WITH_CUDA_KERNELS)
+    target_compile_definitions(flashrt_cpp_pi05
+      PRIVATE FLASHRT_CPP_WITH_CUDA_KERNELS=1)
+    target_link_libraries(flashrt_cpp_pi05 PRIVATE CUDA::cudart)
+    if(TARGET flashrt_native_cpp_cuda_support)
+      target_link_libraries(flashrt_cpp_pi05 PRIVATE
+        flashrt_native_cpp_cuda_support)
+    endif()
+    set_target_properties(flashrt_cpp_pi05 PROPERTIES
+      CUDA_STANDARD 17
+      CUDA_STANDARD_REQUIRED ON)
+    if(FLASHRT_CPP_PI05_CUDA_ARCH)
+      set_target_properties(flashrt_cpp_pi05 PROPERTIES
+        CUDA_ARCHITECTURES ${FLASHRT_CPP_PI05_CUDA_ARCH})
+    endif()
+  endif()
+  if(TARGET flashrt_cpp_native_cuda)
+    add_library(flashrt_cpp_pi05_capture STATIC
+      models/pi05/src/model/captured_program.cpp
+      models/pi05/src/model/native_session.cpp)
+    target_include_directories(flashrt_cpp_pi05_capture
+      PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/internal/include)
+    target_link_libraries(flashrt_cpp_pi05_capture
+      PUBLIC flashrt_cpp_pi05 flashrt_cpp_native_cuda CUDA::cudart)
+  endif()
+
+  if(FLASHRT_CPP_WITH_PI05_SM120_TARGET)
   add_library(flashrt_cpp_pi05_target_sm120 STATIC
     models/pi05/src/targets/sm120/attention.cpp
     models/pi05/src/targets/sm120/attention_driver.cpp
@@ -408,10 +426,11 @@ if(FLASHRT_CPP_WITH_PI05_SM120_TARGET)
   target_link_libraries(flashrt_cpp_pi05_target_sm120
     PUBLIC flashrt_cpp_pi05
     PRIVATE flashrt_cpp_loader flashrt_cpp_csrc_core flashrt_cpp_csrc_sm120
-            flashrt_cpp_fa2_external CUDA::cudart)
-endif()
+            flashrt_native_cpp_cuda_support flashrt_cpp_fa2_external
+            CUDA::cudart)
+  endif()
 
-if(FLASHRT_CPP_WITH_PI05_SM110_TARGET)
+  if(FLASHRT_CPP_WITH_PI05_SM110_TARGET)
   add_library(flashrt_cpp_pi05_target_sm110 STATIC
     models/pi05/src/targets/sm110/frontend_bindings.cpp
     models/pi05/src/targets/sm110/fp8_weight_packer.cpp
@@ -423,82 +442,106 @@ if(FLASHRT_CPP_WITH_PI05_SM110_TARGET)
   target_link_libraries(flashrt_cpp_pi05_target_sm110
     PUBLIC flashrt_cpp_pi05
     PRIVATE flashrt_cpp_loader flashrt_cpp_csrc_core
-            flashrt_cpp_csrc_sm110 CUDA::cublas CUDA::cudart)
+            flashrt_cpp_csrc_sm110 flashrt_native_cpp_cuda_support
+            CUDA::cublas CUDA::cudart)
   set_target_properties(flashrt_cpp_pi05_target_sm110 PROPERTIES
     CUDA_ARCHITECTURES 110a
     CUDA_STANDARD 17
     CUDA_STANDARD_REQUIRED ON)
-endif()
+  endif()
 
-add_library(flashrt_cpp_pi05_c SHARED
-  models/pi05/src/c_api.cpp
-  models/pi05/src/model_runtime.cpp
-  models/pi05/src/native_calibration_c_api.cpp
-  models/pi05/src/native_model_runtime.cpp
-  models/pi05/src/native_open.cpp)
-target_link_libraries(flashrt_cpp_pi05_c
-  PUBLIC flashrt_cpp_pi05 flashrt_runtime
-  PRIVATE flashrt_cpp_loader flashrt_cpp_native)
-target_include_directories(flashrt_cpp_pi05_c
-  PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/include
-  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/internal/include)
-if(TARGET flashrt_cpp_pi05_capture)
-  target_link_libraries(flashrt_cpp_pi05_c PRIVATE flashrt_cpp_pi05_capture)
-endif()
-if(TARGET flashrt_cpp_pi05_capture AND
-   (TARGET flashrt_cpp_pi05_target_sm120 OR
-    TARGET flashrt_cpp_pi05_target_sm110))
-  target_sources(flashrt_cpp_pi05_c PRIVATE
-    models/pi05/src/native_calibration_session.cpp
-    models/pi05/src/native_session_factory.cpp)
-endif()
-if(TARGET flashrt_cpp_pi05_target_sm120)
-  target_compile_definitions(flashrt_cpp_pi05_c
-    PRIVATE FLASHRT_CPP_WITH_PI05_SM120_TARGET=1)
-  target_link_libraries(flashrt_cpp_pi05_c
-    PRIVATE flashrt_cpp_pi05_target_sm120)
-endif()
-if(TARGET flashrt_cpp_pi05_target_sm110)
-  target_compile_definitions(flashrt_cpp_pi05_c
-    PRIVATE FLASHRT_CPP_WITH_PI05_SM110_TARGET=1)
-  target_link_libraries(flashrt_cpp_pi05_c
-    PRIVATE flashrt_cpp_pi05_target_sm110)
+  if(FLASHRT_CPP_WITH_PI05_SM120_TARGET OR
+     FLASHRT_CPP_WITH_PI05_SM110_TARGET)
+    add_library(flashrt_cpp_pi05_c SHARED
+      models/pi05/src/c_api.cpp
+      models/pi05/src/model_runtime.cpp)
+    target_link_libraries(flashrt_cpp_pi05_c
+      PUBLIC flashrt_cpp_pi05 flashrt_runtime)
+    target_include_directories(flashrt_cpp_pi05_c
+      PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/include
+      PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/internal/include)
+    target_compile_definitions(flashrt_cpp_pi05_c
+      PRIVATE FLASHRT_PI05_C_BUILDING_LIBRARY=1)
+    set_target_properties(flashrt_cpp_pi05_c PROPERTIES
+      CXX_VISIBILITY_PRESET hidden
+      CUDA_VISIBILITY_PRESET hidden
+      VISIBILITY_INLINES_HIDDEN YES)
+    if(UNIX AND NOT APPLE)
+      target_link_options(flashrt_cpp_pi05_c PRIVATE
+        "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/pi05_c_exports.map"
+        "LINKER:--exclude-libs,ALL")
+      add_custom_command(TARGET flashrt_cpp_pi05_c POST_BUILD
+        COMMAND ${CMAKE_COMMAND}
+          -DNM_TOOL=${CMAKE_NM}
+          -DINPUT_FILE=$<TARGET_FILE:flashrt_cpp_pi05_c>
+          -DALLOWED_SYMBOLS_FILE=${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/pi05_c_exports.txt
+          -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/verify_dynamic_exports.cmake
+        VERBATIM)
+    endif()
+    if(TARGET flashrt_cpp_pi05_capture)
+      target_link_libraries(flashrt_cpp_pi05_c PRIVATE
+        flashrt_cpp_pi05_capture)
+    endif()
+    if(TARGET flashrt_cpp_pi05_capture AND
+       (TARGET flashrt_cpp_pi05_target_sm120 OR
+        TARGET flashrt_cpp_pi05_target_sm110))
+      target_sources(flashrt_cpp_pi05_c PRIVATE
+        models/pi05/src/native_calibration_c_api.cpp
+        models/pi05/src/native_model_runtime.cpp
+        models/pi05/src/native_open.cpp
+        models/pi05/src/native_calibration_session.cpp
+        models/pi05/src/native_session_factory.cpp)
+      target_link_libraries(flashrt_cpp_pi05_c PRIVATE
+        flashrt_cpp_loader flashrt_cpp_native)
+    endif()
+    if(TARGET flashrt_cpp_pi05_target_sm120)
+      target_compile_definitions(flashrt_cpp_pi05_c
+        PRIVATE FLASHRT_CPP_WITH_PI05_SM120_TARGET=1)
+      target_link_libraries(flashrt_cpp_pi05_c
+        PRIVATE flashrt_cpp_pi05_target_sm120)
+    endif()
+    if(TARGET flashrt_cpp_pi05_target_sm110)
+      target_compile_definitions(flashrt_cpp_pi05_c
+        PRIVATE FLASHRT_CPP_WITH_PI05_SM110_TARGET=1)
+      target_link_libraries(flashrt_cpp_pi05_c
+        PRIVATE flashrt_cpp_pi05_target_sm110)
+    endif()
+  endif()
 endif()
 
 if(BUILD_TESTING)
-  if(TARGET flashrt_cpp_csrc_precise_math)
+  if(TARGET flashrt_native_cpp_cuda_support)
     add_executable(test_csrc_rope_table tests/test_csrc_rope_table.cu)
     target_link_libraries(test_csrc_rope_table PRIVATE
-      flashrt_cpp_csrc_precise_math CUDA::cudart)
+      flashrt_native_cpp_cuda_support CUDA::cudart)
     set_target_properties(test_csrc_rope_table PROPERTIES
       CUDA_STANDARD 17
       CUDA_STANDARD_REQUIRED ON)
     add_test(NAME csrc_rope_table COMMAND test_csrc_rope_table)
 
-    add_executable(test_csrc_attention_seqused
-      tests/test_csrc_attention_seqused.cu
-      ${CMAKE_CURRENT_SOURCE_DIR}/../csrc/kernels/attention_cublas.cu
-      ${CMAKE_CURRENT_SOURCE_DIR}/../csrc/kernels/softmax.cu)
-    target_include_directories(test_csrc_attention_seqused PRIVATE
-      ${CMAKE_CURRENT_SOURCE_DIR}/../csrc/kernels)
-    target_link_libraries(test_csrc_attention_seqused PRIVATE
-      CUDA::cublas CUDA::cudart)
-    target_compile_options(test_csrc_attention_seqused PRIVATE
-      $<$<COMPILE_LANGUAGE:CUDA>:
-        --expt-relaxed-constexpr -O3
-        --ftz=true --prec-div=false --prec-sqrt=false>)
-    set_target_properties(test_csrc_attention_seqused PROPERTIES
-      CUDA_STANDARD 17
-      CUDA_STANDARD_REQUIRED ON)
-    add_test(NAME csrc_attention_seqused
-      COMMAND test_csrc_attention_seqused)
+    if(TARGET flashrt_cpp_csrc_sm110)
+      add_executable(test_csrc_attention_seqused
+        tests/test_csrc_attention_seqused.cu)
+      target_link_libraries(test_csrc_attention_seqused PRIVATE
+        flashrt_native_cpp_cuda_support flashrt_cpp_csrc_sm110
+        CUDA::cublas CUDA::cudart)
+      target_compile_options(test_csrc_attention_seqused PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:
+          --expt-relaxed-constexpr -O3
+          --ftz=true --prec-div=false --prec-sqrt=false>)
+      set_target_properties(test_csrc_attention_seqused PROPERTIES
+        CUDA_STANDARD 17
+        CUDA_STANDARD_REQUIRED ON)
+      add_test(NAME csrc_attention_seqused
+        COMMAND test_csrc_attention_seqused)
+    endif()
   endif()
 
   if(TARGET flashrt_cpp_csrc_core)
     add_executable(test_csrc_bf16_operations
       tests/test_csrc_bf16_operations.cu)
     target_link_libraries(test_csrc_bf16_operations PRIVATE
-      flashrt_cpp_csrc_core CUDA::cudart)
+      flashrt_native_cpp_cuda_support CUDA::cudart)
     set_target_properties(test_csrc_bf16_operations PROPERTIES
       CUDA_STANDARD 17
       CUDA_STANDARD_REQUIRED ON)
@@ -506,29 +549,11 @@ if(BUILD_TESTING)
 
     add_executable(test_csrc_fp8_weight_quantize
       tests/test_csrc_fp8_weight_quantize.cu)
-    target_link_libraries(test_csrc_fp8_weight_quantize PRIVATE
-      flashrt_cpp_csrc_core flashrt_runtime CUDA::cudart)
-    set_target_properties(test_csrc_fp8_weight_quantize PROPERTIES
-      CUDA_STANDARD 17
-      CUDA_STANDARD_REQUIRED ON)
-    if(FLASHRT_CPP_PI05_CUDA_ARCH)
-      set_target_properties(test_csrc_fp8_weight_quantize PROPERTIES
-        CUDA_ARCHITECTURES ${FLASHRT_CPP_PI05_CUDA_ARCH})
-    endif()
-    add_test(NAME csrc_fp8_weight_quantize
-      COMMAND test_csrc_fp8_weight_quantize)
-  elseif(TARGET flashrt_cpp_csrc_precise_math)
-    add_executable(test_csrc_fp8_weight_quantize
-      tests/test_csrc_fp8_weight_quantize.cu
-      ${CMAKE_CURRENT_SOURCE_DIR}/../csrc/kernels/quantize.cu)
     target_include_directories(test_csrc_fp8_weight_quantize PRIVATE
-      ${CMAKE_CURRENT_SOURCE_DIR}/../csrc/kernels)
+      ${CMAKE_CURRENT_SOURCE_DIR}/../csrc/native_cpp)
     target_link_libraries(test_csrc_fp8_weight_quantize PRIVATE
+      flashrt_native_cpp_cuda_support flashrt_cpp_csrc_core
       flashrt_runtime CUDA::cudart)
-    target_compile_options(test_csrc_fp8_weight_quantize PRIVATE
-      $<$<COMPILE_LANGUAGE:CUDA>:
-        --expt-relaxed-constexpr -O3
-        --ftz=true --prec-div=false --prec-sqrt=false>)
     set_target_properties(test_csrc_fp8_weight_quantize PROPERTIES
       CUDA_STANDARD 17
       CUDA_STANDARD_REQUIRED ON)
@@ -540,27 +565,30 @@ if(BUILD_TESTING)
       COMMAND test_csrc_fp8_weight_quantize)
   endif()
 
-  add_executable(test_safetensors_loader tests/test_safetensors_loader.cpp)
-  target_link_libraries(test_safetensors_loader PRIVATE flashrt_cpp_loader)
-  add_test(NAME safetensors_loader COMMAND test_safetensors_loader)
+  if(FLASHRT_ENABLE_NATIVE_CPP)
+    add_executable(test_safetensors_loader tests/test_safetensors_loader.cpp)
+    target_link_libraries(test_safetensors_loader PRIVATE flashrt_cpp_loader)
+    add_test(NAME safetensors_loader COMMAND test_safetensors_loader)
 
-  add_executable(test_sha256 tests/test_sha256.cpp)
-  target_link_libraries(test_sha256 PRIVATE flashrt_cpp_loader)
-  add_test(NAME sha256 COMMAND test_sha256)
+    add_executable(test_sha256 tests/test_sha256.cpp)
+    target_link_libraries(test_sha256 PRIVATE flashrt_cpp_loader)
+    add_test(NAME sha256 COMMAND test_sha256)
 
-  add_executable(test_native_config tests/test_native_config.cpp)
-  target_link_libraries(test_native_config PRIVATE flashrt_cpp_native)
-  add_test(NAME native_config COMMAND test_native_config)
+    add_executable(test_native_config tests/test_native_config.cpp)
+    target_link_libraries(test_native_config PRIVATE flashrt_cpp_native)
+    add_test(NAME native_config COMMAND test_native_config)
 
-  add_executable(test_text_modalities tests/test_text_modalities.cpp)
-  target_link_libraries(test_text_modalities PRIVATE flashrt_cpp_modalities)
-  add_test(NAME text_modalities COMMAND test_text_modalities)
+    add_executable(test_text_modalities tests/test_text_modalities.cpp)
+    target_link_libraries(test_text_modalities PRIVATE flashrt_cpp_modalities)
+    add_test(NAME text_modalities COMMAND test_text_modalities)
 
-  add_executable(test_text_tokenizer tests/test_text_tokenizer.cpp)
-  target_link_libraries(test_text_tokenizer PRIVATE flashrt_cpp_modalities)
-  add_test(NAME text_tokenizer COMMAND test_text_tokenizer)
+    add_executable(test_text_tokenizer tests/test_text_tokenizer.cpp)
+    target_link_libraries(test_text_tokenizer PRIVATE flashrt_cpp_modalities)
+    add_test(NAME text_tokenizer COMMAND test_text_tokenizer)
+  endif()
 
-  add_executable(test_cpp_modalities tests/test_modalities.cpp)
+  if(FLASHRT_ENABLE_NATIVE_CPP)
+    add_executable(test_cpp_modalities tests/test_modalities.cpp)
   target_link_libraries(test_cpp_modalities
     PRIVATE flashrt_cpp_pi05 flashrt_cpp_modalities)
   add_test(NAME cpp_modalities COMMAND test_cpp_modalities)
@@ -634,7 +662,6 @@ if(BUILD_TESTING)
     flashrt_cpp_pi05)
   add_test(NAME pi05_native_resource_resolver
     COMMAND test_pi05_native_resource_resolver)
-
   if(TARGET flashrt_cpp_pi05_target_sm120)
     add_executable(test_pi05_sm120_fp8_linear
       tests/test_pi05_sm120_fp8_linear.cpp)
@@ -684,28 +711,30 @@ if(BUILD_TESTING)
       PRIVATE flashrt_cpp_pi05 flashrt_cpp_modalities CUDA::cudart)
     add_test(NAME device_staging COMMAND test_device_staging)
 
-    add_executable(test_pi05_c_api tests/test_pi05_c_api.cpp)
-    target_link_libraries(test_pi05_c_api
-      PRIVATE flashrt_cpp_pi05_c flashrt_exec CUDA::cudart)
-    add_test(NAME pi05_c_api COMMAND test_pi05_c_api)
+    if(FLASHRT_CPP_WITH_PI05_SM120_TARGET OR
+       FLASHRT_CPP_WITH_PI05_SM110_TARGET)
+      add_executable(test_pi05_c_api tests/test_pi05_c_api.cpp)
+      target_link_libraries(test_pi05_c_api
+        PRIVATE flashrt_cpp_pi05_c flashrt_exec CUDA::cudart)
+      add_test(NAME pi05_c_api COMMAND test_pi05_c_api)
 
-    add_executable(test_pi05_model_runtime tests/test_pi05_model_runtime.cpp)
-    target_link_libraries(test_pi05_model_runtime
-      PRIVATE flashrt_cpp_pi05_c flashrt_exec flashrt_runtime CUDA::cudart)
-    add_test(NAME pi05_model_runtime COMMAND test_pi05_model_runtime)
+      add_executable(test_pi05_model_runtime tests/test_pi05_model_runtime.cpp)
+      target_link_libraries(test_pi05_model_runtime
+        PRIVATE flashrt_cpp_pi05_c flashrt_exec flashrt_runtime CUDA::cudart)
+      add_test(NAME pi05_model_runtime COMMAND test_pi05_model_runtime)
 
-    add_executable(test_pi05_native_open tests/test_pi05_native_open.cpp)
-    target_include_directories(test_pi05_native_open PRIVATE
-      ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/internal/include)
-    target_link_libraries(test_pi05_native_open
-      PRIVATE flashrt_cpp_pi05_c flashrt_runtime)
-    if(FLASHRT_CPP_WITH_SENTENCEPIECE AND
-       (FLASHRT_CPP_WITH_PI05_SM120_TARGET OR
-        FLASHRT_CPP_WITH_PI05_SM110_TARGET))
-      target_compile_definitions(test_pi05_native_open
-        PRIVATE FLASHRT_CPP_PI05_NATIVE_OPEN_ENABLED=1)
+      add_executable(test_pi05_native_open tests/test_pi05_native_open.cpp)
+      target_include_directories(test_pi05_native_open PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/internal/include)
+      target_link_libraries(test_pi05_native_open
+        PRIVATE flashrt_cpp_pi05_c flashrt_runtime)
+      if(FLASHRT_CPP_WITH_SENTENCEPIECE)
+        target_compile_definitions(test_pi05_native_open
+          PRIVATE FLASHRT_CPP_PI05_NATIVE_OPEN_ENABLED=1)
+      endif()
+      add_test(NAME pi05_native_open COMMAND test_pi05_native_open)
     endif()
-    add_test(NAME pi05_native_open COMMAND test_pi05_native_open)
+  endif()
   endif()
 
   if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")

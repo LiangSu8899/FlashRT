@@ -1,4 +1,4 @@
-#include "rope.cuh"
+#include "flashrt/native_cpp/operations.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -66,8 +66,8 @@ int main() {
         return 1;
     }
 
-    generate_rope_table_f16(actual, kStartPosition, kPositions,
-                            kFrequencies, kTheta);
+    flashrt_native_generate_rope_table_f16(
+        actual, kStartPosition, kPositions, kFrequencies, kTheta);
     reference_rope_table<<<(kPositions * kFrequencies + 255) / 256, 256>>>(
         expected, kStartPosition, kPositions, kFrequencies, kTheta);
     if (!check_cuda(cudaGetLastError(), "RoPE table launch") ||

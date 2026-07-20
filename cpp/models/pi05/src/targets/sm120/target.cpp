@@ -1,7 +1,6 @@
 #include "flashrt/cpp/models/pi05/targets/sm120/target.h"
 
 #include "activation.cuh"
-#include "dit_bf16.cuh"
 #include "elementwise.cuh"
 #include "flashrt/cpp/loader/safetensors.h"
 #include "flashrt/cpp/models/pi05/model/frontend_ops.h"
@@ -14,6 +13,7 @@
 #include "flashrt/cpp/models/pi05/targets/sm120/fp8_linear.h"
 #include "flashrt/cpp/models/pi05/targets/sm120/fp8_weight_packer.h"
 #include "flashrt/cpp/models/pi05/targets/sm120/fp8_autotune.h"
+#include "flashrt/native_cpp/operations.h"
 #include "fusion.cuh"
 #include "norm.cuh"
 #include "patch_embed.cuh"
@@ -127,12 +127,12 @@ modalities::Status derive_action_step_weights(
         return backend("SM120 action weight derivation allocation failed");
     }
     const float scale = -1.0f / static_cast<float>(shape.num_steps);
-    scale_bf16_weight_device(
+    flashrt_native_scale_bf16_weight(
         static_cast<const __nv_bfloat16*>(
             weights->decoder.action_out_weight.device_data),
         static_cast<__nv_bfloat16*>(frt_buffer_dptr(derived_weight)), scale,
         kPi05ModelDims.decoder_width * kPi05ModelDims.action_width);
-    scale_bf16_weight_device(
+    flashrt_native_scale_bf16_weight(
         static_cast<const __nv_bfloat16*>(
             weights->decoder.action_out_bias.device_data),
         static_cast<__nv_bfloat16*>(frt_buffer_dptr(derived_bias)), scale,
@@ -324,9 +324,9 @@ modalities::Status frontend_silu(void*,
     if (!values || elements <= 0) {
         return invalid("SM120 BF16 SiLU arguments are invalid");
     }
-    silu_inplace_bf16(static_cast<__nv_bfloat16*>(values),
-                      static_cast<int>(elements),
-                      reinterpret_cast<cudaStream_t>(stream));
+    flashrt_native_silu_inplace_bf16(
+        static_cast<__nv_bfloat16*>(values), static_cast<int>(elements),
+        reinterpret_cast<cudaStream_t>(stream));
     return launch_status();
 }
 

@@ -1,6 +1,7 @@
-#include "quantize.cuh"
+#include "flashrt/native_cpp/operations.h"
 #include "fp8_exact.cuh"
 #include "flashrt/runtime.h"
+#include "quantize.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime_api.h>
@@ -16,6 +17,7 @@ namespace {
 
 constexpr int kCount = 4096;
 constexpr std::uint32_t kScaleBits = 0x3d092492u;
+constexpr std::uint32_t kCommonDynamicF16ScaleBits = 0x3d97924au;
 constexpr std::uint32_t kDynamicF16ScaleBits = 0x3d979249u;
 constexpr std::uint64_t kOutputHash = 0x68ea83e06e2dce5cull;
 constexpr int kMidpointIndex = 402;
@@ -32,7 +34,7 @@ __global__ void check_exact_e4m3_conversion_kernel(
         const __nv_fp8_storage_t expected = __nv_cvt_double_to_fp8(
             static_cast<double>(canonical), __NV_SATFINITE, __NV_E4M3);
         const __nv_fp8_storage_t actual =
-            flashrt_fp8_e4m3_storage_rn(value);
+            flashrt_native_fp8_e4m3_storage_rn(value);
         if (actual != expected) {
             if (result[0] == 0) {
                 result[1] = index;
@@ -168,7 +170,7 @@ bool check_setup_scale(const std::vector<__nv_bfloat16>& input) {
         return false;
     }
     constexpr float kScale = -0.1f;
-    scale_bf16_weight_device(
+    flashrt_native_scale_bf16_weight(
         device_input, device_output, kScale, static_cast<int>(input.size()));
     std::vector<std::uint16_t> output(input.size());
     const bool copied =
@@ -219,22 +221,34 @@ bool check_dynamic_f16_scale() {
     }
 
     quantize_fp8_device_fp16(device_input, device_output, device_scale, 2);
-    float scale = 0.0f;
-    const bool copied =
+    float common_scale = 0.0f;
+    bool copied =
         check_cuda(cudaGetLastError(), "dynamic F16 quantize launch") &&
-        check_cuda(cudaMemcpy(&scale, device_scale, sizeof(scale),
+        check_cuda(cudaMemcpy(&common_scale, device_scale, sizeof(common_scale),
                               cudaMemcpyDeviceToHost),
-                   "copy dynamic F16 scale");
+                   "copy common dynamic F16 scale");
+    flashrt_native_quantize_fp8_device_f16_precise(
+        device_input, device_output, device_scale, 2);
+    float native_scale = 0.0f;
+    copied = copied &&
+        check_cuda(cudaGetLastError(), "native dynamic F16 quantize launch") &&
+        check_cuda(cudaMemcpy(&native_scale, device_scale,
+                              sizeof(native_scale), cudaMemcpyDeviceToHost),
+                   "copy native dynamic F16 scale");
     cudaFree(device_input);
     cudaFree(device_output);
     cudaFree(device_scale);
     if (!copied) return false;
 
-    std::uint32_t bits = 0;
-    std::memcpy(&bits, &scale, sizeof(bits));
-    if (bits != kDynamicF16ScaleBits) {
-        std::fprintf(stderr, "dynamic F16 scale mismatch: %08x != %08x\n",
-                     bits, kDynamicF16ScaleBits);
+    std::uint32_t common_bits = 0;
+    std::uint32_t native_bits = 0;
+    std::memcpy(&common_bits, &common_scale, sizeof(common_bits));
+    std::memcpy(&native_bits, &native_scale, sizeof(native_bits));
+    if (common_bits != kCommonDynamicF16ScaleBits ||
+        native_bits != kDynamicF16ScaleBits) {
+        std::fprintf(stderr,
+                     "dynamic F16 scales mismatch: common=%08x native=%08x\n",
+                     common_bits, native_bits);
         return false;
     }
     return true;
@@ -280,11 +294,11 @@ bool check_f16_pack(bool pair, bool transpose) {
         return false;
     }
     if (pair) {
-        quantize_fp8_weight_f16_pair_device(
+        flashrt_native_quantize_fp8_weight_f16_pair(
             device_first, device_second, device_output, device_scale,
             kRows, kColumns, transpose);
     } else {
-        quantize_fp8_weight_f16_device(
+        flashrt_native_quantize_fp8_weight_f16(
             device_first, device_output, device_scale,
             kRows, kColumns, transpose);
     }
@@ -382,8 +396,8 @@ int main() {
         return 1;
     }
 
-    quantize_fp8_weight_device(device_input, device_output, device_scale,
-                               kCount);
+    flashrt_native_quantize_fp8_weight_bf16(
+        device_input, device_output, device_scale, kCount);
     if (!check_cuda(cudaGetLastError(), "FP8 weight quantize launch") ||
         !check_cuda(cudaDeviceSynchronize(),
                     "FP8 weight quantize synchronize")) {

@@ -31,9 +31,10 @@ extern "C" {
  * object via its own release(owner) — that destroys the internal Pi0.5
  * runtime and drops its export references. Returns 0 or a negative status
  * (same codes as the pi05 C API). */
-int frt_pi05_model_runtime_create(const frt_runtime_export_v1* exp,
-                                  const frt_pi05_runtime_config* config,
-                                  frt_model_runtime_v1** out);
+FLASHRT_PI05_C_API int frt_pi05_model_runtime_create(
+    const frt_runtime_export_v1* exp,
+    const frt_pi05_runtime_config* config,
+    frt_model_runtime_v1** out);
 
 /* Build a retained Pi0.5 native verb overlay over an existing model-runtime
  * declaration. Ports/stages/identity/fingerprint are inherited exactly from
@@ -42,9 +43,16 @@ int frt_pi05_model_runtime_create(const frt_runtime_export_v1* exp,
  * STAGED). Optional "noise"/"actions_raw" must be matching TENSOR SWAP ports;
  * optional "prompt"/"state" must be TEXT/STATE IN STAGED and require a fully
  * configured tokenizer/embedding/state-normalization implementation. */
-int frt_pi05_model_runtime_create_over(const frt_model_runtime_v1* model,
-                                       const frt_pi05_runtime_config* config,
-                                       frt_model_runtime_v1** out);
+FLASHRT_PI05_C_API int frt_pi05_model_runtime_create_over(
+    const frt_model_runtime_v1* model,
+    const frt_pi05_runtime_config* config,
+    frt_model_runtime_v1** out);
+
+/* Native producer factory. The generic symbol name is discovered through
+ * FRT_MODEL_RUNTIME_OPEN_V1_SYMBOL; the error accessor is producer-specific. */
+FLASHRT_PI05_C_API int frt_model_runtime_open_v1(
+    const char* config_json, frt_model_runtime_v1** out);
+FLASHRT_PI05_C_API const char* frt_pi05_native_open_last_error(void);
 
 #ifdef __cplusplus
 }

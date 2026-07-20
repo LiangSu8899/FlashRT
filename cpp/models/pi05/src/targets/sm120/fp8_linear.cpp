@@ -1,6 +1,7 @@
 #include "flashrt/cpp/models/pi05/targets/sm120/fp8_linear.h"
 
 #include "gemm_runner.h"
+#include "flashrt/native_cpp/operations.h"
 #include "quantize.cuh"
 
 #include <cublasLt.h>
@@ -450,7 +451,7 @@ modalities::Status Sm120Fp8Linear::launch(
     void* quantized = prequantized ? const_cast<void*>(input) : scratch_data();
     if (!prequantized) {
         if (observing()) {
-            quantize_fp8_device_precise(
+            flashrt_native_quantize_fp8_device_precise(
                 static_cast<const __nv_bfloat16*>(input),
                 static_cast<__nv_fp8_e4m3*>(quantized), activation_scale,
                 static_cast<int>(input_elements), cuda_stream(stream));

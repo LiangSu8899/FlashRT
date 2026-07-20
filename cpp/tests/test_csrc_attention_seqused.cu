@@ -1,4 +1,5 @@
 #include "attention_cublas.cuh"
+#include "flashrt/native_cpp/operations.h"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime_api.h>
@@ -152,7 +153,7 @@ bool run_attention(cublasHandle_t handle, const Shape& shape, bool seqused,
     const float scale =
         1.0f / std::sqrt(static_cast<float>(shape.head_dimension));
     if (seqused) {
-        attention_qkv_fp16_seqused(
+        flashrt_native_attention_qkv_fp16_seqused(
             handle, queries.data(), keys.data(), values.data(), logits.data(),
             output.data(), shape.query_rows, shape.key_rows, shape.heads,
             shape.head_dimension, valid_keys, scale);

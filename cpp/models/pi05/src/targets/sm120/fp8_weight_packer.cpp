@@ -1,6 +1,6 @@
 #include "flashrt/cpp/models/pi05/targets/sm120/fp8_weight_packer.h"
 
-#include "quantize.cuh"
+#include "flashrt/native_cpp/operations.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -106,7 +106,7 @@ modalities::Status Sm120Fp8WeightPacker::pack_view(
         !frt_buffer_dptr(scale)) {
         return backend("SM120 FP8 packed weight allocation failed");
     }
-    quantize_fp8_weight_device(
+    flashrt_native_quantize_fp8_weight_bf16(
         static_cast<const __nv_bfloat16*>(source.device_data),
         static_cast<__nv_fp8_e4m3*>(frt_buffer_dptr(values)),
         static_cast<float*>(frt_buffer_dptr(scale)),

@@ -5,6 +5,7 @@
 #include "decoder_fused.cuh"
 #include "elementwise.cuh"
 #include "gemm_runner.h"
+#include "flashrt/native_cpp/operations.h"
 #include "norm.cuh"
 #include "patch_embed.cuh"
 #include "quantize.cuh"
@@ -251,7 +252,7 @@ modalities::Status Sm110OperationDriver::layer_norm_fp8(
         !(epsilon > 0.0f) || !std::isfinite(epsilon)) {
         return invalid("SM110 FP8 LayerNorm arguments are invalid");
     }
-    ::layer_norm_fp8(
+    ::flashrt_native_layer_norm_fp8_f16(
         static_cast<const __half*>(values),
         static_cast<__nv_fp8_e4m3*>(output),
         static_cast<const __half*>(weight), static_cast<const __half*>(bias),
@@ -319,7 +320,7 @@ modalities::Status Sm110OperationDriver::quantize_fp8_dynamic(
     if (!values || !output || !scale || !elements || elements > INT_MAX) {
         return invalid("SM110 dynamic FP8 quantization arguments are invalid");
     }
-    ::quantize_fp8_device_fp16(
+    ::flashrt_native_quantize_fp8_device_f16_precise(
         static_cast<const __half*>(values),
         static_cast<__nv_fp8_e4m3*>(output), scale,
         static_cast<int>(elements), reinterpret_cast<cudaStream_t>(stream));
@@ -356,7 +357,7 @@ modalities::Status Sm110OperationDriver::precise_silu_fp16(
     if (!values || !elements || elements > INT_MAX) {
         return invalid("SM110 precise FP16 SiLU arguments are invalid");
     }
-    const cudaError_t rc = flashrt_silu_inplace_fp16_precise(
+    const cudaError_t rc = flashrt_native_silu_inplace_fp16_precise(
         static_cast<__half*>(values), elements,
         reinterpret_cast<cudaStream_t>(stream));
     return rc == cudaSuccess ? modalities::Status::ok()
@@ -508,7 +509,7 @@ modalities::Status Sm110OperationDriver::attention_seqused_fp16(
         head_dimension <= 0 || !(scale > 0.0f) || !std::isfinite(scale)) {
         return invalid("SM110 FP16 attention arguments are invalid");
     }
-    ::attention_qkv_fp16_seqused(
+    ::flashrt_native_attention_qkv_fp16_seqused(
         impl_->cublas, static_cast<const __half*>(query),
         static_cast<const __half*>(key), static_cast<const __half*>(value),
         static_cast<__half*>(logits), static_cast<__half*>(output), query_rows,

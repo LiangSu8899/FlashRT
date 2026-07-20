@@ -2,7 +2,7 @@
 
 #include "flashrt/cpp/models/pi05/model/dims.h"
 
-#include "rope.cuh"
+#include "flashrt/native_cpp/operations.h"
 
 #include <cuda_runtime_api.h>
 
@@ -32,7 +32,7 @@ modalities::Status generate_native_rope_f16(
             "native RoPE generation arguments are invalid");
     }
     cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
-    ::generate_rope_table_f16(
+    ::flashrt_native_generate_rope_table_f16(
         static_cast<__half*>(output), start_position, positions,
         kFrequencies, 10000.0f, cuda_stream);
     cudaError_t rc = cudaGetLastError();

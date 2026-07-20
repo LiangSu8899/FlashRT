@@ -1,6 +1,6 @@
 #include "flashrt/cpp/models/pi05/targets/sm110/fp8_weight_packer.h"
 
-#include "quantize.cuh"
+#include "flashrt/native_cpp/operations.h"
 
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
@@ -128,14 +128,14 @@ modalities::Status Sm110Fp8WeightPacker::pack(
     }
 
     if (pair) {
-        quantize_fp8_weight_f16_pair_device(
+        flashrt_native_quantize_fp8_weight_f16_pair(
             static_cast<const __half*>(group.first->device_data),
             static_cast<const __half*>(group.second->device_data),
             static_cast<__nv_fp8_e4m3*>(frt_buffer_dptr(values)),
             static_cast<float*>(frt_buffer_dptr(scale)), rows, columns,
             transpose, cuda_stream(stream_));
     } else {
-        quantize_fp8_weight_f16_device(
+        flashrt_native_quantize_fp8_weight_f16(
             static_cast<const __half*>(group.first->device_data),
             static_cast<__nv_fp8_e4m3*>(frt_buffer_dptr(values)),
             static_cast<float*>(frt_buffer_dptr(scale)), rows, columns,

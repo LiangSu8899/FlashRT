@@ -3,11 +3,10 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
-// CUDA selects a native float-to-FP8 instruction for SM89+ and a software
-// conversion below SM89. Keep persisted and replay-visible E4M3 values
-// independent of the compilation target while retaining a float-only path.
+// Persisted and replay-visible E4M3 values must not depend on whether CUDA
+// selects a native or software float-to-FP8 conversion path.
 __device__ __forceinline__ __nv_fp8_storage_t
-flashrt_fp8_e4m3_storage_rn(float value) {
+flashrt_native_fp8_e4m3_storage_rn(float value) {
     const unsigned int bits = __float_as_uint(value);
     const unsigned int magnitude_bits = bits & 0x7fffffffu;
     const unsigned int sign = (bits >> 24u) & 0x80u;
@@ -29,8 +28,7 @@ flashrt_fp8_e4m3_storage_rn(float value) {
     const unsigned int mantissa = magnitude_bits & 0x7fffffu;
     const unsigned int remainder = mantissa & 0xfffffu;
     if (remainder != 0x80000u) {
-        return __nv_cvt_float_to_fp8(
-            value, __NV_SATFINITE, __NV_E4M3);
+        return __nv_cvt_float_to_fp8(value, __NV_SATFINITE, __NV_E4M3);
     }
     const unsigned int exponent = magnitude_bits >> 23u;
     unsigned int result = ((exponent - 120u) << 3u) | (mantissa >> 20u);
@@ -40,8 +38,8 @@ flashrt_fp8_e4m3_storage_rn(float value) {
 }
 
 __device__ __forceinline__ __nv_fp8_e4m3
-flashrt_fp8_e4m3_rn(float value) {
+flashrt_native_fp8_e4m3_rn(float value) {
     __nv_fp8_e4m3 result;
-    result.__x = flashrt_fp8_e4m3_storage_rn(value);
+    result.__x = flashrt_native_fp8_e4m3_storage_rn(value);
     return result;
 }

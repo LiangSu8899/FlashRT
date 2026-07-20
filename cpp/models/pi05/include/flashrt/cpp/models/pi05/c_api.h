@@ -1,6 +1,7 @@
 #ifndef FLASHRT_CPP_MODELS_PI05_C_API_H
 #define FLASHRT_CPP_MODELS_PI05_C_API_H
 
+#include "flashrt/cpp/models/pi05/export.h"
 #include "flashrt/runtime.h"
 
 #include <stdint.h>
@@ -110,45 +111,50 @@ typedef struct frt_pi05_calibration_sample_v1 {
     uint64_t noise_seed;
 } frt_pi05_calibration_sample_v1;
 
-int frt_pi05_runtime_create(const frt_runtime_export_v1* exp,
-                            const frt_pi05_runtime_config* config,
-                            frt_pi05_runtime** out);
-void frt_pi05_runtime_destroy(frt_pi05_runtime*);
+FLASHRT_PI05_C_API int frt_pi05_runtime_create(
+    const frt_runtime_export_v1* exp,
+    const frt_pi05_runtime_config* config,
+    frt_pi05_runtime** out);
+FLASHRT_PI05_C_API void frt_pi05_runtime_destroy(frt_pi05_runtime*);
 
-int frt_pi05_runtime_set_prompt(frt_pi05_runtime*, const char* text);
-int frt_pi05_runtime_set_prompt_state(frt_pi05_runtime*, const char* text,
-                                      const float* state, uint64_t n_state);
-int frt_pi05_runtime_prepare_vision(frt_pi05_runtime*,
-                                    const frt_pi05_vision_frame* frames,
-                                    uint64_t n_frames);
-int frt_pi05_runtime_replay_tick(frt_pi05_runtime*);
-int frt_pi05_runtime_read_actions(frt_pi05_runtime*,
-                                  float* out_actions,
-                                  uint64_t out_capacity,
-                                  uint64_t* n_written);
+FLASHRT_PI05_C_API int frt_pi05_runtime_set_prompt(
+    frt_pi05_runtime*, const char* text);
+FLASHRT_PI05_C_API int frt_pi05_runtime_set_prompt_state(
+    frt_pi05_runtime*, const char* text,
+    const float* state, uint64_t n_state);
+FLASHRT_PI05_C_API int frt_pi05_runtime_prepare_vision(
+    frt_pi05_runtime*, const frt_pi05_vision_frame* frames,
+    uint64_t n_frames);
+FLASHRT_PI05_C_API int frt_pi05_runtime_replay_tick(frt_pi05_runtime*);
+FLASHRT_PI05_C_API int frt_pi05_runtime_read_actions(
+    frt_pi05_runtime*, float* out_actions,
+    uint64_t out_capacity, uint64_t* n_written);
 
-const frt_runtime_export_v1* frt_pi05_runtime_export(frt_pi05_runtime*);
-const char* frt_pi05_runtime_last_error(frt_pi05_runtime*);
+FLASHRT_PI05_C_API const frt_runtime_export_v1* frt_pi05_runtime_export(
+    frt_pi05_runtime*);
+FLASHRT_PI05_C_API const char* frt_pi05_runtime_last_error(
+    frt_pi05_runtime*);
 
 /* Native FP8 calibration uses the same checkpoint, tokenizer, shape, and
  * state-normalization fields as frt_model_runtime_open_v1. The model forward
  * is the regular uncaptured semantic pipeline with target observers enabled. */
-int frt_pi05_calibration_create_v1(
+FLASHRT_PI05_C_API int frt_pi05_calibration_create_v1(
     const char* config_json,
     double percentile,
     frt_pi05_calibration_session** out);
-int frt_pi05_calibration_observe_v1(
+FLASHRT_PI05_C_API int frt_pi05_calibration_observe_v1(
     frt_pi05_calibration_session*,
     const frt_pi05_calibration_sample_v1* sample);
-int frt_pi05_calibration_finalize_v1(
+FLASHRT_PI05_C_API int frt_pi05_calibration_finalize_v1(
     frt_pi05_calibration_session*,
     const char* artifact_path);
-uint64_t frt_pi05_calibration_sample_count_v1(
+FLASHRT_PI05_C_API uint64_t frt_pi05_calibration_sample_count_v1(
     const frt_pi05_calibration_session*);
-const char* frt_pi05_calibration_last_error_v1(
+FLASHRT_PI05_C_API const char* frt_pi05_calibration_last_error_v1(
     const frt_pi05_calibration_session*);
-const char* frt_pi05_calibration_create_last_error_v1(void);
-void frt_pi05_calibration_destroy_v1(frt_pi05_calibration_session*);
+FLASHRT_PI05_C_API const char* frt_pi05_calibration_create_last_error_v1(void);
+FLASHRT_PI05_C_API void frt_pi05_calibration_destroy_v1(
+    frt_pi05_calibration_session*);
 
 #ifdef __cplusplus
 }
