@@ -129,7 +129,8 @@ adapter wrap, and verb override alike. Validation happens before owner/export/
 base retain; failed `finish_model` also leaves the builder available for a
 corrected retry. SWAP/SETUP-only declarations may still use unsupported stubs.
 The common Python producer checks the actual callback objects before
-`_assemble()`; non-null pybind trampolines do not count as implementations.
+`_assemble()`; the low-level pybind builder maps `None` to null verbs, so a
+trampoline does not count as an implementation unless its callback exists.
 
 ## C++ model runtime layer
 

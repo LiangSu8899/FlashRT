@@ -90,7 +90,9 @@ no owner/export/base object; `finish_model` additionally leaves its builder
 unconsumed so the producer can supply corrected verbs and retry.
 `build_model_runtime()` performs the equivalent check against the actual
 Python callbacks before `_assemble()`. The pybind trampolines are therefore
-never allowed to conceal a missing Python implementation.
+never allowed to conceal a missing Python implementation:
+`Builder.finish_model()` maps each `None` callback to a null verb before core
+validation.
 
 **Lifetime**: the consumer retains/releases only the model runtime; the owner
 holds one export reference internally. `retain`/`release` are thread-safe;

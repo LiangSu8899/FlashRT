@@ -167,10 +167,11 @@ struct PyRtBuilder {
 
         frt_model_runtime_verbs verbs{};
         verbs.struct_size = sizeof(verbs);
-        verbs.set_input = &verb_set_input;
-        verbs.get_output = &verb_get_output;
-        verbs.prepare = &verb_prepare;
-        verbs.step = &verb_step;
+        verbs.set_input = pv->set_input.is_none() ? nullptr : &verb_set_input;
+        verbs.get_output =
+            pv->get_output.is_none() ? nullptr : &verb_get_output;
+        verbs.prepare = pv->prepare.is_none() ? nullptr : &verb_prepare;
+        verbs.step = pv->step.is_none() ? nullptr : &verb_step;
         verbs.last_error = &verb_last_error;
 
         frt_model_runtime_v1* mr = frt_runtime_builder_finish_model(

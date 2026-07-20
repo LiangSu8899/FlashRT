@@ -215,6 +215,13 @@ int main() {
         /* The builder survives both refusals; valid verbs consume it. */
         frt_model_runtime_verbs staged_verbs{};
         staged_verbs.struct_size = sizeof(staged_verbs);
+        staged_verbs.get_output = v_get_output;
+        CHECK(frt_runtime_builder_finish_model(
+                  b, &staged_verbs, nullptr, &rejected_owner, owner_retain,
+                  owner_release) == nullptr &&
+                  rejected_owner.retains == 0 && rejected_owner.releases == 0,
+              "finish_model rejects missing STAGED input and remains retryable");
+        staged_verbs.get_output = nullptr;
         staged_verbs.set_input = v_set_input;
         CHECK(frt_runtime_builder_finish_model(
                   b, &staged_verbs, nullptr, &rejected_owner, owner_retain,
@@ -386,7 +393,7 @@ int main() {
             eb, &eo, owner_retain, owner_release);
         CHECK(exp != nullptr, "plain export for the wrap path");
 
-        frt_runtime_port_desc ports[1] = {};
+        frt_runtime_port_desc ports[2] = {};
         ports[0].name = "images";
         ports[0].modality = FRT_RT_MOD_IMAGE;
         ports[0].dtype = FRT_RT_DTYPE_BF16;
@@ -396,22 +403,39 @@ int main() {
         ports[0].required = 1;
         ports[0].shape = IMG_SHAPE;
         ports[0].rank = 4;
+        ports[1].name = "actions";
+        ports[1].modality = FRT_RT_MOD_ACTION;
+        ports[1].dtype = FRT_RT_DTYPE_BF16;
+        ports[1].layout = FRT_RT_LAYOUT_FLAT;
+        ports[1].direction = FRT_RT_PORT_OUT;
+        ports[1].update = FRT_RT_PORT_STAGED;
+        ports[1].shape = ACT_SHAPE;
+        ports[1].rank = 2;
         frt_runtime_stage_desc stages[1] = {};
         stages[0].graph = 0;
 
         frt_runtime_stage_desc bad = {};
         bad.graph = 9;
-        CHECK(frt_model_runtime_wrap(exp, ports, 1, &bad, 1, &verbs, &vlog,
+        CHECK(frt_model_runtime_wrap(exp, ports, 2, &bad, 1, &verbs, &vlog,
                                      nullptr, nullptr) == nullptr,
               "wrap rejects a stage over a missing graph");
-        CHECK(frt_model_runtime_wrap(exp, ports, 1, stages, 1, nullptr,
-                                     nullptr, &wrapper_freed,
+        frt_model_runtime_verbs output_only = verbs;
+        output_only.set_input = nullptr;
+        CHECK(frt_model_runtime_wrap(exp, ports, 2, stages, 1, &output_only,
+                                     &vlog, &wrapper_freed,
                                      [](void* p) { *(int*)p += 1; }) == nullptr &&
                   eo.retains == 1 && wrapper_freed == 0,
               "wrap rejects missing STAGED input without retaining owners");
+        frt_model_runtime_verbs input_only = verbs;
+        input_only.get_output = nullptr;
+        CHECK(frt_model_runtime_wrap(exp, ports, 2, stages, 1, &input_only,
+                                     nullptr, &wrapper_freed,
+                                     [](void* p) { *(int*)p += 1; }) == nullptr &&
+                  eo.retains == 1 && wrapper_freed == 0,
+              "wrap rejects missing STAGED output without retaining owners");
 
         frt_model_runtime_v1* wm = frt_model_runtime_wrap(
-            exp, ports, 1, stages, 1, &verbs, &vlog, &wrapper_freed,
+            exp, ports, 2, stages, 1, &verbs, &vlog, &wrapper_freed,
             [](void* p) { *(int*)p += 1; });
         CHECK(wm != nullptr, "frt_model_runtime_wrap");
         CHECK(wm->exp == exp, "wrap keeps the export pointer");
@@ -448,6 +472,14 @@ int main() {
         native_verbs.last_error = v_last_error;
 
         frt_model_runtime_verbs incomplete_verbs = native_verbs;
+        incomplete_verbs.set_input = nullptr;
+        CHECK(frt_model_runtime_override_verbs(
+                  base, &incomplete_verbs, &native_vlog, &native_owner,
+                  owner_retain, owner_release) == nullptr &&
+                  native_owner.retains == 0 && base_owner.retains == 1,
+              "override rejects missing STAGED input without retaining owners");
+
+        incomplete_verbs = native_verbs;
         incomplete_verbs.get_output = nullptr;
         CHECK(frt_model_runtime_override_verbs(
                   base, &incomplete_verbs, &native_vlog, &native_owner,
