@@ -21,8 +21,31 @@ _VISION_PROJ = (("fc1", "fc2"), ("linear_fc1", "linear_fc2"))
 _NORM_ATTRS = ("post_attention_layernorm", "layer_norm2", "norm2")
 _ATTN_PROJ = (("q_proj", "k_proj", "v_proj", "o_proj"),
               ("q_proj", "k_proj", "v_proj", "out_proj"))
+# sibling groups that qkv_pack packs into one GEMM: same input, fixed
+# consumption order. The trailing o_proj/out_proj is not part of the
+# pack (it consumes the attention output, not the shared input).
+_QKV_PACK = (("q_proj", "k_proj", "v_proj"),
+             ("to_q", "to_k", "to_v"))
+# adaptive-norm modules: a norm that also projects a conditioning
+# vector. The child that produces the modulation is the tell.
+_COND_PROJ_ATTRS = ("dense", "linear", "adaLN_modulation", "modulation")
 _PROJ_WEIGHT_FLOOR = 262144  # candidacy filter only; impls add their own
                              # work-based qualification and gates decide
+
+
+def _has_cond_forward(module: nn.Module) -> bool:
+    """A norm takes a conditioning argument (adaptive norm) if its
+    forward accepts a second positional / a ``cond``/``temb`` keyword."""
+    import inspect
+    try:
+        params = list(inspect.signature(module.forward).parameters)
+    except (TypeError, ValueError):
+        return False
+    if any(p in params for p in ("cond", "temb", "emb", "c")):
+        return True
+    # (self is bound out of module.forward already) x + one more positional
+    positional = [p for p in params if p not in ("args", "kwargs")]
+    return len(positional) >= 2
 
 
 @dataclass
@@ -37,6 +60,8 @@ class Seam:
     variant: dict[str, str]
     fc_attrs: tuple[str, str] | None = None
     proj_attr: str | None = None      # linear_proj: attr name in parent
+    pack_attrs: tuple[str, ...] | None = None   # qkv_pack: sibling attrs
+    cond_attr: str | None = None      # adaln_producer: cond-proj child
     family: str = ""
     layer_index: int = -1
     m_profile: list[int] = field(default_factory=list)
@@ -112,6 +137,43 @@ def discover(
                 variant={"activation": act, "norm_weight_mode": "direct"},
                 family=family, layer_index=idx))
             continue
+        if "qkv_pack" in structures:
+            for group in _QKV_PACK:
+                projs = [getattr(module, a, None) for a in group]
+                if not all(isinstance(p, nn.Linear) for p in projs):
+                    continue
+                if len({p.in_features for p in projs}) != 1:
+                    continue  # siblings must share the input dim
+                if projs[0].weight.numel() < _PROJ_WEIGHT_FLOOR:
+                    continue
+                family, idx = _family_key(path)
+                seams.append(Seam(
+                    structure="qkv_pack", path=path, parent_path=parent_path,
+                    norm_attr=None, pack_attrs=group,
+                    dims={"K": projs[0].in_features,
+                          "N": sum(p.out_features for p in projs)},
+                    variant={"bind": "leaf", "in_dtype": "bf16_fused_quant"},
+                    family=family, layer_index=idx))
+                break
+        if "adaln_producer" in structures:
+            cond_attr = next(
+                (a for a in _COND_PROJ_ATTRS
+                 if isinstance(getattr(module, a, None), nn.Linear)), None)
+            if (cond_attr is not None and _has_cond_forward(module)
+                    and getattr(module, cond_attr).out_features
+                    % 2 == 0):
+                cond_proj = getattr(module, cond_attr)
+                family, idx = _family_key(path)
+                # style width is a multiple of the model dim: 3x (scale,
+                # shift, gate) for RMS AdaLN, 2x (scale, shift) for LN
+                seams.append(Seam(
+                    structure="adaln_producer", path=path,
+                    parent_path=parent_path, norm_attr=None,
+                    cond_attr=cond_attr,
+                    dims={"C": cond_proj.in_features,
+                          "S": cond_proj.out_features},
+                    variant={"bind": "table_only", "out_dtype": "bf16"},
+                    family=family, layer_index=idx))
         if "linear_proj" in structures:
             for group in _ATTN_PROJ:
                 projs = [getattr(module, a, None) for a in group]

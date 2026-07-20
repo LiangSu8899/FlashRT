@@ -32,6 +32,17 @@ def capture(fn, **kwargs):
     return _capture(fn, **kwargs)
 
 
+def auto_swaps(model, forward, **kwargs):
+    """Distribution layer: discover, calibrate, bind — one pass, no
+    per-seam scaffolding. Returns an :class:`AutoPlan` of swaps.
+
+    See :func:`flash_rt.structures.autobuild.auto_swaps`.
+    """
+    from flash_rt.structures.autobuild import auto_swaps as _auto
+
+    return _auto(model, forward, **kwargs)
+
+
 def run_recipe(recipe, model, ctx=None, **kwargs):
     """Recipe door: assemble declared levers, audit same-process on the
     graph, certify or refuse — one call, one receipt.
