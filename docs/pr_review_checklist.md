@@ -207,6 +207,13 @@ Required:
 - A native model PR must show that existing common `csrc` files are unchanged
   from the base revision. Native-only operation gaps may live under
   `csrc/native_cpp/` only when they are model-independent and opt-in.
+- Each native-only operation must identify the missing common contract
+  dimension. Reject shadow implementations when an existing operation already
+  satisfies the call site, especially copies that differ only in rounding or
+  reduction details.
+- Numerical parity evidence must use the unchanged current producer as the
+  reference. A frozen producer built from the same modified operation sources
+  is useful for refactor regression, but is not an independent parity oracle.
 
 Blockers:
 

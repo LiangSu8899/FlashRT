@@ -252,7 +252,7 @@ modalities::Status Sm110OperationDriver::layer_norm_fp8(
         !(epsilon > 0.0f) || !std::isfinite(epsilon)) {
         return invalid("SM110 FP8 LayerNorm arguments are invalid");
     }
-    ::flashrt_native_layer_norm_fp8_f16(
+    ::layer_norm_fp8(
         static_cast<const __half*>(values),
         static_cast<__nv_fp8_e4m3*>(output),
         static_cast<const __half*>(weight), static_cast<const __half*>(bias),
@@ -320,7 +320,7 @@ modalities::Status Sm110OperationDriver::quantize_fp8_dynamic(
     if (!values || !output || !scale || !elements || elements > INT_MAX) {
         return invalid("SM110 dynamic FP8 quantization arguments are invalid");
     }
-    ::flashrt_native_quantize_fp8_device_f16_precise(
+    ::quantize_fp8_device_fp16(
         static_cast<const __half*>(values),
         static_cast<__nv_fp8_e4m3*>(output), scale,
         static_cast<int>(elements), reinterpret_cast<cudaStream_t>(stream));
@@ -350,18 +350,6 @@ modalities::Status Sm110OperationDriver::silu_fp16(
                         static_cast<int>(elements),
                         reinterpret_cast<cudaStream_t>(stream));
     return launch_status();
-}
-
-modalities::Status Sm110OperationDriver::precise_silu_fp16(
-    void* values, std::size_t elements, std::uintptr_t stream) const {
-    if (!values || !elements || elements > INT_MAX) {
-        return invalid("SM110 precise FP16 SiLU arguments are invalid");
-    }
-    const cudaError_t rc = flashrt_native_silu_inplace_fp16_precise(
-        static_cast<__half*>(values), elements,
-        reinterpret_cast<cudaStream_t>(stream));
-    return rc == cudaSuccess ? modalities::Status::ok()
-                             : backend(cudaGetErrorString(rc));
 }
 
 modalities::Status Sm110OperationDriver::gate_gelu_fp16(

@@ -12,16 +12,6 @@ __global__ void silu_bf16_kernel(__nv_bfloat16* values, int elements) {
         value / (1.0f + expf(-value)));
 }
 
-__global__ void silu_fp16_precise_kernel(
-    __half* values, std::size_t elements) {
-    const std::size_t index =
-        static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (index >= elements) return;
-    const float value = __half2float(values[index]);
-    values[index] = __float2half_rn(
-        value / (1.0f + expf(-value)));
-}
-
 __global__ void fill_negative_infinity_f32_kernel(
     float* values, std::size_t count) {
     const std::size_t index =
@@ -54,16 +44,6 @@ void flashrt_native_silu_inplace_bf16(
     if (elements <= 0) return;
     silu_bf16_kernel<<<(elements + 255) / 256, 256, 0, stream>>>(
         values, elements);
-}
-
-cudaError_t flashrt_native_silu_inplace_fp16_precise(
-    __half* values, std::size_t elements, cudaStream_t stream) {
-    if (!values || !elements) return cudaErrorInvalidValue;
-    constexpr unsigned int kBlock = 256;
-    silu_fp16_precise_kernel<<<
-        static_cast<unsigned int>((elements + kBlock - 1) / kBlock),
-        kBlock, 0, stream>>>(values, elements);
-    return cudaGetLastError();
 }
 
 void flashrt_native_fill_negative_infinity_f32(

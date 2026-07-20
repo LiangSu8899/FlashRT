@@ -320,7 +320,7 @@ modalities::Status frontend_silu(
     void* state, void* values, std::size_t elements, Pi05Stream stream) {
     Sm110FrontendBindings* binding = bindings(state);
     return ready(binding)
-               ? binding->driver->precise_silu_fp16(
+               ? binding->driver->silu_fp16(
                      values, elements, stream)
                : invalid("SM110 SiLU binding is invalid");
 }

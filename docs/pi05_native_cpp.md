@@ -85,6 +85,13 @@ kernel modules. They are model-independent operation implementations; PI0.5
 model order, dimensions, state rules and checkpoint mapping remain under
 `cpp/models/pi05/`.
 
+The SM110 target therefore reuses the shipped FP16 LayerNorm and dynamic FP8
+quantizer directly. The opt-in gap library is limited to operations absent from
+the common surface, including host-free setup helpers, persisted FP8 weight
+packing, and the explicit padded-stride seqused attention entry point. The
+strict target gate compares calibration scales and raw actions with the
+unchanged Torch producer bit for bit.
+
 | Native C++ | PI0.5 target | Result |
 |---|---|---|
 | OFF | OFF | Existing default build; no native PI0.5 product |

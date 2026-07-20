@@ -81,8 +81,6 @@ public:
                                  std::uintptr_t stream) const;
     modalities::Status silu_fp16(void* values, std::size_t elements,
                                  std::uintptr_t stream) const;
-    modalities::Status precise_silu_fp16(
-        void* values, std::size_t elements, std::uintptr_t stream) const;
     modalities::Status gate_gelu_fp16(
         const void* merged, void* output, int rows, int hidden,
         std::uintptr_t stream) const;

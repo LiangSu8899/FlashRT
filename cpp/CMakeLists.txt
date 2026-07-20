@@ -264,7 +264,6 @@ if(FLASHRT_CPP_WITH_PI05_SM120_TARGET OR
   add_library(flashrt_native_cpp_cuda_support STATIC
     ${_flashrt_csrc_dir}/native_cpp/operations.cu
     ${_flashrt_csrc_dir}/native_cpp/fp8_quantize.cu
-    ${_flashrt_csrc_dir}/native_cpp/layer_norm.cu
     ${_flashrt_csrc_dir}/native_cpp/attention_seqused.cu)
   _flashrt_configure_csrc_target(flashrt_native_cpp_cuda_support)
   target_include_directories(flashrt_native_cpp_cuda_support

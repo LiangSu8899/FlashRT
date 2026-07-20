@@ -236,6 +236,14 @@ native frontend. Propose a genuinely common correction separately with a
 caller inventory, cross-model numerical tests and cache/artifact compatibility
 analysis.
 
+Reuse an existing common operation whenever its contract matches the native
+call site. Do not add a shadow implementation merely to change rounding or
+reduction behavior. A native-only operation is justified only when the common
+surface lacks the required signature, layout, workspace contract or host-free
+setup capability. Numerical parity must be checked against the unchanged
+current producer; matching a branch-local frozen producer that used the same
+shadow implementation is not sufficient evidence.
+
 ### Calibration And Precision
 
 FP8/NVFP4 changes must preserve the calibration cache contract described in

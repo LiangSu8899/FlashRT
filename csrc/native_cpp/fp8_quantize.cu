@@ -168,19 +168,6 @@ void flashrt_native_quantize_fp8_device_precise(
         input, output, device_scale, elements);
 }
 
-void flashrt_native_quantize_fp8_device_f16_precise(
-    const __half* input, __nv_fp8_e4m3* output,
-    float* device_scale, int elements, cudaStream_t stream) {
-    cudaMemsetAsync(device_scale, 0, sizeof(float), stream);
-    const int blocks = reduction_blocks(elements);
-    absmax_packed_kernel<<<blocks, 256, 256 * sizeof(float), stream>>>(
-        input, device_scale, elements);
-    compute_scale_kernel<<<1, 1, 0, stream>>>(device_scale, device_scale);
-    const int output_blocks = ((elements >> 1) + 255) / 256;
-    quantize_activation_kernel<<<output_blocks, 256, 0, stream>>>(
-        input, output, device_scale, elements);
-}
-
 void flashrt_native_quantize_fp8_weight_bf16(
     const __nv_bfloat16* input, __nv_fp8_e4m3* output,
     float* device_scale, int elements, cudaStream_t stream) {

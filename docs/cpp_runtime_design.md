@@ -194,3 +194,11 @@ the Python-oriented build, but it must not contain model topology, checkpoint
 keys, model dimensions, prompt rules or stage policy. Its entry points are
 internal linkage contracts, not another deployment ABI. The model producer's
 shared library exports only its documented C API.
+
+The native directory is a gap layer, not an alternate kernel library. Target
+bindings must call an existing common operation when its public contract is
+already sufficient. A distinct native operation must document the missing
+contract dimension and remain independently named. Producer parity is measured
+against an unchanged base build so a private implementation cannot validate
+itself through a branch-local reference that contains the same numerical
+change.
