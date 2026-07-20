@@ -110,6 +110,8 @@ class Arm:
     output: Callable[[], torch.Tensor]
     teardown: Callable[[], None] | None = None
     refs: Any = None
+    stage: Any = None    # the CapturedStage, if the arm graphed one —
+                         # lets the winning arm feed stage.export()
 
 
 @dataclass
