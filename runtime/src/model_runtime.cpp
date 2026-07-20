@@ -53,6 +53,13 @@ const char* stub_last_error(void*) {
     return "verb not provided by this producer";
 }
 
+int query_no_extensions(const frt_model_runtime_v1* runtime, uint64_t,
+                        uint32_t min_version, const void** out_extension) {
+    if (out_extension) *out_extension = nullptr;
+    if (!runtime || !out_extension || min_version == 0) return -1;
+    return -3;
+}
+
 void copy_verbs(frt_model_runtime_v1* m, const frt_model_runtime_verbs* verbs,
                 void* verbs_self) {
     m->verbs.struct_size = (uint32_t)sizeof(frt_model_runtime_verbs);
@@ -69,6 +76,7 @@ void copy_verbs(frt_model_runtime_v1* m, const frt_model_runtime_verbs* verbs,
     if (!m->verbs.step) m->verbs.step = stub_step;
     if (!m->verbs.last_error) m->verbs.last_error = stub_last_error;
     m->self = verbs_self;
+    m->query_extension = query_no_extensions;
 }
 
 }  // namespace

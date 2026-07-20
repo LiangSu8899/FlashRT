@@ -202,6 +202,17 @@ typedef struct frt_model_runtime_verbs {
 /* ------------------------------------------------------------------ */
 /* The model runtime object.                                           */
 /* ------------------------------------------------------------------ */
+struct frt_model_runtime_v1;
+
+/* Optional capabilities are discovered through an additive tail instead of
+ * growing the ABI-frozen verbs table. Consumers must probe the runtime's
+ * struct_size before reading this function pointer. */
+typedef int (*frt_model_runtime_query_extension_fn)(
+    const struct frt_model_runtime_v1* runtime,
+    uint64_t extension_id,
+    uint32_t min_version,
+    const void** out_extension);
+
 typedef struct frt_model_runtime_v1 {
     uint32_t abi_version;      /* = FRT_MODEL_RUNTIME_ABI_VERSION          */
     uint32_t struct_size;      /* = sizeof(frt_model_runtime_v1)           */
@@ -222,6 +233,9 @@ typedef struct frt_model_runtime_v1 {
     void* owner;
     void (*retain)(void* owner);
     void (*release)(void* owner);
+
+    /* Additive v1 tail. Baseline-prefix producers end before this field. */
+    frt_model_runtime_query_extension_fn query_extension;
 } frt_model_runtime_v1;
 
 /* Minimum byte prefix every v1 consumer may require. Keep this anchored to
@@ -231,6 +245,10 @@ typedef struct frt_model_runtime_v1 {
 #define FRT_MODEL_RUNTIME_V1_BASE_SIZE \
     ((uint32_t)(offsetof(frt_model_runtime_v1, release) + \
                 sizeof(((frt_model_runtime_v1*)0)->release)))
+
+#define FRT_MODEL_RUNTIME_V1_QUERY_EXTENSION_SIZE \
+    ((uint32_t)(offsetof(frt_model_runtime_v1, query_extension) + \
+                sizeof(((frt_model_runtime_v1*)0)->query_extension)))
 
 /* Factory symbol convention for NATIVE model runtimes: a model-runtime .so
  * exports exactly this symbol. Returns a retained object (caller releases). */

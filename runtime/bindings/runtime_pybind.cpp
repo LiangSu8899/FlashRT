@@ -213,6 +213,8 @@ PYBIND11_MODULE(_flashrt_runtime, m) {
 
     m.attr("MODEL_ABI_VERSION") = FRT_MODEL_RUNTIME_ABI_VERSION;
     m.attr("MODEL_V1_BASE_SIZE") = FRT_MODEL_RUNTIME_V1_BASE_SIZE;
+    m.attr("MODEL_V1_QUERY_EXTENSION_SIZE") =
+        FRT_MODEL_RUNTIME_V1_QUERY_EXTENSION_SIZE;
     m.attr("MOD_TENSOR") = (unsigned)FRT_RT_MOD_TENSOR;
     m.attr("MOD_IMAGE") = (unsigned)FRT_RT_MOD_IMAGE;
     m.attr("MOD_TEXT") = (unsigned)FRT_RT_MOD_TEXT;

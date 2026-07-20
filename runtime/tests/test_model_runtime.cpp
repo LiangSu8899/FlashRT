@@ -111,6 +111,12 @@ ASSERT_BASELINE_OFFSET(frt_model_runtime_verbs, last_error);
 static_assert(FRT_MODEL_RUNTIME_V1_BASE_SIZE ==
                   sizeof(abi_baseline::frt_model_runtime_v1),
               "v1 required prefix changed");
+static_assert(FRT_MODEL_RUNTIME_V1_BASE_SIZE ==
+                  offsetof(frt_model_runtime_v1, query_extension),
+              "query_extension must immediately follow the v1 prefix");
+static_assert(FRT_MODEL_RUNTIME_V1_QUERY_EXTENSION_SIZE ==
+                  sizeof(frt_model_runtime_v1),
+              "query_extension must be the only current v1 tail field");
 static_assert(alignof(frt_model_runtime_v1) ==
                   alignof(abi_baseline::frt_model_runtime_v1),
               "frt_model_runtime_v1 prefix alignment changed");
@@ -265,6 +271,9 @@ int main() {
             static_cast<frt_model_runtime_v1*>(baseline_object);
         CHECK(current_view->struct_size == FRT_MODEL_RUNTIME_V1_BASE_SIZE,
               "ABI baseline publishes exactly the v1 required prefix");
+        CHECK(current_view->struct_size <
+                  FRT_MODEL_RUNTIME_V1_QUERY_EXTENSION_SIZE,
+              "tail-aware consumer detects extension absence before reading tail");
 
         current_view->struct_size = FRT_MODEL_RUNTIME_V1_BASE_SIZE - 1;
         CHECK(frt_model_runtime_override_verbs(
@@ -306,6 +315,18 @@ int main() {
     CHECK(m != nullptr, "finish_model");
     CHECK(m->abi_version == FRT_MODEL_RUNTIME_ABI_VERSION &&
           m->struct_size == sizeof(frt_model_runtime_v1), "model ABI stamp");
+    const void* absent_extension = reinterpret_cast<const void*>(0x1);
+    CHECK(m->struct_size >= FRT_MODEL_RUNTIME_V1_QUERY_EXTENSION_SIZE &&
+              m->query_extension &&
+              m->query_extension(m, UINT64_C(0xffff), 1,
+                                 &absent_extension) == -3 &&
+              absent_extension == nullptr,
+          "tail-capable runtime publishes an unsupported query stub");
+    absent_extension = reinterpret_cast<const void*>(0x1);
+    CHECK(m->query_extension(m, UINT64_C(0xffff), 0,
+                             &absent_extension) == -1 &&
+              absent_extension == nullptr,
+          "query rejects version zero and clears output");
     CHECK(m->exp && m->exp->abi_version == FRT_RUNTIME_ABI_VERSION,
           "embedded export is stamped");
     CHECK(m->n_ports == 2 && m->n_stages == 2, "port/stage counts");
