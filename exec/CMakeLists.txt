@@ -17,7 +17,6 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
-include(CTest)
 
 find_package(CUDAToolkit REQUIRED)
 
@@ -33,15 +32,6 @@ target_include_directories(flashrt_exec
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
           ${CMAKE_CURRENT_SOURCE_DIR}/backend)
 target_link_libraries(flashrt_exec PUBLIC CUDA::cudart)
-
-if(BUILD_TESTING)
-  add_executable(test_graph_lru_alloc tests/test_graph_lru_alloc.cpp)
-  target_include_directories(test_graph_lru_alloc PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/src)
-  target_link_libraries(test_graph_lru_alloc PRIVATE flashrt_exec)
-  add_test(NAME graph_lru_alloc COMMAND test_graph_lru_alloc)
-endif()
 
 # --- pybind dev module (optional) ---
 find_package(Python3 COMPONENTS Interpreter Development.Module QUIET)

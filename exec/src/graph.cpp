@@ -4,10 +4,7 @@
 
 void frt_graph_s::touch(frt_shape_key key) {
     for (auto it = lru.begin(); it != lru.end(); ++it) {
-        if (*it == key) {
-            lru.splice(lru.end(), lru, it);
-            return;
-        }
+        if (*it == key) { lru.erase(it); break; }
     }
     lru.push_back(key);  // back = most recently used
 }
