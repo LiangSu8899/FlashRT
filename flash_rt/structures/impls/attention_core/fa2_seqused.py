@@ -1,0 +1,193 @@
+"""attention_core — run attention on the FlashRT FA2 kernel.
+
+A fused attention kernel wants contiguous keys and values; hosts hand
+it an additive mask instead, and a mask that blocks a run of positions
+in the middle of the sequence has no equivalent the kernel accepts. The
+structure resolves that at bind time rather than per call: it reads the
+host's own mask, and when the blocked positions form one contiguous run
+it packs the surviving keys and values into a compact buffer. What is
+left is a dense attention the kernel runs directly.
+
+The packed prefix (everything before the blocked run) belongs to a
+slower cadence — it is the encoder's output for the current
+observation, unchanged across the denoise loop — so it is filled once
+at bind time and refreshed through an update function, exactly as
+:mod:`..cadence_static` does for whole modules. The suffix is written
+per call.
+
+Three qualifications, all decided from real captures:
+
+- ``head_dim`` must be one the kernel supports; otherwise the caller
+  keeps its own path (``bind_attention_core`` returns ``None`` so the
+  host can fall back to a community kernel rather than fail),
+- every query row must see the same mask, and the blocked positions
+  must form a single contiguous run — anything else is not expressible
+  as a packed dense attention,
+- the prefix keys must not move across the loop; a moving prefix means
+  the split is wrong and the parity gate would catch it downstream, so
+  it is rejected here where the reason is still legible.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import torch
+
+from .. import hub_kernel
+
+SUPPORTED_HEAD_DIMS = (64, 96, 128, 256)
+
+
+@dataclass
+class _Scratch:
+    """Output/LSE/workspace shared by same-shaped attention sites."""
+
+    out: torch.Tensor
+    lse: torch.Tensor
+    workspace: object
+
+
+@dataclass
+class PackedKVPlan:
+    """How the host's masked attention maps onto a dense one."""
+
+    prefix: int
+    suffix_start: int
+    suffix_len: int
+    seq_kv: int
+
+    @property
+    def packed(self) -> int:
+        return self.prefix + self.suffix_len
+
+
+def plan_packed_kv(mask: torch.Tensor | None, seq_kv: int) -> PackedKVPlan:
+    """Derive the packing plan from one captured attention mask."""
+    if mask is None:
+        return PackedKVPlan(seq_kv, seq_kv, 0, seq_kv)
+    if mask.dim() < 3:
+        raise ValueError("attention_core: unexpected mask rank")
+    rows = mask.reshape(-1, mask.shape[-2], mask.shape[-1])[0]
+    if not bool((rows == rows[0]).all()):
+        raise ValueError("attention_core: mask differs per query row")
+    row = rows[0].float()
+    blocked = ((row < -1e5) | row.isneginf()).nonzero().flatten()
+    if blocked.numel() == 0:
+        return PackedKVPlan(seq_kv, seq_kv, 0, seq_kv)
+    runs, start, prev = [], None, None
+    for i in blocked.tolist():
+        if start is None:
+            start = prev = i
+        elif i == prev + 1:
+            prev = i
+        else:
+            runs.append((start, prev))
+            start = prev = i
+    runs.append((start, prev))
+    if len(runs) != 1:
+        raise ValueError(
+            f"attention_core: mask blocks {len(runs)} separate runs — "
+            "not expressible as one packed dense attention")
+    lo, hi = runs[0]
+    return PackedKVPlan(lo, hi + 1, seq_kv - (hi + 1), seq_kv)
+
+
+class PackedKVAttention(torch.nn.Module):
+    """Attention over packed keys/values, on the FlashRT FA2 kernel.
+
+    Holds one host module's packed buffers. Call it in place of the
+    host's attention body; the prefix half is refreshed by the update
+    function returned from :func:`bind_attention_core`.
+    """
+
+    def __init__(self, plan: PackedKVPlan, q_shape, kv_heads: int,
+                 dtype: torch.dtype, device, prefix_kv=None,
+                 scratch: "_Scratch | None" = None):
+        super().__init__()
+        self.plan = plan
+        b, heads, seq_q, head_dim = q_shape
+        self.seq_q = seq_q
+        self._kfa = hub_kernel("flashrt/fa2-seqused-runtime", ">=1")
+        self.register_buffer("packed_k", torch.zeros(
+            b, plan.packed, kv_heads, head_dim, device=device,
+            dtype=dtype))
+        self.register_buffer("packed_v", torch.zeros_like(self.packed_k))
+        if prefix_kv is not None:
+            k0, v0 = prefix_kv
+            self.packed_k[:, :plan.prefix] = k0
+            self.packed_v[:, :plan.prefix] = v0
+        # Output, LSE and split-KV workspace are scratch: each site
+        # consumes its result before the next one runs, so sites with
+        # the same shapes share one set. Per-site copies cost real
+        # latency (pi05 r16: 18 private scratches ran 1.5% slower than
+        # one shared set) and buy nothing.
+        if scratch is None:
+            q_sample = torch.empty(b, seq_q, heads, head_dim,
+                                   device=device, dtype=dtype)
+            out, lse = self._kfa.allocate_outputs(q_sample)
+            scratch = _Scratch(out, lse, self._kfa.allocate_workspace(
+                q_sample, self.packed_k))
+        self._scratch = scratch
+
+    def forward(self, query, key, value, *, scale=None):
+        """``query``/``key``/``value`` in the host's (B, H, S, D)."""
+        plan = self.plan
+        q = query.transpose(1, 2).contiguous()
+        if plan.suffix_len:
+            self.packed_k[:, plan.prefix:].copy_(
+                key.transpose(1, 2)[:, plan.suffix_start:])
+            self.packed_v[:, plan.prefix:].copy_(
+                value.transpose(1, 2)[:, plan.suffix_start:])
+        sc = self._scratch
+        return self._kfa.forward_static(
+            q, self.packed_k, self.packed_v, out=sc.out,
+            softmax_lse=sc.lse, workspace=sc.workspace,
+            softmax_scale=scale)
+
+
+def bind_attention_core(captures, *, prefix_static_rtol: float = 1e-3):
+    """Bind one packed-KV attention per site from real captures.
+
+    ``captures`` is a sequence of per-site dicts holding ``q`` (one
+    captured query, host layout), ``keys``/``values`` (the tensors that
+    site produced across the hot loop, oldest first) and ``mask``.
+    Returns ``(modules, update)``, or ``None`` when the head dim is
+    unsupported so the caller can keep a fallback path.
+    """
+    if not captures:
+        raise ValueError("attention_core: no captures")
+    head_dim = captures[0]["q"].shape[-1]
+    if head_dim not in SUPPORTED_HEAD_DIMS:
+        return None
+
+    modules, scratch = [], None
+    for site, cap in enumerate(captures):
+        keys = cap["keys"]
+        plan = plan_packed_kv(cap.get("mask"), keys[0].shape[2])
+        first = keys[0][:, :, :plan.prefix]
+        for other in keys[1:]:
+            if not torch.allclose(first, other[:, :, :plan.prefix],
+                                  rtol=prefix_static_rtol,
+                                  atol=prefix_static_rtol):
+                raise ValueError(
+                    f"attention_core: site {site} prefix keys move "
+                    "across the loop — the cadence split is wrong")
+        q = cap["q"]
+        core = PackedKVAttention(
+            plan, q.shape, keys[0].shape[1], q.dtype, q.device,
+            prefix_kv=(keys[0].transpose(1, 2)[:, :plan.prefix],
+                       cap["values"][0].transpose(1, 2)[:, :plan.prefix]),
+            scratch=scratch)
+        scratch = scratch or core._scratch
+        modules.append(core)
+
+    def update(fresh_kv) -> None:
+        """Refresh every site's prefix from freshly computed K/V."""
+        with torch.no_grad():
+            for mod, (k, v) in zip(modules, fresh_kv):
+                p = mod.plan.prefix
+                mod.packed_k[:, :p].copy_(k.transpose(1, 2)[:, :p])
+                mod.packed_v[:, :p].copy_(v.transpose(1, 2)[:, :p])
+
+    return modules, update
