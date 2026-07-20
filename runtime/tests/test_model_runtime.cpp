@@ -38,6 +38,12 @@ namespace abi_baseline = flashrt::model_runtime_v1_abi::baseline;
 
 static_assert(FRT_MODEL_RUNTIME_ABI_VERSION == 1u,
               "v1 model-runtime ABI version changed");
+static_assert(FRT_GENERIC_STAGE_GRAPH == 0 &&
+                  FRT_GENERIC_STAGE_OPAQUE == 1,
+              "generic executor values are ABI-frozen");
+static_assert(FRT_GENERIC_STAGE_PLAN_EXT_V1_SIZE ==
+                  sizeof(frt_generic_stage_plan_ext_v1),
+              "generic plan v1 currently has no optional tail");
 ASSERT_BASELINE_VALUE(FRT_RT_MOD_TENSOR);
 ASSERT_BASELINE_VALUE(FRT_RT_MOD_IMAGE);
 ASSERT_BASELINE_VALUE(FRT_RT_MOD_TEXT);
@@ -161,6 +167,17 @@ static int v_prepare(void* s, uint32_t, frt_shape_key) {
 }
 static int v_step(void* s) { ((VerbLog*)s)->step++; return 0; }
 static const char* v_last_error(void*) { return ""; }
+static const char* v_base_error(void*) { return "base opaque error"; }
+static const char* v_override_error(void*) { return "override IO error"; }
+
+struct OpaqueLog { int calls = 0; uint32_t last_ref = 0; };
+static int run_opaque(void* self, uint32_t executor_ref) {
+    auto* log = static_cast<OpaqueLog*>(self);
+    log->calls++;
+    log->last_ref = executor_ref;
+    return 0;
+}
+static int run_opaque_noop(void*, uint32_t) { return 0; }
 
 struct Owner { int retains = 0, releases = 0; };
 static void owner_retain(void* p)  { ((Owner*)p)->retains++; }
@@ -247,12 +264,358 @@ int main() {
                   FRT_RT_LAYOUT_FLAT, FRT_RT_PORT_IN, FRT_RT_PORT_SETUP, 0,
                   shape, 1, 0, nullptr, 0, 0) == 0,
               "add non-staged port");
+        frt_model_runtime_verbs step_verbs{};
+        step_verbs.struct_size = sizeof(step_verbs);
+        step_verbs.step = v_step;
+        VerbLog setup_log;
         frt_model_runtime_v1* sm = frt_runtime_builder_finish_model(
-            sb, nullptr, nullptr, nullptr, nullptr, nullptr);
-        CHECK(sm && sm->verbs.step(sm->self) == -3 &&
+            sb, &step_verbs, &setup_log, nullptr, nullptr, nullptr);
+        CHECK(sm && sm->verbs.step(sm->self) == 0 &&
+                  sm->verbs.set_input(sm->self, 0, nullptr, 0, -1) == -3 &&
                   sm->verbs.last_error(sm->self)[0] != '\0',
-              "missing non-staged verbs retain unsupported stubs");
+              "non-authority verbs may retain unsupported stubs");
         sm->release(sm->owner);
+    }
+
+    /* --- generic selected-plan validation and discovery --- */
+    {
+        frt_model_runtime_verbs generic_verbs{};
+        generic_verbs.struct_size = sizeof(generic_verbs);
+        generic_verbs.step = v_step;
+        generic_verbs.last_error = v_base_error;
+        OpaqueLog opaque_log;
+
+        frt_runtime_builder gb = make_builder();
+        CHECK(frt_runtime_builder_add_generic_stage(
+                  gb, "", FRT_GENERIC_STAGE_OPAQUE, 1, nullptr, 0) < 0,
+              "generic stage rejects an empty name");
+        CHECK(frt_runtime_builder_add_generic_stage(
+                  gb, "bad\nname", FRT_GENERIC_STAGE_OPAQUE, 1,
+                  nullptr, 0) < 0,
+              "generic stage rejects ASCII controls");
+        CHECK(frt_runtime_builder_add_generic_stage(
+                  gb, "\xc0\x80", FRT_GENERIC_STAGE_OPAQUE, 1,
+                  nullptr, 0) < 0,
+              "generic stage rejects invalid UTF-8");
+        std::string too_long(FRT_GENERIC_STAGE_NAME_MAX_BYTES + 1, 'x');
+        CHECK(frt_runtime_builder_add_generic_stage(
+                  gb, too_long.c_str(), FRT_GENERIC_STAGE_OPAQUE, 1,
+                  nullptr, 0) < 0,
+              "generic stage enforces the frozen name byte limit");
+        CHECK(frt_runtime_builder_add_generic_stage(
+                  gb, "bad-kind", 2, 1, nullptr, 0) < 0,
+              "generic stage rejects unknown executor kinds");
+        CHECK(frt_runtime_builder_add_generic_stage(
+                  gb, "bad-graph", FRT_GENERIC_STAGE_GRAPH, 99,
+                  nullptr, 0) < 0,
+              "generic graph stage rejects an unknown graph");
+        CHECK(frt_runtime_builder_add_generic_stage(
+                  gb, "context:main", FRT_GENERIC_STAGE_OPAQUE, 17,
+                  nullptr, 0) == 0,
+              "generic stage accepts delimiter-safe names");
+        CHECK(frt_runtime_builder_add_generic_stage(
+                  gb, "context:main", FRT_GENERIC_STAGE_OPAQUE, 18,
+                  nullptr, 0) < 0,
+              "generic stage names are unique");
+        const uint32_t duplicate_deps[2] = {0, 0};
+        CHECK(frt_runtime_builder_add_generic_stage(
+                  gb, "bad-deps", FRT_GENERIC_STAGE_OPAQUE, 19,
+                  duplicate_deps, 2) < 0,
+              "generic dependencies must be strictly increasing");
+        const uint32_t future_dep[1] = {1};
+        CHECK(frt_runtime_builder_add_generic_stage(
+                  gb, "future", FRT_GENERIC_STAGE_OPAQUE, 19,
+                  future_dep, 1) < 0,
+              "generic dependencies only reference earlier stages");
+        const uint32_t after_context[1] = {0};
+        CHECK(frt_runtime_builder_add_generic_stage(
+                  gb, "action", FRT_GENERIC_STAGE_OPAQUE, 42,
+                  after_context, 1) == 0,
+              "generic stage records an ordered dependency");
+        CHECK(frt_runtime_builder_set_generic_stage_runner(
+                  gb, &opaque_log, run_opaque) == 0 &&
+              frt_runtime_builder_set_generic_stage_runner(
+                  gb, &opaque_log, run_opaque) < 0,
+              "generic runner is registered exactly once");
+        frt_model_runtime_v1* gm = frt_runtime_builder_finish_model(
+            gb, &generic_verbs, nullptr, nullptr, nullptr, nullptr);
+        CHECK(gm && gm->n_stages == 0,
+              "generic plan is the sole schedulable authority");
+
+        const void* extension = reinterpret_cast<const void*>(0x1);
+        CHECK(gm->query_extension(gm, FRT_EXT_GENERIC_STAGE_PLAN_V1, 1,
+                                  &extension) == 0 && extension,
+              "generic extension query succeeds at version one");
+        auto* plan = static_cast<const frt_generic_stage_plan_ext_v1*>(extension);
+        CHECK(plan->abi_version == 1 &&
+                  plan->struct_size == sizeof(*plan) && plan->n_stages == 2 &&
+                  std::strcmp(plan->stages[0].name, "context:main") == 0 &&
+                  plan->stages[1].executor_ref == 42 &&
+                  plan->stages[1].n_after == 1 &&
+                  plan->stages[1].after[0] == 0,
+              "generic extension table and descriptors remain stable");
+        CHECK(plan->run_opaque(plan->stage_self,
+                               plan->stages[1].executor_ref) == 0 &&
+                  opaque_log.calls == 1 && opaque_log.last_ref == 42,
+              "opaque execution uses executor_ref rather than stage index");
+        const void* stable_extension = nullptr;
+        CHECK(gm->query_extension(gm, FRT_EXT_GENERIC_STAGE_PLAN_V1, 1,
+                                  &stable_extension) == 0 &&
+                  stable_extension == extension,
+              "query returns a lifetime-stable extension table");
+        extension = reinterpret_cast<const void*>(0x1);
+        CHECK(gm->query_extension(gm, FRT_EXT_GENERIC_STAGE_PLAN_V1, 2,
+                                  &extension) == -3 && !extension,
+              "query rejects an unsupported extension version");
+        extension = reinterpret_cast<const void*>(0x1);
+        CHECK(gm->query_extension(gm, UINT64_C(0xffff), 1,
+                                  &extension) == -3 && !extension,
+              "query rejects unknown extension IDs and clears output");
+        extension = reinterpret_cast<const void*>(0x1);
+        CHECK(gm->query_extension(nullptr, FRT_EXT_GENERIC_STAGE_PLAN_V1, 1,
+                                  &extension) == -1 && !extension &&
+                  gm->query_extension(gm, FRT_EXT_GENERIC_STAGE_PLAN_V1, 1,
+                                      nullptr) == -1,
+              "query rejects null runtime/output arguments without mutation");
+        std::string generic_id = gm->exp->identity;
+        CHECK(generic_id.find(
+                  "gstage-v1:0:12:context:main:1:17:0:\n") !=
+                  std::string::npos &&
+              generic_id.find("gstage-v1:1:6:action:1:42:1:0\n") !=
+                  std::string::npos,
+              "generic stages use length-delimited canonical identity records");
+        VerbLog override_log;
+        frt_model_runtime_verbs replacement_verbs = generic_verbs;
+        replacement_verbs.last_error = v_override_error;
+        frt_model_runtime_v1* generic_override =
+            frt_model_runtime_override_verbs(
+                gm, &replacement_verbs, &override_log, nullptr, nullptr,
+                nullptr);
+        const void* forwarded_extension = nullptr;
+        CHECK(generic_override &&
+                  generic_override->query_extension(
+                      generic_override, FRT_EXT_GENERIC_STAGE_PLAN_V1, 1,
+                      &forwarded_extension) == 0 &&
+                  forwarded_extension == stable_extension,
+              "all-OPAQUE override forwards the base extension table");
+        auto* forwarded_plan =
+            static_cast<const frt_generic_stage_plan_ext_v1*>(
+                forwarded_extension);
+        CHECK(forwarded_plan->run_opaque(forwarded_plan->stage_self, 73) == 0 &&
+                  opaque_log.calls == 2 && opaque_log.last_ref == 73,
+              "override preserves the base stage_self and runner");
+        CHECK(std::strcmp(generic_override->verbs.last_error(
+                              generic_override->self),
+                          "base opaque error") == 0,
+              "generic override preserves the base authoritative error source");
+        gm->release(gm->owner);
+        CHECK(generic_override->query_extension(
+                  generic_override, FRT_EXT_GENERIC_STAGE_PLAN_V1, 1,
+                  &forwarded_extension) == 0,
+              "override retains extension storage after base release");
+        generic_override->release(generic_override->owner);
+
+        frt_runtime_builder empty = make_builder();
+        CHECK(frt_runtime_builder_set_generic_stage_runner(
+                  empty, nullptr, run_opaque_noop) == 0 &&
+              frt_runtime_builder_finish_model(
+                  empty, &generic_verbs, nullptr, nullptr, nullptr,
+                  nullptr) == nullptr,
+              "an explicitly present empty generic plan is rejected");
+        CHECK(frt_runtime_builder_add_generic_stage(
+                  empty, "infer", FRT_GENERIC_STAGE_OPAQUE, 7,
+                  nullptr, 0) == 0,
+              "empty-plan validation failure leaves the builder retryable");
+        frt_model_runtime_v1* repaired = frt_runtime_builder_finish_model(
+            empty, &generic_verbs, nullptr, nullptr, nullptr, nullptr);
+        CHECK(repaired != nullptr, "repaired generic plan finishes");
+        repaired->release(repaired->owner);
+
+        frt_runtime_builder utf8 = make_builder();
+        CHECK(frt_runtime_builder_add_generic_stage(
+                  utf8, "\xe9\x98\xb6\xe6\xae\xb5",
+                  FRT_GENERIC_STAGE_OPAQUE, 5, nullptr, 0) == 0 &&
+              frt_runtime_builder_set_generic_stage_runner(
+                  utf8, nullptr, run_opaque_noop) == 0,
+              "generic stage accepts valid UTF-8 names");
+        repaired = frt_runtime_builder_finish_model(
+            utf8, &generic_verbs, nullptr, nullptr, nullptr, nullptr);
+        CHECK(repaired && std::string(repaired->exp->identity).find(
+                  "gstage-v1:0:6:") != std::string::npos,
+              "canonical name length counts UTF-8 bytes");
+        repaired->release(repaired->owner);
+
+        frt_runtime_builder missing_runner = make_builder();
+        CHECK(frt_runtime_builder_add_generic_stage(
+                  missing_runner, "infer", FRT_GENERIC_STAGE_OPAQUE, 8,
+                  nullptr, 0) == 0 &&
+              frt_runtime_builder_finish_model(
+                  missing_runner, &generic_verbs, nullptr, nullptr, nullptr,
+                  nullptr) == nullptr,
+              "OPAQUE plan without a registered runner is rejected");
+        CHECK(frt_runtime_builder_set_generic_stage_runner(
+                  missing_runner, nullptr, run_opaque_noop) == 0,
+              "missing-runner rejection leaves builder retryable");
+        frt_model_runtime_verbs no_error = generic_verbs;
+        no_error.last_error = nullptr;
+        CHECK(frt_runtime_builder_finish_model(
+                  missing_runner, &no_error, nullptr, nullptr, nullptr,
+                  nullptr) == nullptr,
+              "OPAQUE plan requires a real authoritative last_error verb");
+        repaired = frt_runtime_builder_finish_model(
+            missing_runner, &generic_verbs, nullptr, nullptr, nullptr, nullptr);
+        CHECK(repaired != nullptr,
+              "runner/error validation failures do not consume builder");
+        repaired->release(repaired->owner);
+
+        frt_runtime_builder pure_graph = make_builder();
+        CHECK(frt_runtime_builder_add_generic_stage(
+                  pure_graph, "graph", FRT_GENERIC_STAGE_GRAPH, 0,
+                  nullptr, 0) == 0 &&
+              frt_runtime_builder_set_generic_stage_runner(
+                  pure_graph, nullptr, run_opaque_noop) == 0 &&
+              frt_runtime_builder_finish_model(
+                  pure_graph, &generic_verbs, nullptr, nullptr, nullptr,
+                  nullptr) == nullptr,
+              "pure GRAPH generic plan is rejected in favor of legacy stages");
+        const uint32_t after_graph[1] = {0};
+        CHECK(frt_runtime_builder_add_generic_stage(
+                  pure_graph, "opaque", FRT_GENERIC_STAGE_OPAQUE, 9,
+                  after_graph, 1) == 0,
+              "a mixed generic plan can repair the pure-GRAPH rejection");
+        repaired = frt_runtime_builder_finish_model(
+            pure_graph, &generic_verbs, nullptr, nullptr, nullptr, nullptr);
+        CHECK(repaired != nullptr, "mixed GRAPH/OPAQUE generic plan finishes");
+        CHECK(frt_model_runtime_override_verbs(
+                  repaired, &generic_verbs, nullptr, nullptr, nullptr,
+                  nullptr) == nullptr,
+              "mixed generic plan rejects verb override in M0");
+        repaired->release(repaired->owner);
+
+        frt_runtime_builder legacy = make_builder();
+        CHECK(frt_runtime_builder_add_stage(legacy, 0, nullptr, 0) == 0 &&
+              frt_runtime_builder_add_generic_stage(
+                  legacy, "opaque", FRT_GENERIC_STAGE_OPAQUE, 1,
+                  nullptr, 0) < 0,
+              "legacy authority rejects a second generic authority");
+        repaired = frt_runtime_builder_finish_model(
+            legacy, &generic_verbs, nullptr, nullptr, nullptr, nullptr);
+        CHECK(repaired != nullptr, "rejected second authority does not mutate builder");
+        repaired->release(repaired->owner);
+
+        frt_runtime_builder no_authority = make_builder();
+        CHECK(frt_runtime_builder_finish_model(
+                  no_authority, nullptr, nullptr, nullptr, nullptr,
+                  nullptr) == nullptr,
+              "runtime without a plan or real step is rejected");
+        repaired = frt_runtime_builder_finish_model(
+            no_authority, &generic_verbs, nullptr, nullptr, nullptr, nullptr);
+        CHECK(repaired != nullptr, "step-only runtime is an explicit authority");
+        CHECK(frt_model_runtime_override_verbs(
+                  repaired, &generic_verbs, nullptr, nullptr, nullptr,
+                  nullptr) == nullptr,
+              "step-only runtime rejects identity-preserving verb override");
+        repaired->release(repaired->owner);
+    }
+
+    /* --- metadata-only provider: identity anchor without exec resources --- */
+    {
+        CHECK(frt_runtime_builder_create(nullptr) == nullptr,
+              "ordinary runtime builder continues to reject null ctx");
+        frt_runtime_builder metadata =
+            frt_model_runtime_builder_create_metadata();
+        frt_shape_key key = 0;
+        CHECK(metadata &&
+                  frt_runtime_builder_add_stream(
+                      metadata, "main", 0, 0, nullptr) < 0 &&
+                  frt_runtime_builder_add_graph(
+                      metadata, "graph", FAKE_G0, 0, &key, 1, 0) < 0 &&
+                  frt_runtime_builder_add_buffer(
+                      metadata, "buffer", FAKE_B0, 16, FRT_RT_ROLE_INPUT) < 0 &&
+                  frt_runtime_builder_add_region(
+                      metadata, "region", FAKE_B0, 0, 16,
+                      FRT_RT_REGION_SNAPSHOT) < 0 &&
+                  frt_runtime_builder_add_stage(
+                      metadata, 0, nullptr, 0) < 0,
+              "metadata builder rejects every FlashRT resource declaration");
+        const int64_t scalar[1] = {1};
+        CHECK(frt_runtime_builder_add_port(
+                  metadata, "swap", FRT_RT_MOD_TENSOR, FRT_RT_DTYPE_F32,
+                  FRT_RT_LAYOUT_FLAT, FRT_RT_PORT_IN, FRT_RT_PORT_SWAP, 0,
+                  scalar, 1, 0, FAKE_B0, 0, 4) < 0,
+              "metadata builder rejects SWAP windows");
+        CHECK(frt_runtime_builder_add_generic_stage(
+                  metadata, "graph", FRT_GENERIC_STAGE_GRAPH, 0,
+                  nullptr, 0) < 0,
+              "metadata builder rejects GRAPH and mixed plans");
+        CHECK(frt_runtime_builder_add_port(
+                  metadata, "input", FRT_RT_MOD_TENSOR, FRT_RT_DTYPE_F32,
+                  FRT_RT_LAYOUT_FLAT, FRT_RT_PORT_IN, FRT_RT_PORT_STAGED, 1,
+                  scalar, 1, 0, nullptr, 0, 0) == 0 &&
+                  frt_runtime_builder_add_identity(
+                      metadata, "provider", "fixture") == 0 &&
+                  frt_runtime_builder_set_manifest(
+                      metadata, "{\"provider\":\"fixture\"}") == 0 &&
+                  frt_runtime_builder_add_generic_stage(
+                      metadata, "infer", FRT_GENERIC_STAGE_OPAQUE, 101,
+                      nullptr, 0) == 0,
+              "metadata builder accepts identity, discovery, staged IO and OPAQUE plan");
+        OpaqueLog metadata_log;
+        CHECK(frt_runtime_builder_set_generic_stage_runner(
+                  metadata, &metadata_log, run_opaque) == 0,
+              "metadata builder records its blocking OPAQUE runner");
+        frt_model_runtime_verbs metadata_verbs{};
+        metadata_verbs.struct_size = sizeof(metadata_verbs);
+        metadata_verbs.set_input = v_set_input;
+        metadata_verbs.last_error = v_last_error;
+        VerbLog metadata_verb_log;
+        Owner metadata_owner;
+        frt_model_runtime_v1* mm = frt_runtime_builder_finish_model(
+            metadata, &metadata_verbs, &metadata_verb_log, &metadata_owner,
+            owner_retain, owner_release);
+        CHECK(mm && mm->exp && !mm->exp->ctx &&
+                  mm->exp->n_streams == 0 && mm->exp->n_graphs == 0 &&
+                  mm->exp->n_buffers == 0 &&
+                  mm->exp->n_capsule_regions == 0 &&
+                  mm->exp->identity && mm->exp->fingerprint != 0,
+              "metadata runtime publishes one valid zero-resource export anchor");
+        const void* metadata_extension = nullptr;
+        CHECK(mm->query_extension(mm, FRT_EXT_GENERIC_STAGE_PLAN_V1, 1,
+                                  &metadata_extension) == 0 &&
+                  static_cast<const frt_generic_stage_plan_ext_v1*>(
+                      metadata_extension)->n_stages == 1,
+              "metadata runtime publishes its all-OPAQUE selected plan");
+        frt_runtime_stage_desc fake_stage{};
+        const int retains_before_wrap = metadata_owner.retains;
+        CHECK(frt_model_runtime_wrap(
+                  mm->exp, nullptr, 0, &fake_stage, 1, nullptr, nullptr,
+                  nullptr, nullptr) == nullptr &&
+                  metadata_owner.retains == retains_before_wrap,
+              "legacy wrapper rejects a null-ctx metadata anchor without retaining it");
+        mm->release(mm->owner);
+        CHECK(metadata_owner.retains == 1 && metadata_owner.releases == 1,
+              "metadata runtime retains and releases its sole owner exactly once");
+
+        frt_runtime_builder metadata_step =
+            frt_model_runtime_builder_create_metadata();
+        frt_runtime_builder_add_identity(metadata_step, "provider", "step");
+        frt_model_runtime_verbs step_only_verbs{};
+        step_only_verbs.struct_size = sizeof(step_only_verbs);
+        step_only_verbs.step = v_step;
+        VerbLog metadata_step_log;
+        mm = frt_runtime_builder_finish_model(
+            metadata_step, &step_only_verbs, &metadata_step_log,
+            nullptr, nullptr, nullptr);
+        CHECK(mm && !mm->exp->ctx && mm->verbs.step(mm->self) == 0 &&
+                  metadata_step_log.step == 1,
+              "metadata runtime supports explicit step-only authority");
+        mm->release(mm->owner);
+
+        frt_runtime_builder metadata_export =
+            frt_model_runtime_builder_create_metadata();
+        CHECK(frt_runtime_builder_finish(
+                  metadata_export, nullptr, nullptr, nullptr) == nullptr,
+              "metadata-only builder cannot publish a standalone export");
     }
 
     /* --- independently compiled ABI baseline -> current prefix consumer --- */
@@ -349,6 +712,8 @@ int main() {
     CHECK(m->exp->fingerprint ==
               frt_runtime_fingerprint(id.data(), id.size()),
           "fingerprint == hash(identity)");
+    CHECK(m->exp->fingerprint == UINT64_C(0xd1393a80cdef15b3),
+          "legacy identity and fingerprint remain exact across CORE-B");
 
     /* port schema change => different fingerprint */
     {

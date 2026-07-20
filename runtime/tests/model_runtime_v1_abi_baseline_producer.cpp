@@ -26,6 +26,9 @@ void* create_baseline(const frt_runtime_export_v1* exp, void* owner,
     model->abi_version = FRT_MODEL_RUNTIME_ABI_VERSION;
     model->struct_size = (uint32_t)sizeof(*model);
     model->exp = exp;
+    static const frt_runtime_stage_desc stage = {0, 0, nullptr};
+    model->stages = &stage;
+    model->n_stages = 1;
     model->verbs.struct_size = (uint32_t)sizeof(model->verbs);
     model->verbs.set_input = unsupported_set_input;
     model->verbs.get_output = unsupported_get_output;
@@ -43,3 +46,14 @@ void destroy_baseline(void* model) {
 }
 
 }  // namespace flashrt::model_runtime_v1_abi
+
+extern "C" void* flashrt_model_runtime_v1_abi_baseline_create(
+        const frt_runtime_export_v1* exp, void* owner,
+        void (*retain_owner)(void*), void (*release_owner)(void*)) {
+    return flashrt::model_runtime_v1_abi::create_baseline(
+        exp, owner, retain_owner, release_owner);
+}
+
+extern "C" void flashrt_model_runtime_v1_abi_baseline_destroy(void* model) {
+    flashrt::model_runtime_v1_abi::destroy_baseline(model);
+}

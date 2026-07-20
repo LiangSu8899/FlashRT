@@ -8,6 +8,7 @@
 #include "internal.h"
 
 #include <cstdio>
+#include <cstring>
 
 namespace frt_rt {
 
@@ -91,6 +92,22 @@ void finish_export_into(Holder* h, frt_runtime_builder_s* b,
         }
         id += '\n';
     }
+    for (size_t i = 0; i < h->n_generic_stages; ++i) {
+        const auto& s = h->generic_stages[i];
+        const size_t name_len = std::strlen(s.name);
+        std::snprintf(line, sizeof(line), "gstage-v1:%zu:%zu:", i, name_len);
+        id += line;
+        id.append(s.name, name_len);
+        std::snprintf(line, sizeof(line), ":%u:%u:%u:", s.executor_kind,
+                      s.executor_ref, s.n_after);
+        id += line;
+        for (uint32_t d = 0; d < s.n_after; ++d) {
+            std::snprintf(line, sizeof(line), "%s%u", d ? "," : "",
+                          s.after[d]);
+            id += line;
+        }
+        id += '\n';
+    }
     h->identity = std::move(id);
 
     h->user_owner = owner;
@@ -126,10 +143,17 @@ extern "C" frt_runtime_builder frt_runtime_builder_create(frt_ctx ctx) {
     return b;
 }
 
+extern "C" frt_runtime_builder frt_model_runtime_builder_create_metadata() {
+    auto* b = new frt_runtime_builder_s();
+    b->h = new Holder();
+    b->metadata_only = true;
+    return b;
+}
+
 extern "C" int frt_runtime_builder_add_stream(frt_runtime_builder b,
                                               const char* name, int stream_id,
                                               int priority, void* native_handle) {
-    if (!b || !name || stream_id < 0) return -1;
+    if (!b || b->metadata_only || !name || stream_id < 0) return -1;
     frt_runtime_stream_desc d{};
     d.name = stored(b->h, name);
     d.stream_id = stream_id;
@@ -144,7 +168,7 @@ extern "C" int frt_runtime_builder_add_graph(frt_runtime_builder b,
                                              frt_shape_key default_key,
                                              const frt_shape_key* keys,
                                              uint64_t n_keys, int stream_id) {
-    if (!b || !name || !g || (n_keys && !keys)) return -1;
+    if (!b || b->metadata_only || !name || !g || (n_keys && !keys)) return -1;
     b->h->key_arrays.emplace_back(keys, keys + n_keys);
     frt_runtime_graph_desc d{};
     d.name = stored(b->h, name);
@@ -160,7 +184,7 @@ extern "C" int frt_runtime_builder_add_graph(frt_runtime_builder b,
 extern "C" int frt_runtime_builder_add_buffer(frt_runtime_builder b,
                                               const char* name, frt_buffer buf,
                                               uint64_t bytes, uint32_t role) {
-    if (!b || !name || !buf) return -1;
+    if (!b || b->metadata_only || !name || !buf) return -1;
     frt_runtime_buffer_desc d{};
     d.name = stored(b->h, name);
     d.handle = buf;
@@ -174,7 +198,7 @@ extern "C" int frt_runtime_builder_add_region(frt_runtime_builder b,
                                               const char* name, frt_buffer buf,
                                               uint64_t offset, uint64_t bytes,
                                               uint32_t flags) {
-    if (!b || !name || !buf || !bytes) return -1;
+    if (!b || b->metadata_only || !name || !buf || !bytes) return -1;
     frt_runtime_region_desc d{};
     d.name = stored(b->h, name);
     d.buffer = buf;
@@ -220,9 +244,15 @@ extern "C" frt_runtime_export_v1* frt_runtime_builder_finish(
         frt_runtime_builder b, void* owner,
         void (*retain_owner)(void*), void (*release_owner)(void*)) {
     if (!b) return nullptr;
+    if (b->metadata_only) {
+        delete b->h;
+        delete b;
+        return nullptr;
+    }
     /* Ports/stages declare a MODEL runtime; a plain export cannot carry
      * them — use frt_runtime_builder_finish_model instead. */
-    if (!b->h->ports.empty() || !b->h->stages.empty()) return nullptr;
+    if (!b->h->ports.empty() || !b->h->stages.empty() ||
+        b->h->generic_plan_present) return nullptr;
     Holder* h = b->h;
     frt_rt::finish_export_into(h, b, owner, retain_owner, release_owner);
     delete b;  /* h lives on inside the export */

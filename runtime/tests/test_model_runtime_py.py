@@ -24,8 +24,9 @@ import _flashrt_runtime as rt
 
 import flash_rt.runtime.export as export_mod
 from flash_rt.runtime.export import (
-    BufferSpec, GraphSpec, PortSpec, RegionSpec, StageSpec, StreamSpec,
-    build_model_runtime, DTYPE, LAYOUT, MODALITY, UPDATE,
+    BufferSpec, GenericStageSpec, GraphSpec, PortSpec, RegionSpec, StageSpec,
+    StreamSpec, build_metadata_model_runtime, build_model_runtime,
+    DTYPE, LAYOUT, MODALITY, UPDATE,
 )
 from flash_rt.subgraphs.stage_plan import (
     StagePlan,
@@ -77,6 +78,27 @@ class ModelV1(ctypes.Structure):
                 ("owner", ctypes.c_void_p),
                 ("retain", ctypes.CFUNCTYPE(None, ctypes.c_void_p)),
                 ("release", ctypes.CFUNCTYPE(None, ctypes.c_void_p))]
+
+
+class ModelV1Tail(ctypes.Structure):
+    _fields_ = ModelV1._fields_ + [("query_extension", ctypes.c_void_p)]
+
+
+class GenericStageDesc(ctypes.Structure):
+    _fields_ = [("name", ctypes.c_char_p),
+                ("executor_kind", ctypes.c_uint32),
+                ("executor_ref", ctypes.c_uint32),
+                ("n_after", ctypes.c_uint32),
+                ("after", ctypes.POINTER(ctypes.c_uint32))]
+
+
+class GenericStagePlan(ctypes.Structure):
+    _fields_ = [("abi_version", ctypes.c_uint32),
+                ("struct_size", ctypes.c_uint32),
+                ("stages", ctypes.POINTER(GenericStageDesc)),
+                ("n_stages", ctypes.c_uint64),
+                ("stage_self", ctypes.c_void_p),
+                ("run_opaque", ctypes.c_void_p)]
 
 
 def make_setup():
@@ -243,6 +265,7 @@ def check_low_level_staged_builder_guard(setup):
         final_owner,
         set_input=lambda port, payload, stream: 0,
         get_output=lambda port, stream: b"",
+        step=lambda: 0,
     )
     del final_owner
     gc.collect()
@@ -388,6 +411,74 @@ def check_vjp_guided_port_lowering(setup):
         mr.release()
 
 
+def check_generic_and_metadata(setup):
+    ctx, sid, _, _, g = setup
+    opaque_refs = []
+    def make_generic(executor_ref=91):
+        return build_model_runtime(
+            ctx,
+            streams=[StreamSpec("main", sid)],
+            graphs=[GraphSpec("graph", g)],
+            generic_stages=[
+                GenericStageSpec("graph", "graph", 0),
+                GenericStageSpec("opaque:decode", "opaque", executor_ref,
+                                 after=(0,)),
+            ],
+            identity={"provider": "python-fixture"},
+            step=lambda: 0,
+            run_opaque=lambda ref: opaque_refs.append(ref) or 0,
+        )
+
+    generic = make_generic()
+    try:
+        check("Python generic plan is the sole stage authority",
+              generic.stages() == [] and generic.generic_stages() == [
+                  {"name": "graph", "executor_kind": rt.GENERIC_STAGE_GRAPH,
+                   "executor_ref": 0, "after": []},
+                  {"name": "opaque:decode",
+                   "executor_kind": rt.GENERIC_STAGE_OPAQUE,
+                   "executor_ref": 91, "after": [0]},
+              ])
+        check("Python generic identity is canonical",
+              "gstage-v1:1:13:opaque:decode:1:91:1:0\n" in generic.identity)
+        check("Python OPAQUE trampoline receives executor_ref",
+              rt.model_run_opaque(generic.ptr, 91) == 0 and opaque_refs == [91])
+        same = make_generic()
+        changed = make_generic(92)
+        try:
+            check("generic fingerprint is deterministic and ref-sensitive",
+                  same.fingerprint == generic.fingerprint and
+                  changed.fingerprint != generic.fingerprint)
+        finally:
+            same.release()
+            changed.release()
+    finally:
+        generic.release()
+
+    metadata_refs = []
+    metadata = build_metadata_model_runtime(
+        ports=[PortSpec("input", "tensor", "f32", "flat", "in", "staged",
+                        shape=(1,), required=True)],
+        generic_stages=[GenericStageSpec("infer", "opaque", 7)],
+        identity={"provider": "metadata-fixture"},
+        set_input=lambda port, payload, stream: 0,
+        run_opaque=lambda ref: metadata_refs.append(ref) or 0,
+    )
+    try:
+        check("Python metadata runtime has a zero-resource export anchor",
+              rt.export_counts(metadata.export_ptr) == {
+                  "streams": 0, "graphs": 0, "buffers": 0,
+                  "capsule_regions": 0})
+        check("Python metadata runtime publishes all-OPAQUE plan",
+              metadata.generic_stages() == [
+                  {"name": "infer", "executor_kind": rt.GENERIC_STAGE_OPAQUE,
+                   "executor_ref": 7, "after": []}])
+        check("Python metadata OPAQUE callback runs",
+              rt.model_run_opaque(metadata.ptr, 7) == 0 and metadata_refs == [7])
+    finally:
+        metadata.release()
+
+
 def main():
     CHECKS.clear()
     setup = make_setup()
@@ -396,6 +487,13 @@ def main():
     print("== struct layout (ctypes mirror vs specs) ==")
     check("ctypes v1 prefix matches exported required size",
           ctypes.sizeof(ModelV1) == int(rt.MODEL_V1_BASE_SIZE))
+    check("ctypes v1 tail matches exported query size",
+          ctypes.sizeof(ModelV1Tail) ==
+          int(rt.MODEL_V1_QUERY_EXTENSION_SIZE))
+    check("ctypes generic descriptor/table match C ABI sizes",
+          ctypes.sizeof(GenericStageDesc) == int(rt.GENERIC_STAGE_DESC_V1_SIZE)
+          and ctypes.sizeof(GenericStagePlan) ==
+          int(rt.GENERIC_STAGE_PLAN_EXT_V1_SIZE))
     check_staged_callback_guards()
     check_low_level_staged_builder_guard(setup)
     calls = {"set_input": [], "step": 0}
@@ -453,6 +551,7 @@ def main():
     print("== stage plan registry ==")
     check_stage_plan_registry()
     check_vjp_guided_port_lowering(setup)
+    check_generic_and_metadata(setup)
 
     print("== verbs through the C function pointers ==")
     rc = rt.model_set_input(mr.ptr, 1, b"\xAA\xBB", -1)

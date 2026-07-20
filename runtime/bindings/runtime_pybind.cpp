@@ -20,6 +20,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -36,10 +37,18 @@ void release_py_owner(void* owner) {
 /* Model-runtime verbs implemented by Python callables. Trampolines acquire
  * the GIL (a native consumer calls these fn pointers from its own threads)
  * and translate exceptions into negative status + last_error. */
+struct PyVerbs;
+
+struct PyOpaqueRunner {
+    py::object callback;
+    PyVerbs* error_sink = nullptr;
+};
+
 struct PyVerbs {
     py::object set_input, get_output, prepare, step;
     std::string last_error;
     py::object owner;   /* the producer object the export anchors */
+    std::unique_ptr<PyOpaqueRunner> opaque_runner;
 };
 
 void release_py_verbs(void* p) {
@@ -119,6 +128,17 @@ int verb_step(void* self) {
     }
 }
 
+int verb_run_opaque(void* self, uint32_t executor_ref) {
+    auto* runner = static_cast<PyOpaqueRunner*>(self);
+    py::gil_scoped_acquire gil;
+    try {
+        return py::cast<int>(runner->callback(executor_ref));
+    } catch (const std::exception& e) {
+        if (runner->error_sink) runner->error_sink->last_error = e.what();
+        return -1;
+    }
+}
+
 const char* verb_last_error(void* self) {
     return static_cast<PyVerbs*>(self)->last_error.c_str();
 }
@@ -129,10 +149,16 @@ void check(int rc, const char* what) {
 
 struct PyRtBuilder {
     frt_runtime_builder b;
+    std::unique_ptr<PyOpaqueRunner> opaque_runner;
 
     explicit PyRtBuilder(std::uintptr_t ctx_raw) {
         b = frt_runtime_builder_create(reinterpret_cast<frt_ctx>(ctx_raw));
         if (!b) throw std::runtime_error("frt_runtime_builder_create failed (null ctx?)");
+    }
+    PyRtBuilder() {
+        b = frt_model_runtime_builder_create_metadata();
+        if (!b) throw std::runtime_error(
+            "frt_model_runtime_builder_create_metadata failed");
     }
     ~PyRtBuilder() {
         /* A never-finished builder leaks its holder by design tradeoff: the
@@ -164,6 +190,7 @@ struct PyRtBuilder {
         pv->prepare = std::move(prepare);
         pv->step = std::move(step);
         pv->owner = std::move(owner);
+        if (opaque_runner) opaque_runner->error_sink = pv;
 
         frt_model_runtime_verbs verbs{};
         verbs.struct_size = sizeof(verbs);
@@ -176,11 +203,29 @@ struct PyRtBuilder {
 
         frt_model_runtime_v1* mr = frt_runtime_builder_finish_model(
             b, &verbs, pv, pv, /*retain_owner=*/nullptr, &release_py_verbs);
-        if (!mr) { release_py_verbs(pv); throw std::runtime_error("finish_model failed"); }
+        if (!mr) {
+            if (opaque_runner) opaque_runner->error_sink = nullptr;
+            release_py_verbs(pv);
+            throw std::runtime_error("finish_model failed");
+        }
+        pv->opaque_runner = std::move(opaque_runner);
         b = nullptr;
         return reinterpret_cast<std::uintptr_t>(mr);
     }
 };
+
+const frt_generic_stage_plan_ext_v1* generic_plan(frt_model_runtime_v1* model) {
+    if (model->struct_size < FRT_MODEL_RUNTIME_V1_QUERY_EXTENSION_SIZE ||
+        !model->query_extension) return nullptr;
+    const void* extension = nullptr;
+    if (model->query_extension(model, FRT_EXT_GENERIC_STAGE_PLAN_V1, 1,
+                               &extension) != 0) return nullptr;
+    auto* plan = static_cast<const frt_generic_stage_plan_ext_v1*>(extension);
+    if (!plan || plan->abi_version < FRT_GENERIC_STAGE_PLAN_ABI_VERSION ||
+        plan->struct_size < FRT_GENERIC_STAGE_PLAN_EXT_V1_SIZE)
+        throw std::runtime_error("invalid generic stage-plan extension");
+    return plan;
+}
 
 frt_runtime_export_v1* as_export(std::uintptr_t p) {
     auto* e = reinterpret_cast<frt_runtime_export_v1*>(p);
@@ -239,9 +284,19 @@ PYBIND11_MODULE(_flashrt_runtime, m) {
     m.attr("PORT_SWAP") = (unsigned)FRT_RT_PORT_SWAP;
     m.attr("PORT_STAGED") = (unsigned)FRT_RT_PORT_STAGED;
     m.attr("PORT_SETUP") = (unsigned)FRT_RT_PORT_SETUP;
+    m.attr("GENERIC_STAGE_GRAPH") = (unsigned)FRT_GENERIC_STAGE_GRAPH;
+    m.attr("GENERIC_STAGE_OPAQUE") = (unsigned)FRT_GENERIC_STAGE_OPAQUE;
+    m.attr("GENERIC_STAGE_NAME_MAX_BYTES") =
+        (unsigned)FRT_GENERIC_STAGE_NAME_MAX_BYTES;
+    m.attr("GENERIC_STAGE_DESC_V1_SIZE") =
+        (unsigned)sizeof(frt_generic_stage_desc_v1);
+    m.attr("GENERIC_STAGE_PLAN_EXT_V1_SIZE") =
+        (unsigned)FRT_GENERIC_STAGE_PLAN_EXT_V1_SIZE;
+    m.attr("EXT_GENERIC_STAGE_PLAN_V1") = FRT_EXT_GENERIC_STAGE_PLAN_V1;
 
     py::class_<PyRtBuilder>(m, "Builder")
         .def(py::init<std::uintptr_t>(), py::arg("ctx_raw"))
+        .def_static("metadata", []() { return std::make_unique<PyRtBuilder>(); })
         .def("add_stream", [](PyRtBuilder& s, const std::string& name, int stream_id,
                               int priority, std::uintptr_t native_handle) {
             s.need();
@@ -313,6 +368,30 @@ PYBIND11_MODULE(_flashrt_runtime, m) {
                                                 (uint32_t)after.size()),
                   "add_stage");
         }, py::arg("graph"), py::arg("after") = std::vector<unsigned>{})
+        .def("add_generic_stage", [](PyRtBuilder& s, const std::string& name,
+                                     unsigned executor_kind,
+                                     unsigned executor_ref,
+                                     const std::vector<unsigned>& after) {
+            s.need();
+            check(frt_runtime_builder_add_generic_stage(
+                      s.b, name.c_str(), executor_kind, executor_ref,
+                      after.data(), (uint32_t)after.size()),
+                  "add_generic_stage");
+        }, py::arg("name"), py::arg("executor_kind"),
+           py::arg("executor_ref"),
+           py::arg("after") = std::vector<unsigned>{})
+        .def("set_generic_stage_runner", [](PyRtBuilder& s,
+                                             py::object callback) {
+            s.need();
+            if (callback.is_none())
+                throw std::invalid_argument("opaque runner must be callable");
+            auto runner = std::make_unique<PyOpaqueRunner>();
+            runner->callback = std::move(callback);
+            check(frt_runtime_builder_set_generic_stage_runner(
+                      s.b, runner.get(), verb_run_opaque),
+                  "set_generic_stage_runner");
+            s.opaque_runner = std::move(runner);
+        }, py::arg("callback"))
         .def("finish", &PyRtBuilder::finish, py::arg("owner"),
              "Consume the builder; returns the export pointer (uintptr). The export "
              "holds one reference; hand the pointer to a native consumer, which must "
@@ -387,6 +466,28 @@ PYBIND11_MODULE(_flashrt_runtime, m) {
             out.append(e);
         }
         return out;
+    });
+    m.def("model_generic_stages", [](std::uintptr_t p) {
+        auto* plan = generic_plan(as_model(p));
+        py::list out;
+        if (!plan) return out;
+        for (std::uint64_t i = 0; i < plan->n_stages; ++i) {
+            const frt_generic_stage_desc_v1& d = plan->stages[i];
+            py::dict e;
+            e["name"] = std::string(d.name);
+            e["executor_kind"] = d.executor_kind;
+            e["executor_ref"] = d.executor_ref;
+            e["after"] = std::vector<unsigned>(d.after, d.after + d.n_after);
+            out.append(e);
+        }
+        return out;
+    });
+    m.def("model_run_opaque", [](std::uintptr_t p, unsigned executor_ref) {
+        auto* plan = generic_plan(as_model(p));
+        if (!plan || !plan->run_opaque)
+            throw std::runtime_error("model has no OPAQUE executor");
+        py::gil_scoped_release nogil;
+        return plan->run_opaque(plan->stage_self, executor_ref);
     });
     m.def("model_retain", [](std::uintptr_t p) { auto* mr = as_model(p); mr->retain(mr->owner); });
     m.def("model_release", [](std::uintptr_t p) {

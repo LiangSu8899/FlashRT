@@ -83,6 +83,10 @@ UPDATE = {
     "swap": int(_c.PORT_SWAP), "staged": int(_c.PORT_STAGED),
     "setup": int(_c.PORT_SETUP),
 }
+GENERIC_EXECUTOR = {
+    "graph": int(_c.GENERIC_STAGE_GRAPH),
+    "opaque": int(_c.GENERIC_STAGE_OPAQUE),
+}
 
 
 def _enum(table: Mapping[str, int], value: int | str) -> int:
@@ -167,6 +171,20 @@ class StageSpec:
 
 
 @dataclass
+class GenericStageSpec:
+    """One stage in a backend-neutral selected plan.
+
+    ``executor_ref`` indexes export graphs for ``graph`` and remains an opaque,
+    provider-owned integer for ``opaque``.
+    """
+
+    name: str
+    executor_kind: int | str
+    executor_ref: int
+    after: Sequence[int] = ()
+
+
+@dataclass
 class RuntimeExport:
     """A finished export. ``ptr`` is the ``frt_runtime_export_v1*`` to hand to a
     native consumer. The export holds one reference; this object anchors every
@@ -208,6 +226,9 @@ class ModelRuntime:
     def stages(self) -> list:
         return list(_c.model_stages(self.ptr))
 
+    def generic_stages(self) -> list:
+        return list(_c.model_generic_stages(self.ptr))
+
     def release(self) -> None:
         """Drop the producer's reference (native retains keep it alive)."""
         if self.ptr:
@@ -248,7 +269,8 @@ def build_export(
     """
     b, anchor, manifest_json = _assemble(
         ctx, streams=streams, graphs=graphs, buffers=buffers, regions=regions,
-        ports=(), stages=(), identity=identity, manifest_extra=manifest_extra,
+        ports=(), stages=(), generic_stages=(), identity=identity,
+        manifest_extra=manifest_extra,
         owner=owner)
     ptr = b.finish(anchor)
     return RuntimeExport(
@@ -269,6 +291,7 @@ def build_model_runtime(
     regions: Sequence[RegionSpec] = (),
     ports: Sequence[PortSpec] = (),
     stages: Sequence[StageSpec] = (),
+    generic_stages: Sequence[GenericStageSpec] = (),
     identity: Mapping[str, str],
     manifest_extra: Mapping[str, Any] | None = None,
     owner: Any = None,
@@ -276,6 +299,7 @@ def build_model_runtime(
     get_output=None,
     prepare=None,
     step=None,
+    run_opaque=None,
 ) -> ModelRuntime:
     """Assemble an ``frt_model_runtime_v1``: an export plus the dynamic-IO
     contract (ports, stage DAG, optional verb callables) under one identity —
@@ -303,12 +327,19 @@ def build_model_runtime(
         raise ValueError("STAGED input ports require set_input")
     if staged_outputs and get_output is None:
         raise ValueError("STAGED output ports require get_output")
+    if stages and generic_stages:
+        raise ValueError("legacy and generic stage plans are mutually exclusive")
+    if generic_stages and run_opaque is None:
+        raise ValueError("generic stage plans require run_opaque")
 
     b, anchor, manifest_json = _assemble(
         ctx, streams=streams, graphs=graphs, buffers=buffers, regions=regions,
-        ports=ports, stages=stages, identity=identity,
+        ports=ports, stages=stages, generic_stages=generic_stages,
+        identity=identity,
         manifest_extra=manifest_extra, owner=owner)
-    anchor._objs.append((set_input, get_output, prepare, step))
+    if generic_stages:
+        b.set_generic_stage_runner(run_opaque)
+    anchor._objs.append((set_input, get_output, prepare, step, run_opaque))
     ptr = b.finish_model(anchor, set_input=set_input, get_output=get_output,
                          prepare=prepare, step=step)
     export_ptr = int(_c.model_export_ptr(ptr))
@@ -322,7 +353,81 @@ def build_model_runtime(
     )
 
 
+def build_metadata_model_runtime(
+    *,
+    ports: Sequence[PortSpec] = (),
+    generic_stages: Sequence[GenericStageSpec] = (),
+    identity: Mapping[str, str],
+    manifest_extra: Mapping[str, Any] | None = None,
+    owner: Any = None,
+    set_input=None,
+    get_output=None,
+    step=None,
+    run_opaque=None,
+) -> ModelRuntime:
+    """Build a provider-owned runtime with no FlashRT graph resources.
+
+    The resulting non-null export is only an identity and lifetime anchor. The
+    C builder rejects SWAP windows, GRAPH stages and every resource declaration.
+    """
+    staged_inputs = any(
+        _enum(UPDATE, p.update) == UPDATE["staged"] and
+        _enum(DIRECTION, p.direction) == DIRECTION["in"] for p in ports)
+    staged_outputs = any(
+        _enum(UPDATE, p.update) == UPDATE["staged"] and
+        _enum(DIRECTION, p.direction) == DIRECTION["out"] for p in ports)
+    if staged_inputs and set_input is None:
+        raise ValueError("STAGED input ports require set_input")
+    if staged_outputs and get_output is None:
+        raise ValueError("STAGED output ports require get_output")
+    if generic_stages and run_opaque is None:
+        raise ValueError("generic stage plans require run_opaque")
+
+    b = _c.Builder.metadata()
+    for p in ports:
+        b.add_port(p.name, _enum(MODALITY, p.modality), _enum(DTYPE, p.dtype),
+                   _enum(LAYOUT, p.layout), _enum(DIRECTION, p.direction),
+                   _enum(UPDATE, p.update), int(bool(p.required)),
+                   list(p.shape), p.cadence_hz, 0, 0, 0)
+    for st in generic_stages:
+        b.add_generic_stage(st.name,
+                            _enum(GENERIC_EXECUTOR, st.executor_kind),
+                            st.executor_ref, list(st.after))
+    for k, v in identity.items():
+        b.add_identity(str(k), str(v))
+    manifest = {
+        "ports": [{"name": p.name, "modality": _enum(MODALITY, p.modality),
+                   "dtype": _enum(DTYPE, p.dtype),
+                   "layout": _enum(LAYOUT, p.layout),
+                   "direction": _enum(DIRECTION, p.direction),
+                   "update": _enum(UPDATE, p.update),
+                   "required": bool(p.required), "shape": list(p.shape),
+                   "cadence_hz": p.cadence_hz} for p in ports],
+        "generic_stages": [
+            {"name": st.name,
+             "executor_kind": _enum(GENERIC_EXECUTOR, st.executor_kind),
+             "executor_ref": st.executor_ref, "after": list(st.after)}
+            for st in generic_stages],
+    }
+    if manifest_extra:
+        manifest.update(dict(manifest_extra))
+    manifest_json = json.dumps(manifest, sort_keys=True)
+    b.set_manifest(manifest_json)
+    if generic_stages:
+        b.set_generic_stage_runner(run_opaque)
+    anchor = _Anchor([owner, set_input, get_output, step, run_opaque])
+    ptr = b.finish_model(anchor, set_input=set_input, get_output=get_output,
+                         step=step)
+    export_ptr = int(_c.model_export_ptr(ptr))
+    return ModelRuntime(
+        ptr=ptr, export_ptr=export_ptr,
+        fingerprint=int(_c.export_fingerprint(export_ptr)),
+        identity=_c.export_identity(export_ptr), manifest=manifest_json,
+        _anchor=anchor)
+
+
 def _assemble(ctx, *, streams, graphs, buffers, regions, ports, stages,
+              generic_stages,
               identity, manifest_extra, owner):
     if not streams:
         raise ValueError("at least one stream is required")
@@ -356,6 +461,10 @@ def _assemble(ctx, *, streams, graphs, buffers, regions, ports, stages,
         if st.graph not in graph_index:
             raise ValueError(f"stage references unknown graph {st.graph!r}")
         b.add_stage(graph_index[st.graph], list(st.after))
+    for st in generic_stages:
+        b.add_generic_stage(st.name,
+                            _enum(GENERIC_EXECUTOR, st.executor_kind),
+                            st.executor_ref, list(st.after))
     for k, v in identity.items():
         b.add_identity(str(k), str(v))
 
@@ -380,6 +489,12 @@ def _assemble(ctx, *, streams, graphs, buffers, regions, ports, stages,
     if stages:
         manifest["stages"] = [
             {"graph": st.graph, "after": list(st.after)} for st in stages]
+    if generic_stages:
+        manifest["generic_stages"] = [
+            {"name": st.name,
+             "executor_kind": _enum(GENERIC_EXECUTOR, st.executor_kind),
+             "executor_ref": st.executor_ref, "after": list(st.after)}
+            for st in generic_stages]
     if manifest_extra:
         manifest.update(dict(manifest_extra))
     manifest_json = json.dumps(manifest, sort_keys=True)
@@ -396,9 +511,10 @@ def _assemble(ctx, *, streams, graphs, buffers, regions, ports, stages,
 __all__ = [
     "RuntimeExport", "ModelRuntime",
     "StreamSpec", "GraphSpec", "BufferSpec", "RegionSpec", "PortSpec",
-    "StageSpec",
-    "build_export", "build_model_runtime",
+    "StageSpec", "GenericStageSpec",
+    "build_export", "build_model_runtime", "build_metadata_model_runtime",
     "ROLE_INPUT", "ROLE_OUTPUT", "ROLE_STATE", "ROLE_SCRATCH",
     "REGION_SNAPSHOT", "REGION_RESTORE", "REGION_DEFAULT",
     "MODALITY", "DTYPE", "LAYOUT", "DIRECTION", "UPDATE",
+    "GENERIC_EXECUTOR",
 ]

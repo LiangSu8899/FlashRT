@@ -105,6 +105,15 @@ enum frt_rt_port_update {
     FRT_RT_PORT_SETUP  = 2
 };
 
+enum frt_generic_stage_executor_kind_v1 {
+    FRT_GENERIC_STAGE_GRAPH  = 0,
+    FRT_GENERIC_STAGE_OPAQUE = 1
+};
+
+#define FRT_GENERIC_STAGE_NAME_MAX_BYTES 255u
+#define FRT_GENERIC_STAGE_PLAN_ABI_VERSION 1u
+#define FRT_EXT_GENERIC_STAGE_PLAN_V1 UINT64_C(0x0000000000000001)
+
 /* ------------------------------------------------------------------ */
 /* Payload types (STAGED lane).                                        */
 /* ------------------------------------------------------------------ */
@@ -158,6 +167,29 @@ typedef struct frt_runtime_stage_desc {
     uint32_t n_after;
     const uint32_t* after;     /* stage indices                            */
 } frt_runtime_stage_desc;
+
+/* Generic selected-plan descriptors. Unlike extension tables, array elements
+ * have frozen size/stride and must not receive additive tail fields. */
+typedef struct frt_generic_stage_desc_v1 {
+    const char* name;
+    uint32_t executor_kind;
+    uint32_t executor_ref;
+    uint32_t n_after;
+    const uint32_t* after;
+} frt_generic_stage_desc_v1;
+
+typedef struct frt_generic_stage_plan_ext_v1 {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    const frt_generic_stage_desc_v1* stages;
+    uint64_t n_stages;
+    void* stage_self;
+    int (*run_opaque)(void* stage_self, uint32_t executor_ref);
+} frt_generic_stage_plan_ext_v1;
+
+#define FRT_GENERIC_STAGE_PLAN_EXT_V1_SIZE \
+    ((uint32_t)(offsetof(frt_generic_stage_plan_ext_v1, run_opaque) + \
+                sizeof(((frt_generic_stage_plan_ext_v1*)0)->run_opaque)))
 
 /* ------------------------------------------------------------------ */
 /* Verbs — implemented by the producer, called by the host.            */
@@ -275,6 +307,19 @@ int frt_runtime_builder_add_port(frt_runtime_builder, const char* name,
                                  uint64_t bytes);
 int frt_runtime_builder_add_stage(frt_runtime_builder, uint32_t graph,
                                   const uint32_t* after, uint32_t n_after);
+int frt_runtime_builder_add_generic_stage(
+    frt_runtime_builder, const char* name, uint32_t executor_kind,
+    uint32_t executor_ref, const uint32_t* after, uint32_t n_after);
+int frt_runtime_builder_set_generic_stage_runner(
+    frt_runtime_builder, void* stage_self,
+    int (*run_opaque)(void* stage_self, uint32_t executor_ref));
+
+/* Create a model-only builder for a provider that owns no FlashRT execution
+ * resources. Its export remains the identity/lifetime anchor, with null ctx
+ * and zero resource arrays. The builder is deliberately restricted to
+ * identity/manifest, unbound STAGED or SETUP ports, and all-OPAQUE generic or
+ * step-only authority. */
+frt_runtime_builder frt_model_runtime_builder_create_metadata(void);
 
 /* Like frt_runtime_builder_finish, but returns the model runtime whose
  * `exp` is the internally-built export (one object, one refcount). `verbs`

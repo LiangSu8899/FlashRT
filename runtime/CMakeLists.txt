@@ -30,11 +30,30 @@ target_include_directories(flashrt_runtime
          ${CMAKE_CURRENT_SOURCE_DIR}/../exec/include)
 
 if(BUILD_TESTING)
-  add_executable(test_model_runtime
-    tests/test_model_runtime.cpp
+  add_library(model_runtime_v1_abi_baseline_producer SHARED
     tests/model_runtime_v1_abi_baseline_producer.cpp)
-  target_link_libraries(test_model_runtime PRIVATE flashrt_runtime)
+  target_include_directories(model_runtime_v1_abi_baseline_producer PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../exec/include)
+  add_library(model_runtime_v1_abi_baseline_consumer SHARED
+    tests/model_runtime_v1_abi_baseline_consumer.cpp)
+  target_include_directories(model_runtime_v1_abi_baseline_consumer PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../exec/include)
+
+  add_executable(test_model_runtime tests/test_model_runtime.cpp)
+  target_link_libraries(test_model_runtime PRIVATE flashrt_runtime
+    model_runtime_v1_abi_baseline_producer)
   add_test(NAME model_runtime COMMAND test_model_runtime)
+
+  add_executable(test_model_runtime_abi_compat
+    tests/test_model_runtime_abi_compat.cpp)
+  target_link_libraries(test_model_runtime_abi_compat PRIVATE
+    flashrt_runtime ${CMAKE_DL_LIBS})
+  add_test(NAME model_runtime_abi_compat
+    COMMAND test_model_runtime_abi_compat
+      $<TARGET_FILE:model_runtime_v1_abi_baseline_producer>
+      $<TARGET_FILE:model_runtime_v1_abi_baseline_consumer>)
 endif()
 
 # --- pybind setup/dev module (optional) ---
