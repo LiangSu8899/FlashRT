@@ -37,6 +37,7 @@ unchanged.
 Build one deployment target per CMake tree:
 
 - `FLASHRT_ENABLE_NATIVE_CPP=ON` enables the native C++ product boundary.
+- `FLASHRT_CPP_WITH_PI05=ON` enables the PI0.5 model frontend.
 - `FLASHRT_CPP_WITH_PI05_SM120_TARGET=ON` for SM120 BF16 or static FP8.
 - `FLASHRT_CPP_WITH_PI05_SM110_TARGET=ON` for SM110 static FP8.
 - `FLASHRT_CPP_WITH_SENTENCEPIECE=ON` is required for native prompt formatting
@@ -57,6 +58,7 @@ cmake --build <operations-build> --target flashrt_fa2_raw -j
 cmake -S cpp -B <frontend-build> \
   -DCMAKE_BUILD_TYPE=Release \
   -DFLASHRT_ENABLE_NATIVE_CPP=ON \
+  -DFLASHRT_CPP_WITH_PI05=ON \
   -DFLASHRT_CPP_WITH_SENTENCEPIECE=ON \
   -DFLASHRT_CPP_WITH_PI05_SM120_TARGET=ON \
   -DFLASHRT_CPP_FA2_LIBRARY=<operations-build>/libflashrt_fa2_raw.so
@@ -81,6 +83,7 @@ SM110 does not depend on FA2. It consumes the existing CUTLASS FMHA path:
 cmake -S cpp -B <frontend-build> \
   -DCMAKE_BUILD_TYPE=Release \
   -DFLASHRT_ENABLE_NATIVE_CPP=ON \
+  -DFLASHRT_CPP_WITH_PI05=ON \
   -DFLASHRT_CPP_WITH_SENTENCEPIECE=ON \
   -DFLASHRT_CPP_WITH_PI05_SM110_TARGET=ON \
   -DFLASHRT_CPP_CUTLASS_DIR=<cutlass-source>
@@ -104,13 +107,14 @@ packing, and the explicit padded-stride seqused attention entry point. The
 strict target gate compares calibration scales and raw actions with the
 unchanged Torch producer bit for bit.
 
-| Native C++ | PI0.5 target | Result |
-|---|---|---|
-| OFF | OFF | Existing default build; no native PI0.5 product |
-| OFF | ON | Configuration error |
-| ON | OFF | Native support/model static libraries only; no deployable producer |
-| ON | exactly one target | `libflashrt_cpp_pi05_c` and selected target |
-| ON | both targets | Configuration error; use separate build trees |
+| Native C++ | PI0.5 model | PI0.5 target | Result |
+|---|---|---|---|
+| OFF | OFF | OFF | Existing default build; no native model product |
+| ON | OFF | OFF | Generic native support only; no PI0.5 TU or test |
+| ON | ON | OFF | Hardware-independent PI0.5 model and contract tests |
+| ON | ON | exactly one | PI0.5 producer and selected target |
+| any | OFF | ON | Configuration error |
+| ON | ON | both | Configuration error; use separate build trees |
 
 ## Configuration
 

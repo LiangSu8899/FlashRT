@@ -200,8 +200,9 @@ Required:
   and docs entry.
 - Architecture labels and CMake feature flags must be consistent with runtime
   hardware detection and routing.
-- Native C++ model producers must be absent from the default build and enabled
-  only through `FLASHRT_ENABLE_NATIVE_CPP` plus an explicit model target.
+- Native C++ model producers must be absent from the default build. Require a
+  three-level umbrella, model and hardware-target gate; enabling only the
+  umbrella must not compile model sources or tests.
 - A native producer shared library must use hidden visibility and an exact C
   API export allowlist; check the complete set, not only symbol presence.
 - A native model PR must show that existing common `csrc` files are unchanged

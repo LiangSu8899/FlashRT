@@ -25,19 +25,25 @@ option(FLASHRT_CPP_WITH_CUDA_STAGING "Enable conservative CUDA H2D/D2H modality 
 option(FLASHRT_CPP_WITH_CUDA_KERNELS "Enable CUDA modality kernels" ON)
 option(FLASHRT_ENABLE_NATIVE_CPP
        "Build opt-in native C++ operation and model extensions" OFF)
+option(FLASHRT_CPP_WITH_PI05
+       "Build the PI0.5 native C++ model frontend" OFF)
 option(FLASHRT_CPP_WITH_SENTENCEPIECE
        "Enable native SentencePiece text tokenization" OFF)
 option(FLASHRT_CPP_WITH_PI05_SM120_TARGET
        "Build the PI0.5 SM120 frontend target" OFF)
 option(FLASHRT_CPP_WITH_PI05_SM110_TARGET
        "Build the PI0.5 SM110 frontend target" OFF)
-if((FLASHRT_CPP_WITH_PI05_SM120_TARGET OR
-    FLASHRT_CPP_WITH_PI05_SM110_TARGET OR
-    FLASHRT_CPP_WITH_SENTENCEPIECE) AND
+if((FLASHRT_CPP_WITH_PI05 OR FLASHRT_CPP_WITH_SENTENCEPIECE) AND
    NOT FLASHRT_ENABLE_NATIVE_CPP)
   message(FATAL_ERROR
-    "Native tokenizer and PI0.5 targets require "
+    "Native tokenizer and model frontends require "
     "FLASHRT_ENABLE_NATIVE_CPP=ON")
+endif()
+if((FLASHRT_CPP_WITH_PI05_SM120_TARGET OR
+    FLASHRT_CPP_WITH_PI05_SM110_TARGET) AND
+   NOT FLASHRT_CPP_WITH_PI05)
+  message(FATAL_ERROR
+    "PI0.5 hardware targets require FLASHRT_CPP_WITH_PI05=ON")
 endif()
 if(FLASHRT_ENABLE_NATIVE_CPP AND NOT FLASHRT_CPP_WITH_EXEC)
   message(FATAL_ERROR
@@ -347,7 +353,7 @@ if(FLASHRT_ENABLE_NATIVE_CPP)
   endif()
 endif()
 
-if(FLASHRT_ENABLE_NATIVE_CPP)
+if(FLASHRT_CPP_WITH_PI05)
   set(FLASHRT_CPP_PI05_SUPPORT_SRCS
     models/pi05/src/support/native_rope_unavailable.cpp)
   if(FLASHRT_CPP_WITH_PI05_SM120_TARGET OR
@@ -602,7 +608,7 @@ if(BUILD_TESTING)
     add_test(NAME text_tokenizer COMMAND test_text_tokenizer)
   endif()
 
-  if(FLASHRT_ENABLE_NATIVE_CPP)
+  if(FLASHRT_CPP_WITH_PI05)
     add_executable(test_cpp_modalities tests/test_modalities.cpp)
   target_link_libraries(test_cpp_modalities
     PRIVATE flashrt_cpp_pi05 flashrt_cpp_modalities)

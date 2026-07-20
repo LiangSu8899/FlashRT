@@ -182,6 +182,10 @@ Native C++ deployment support is an explicit product boundary controlled by
 their operation-only dependencies do not enter the default Python build or
 change its dynamic dependencies.
 
+Each model has a second, default-off build option below that umbrella, and
+hardware targets require the model option. Enabling generic native loader,
+tokenizer or graph support alone must not compile any model source or test.
+
 An existing common `csrc` symbol is a shared behavioral contract. A native
 model adaptation must not change its signature, workspace requirement,
 numerical behavior, launch behavior or default build ownership. If the native

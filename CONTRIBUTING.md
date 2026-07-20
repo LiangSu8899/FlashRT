@@ -226,7 +226,9 @@ reviewers hold every PR to:
   cut is a re-ordering, not an approximation — split-vs-full replay must stay
   bit-exact (`cpp/tests/gate_pi05_model_runtime_export.py` is the gate).
 
-Native C++ model work is opt-in under `FLASHRT_ENABLE_NATIVE_CPP`. A model PR
+Native C++ model work is opt-in under `FLASHRT_ENABLE_NATIVE_CPP` and an
+explicit model-level option. Hardware targets require that model option; the
+native umbrella alone must not compile any model source or test. A model PR
 must leave the default Python build graph and every existing common `csrc`
 symbol unchanged. Native-only operation gaps belong in `csrc/native_cpp/` and
 must remain model-independent, hidden from the producer library's dynamic
