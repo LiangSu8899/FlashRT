@@ -95,7 +95,11 @@ def make_setup():
 
 def build(setup, img_h=224, verbs=None):
     ctx, sid, src, dst, g = setup
-    verbs = verbs or {}
+    if verbs is None:
+        verbs = {
+            "set_input": lambda port, payload, stream: 0,
+            "get_output": lambda port, stream: b"",
+        }
     return build_model_runtime(
         ctx,
         streams=[StreamSpec("main", sid)],
@@ -142,7 +146,53 @@ def build_split(setup):
         stages=plan.to_stage_specs(export_mod),
         identity={"model": "trivial", "quant": "none"},
         manifest_extra={"stage_plan": plan.manifest()},
+        set_input=lambda port, payload, stream: 0,
+        get_output=lambda port, stream: b"",
     )
+
+
+def check_staged_callback_guards():
+    original_assemble = export_mod._assemble
+    assemble_calls = 0
+
+    def forbidden_assemble(*args, **kwargs):
+        nonlocal assemble_calls
+        assemble_calls += 1
+        raise AssertionError("_assemble must not run after STAGED validation failure")
+
+    export_mod._assemble = forbidden_assemble
+    try:
+        try:
+            build_model_runtime(
+                None, streams=(), graphs=(),
+                ports=[PortSpec("input", "tensor", "f32", "flat",
+                                "in", "staged", shape=(1,))],
+                identity={"model": "invalid-staged-input"},
+            )
+        except ValueError as exc:
+            input_rejected = str(exc) == "STAGED input ports require set_input"
+        else:
+            input_rejected = False
+
+        try:
+            build_model_runtime(
+                None, streams=(), graphs=(),
+                ports=[PortSpec("output", "tensor", "f32", "flat",
+                                "out", "staged", shape=(1,))],
+                identity={"model": "invalid-staged-output"},
+            )
+        except ValueError as exc:
+            output_rejected = str(exc) == "STAGED output ports require get_output"
+        else:
+            output_rejected = False
+    finally:
+        export_mod._assemble = original_assemble
+
+    check("Python producer rejects STAGED input without set_input",
+          input_rejected)
+    check("Python producer rejects STAGED output without get_output",
+          output_rejected)
+    check("Python STAGED rejection happens before _assemble", assemble_calls == 0)
 
 
 def check_stage_plan_registry():
@@ -278,6 +328,9 @@ def main():
     ctx, sid, src, dst, g = setup
 
     print("== struct layout (ctypes mirror vs specs) ==")
+    check("ctypes v1 prefix matches exported required size",
+          ctypes.sizeof(ModelV1) == int(rt.MODEL_V1_BASE_SIZE))
+    check_staged_callback_guards()
     calls = {"set_input": [], "step": 0}
 
     def py_set_input(port, payload, stream):
@@ -297,7 +350,7 @@ def main():
                                  get_output=py_get_output, step=py_step))
     m = ModelV1.from_address(mr.ptr)
     check("abi stamp", m.abi_version == int(rt.MODEL_ABI_VERSION)
-          and m.struct_size == ctypes.sizeof(ModelV1))
+          and m.struct_size >= int(rt.MODEL_V1_BASE_SIZE))
     check("embedded export pointer", m.exp == mr.export_ptr)
     check("port count", m.n_ports == 3 and m.n_stages == 1)
     p0 = m.ports[0]

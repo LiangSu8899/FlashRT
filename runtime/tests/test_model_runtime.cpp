@@ -7,10 +7,129 @@
  * model-level tests (cpp/tests) and the consumer-side suites.
  */
 #include "flashrt/model_runtime.h"
+#include "abi/model_runtime_v1_abi_baseline_producer.h"
 
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <string>
+
+/* The baseline keeps the released ABI names intact. A namespace lets this
+ * translation unit compare it with the current header without renaming either
+ * side; the producer fixture includes the same baseline globally. */
+namespace flashrt::model_runtime_v1_abi::baseline {
+#include "abi/model_runtime_v1_abi_baseline.h"
+}  // namespace flashrt::model_runtime_v1_abi::baseline
+
+namespace abi_baseline = flashrt::model_runtime_v1_abi::baseline;
+
+#define ASSERT_BASELINE_OFFSET(type, field) \
+    static_assert(offsetof(type, field) == \
+                      offsetof(abi_baseline::type, field), \
+                  #type "." #field " offset changed")
+#define ASSERT_BASELINE_LAYOUT(type) \
+    static_assert(sizeof(type) == sizeof(abi_baseline::type) && \
+                      alignof(type) == alignof(abi_baseline::type), \
+                  #type " layout changed")
+#define ASSERT_BASELINE_VALUE(value) \
+    static_assert(static_cast<int>(value) == \
+                      static_cast<int>(abi_baseline::value), \
+                  #value " value changed")
+
+static_assert(FRT_MODEL_RUNTIME_ABI_VERSION == 1u,
+              "v1 model-runtime ABI version changed");
+ASSERT_BASELINE_VALUE(FRT_RT_MOD_TENSOR);
+ASSERT_BASELINE_VALUE(FRT_RT_MOD_IMAGE);
+ASSERT_BASELINE_VALUE(FRT_RT_MOD_TEXT);
+ASSERT_BASELINE_VALUE(FRT_RT_MOD_STATE);
+ASSERT_BASELINE_VALUE(FRT_RT_MOD_ACTION);
+ASSERT_BASELINE_VALUE(FRT_RT_MOD_AUDIO);
+ASSERT_BASELINE_VALUE(FRT_RT_MOD_DEPTH);
+ASSERT_BASELINE_VALUE(FRT_RT_MOD_FORCE);
+ASSERT_BASELINE_VALUE(FRT_RT_DTYPE_U8);
+ASSERT_BASELINE_VALUE(FRT_RT_DTYPE_F32);
+ASSERT_BASELINE_VALUE(FRT_RT_DTYPE_F16);
+ASSERT_BASELINE_VALUE(FRT_RT_DTYPE_BF16);
+ASSERT_BASELINE_VALUE(FRT_RT_DTYPE_I32);
+ASSERT_BASELINE_VALUE(FRT_RT_DTYPE_I64);
+ASSERT_BASELINE_VALUE(FRT_RT_LAYOUT_FLAT);
+ASSERT_BASELINE_VALUE(FRT_RT_LAYOUT_HWC);
+ASSERT_BASELINE_VALUE(FRT_RT_LAYOUT_NHWC);
+ASSERT_BASELINE_VALUE(FRT_RT_LAYOUT_CHW);
+ASSERT_BASELINE_VALUE(FRT_RT_LAYOUT_NCHW);
+ASSERT_BASELINE_VALUE(FRT_RT_PIXEL_RGB8);
+ASSERT_BASELINE_VALUE(FRT_RT_PIXEL_BGR8);
+ASSERT_BASELINE_VALUE(FRT_RT_PIXEL_RGBA8);
+ASSERT_BASELINE_VALUE(FRT_RT_PIXEL_BGRA8);
+ASSERT_BASELINE_VALUE(FRT_RT_PIXEL_GRAY8);
+ASSERT_BASELINE_VALUE(FRT_RT_PORT_IN);
+ASSERT_BASELINE_VALUE(FRT_RT_PORT_OUT);
+ASSERT_BASELINE_VALUE(FRT_RT_PORT_SWAP);
+ASSERT_BASELINE_VALUE(FRT_RT_PORT_STAGED);
+ASSERT_BASELINE_VALUE(FRT_RT_PORT_SETUP);
+
+ASSERT_BASELINE_LAYOUT(frt_image_view);
+ASSERT_BASELINE_OFFSET(frt_image_view, struct_size);
+ASSERT_BASELINE_OFFSET(frt_image_view, pixel_format);
+ASSERT_BASELINE_OFFSET(frt_image_view, data);
+ASSERT_BASELINE_OFFSET(frt_image_view, bytes);
+ASSERT_BASELINE_OFFSET(frt_image_view, width);
+ASSERT_BASELINE_OFFSET(frt_image_view, height);
+ASSERT_BASELINE_OFFSET(frt_image_view, stride_bytes);
+ASSERT_BASELINE_OFFSET(frt_image_view, reserved);
+ASSERT_BASELINE_OFFSET(frt_image_view, timestamp_ns);
+
+ASSERT_BASELINE_LAYOUT(frt_runtime_port_desc);
+ASSERT_BASELINE_OFFSET(frt_runtime_port_desc, name);
+ASSERT_BASELINE_OFFSET(frt_runtime_port_desc, modality);
+ASSERT_BASELINE_OFFSET(frt_runtime_port_desc, dtype);
+ASSERT_BASELINE_OFFSET(frt_runtime_port_desc, layout);
+ASSERT_BASELINE_OFFSET(frt_runtime_port_desc, direction);
+ASSERT_BASELINE_OFFSET(frt_runtime_port_desc, update);
+ASSERT_BASELINE_OFFSET(frt_runtime_port_desc, required);
+ASSERT_BASELINE_OFFSET(frt_runtime_port_desc, shape);
+ASSERT_BASELINE_OFFSET(frt_runtime_port_desc, rank);
+ASSERT_BASELINE_OFFSET(frt_runtime_port_desc, cadence_hint_hz);
+ASSERT_BASELINE_OFFSET(frt_runtime_port_desc, buffer);
+ASSERT_BASELINE_OFFSET(frt_runtime_port_desc, offset);
+ASSERT_BASELINE_OFFSET(frt_runtime_port_desc, bytes);
+
+ASSERT_BASELINE_LAYOUT(frt_runtime_stage_desc);
+ASSERT_BASELINE_OFFSET(frt_runtime_stage_desc, graph);
+ASSERT_BASELINE_OFFSET(frt_runtime_stage_desc, n_after);
+ASSERT_BASELINE_OFFSET(frt_runtime_stage_desc, after);
+
+ASSERT_BASELINE_LAYOUT(frt_model_runtime_verbs);
+ASSERT_BASELINE_OFFSET(frt_model_runtime_verbs, struct_size);
+ASSERT_BASELINE_OFFSET(frt_model_runtime_verbs, reserved);
+ASSERT_BASELINE_OFFSET(frt_model_runtime_verbs, set_input);
+ASSERT_BASELINE_OFFSET(frt_model_runtime_verbs, get_output);
+ASSERT_BASELINE_OFFSET(frt_model_runtime_verbs, prepare);
+ASSERT_BASELINE_OFFSET(frt_model_runtime_verbs, step);
+ASSERT_BASELINE_OFFSET(frt_model_runtime_verbs, last_error);
+
+static_assert(FRT_MODEL_RUNTIME_V1_BASE_SIZE ==
+                  sizeof(abi_baseline::frt_model_runtime_v1),
+              "v1 required prefix changed");
+static_assert(alignof(frt_model_runtime_v1) ==
+                  alignof(abi_baseline::frt_model_runtime_v1),
+              "frt_model_runtime_v1 prefix alignment changed");
+ASSERT_BASELINE_OFFSET(frt_model_runtime_v1, abi_version);
+ASSERT_BASELINE_OFFSET(frt_model_runtime_v1, struct_size);
+ASSERT_BASELINE_OFFSET(frt_model_runtime_v1, exp);
+ASSERT_BASELINE_OFFSET(frt_model_runtime_v1, ports);
+ASSERT_BASELINE_OFFSET(frt_model_runtime_v1, n_ports);
+ASSERT_BASELINE_OFFSET(frt_model_runtime_v1, stages);
+ASSERT_BASELINE_OFFSET(frt_model_runtime_v1, n_stages);
+ASSERT_BASELINE_OFFSET(frt_model_runtime_v1, self);
+ASSERT_BASELINE_OFFSET(frt_model_runtime_v1, verbs);
+ASSERT_BASELINE_OFFSET(frt_model_runtime_v1, owner);
+ASSERT_BASELINE_OFFSET(frt_model_runtime_v1, retain);
+ASSERT_BASELINE_OFFSET(frt_model_runtime_v1, release);
+
+#undef ASSERT_BASELINE_OFFSET
+#undef ASSERT_BASELINE_LAYOUT
+#undef ASSERT_BASELINE_VALUE
 
 static int g_fail = 0;
 #define CHECK(cond, msg) do { \
@@ -87,18 +206,79 @@ int main() {
         add_ports_and_stages(b);
         CHECK(frt_runtime_builder_finish(b, nullptr, nullptr, nullptr) == nullptr,
               "plain finish refuses a builder that declared ports/stages");
-        /* the builder survives that refusal — finish_model consumes it */
+        Owner rejected_owner;
+        CHECK(frt_runtime_builder_finish_model(
+                  b, nullptr, nullptr, &rejected_owner, owner_retain,
+                  owner_release) == nullptr &&
+                  rejected_owner.retains == 0 && rejected_owner.releases == 0,
+              "finish_model rejects STAGED ports without retaining owner");
+        /* The builder survives both refusals; valid verbs consume it. */
+        frt_model_runtime_verbs staged_verbs{};
+        staged_verbs.struct_size = sizeof(staged_verbs);
+        staged_verbs.set_input = v_set_input;
+        CHECK(frt_runtime_builder_finish_model(
+                  b, &staged_verbs, nullptr, &rejected_owner, owner_retain,
+                  owner_release) == nullptr &&
+                  rejected_owner.retains == 0 && rejected_owner.releases == 0,
+              "finish_model rejects missing STAGED output and remains retryable");
+        staged_verbs.get_output = v_get_output;
         frt_model_runtime_v1* m = frt_runtime_builder_finish_model(
-            b, nullptr, nullptr, nullptr, nullptr, nullptr);
-        CHECK(m != nullptr, "finish_model after refused finish");
-        /* absent producer verbs become unsupported stubs, never null */
-        CHECK(m->verbs.set_input && m->verbs.step && m->verbs.last_error,
-              "null verbs are stubbed");
-        CHECK(m->verbs.set_input(m->self, 0, nullptr, 0, -1) == -3 &&
-                  m->verbs.step(m->self) == -3 &&
-                  m->verbs.last_error(m->self)[0] != '\0',
-              "stubs report unsupported (-3) with an explanation");
+            b, &staged_verbs, nullptr, nullptr, nullptr, nullptr);
+        CHECK(m != nullptr, "finish_model succeeds after validation retry");
         m->release(m->owner);
+
+        frt_runtime_builder sb = make_builder();
+        const int64_t shape[1] = {16};
+        CHECK(frt_runtime_builder_add_port(
+                  sb, "setup", FRT_RT_MOD_TENSOR, FRT_RT_DTYPE_F32,
+                  FRT_RT_LAYOUT_FLAT, FRT_RT_PORT_IN, FRT_RT_PORT_SETUP, 0,
+                  shape, 1, 0, nullptr, 0, 0) == 0,
+              "add non-staged port");
+        frt_model_runtime_v1* sm = frt_runtime_builder_finish_model(
+            sb, nullptr, nullptr, nullptr, nullptr, nullptr);
+        CHECK(sm && sm->verbs.step(sm->self) == -3 &&
+                  sm->verbs.last_error(sm->self)[0] != '\0',
+              "missing non-staged verbs retain unsupported stubs");
+        sm->release(sm->owner);
+    }
+
+    /* --- independently compiled ABI baseline -> current prefix consumer --- */
+    {
+        Owner export_owner;
+        frt_runtime_builder eb = make_builder();
+        frt_runtime_export_v1* exp = frt_runtime_builder_finish(
+            eb, &export_owner, owner_retain, owner_release);
+        CHECK(exp != nullptr, "export backing the v1 ABI baseline producer");
+
+        Owner baseline_owner;
+        void* baseline_object =
+            flashrt::model_runtime_v1_abi::create_baseline(
+                exp, &baseline_owner, owner_retain, owner_release);
+        auto* current_view =
+            static_cast<frt_model_runtime_v1*>(baseline_object);
+        CHECK(current_view->struct_size == FRT_MODEL_RUNTIME_V1_BASE_SIZE,
+              "ABI baseline publishes exactly the v1 required prefix");
+
+        current_view->struct_size = FRT_MODEL_RUNTIME_V1_BASE_SIZE - 1;
+        CHECK(frt_model_runtime_override_verbs(
+                  current_view, nullptr, nullptr, nullptr, nullptr,
+                  nullptr) == nullptr && baseline_owner.retains == 0,
+              "consumer rejects a short v1 prefix without retaining it");
+        current_view->struct_size = FRT_MODEL_RUNTIME_V1_BASE_SIZE;
+        frt_model_runtime_v1* adopted = frt_model_runtime_override_verbs(
+            current_view, nullptr, nullptr, nullptr, nullptr, nullptr);
+        CHECK(adopted != nullptr &&
+                  adopted->struct_size == sizeof(frt_model_runtime_v1),
+              "current consumer accepts the independently compiled ABI baseline");
+        CHECK(baseline_owner.retains == 1 && baseline_owner.releases == 0,
+              "current wrapper retains the baseline producer once");
+        adopted->release(adopted->owner);
+        CHECK(baseline_owner.releases == 1,
+              "current wrapper releases the baseline producer once");
+        flashrt::model_runtime_v1_abi::destroy_baseline(baseline_object);
+        exp->release(exp->owner);
+        CHECK(export_owner.releases == 1,
+              "ABI baseline backing export releases once");
     }
 
     /* --- integrated build: struct, identity, fingerprint, verbs --- */
@@ -224,6 +404,11 @@ int main() {
         CHECK(frt_model_runtime_wrap(exp, ports, 1, &bad, 1, &verbs, &vlog,
                                      nullptr, nullptr) == nullptr,
               "wrap rejects a stage over a missing graph");
+        CHECK(frt_model_runtime_wrap(exp, ports, 1, stages, 1, nullptr,
+                                     nullptr, &wrapper_freed,
+                                     [](void* p) { *(int*)p += 1; }) == nullptr &&
+                  eo.retains == 1 && wrapper_freed == 0,
+              "wrap rejects missing STAGED input without retaining owners");
 
         frt_model_runtime_v1* wm = frt_model_runtime_wrap(
             exp, ports, 1, stages, 1, &verbs, &vlog, &wrapper_freed,
@@ -261,6 +446,14 @@ int main() {
         native_verbs.prepare = v_prepare;
         native_verbs.step = v_step;
         native_verbs.last_error = v_last_error;
+
+        frt_model_runtime_verbs incomplete_verbs = native_verbs;
+        incomplete_verbs.get_output = nullptr;
+        CHECK(frt_model_runtime_override_verbs(
+                  base, &incomplete_verbs, &native_vlog, &native_owner,
+                  owner_retain, owner_release) == nullptr &&
+                  native_owner.retains == 0 && base_owner.retains == 1,
+              "override rejects missing STAGED output without retaining owners");
 
         frt_model_runtime_v1* over = frt_model_runtime_override_verbs(
             base, &native_verbs, &native_vlog, &native_owner, owner_retain,

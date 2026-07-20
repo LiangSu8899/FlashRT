@@ -58,6 +58,13 @@ frt_model_runtime_v1 {
 }
 ```
 
+`FRT_MODEL_RUNTIME_V1_BASE_SIZE` is the only required size for the published v1
+prefix above. Consumers reject `struct_size < BASE_SIZE`; they must not require
+the latest `sizeof(frt_model_runtime_v1)`. Any future additive tail has its own
+required-size probe before it is read. The embedded `frt_model_runtime_verbs`
+table is not tail-extensible: growing it would move `owner/retain/release` and
+break this prefix.
+
 **Verbs** (`frt_model_runtime_verbs`; every entry is always callable — absent
 producer verbs are filled with unsupported stubs returning `-3`):
 
@@ -74,6 +81,16 @@ Status codes follow the pi05 C face: `0` ok, `-1` invalid, `-2` not found,
 
 **Hot contract** (SWAP writes and both hot verbs): never recapture, never
 allocate, never rebind graph pointers — only buffer contents change.
+
+All three construction paths enforce the STAGED promise: any STAGED `IN`
+requires a non-null `set_input`, and any STAGED `OUT` requires a non-null
+`get_output`. Missing verbs remain legal for SWAP/SETUP-only declarations and
+are filled with the callable `-3` stubs. A contract-validation failure retains
+no owner/export/base object; `finish_model` additionally leaves its builder
+unconsumed so the producer can supply corrected verbs and retry.
+`build_model_runtime()` performs the equivalent check against the actual
+Python callbacks before `_assemble()`. The pybind trampolines are therefore
+never allowed to conceal a missing Python implementation.
 
 **Lifetime**: the consumer retains/releases only the model runtime; the owner
 holds one export reference internally. `retain`/`release` are thread-safe;
@@ -128,6 +145,10 @@ frt_model_runtime_v1* m = frt_model_runtime_override_verbs(
 The override retains `producer_model`, so inherited port/stage pointers remain
 valid even if the original producer reference is released first. Deployment
 identity is unchanged.
+
+`finish_model`, `wrap`, and `override_verbs` apply the same STAGED verb check
+before taking ownership. A producer must not publish a STAGED declaration and
+rely on the final unsupported stub as its implementation.
 
 **Native factory (symbol convention)** — a model-runtime `.so` exports
 `FRT_MODEL_RUNTIME_OPEN_V1_SYMBOL`:
@@ -258,7 +279,7 @@ size_t frt_graph_variant_count(frt_graph);
 ## Validation
 
 ```
-./runtime/build/test_model_runtime                     # ABI, identity, lifetime, stubs
+./runtime/build/test_model_runtime                     # prefix ABI, STAGED guards, identity, lifetime
 ctest --test-dir cpp/build                             # modalities, staging pool, pi05 faces
 PYTHONPATH=.:./exec/build:./runtime/build \
   python runtime/tests/test_model_runtime_py.py        # Python producer through C fn pointers

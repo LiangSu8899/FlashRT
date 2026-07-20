@@ -114,12 +114,22 @@ DAG is for).
 Full structure map: [`cpp_runtime_design.md`](cpp_runtime_design.md).
 Field-by-field interface reference: [`model_runtime_api.md`](model_runtime_api.md).
 
-Two construction paths: the export builder assembles export + ports + stages
-under ONE identity (`frt_runtime_builder_finish_model` — a port-schema change
-changes the fingerprint), or `frt_model_runtime_wrap` wraps an existing
-export with ports/verbs (the native-adapter path; identity inherited).
-Consumers retain/release only the model runtime; it holds the export
-reference internally.
+Three construction paths share the contract: the export builder assembles
+export + ports + stages under ONE identity
+(`frt_runtime_builder_finish_model` — a port-schema change changes the
+fingerprint); `frt_model_runtime_wrap` wraps an existing export with
+ports/verbs (identity inherited); and `frt_model_runtime_override_verbs`
+retains an existing declaration while replacing only its verbs. Consumers
+retain/release only the model runtime; it holds the export/base reference
+internally.
+
+Construction is fail-closed on the STAGED promise: a STAGED input requires
+`set_input`, and a STAGED output requires `get_output`, on integrated build,
+adapter wrap, and verb override alike. Validation happens before owner/export/
+base retain; failed `finish_model` also leaves the builder available for a
+corrected retry. SWAP/SETUP-only declarations may still use unsupported stubs.
+The common Python producer checks the actual callback objects before
+`_assemble()`; non-null pybind trampolines do not count as implementations.
 
 ## C++ model runtime layer
 
@@ -151,9 +161,19 @@ Nexus and serving hosts do not change.
 
 ## Extending the ABI
 
-Additive only after v1: append struct fields (bump `FRT_RUNTIME_ABI_VERSION` +
-`struct_size`), append enum values, never reorder or remove. Consumers gate on
-`abi_version`/`struct_size` before reading anything else.
+Additive only after v1; never reorder or remove. The two public structs use
+their own version policy:
+
+- `frt_runtime_export_v1`: append fields with the export contract's
+  `FRT_RUNTIME_ABI_VERSION` + `struct_size` policy.
+- `frt_model_runtime_v1`: the existing prefix ends at `release` and is measured
+  by `FRT_MODEL_RUNTIME_V1_BASE_SIZE`. Consumers require only that prefix;
+  future additive tails are individually size-probed while
+  `FRT_MODEL_RUNTIME_ABI_VERSION` remains `1`. The embedded verbs table is
+  frozen and cannot grow because fields follow it.
+
+An incompatible major type/symbol requires a separately reviewed ABI. An
+additive tail does not justify duplicating the full model-runtime interface.
 
 ## Validation
 
@@ -165,8 +185,9 @@ PYTHONPATH=.:./exec/build:./runtime/build python runtime/tests/test_runtime_expo
 The export test covers: ctypes-mirror layout check of every field, fingerprint
 determinism / identity sensitivity / region-order sensitivity / manifest
 insensitivity, retain-release lifetime against the Python anchor, and replay
-through exported handles. The model-runtime test covers: port/stage
-declaration and validation, port schema in the identity fingerprint, verb
-dispatch, and lifetime on both construction paths. The consumer side is
+through exported handles. The model-runtime test covers: an independently
+compiled v1 ABI baseline, STAGED rejection/retry and no-retain failures,
+port/stage declaration, port schema in the identity fingerprint, verb
+dispatch, and lifetime on all three construction paths. The consumer side is
 validated in the FlashRT-Nexus repo (adopt + snapshot/restore through the
 capsule core).

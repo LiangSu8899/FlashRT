@@ -30,7 +30,9 @@ target_include_directories(flashrt_runtime
          ${CMAKE_CURRENT_SOURCE_DIR}/../exec/include)
 
 if(BUILD_TESTING)
-  add_executable(test_model_runtime tests/test_model_runtime.cpp)
+  add_executable(test_model_runtime
+    tests/test_model_runtime.cpp
+    tests/model_runtime_v1_abi_baseline_producer.cpp)
   target_link_libraries(test_model_runtime PRIVATE flashrt_runtime)
   add_test(NAME model_runtime COMMAND test_model_runtime)
 endif()

@@ -281,7 +281,7 @@ def build_model_runtime(
     contract (ports, stage DAG, optional verb callables) under one identity —
     a port-schema change changes the fingerprint.
 
-    Verb callables (all optional; absent verbs report unsupported):
+    Verb callables are optional unless required by a STAGED declaration:
       ``set_input(port, payload: bytes, stream) -> int``,
       ``get_output(port, stream) -> bytes``,
       ``prepare(graph, key) -> int``, ``step() -> int``.
@@ -289,6 +289,21 @@ def build_model_runtime(
     them from any thread. SWAP ports need no callable — hosts write the
     declared buffer window directly.
     """
+    staged_inputs = any(
+        _enum(UPDATE, port.update) == UPDATE["staged"] and
+        _enum(DIRECTION, port.direction) == DIRECTION["in"]
+        for port in ports
+    )
+    staged_outputs = any(
+        _enum(UPDATE, port.update) == UPDATE["staged"] and
+        _enum(DIRECTION, port.direction) == DIRECTION["out"]
+        for port in ports
+    )
+    if staged_inputs and set_input is None:
+        raise ValueError("STAGED input ports require set_input")
+    if staged_outputs and get_output is None:
+        raise ValueError("STAGED output ports require get_output")
+
     b, anchor, manifest_json = _assemble(
         ctx, streams=streams, graphs=graphs, buffers=buffers, regions=regions,
         ports=ports, stages=stages, identity=identity,

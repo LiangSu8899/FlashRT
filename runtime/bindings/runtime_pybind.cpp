@@ -175,8 +175,8 @@ struct PyRtBuilder {
 
         frt_model_runtime_v1* mr = frt_runtime_builder_finish_model(
             b, &verbs, pv, pv, /*retain_owner=*/nullptr, &release_py_verbs);
-        b = nullptr;
         if (!mr) { release_py_verbs(pv); throw std::runtime_error("finish_model failed"); }
+        b = nullptr;
         return reinterpret_cast<std::uintptr_t>(mr);
     }
 };
@@ -192,7 +192,7 @@ frt_runtime_export_v1* as_export(std::uintptr_t p) {
 frt_model_runtime_v1* as_model(std::uintptr_t p) {
     auto* m = reinterpret_cast<frt_model_runtime_v1*>(p);
     if (!m || m->abi_version != FRT_MODEL_RUNTIME_ABI_VERSION ||
-        m->struct_size != sizeof(frt_model_runtime_v1))
+        m->struct_size < FRT_MODEL_RUNTIME_V1_BASE_SIZE)
         throw std::runtime_error("not a valid frt_model_runtime_v1 pointer");
     return m;
 }
@@ -211,6 +211,7 @@ PYBIND11_MODULE(_flashrt_runtime, m) {
     m.attr("REGION_RESTORE") = (unsigned)FRT_RT_REGION_RESTORE;
 
     m.attr("MODEL_ABI_VERSION") = FRT_MODEL_RUNTIME_ABI_VERSION;
+    m.attr("MODEL_V1_BASE_SIZE") = FRT_MODEL_RUNTIME_V1_BASE_SIZE;
     m.attr("MOD_TENSOR") = (unsigned)FRT_RT_MOD_TENSOR;
     m.attr("MOD_IMAGE") = (unsigned)FRT_RT_MOD_IMAGE;
     m.attr("MOD_TEXT") = (unsigned)FRT_RT_MOD_TEXT;

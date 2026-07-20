@@ -135,8 +135,10 @@ Blockers:
 - `exec/` gains a field or verb whose meaning is specific to one model family,
   protocol, session policy, scheduler policy, or KV-cache policy.
 - `runtime/` gains a model-named field, a scenario verb, or a non-additive
-  struct change; or a port is declared `STAGED` while its `set_input` refuses
-  hot updates (advertise-and-refuse).
+  struct change; a consumer requires the latest full
+  `sizeof(frt_model_runtime_v1)` instead of `FRT_MODEL_RUNTIME_V1_BASE_SIZE`;
+  or a port is declared `STAGED` without a working input `set_input` / output
+  `get_output` hot verb (advertise-and-refuse).
 - A hot-path verb (`set_input`/`get_output`, SWAP writes, tick) allocates,
   recaptures, or rebinds graph pointers.
 

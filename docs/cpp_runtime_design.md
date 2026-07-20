@@ -147,7 +147,10 @@ be in flight.
 
 ## Freeze and evolution
 
-`runtime/include/flashrt/*.h` is additive-only after v1: append fields (bump
-ABI version + struct_size), append enum values, never reorder or remove.
+`runtime/include/flashrt/*.h` is additive-only after v1: append fields, append
+enum values, never reorder or remove. `frt_runtime_export_v1` follows its
+version + `struct_size` contract; `frt_model_runtime_v1` consumers require
+only `FRT_MODEL_RUNTIME_V1_BASE_SIZE` and probe future tails separately while
+the model-runtime ABI version remains 1. The embedded verbs table is frozen.
 Everything under `cpp/` may be refactored freely as long as the produced
 struct — and the identity it fingerprints — is preserved.
