@@ -2055,7 +2055,8 @@ class Pi05PipelineFP16:
 
     def export_model_runtime(self, identity=None, extra_regions=None,
                              stage_plan="full", io="python",
-                             stage_plan_kwargs=None):
+                             stage_plan_kwargs=None, robot_action_dim=None,
+                             state_dim=None):
         """Package the captured pipeline as an ``frt_model_runtime_v1``.
 
         See :func:`flash_rt.models.pi05.runtime_export.export_model_runtime`
@@ -2065,7 +2066,9 @@ class Pi05PipelineFP16:
         return export_model_runtime(self, identity=identity,
                                     extra_regions=extra_regions,
                                     stage_plan=stage_plan, io=io,
-                                    stage_plan_kwargs=stage_plan_kwargs)
+                                    stage_plan_kwargs=stage_plan_kwargs,
+                                    robot_action_dim=robot_action_dim,
+                                    state_dim=state_dim)
 
     def record_infer_graph(self, external_stream_int: int | None = None) -> None:
         """Capture the full pipeline as a CUDA Graph.

@@ -19,6 +19,11 @@ windows are `TENSOR`. A `STAGED` declaration is a promise the port accepts hot
 updates — a producer that cannot deliver that declares `SETUP` or omits the
 port, never advertise-and-refuse.
 
+The Python `build_model_runtime()` helper enforces this mechanically: STAGED
+inputs require `set_input`, and STAGED outputs require `get_output`. Internal
+declaration-only handoffs may bypass that check only while constructing a
+native verb overlay; the declaration is not an adoptable runtime.
+
 ## Payload conventions (STAGED `set_input`)
 
 | modality | `data` points at | `bytes` |
@@ -30,7 +35,7 @@ port, never advertise-and-refuse.
 ## Descriptors
 
 `frt_runtime_port_desc` — one dynamic input/output:
-`name`, `modality`, `dtype` (device-side tensor), `layout`, `direction`,
+`name`, `modality`, `dtype` (logical payload/target tensor), `layout`, `direction`,
 `update`, `required`, `shape[rank]` (−1 = bucket-variable),
 `cadence_hint_hz` (advisory only), and the SWAP window `buffer`/`offset`/
 `bytes` (null buffer = staged-only). Strings/arrays are owned by the runtime
@@ -269,6 +274,10 @@ chunked = pipeline.export_model_runtime(
     io="native",
 )
 ```
+
+Pi0.5 native declarations also take `robot_action_dim` from the frontend's
+checkpoint metadata. `io="native_v2"` additionally takes `state_dim`; neither
+deployment dimension is inferred from or stored in the semantic pipeline.
 
 Every graph named by the resolved plan must already exist in the producer's
 export. Validation happens during export: unknown graph, unknown stream, stream

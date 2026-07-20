@@ -417,16 +417,19 @@ def main() -> None:
     model.predict(images, prompt=args.prompt)
     pipe = model._pipe
     pl = pipe.pipeline
+    robot_action_dim = len(pipe.norm_stats["actions"]["q01"])
 
     mr_full = pl.export_model_runtime(
         identity={"gate": "cpp_pi05_model_runtime", "plan": "full"},
         stage_plan="full",
         io="native",
+        robot_action_dim=robot_action_dim,
     )
     mr_split = pl.export_model_runtime(
         identity={"gate": "cpp_pi05_model_runtime", "plan": "context_action"},
         stage_plan="context_action",
         io="native",
+        robot_action_dim=robot_action_dim,
     )
     mr_rtc = pl.export_model_runtime(
         identity={
@@ -437,6 +440,7 @@ def main() -> None:
         stage_plan="context_rtc_prefix_action",
         stage_plan_kwargs={"prefix_len": args.rtc_prefix_len},
         io="native",
+        robot_action_dim=robot_action_dim,
     )
     lib = _load_lib(args.lib)
     dtype_id, torch_dtype = _dtype_from_model_runtime(mr_full)
@@ -470,6 +474,28 @@ def main() -> None:
         assert m_split.n_stages == 2, m_split.n_stages
         assert m_rtc.n_ports == 5, m_rtc.n_ports
         assert m_rtc.n_stages == 2, m_rtc.n_stages
+        for runtime in (mr_full, mr_split, mr_rtc):
+            action_port = next(
+                port for port in runtime.ports()
+                if port["name"] == "actions"
+            )
+            assert action_port["dtype"] == 1, action_port
+            assert action_port["update"] == 1, action_port
+            assert action_port["buffer"] == 0, action_port
+            assert action_port["bytes"] == (
+                int(pl.chunk_size) * LIBERO_ACTION_DIM * 4
+            ), action_port
+        rtc_raw_port = next(
+            port for port in mr_rtc.ports()
+            if port["name"] == "actions_raw"
+        )
+        rtc_noise_port = next(
+            port for port in mr_rtc.ports()
+            if port["name"] == "noise"
+        )
+        assert rtc_raw_port["dtype"] == rtc_noise_port["dtype"], rtc_raw_port
+        assert rtc_raw_port["update"] == 0, rtc_raw_port
+        assert rtc_raw_port["buffer"] != 0, rtc_raw_port
         assert mr_full.fingerprint != mr_split.fingerprint
         assert mr_rtc.fingerprint not in (
             mr_full.fingerprint, mr_split.fingerprint)
@@ -529,9 +555,8 @@ def main() -> None:
         split_raw_max = float(np.max(np.abs(
             _raw_to_float(full_raw, torch_dtype) -
             _raw_to_float(split_raw, torch_dtype))))
+        split_act_exact = bool(np.array_equal(full_actions, split_actions))
         split_act_max = float(np.max(np.abs(full_actions - split_actions)))
-        split_act_ok = bool(np.allclose(
-            full_actions, split_actions, rtol=1e-4, atol=1e-3))
 
         print("\n===== REAL PI0.5 MODEL-RUNTIME EXPORT GATE =====")
         print(f"full fingerprint       : 0x{mr_full.fingerprint:016x}")
@@ -544,17 +569,22 @@ def main() -> None:
         print(f"py vs full raw exact   : {raw_exact}  cos={raw_cos:.8f}  max_abs={raw_max:.6g}")
         print(f"py vs full action      : {act_ok}  max_abs={act_max:.6g}")
         print(f"full vs split raw exact: {split_raw_exact}  cos={split_raw_cos:.8f}  max_abs={split_raw_max:.6g}")
-        print(f"full vs split action   : {split_act_ok}  max_abs={split_act_max:.6g}")
+        print(f"full vs split action   : exact={split_act_exact}  max_abs={split_act_max:.6g}")
         print(f"rtc prefix exact       : {rtc_prefix_exact}  max_abs={rtc_prefix_max:.6g}")
 
-        assert img_cos >= 0.999, f"image preprocess cosine too low: {img_cos}"
+        assert img_exact, (
+            "Python and C++ image staging must be bit-exact; "
+            f"cos={img_cos:.8f} max_abs={img_max:.6g}")
+        assert raw_exact, (
+            "Python and C++ raw replay must be bit-exact; "
+            f"cos={raw_cos:.8f} max_abs={raw_max:.6g}")
         assert raw_cos >= 0.999, f"raw replay cosine too low: {raw_cos}"
         assert act_ok, f"robot actions differ: max_abs={act_max}"
         assert split_raw_exact, (
             "split replay must be bit-exact against full replay; "
             f"cos={split_raw_cos:.8f} max_abs={split_raw_max:.6g}")
-        assert split_act_ok, (
-            f"split robot actions differ: max_abs={split_act_max}")
+        assert split_act_exact, (
+            f"split robot actions are not bit-exact: max_abs={split_act_max}")
         assert rtc_prefix_exact, (
             "RTC-prefix action graph did not preserve prev_action_chunk "
             f"prefix; max_abs={rtc_prefix_max:.6g}")

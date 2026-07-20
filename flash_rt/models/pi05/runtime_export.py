@@ -9,6 +9,8 @@ packages either of them as an ``frt_runtime_export_v1``
 
 from __future__ import annotations
 
+import hashlib
+
 
 def exec_enable(pl) -> None:
     """Create the exec ctx/graphs for a captured pipeline and adopt any
@@ -51,7 +53,10 @@ def export_runtime(pl, identity=None, extra_regions=None):
       default rollout boundary (``diffusion_noise`` — the region set
       validated by serving/robot_recap/verify_capsule.py).
     """
-    parts = _parts(pl, identity, extra_regions)
+    parts = _parts(
+        pl, identity, extra_regions,
+        robot_action_dim=_resolve_robot_action_dim(
+            pl, None, required=False))
     from flash_rt.runtime import export as _rt
 
     return _rt.build_export(
@@ -67,7 +72,8 @@ def export_runtime(pl, identity=None, extra_regions=None):
 
 def export_model_runtime(pl, identity=None, extra_regions=None,
                          stage_plan="full", io="python",
-                         stage_plan_kwargs=None):
+                         stage_plan_kwargs=None, robot_action_dim=None,
+                         state_dim=None):
     """Package a captured Pi0.5 pipeline as an ``frt_model_runtime_v1``.
 
     ``io="python"`` mirrors the Python frontend: the frontend already delivers
@@ -84,13 +90,34 @@ def export_model_runtime(pl, identity=None, extra_regions=None,
     graphs: images/actions are STAGED, noise is SWAP, and the C++ runtime
     supplies the verbs through ``frt_model_runtime_override_verbs``.
 
+    ``io="native_v2"`` extends that face with prompt/state STAGED ports for
+    fixed state-prompt deployments. The declaration is intended to be consumed
+    through the C++ verb overlay; port/window/region changes are part of the
+    export identity and therefore intentionally change the fingerprint.
+
     Prompt staging (text -> embeds) stays with the frontend / the native
     tokenizer producer. ``stage_plan`` defaults to the full infer graph; an
     explicit StagePlan or registered plan name may select already-captured
     graphs from this export. ``stage_plan_kwargs`` are passed only to
-    registered plan factories, for deployment-specific graph cuts.
+    registered plan factories, for deployment-specific graph cuts. Native
+    declarations require ``robot_action_dim`` from checkpoint metadata;
+    ``native_v2`` also requires the corresponding ``state_dim``. These
+    deployment dimensions are deliberately not owned by the model pipeline.
     """
-    parts = _parts(pl, identity, extra_regions)
+    robot_action_dim = _resolve_robot_action_dim(
+        pl, robot_action_dim, required=io in ("native", "native_v2"))
+    state_dim = _resolve_state_dim(
+        pl, state_dim, required=io == "native_v2")
+    identity_for_parts = identity
+    if io == "native_v2":
+        _require_native_v2_ready(pl, state_dim)
+        identity_for_parts = {
+            **{str(k): str(v) for k, v in (identity or {}).items()},
+            "io": "native_v2",
+        }
+    parts = _parts(
+        pl, identity_for_parts, extra_regions,
+        robot_action_dim=robot_action_dim, state_dim=state_dim)
     from flash_rt.runtime import export as _rt
     from flash_rt.subgraphs.pi05 import stage_plans as _pi05_stage_plans  # noqa: F401
     from flash_rt.subgraphs.stage_plan import resolve_stage_plan
@@ -105,7 +132,6 @@ def export_model_runtime(pl, identity=None, extra_regions=None,
         for stage in plan.stages)
     num_views = int(getattr(pl, "num_views", 0) or 0)
     chunk = wrap["diffusion_noise"].nbytes() // (32 * 2)  # 2-byte action dtype
-    robot_action_dim = _robot_action_dim(pl)
     tensor_dtype = _tensor_dtype(pl)
     if io == "python":
         ports = [
@@ -138,7 +164,7 @@ def export_model_runtime(pl, identity=None, extra_regions=None,
                              "in", "swap", shape=(1,),
                              buffer=wrap["rtc_guidance_weight"]),
             ])
-    elif io == "native":
+    elif io in ("native", "native_v2"):
         ports = [
             _rt.PortSpec("images", "image", tensor_dtype, "nhwc", "in", "staged",
                          required=True, shape=(num_views, 224, 224, 3),
@@ -146,10 +172,22 @@ def export_model_runtime(pl, identity=None, extra_regions=None,
                          buffer=wrap["observation_images_normalized"]),
             _rt.PortSpec("noise", "tensor", tensor_dtype, "flat", "in", "swap",
                          shape=(chunk, 32), buffer=wrap["diffusion_noise"]),
-            _rt.PortSpec("actions", "action", tensor_dtype, "flat", "out",
+            _rt.PortSpec("actions", "action", "f32", "flat", "out",
                          "staged", shape=(chunk, robot_action_dim),
-                         buffer=wrap["diffusion_noise"]),
+                         nbytes=chunk * robot_action_dim * 4),
         ]
+        if io == "native_v2":
+            ports = [
+                _rt.PortSpec("prompt", "text", "u8", "flat", "in", "staged",
+                             required=True, shape=(-1,)),
+                _rt.PortSpec("state", "state", "f32", "flat", "in", "staged",
+                             required=True, shape=(state_dim,)),
+            ] + ports
+            if not (uses_rtc_prefix or uses_rtc_vjp):
+                ports.append(
+                    _rt.PortSpec("actions_raw", "tensor", tensor_dtype,
+                                 "flat", "out", "swap", shape=(chunk, 32),
+                                 buffer=wrap["diffusion_noise"]))
         if uses_rtc_prefix or uses_rtc_vjp:
             ports.extend([
                 _rt.PortSpec("prev_action_chunk", "tensor", tensor_dtype,
@@ -193,6 +231,16 @@ def export_model_runtime(pl, identity=None, extra_regions=None,
                 return rc
         return rc
 
+    manifest_extra = {"stage_plan": plan.manifest(), "io": io}
+    declaration_only = io in ("native", "native_v2")
+    if declaration_only:
+        manifest_extra["declaration_only"] = True
+    if io == "native_v2":
+        manifest_extra["prompt"] = {
+            "state_prompt_mode": "fixed",
+            "max_prompt_len": int(getattr(pl, "max_prompt_len", 0) or 0),
+            "state_dim": state_dim,
+        }
     return _rt.build_model_runtime(
         pl._exec_ctx,
         streams=parts["streams"],
@@ -202,9 +250,10 @@ def export_model_runtime(pl, identity=None, extra_regions=None,
         ports=ports,
         stages=stages,
         identity=parts["identity"],
-        manifest_extra={"stage_plan": plan.manifest(), "io": io},
+        manifest_extra=manifest_extra,
         owner=parts["owner"],
         step=step,
+        _allow_incomplete_staged=declaration_only,
     )
 
 
@@ -218,19 +267,69 @@ def _tensor_dtype(pl):
     return "bf16"
 
 
-def _robot_action_dim(pl):
+def _resolve_robot_action_dim(pl, value, *, required):
     """Logical robot action dimension exposed by the STAGED output face."""
+    if value is not None:
+        value = int(value)
+        if value <= 0 or value > 32:
+            raise ValueError("robot_action_dim must be in [1, 32]")
+        return value
     try:
         q01 = pl.norm_stats["actions"]["q01"]
         if q01:
             return int(min(len(q01), 32))
     except Exception:
         pass
+    if required:
+        raise ValueError(
+            "native model-runtime export requires robot_action_dim from "
+            "the frontend checkpoint metadata")
     from flash_rt.core.utils.actions import LIBERO_ACTION_DIM
     return int(LIBERO_ACTION_DIM)
 
 
-def _parts(pl, identity, extra_regions):
+def _resolve_state_dim(pl, value, *, required):
+    """Raw proprioception dimension exposed by native_v2 STATE/STAGED."""
+    if value is not None:
+        value = int(value)
+        if value <= 0:
+            raise ValueError("state_dim must be positive")
+        return value
+    try:
+        return int(len(pl.norm_stats["state"]["q01"]))
+    except Exception:
+        if not required:
+            return None
+        raise ValueError(
+            "native_v2 export requires state_dim from the frontend "
+            "checkpoint metadata") from None
+
+
+def _tokenizer_sha256() -> str:
+    from flash_rt.utils.paligemma_tokenizer import (
+        resolve_paligemma_tokenizer_path,
+    )
+    h = hashlib.sha256()
+    with open(resolve_paligemma_tokenizer_path(), "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _require_native_v2_ready(pl, state_dim) -> None:
+    mode = getattr(pl, "_state_prompt_mode", None)
+    fixed = bool(getattr(pl, "_fixed_shape", False))
+    if mode != "fixed" and not fixed:
+        raise ValueError(
+            "Pi05 native_v2 requires state_prompt_mode='fixed'")
+    if int(getattr(pl, "max_prompt_len", 0) or 0) < 200:
+        raise ValueError("Pi05 native_v2 requires max_prompt_len >= 200")
+    if state_dim is None:
+        raise ValueError("Pi05 native_v2 requires state_dim")
+
+
+def _parts(pl, identity, extra_regions, *, robot_action_dim=None,
+           state_dim=None):
     """Shared assembly for the plain export and the model-runtime export."""
     if getattr(pl, "_graph", None) is None:
         raise RuntimeError("export_runtime requires record_infer_graph() first")
@@ -293,9 +392,13 @@ def _parts(pl, identity, extra_regions):
         "max_prompt_len": str(getattr(pl, "max_prompt_len", "")),
         "chunk_size": str(getattr(pl, "chunk_size", "")),
         "model_action_dim": "32",
-        "robot_action_dim": str(_robot_action_dim(pl)),
+        "robot_action_dim": str(robot_action_dim),
     }
     ident.update({str(k): str(v) for k, v in (identity or {}).items()})
+    if ident.get("io") == "native_v2":
+        ident["state_prompt_mode"] = "fixed"
+        ident["state_dim"] = str(state_dim)
+        ident["tokenizer_sha256"] = _tokenizer_sha256()
 
     return {
         "wrap": wrap,
