@@ -13,6 +13,7 @@ layer norms: [`runtime_contract.md`](runtime_contract.md).
 | layout | `FLAT 0` · `HWC 1` · `NHWC 2` · `CHW 3` · `NCHW 4` |
 | direction | `IN 0` · `OUT 1` |
 | update | `SWAP 0` · `STAGED 1` · `SETUP 2` |
+| generic executor | `GRAPH 0` · `OPAQUE 1` |
 
 `STATE` is reserved for real proprioception; internal embedding/residual
 windows are `TENSOR`. A `STAGED` declaration is a promise the port accepts hot
@@ -60,6 +61,7 @@ frt_model_runtime_v1 {
   stages / n_stages                  subgraph DAG
   self + verbs                       producer verbs (below)
   owner / retain / release           lifetime (see below)
+  query_extension                    optional, size-probed capability tail
 }
 ```
 
@@ -69,6 +71,14 @@ the latest `sizeof(frt_model_runtime_v1)`. Any future additive tail has its own
 required-size probe before it is read. The embedded `frt_model_runtime_verbs`
 table is not tail-extensible: growing it would move `owner/retain/release` and
 break this prefix.
+
+Before reading `query_extension`, require
+`struct_size >= FRT_MODEL_RUNTIME_V1_QUERY_EXTENSION_SIZE`. A
+baseline-prefix producer is valid and simply has no extension tail. Every
+tail-capable core builder installs a callable query function, even when it
+returns `-3` (unsupported) for every ID. Query failures clear the output
+pointer; version zero is invalid (`-1`). Extension tables are runtime-owned and
+stable while the caller holds a model-runtime reference.
 
 **Verbs** (`frt_model_runtime_verbs`; every entry is always callable — absent
 producer verbs are filled with unsupported stubs returning `-3`):
@@ -81,11 +91,50 @@ producer verbs are filled with unsupported stubs returning `-3`):
 | `step(self)` | HOT (sugar) | fire all stages in declared order; scheduling hosts fire stages themselves |
 | `last_error(self)` | — | message for the most recent failure |
 
-Status codes follow the pi05 C face: `0` ok, `-1` invalid, `-2` not found,
+Status codes follow the common runtime convention: `0` ok, `-1` invalid, `-2` not found,
 `-3` unsupported, `-4` shape mismatch, `-5` insufficient storage, `-6` backend.
 
 **Hot contract** (SWAP writes and both hot verbs): never recapture, never
 allocate, never rebind graph pointers — only buffer contents change.
+
+## Execution authority and generic selected plans
+
+One runtime instance has exactly one execution authority:
+
+| legacy stages | generic plan | real `step` | result |
+|---:|---:|---:|---|
+| nonempty | absent | optional | legacy GRAPH plan |
+| empty | nonempty | optional | generic selected plan |
+| empty | absent | present | step-only black box |
+| nonempty | present | any | invalid |
+| empty | empty/absent | absent | invalid |
+
+`step` is whole-model sugar for a declared plan, not a second DAG. A host uses
+either `step()` or manual selected-plan scheduling for a tick.
+
+`FRT_EXT_GENERIC_STAGE_PLAN_V1` is the only extension currently assigned. Its
+table contains a frozen-stride descriptor array:
+
+```c
+frt_generic_stage_desc_v1 {
+  name;
+  executor_kind;   /* GRAPH or OPAQUE */
+  executor_ref;    /* graph index or provider-private uint32 */
+  n_after / after; /* strictly increasing earlier stage indices */
+}
+```
+
+GRAPH references index `exp->graphs`. OPAQUE references are passed unchanged
+to `run_opaque(stage_self, executor_ref)`; core does not interpret them or keep
+a provider registry. M0 OPAQUE execution is synchronous and blocking. It does
+not promise async submission, cancellation, graph capture, no host allocation,
+or model-level snapshot/restore. A mixed GRAPH/OPAQUE consumer must honor every
+dependency conservatively before starting downstream work.
+
+Generic names are unique valid UTF-8, contain no ASCII control bytes, and are
+at most `FRT_GENERIC_STAGE_NAME_MAX_BYTES` bytes. A generic plan must contain
+at least one OPAQUE stage; pure GRAPH plans use the legacy stage array. OPAQUE
+plans require one builder-registered runner and a real `last_error` verb.
 
 All three construction paths enforce the STAGED promise: any STAGED `IN`
 requires a non-null `set_input`, and any STAGED `OUT` requires a non-null
@@ -118,6 +167,35 @@ frt_model_runtime_v1* m = frt_runtime_builder_finish_model(
     b, &verbs, verbs_self, owner, retain_owner, release_owner);
 ```
 
+For a generic selected plan, use the same builder and identity:
+
+```c
+frt_runtime_builder_add_generic_stage(
+    b, "prefill", FRT_GENERIC_STAGE_OPAQUE, 10, NULL, 0);
+uint32_t after[] = {0};
+frt_runtime_builder_add_generic_stage(
+    b, "decode", FRT_GENERIC_STAGE_OPAQUE, 11, after, 1);
+frt_runtime_builder_set_generic_stage_runner(b, provider, run_opaque);
+```
+
+The builder appends one canonical record per selected stage:
+
+```text
+gstage-v1:<i>:<name_len>:<name_bytes>:<kind>:<executor_ref>:<n_after>:<after...>\n
+```
+
+`name_len` is the UTF-8 byte length, so delimiters inside names cannot collide.
+The builder remains the only fingerprint implementation. With no generic plan,
+legacy identity bytes and fingerprints are unchanged.
+
+Providers with no FlashRT resources use
+`frt_model_runtime_builder_create_metadata()`. It produces a non-null export
+whose `ctx` is null and whose stream/graph/buffer/region counts are all zero.
+That export is only the common identity, fingerprint and lifetime anchor. The
+restricted builder accepts identity/manifest, unbound STAGED or SETUP ports,
+and all-OPAQUE generic or step-only authority; it rejects resources, SWAP,
+GRAPH/mixed plans, standalone export finish, and legacy wrapping.
+
 Identity covers each port's schema **and its bound window** (buffer index
 into the declared buffers array, offset, bytes) plus the stage DAG; only
 `cadence_hint_hz` stays out. A port-schema or window change therefore changes
@@ -138,6 +216,10 @@ frt_model_runtime_v1* m = frt_model_runtime_wrap(
     &verbs, verbs_self, wrapper_owner, wrapper_release);
 ```
 
+This path is intentionally narrow: it requires a real non-null exec context
+and a nonempty legacy graph plan. It cannot turn a metadata anchor or a
+zero-stage export into a new authority under an inherited fingerprint.
+
 **Verb override** — inherit an existing model-runtime declaration and replace
 only verbs. This is the standard hand-off when a setup producer owns capture,
 ports, stage DAG and fingerprint, while a native C++ runtime owns hot-path
@@ -152,6 +234,26 @@ frt_model_runtime_v1* m = frt_model_runtime_override_verbs(
 The override retains `producer_model`, so inherited port/stage pointers remain
 valid even if the original producer reference is released first. Deployment
 identity is unchanged.
+
+Step-only runtimes cannot be overridden because `step` is their sole identity-
+bound authority. An all-OPAQUE generic runtime may be overridden: query is
+forwarded to the retained base, the original `stage_self`/runner remain in
+force, and OPAQUE errors continue to use the base `last_error`. M0 rejects a
+mixed-plan override rather than publishing an ambiguous error/owner surface.
+
+Python exposes the same two producer modes:
+
+```python
+from flash_rt.runtime.export import (
+    GenericStageSpec, build_metadata_model_runtime,
+)
+
+runtime = build_metadata_model_runtime(
+    identity={"provider_build": digest},
+    generic_stages=[GenericStageSpec("infer", "opaque", 7)],
+    run_opaque=lambda executor_ref: provider.run(executor_ref),
+)
+```
 
 `finish_model`, `wrap`, and `override_verbs` apply the same STAGED verb check
 before taking ownership. A producer must not publish a STAGED declaration and

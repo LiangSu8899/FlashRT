@@ -194,9 +194,22 @@ same mechanism-not-policy rule. Design:
 [`docs/runtime_contract.md`](docs/runtime_contract.md). The essentials
 reviewers hold every PR to:
 
+- Optional model-runtime capabilities append only to the main struct tail and
+  require an independent size probe. Never grow the embedded verbs table.
+- Extension IDs and tables are core-owned. Provider/model/backend names,
+  private registries, post-finish table attachment, and parallel identity/hash
+  implementations are rejected.
+- One runtime publishes one selected execution authority: legacy stages,
+  generic stages, or step-only. A new capability must include authority,
+  malformed-table, owner-lifetime, fingerprint and baseline-prefix tests.
+- Metadata-only exports are zero-resource identity/lifetime anchors. They must
+  not fake an exec context or imply snapshot/restore support.
+
 - `runtime/` headers are the ONLY frozen surface and are additive-only after
-  v1: append fields (bump ABI version + struct_size), append enum values,
-  never reorder or remove. Nothing under `cpp/` is ABI.
+  v1: append fields/enums, never reorder or remove. Export revisions follow
+  their documented version policy; model-runtime v1 tails use independent
+  size probes without changing the required prefix. Nothing under `cpp/` is
+  ABI.
 - The contract is data first, verbs as sugar: ports (with update class) and
   the stage DAG are the standard face; `step` is convenience, never the
   center. Do not add scenario fields, model names, or scheduling concepts to

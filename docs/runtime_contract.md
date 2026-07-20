@@ -7,8 +7,9 @@ as one POD struct — `frt_runtime_export_v1` — and adopted by the consumer.
 The exec contract (`docs/exec_contract.md`) fixes *how to replay*. The runtime
 export fixes *what a deployed model IS*: which streams, graphs, buffers, and
 restorable state regions exist, and the identity that stored state is bound to.
-Both layers are mechanism only. Plans are deliberately **not** exported — DAG
-orchestration is the consumer's job.
+Both layers are mechanism only. The base export does not publish scheduling
+policy. The model-runtime face may publish one selected stage DAG as execution
+mechanism; orchestration policy remains the consumer's job.
 
 ## Structure
 
@@ -172,6 +173,18 @@ their own version policy:
   future additive tails are individually size-probed while
   `FRT_MODEL_RUNTIME_ABI_VERSION` remains `1`. The embedded verbs table is
   frozen and cannot grow because fields follow it.
+
+The first model-runtime tail is `query_extension`. It is read only after the
+`FRT_MODEL_RUNTIME_V1_QUERY_EXTENSION_SIZE` probe. CORE assigns extension IDs;
+providers cannot add private IDs to the public namespace, attach tables after
+finish, or compute a parallel identity. The current generic stage-plan table
+describes one selected GRAPH/OPAQUE DAG and remains owned by the runtime.
+
+A provider with no FlashRT graph resources may use the core metadata-only
+model builder. Its non-null zero-resource export is an identity/lifetime anchor,
+not an execution context and not a model-state snapshot promise. OPAQUE and
+step-only runtimes remain fail-closed for model-level state until a separately
+reviewed state capability exists.
 
 An incompatible major type/symbol requires a separately reviewed ABI. An
 additive tail does not justify duplicating the full model-runtime interface.

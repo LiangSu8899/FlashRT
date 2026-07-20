@@ -125,6 +125,19 @@ Keep responsibilities in their owner layer.
 | `serving/` | scenario hosts, sessions, protocols, request policy | kernel implementation, default core imports, common execution policy |
 | `training/` | training and finetuning paths | inference hot-path dependencies unless explicitly shared and tested |
 
+For a model-runtime capability change, require all of the following:
+
+- the released prefix, verbs size/offsets, enum values and ABI version remain
+  exact; each additive tail/table has its own required-size probe;
+- an independently compiled baseline-prefix producer and a tail-aware consumer
+  prove no out-of-bounds tail read;
+- extension IDs and canonical identity records are assigned in core, contain no
+  provider/model/backend names, and are emitted only by the common builder;
+- authority XOR, malformed/unknown table, owner retention, override forwarding,
+  metadata restrictions and fingerprint change/no-change matrices are tested;
+- OPAQUE execution does not silently acquire graph hot-path, async, cancellation
+  or model-state guarantees that its table does not declare.
+
 Blockers:
 
 - A frontend imports a serving host or server-only dependency.
