@@ -137,6 +137,10 @@ set(FA2_HDIMS "64;96;128;256" CACHE STRING
     "Semicolon-separated FA2 head_dim instantiations to build. Qwen3-VL 2B vision uses 64; other shipped models use 96 and 256.")
 set(FA2_DTYPES "fp16;bf16" CACHE STRING
     "Semicolon-separated FA2 dtype instantiations to build. Pi0 uses fp16; pi0.5/groot use bf16.")
+option(FLASHRT_ENABLE_NATIVE_CPP
+       "Build Python-free operation libraries for native C++ consumers" OFF)
+option(FLASHRT_BUILD_FA2_PYTHON_ADAPTER
+       "Build the vendored FA2 Python adapter when FA2 is available" ON)
 
 # Motus beta integration. Motus-specific kernels are additive and must keep
 # their symbols prefixed with ``motus_``. Keeping a build tag lets the public
@@ -783,8 +787,10 @@ if(ENABLE_NVFP4)
 endif()
 
 # ── Flash-Attention 2 vendored kernels (fp16 + bf16 fwd SM80) ──
-# Built as an object library and linked into a Python-free raw library;
-# flash_rt_fa2.so is a thin pybind adapter over that library. The
+# By default the object library is linked directly into the existing
+# flash_rt_fa2.so Python module. Native C++ builds explicitly opt into a
+# Python-free raw library; an enabled Python adapter then becomes a thin
+# consumer of that library. The
 # main flash_rt_kernels.so stays small (~3.6 MB) and its rebuild no
 # longer waits on FA2's heavy CUTLASS 3.x template codegen (~8 min).
 #
@@ -793,7 +799,8 @@ endif()
 # fa2_wrapper.cu provides the raw-pointer C entries
 # (fvk_attention_fa2_fwd_{fp16,bf16}); fa2_bindings.cpp pybind11-wraps
 # them into the flash_rt_fa2 module.
-if(ENABLE_FA2)
+if(ENABLE_FA2 AND
+   (FLASHRT_BUILD_FA2_PYTHON_ADAPTER OR FLASHRT_ENABLE_NATIVE_CPP))
   # Dynamic source list: {hdim} x {dtype} x {split, no-split} .cu files,
   # driven by FA2_HDIMS / FA2_DTYPES cache vars. Default is the full
   # 12-file matrix; users can restrict either axis to slim builds.
@@ -847,15 +854,29 @@ if(ENABLE_FA2)
       csrc/attention/fa2_causal_inst/flash_fwd_split_hdim256_bf16_sm80_causal.cu
     )
   endif()
-  # Always emit the causal C entry. Builds without a causal hdim retain a
-  # stable raw-library symbol that fails clearly instead of an unresolved ABI.
-  list(APPEND FA2_SRCS csrc/attention/fa2_wrapper_causal.cu)
+  if(FLASHRT_ENABLE_NATIVE_CPP)
+    # The native C boundary has a stable five-symbol surface. Its causal
+    # wrapper contains native-only fail-fast dispatch for a slim matrix.
+    list(APPEND FA2_SRCS csrc/attention/fa2_wrapper_causal.cu)
+  elseif("bf16" IN_LIST FA2_DTYPES AND
+         ("128" IN_LIST FA2_HDIMS OR "256" IN_LIST FA2_HDIMS))
+    # Preserve the existing Python-only source matrix exactly by default.
+    list(APPEND FA2_SRCS csrc/attention/fa2_wrapper_causal.cu)
+  endif()
 
   add_library(fa2_vendor_obj OBJECT ${FA2_SRCS})
   set_target_properties(fa2_vendor_obj PROPERTIES
     CUDA_STANDARD 17
     POSITION_INDEPENDENT_CODE ON
   )
+  if(FLASHRT_ENABLE_NATIVE_CPP)
+    target_compile_definitions(fa2_vendor_obj PRIVATE
+      FLASHRT_FA2_NATIVE_BUILD=1)
+    set_target_properties(fa2_vendor_obj PROPERTIES
+      CXX_VISIBILITY_PRESET hidden
+      CUDA_VISIBILITY_PRESET hidden
+      VISIBILITY_INLINES_HIDDEN YES)
+  endif()
   target_include_directories(fa2_vendor_obj PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/flash_attn_2_src
@@ -970,40 +991,67 @@ if(ENABLE_FA2)
   math(EXPR _FA2_NKERN "${_FA2_NSRC} - 1")
   message(STATUS "FA2 vendor instantiations: hdim={${_FA2_H}} x dtype={${_FA2_D}} x {split,no-split} = ${_FA2_NKERN} kernel .cu files")
 
-  # Keep the raw C entries in a Python-free library. The native C++ runtime
-  # links this target directly; the pybind module below is only an adapter.
-  add_library(flashrt_fa2_raw SHARED)
-  target_sources(flashrt_fa2_raw PRIVATE $<TARGET_OBJECTS:fa2_vendor_obj>)
-  target_link_libraries(flashrt_fa2_raw PRIVATE CUDA::cudart)
-  if(NOT MSVC)
-    target_link_options(flashrt_fa2_raw PRIVATE
-      "LINKER:--no-undefined" -static-libstdc++ -static-libgcc)
+  if(FLASHRT_ENABLE_NATIVE_CPP)
+    # Opt-in Python-free linkage boundary for native C++ runtimes.
+    add_library(flashrt_fa2_raw SHARED)
+    target_sources(flashrt_fa2_raw PRIVATE
+      $<TARGET_OBJECTS:fa2_vendor_obj>)
+    target_link_libraries(flashrt_fa2_raw PRIVATE CUDA::cudart)
+    if(MSVC)
+      target_compile_definitions(flashrt_fa2_raw PRIVATE
+        FLASHRT_FA2_NATIVE_BUILD=1)
+    else()
+      target_link_options(flashrt_fa2_raw PRIVATE
+        "LINKER:--no-undefined")
+      if(UNIX AND NOT APPLE)
+        target_link_options(flashrt_fa2_raw PRIVATE
+          "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/fa2_native_exports.map")
+      endif()
+    endif()
+    set_target_properties(flashrt_fa2_raw PROPERTIES
+      CXX_VISIBILITY_PRESET hidden
+      CUDA_VISIBILITY_PRESET hidden
+      VISIBILITY_INLINES_HIDDEN YES
+      LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt
+      RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt
+      BUILD_RPATH "$ORIGIN"
+      INSTALL_RPATH "$ORIGIN"
+      BUILD_WITH_INSTALL_RPATH ON)
+    install(TARGETS flashrt_fa2_raw
+      DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
+    message(STATUS "FA2 native C library: flashrt_fa2_raw (opt-in)")
   endif()
-  set_target_properties(flashrt_fa2_raw PROPERTIES
-    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt
-    BUILD_RPATH "$ORIGIN"
-    INSTALL_RPATH "$ORIGIN"
-    BUILD_WITH_INSTALL_RPATH ON)
 
-  # Independent pybind module. Caller side:
-  #     from flash_rt import flash_rt_fa2 as fa2
-  #     fa2.fwd_fp16(...)  /  fa2.fwd_bf16(...)
-  pybind11_add_module(flash_rt_fa2 csrc/fa2_bindings.cpp)
-  set_target_properties(flash_rt_fa2 PROPERTIES
-    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
-  target_include_directories(flash_rt_fa2 PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/csrc
-  )
-  target_link_libraries(flash_rt_fa2 PRIVATE flashrt_fa2_raw CUDA::cudart)
-  set_target_properties(flash_rt_fa2 PROPERTIES
-    BUILD_RPATH "$ORIGIN"
-    INSTALL_RPATH "$ORIGIN"
-    BUILD_WITH_INSTALL_RPATH ON)
-  install(TARGETS flash_rt_fa2 flashrt_fa2_raw
-    DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
-  message(STATUS "FA2 pybind module: flash_rt_fa2 (separate .so)")
+  if(FLASHRT_BUILD_FA2_PYTHON_ADAPTER)
+    # Independent pybind module. Caller side:
+    #     from flash_rt import flash_rt_fa2 as fa2
+    #     fa2.fwd_fp16(...)  /  fa2.fwd_bf16(...)
+    pybind11_add_module(flash_rt_fa2 csrc/fa2_bindings.cpp)
+    set_target_properties(flash_rt_fa2 PROPERTIES
+      LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt
+      RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
+    target_include_directories(flash_rt_fa2 PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/csrc
+    )
+    if(FLASHRT_ENABLE_NATIVE_CPP)
+      target_compile_definitions(flash_rt_fa2 PRIVATE
+        FLASHRT_FA2_NATIVE_SHARED=1)
+      target_link_libraries(flash_rt_fa2 PRIVATE
+        flashrt_fa2_raw CUDA::cudart)
+      set_target_properties(flash_rt_fa2 PROPERTIES
+        BUILD_RPATH "$ORIGIN"
+        INSTALL_RPATH "$ORIGIN"
+        BUILD_WITH_INSTALL_RPATH ON)
+    else()
+      # This is the compatibility path and must remain the default.
+      target_sources(flash_rt_fa2 PRIVATE
+        $<TARGET_OBJECTS:fa2_vendor_obj>)
+      target_link_libraries(flash_rt_fa2 PRIVATE CUDA::cudart)
+    endif()
+    install(TARGETS flash_rt_fa2
+      DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
+    message(STATUS "FA2 pybind module: flash_rt_fa2 (separate .so)")
+  endif()
 endif()
 
 # ── Qwen3-VL kernels (separate module, additive) ──
@@ -1530,8 +1578,9 @@ if(FLASHRT_ENABLE_MOTUS AND GPU_ARCH STREQUAL "120")
     ENABLE_TINYFP8_KERNELS=1)
 endif()
 
-# (ENABLE_FA2 object-lib is linked into libflashrt_fa2_raw.so only; the
-# dedicated pybind module and native C++ runtime both consume it. The main
+# (ENABLE_FA2 object-lib is linked directly into flash_rt_fa2.so by default.
+# Native C++ builds opt into libflashrt_fa2_raw.so and may link the adapter
+# against that single implementation. The main
 # flash_rt_kernels.so deliberately does NOT pull FA2 in, so rebuilds
 # of our hand-written kernels don't re-trigger the FA2 codegen tax.)
 

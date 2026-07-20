@@ -21,8 +21,7 @@ files directly into ``flash_rt/`` at build time — no follow-up
     cmake --build build -j
 
 After this, ``flash_rt/flash_rt_kernels*.so`` (and on RTX,
-``flash_rt_fa2*.so`` plus ``libflashrt_fa2_raw.so``; on Thor/Hopper,
-``flash_rt_fp4*.so``) exist
+``flash_rt_fa2*.so``; on Thor/Hopper, ``flash_rt_fp4*.so``) exist
 and ``import flash_rt`` works in editable installs.
 
 Optional pip dependency: the legacy upstream attention path

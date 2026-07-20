@@ -183,9 +183,9 @@ def test_object_libraries_counted_in_total():
     module's direct sources; the inventory must account for them separately so
     the reported compile surface is not understated.
 
-    flash_rt_fa2 compiles 1 direct TU but links the fa2_vendor_obj object
-    library; its total must exceed its direct count when attribution is
-    available (Makefile link.txt / Ninja build.ninja present).
+    The default flash_rt_fa2 module links fa2_vendor_obj directly. The opt-in
+    native build links those objects once into flashrt_fa2_raw, leaving the
+    Python module as a thin adapter with no object-library TUs of its own.
     """
     _require_build_dir()
     report = inv.collect(BUILD_DIR)
@@ -194,6 +194,10 @@ def test_object_libraries_counted_in_total():
         pytest.skip("flash_rt_fa2 not configured in this build dir")
     if "object_tu_count" not in fa2:
         pytest.skip("no linker manifest in this build dir; attribution skipped")
-    assert fa2["object_tu_count"] >= 1
-    assert fa2["total_tu_count"] == fa2["count"] + fa2["object_tu_count"]
-    assert fa2["total_tu_count"] > fa2["count"]
+    if _cache_bool("FLASHRT_ENABLE_NATIVE_CPP"):
+        assert fa2["object_tu_count"] == 0
+        assert fa2["total_tu_count"] == fa2["count"]
+    else:
+        assert fa2["object_tu_count"] >= 1
+        assert fa2["total_tu_count"] == fa2["count"] + fa2["object_tu_count"]
+        assert fa2["total_tu_count"] > fa2["count"]

@@ -181,6 +181,7 @@ extern "C" void fvk_attention_fa2_fwd_bf16_causal(
     int o_batch_stride, int o_row_stride, int o_head_stride,
     float softmax_scale, int num_sms, cudaStream_t stream)
 {
+#ifdef FLASHRT_FA2_NATIVE_BUILD
     bool supported = false;
 #if defined(FA2_HAS_BF16) && defined(FA2_HAS_HDIM_128)
     supported = supported || head_dim == 128;
@@ -194,6 +195,24 @@ extern "C" void fvk_attention_fa2_fwd_bf16_causal(
             "Enable its FA2_HDIMS entry and rebuild.\n", head_dim);
         std::abort();
     }
+#else
+    if ((head_dim != 128)
+#ifdef FA2_HAS_HDIM_256
+        && head_dim != 256
+#endif
+        ) {
+#ifdef FA2_HAS_HDIM_256
+        fprintf(stderr,
+            "fvk_attention_fa2_fwd_bf16_causal: head_dim=%d not built. "
+            "Only head_dim=128 and 256 are currently instantiated.\n", head_dim);
+#else
+        fprintf(stderr,
+            "fvk_attention_fa2_fwd_bf16_causal: head_dim=%d not built. "
+            "Only head_dim=128 is currently instantiated.\n", head_dim);
+#endif
+        std::abort();
+    }
+#endif
 
     FLASH_NAMESPACE::Flash_fwd_params params;
     fill_params_causal(params,
@@ -206,9 +225,10 @@ extern "C" void fvk_attention_fa2_fwd_bf16_causal(
                        o_batch_stride, o_row_stride, o_head_stride,
                        softmax_scale);
 
-    int num_splits = setup_splitkv_causal(
-        params, softmax_lse_accum_ptr, o_accum_ptr, num_sms, seqlen_q,
-        seqlen_k, head_dim, batch, num_heads_q);
+    int num_splits = setup_splitkv_causal(params, softmax_lse_accum_ptr, o_accum_ptr,
+                                          num_sms, seqlen_q, seqlen_k,
+                                          head_dim, batch, num_heads_q);
+#ifdef FLASHRT_FA2_NATIVE_BUILD
     switch (head_dim) {
 #if defined(FA2_HAS_BF16) && defined(FA2_HAS_HDIM_128)
         case 128:
@@ -238,4 +258,25 @@ extern "C" void fvk_attention_fa2_fwd_bf16_causal(
                 "in this FA2 matrix.\n", head_dim);
             std::abort();
     }
+#else
+    if (head_dim == 128 && num_splits > 1) {
+        FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 128, true>(params, stream);
+    } else if (head_dim == 128) {
+        FLASH_NAMESPACE::run_mha_fwd_<cutlass::bfloat16_t, 128, true>(params, stream);
+    }
+#ifdef FA2_HAS_HDIM_256
+    else if (num_splits > 1) {
+        FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 256, true>(params, stream);
+    } else {
+        FLASH_NAMESPACE::run_mha_fwd_<cutlass::bfloat16_t, 256, true>(params, stream);
+    }
+#else
+    else {
+        fprintf(stderr,
+            "fvk_attention_fa2_fwd_bf16_causal: head_dim=%d not built "
+            "(hdim=256 disabled at compile time).\n", head_dim);
+        std::abort();
+    }
+#endif
+#endif
 }
