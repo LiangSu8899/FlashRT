@@ -34,6 +34,19 @@ from .discover import (Seam, _resolve, discover, group_families,
 
 _FP8 = torch.float8_e4m3fn
 
+# Host-family attention adapters. Attention seams are not a static
+# module pattern — where the attention math actually runs is
+# host-specific (a function in one host, a processor in another), so
+# auto-discovery of the attention_core structure is delegated to
+# registered adapters. Each adapter, given the model and a way to run
+# it, returns (swaps, update) or None (this host is not its family).
+_ATTENTION_ADAPTERS: list = []
+
+
+def register_attention_adapter(adapter) -> None:
+    """Register a host-family attention adapter (callable)."""
+    _ATTENTION_ADAPTERS.append(adapter)
+
 
 @dataclass
 class AutoPlan:
@@ -138,6 +151,26 @@ def auto_swaps(
                 plan.swaps.update(bound)
             else:
                 plan.swaps[seam.path] = bound
+    # ---- attention_core: host-family adapters (fa2 seam) ----
+    if "attention_core" in structures:
+        from . import adapters as _adapters  # noqa: F401 (registers)
+        for adapter in _ATTENTION_ADAPTERS:
+            try:
+                result = adapter(model, forward)
+            except (ValueError, RuntimeError) as refusal:
+                plan.notes.setdefault("refused", []).append(
+                    ("attention_core", str(refusal)[:80]))
+                continue
+            if result is None:
+                continue
+            att_swaps, update = result
+            plan.swaps.update(att_swaps)
+            if update is not None:
+                plan.updates.append(update)
+            plan.notes["attention_adapter"] = type(adapter).__name__ \
+                if hasattr(adapter, "__name__") else str(adapter)
+            break
+
     say(f"bound {len(plan.swaps)} seam(s), "
         f"{len(plan.notes.get('refused', []))} refused")
     return plan
