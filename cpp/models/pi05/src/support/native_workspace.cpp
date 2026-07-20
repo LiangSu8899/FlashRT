@@ -1,6 +1,7 @@
 #include "flashrt/cpp/models/pi05/support/native_workspace.h"
 
 #include "flashrt/cpp/models/pi05/model/dims.h"
+#include "flashrt/cpp/models/pi05/support/native_float16.h"
 #include "flashrt/cpp/models/pi05/support/native_rope.h"
 
 #ifdef FLASHRT_CPP_WITH_CUDA_STAGING
@@ -111,7 +112,7 @@ modalities::Status NativeWorkspace::initialize_rms_ones() {
         }
         const std::uint16_t one =
             target->dtype == modalities::DType::kFloat16
-                ? modalities::float_to_float16(1.0f)
+                ? float_to_float16_rne(1.0f)
                 : modalities::float_to_bfloat16(1.0f);
         std::vector<std::uint16_t> ones(target->shape[0], one);
         const cudaError_t rc = cudaMemcpy(

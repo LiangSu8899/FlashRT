@@ -7,7 +7,6 @@
 #include <cmath>
 #include <cstdint>
 #include <iostream>
-#include <limits>
 #include <vector>
 
 using flashrt::modalities::DType;
@@ -20,36 +19,11 @@ using flashrt::modalities::TensorView;
 using flashrt::modalities::VisionFrame;
 using flashrt::modalities::bfloat16_to_float;
 using flashrt::modalities::float_to_bfloat16;
-using flashrt::modalities::float_to_float16;
 using flashrt::modalities::postprocess_action_cpu;
 using flashrt::modalities::preprocess_vision_cpu;
 using flashrt::modalities::required_vision_output_bytes;
 
 namespace {
-
-void test_float16_round_to_nearest_even() {
-    assert(float_to_float16(1.00048828125f) == 0x3c00u);
-    assert(float_to_float16(1.00146484375f) == 0x3c02u);
-    assert(float_to_float16(-1.00048828125f) == 0xbc00u);
-    assert(float_to_float16(-1.00146484375f) == 0xbc02u);
-
-    const float half_min_subnormal = std::ldexp(1.0f, -25);
-    assert(float_to_float16(half_min_subnormal) == 0x0000u);
-    assert(float_to_float16(std::nextafter(
-               half_min_subnormal, std::numeric_limits<float>::infinity())) ==
-           0x0001u);
-    assert(float_to_float16(3.0f * std::ldexp(1.0f, -25)) == 0x0002u);
-    assert(float_to_float16(std::ldexp(1.0f, -14) -
-                            std::ldexp(1.0f, -25)) == 0x0400u);
-
-    assert(float_to_float16(std::numeric_limits<float>::infinity()) ==
-           0x7c00u);
-    assert(float_to_float16(-std::numeric_limits<float>::infinity()) ==
-           0xfc00u);
-    const std::uint16_t nan =
-        float_to_float16(std::numeric_limits<float>::quiet_NaN());
-    assert((nan & 0x7c00u) == 0x7c00u && (nan & 0x03ffu) != 0);
-}
 
 void test_divide_shift_normalization() {
     flashrt::modalities::VisionPreprocessSpec spec;
@@ -227,7 +201,6 @@ void test_pi05_runtime_io_adapter() {
 }  // namespace
 
 int main() {
-    test_float16_round_to_nearest_even();
     test_divide_shift_normalization();
     test_pi05_vision_spec_and_preprocess();
     test_view_order_guard();

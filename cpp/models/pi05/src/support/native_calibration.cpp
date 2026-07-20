@@ -2,6 +2,7 @@
 
 #include "flashrt/cpp/loader/safetensors.h"
 #include "flashrt/cpp/models/pi05/model/dims.h"
+#include "flashrt/cpp/models/pi05/support/native_float16.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -65,7 +66,7 @@ double uniform_open(std::uint64_t* state) {
 
 std::uint16_t encode(float value, modalities::DType dtype) {
     return dtype == modalities::DType::kFloat16
-               ? modalities::float_to_float16(value)
+               ? float_to_float16_rne(value)
                : modalities::float_to_bfloat16(value);
 }
 

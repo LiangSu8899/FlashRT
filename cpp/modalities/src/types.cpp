@@ -74,47 +74,25 @@ std::uint16_t float_to_float16(float value) {
     std::uint32_t x = 0;
     std::memcpy(&x, &value, sizeof(x));
     const std::uint32_t sign = (x >> 16) & 0x8000u;
-    const std::uint32_t exponent_bits = (x >> 23) & 0xffu;
+    std::int32_t exp = static_cast<std::int32_t>((x >> 23) & 0xffu) - 127 + 15;
     std::uint32_t mant = x & 0x7fffffu;
 
-    if (exponent_bits == 0xffu) {
-        if (!mant) return static_cast<std::uint16_t>(sign | 0x7c00u);
-        return static_cast<std::uint16_t>(sign | 0x7e00u);
+    if (exp <= 0) {
+        if (exp < -10) return static_cast<std::uint16_t>(sign);
+        mant |= 0x800000u;
+        const std::uint32_t shift = static_cast<std::uint32_t>(14 - exp);
+        std::uint32_t half = mant >> shift;
+        if ((mant >> (shift - 1)) & 1u) half += 1;
+        return static_cast<std::uint16_t>(sign | half);
     }
-    const std::int32_t exponent =
-        static_cast<std::int32_t>(exponent_bits) - 127;
-    if (exponent > 15) {
-        return static_cast<std::uint16_t>(sign | 0x7c00u);
+    if (exp >= 31) {
+        if (mant == 0) return static_cast<std::uint16_t>(sign | 0x7c00u);
+        return static_cast<std::uint16_t>(sign | 0x7c00u | (mant >> 13) | 1u);
     }
-    if (exponent >= -14) {
-        std::uint32_t half_exponent =
-            static_cast<std::uint32_t>(exponent + 15);
-        std::uint32_t half_mantissa = mant >> 13;
-        const std::uint32_t remainder = mant & 0x1fffu;
-        if (remainder > 0x1000u ||
-            (remainder == 0x1000u && (half_mantissa & 1u))) {
-            if (++half_mantissa == 0x400u) {
-                half_mantissa = 0;
-                if (++half_exponent == 31u) {
-                    return static_cast<std::uint16_t>(sign | 0x7c00u);
-                }
-            }
-        }
-        return static_cast<std::uint16_t>(
-            sign | (half_exponent << 10) | half_mantissa);
-    }
-    if (exponent < -25) return static_cast<std::uint16_t>(sign);
 
-    mant |= 0x800000u;
-    const std::uint32_t shift = static_cast<std::uint32_t>(-exponent - 1);
-    std::uint32_t half_mantissa = mant >> shift;
-    const std::uint32_t remainder = mant & ((1u << shift) - 1u);
-    const std::uint32_t halfway = 1u << (shift - 1u);
-    if (remainder > halfway ||
-        (remainder == halfway && (half_mantissa & 1u))) {
-        ++half_mantissa;
-    }
-    return static_cast<std::uint16_t>(sign | half_mantissa);
+    std::uint32_t half = (static_cast<std::uint32_t>(exp) << 10) | (mant >> 13);
+    if (mant & 0x1000u) half += 1;
+    return static_cast<std::uint16_t>(sign | half);
 }
 
 float float16_to_float(std::uint16_t value) {

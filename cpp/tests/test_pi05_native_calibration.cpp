@@ -1,9 +1,11 @@
 #include "flashrt/cpp/models/pi05/model/dims.h"
 #include "flashrt/cpp/models/pi05/support/native_calibration.h"
+#include "flashrt/cpp/models/pi05/support/native_float16.h"
 
 #include <cassert>
 #include <cmath>
 #include <cstdio>
+#include <limits>
 #include <string>
 #include <unistd.h>
 #include <vector>
@@ -30,6 +32,25 @@ int main() {
     using flashrt::models::pi05::reduce_native_calibration_samples;
     using flashrt::models::pi05::save_native_calibration_artifact;
     using flashrt::models::pi05::valid_native_calibration_config;
+
+    const auto to_float16 = flashrt::models::pi05::float_to_float16_rne;
+    assert(to_float16(1.00048828125f) == 0x3c00u);
+    assert(to_float16(1.00146484375f) == 0x3c02u);
+    assert(to_float16(-1.00048828125f) == 0xbc00u);
+    assert(to_float16(-1.00146484375f) == 0xbc02u);
+    const float half_min_subnormal = std::ldexp(1.0f, -25);
+    assert(to_float16(half_min_subnormal) == 0x0000u);
+    assert(to_float16(std::nextafter(
+               half_min_subnormal, std::numeric_limits<float>::infinity())) ==
+           0x0001u);
+    assert(to_float16(3.0f * std::ldexp(1.0f, -25)) == 0x0002u);
+    assert(to_float16(std::ldexp(1.0f, -14) -
+                      std::ldexp(1.0f, -25)) == 0x0400u);
+    assert(to_float16(std::numeric_limits<float>::infinity()) == 0x7c00u);
+    assert(to_float16(-std::numeric_limits<float>::infinity()) == 0xfc00u);
+    const std::uint16_t nan =
+        to_float16(std::numeric_limits<float>::quiet_NaN());
+    assert((nan & 0x7c00u) == 0x7c00u && (nan & 0x03ffu) != 0);
 
     NativeCalibrationConfig config;
     config.checkpoint_path = "checkpoint";

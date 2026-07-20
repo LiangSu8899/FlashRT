@@ -375,6 +375,7 @@ if(FLASHRT_CPP_WITH_PI05)
     models/pi05/src/model/semantic_pipeline.cpp
     models/pi05/src/support/native_calibration.cpp
     models/pi05/src/support/native_device_weights.cpp
+    models/pi05/src/support/native_float16.cpp
     models/pi05/src/support/native_weight_materializer.cpp
     models/pi05/src/support/native_resource_resolver.cpp
     models/pi05/src/support/native_weight_ops.cpp

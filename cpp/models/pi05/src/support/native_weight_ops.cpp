@@ -1,5 +1,7 @@
 #include "flashrt/cpp/models/pi05/support/native_weight_ops.h"
 
+#include "flashrt/cpp/models/pi05/support/native_float16.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -117,7 +119,7 @@ struct F32Reader {
         return modalities::float_to_bfloat16(data[index]);
     }
     std::uint16_t f16(std::size_t index) const {
-        return modalities::float_to_float16(data[index]);
+        return float_to_float16_rne(data[index]);
     }
 };
 
@@ -128,7 +130,7 @@ struct Bf16Reader {
     }
     std::uint16_t bf16(std::size_t index) const { return data[index]; }
     std::uint16_t f16(std::size_t index) const {
-        return modalities::float_to_float16((*this)[index]);
+        return float_to_float16_rne((*this)[index]);
     }
 };
 
@@ -155,7 +157,7 @@ struct UnalignedF32Reader {
         return modalities::float_to_bfloat16((*this)[index]);
     }
     std::uint16_t f16(std::size_t index) const {
-        return modalities::float_to_float16((*this)[index]);
+        return float_to_float16_rne((*this)[index]);
     }
 };
 
@@ -176,7 +178,7 @@ struct UnalignedU16Reader {
                       : modalities::float_to_bfloat16((*this)[index]);
     }
     std::uint16_t f16(std::size_t index) const {
-        return IsBf16 ? modalities::float_to_float16((*this)[index])
+        return IsBf16 ? float_to_float16_rne((*this)[index])
                       : bits(index);
     }
 };
@@ -394,7 +396,7 @@ modalities::Status native_source_qkv_to_f16(
                 const float folded = norm
                     ? weight * (1.0f + norm->values[col])
                     : weight;
-                return modalities::float_to_float16(folded);
+                return float_to_float16_rne(folded);
             };
             if (transpose) {
                 tiled_transform_transpose(
@@ -455,7 +457,7 @@ modalities::Status native_source_pair_to_f16(
         return dispatch_source(source, [&](const auto& reader) {
             const auto value = [&](std::size_t row, std::size_t col) {
                 const float weight = reader[row * cols + col];
-                return modalities::float_to_float16(
+                return float_to_float16_rne(
                     norm ? weight * (1.0f + norm->values[col]) : weight);
             };
             if (transpose) {
@@ -578,7 +580,7 @@ modalities::Status native_source_fold_rms_columns_to_f16(
     folded.values.resize(count);
     modalities::Status st = dispatch_source(weight, [&](const auto& reader) {
         const auto value = [&](std::size_t row, std::size_t col) {
-            return modalities::float_to_float16(
+            return float_to_float16_rne(
                 reader[row * cols + col] * (1.0f + norm.values[col]));
         };
         if (transpose) {
@@ -918,7 +920,7 @@ modalities::Status native_to_f16(const NativeFloatTensor& input,
                     [&](std::size_t begin, std::size_t end) {
         for (std::size_t i = begin; i < end; ++i) {
             converted.values[i] =
-                modalities::float_to_float16(input.values[i]);
+                float_to_float16_rne(input.values[i]);
         }
     });
     *out = std::move(converted);
@@ -1234,9 +1236,9 @@ modalities::Status native_pi05_time_embeddings_f16(
             const double period =
                 kMinPeriod * std::pow(kPeriodRatio, fraction);
             const double angle = t * kTwoPi / period;
-            result.values[row + i] = modalities::float_to_float16(
+            result.values[row + i] = float_to_float16_rne(
                 static_cast<float>(std::sin(angle)));
-            result.values[row + half + i] = modalities::float_to_float16(
+            result.values[row + half + i] = float_to_float16_rne(
                 static_cast<float>(std::cos(angle)));
         }
     }
