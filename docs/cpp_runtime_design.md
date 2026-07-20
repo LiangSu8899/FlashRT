@@ -41,6 +41,10 @@ cpp/                         native implementation layers (NOT frozen)
                              buffers, normalization, action schemas and the
                              generic model-runtime face
 
+csrc/native_cpp/             opt-in, Python-free operation implementations
+                             used by native frontends; model-independent and
+                             hidden from the public shared-library surface
+
 flash_rt/runtime/export.py   the Python producer (same face, GIL-safe verbs)
 ```
 
@@ -169,3 +173,24 @@ only `FRT_MODEL_RUNTIME_V1_BASE_SIZE` and probe future tails separately while
 the model-runtime ABI version remains 1. The embedded verbs table is frozen.
 Everything under `cpp/` may be refactored freely as long as the produced
 struct — and the identity it fingerprints — is preserved.
+
+## Native build isolation
+
+Native C++ deployment support is an explicit product boundary controlled by
+`FLASHRT_ENABLE_NATIVE_CPP`. When it is disabled, native model producers and
+their operation-only dependencies do not enter the default Python build or
+change its dynamic dependencies.
+
+An existing common `csrc` symbol is a shared behavioral contract. A native
+model adaptation must not change its signature, workspace requirement,
+numerical behavior, launch behavior or default build ownership. If the native
+path needs stricter math or a different workspace contract, add a distinctly
+named operation under the opt-in native boundary. A genuinely common fix is a
+separate infrastructure change with a complete caller inventory, old-path
+regression evidence and calibration-cache impact analysis.
+
+`csrc/native_cpp/` may contain reusable operation implementations missing from
+the Python-oriented build, but it must not contain model topology, checkpoint
+keys, model dimensions, prompt rules or stage policy. Its entry points are
+internal linkage contracts, not another deployment ABI. The model producer's
+shared library exports only its documented C API.

@@ -49,8 +49,10 @@ entries in one observation.
 
 ## Build and link
 
-Enable one PI0.5 target and SentencePiece in the FlashRT build. When FlashRT is
-included with CMake, link the C face:
+Enable `FLASHRT_ENABLE_NATIVE_CPP`, SentencePiece, and exactly one PI0.5 target
+as shown in [`pi05_native_cpp.md`](pi05_native_cpp.md). Calibration is part of
+the same producer library as runtime open; it does not build or load a second
+model forward. When FlashRT is included with CMake, link the C face:
 
 ```cmake
 target_link_libraries(my_runner PRIVATE flashrt_cpp_pi05_c)

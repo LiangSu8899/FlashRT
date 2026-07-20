@@ -226,6 +226,16 @@ reviewers hold every PR to:
   cut is a re-ordering, not an approximation — split-vs-full replay must stay
   bit-exact (`cpp/tests/gate_pi05_model_runtime_export.py` is the gate).
 
+Native C++ model work is opt-in under `FLASHRT_ENABLE_NATIVE_CPP`. A model PR
+must leave the default Python build graph and every existing common `csrc`
+symbol unchanged. Native-only operation gaps belong in `csrc/native_cpp/` and
+must remain model-independent, hidden from the producer library's dynamic
+symbol surface, and unreachable when the option is disabled. Do not modify a
+shared kernel's math, workspace stride, signature or packaging to satisfy one
+native frontend. Propose a genuinely common correction separately with a
+caller inventory, cross-model numerical tests and cache/artifact compatibility
+analysis.
+
 ### Calibration And Precision
 
 FP8/NVFP4 changes must preserve the calibration cache contract described in

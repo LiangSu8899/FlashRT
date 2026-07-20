@@ -200,6 +200,13 @@ Required:
   and docs entry.
 - Architecture labels and CMake feature flags must be consistent with runtime
   hardware detection and routing.
+- Native C++ model producers must be absent from the default build and enabled
+  only through `FLASHRT_ENABLE_NATIVE_CPP` plus an explicit model target.
+- A native producer shared library must use hidden visibility and an exact C
+  API export allowlist; check the complete set, not only symbol presence.
+- A native model PR must show that existing common `csrc` files are unchanged
+  from the base revision. Native-only operation gaps may live under
+  `csrc/native_cpp/` only when they are model-independent and opt-in.
 
 Blockers:
 
@@ -209,6 +216,11 @@ Blockers:
 - Architecture-specific kernels compile into unsupported architecture targets.
 - Vendor-specific compile options leak into generic targets without a gate.
 - Binding list and required-symbol list are not updated together.
+- Internal CUDA/C++/vendor symbols leak from a native producer shared library.
+- Enabling a native target changes the default Python module's math, link
+  ownership, dynamic dependencies or install unit.
+- A model adaptation changes an existing common operation's signature,
+  numerical behavior or workspace contract instead of isolating the need.
 
 Build checks:
 
@@ -225,6 +237,12 @@ cmake -S . -B <build-dir> \
   -D<FEATURE_FLAG>=ON
 cmake --build <build-dir> --target <target_module> -j$(nproc)
 ```
+
+For native C++ model work, also configure the option OFF and confirm the model
+producer target is absent; configure target ON with the umbrella OFF and
+confirm configuration fails; build every selected hardware target; and on
+Linux compare `nm -D --defined-only` against the checked-in C API allowlist.
+SM110 builds must not gain an FA2 dependency merely because SM120 uses it.
 
 Import check:
 

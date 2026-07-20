@@ -28,15 +28,70 @@ rebinding.
 
 ## Build requirements
 
-Build one deployment target per build tree:
+The complete native path is opt-in. With
+`FLASHRT_ENABLE_NATIVE_CPP=OFF` (the default), the PI0.5 model libraries,
+native operation support, loader, tokenizer, producer and their tests are not
+part of the build. Existing Python modules and their kernel linkage remain
+unchanged.
 
+Build one deployment target per CMake tree:
+
+- `FLASHRT_ENABLE_NATIVE_CPP=ON` enables the native C++ product boundary.
 - `FLASHRT_CPP_WITH_PI05_SM120_TARGET=ON` for SM120 BF16 or static FP8.
 - `FLASHRT_CPP_WITH_PI05_SM110_TARGET=ON` for SM110 static FP8.
 - `FLASHRT_CPP_WITH_SENTENCEPIECE=ON` is required for native prompt formatting
   and embedding.
 
-The target uses the repository's existing CUDA kernels. The C++ frontend does
-not carry a second kernel implementation.
+SM120 also consumes the opt-in FA2 native C library documented in
+[`fa2_native_c_api.md`](fa2_native_c_api.md). Build it first, then pass its
+path to the frontend build:
+
+```bash
+cmake -S . -B <operations-build> \
+  -DGPU_ARCH=120 \
+  -DENABLE_FA2=ON \
+  -DFLASHRT_ENABLE_NATIVE_CPP=ON \
+  -DFLASHRT_BUILD_FA2_PYTHON_ADAPTER=OFF
+cmake --build <operations-build> --target flashrt_fa2_raw -j
+
+cmake -S cpp -B <frontend-build> \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DFLASHRT_ENABLE_NATIVE_CPP=ON \
+  -DFLASHRT_CPP_WITH_SENTENCEPIECE=ON \
+  -DFLASHRT_CPP_WITH_PI05_SM120_TARGET=ON \
+  -DFLASHRT_CPP_FA2_LIBRARY=<operations-build>/libflashrt_fa2_raw.so
+cmake --build <frontend-build> -j
+```
+
+SM110 does not depend on FA2. It consumes the existing CUTLASS FMHA path:
+
+```bash
+cmake -S cpp -B <frontend-build> \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DFLASHRT_ENABLE_NATIVE_CPP=ON \
+  -DFLASHRT_CPP_WITH_SENTENCEPIECE=ON \
+  -DFLASHRT_CPP_WITH_PI05_SM110_TARGET=ON \
+  -DFLASHRT_CPP_CUTLASS_DIR=<cutlass-source>
+cmake --build <frontend-build> -j
+```
+
+The shared producer exports only the documented `frt_*` C API. Internal CUDA,
+C++, SentencePiece and target symbols are hidden and checked at link time.
+
+The frontend uses existing common `csrc` operations without changing their
+symbols or behavior. Native-only operation gaps live under `csrc/native_cpp/`,
+are linked only by an enabled native target, and are not added to the Python
+kernel modules. They are model-independent operation implementations; PI0.5
+model order, dimensions, state rules and checkpoint mapping remain under
+`cpp/models/pi05/`.
+
+| Native C++ | PI0.5 target | Result |
+|---|---|---|
+| OFF | OFF | Existing default build; no native PI0.5 product |
+| OFF | ON | Configuration error |
+| ON | OFF | Native support/model static libraries only; no deployable producer |
+| ON | exactly one target | `libflashrt_cpp_pi05_c` and selected target |
+| ON | both targets | Configuration error; use separate build trees |
 
 ## Configuration
 
