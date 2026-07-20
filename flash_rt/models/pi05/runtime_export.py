@@ -73,7 +73,7 @@ def export_runtime(pl, identity=None, extra_regions=None):
 def export_model_runtime(pl, identity=None, extra_regions=None,
                          stage_plan="full", io="python",
                          stage_plan_kwargs=None, robot_action_dim=None,
-                         state_dim=None):
+                         state_dim=None, native_overlay=None):
     """Package a captured Pi0.5 pipeline as an ``frt_model_runtime_v1``.
 
     ``io="python"`` mirrors the Python frontend: the frontend already delivers
@@ -86,9 +86,12 @@ def export_model_runtime(pl, identity=None, extra_regions=None,
                           (TENSOR — STATE is reserved for real proprioception)
       actions   OUT SWAP  raw bf16 action chunk (= diffusion_noise after step)
 
-    ``io="native"`` declares the native C++ runtime face over the same captured
-    graphs: images/actions are STAGED, noise is SWAP, and the C++ runtime
-    supplies the verbs through ``frt_model_runtime_override_verbs``.
+    ``io="native"`` publishes the native C++ runtime face over the same
+    captured graphs: images/actions are STAGED, noise is SWAP, and
+    ``native_overlay`` atomically installs the C++ verbs before the runtime is
+    returned. The callback receives the temporary declaration pointer and must
+    return the non-zero pointer produced by
+    ``frt_pi05_model_runtime_create_over``.
 
     ``io="native_v2"`` extends that face with prompt/state STAGED ports for
     fixed state-prompt deployments. The declaration is intended to be consumed
@@ -104,6 +107,11 @@ def export_model_runtime(pl, identity=None, extra_regions=None,
     ``native_v2`` also requires the corresponding ``state_dim``. These
     deployment dimensions are deliberately not owned by the model pipeline.
     """
+    native_io = io in ("native", "native_v2")
+    if native_io and native_overlay is None:
+        raise ValueError(
+            f"io={io!r} requires an immediate native_overlay; "
+            "a STAGED declaration cannot be published without real verbs")
     robot_action_dim = _resolve_robot_action_dim(
         pl, robot_action_dim, required=io in ("native", "native_v2"))
     state_dim = _resolve_state_dim(
@@ -232,16 +240,31 @@ def export_model_runtime(pl, identity=None, extra_regions=None,
         return rc
 
     manifest_extra = {"stage_plan": plan.manifest(), "io": io}
-    declaration_only = io in ("native", "native_v2")
-    if declaration_only:
-        manifest_extra["declaration_only"] = True
     if io == "native_v2":
         manifest_extra["prompt"] = {
             "state_prompt_mode": "fixed",
             "max_prompt_len": int(getattr(pl, "max_prompt_len", 0) or 0),
             "state_dim": state_dim,
         }
-    return _rt.build_model_runtime(
+    if not native_io:
+        return _rt.build_model_runtime(
+            pl._exec_ctx,
+            streams=parts["streams"],
+            graphs=parts["graphs"],
+            buffers=parts["buffers"],
+            regions=parts["regions"],
+            ports=ports,
+            stages=stages,
+            identity=parts["identity"],
+            manifest_extra=manifest_extra,
+            owner=parts["owner"],
+            step=step,
+        )
+
+    # The declaration exists only inside this call. Placeholder callbacks make
+    # the generic builder's STAGED invariant true while the model-private C++
+    # overlay is installed; they can never escape to a consumer.
+    declaration = _rt.build_model_runtime(
         pl._exec_ctx,
         streams=parts["streams"],
         graphs=parts["graphs"],
@@ -252,9 +275,24 @@ def export_model_runtime(pl, identity=None, extra_regions=None,
         identity=parts["identity"],
         manifest_extra=manifest_extra,
         owner=parts["owner"],
+        set_input=lambda _port, _payload, _stream: -3,
+        get_output=lambda _port, _stream: b"",
         step=step,
-        _allow_incomplete_staged=declaration_only,
     )
+    try:
+        over_ptr = int(native_overlay(declaration.ptr) or 0)
+        if not over_ptr:
+            raise RuntimeError("Pi05 native model-runtime overlay failed")
+        return _rt.ModelRuntime(
+            ptr=over_ptr,
+            export_ptr=declaration.export_ptr,
+            fingerprint=declaration.fingerprint,
+            identity=declaration.identity,
+            manifest=declaration.manifest,
+            _anchor=(declaration._anchor, native_overlay),
+        )
+    finally:
+        declaration.release()
 
 
 def _tensor_dtype(pl):

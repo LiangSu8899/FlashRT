@@ -39,33 +39,17 @@ import flash_rt  # noqa: E402
 from flash_rt.core.utils.actions import LIBERO_ACTION_DIM, unnormalize_actions  # noqa: E402
 from flash_rt.subgraphs.pi05.context_action import enable as enable_context_action  # noqa: E402
 from flash_rt.subgraphs.pi05.rtc_prefix import enable as enable_rtc_prefix  # noqa: E402
+from cpp.tests.pi05_runtime_ctypes import (  # noqa: E402
+    FRT_PI05_DTYPE_BFLOAT16,
+    FRT_PI05_DTYPE_FLOAT16,
+    FRT_PI05_DTYPE_FLOAT32,
+    Pi05RuntimeConfig,
+    load_pi05_library,
+    native_overlay,
+)
 
 
 FRT_RT_PIXEL_RGB8 = 0
-
-FRT_PI05_DTYPE_BFLOAT16 = 1
-FRT_PI05_DTYPE_FLOAT16 = 2
-FRT_PI05_DTYPE_FLOAT32 = 3
-
-
-class Pi05RuntimeConfig(ctypes.Structure):
-    _fields_ = [
-        ("struct_size", ctypes.c_uint32),
-        ("num_views", ctypes.c_int),
-        ("chunk", ctypes.c_int),
-        ("model_action_dim", ctypes.c_int),
-        ("robot_action_dim", ctypes.c_int),
-        ("action_mean", ctypes.POINTER(ctypes.c_float)),
-        ("n_action_mean", ctypes.c_uint64),
-        ("action_stddev", ctypes.POINTER(ctypes.c_float)),
-        ("n_action_stddev", ctypes.c_uint64),
-        ("graph_name", ctypes.c_char_p),
-        ("image_buffer_name", ctypes.c_char_p),
-        ("action_buffer_name", ctypes.c_char_p),
-        ("image_dtype", ctypes.c_int),
-        ("action_dtype", ctypes.c_int),
-    ]
-
 
 class FrtImageView(ctypes.Structure):
     _fields_ = [
@@ -124,23 +108,6 @@ class FrtModelRuntimeV1(ctypes.Structure):
     ]
 
 
-def _load_lib(path: str):
-    lib = ctypes.CDLL(path)
-    lib.frt_pi05_model_runtime_create.argtypes = [
-        ctypes.c_void_p,
-        ctypes.POINTER(Pi05RuntimeConfig),
-        ctypes.POINTER(ctypes.c_void_p),
-    ]
-    lib.frt_pi05_model_runtime_create.restype = ctypes.c_int
-    lib.frt_pi05_model_runtime_create_over.argtypes = [
-        ctypes.c_void_p,
-        ctypes.POINTER(Pi05RuntimeConfig),
-        ctypes.POINTER(ctypes.c_void_p),
-    ]
-    lib.frt_pi05_model_runtime_create_over.restype = ctypes.c_int
-    return lib
-
-
 def _model_error(m: FrtModelRuntimeV1) -> str:
     msg = m.verbs.last_error(m.self)
     return (msg or b"").decode(errors="replace")
@@ -176,13 +143,6 @@ def _dtype_from_value(dtype) -> tuple[int, torch.dtype]:
     if text in ("f32", "float32", "fp32", "1"):
         return FRT_PI05_DTYPE_FLOAT32, torch.float32
     raise RuntimeError(f"unsupported Pi05 action dtype: {dtype}")
-
-
-def _dtype_from_model_runtime(mr) -> tuple[int, torch.dtype]:
-    for port in mr.ports():
-        if port.get("name") == "noise":
-            return _dtype_from_value(port.get("dtype"))
-    raise RuntimeError("model runtime does not declare a noise port dtype")
 
 
 def _raw_to_float(raw: np.ndarray, dtype: torch.dtype) -> np.ndarray:
@@ -356,15 +316,6 @@ def _model_step_get_actions(m: FrtModelRuntimeV1, chunk: int) -> np.ndarray:
     return out
 
 
-def _create_over(lib, mr, cfg) -> FrtModelRuntimeV1:
-    m_ptr = ctypes.c_void_p()
-    rc = lib.frt_pi05_model_runtime_create_over(
-        ctypes.c_void_p(mr.ptr), ctypes.byref(cfg), ctypes.byref(m_ptr))
-    if rc != 0:
-        raise RuntimeError(f"frt_pi05_model_runtime_create_over failed rc={rc}")
-    return ctypes.cast(m_ptr, ctypes.POINTER(FrtModelRuntimeV1)).contents
-
-
 def _bench(label: str, n: int, fn) -> list[float]:
     for _ in range(min(3, n)):
         fn()
@@ -419,31 +370,11 @@ def main() -> None:
     pl = pipe.pipeline
     robot_action_dim = len(pipe.norm_stats["actions"]["q01"])
 
-    mr_full = pl.export_model_runtime(
-        identity={"gate": "cpp_pi05_model_runtime", "plan": "full"},
-        stage_plan="full",
-        io="native",
-        robot_action_dim=robot_action_dim,
-    )
-    mr_split = pl.export_model_runtime(
-        identity={"gate": "cpp_pi05_model_runtime", "plan": "context_action"},
-        stage_plan="context_action",
-        io="native",
-        robot_action_dim=robot_action_dim,
-    )
-    mr_rtc = pl.export_model_runtime(
-        identity={
-            "gate": "cpp_pi05_model_runtime",
-            "plan": "context_rtc_prefix_action",
-            "rtc_prefix_len": str(args.rtc_prefix_len),
-        },
-        stage_plan="context_rtc_prefix_action",
-        stage_plan_kwargs={"prefix_len": args.rtc_prefix_len},
-        io="native",
-        robot_action_dim=robot_action_dim,
-    )
-    lib = _load_lib(args.lib)
-    dtype_id, torch_dtype = _dtype_from_model_runtime(mr_full)
+    lib = load_pi05_library(args.lib)
+    tensor_dtype = getattr(pl, "tensor_dtype", None)
+    if not tensor_dtype:
+        tensor_dtype = "f16" if type(pl).__name__.endswith("FP16") else "bf16"
+    dtype_id, torch_dtype = _dtype_from_value(tensor_dtype)
     action_mean, action_stddev = _action_affine(pipe.norm_stats)
 
     cfg = Pi05RuntimeConfig()
@@ -461,10 +392,49 @@ def main() -> None:
     cfg.action_buffer_name = b"diffusion_noise"
     cfg.image_dtype = dtype_id
     cfg.action_dtype = dtype_id
+    overlay = native_overlay(lib, cfg)
 
-    m_full = _create_over(lib, mr_full, cfg)
-    m_split = _create_over(lib, mr_split, cfg)
-    m_rtc = _create_over(lib, mr_rtc, cfg)
+    try:
+        pl.export_model_runtime(
+            stage_plan="full", io="native",
+            robot_action_dim=robot_action_dim)
+    except ValueError as exc:
+        assert "native_overlay" in str(exc), exc
+    else:
+        raise AssertionError("native STAGED declarations must not escape")
+
+    mr_full = pl.export_model_runtime(
+        identity={"gate": "cpp_pi05_model_runtime", "plan": "full"},
+        stage_plan="full",
+        io="native",
+        robot_action_dim=robot_action_dim,
+        native_overlay=overlay,
+    )
+    mr_split = pl.export_model_runtime(
+        identity={"gate": "cpp_pi05_model_runtime", "plan": "context_action"},
+        stage_plan="context_action",
+        io="native",
+        robot_action_dim=robot_action_dim,
+        native_overlay=overlay,
+    )
+    mr_rtc = pl.export_model_runtime(
+        identity={
+            "gate": "cpp_pi05_model_runtime",
+            "plan": "context_rtc_prefix_action",
+            "rtc_prefix_len": str(args.rtc_prefix_len),
+        },
+        stage_plan="context_rtc_prefix_action",
+        stage_plan_kwargs={"prefix_len": args.rtc_prefix_len},
+        io="native",
+        robot_action_dim=robot_action_dim,
+        native_overlay=overlay,
+    )
+    m_full = ctypes.cast(
+        mr_full.ptr, ctypes.POINTER(FrtModelRuntimeV1)).contents
+    m_split = ctypes.cast(
+        mr_split.ptr, ctypes.POINTER(FrtModelRuntimeV1)).contents
+    m_rtc = ctypes.cast(
+        mr_rtc.ptr, ctypes.POINTER(FrtModelRuntimeV1)).contents
 
     try:
         assert m_full.abi_version == 1, m_full.abi_version
@@ -639,9 +609,6 @@ def main() -> None:
 
         print("\nPASS - Pi05 full, context/action, and RTC-prefix model runtimes passed")
     finally:
-        m_full.release(m_full.owner)
-        m_split.release(m_split.owner)
-        m_rtc.release(m_rtc.owner)
         mr_full.release()
         mr_split.release()
         mr_rtc.release()

@@ -143,8 +143,9 @@ It also exposes two IO faces over the same captured graphs:
 
 - `io="python"`: Python frontend hot loop; normalized tensors are SWAP ports.
 - `io="native"`: native C++ hot loop; raw images/actions are STAGED and noise
-  remains a SWAP port. This is the face consumed by
-  `frt_pi05_model_runtime_create_over`.
+  remains a SWAP port. Export requires an immediate
+  `frt_pi05_model_runtime_create_over` callback, so a declaration with
+  placeholder verbs can never escape to a consumer.
 
 The native `actions` port declares the logical output chunk delivered by
 `get_output`, not necessarily the raw model buffer layout. A Pi0.5 producer may

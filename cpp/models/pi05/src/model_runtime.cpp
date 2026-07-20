@@ -474,7 +474,7 @@ extern "C" int frt_pi05_model_runtime_create_over(
     if (!model || !out) return -1;
     *out = nullptr;
     if (model->abi_version != FRT_MODEL_RUNTIME_ABI_VERSION ||
-        model->struct_size < sizeof(frt_model_runtime_v1) ||
+        model->struct_size < FRT_MODEL_RUNTIME_V1_BASE_SIZE ||
         !model->exp || !model->retain || !model->release) {
         return -1;
     }

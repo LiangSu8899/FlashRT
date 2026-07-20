@@ -317,9 +317,19 @@ int main() {
     wrong_action_producer->release(wrong_action_producer->owner);
 
     frt_model_runtime_v1* over = nullptr;
+    const int prefix_retain_before = owner.retain;
+    const int prefix_release_before = owner.release;
+    producer->struct_size = FRT_MODEL_RUNTIME_V1_BASE_SIZE - 1;
+    CHECK(frt_pi05_model_runtime_create_over(producer, &cfg, &over) == -1 &&
+              over == nullptr,
+          "create_over rejects a model shorter than the v1 prefix");
+    CHECK(owner.retain == prefix_retain_before &&
+              owner.release == prefix_release_before,
+          "rejected prefix does not change producer ownership");
+    producer->struct_size = FRT_MODEL_RUNTIME_V1_BASE_SIZE;
     CHECK(frt_pi05_model_runtime_create_over(producer, &cfg, &over) == 0 &&
               over,
-          "frt_pi05_model_runtime_create_over");
+          "create_over accepts the required v1 prefix");
     CHECK(over->exp == producer->exp && over->ports == producer->ports &&
               over->stages == producer->stages,
           "create_over inherits producer declarations");

@@ -226,7 +226,9 @@ Pi0.5 export knobs:
   `(chunk_length,) f32`, and `guidance_weight` `(1,) f32`.
 - `io="python"` exports the Python frontend SWAP-tensor face.
 - `io="native"` exports the C++ runtime face (`images/actions` STAGED,
-  `noise` SWAP), intended for `frt_pi05_model_runtime_create_over`.
+  `noise` SWAP). It requires `native_overlay`, a callable around
+  `frt_pi05_model_runtime_create_over`; the temporary declaration is never
+  published without the real C++ verbs.
 
 For VLA outputs, the `actions` port shape is the logical host-visible action
 chunk after postprocess: `(chunk_length, robot_action_dim)` for flat robot
@@ -266,18 +268,24 @@ Export-time selection:
 model = pipeline.export_model_runtime(
     stage_plan="prefill_decode",
     io="native",
+    native_overlay=overlay,
 )
 
 chunked = pipeline.export_model_runtime(
     stage_plan="denoise_chunks",
     stage_plan_kwargs={"chunk_size": 5, "total_steps": 10},
     io="native",
+    native_overlay=overlay,
 )
 ```
 
 Pi0.5 native declarations also take `robot_action_dim` from the frontend's
 checkpoint metadata. `io="native_v2"` additionally takes `state_dim`; neither
 deployment dimension is inferred from or stored in the semantic pipeline.
+For Pi0.5, `overlay(declaration_ptr)` must return the non-null runtime pointer
+created by `frt_pi05_model_runtime_create_over`. The overlay owns its config
+resources for the returned runtime lifetime. Export fails before publication
+if no overlay is supplied or overlay construction fails.
 
 Every graph named by the resolved plan must already exist in the producer's
 export. Validation happens during export: unknown graph, unknown stream, stream

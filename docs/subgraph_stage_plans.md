@@ -66,6 +66,8 @@ it before capture/export.
 ## Pi0.5 example: enable `context -> action`
 
 Default Pi0.5 capture stays unchanged. To add the optional split:
+The examples below assume `overlay` is the deployment-owned callable that
+invokes `frt_pi05_model_runtime_create_over` with a complete runtime config.
 
 ```python
 from flash_rt.subgraphs.pi05.context_action import enable
@@ -80,6 +82,7 @@ runtime = pipeline.export_model_runtime(
     stage_plan="context_action",
     io="native",
     robot_action_dim=len(frontend.norm_stats["actions"]["q01"]),
+    native_overlay=overlay,
 )
 ```
 
@@ -124,6 +127,7 @@ runtime = pipeline.export_model_runtime(
     stage_plan_kwargs={"prefix_len": 2},
     io="native",
     robot_action_dim=len(frontend.norm_stats["actions"]["q01"]),
+    native_overlay=overlay,
 )
 ```
 
@@ -156,6 +160,7 @@ runtime = pipeline.export_model_runtime(
     stage_plan="context_rtc_vjp_guided_action",
     io="native",
     robot_action_dim=len(model._pipe.norm_stats["actions"]["q01"]),
+    native_overlay=overlay,
 )
 ```
 
@@ -256,6 +261,7 @@ Export:
 pipeline.export_model_runtime(
     stage_plan="vision_encoder_decoder",
     io="native",
+    native_overlay=overlay,
 )
 ```
 
@@ -289,6 +295,7 @@ pipeline.export_model_runtime(
     stage_plan="denoise_chunks",
     stage_plan_kwargs={"chunk_size": 5, "total_steps": 10},
     io="native",
+    native_overlay=overlay,
 )
 ```
 
