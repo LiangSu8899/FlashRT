@@ -240,6 +240,9 @@ bound authority. An all-OPAQUE generic runtime may be overridden: query is
 forwarded to the retained base, the original `stage_self`/runner remain in
 force, and OPAQUE errors continue to use the base `last_error`. M0 rejects a
 mixed-plan override rather than publishing an ambiguous error/owner surface.
+Before retaining either owner, the override validates an external generic
+table's runner, error authority, names, executor references and dependency DAG.
+Malformed or dual-authority tables fail closed and are never republished.
 
 Python exposes the same two producer modes:
 

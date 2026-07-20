@@ -183,6 +183,19 @@ struct Owner { int retains = 0, releases = 0; };
 static void owner_retain(void* p)  { ((Owner*)p)->retains++; }
 static void owner_release(void* p) { ((Owner*)p)->releases++; }
 
+static const frt_generic_stage_plan_ext_v1* EXTERNAL_GENERIC_PLAN = nullptr;
+static int query_external_generic_plan(const frt_model_runtime_v1* runtime,
+                                       uint64_t extension_id,
+                                       uint32_t min_version,
+                                       const void** out_extension) {
+    if (out_extension) *out_extension = nullptr;
+    if (!runtime || !out_extension || min_version == 0) return -1;
+    if (extension_id != FRT_EXT_GENERIC_STAGE_PLAN_V1 || min_version > 1 ||
+        !EXTERNAL_GENERIC_PLAN) return -3;
+    *out_extension = EXTERNAL_GENERIC_PLAN;
+    return 0;
+}
+
 static frt_runtime_builder make_builder() {
     frt_runtime_builder b = frt_runtime_builder_create(FAKE_CTX);
     frt_runtime_builder_add_stream(b, "main", 0, 0, nullptr);
@@ -494,14 +507,121 @@ int main() {
 
         frt_runtime_builder legacy = make_builder();
         CHECK(frt_runtime_builder_add_stage(legacy, 0, nullptr, 0) == 0 &&
+              frt_runtime_builder_set_generic_stage_runner(
+                  legacy, nullptr, run_opaque_noop) < 0 &&
               frt_runtime_builder_add_generic_stage(
                   legacy, "opaque", FRT_GENERIC_STAGE_OPAQUE, 1,
                   nullptr, 0) < 0,
-              "legacy authority rejects a second generic authority");
+              "legacy authority rejects generic runner and stage setters");
         repaired = frt_runtime_builder_finish_model(
             legacy, &generic_verbs, nullptr, nullptr, nullptr, nullptr);
-        CHECK(repaired != nullptr, "rejected second authority does not mutate builder");
+        CHECK(repaired != nullptr,
+              "rejected generic setters leave the legacy builder finishable");
         repaired->release(repaired->owner);
+
+        frt_shape_key external_key = 0;
+        frt_runtime_graph_desc external_graph{
+            "graph", FAKE_G0, 0, &external_key, 1, 0};
+        Owner external_owner;
+        frt_runtime_export_v1 external_export{};
+        external_export.abi_version = FRT_RUNTIME_ABI_VERSION;
+        external_export.struct_size = sizeof(external_export);
+        external_export.ctx = FAKE_CTX;
+        external_export.graphs = &external_graph;
+        external_export.n_graphs = 1;
+        external_export.owner = &external_owner;
+        external_export.retain = owner_retain;
+        external_export.release = owner_release;
+
+        const uint32_t external_dep[1] = {0};
+        frt_generic_stage_desc_v1 external_stages[2] = {
+            {"context", FRT_GENERIC_STAGE_OPAQUE, 10, 0, nullptr},
+            {"action", FRT_GENERIC_STAGE_OPAQUE, 11, 1, external_dep},
+        };
+        frt_generic_stage_plan_ext_v1 external_plan{
+            FRT_GENERIC_STAGE_PLAN_ABI_VERSION,
+            sizeof(frt_generic_stage_plan_ext_v1),
+            external_stages,
+            2,
+            nullptr,
+            run_opaque_noop,
+        };
+        frt_model_runtime_v1 external_model{};
+        external_model.abi_version = FRT_MODEL_RUNTIME_ABI_VERSION;
+        external_model.struct_size = sizeof(external_model);
+        external_model.exp = &external_export;
+        external_model.verbs = generic_verbs;
+        external_model.owner = &external_owner;
+        external_model.retain = owner_retain;
+        external_model.release = owner_release;
+        external_model.query_extension = query_external_generic_plan;
+        EXTERNAL_GENERIC_PLAN = &external_plan;
+
+        auto reject_external = [&](const char* message) {
+            Owner replacement_owner;
+            frt_model_runtime_v1* rejected = frt_model_runtime_override_verbs(
+                &external_model, &generic_verbs, nullptr,
+                &replacement_owner, owner_retain, owner_release);
+            CHECK(!rejected && external_owner.retains == 0 &&
+                      replacement_owner.retains == 0,
+                  message);
+        };
+
+        external_plan.run_opaque = nullptr;
+        reject_external("external generic plan rejects a null runner before retain");
+        external_plan.run_opaque = run_opaque_noop;
+
+        external_model.verbs.last_error = nullptr;
+        reject_external("external generic plan requires base error authority");
+        external_model.verbs.last_error = v_base_error;
+
+        external_stages[0].executor_kind = 2;
+        reject_external("external generic plan rejects unknown executor kinds");
+        external_stages[0].executor_kind = FRT_GENERIC_STAGE_OPAQUE;
+
+        external_stages[0].executor_kind = FRT_GENERIC_STAGE_GRAPH;
+        external_stages[0].executor_ref = 1;
+        reject_external("external generic plan rejects unknown graph references");
+        external_stages[0].executor_kind = FRT_GENERIC_STAGE_OPAQUE;
+        external_stages[0].executor_ref = 10;
+
+        external_stages[1].after = nullptr;
+        reject_external("external generic plan rejects a missing dependency array");
+        external_stages[1].after = external_dep;
+        const uint32_t invalid_external_dep[1] = {1};
+        external_stages[1].after = invalid_external_dep;
+        reject_external("external generic dependencies only reference earlier stages");
+        const uint32_t duplicate_external_deps[2] = {0, 0};
+        external_stages[1].after = duplicate_external_deps;
+        external_stages[1].n_after = 2;
+        reject_external("external generic dependencies are strictly increasing");
+        external_stages[1].after = external_dep;
+        external_stages[1].n_after = 1;
+
+        external_stages[1].name = "context";
+        reject_external("external generic stage names are unique");
+        external_stages[1].name = "action";
+
+        frt_runtime_stage_desc external_legacy_stage{0, 0, nullptr};
+        external_model.stages = &external_legacy_stage;
+        external_model.n_stages = 1;
+        reject_external(
+            "external runtime rejects simultaneous legacy and generic authority");
+        external_model.stages = nullptr;
+        external_model.n_stages = 0;
+
+        Owner replacement_owner;
+        frt_model_runtime_v1* accepted_external =
+            frt_model_runtime_override_verbs(
+                &external_model, &generic_verbs, nullptr,
+                &replacement_owner, owner_retain, owner_release);
+        CHECK(accepted_external && external_owner.retains == 1 &&
+                  replacement_owner.retains == 1,
+              "validated external generic plan is retained and published");
+        accepted_external->release(accepted_external->owner);
+        CHECK(external_owner.releases == 1 && replacement_owner.releases == 1,
+              "validated external generic override releases both owners");
+        EXTERNAL_GENERIC_PLAN = nullptr;
 
         frt_runtime_builder no_authority = make_builder();
         CHECK(frt_runtime_builder_finish_model(

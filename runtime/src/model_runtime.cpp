@@ -241,7 +241,8 @@ extern "C" int frt_runtime_builder_add_generic_stage(
 extern "C" int frt_runtime_builder_set_generic_stage_runner(
         frt_runtime_builder b, void* stage_self,
         int (*run_opaque)(void*, uint32_t)) {
-    if (!b || !run_opaque || b->h->generic_runner_registered) return -1;
+    if (!b || !run_opaque || !b->h->stages.empty() ||
+        b->h->generic_runner_registered) return -1;
     b->h->generic_plan_present = true;
     b->h->generic_runner_registered = true;
     b->h->generic_stage_self = stage_self;
@@ -465,7 +466,31 @@ int get_generic_plan(const frt_model_runtime_v1* model,
     auto* plan = static_cast<const frt_generic_stage_plan_ext_v1*>(extension);
     if (!plan || plan->abi_version < FRT_GENERIC_STAGE_PLAN_ABI_VERSION ||
         plan->struct_size < FRT_GENERIC_STAGE_PLAN_EXT_V1_SIZE ||
-        !plan->stages || plan->n_stages == 0) return -1;
+        !plan->stages || plan->n_stages == 0 || !plan->run_opaque ||
+        !has_real_last_error(&model->verbs)) return -1;
+    if (!model->exp || model->exp->abi_version != FRT_RUNTIME_ABI_VERSION ||
+        model->exp->struct_size < sizeof(frt_runtime_export_v1)) return -1;
+
+    bool has_opaque = false;
+    for (uint64_t i = 0; i < plan->n_stages; ++i) {
+        const frt_generic_stage_desc_v1& stage = plan->stages[i];
+        if (!valid_utf8_stage_name(stage.name) ||
+            stage.executor_kind > FRT_GENERIC_STAGE_OPAQUE ||
+            (stage.n_after && !stage.after)) return -1;
+        if (stage.executor_kind == FRT_GENERIC_STAGE_GRAPH &&
+            stage.executor_ref >= model->exp->n_graphs) return -1;
+        has_opaque |= stage.executor_kind == FRT_GENERIC_STAGE_OPAQUE;
+        for (uint64_t previous = 0; previous < i; ++previous)
+            if (std::strcmp(plan->stages[previous].name, stage.name) == 0)
+                return -1;
+        uint32_t previous = 0;
+        for (uint32_t d = 0; d < stage.n_after; ++d) {
+            if (stage.after[d] >= i ||
+                (d && stage.after[d] <= previous)) return -1;
+            previous = stage.after[d];
+        }
+    }
+    if (!has_opaque) return -1;
     *out = plan;
     return 0;
 }
@@ -482,6 +507,7 @@ extern "C" frt_model_runtime_v1* frt_model_runtime_override_verbs(
     const frt_generic_stage_plan_ext_v1* generic_plan = nullptr;
     const int generic_rc = get_generic_plan(in, &generic_plan);
     if (generic_rc != 0 && generic_rc != -3) return nullptr;
+    if (in->n_stages && generic_plan) return nullptr;
     if (!in->n_stages && !generic_plan) return nullptr;  /* step-only */
     if (generic_plan) {
         for (uint64_t i = 0; i < generic_plan->n_stages; ++i)
