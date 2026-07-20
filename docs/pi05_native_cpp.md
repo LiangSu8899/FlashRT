@@ -63,6 +63,18 @@ cmake -S cpp -B <frontend-build> \
 cmake --build <frontend-build> -j
 ```
 
+Install the C ABI producer, runtime/exec dependencies, and public headers into
+a deployment prefix:
+
+```bash
+cmake --install <frontend-build> --prefix <install-prefix>
+```
+
+For SM120, place the separately built `libflashrt_fa2_raw` from the opt-in FA2
+native build in the same install library directory. Installed FlashRT DSOs use
+only an `$ORIGIN` relative runtime search path; build-tree or machine-local
+paths are not embedded in the installed producer.
+
 SM110 does not depend on FA2. It consumes the existing CUTLASS FMHA path:
 
 ```bash
@@ -222,7 +234,9 @@ assuming a particular chunk or robot action width.
 
 ## Compatibility
 
-The existing Python producer and `io="native"` verb-overlay path remain valid.
+The existing Python producer and `io="native"` verb-overlay path remain valid;
+the export call now requires the overlay factory and publishes only the
+completed runtime, never a declaration-only STAGED face.
 `io="native_v2"` is the fully native checkpoint producer. Both converge on
 `frt_model_runtime_v1`; choosing one does not change Nexus or host lifecycle
 semantics.

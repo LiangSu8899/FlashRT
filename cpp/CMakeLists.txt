@@ -18,6 +18,7 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 include(CTest)
+include(GNUInstallDirs)
 
 option(FLASHRT_CPP_WITH_EXEC "Build/link the exec layer for native replay" ON)
 option(FLASHRT_CPP_WITH_CUDA_STAGING "Enable conservative CUDA H2D/D2H modality staging" ON)
@@ -505,6 +506,21 @@ if(FLASHRT_ENABLE_NATIVE_CPP)
       target_link_libraries(flashrt_cpp_pi05_c
         PRIVATE flashrt_cpp_pi05_target_sm110)
     endif()
+    set_target_properties(flashrt_cpp_pi05_c PROPERTIES
+      INSTALL_RPATH "$ORIGIN")
+    install(TARGETS flashrt_cpp_pi05_c flashrt_runtime flashrt_exec
+      LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+      RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+    install(FILES
+      ${CMAKE_CURRENT_SOURCE_DIR}/../exec/include/flashrt/exec.h
+      ${CMAKE_CURRENT_SOURCE_DIR}/../runtime/include/flashrt/runtime.h
+      ${CMAKE_CURRENT_SOURCE_DIR}/../runtime/include/flashrt/model_runtime.h
+      DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/flashrt)
+    install(FILES
+      ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/include/flashrt/cpp/models/pi05/export.h
+      ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/include/flashrt/cpp/models/pi05/c_api.h
+      ${CMAKE_CURRENT_SOURCE_DIR}/models/pi05/include/flashrt/cpp/models/pi05/model_runtime.h
+      DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/flashrt/cpp/models/pi05)
   endif()
 endif()
 
