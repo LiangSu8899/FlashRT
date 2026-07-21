@@ -174,6 +174,7 @@ class EdgeDenoiseFlashRTQuant:
         bf16_projs: tuple[str, ...] = (),
         ffn_fp4: bool = False,
         slim_last: bool = True,
+        teacache_steps: tuple[int, ...] | None = None,
         use_cuda_graphs: bool = True,
     ):
         from flash_rt.models.cosmos3_edge.pipeline_thor import CosmosEdgeThor
@@ -199,6 +200,8 @@ class EdgeDenoiseFlashRTQuant:
         self.static_engine = None
         self.static_scheduler = self.engine.unipc
         self.engine.calibrate(self.denoise_dump.step_noise(0))
+        if teacache_steps is not None:
+            self.engine.set_teacache(teacache_steps)
         if self.use_cuda_graphs:
             self.engine.capture(warmup_noise=self.denoise_dump.step_noise(0))
 

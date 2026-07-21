@@ -152,6 +152,18 @@ def main() -> None:
     ap.add_argument("--bf16-projs", default="", help="comma-separated projections kept in bf16 (fp8 engine)")
     ap.add_argument("--ffn-fp4", action="store_true", help="NVFP4 W4A4 FFN (up/down) via flash_rt_fp4")
     ap.add_argument("--no-slim-last", action="store_true", help="disable the M=60 slim last layer")
+    ap.add_argument(
+        "--teacache-computes",
+        type=int,
+        default=0,
+        help="TeaCache: number of computed denoise steps, evenly spaced over the schedule "
+        "(always includes step 0 and the final step); 0 disables",
+    )
+    ap.add_argument(
+        "--teacache-steps",
+        default="",
+        help="TeaCache: explicit comma-separated computed step indices (overrides --teacache-computes)",
+    )
     ap.add_argument("--json-out", default=None)
     ap.add_argument(
         "--profile-loop-breakdown",
@@ -206,6 +218,16 @@ def main() -> None:
 
     if args.device == "cuda":
         torch.cuda.reset_peak_memory_stats()
+    teacache_steps: tuple[int, ...] | None = None
+    if args.teacache_steps:
+        teacache_steps = tuple(int(v) for v in args.teacache_steps.split(",") if v != "")
+    elif args.teacache_computes > 1:
+        n_steps = 30
+        k = args.teacache_computes
+        teacache_steps = tuple(sorted({round(i * (n_steps - 1) / (k - 1)) for i in range(k)}))
+    if teacache_steps is not None and args.engine == "bf16-eager":
+        raise SystemExit("TeaCache requires the quantized static engine (--engine fp8/quant-bf16)")
+
     t0 = time.perf_counter()
     if args.engine == "bf16-eager":
         runner = EdgeDenoiseFlashRT(
@@ -225,6 +247,7 @@ def main() -> None:
             bf16_projs=tuple(p for p in args.bf16_projs.split(",") if p),
             ffn_fp4=args.ffn_fp4,
             slim_last=not args.no_slim_last,
+            teacache_steps=teacache_steps,
             use_cuda_graphs=not args.no_quant_graph,
         )
     if args.device == "cuda":
@@ -292,6 +315,8 @@ def main() -> None:
         "engine": args.engine,
         "bf16_projs": args.bf16_projs,
         "quant_graph": bool(args.engine != "bf16-eager" and not args.no_quant_graph),
+        "teacache_steps": list(teacache_steps) if teacache_steps is not None else None,
+        "teacache_computes": len(teacache_steps) if teacache_steps is not None else 30,
         "checkpoint": str(checkpoint),
         "reference_dump": str(reference_dump),
         "boundary_dump": str(boundary_dump),

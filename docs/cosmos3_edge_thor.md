@@ -62,22 +62,44 @@ selected by the caller.
 - The last layer runs slim at M=60: only the action rows feed the head, so
   final-layer Q/attention/o-proj/FFN shrink to the 60 action tokens while K/V
   still cover the full sequence (math-identical; `--no-slim-last` to disable).
+- TeaCache step caching: a fixed compute-step schedule baked into the denoise
+  graph. Skipped steps reuse the last computed velocity while the native UniPC
+  still advances all 30 steps. `--teacache-computes K` computes K evenly spaced
+  steps (always step 0 and step 29); `--teacache-steps` takes an explicit list.
+  For this AV inverse-dynamics workload the action velocity field is dominated
+  by the static clean-video conditioning, so even the 2-compute schedule stays
+  within quantization-level error of the official action.
 
-Measured on Thor (15 back-to-back iterations, hot regime, `av_inverse_0`,
-official eager denoise baseline 33.14s; gate cos >= 0.999, rel_l2 < 3%,
-both engines re-validated on the second-seed dump):
+## Cosmos3-Edge AV inverse dynamics on Jetson AGX Thor — performance table (v1)
 
-| engine | denoise P50 | speedup | final action cos | rel_l2 |
-|---|---|---|---|---|
-| `--engine bf16-eager` (per-op path) | 11.998s | 2.76x | 0.9999959 | 0.29% |
-| `--engine fp8` | 5.792s | 5.72x | 0.9999834 | 0.59% |
-| `--engine fp8 --ffn-fp4` | 5.456s | 6.07x | 0.9997067 | 2.42% |
+All latency numbers are direct measurements of the same 30-step denoise
+boundary (`av_inverse_0`, 15 back-to-back iterations, hot regime). They do not
+include tokenization, VAE preprocessing, or response wrapping. Accuracy gates:
+final-action cosine >= 0.999 and relative L2 < 3% against the official output;
+the TeaCache 3/2-compute rows and both engines were re-validated on a
+second-seed dump.
+
+| Configuration | Denoise P50 | Speedup vs Official | Cosine | Rel-L2 | Peak mem (GiB) |
+|---|---|---|---|---|---|
+| Official Cosmos3-Edge (eager) | 33.14 s | 1.00x | reference | reference | — |
+| FlashRT FP8, no step cache | 5.792 s | **5.72x** | 0.999983 | 0.59% | 7.85 |
+| FlashRT FP8 + NVFP4 FFN, no step cache | 5.456 s | **6.07x** | 0.999707 | 2.42% | 7.54 |
+| FlashRT FP8 + TeaCache, 15 compute steps | 2.877 s | **11.52x** | 0.999985 | 0.56% | 7.85 |
+| FlashRT FP8 + TeaCache, 6 compute steps | 1.153 s | **28.74x** | 0.999984 | 0.57% | 7.85 |
+| FlashRT FP8 + TeaCache, 3 compute steps | 0.576 s | **57.56x** | 0.999986 | 0.54% | 7.85 |
+| FlashRT FP8 + TeaCache, 2 compute steps | 0.384 s | **86.36x** | 0.999983 | 0.59% | 7.85 |
+| FlashRT FP8 + NVFP4 FFN + TeaCache 2 | 0.362 s | **91.57x** | 0.999727 | 2.34% | 7.54 |
+
+The 2-compute rows are an aggressive benchmark operating point, not yet a
+dataset-level task-success claim.
 
 ```bash
 python benchmarks/cosmos3_edge_thor_denoise.py --engine fp8 --iters 15 \
-  --warmup-steps 30 --enforce-gates            # FP8 default
+  --warmup-steps 30 --enforce-gates                       # FP8, no cache
 python benchmarks/cosmos3_edge_thor_denoise.py --engine fp8 --ffn-fp4 \
-  --iters 15 --warmup-steps 30 --enforce-gates # max-quantization variant
+  --iters 15 --warmup-steps 30 --enforce-gates            # max quantization
+python benchmarks/cosmos3_edge_thor_denoise.py --engine fp8 \
+  --teacache-computes 3 --iters 15 --warmup-steps 30 --enforce-gates
 ```
 
 FP8 is the recommended default (large precision margin); `--ffn-fp4` trades
