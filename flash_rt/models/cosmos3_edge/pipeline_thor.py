@@ -235,6 +235,7 @@ class CosmosEdgeThor:
         self.cos_f = t["s00/layers/00/rope/cos/full_only_seq"].to(device=DEV, dtype=BF).contiguous()
         self.sin_f = t["s00/layers/00/rope/sin/full_only_seq"].to(device=DEV, dtype=BF).contiguous()
 
+        self.compute_steps: frozenset[int] | None = None
         self.unipc = EdgeStaticUniPCScheduler(self.num_steps, device=torch.device(DEV), shift=shift)
         if not self.unipc.native_available:
             raise RuntimeError("native UniPC step binding is required")
@@ -455,6 +456,20 @@ class CosmosEdgeThor:
             self.action_out.data_ptr(), self.velocity.data_ptr(), self.velocity.numel(), NA * AD, s)
         return self.velocity
 
+    def set_teacache(self, compute_steps: tuple[int, ...] | list[int] | None) -> None:
+        """Fixed compute-step schedule: skipped steps reuse the last computed
+        velocity (the static velocity buffer) while UniPC still advances every
+        step. Step 0 must always compute. Call before ``capture``."""
+        if self.graph is not None:
+            raise RuntimeError("set_teacache must be called before graph capture")
+        if compute_steps is None:
+            self.compute_steps = None
+            return
+        steps = sorted(set(int(v) for v in compute_steps))
+        if not steps or steps[0] != 0 or steps[-1] >= self.num_steps:
+            raise ValueError(f"invalid TeaCache compute schedule: {steps}")
+        self.compute_steps = frozenset(steps)
+
     # ---- whole-denoise loop: forward + native UniPC per step ----
     def run_loop(self) -> torch.Tensor:
         # UniPC state buffers are allocated once; their contents are fully
@@ -462,7 +477,10 @@ class CosmosEdgeThor:
         if self.unipc.prev_m1 is None:
             self.unipc.reset(self.latent)
         for step in range(self.num_steps):
-            velocity = self.forward_step(step, self.latent)
+            if self.compute_steps is None or step in self.compute_steps:
+                velocity = self.forward_step(step, self.latent)
+            else:
+                velocity = self.velocity
             self.unipc.step(self.latent, velocity, step)
         return self.latent
 
