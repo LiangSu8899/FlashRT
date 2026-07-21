@@ -29,7 +29,7 @@ def load_model(
     autotune: int = 3,              # 0=off, 3=default, 5+=thorough
     recalibrate: bool = False,
     weight_cache: bool = True,      # JAX only
-    config: str = "pi05",           # "pi05" | "pi0" | "groot" | "groot_n17" | "pi0fast" | "motus" | "wan22_ti2v_5b" | "cosmos3_video"
+    config: str = "pi05",           # "pi05" | "pi0" | "groot" | "groot_n17" | "pi0fast" | "motus" | "wan22_ti2v_5b" | "cosmos3_video" | "cosmos3_edge"
     device=None,                    # reserved
     # Pi0-FAST-specific:
     decode_cuda_graph: bool = False,
@@ -113,6 +113,11 @@ Returns a `VLAModel` wrapping the appropriate frontend for the detected
   compare_ref=..., return_metadata=...)`, returning the denoised vision
   latent; `predict()` is not part of this API. Precision is selected with
   `load_model(..., use_fp8=True|False)`. See `docs/cosmos3_video_usage.md`.
+- `config="cosmos3_edge"` is a Thor official-baseline runner for NVIDIA
+  Cosmos Framework. It exposes `set_prompt(input_json=...)` or
+  `set_prompt(sample=...)`, then `infer(output_dir=..., vae_path=...,
+  cosmos_root=...)`. It is the accuracy/latency gate before the optimized Thor
+  Edge pipeline replaces the reference execution. See `docs/cosmos3_edge_thor.md`.
 - `config="groot_n17"` is registered for `framework="torch"` on
   `hardware in {"thor", "rtx_sm120", "rtx_sm89"}`. On RTX,
   `rtx_sm120` resolves through the historical shared RTX registration and

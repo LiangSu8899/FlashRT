@@ -133,6 +133,10 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
     ("cosmos3_video", "torch", "rtx_sm120"):
         ("flash_rt.frontends.torch.cosmos3_video_rtx", "Cosmos3VideoTorchFrontendRtx"),
 
+    # Cosmos3-Edge official Thor baseline.
+    ("cosmos3_edge", "torch", "thor"):
+        ("flash_rt.frontends.torch.cosmos3_edge_thor", "Cosmos3EdgeTorchFrontendThor"),
+
     # ── Nex-N2-mini / Qwen3.6-35B-A3B (qwen3_5_moe) ──
     # Text LLM, not a VLA: GDN linear-attn + full-attn-every-4th + 256-expert
     # NVFP4 MoE. RTX 5090 (SM120) only, and requires the gated kernel build

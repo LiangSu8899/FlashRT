@@ -20,6 +20,7 @@
 #include "quantize/quantize_fp4_sfa.cuh"
 #include "quantize/reshape_scales_sfa.cuh"
 #include "fused_fp16/rms_norm_noweight_fp16.cuh"
+#include "fused_fp4/cosmos3_edge_fp4.cuh"
 #include "fused_fp4/norm_silu_fp4_sfa.cuh"
 #include "fused_fp4/silu_mul_two_fp4_to_fp4.cuh"
 
@@ -234,6 +235,39 @@ reshape_linear_scales_to_sfa, in a single kernel launch.
         py::arg("residual"), py::arg("x"), py::arg("packed"), py::arg("sfa"),
         py::arg("seq_len"), py::arg("dim"), py::arg("stream") = 0,
         "F3: fused residual+rms_norm + fp4_quant + SFA write.");
+
+  // Cosmos3-Edge model-specific fused FP4 quant kernels (bf16 residual chain).
+  m.def("cosmos3_edge_res_rms_fp4_sfa_bf16",
+        [](uintptr_t residual, uintptr_t x, uintptr_t weight,
+           uintptr_t packed, uintptr_t sfa,
+           int seq_len, int dim, float eps, uintptr_t stream) {
+          flash_rt::fused_fp4::cosmos3_edge_res_rms_fp4_sfa_bf16(
+              reinterpret_cast<__nv_bfloat16*>(residual),
+              reinterpret_cast<const __nv_bfloat16*>(x),
+              reinterpret_cast<const __nv_bfloat16*>(weight),
+              reinterpret_cast<uint8_t*>(packed),
+              reinterpret_cast<uint8_t*>(sfa),
+              seq_len, dim, eps,
+              reinterpret_cast<cudaStream_t>(stream));
+        },
+        py::arg("residual"), py::arg("x"), py::arg("weight"),
+        py::arg("packed"), py::arg("sfa"),
+        py::arg("seq_len"), py::arg("dim"), py::arg("eps"), py::arg("stream") = 0,
+        "Cosmos3-Edge: bf16 residual += x; weighted RMSNorm; NVFP4 quant + SFA.");
+
+  m.def("cosmos3_edge_relu2_fp4_sfa_fp16",
+        [](uintptr_t x, uintptr_t packed, uintptr_t sfa,
+           int seq_len, int dim, uintptr_t stream) {
+          flash_rt::fused_fp4::cosmos3_edge_relu2_fp4_sfa_fp16(
+              reinterpret_cast<const __half*>(x),
+              reinterpret_cast<uint8_t*>(packed),
+              reinterpret_cast<uint8_t*>(sfa),
+              seq_len, dim,
+              reinterpret_cast<cudaStream_t>(stream));
+        },
+        py::arg("x"), py::arg("packed"), py::arg("sfa"),
+        py::arg("seq_len"), py::arg("dim"), py::arg("stream") = 0,
+        "Cosmos3-Edge: relu(x)^2 (fp16 in) -> NVFP4 quant + SFA.");
 
   // GEGLU (tanh-approx GELU(gate) * up) fused FP4 kernels.
   m.def("gate_geglu_fp4_sfa_fp16",
