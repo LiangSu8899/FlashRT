@@ -318,9 +318,13 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         weight_cache: if True (default), cache FP8-quantized weights to disk
             after first load. Only affects JAX.
         config: model config name: "pi05", "pi0", "groot", "groot_n17",
-            "pi0fast", "motus", "wan22_ti2v_5b", "cosmos3_video".
+            "pi0fast", "motus", "wan22_ti2v_5b", "cosmos3_video",
+            "cosmos3_edge".
             "cosmos3_video" is a non-VLA text2video denoise model: drive it with
             set_prompt(ref=<reference dump>) + infer(...), not predict().
+            "cosmos3_edge" is the official Cosmos Framework Thor baseline
+            runner: drive it with set_prompt(sample=... or input_json=...) +
+            infer(output_dir=..., vae_path=...).
         device: ignored (auto-detects GPU). Reserved for future multi-GPU.
         decode_cuda_graph: Pi0-FAST only. Capture action-phase decode as CUDA
             Graph for max throughput (trades startup time for per-token speed).
@@ -433,11 +437,12 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             "See docs/qwen3_vl_fp8_sm89.md and docs/qwen3_vl_nvfp4.md.")
 
     if config not in ("pi05", "groot", "groot_n17", "pi0", "pi0fast",
-                      "motus", "wan22_ti2v_5b", "cosmos3_video", "nexn2"):
+                      "motus", "wan22_ti2v_5b", "cosmos3_video",
+                      "cosmos3_edge", "nexn2"):
         raise ValueError(
             f"Unknown config: {config}. "
             f"Supported: pi05, groot, groot_n17, pi0, pi0fast, motus, "
-            f"wan22_ti2v_5b, cosmos3_video, nexn2")
+            f"wan22_ti2v_5b, cosmos3_video, cosmos3_edge, nexn2")
     if framework not in ("torch", "jax"):
         raise ValueError(
             f"Unknown framework: {framework}. Supported: torch, jax")
@@ -656,6 +661,10 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
     elif config == "wan22_ti2v_5b":
         if "autotune" in sig.parameters:
             kwargs["autotune"] = autotune
+    elif config == "cosmos3_edge":
+        # Official Cosmos Framework baseline runner. Runtime knobs such as
+        # output_dir, seed, benchmark, and local Wan VAE path are infer() args.
+        pass
     else:
         # pi05, pi0 — both Thor and rtx variants take (checkpoint, num_views, autotune)
         # or (checkpoint, num_views). Feature-detect.

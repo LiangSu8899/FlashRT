@@ -1289,6 +1289,7 @@ pybind11_add_module(flash_rt_kernels
   csrc/kernels/attention_mha.cu
   csrc/kernels/attention_mha_causal.cu
   csrc/kernels/rope_qwen3.cu
+  csrc/kernels/cosmos3_edge_misc.cu
   csrc/kernels/decoder_fused.cu
   csrc/kernels/dit_bf16.cu
   csrc/kernels/attention_dit_bf16.cu
@@ -1562,6 +1563,17 @@ if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121" OR
     ENABLE_QWEN36_FLASHINFER_XQA=1)
 endif()
 
+if(GPU_ARCH STREQUAL "110")
+  target_sources(flash_rt_kernels PRIVATE
+    csrc/conv/fp8_conv3d_sm120_v17.cu
+    csrc/conv/fp8_conv3d_sm120_v18.cu
+    csrc/conv/bf16_conv3d_v0_sm110.cu)
+  target_compile_definitions(flash_rt_kernels PRIVATE
+    ENABLE_FP8_CONV3D_V17=1
+    ENABLE_FP8_CONV3D_V18=1
+    ENABLE_BF16_CONV3D_V0=1)
+endif()
+
 if(FLASHRT_ENABLE_MOTUS AND GPU_ARCH STREQUAL "120")
   target_sources(flash_rt_kernels PRIVATE
     $<TARGET_OBJECTS:motus_aux_sm120_obj>
@@ -1630,6 +1642,7 @@ if(ENABLE_SM100_CUTLASS)
     csrc/fused_fp4/norm_silu_fp4_sfa.cu
     csrc/fused_fp4/silu_mul_fp4_sfa_v2.cu
     csrc/fused_fp4/res_rms_fp4_sfa_v2.cu
+    csrc/fused_fp4/cosmos3_edge_fp4.cu
     csrc/fused_fp4/per_channel_mul_fp16.cu
     csrc/fused_fp4/res_rms_mul_fp4_sfa.cu
     csrc/fused_fp4/silu_mul_mul_fp4_sfa_v2.cu

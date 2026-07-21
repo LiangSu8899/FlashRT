@@ -397,3 +397,30 @@ void relu_inplace_bf16(__nv_bfloat16* x, int n, cudaStream_t stream) {
     int n2 = n >> 1;
     relu_inplace_kernel<__nv_bfloat16><<<(n2 + 255) / 256, 256, 0, stream>>>(x, n);
 }
+
+// ── ReLU² in-place: x = max(x, 0)^2, used by Cosmos3-Edge FFN ──
+template<typename T>
+__global__ void relu2_inplace_kernel(T* __restrict__ x, int n) {
+    using T2 = typename packed2<T>::type;
+    T2* x2 = reinterpret_cast<T2*>(x);
+    int n2 = n >> 1;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n2) {
+        T2 val = x2[idx];
+        float v0 = fmaxf(to_f32(val.x), 0.0f);
+        float v1 = fmaxf(to_f32(val.y), 0.0f);
+        x2[idx] = make_packed2<T>(from_f32<T>(v0 * v0), from_f32<T>(v1 * v1));
+    }
+    int tail = n2 * 2;
+    if (idx == 0 && tail < n) {
+        float v = fmaxf(to_f32(x[tail]), 0.0f);
+        x[tail] = from_f32<T>(v * v);
+    }
+}
+
+template __global__ void relu2_inplace_kernel<__nv_bfloat16>(__nv_bfloat16*, int);
+
+void relu2_inplace_bf16(__nv_bfloat16* x, int n, cudaStream_t stream) {
+    int n2 = n >> 1;
+    relu2_inplace_kernel<__nv_bfloat16><<<(n2 + 255) / 256, 256, 0, stream>>>(x, n);
+}

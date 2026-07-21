@@ -72,6 +72,14 @@ extern "C" int fp8_conv3d_v18_ncdhw_res_bf16out(
     int N, int T_cache, int T_new, int H, int W, int Ci, int Co,
     float alpha, cudaStream_t stream);
 #endif
+#ifdef ENABLE_BF16_CONV3D_V0
+extern "C" int bf16_conv3d_v0_ndhwc_bf16out(
+    const void* cache_x_bf16, const void* new_x_bf16,
+    const void* w_bf16, void* y_bf16,
+    const void* bias_bf16,
+    int N, int T_cache, int T_new, int H, int W, int Ci, int Co,
+    float alpha, cudaStream_t stream);
+#endif
 #ifdef ENABLE_FP8_CONV2D_3X3_V1
 extern "C" int fp8_conv2d_3x3_v1_nhwc_bf16out(
     const void* x_fp8, const void* w_fp8, void* y_bf16,
@@ -155,6 +163,7 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #ifdef FLASHRT_HAVE_AUDIO_CODEBOOK
 #include "kernels/delayed_codebook_kernels.cuh"
 #endif
+#include "kernels/cosmos3_edge_misc.cuh"
 #ifdef FLASHRT_HAVE_QWEN36_KERNELS
 #include "kernels/qwen36_misc.cuh"
 #endif
@@ -2284,6 +2293,11 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     m.def("relu_inplace_bf16", [](uintptr_t x, int n, uintptr_t stream) {
         extern void relu_inplace_bf16(__nv_bfloat16*, int, cudaStream_t);
         relu_inplace_bf16(reinterpret_cast<__nv_bfloat16*>(x), n, to_stream(stream));
+    }, py::arg("x"), py::arg("n"), py::arg("stream") = 0);
+
+    m.def("relu2_inplace_bf16", [](uintptr_t x, int n, uintptr_t stream) {
+        extern void relu2_inplace_bf16(__nv_bfloat16*, int, cudaStream_t);
+        relu2_inplace_bf16(reinterpret_cast<__nv_bfloat16*>(x), n, to_stream(stream));
     }, py::arg("x"), py::arg("n"), py::arg("stream") = 0);
 
     // GQA KV repeat interleave (for Qwen3 8→16 heads)
@@ -4557,6 +4571,213 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("step"), py::arg("stream") = 0);
 #endif
 
+    m.def("cosmos3_edge_qk_norm_rope_bf16",
+        [](uintptr_t q_in, uintptr_t k_in, uintptr_t q_weight, uintptr_t k_weight,
+           uintptr_t cos, uintptr_t sin, uintptr_t q_out, uintptr_t k_out,
+           int rows, int q_heads, int k_heads, int head_dim, int rope_dim,
+           float eps, uintptr_t stream) {
+            flash_rt::kernels::cosmos3_edge_qk_norm_rope_bf16(
+                reinterpret_cast<const __nv_bfloat16*>(q_in),
+                reinterpret_cast<const __nv_bfloat16*>(k_in),
+                reinterpret_cast<const __nv_bfloat16*>(q_weight),
+                reinterpret_cast<const __nv_bfloat16*>(k_weight),
+                reinterpret_cast<const __nv_bfloat16*>(cos),
+                reinterpret_cast<const __nv_bfloat16*>(sin),
+                reinterpret_cast<__nv_bfloat16*>(q_out),
+                reinterpret_cast<__nv_bfloat16*>(k_out),
+                rows, q_heads, k_heads, head_dim, rope_dim, eps,
+                to_stream(stream));
+        },
+        py::arg("q_in"), py::arg("k_in"), py::arg("q_weight"),
+        py::arg("k_weight"), py::arg("cos"), py::arg("sin"),
+        py::arg("q_out"), py::arg("k_out"), py::arg("rows"),
+        py::arg("q_heads"), py::arg("k_heads"), py::arg("head_dim"),
+        py::arg("rope_dim"), py::arg("eps"), py::arg("stream") = 0);
+
+    m.def("cosmos3_edge_fill_flat_velocity_bf16",
+        [](uintptr_t action, uintptr_t velocity, int flat_dim, int action_numel, uintptr_t stream) {
+            flash_rt::kernels::cosmos3_edge_fill_flat_velocity_bf16(
+                reinterpret_cast<const __nv_bfloat16*>(action),
+                reinterpret_cast<__nv_bfloat16*>(velocity),
+                flat_dim,
+                action_numel,
+                to_stream(stream));
+        },
+        py::arg("action"), py::arg("velocity"), py::arg("flat_dim"),
+        py::arg("action_numel"), py::arg("stream") = 0);
+
+    m.def("cosmos3_edge_add_bias_zero_action_tail_bf16",
+        [](uintptr_t action, uintptr_t bias, int rows, int cols, int valid_cols, uintptr_t stream) {
+            flash_rt::kernels::cosmos3_edge_add_bias_zero_action_tail_bf16(
+                reinterpret_cast<__nv_bfloat16*>(action),
+                reinterpret_cast<const __nv_bfloat16*>(bias),
+                rows,
+                cols,
+                valid_cols,
+                to_stream(stream));
+        },
+        py::arg("action"), py::arg("bias"), py::arg("rows"), py::arg("cols"),
+        py::arg("valid_cols"), py::arg("stream") = 0);
+
+    m.def("cosmos3_edge_scatter_rows_bf16",
+        [](uintptr_t src, uintptr_t dst, uintptr_t row_indices, int rows, int hidden, uintptr_t stream) {
+            flash_rt::kernels::cosmos3_edge_scatter_rows_bf16(
+                reinterpret_cast<const __nv_bfloat16*>(src),
+                reinterpret_cast<__nv_bfloat16*>(dst),
+                reinterpret_cast<const int64_t*>(row_indices),
+                rows,
+                hidden,
+                to_stream(stream));
+        },
+        py::arg("src"), py::arg("dst"), py::arg("row_indices"),
+        py::arg("rows"), py::arg("hidden"), py::arg("stream") = 0);
+
+    m.def("cosmos3_edge_gather_rows_bf16",
+        [](uintptr_t src, uintptr_t dst, uintptr_t row_indices, int rows, int hidden, uintptr_t stream) {
+            flash_rt::kernels::cosmos3_edge_gather_rows_bf16(
+                reinterpret_cast<const __nv_bfloat16*>(src),
+                reinterpret_cast<__nv_bfloat16*>(dst),
+                reinterpret_cast<const int64_t*>(row_indices),
+                rows,
+                hidden,
+                to_stream(stream));
+        },
+        py::arg("src"), py::arg("dst"), py::arg("row_indices"),
+        py::arg("rows"), py::arg("hidden"), py::arg("stream") = 0);
+
+    m.def("cosmos3_edge_qk_norm_rope_strided_bf16",
+        [](uintptr_t q_in, uintptr_t k_in, uintptr_t q_weight, uintptr_t k_weight,
+           uintptr_t cos, uintptr_t sin, uintptr_t q_out, uintptr_t k_out,
+           int rows, int q_heads, int k_heads, int q_in_row_stride, int k_in_row_stride,
+           float eps, uintptr_t stream) {
+            flash_rt::kernels::cosmos3_edge_qk_norm_rope_strided_bf16(
+                reinterpret_cast<const __nv_bfloat16*>(q_in),
+                reinterpret_cast<const __nv_bfloat16*>(k_in),
+                reinterpret_cast<const __nv_bfloat16*>(q_weight),
+                reinterpret_cast<const __nv_bfloat16*>(k_weight),
+                reinterpret_cast<const __nv_bfloat16*>(cos),
+                reinterpret_cast<const __nv_bfloat16*>(sin),
+                reinterpret_cast<__nv_bfloat16*>(q_out),
+                reinterpret_cast<__nv_bfloat16*>(k_out),
+                rows, q_heads, k_heads, q_in_row_stride, k_in_row_stride, eps,
+                to_stream(stream));
+        },
+        py::arg("q_in"), py::arg("k_in"), py::arg("q_weight"), py::arg("k_weight"),
+        py::arg("cos"), py::arg("sin"), py::arg("q_out"), py::arg("k_out"),
+        py::arg("rows"), py::arg("q_heads"), py::arg("k_heads"),
+        py::arg("q_in_row_stride"), py::arg("k_in_row_stride"),
+        py::arg("eps"), py::arg("stream") = 0);
+
+    m.def("cosmos3_edge_relu2_to_fp8_static_bf16",
+        [](uintptr_t x, uintptr_t out, uintptr_t d_scale, int numel, uintptr_t stream) {
+            flash_rt::kernels::cosmos3_edge_relu2_to_fp8_static_bf16(
+                reinterpret_cast<const __nv_bfloat16*>(x),
+                reinterpret_cast<__nv_fp8_e4m3*>(out),
+                reinterpret_cast<const float*>(d_scale),
+                numel,
+                to_stream(stream));
+        },
+        py::arg("x"), py::arg("out"), py::arg("d_scale"),
+        py::arg("numel"), py::arg("stream") = 0);
+
+    m.def("cosmos3_edge_copy_action_tail_f32_to_bf16",
+        [](uintptr_t flat_noise, uintptr_t action, int flat_dim, int action_numel, uintptr_t stream) {
+            flash_rt::kernels::cosmos3_edge_copy_action_tail_f32_to_bf16(
+                reinterpret_cast<const float*>(flat_noise),
+                reinterpret_cast<__nv_bfloat16*>(action),
+                flat_dim,
+                action_numel,
+                to_stream(stream));
+        },
+        py::arg("flat_noise"), py::arg("action"), py::arg("flat_dim"),
+        py::arg("action_numel"), py::arg("stream") = 0);
+
+    m.def("cosmos3_edge_add_action_bias_timestep_bf16",
+        [](uintptr_t x, uintptr_t static_bias, uintptr_t timestep, int rows, int hidden, uintptr_t stream) {
+            flash_rt::kernels::cosmos3_edge_add_action_bias_timestep_bf16(
+                reinterpret_cast<__nv_bfloat16*>(x),
+                reinterpret_cast<const __nv_bfloat16*>(static_bias),
+                reinterpret_cast<const __nv_bfloat16*>(timestep),
+                rows,
+                hidden,
+                to_stream(stream));
+        },
+        py::arg("x"), py::arg("static_bias"), py::arg("timestep"),
+        py::arg("rows"), py::arg("hidden"), py::arg("stream") = 0);
+
+    m.def("cosmos3_edge_add_bf16",
+        [](uintptr_t a, uintptr_t b, uintptr_t out, int numel, uintptr_t stream) {
+            flash_rt::kernels::cosmos3_edge_add_bf16(
+                reinterpret_cast<const __nv_bfloat16*>(a),
+                reinterpret_cast<const __nv_bfloat16*>(b),
+                reinterpret_cast<__nv_bfloat16*>(out),
+                numel,
+                to_stream(stream));
+        },
+        py::arg("a"), py::arg("b"), py::arg("out"), py::arg("numel"),
+        py::arg("stream") = 0);
+
+    m.def("cosmos3_edge_avgdown3d_bf16",
+        [](uintptr_t x, uintptr_t out, int b, int c, int t, int h, int w,
+           int out_c, int factor_t, int factor_s, int group_size, uintptr_t stream) {
+            flash_rt::kernels::cosmos3_edge_avgdown3d_bf16(
+                reinterpret_cast<const __nv_bfloat16*>(x),
+                reinterpret_cast<__nv_bfloat16*>(out),
+                b,
+                c,
+                t,
+                h,
+                w,
+                out_c,
+                factor_t,
+                factor_s,
+                group_size,
+                to_stream(stream));
+        },
+        py::arg("x"), py::arg("out"), py::arg("b"), py::arg("c"),
+        py::arg("t"), py::arg("h"), py::arg("w"), py::arg("out_c"),
+        py::arg("factor_t"), py::arg("factor_s"), py::arg("group_size"),
+        py::arg("stream") = 0);
+
+    m.def("cosmos3_edge_unipc_step_f32_bf16",
+        [](uintptr_t sample, uintptr_t velocity, uintptr_t prev_m1,
+           uintptr_t prev_m2, uintptr_t prev_last_sample, uintptr_t next_sample,
+           uintptr_t current_m, uintptr_t current_last_sample, int numel,
+           float sigma, int corrector_order, int predictor_order,
+           float c_sample, float c_last, float c_prev_m1, float c_prev_m2,
+           float c_curr_m, float p_sample, float p_curr_m, float p_prev_m1,
+           uintptr_t stream) {
+            flash_rt::kernels::cosmos3_edge_unipc_step_f32_bf16(
+                reinterpret_cast<const float*>(sample),
+                reinterpret_cast<const __nv_bfloat16*>(velocity),
+                reinterpret_cast<const float*>(prev_m1),
+                reinterpret_cast<const float*>(prev_m2),
+                reinterpret_cast<const float*>(prev_last_sample),
+                reinterpret_cast<float*>(next_sample),
+                reinterpret_cast<float*>(current_m),
+                reinterpret_cast<float*>(current_last_sample),
+                numel,
+                sigma,
+                corrector_order,
+                predictor_order,
+                c_sample,
+                c_last,
+                c_prev_m1,
+                c_prev_m2,
+                c_curr_m,
+                p_sample,
+                p_curr_m,
+                p_prev_m1,
+                to_stream(stream));
+        },
+        py::arg("sample"), py::arg("velocity"), py::arg("prev_m1"),
+        py::arg("prev_m2"), py::arg("prev_last_sample"), py::arg("next_sample"),
+        py::arg("current_m"), py::arg("current_last_sample"), py::arg("numel"),
+        py::arg("sigma"), py::arg("corrector_order"), py::arg("predictor_order"),
+        py::arg("c_sample"), py::arg("c_last"), py::arg("c_prev_m1"),
+        py::arg("c_prev_m2"), py::arg("c_curr_m"), py::arg("p_sample"),
+        py::arg("p_curr_m"), py::arg("p_prev_m1"), py::arg("stream") = 0);
+
 #ifdef FLASHRT_HAVE_QWEN36_KERNELS
     m.def("qwen36_embedding_lookup_bf16",
         [](uintptr_t token_ids, uintptr_t embed, uintptr_t out,
@@ -6064,6 +6285,28 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("w_fp8"), py::arg("y_bf16"),
         py::arg("bias_bf16") = 0,
         py::arg("residual_bf16") = 0,
+        py::arg("N"), py::arg("T_cache"), py::arg("T_new"),
+        py::arg("H"), py::arg("W"),
+        py::arg("Ci"), py::arg("Co"),
+        py::arg("alpha") = 1.0f, py::arg("stream") = 0);
+#endif
+#ifdef ENABLE_BF16_CONV3D_V0
+    m.def("bf16_conv3d_v0_ndhwc_bf16out",
+        [](uintptr_t cache_x_bf16, uintptr_t new_x_bf16,
+           uintptr_t w_bf16, uintptr_t y_bf16,
+           uintptr_t bias_bf16,
+           int N, int T_cache, int T_new, int H, int W, int Ci, int Co,
+           float alpha, uintptr_t stream) {
+            return ::bf16_conv3d_v0_ndhwc_bf16out(
+                to_ptr(cache_x_bf16), to_ptr(new_x_bf16),
+                to_ptr(w_bf16), to_ptr(y_bf16),
+                to_ptr(bias_bf16),
+                N, T_cache, T_new, H, W, Ci, Co, alpha,
+                to_stream(stream));
+        },
+        py::arg("cache_x_bf16"), py::arg("new_x_bf16"),
+        py::arg("w_bf16"), py::arg("y_bf16"),
+        py::arg("bias_bf16") = 0,
         py::arg("N"), py::arg("T_cache"), py::arg("T_new"),
         py::arg("H"), py::arg("W"),
         py::arg("Ci"), py::arg("Co"),

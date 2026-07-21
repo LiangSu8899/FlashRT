@@ -1,0 +1,21 @@
+# Cosmos3-Edge official Thor baseline.
+# Metadata only - the reference execution is delegated to NVIDIA Cosmos
+# Framework so the first Thor baseline remains directly comparable upstream.
+name: cosmos3_edge
+description: Cosmos3-Edge official Cosmos Framework baseline runner for Thor
+arch: cosmos3_edge_omni
+hidden_dim: 2048
+ffn_hidden_dim: 9216
+num_layers: 28
+num_heads: 16
+num_kv_heads: 8
+head_dim: 128
+patch_latent_dim: 192
+latent_channels: 48
+max_action_dim: 64
+action_gen: true
+vision_gen: true
+sound_gen: false
+precision: bf16
+backend: cosmos_framework
+hardware: thor
