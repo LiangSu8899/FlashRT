@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 import pytest
@@ -10,11 +11,11 @@ from flash_rt.models.cosmos3_edge.weights import EdgeTransformerWeights  # noqa:
 
 
 def _local_checkpoint() -> Path | None:
-    candidates = [
-        Path("/home/heima-thor/suliang/nvidia_fp8_80ms/models/Cosmos3-Edge"),
-        Path("/work/models/Cosmos3-Edge"),
-    ]
-    return next((path for path in candidates if path.exists()), None)
+    raw = os.environ.get("COSMOS3_EDGE_CHECKPOINT")
+    if not raw:
+        return None
+    path = Path(raw).expanduser()
+    return path if path.exists() else None
 
 
 def test_cosmos3_edge_weight_loader_refs_expected_shard():

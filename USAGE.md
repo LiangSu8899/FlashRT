@@ -213,7 +213,7 @@ model = flash_rt.load_model(
 | `autotune` | `int\|bool` | `3` | CUDA Graph autotune intensity. See [Autotune](#autotune). |
 | `recalibrate` | `bool` | `False` | Force fresh FP8 calibration (and weight cache for JAX), ignoring cache. See [Calibration](#calibration). |
 | `weight_cache` | `bool` | `True` | Cache FP8-quantized weights to disk. **JAX only** — reduces cold start from ~42s to ~6s. Torch loads in ~3s and ignores this. See [Weight Cache](#weight-cache-jax-only). |
-| `config` | `str` | `"pi05"` | Model architecture config: `"pi05"`, `"pi0"`, `"groot"`, `"groot_n17"`, `"pi0fast"`, `"motus"`, `"wan22_ti2v_5b"`, `"cosmos3_video"`. `"cosmos3_video"` is a non-VLA text2video denoise model — drive it with `set_prompt(ref=...)` + `infer(...)`, not `predict()`. |
+| `config` | `str` | `"pi05"` | Model architecture config: `"pi05"`, `"pi0"`, `"groot"`, `"groot_n17"`, `"pi0fast"`, `"motus"`, `"wan22_ti2v_5b"`, `"cosmos3_video"`, `"cosmos3_edge"`. Cosmos video/Edge routes use `set_prompt(...)` + `infer(...)`, not the VLA `predict()` convenience API. |
 | `decode_cuda_graph` | `bool` | `False` | **Pi0-FAST only.** Capture action-phase decode as CUDA Graph. Trades startup time for per-token speed. See [Pi0-FAST](#pi0-fast). |
 | `decode_graph_steps` | `int` | `80` | **Pi0-FAST only.** Number of action tokens to capture in the decode graph. Should cover your longest expected action sequence. |
 | `use_fp4` | `bool` | `False` | **Pi0.5 torch + jax on Thor.** Enable NVFP4 quantization on the encoder FFN stack. When `True`, resolves to the production preset (`fp4_layers=tuple(range(18))` + `use_awq=True` + `use_p1_split_gu=True`). Requires SM100+ GPU. Other configs emit a warning and fall back to FP8. See [NVFP4](#nvfp4-pi05-only). |
@@ -676,6 +676,37 @@ out = model.infer(
 The model-local kernel is built once on the target GPU (`cd
 flash_rt/models/cosmos3_video/kernels && python3 setup.py build_ext --inplace`).
 See [`docs/cosmos3_video_usage.md`](docs/cosmos3_video_usage.md).
+
+### Cosmos3-Edge AV inverse dynamics
+
+Cosmos3-Edge is registered for PyTorch on Jetson AGX Thor. Run the official
+action-only path first to establish the end-to-end output and baseline:
+
+```python
+import flash_rt
+
+model = flash_rt.load_model(
+    "/path/to/Cosmos3-Edge",
+    framework="torch",
+    config="cosmos3_edge",
+    hardware="thor",
+)
+model.set_prompt(input_json="/path/to/av_inverse_input.json")
+result = model.infer(
+    output_dir="/path/to/output",
+    backend="official_action_only",
+    cosmos_root="/path/to/cosmos-framework",
+    vae_path="/path/to/Wan2.2_VAE.pth",
+    benchmark=True,
+)
+```
+
+The FlashRT denoise engine executes all 30 steps in one CUDA Graph and reaches
+5.72x with FP8 or 6.07x with FP8 plus NVFP4 FFN on the measured Thor workload.
+Optional TeaCache schedules can be much faster, but must be qualified for each
+task distribution and fine-tuned checkpoint. See
+[`docs/cosmos3_edge_thor.md`](docs/cosmos3_edge_thor.md) for the complete table,
+benchmark commands, accuracy gates, and limitations.
 
 ### `model.predict()`
 

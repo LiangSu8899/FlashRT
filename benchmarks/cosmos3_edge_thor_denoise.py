@@ -6,15 +6,13 @@ official dump. It intentionally does not run Cosmos Framework; pass the
 official ``benchmark.json`` only to print the recorded eager baseline next to
 the FlashRT numbers.
 
-Run inside the Thor container and isolated venv:
+Run inside a Thor environment with the FlashRT extensions available:
 
-    cd /work/official/flashrt-public
-    source /work/.venv_cosmos_thor/bin/activate
     python benchmarks/cosmos3_edge_thor_denoise.py \
-      --checkpoint /work/models/Cosmos3-Edge \
-      --reference-dump dev_scratch_cosmos3_thor/edge_av_inverse_0/tensors.safetensors \
-      --boundary-dump dev_scratch_cosmos3_thor/edge_av_inverse_0_boundary_step0/tensors.safetensors \
-      --official-benchmark dev_scratch_cosmos3_thor/edge_av_inverse_0/official_outputs/benchmark.json
+      --checkpoint /path/to/Cosmos3-Edge \
+      --reference-dump /path/to/denoise/tensors.safetensors \
+      --boundary-dump /path/to/step0_boundary/tensors.safetensors \
+      --official-benchmark /path/to/official/benchmark.json
 """
 
 from __future__ import annotations
@@ -121,18 +119,18 @@ def _profile_loop_breakdown(runner: Any, *, device: str) -> dict[str, Any]:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--checkpoint", default="/work/models/Cosmos3-Edge")
+    ap.add_argument("--checkpoint", required=True)
     ap.add_argument(
         "--reference-dump",
-        default="dev_scratch_cosmos3_thor/edge_av_inverse_0/tensors.safetensors",
+        required=True,
     )
     ap.add_argument(
         "--boundary-dump",
-        default="dev_scratch_cosmos3_thor/edge_av_inverse_0_boundary_step0/tensors.safetensors",
+        required=True,
     )
     ap.add_argument(
         "--official-benchmark",
-        default="dev_scratch_cosmos3_thor/edge_av_inverse_0/official_outputs/benchmark.json",
+        default=None,
     )
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--warmup-steps", type=int, default=1)

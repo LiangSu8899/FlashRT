@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 import pytest
@@ -16,66 +17,36 @@ from flash_rt.models.cosmos3_edge.boundary_dump import (  # noqa: E402
 )
 
 
+def _path_from_env(name: str) -> Path | None:
+    raw = os.environ.get(name)
+    if not raw:
+        return None
+    path = Path(raw).expanduser()
+    return path if path.exists() else None
+
+
 def _local_boundary_dump() -> Path | None:
-    candidates = [
-        Path(
-            "/home/heima-thor/suliang/nvidia_fp8_80ms/official/flashrt-public/"
-            "dev_scratch_cosmos3_thor/edge_av_inverse_0_boundary_step0/tensors.safetensors"
-        ),
-        Path(
-            "/work/official/flashrt-public/dev_scratch_cosmos3_thor/"
-            "edge_av_inverse_0_boundary_step0/tensors.safetensors"
-        ),
-    ]
-    return next((path for path in candidates if path.exists()), None)
+    return _path_from_env("COSMOS3_EDGE_BOUNDARY_DUMP")
 
 
 def _local_prelayer_boundary_dump() -> Path | None:
-    candidates = [
-        Path(
-            "/home/heima-thor/suliang/nvidia_fp8_80ms/official/flashrt-public/"
-            "dev_scratch_cosmos3_thor/edge_av_inverse_0/official_action_only_live_prelayer_boundary.safetensors"
-        ),
-        Path(
-            "/work/official/flashrt-public/dev_scratch_cosmos3_thor/"
-            "edge_av_inverse_0/official_action_only_live_prelayer_boundary.safetensors"
-        ),
-    ]
-    return next((path for path in candidates if path.exists()), None)
+    return _path_from_env("COSMOS3_EDGE_PRELAYER_BOUNDARY_DUMP")
 
 
 def _local_slim_prepare_dump() -> Path | None:
-    candidates = [
-        Path(
-            "/home/heima-thor/suliang/nvidia_fp8_80ms/official/flashrt-public/"
-            "dev_scratch_cosmos3_thor/edge_av_inverse_0/"
-            "official_action_only_live_prelayer_prepare_slim_derive_noise_dump.pt"
-        ),
-        Path(
-            "/work/official/flashrt-public/dev_scratch_cosmos3_thor/"
-            "edge_av_inverse_0/official_action_only_live_prelayer_prepare_slim_derive_noise_dump.pt"
-        ),
-    ]
-    return next((path for path in candidates if path.exists()), None)
+    return _path_from_env("COSMOS3_EDGE_SLIM_PREPARE_DUMP")
 
 
 def _local_text_embedding_shard() -> Path | None:
-    candidates = [
-        Path(
-            "/home/heima-thor/suliang/nvidia_fp8_80ms/models/Cosmos3-Edge/"
-            "transformer/diffusion_pytorch_model-00001-of-00002.safetensors"
-        ),
-        Path("/work/models/Cosmos3-Edge/transformer/diffusion_pytorch_model-00001-of-00002.safetensors"),
-    ]
-    return next((path for path in candidates if path.exists()), None)
+    root = _local_cosmos3_edge_model_root()
+    if root is None:
+        return None
+    path = root / "transformer" / "diffusion_pytorch_model-00001-of-00002.safetensors"
+    return path if path.exists() else None
 
 
 def _local_cosmos3_edge_model_root() -> Path | None:
-    candidates = [
-        Path("/home/heima-thor/suliang/nvidia_fp8_80ms/models/Cosmos3-Edge"),
-        Path("/work/models/Cosmos3-Edge"),
-    ]
-    return next((path for path in candidates if path.exists()), None)
+    return _path_from_env("COSMOS3_EDGE_CHECKPOINT")
 
 
 def test_cosmos3_edge_boundary_dump_geometry_when_present():

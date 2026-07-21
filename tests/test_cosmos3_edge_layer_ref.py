@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 import pytest
@@ -16,23 +17,12 @@ from flash_rt.models.cosmos3_edge.weights import EdgeTransformerWeights  # noqa:
 
 
 def _local_paths() -> tuple[Path, Path] | None:
-    candidates = [
-        (
-            Path("/home/heima-thor/suliang/nvidia_fp8_80ms/models/Cosmos3-Edge"),
-            Path(
-                "/home/heima-thor/suliang/nvidia_fp8_80ms/official/flashrt-public/"
-                "dev_scratch_cosmos3_thor/edge_av_inverse_0_boundary_step0/tensors.safetensors"
-            ),
-        ),
-        (
-            Path("/work/models/Cosmos3-Edge"),
-            Path(
-                "/work/official/flashrt-public/dev_scratch_cosmos3_thor/"
-                "edge_av_inverse_0_boundary_step0/tensors.safetensors"
-            ),
-        ),
-    ]
-    return next((paths for paths in candidates if paths[0].exists() and paths[1].exists()), None)
+    checkpoint_raw = os.environ.get("COSMOS3_EDGE_CHECKPOINT")
+    boundary_raw = os.environ.get("COSMOS3_EDGE_BOUNDARY_DUMP")
+    if not checkpoint_raw or not boundary_raw:
+        return None
+    paths = (Path(checkpoint_raw).expanduser(), Path(boundary_raw).expanduser())
+    return paths if paths[0].exists() and paths[1].exists() else None
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="layer0 reference requires CUDA for this shape")

@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,6 +15,14 @@ from flash_rt.models.cosmos3_edge.dump_replay import (  # noqa: E402
     EdgeDenoiseReplay,
 )
 from flash_rt.models.cosmos3_edge.static_unipc import EdgeStaticUniPCScheduler  # noqa: E402
+
+
+def _local_denoise_dump() -> Path | None:
+    raw = os.environ.get("COSMOS3_EDGE_REFERENCE_DUMP")
+    if not raw:
+        return None
+    path = Path(raw).expanduser()
+    return path if path.exists() else None
 
 
 def test_cosmos3_edge_split_flat_geometry():
@@ -38,17 +47,7 @@ def test_cosmos3_edge_split_flat_geometry():
 
 
 def test_cosmos3_edge_local_dump_replays_scheduler_when_present():
-    candidates = [
-        Path(
-            "/home/heima-thor/suliang/nvidia_fp8_80ms/official/flashrt-public/"
-            "dev_scratch_cosmos3_thor/edge_av_inverse_0/tensors.safetensors"
-        ),
-        Path(
-            "/work/official/flashrt-public/dev_scratch_cosmos3_thor/"
-            "edge_av_inverse_0/tensors.safetensors"
-        ),
-    ]
-    dump_path = next((path for path in candidates if path.exists()), None)
+    dump_path = _local_denoise_dump()
     if dump_path is None:
         pytest.skip("local Cosmos3-Edge P0 dump is not available")
 
@@ -69,17 +68,7 @@ def test_cosmos3_edge_local_dump_replays_scheduler_when_present():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="native static UniPC replay requires CUDA")
 def test_cosmos3_edge_static_unipc_replays_scheduler_when_present():
-    candidates = [
-        Path(
-            "/home/heima-thor/suliang/nvidia_fp8_80ms/official/flashrt-public/"
-            "dev_scratch_cosmos3_thor/edge_av_inverse_0/tensors.safetensors"
-        ),
-        Path(
-            "/work/official/flashrt-public/dev_scratch_cosmos3_thor/"
-            "edge_av_inverse_0/tensors.safetensors"
-        ),
-    ]
-    dump_path = next((path for path in candidates if path.exists()), None)
+    dump_path = _local_denoise_dump()
     if dump_path is None:
         pytest.skip("local Cosmos3-Edge P0 dump is not available")
 

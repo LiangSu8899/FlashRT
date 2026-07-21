@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 import pytest
@@ -26,7 +27,8 @@ def test_cosmos3_edge_spec_counts_and_tower_names():
 
 
 def test_cosmos3_edge_local_checkpoint_index_matches_when_present():
-    checkpoint = "/home/heima-thor/suliang/nvidia_fp8_80ms/models/Cosmos3-Edge"
-    if not Path(checkpoint).exists():
+    raw = os.environ.get("COSMOS3_EDGE_CHECKPOINT")
+    checkpoint = Path(raw).expanduser() if raw else None
+    if checkpoint is None or not checkpoint.exists():
         pytest.skip("local Cosmos3-Edge checkpoint is not available")
     validate_transformer_index(checkpoint)
