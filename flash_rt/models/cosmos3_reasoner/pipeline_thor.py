@@ -11,8 +11,8 @@ no deepstack), a PatchMerger projector, and ``embed_tokens`` / ``norm`` /
 Two execution paths share the weights:
   - vision + prefill: exact torch replica of the official
     ``nemotron_3_dense_vl`` modules (parity-first; prefill is one pass).
-  - decode: static-buffer per-token loop over the KV cache, optionally
-    quantized (fp8/fp4 weights) and captured in a single CUDA graph.
+  - decode: static-buffer BF16 or NVFP4 per-token loop over the KV cache,
+    captured in a single CUDA graph.
 """
 from __future__ import annotations
 
@@ -36,6 +36,7 @@ VOCAB = 131072
 IMAGE_TOKEN_ID = 19
 VIDEO_TOKEN_ID = 18
 VISION_START_ID = 20  # verified against tokenizer at load time
+ATTN_SPLITS = 24
 
 # Vision tower (SigLIP2).
 V_NL, V_HID, V_NH, V_HD, V_FF = 27, 1152, 16, 72, 4304
@@ -95,6 +96,8 @@ class CosmosReasonerThor:
 
         if self.quant == "fp4":
             self._init_fp4_decode()
+        else:
+            self._init_bf16_decode()
 
     # ---------------- NVFP4 W4A4 decode path ----------------
     @staticmethod
@@ -164,8 +167,8 @@ class CosmosReasonerThor:
         self.d_step = torch.zeros(1, dtype=torch.long, device=DEV)
         self.d_out_tokens = torch.zeros(self.max_new + 1, dtype=torch.long, device=DEV)
         self.d_max_val = torch.empty(1, device=DEV, dtype=BF)
-        self.d_pacc = torch.empty(NH, 20, HD, dtype=torch.float32, device=DEV)
-        self.d_pml = torch.empty(NH, 20, 2, dtype=torch.float32, device=DEV)
+        self.d_pacc = torch.empty(NH, ATTN_SPLITS, HD, dtype=torch.float32, device=DEV)
+        self.d_pml = torch.empty(NH, ATTN_SPLITS, 2, dtype=torch.float32, device=DEV)
         # e4m3 KV cache (uint8 bit-pattern storage): halves decode KV traffic.
         self.k8_cache = torch.zeros(NL, self.max_seq, NKV, HD, device=DEV, dtype=torch.uint8)
         self.v8_cache = torch.zeros(NL, self.max_seq, NKV, HD, device=DEV, dtype=torch.uint8)
@@ -179,6 +182,101 @@ class CosmosReasonerThor:
         self._kT = [self.k_cache[li].permute(1, 0, 2).unsqueeze(0) for li in range(NL)]
         self._vT = [self.v_cache[li].permute(1, 0, 2).unsqueeze(0) for li in range(NL)]
         self._graph = None
+
+    # ---------------- BF16 W16A16 decode path ----------------
+    def _init_bf16_decode(self) -> None:
+        import flash_rt.flash_rt_kernels as fvk
+
+        self.fvk = fvk
+        if not hasattr(fvk, "ht_gemv_bf16_m1_w4"):
+            raise RuntimeError("FlashRT was built without the BF16 decode GEMV")
+
+        # A single wide QKV GEMV is more efficient than three short-M launches.
+        self.W16_qkv = []
+        for li in range(NL):
+            self.W16_qkv.append(torch.cat([
+                self.w[f"layers.{li}.self_attn.to_q.weight"],
+                self.w[f"layers.{li}.self_attn.to_k.weight"],
+                self.w[f"layers.{li}.self_attn.to_v.weight"],
+            ], dim=0).contiguous())
+
+        self.d_tok = torch.zeros(1, dtype=torch.long, device=DEV)
+        self.d_pos = torch.zeros(1, dtype=torch.long, device=DEV)
+        self.d_slot = torch.zeros(1, dtype=torch.long, device=DEV)
+        self.d_x = torch.zeros(1, HID, device=DEV, dtype=BF)
+        self.d_nrm = torch.zeros(1, HID, device=DEV, dtype=BF)
+        self.d_qkv = torch.empty(1, (NH + 2 * NKV) * HD, device=DEV, dtype=BF)
+        self.d_q = self.d_qkv[:, : NH * HD]
+        self.d_k = self.d_qkv[:, NH * HD : (NH + NKV) * HD]
+        self.d_v = self.d_qkv[:, (NH + NKV) * HD :]
+        self.d_attn = torch.empty(1, HID, device=DEV, dtype=BF)
+        self.d_o = torch.empty(1, HID, device=DEV, dtype=BF)
+        self.d_up = torch.empty(1, FF, device=DEV, dtype=BF)
+        self.d_dn = torch.empty(1, HID, device=DEV, dtype=BF)
+        self.d_logits = torch.empty(1, VOCAB, device=DEV, dtype=BF)
+        self.d_qr = torch.empty(NH, HD, device=DEV, dtype=BF)
+        self.d_len = torch.zeros(1, dtype=torch.int32, device=DEV)
+        self.d_step = torch.zeros(1, dtype=torch.long, device=DEV)
+        self.d_out_tokens = torch.zeros(self.max_new + 1, dtype=torch.long, device=DEV)
+        self.d_max_val = torch.empty(1, device=DEV, dtype=BF)
+        self.d_pacc = torch.empty(NH, ATTN_SPLITS, HD, dtype=torch.float32, device=DEV)
+        self.d_pml = torch.empty(NH, ATTN_SPLITS, 2, dtype=torch.float32, device=DEV)
+        p = torch.arange(self.max_seq, device=DEV, dtype=torch.float32)
+        f = p[:, None] * self.inv_freq[None, :]
+        emb = torch.cat((f, f), dim=-1)
+        self.d_cos_table = emb.cos().to(BF)
+        self.d_sin_table = emb.sin().to(BF)
+        self._graph = None
+
+    def _gemv_bf16(self, x: torch.Tensor, weight: torch.Tensor,
+                    out: torch.Tensor, n: int, k: int) -> None:
+        self.fvk.ht_gemv_bf16_m1_w4(
+            x.data_ptr(), weight.data_ptr(), out.data_ptr(), 1, n, k, 1.0,
+            torch.cuda.current_stream().cuda_stream)
+
+    def _decode_step_bf16(self) -> None:
+        fvk = self.fvk
+        s = torch.cuda.current_stream().cuda_stream
+        torch.index_select(self.w["embed_tokens.weight"], 0, self.d_tok, out=self.d_x)
+        for li in range(NL):
+            fvk.rms_norm(self.d_x.data_ptr(), self.w[f"layers.{li}.input_layernorm.weight"].data_ptr(),
+                         self.d_nrm.data_ptr(), 1, HID, EPS, s)
+            self._gemv_bf16(self.d_nrm, self.W16_qkv[li], self.d_qkv,
+                            (NH + 2 * NKV) * HD, HID)
+            fvk.cosmos3_reasoner_rope_kv_bf16(
+                self.d_q.data_ptr(), self.d_k.data_ptr(), self.d_v.data_ptr(),
+                self.d_cos_table.data_ptr(), self.d_sin_table.data_ptr(),
+                self.d_pos.data_ptr(), self.d_slot.data_ptr(),
+                self.d_qr.data_ptr(), self.k_cache[li].data_ptr(), self.v_cache[li].data_ptr(),
+                NH, NKV, s)
+            fvk.cosmos3_reasoner_decode_attn_bf16(
+                self.d_qr.data_ptr(), self.k_cache[li].data_ptr(), self.v_cache[li].data_ptr(),
+                self.d_len.data_ptr(), self.d_attn.data_ptr(),
+                self.d_pacc.data_ptr(), self.d_pml.data_ptr(), NH, NKV, HD ** -0.5, s)
+            self._gemv_bf16(
+                self.d_attn, self.w[f"layers.{li}.self_attn.to_out.weight"],
+                self.d_o, HID, HID)
+            self.d_x.add_(self.d_o)
+            fvk.rms_norm(self.d_x.data_ptr(), self.w[f"layers.{li}.post_attention_layernorm.weight"].data_ptr(),
+                         self.d_nrm.data_ptr(), 1, HID, EPS, s)
+            self._gemv_bf16(
+                self.d_nrm, self.w[f"layers.{li}.mlp.up_proj.weight"],
+                self.d_up, FF, HID)
+            fvk.relu2_inplace_bf16(self.d_up.data_ptr(), FF, s)
+            self._gemv_bf16(
+                self.d_up, self.w[f"layers.{li}.mlp.down_proj.weight"],
+                self.d_dn, HID, FF)
+            self.d_x.add_(self.d_dn)
+        fvk.rms_norm(self.d_x.data_ptr(), self.w["norm.weight"].data_ptr(),
+                     self.d_nrm.data_ptr(), 1, HID, EPS, s)
+        self._gemv_bf16(self.d_nrm, self.w["lm_head.weight"],
+                        self.d_logits, VOCAB, HID)
+        torch.max(self.d_logits.view(VOCAB), 0, out=(self.d_max_val[0], self.d_tok[0]))
+        self.d_out_tokens.index_copy_(0, self.d_step, self.d_tok)
+        self.d_pos.add_(1)
+        self.d_slot.add_(1)
+        self.d_len.add_(1)
+        self.d_step.add_(1)
 
     def _gemv(self, x_bf16, key, out, n, k):
         wp, ws = self.W4[key]
@@ -228,13 +326,14 @@ class CosmosReasonerThor:
             return
         st = torch.cuda.Stream()
         st.wait_stream(torch.cuda.current_stream())
+        step = self._decode_step_fp4 if self.quant == "fp4" else self._decode_step_bf16
         with torch.cuda.stream(st):
             for _ in range(2):
-                self._decode_step_fp4()
+                step()
         torch.cuda.current_stream().wait_stream(st)
         self._graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self._graph):
-            self._decode_step_fp4()
+            step()
 
     # ---------------- weights ----------------
     def _load(self, key: str) -> torch.Tensor:
@@ -417,6 +516,7 @@ class CosmosReasonerThor:
         if self.quant == "fp4":
             self.k8_cache[:, :S].copy_(self.k_cache[:, :S].to(torch.float8_e4m3fn).view(torch.uint8))
             self.v8_cache[:, :S].copy_(self.v_cache[:, :S].to(torch.float8_e4m3fn).view(torch.uint8))
+        if self.quant in ("fp4", "bf16"):
             self._ensure_graph()
             self.d_tok.fill_(out[0])
             self.d_pos.fill_(nxt)
@@ -426,26 +526,16 @@ class CosmosReasonerThor:
             for _ in range(max_new - 1):
                 if self._graph is not None:
                     self._graph.replay()
-                else:
+                elif self.quant == "fp4":
                     self._decode_step_fp4()
+                else:
+                    self._decode_step_bf16()
             toks = self.d_out_tokens[: max_new - 1].tolist()
             for t in toks:
                 out.append(int(t))
                 self.seq_len += 1
                 if not ignore_eos and t == self.eos_token_id:
                     break
-        else:
-            for step in range(max_new - 1):
-                if not ignore_eos and out[-1] == self.eos_token_id:
-                    break
-                tok = torch.tensor([out[-1]], device=DEV)
-                emb = F.embedding(tok, self.w["embed_tokens.weight"])
-                p = nxt + step
-                posd = torch.full((3, 1), p, dtype=torch.long, device=DEV)
-                cos, sin = self._cos_sin(posd)
-                logits = self._forward(emb, cos, sin, self.seq_len, causal=False)
-                out.append(int(logits.argmax(-1)))
-                self.seq_len += 1
         torch.cuda.synchronize()
         decode_s = time.perf_counter() - t0
         n_dec = len(out) - 1

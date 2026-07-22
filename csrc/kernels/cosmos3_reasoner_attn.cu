@@ -16,7 +16,7 @@ namespace {
 
 constexpr int HD = 128;
 constexpr int TS = 4;   // rows per iteration (one per warp)
-constexpr int SPLITS = 20;  // KV splits per head (fills Thor SMs on long KV)
+constexpr int SPLITS = 24;  // KV splits per head (fills Thor SMs on long KV)
 
 // Phase 1: each block covers one (head, split) KV chunk; emits an
 // unnormalized partial accumulator plus its (m, l) softmax state.
