@@ -4,8 +4,9 @@
 // ([N, K/2] u8, low nibble = even k) with a bf16 scale per 16-element block
 // ([N, K/16]). At M=1 the GEMM is a dot product — pure weight-bandwidth work —
 // so a SIMT FMA kernel with one warp per output row streams weights at DRAM
-// speed without tensor cores (the tiled CUTLASS W4A16 path underfills SMs at
-// these shapes).
+// speed without tensor cores. The activation vector is read directly from
+// global memory: it is a few KB shared by every block, so it lives in L1/L2
+// and a shared-memory staging pass would only add traffic and a barrier.
 
 #include "cosmos3_reasoner_gemv.cuh"
 
@@ -20,7 +21,6 @@ __constant__ float kE2M1[16] = {
 };
 
 // One warp per output row. blockDim.x = 32 lanes, blockDim.y = rows/block.
-// The activation vector is staged in shared memory once per block.
 __global__ void reasoner_gemv_w4a16_kernel(
     const uint8_t* __restrict__ wp,       // [N, K/2]
     const __nv_bfloat16* __restrict__ ws, // [N, K/16]
@@ -29,18 +29,12 @@ __global__ void reasoner_gemv_w4a16_kernel(
     int n_rows,
     int k)
 {
-  // Dynamic smem: [16] decode LUT then [k] activation floats. The LUT lives in
-  // shared memory because divergent indexing into __constant__ serializes.
-  extern __shared__ float sh[];
-  float* sh_lut = sh;
-  float* sh_a = sh + 16;
+  // 16-entry nibble LUT in shared memory: divergent indexing into
+  // __constant__ serializes, while 16 floats span 16 smem banks.
+  __shared__ float sh_lut[16];
   const int tid = threadIdx.y * 32 + threadIdx.x;
-  const int block_threads = blockDim.x * blockDim.y;
   if (tid < 16) {
     sh_lut[tid] = kE2M1[tid];
-  }
-  for (int i = tid; i < k; i += block_threads) {
-    sh_a[i] = __bfloat162float(a[i]);
   }
   __syncthreads();
 
@@ -58,7 +52,7 @@ __global__ void reasoner_gemv_w4a16_kernel(
   for (int b = lane; b < n_blocks; b += 32) {
     const float scale = __bfloat162float(srow[b]);
     const uint2 packed = reinterpret_cast<const uint2*>(wrow + (b << 3))[0];
-    const float* av = sh_a + (b << 4);
+    const __nv_bfloat162* av2 = reinterpret_cast<const __nv_bfloat162*>(a + (b << 4));
     float part = 0.0f;
 #pragma unroll
     for (int j = 0; j < 2; ++j) {
@@ -66,9 +60,9 @@ __global__ void reasoner_gemv_w4a16_kernel(
 #pragma unroll
       for (int byte = 0; byte < 4; ++byte) {
         const uint32_t v = (word >> (byte * 8)) & 0xffu;
-        const int base = j * 8 + byte * 2;
-        part += sh_lut[v & 0xfu] * av[base];
-        part += sh_lut[v >> 4] * av[base + 1];
+        const __nv_bfloat162 a2 = av2[j * 4 + byte];
+        part += sh_lut[v & 0xfu] * __bfloat162float(a2.x);
+        part += sh_lut[v >> 4] * __bfloat162float(a2.y);
       }
     }
     acc += part * scale;
@@ -102,8 +96,7 @@ void cosmos3_reasoner_gemv_w4a16_bf16(
   constexpr int kRowsPerBlock = 8;
   dim3 block(32, kRowsPerBlock);
   const int blocks = (n_rows + kRowsPerBlock - 1) / kRowsPerBlock;
-  const size_t smem = (size_t)(k + 16) * sizeof(float);
-  reasoner_gemv_w4a16_kernel<<<blocks, block, smem, stream>>>(
+  reasoner_gemv_w4a16_kernel<<<blocks, block, 0, stream>>>(
       w_packed, w_scales, a, out, n_rows, k);
 }
 
