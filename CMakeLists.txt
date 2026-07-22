@@ -629,13 +629,13 @@ endif()
 
 # ── Dedicated M=1 decode GEMV (FP8 + BF16) ──
 # Origin sm_120a, but neither kernel uses an SM120-specific instruction, so both
-# compile for Ada (sm89) too — built for the FP8-capable consumer RTX arches
-# (sm89 / sm120). Independent of FLASHRT_ENABLE_MOTUS: the bindings are gated by
+# compile for Thor (sm110) and Ada (sm89) too. Independent of
+# FLASHRT_ENABLE_MOTUS: the bindings are gated by
 # ENABLE_DECODE_GEMV_M1 (set alongside this object below), so the object must
 # link whenever it is built — otherwise the binding would reference an unlinked
 # symbol when MOTUS is OFF. (FP8 still needs the SM120 prefill GEMM in MOTUS, so
 # the FP8 path is SM120-only; the BF16 path runs wherever this object is built.)
-if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121" OR
+if(GPU_ARCH STREQUAL "110" OR GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121" OR
    GPU_ARCH STREQUAL "89")
   add_library(decode_gemv_m1_obj OBJECT
     csrc/gemm/fp8_gemv_m1_sm120.cu
@@ -1511,9 +1511,9 @@ if(GPU_ARCH STREQUAL "120")
 endif()
 
 # Dedicated M=1 decode GEMV (FP8 + BF16); linked + macro defined wherever the
-# object is built (sm89 / sm120) so the ENABLE_DECODE_GEMV_M1 bindings always
+# object is built (sm89 / sm110 / sm120) so the ENABLE_DECODE_GEMV_M1 bindings always
 # resolve, independent of FLASHRT_ENABLE_MOTUS.
-if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121" OR
+if(GPU_ARCH STREQUAL "110" OR GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121" OR
    GPU_ARCH STREQUAL "89")
   target_sources(flash_rt_kernels PRIVATE
     $<TARGET_OBJECTS:decode_gemv_m1_obj>)
