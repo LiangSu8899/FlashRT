@@ -382,6 +382,7 @@ class CosmosReasonerThor:
         grid_thw: torch.Tensor | None = None,
         is_video: bool = False,
         max_new_tokens: int | None = None,
+        ignore_eos: bool = False,
     ) -> tuple[list[int], dict[str, float]]:
         import time
 
@@ -431,11 +432,11 @@ class CosmosReasonerThor:
             for t in toks:
                 out.append(int(t))
                 self.seq_len += 1
-                if t == self.eos_token_id:
+                if not ignore_eos and t == self.eos_token_id:
                     break
         else:
             for step in range(max_new - 1):
-                if out[-1] == self.eos_token_id:
+                if not ignore_eos and out[-1] == self.eos_token_id:
                     break
                 tok = torch.tensor([out[-1]], device=DEV)
                 emb = F.embedding(tok, self.w["embed_tokens.weight"])
