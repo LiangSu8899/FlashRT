@@ -158,7 +158,7 @@ DGX Spark / GB10:
 | RTX 5090 | 720p, 121f, 20 steps | **178.6 s** | [Wan2.2 benchmarks](docs/wan22_usage.md#benchmarks) |
 | RTX 5090 | TeaCache 0.3 | **114.2 s** | [Wan2.2 benchmarks](docs/wan22_usage.md#benchmarks) |
 
-#### Cosmos3-Edge AV inverse dynamics
+#### Cosmos3-Edge AV inverse dynamics and Reasoner
 
 Jetson AGX Thor, 30-step denoise boundary, 15 hot back-to-back iterations:
 
@@ -167,10 +167,17 @@ Jetson AGX Thor, 30-step denoise boundary, 15 hot back-to-back iterations:
 | Official eager | 33.14 s | 1.00x | reference | [Cosmos3-Edge usage](docs/cosmos3_edge_thor.md#performance) |
 | FlashRT FP8, no step cache | 5.792 s | **5.72x** | cos 0.999983 | [Cosmos3-Edge usage](docs/cosmos3_edge_thor.md#performance) |
 | FlashRT FP8 + NVFP4 FFN, no step cache | 5.020 s | **6.60x** | cos 0.999771 | [Cosmos3-Edge usage](docs/cosmos3_edge_thor.md#performance) |
-| FlashRT FP8 + TeaCache, 3 computes | 0.576 s | **57.56x** | cos 0.999986 | [Cosmos3-Edge usage](docs/cosmos3_edge_thor.md#performance) |
 
-TeaCache results are workload-specific and require checkpoint- and task-level
-validation. They are not a general policy-quality guarantee.
+Reasoner decode throughput uses batch 1, greedy decode, 128 output tokens, and
+the public 1705/911/1263-token text/image/video profile:
+
+| Mode | Text | Image | Video | Source |
+|---|---:|---:|---:|---|
+| FlashRT NVFP4 + whole-step CUDA Graph | **104.3 tok/s** | **112.6 tok/s** | **108.7 tok/s** | [Cosmos3-Edge Reasoner usage](docs/cosmos3_edge_thor.md) |
+
+See the [complete Cosmos3-Edge Thor usage guide](docs/cosmos3_edge_thor.md) for
+the SM110 build flags, official AV baseline and fixture workflow, FP8/NVFP4
+commands, Reasoner text/image/video inputs, accuracy checks, and limitations.
 
 ## Getting Started
 
@@ -219,7 +226,7 @@ First call: ~3 s (calibration + CUDA Graph capture). Every subsequent call: 44 m
 | **Run Higgs Audio v3 TTS** | [`docs/higgs_audio_v3.md`](docs/higgs_audio_v3.md) — usage + performance · [`serving/higgs_audio_agent/`](serving/higgs_audio_agent/README.md) — HTTP serving |
 | **Run Motus RTX beta, TeaCache, or legacy async chunk runner** | [`docs/motus_usage_beta.md`](docs/motus_usage_beta.md) · [`docs/rtc_lite_design.md`](docs/rtc_lite_design.md) |
 | **Run Wan2.2 TI2V-5B official-pipeline baseline** | [`docs/wan22_usage.md`](docs/wan22_usage.md) |
-| **Run Cosmos3-Edge AV inverse dynamics on Jetson AGX Thor** | [`docs/cosmos3_edge_thor.md`](docs/cosmos3_edge_thor.md) — official baseline, optimized denoise, TeaCache qualification, and benchmarks |
+| **Run Cosmos3-Edge AV inverse dynamics or Reasoner on Jetson AGX Thor** | [`docs/cosmos3_edge_thor.md`](docs/cosmos3_edge_thor.md) — SM110 build, official AV baseline, optimized denoise, Reasoner text/image/video usage, correctness checks, and benchmarks |
 | **Use FlashRT kernels through Hugging Face Kernel Hub** | [`LiangSu8899/FlashRT-HF-kernels`](https://github.com/LiangSu8899/FlashRT-HF-kernels) · [`huggingface.co/flashrt`](https://huggingface.co/flashrt) |
 | **Run serving hosts** | [`serving/README.md`](serving/README.md) — scenario hosts · [`docs/serving_design.md`](docs/serving_design.md) — capsules and roadmap · [`docs/serving_production.md`](docs/serving_production.md) — production notes |
 | **Look up the stable Python API surface** | [`docs/stable_api.md`](docs/stable_api.md) |
@@ -987,7 +994,7 @@ examples/
 - **LingBot-VLA** — [LingBot usage](docs/lingbot_usage.md), [Thor latency](docs/lingbot_usage.md#5-accuracy--latency-thor-sm_110-cuda-graph-replay)
 - **Motus Stage3 RTX beta** (`config="motus"`) — [Motus usage](docs/motus_usage_beta.md), [legacy async chunk runner](docs/rtc_lite_design.md)
 - **Wan2.2 TI2V-5B** (`config="wan22_ti2v_5b"`) — [Wan2.2 usage](docs/wan22_usage.md)
-- **Cosmos3-Edge AV inverse dynamics** (`config="cosmos3_edge"`) — Jetson AGX Thor official baseline and 6x-class FlashRT denoise; [usage and performance](docs/cosmos3_edge_thor.md)
+- **Cosmos3-Edge AV inverse dynamics and Reasoner** (`config="cosmos3_edge"`) — Jetson AGX Thor official baseline, 6.60x no-cache AV denoise, and NVFP4 multimodal chat decode; [complete usage and performance](docs/cosmos3_edge_thor.md)
 - **Higgs Audio v3 TTS-4B** — [Higgs usage](docs/higgs_audio_v3.md#3-quickstart), [Higgs serving](serving/higgs_audio_agent/README.md)
 - **Qwen3.6-27B NVFP4** — [Qwen3.6 usage](docs/qwen36_nvfp4.md), [parameter reference](docs/qwen36_usage.md), [serving](serving/qwen36_agent/README.md)
 - **Qwen3-8B NVFP4** — [Qwen3-8B usage](docs/qwen3_8b_nvfp4.md), [OpenAI server example](examples/qwen3_openai_server.py)
@@ -1004,7 +1011,7 @@ artifacts and dispatch map are.
 
 | Hardware | SM | Status | Validated paths / notes |
 |---|---:|---|---|
-| Jetson AGX Thor | SM110 | Production target | Pi0, Pi0.5, GROOT N1.6, Pi0-FAST, Qwen3.6 Thor path, Lingbot, and Cosmos3-Edge AV denoise; CUTLASS FMHA / Thor attention paths; Pi0.5 FP8 and NVFP4 validation live in [examples/thor](examples/thor/README.md#thor-vla-performance). |
+| Jetson AGX Thor | SM110 | Production target | Pi0, Pi0.5, GROOT N1.6, Pi0-FAST, Qwen3.6 Thor path, Lingbot, and Cosmos3-Edge AV/Reasoner; CUTLASS FMHA / Thor attention paths; Pi0.5 FP8 and NVFP4 validation live in [examples/thor](examples/thor/README.md#thor-vla-performance). |
 | RTX 5090 | SM120 | Production target | Pi0/Pi0.5/GROOT/Pi0-FAST RTX paths, Qwen3.6, Qwen3-8B, Higgs Audio v3 FP8, Motus, Wan2.2, HF Kernel Hub package validation; see [RTX 5090 latency](examples/blackwell/README.md#vla-latency-rtx-5090). |
 | RTX 4090 | SM89 | Validated / supported target | RTX VLA build path and deployment recipe; Higgs BF16 path compiles/configures. See [deployment_rtx4090.md](docs/deployment_rtx4090.md). |
 | RTX 5060 Ti | SM120 | Community validated | Pi0.5 FP8 and LIBERO Spatial submission; see [Community benchmarks](#community-benchmarks). |

@@ -1,4 +1,4 @@
-# Cosmos3-Edge AV on Jetson AGX Thor
+# Cosmos3-Edge AV and Reasoner on Jetson AGX Thor
 
 FlashRT provides an optimized 30-step denoise engine for the Cosmos3-Edge AV
 inverse-dynamics policy on Jetson AGX Thor (`sm_110`). The integration keeps
@@ -41,8 +41,14 @@ and 1263 tokens for text, image, and video respectively.
 
 | decode tok/s | Text | Image | Video |
 |---|---|---|---|
-| FlashRT BF16 + CUDA graph | **68.3** | **71.6** | **70.1** |
+| FlashRT BF16 + CUDA graph | **68.2** | **71.6** | **70.0** |
 | FlashRT NVFP4 + CUDA graph | **104.3** | **112.6** | **108.7** |
+
+For both precision paths, a fresh engine's first public `generate()` result
+matched all five measured runs token for token across text, image, and video.
+The benchmark records the first call and exits nonzero on any later token
+divergence. CUDA canaries separately compare BF16/FP8-KV attention,
+BF16/FP8 RoPE plus KV writes, and W4A16 GEMV against torch references.
 
 ```bash
 git init nvidia-cosmos
@@ -54,12 +60,14 @@ git -C nvidia-cosmos checkout --detach FETCH_HEAD
 python benchmarks/cosmos3_reasoner_thor.py --modes text,image,video \
   --checkpoint "$COSMOS_EDGE_CHECKPOINT" \
   --quant bf16 --warmup-iters 1 --iters 5 \
+  --performance-only \
   --nvidia-assets-dir nvidia-cosmos/cookbooks/cosmos3/reasoner/assets \
   --json-out bf16.json
 
 python benchmarks/cosmos3_reasoner_thor.py --modes text,image,video \
   --checkpoint "$COSMOS_EDGE_CHECKPOINT" \
   --quant fp4 --warmup-iters 1 --iters 5 \
+  --performance-only \
   --nvidia-assets-dir nvidia-cosmos/cookbooks/cosmos3/reasoner/assets \
   --json-out nvfp4.json
 ```
@@ -73,6 +81,11 @@ Against the eager implementation, the first decode-step logits measured
 cosine 0.999937 and 1.12% relative L2 with the same argmax; later greedy tokens
 can diverge because the custom GEMV uses a different valid FP32 reduction order.
 The NVFP4 row instead uses NVFP4 weights, BF16 activations, and an FP8 KV cache.
+`--performance-only` is required because the public cookbook profile does not
+ship official output goldens. It still requires exact token equality between
+the first public `generate()` call and every measured call. Correctness runs
+omit that flag and pass `--golden-dir`; a missing golden or text mismatch then
+exits nonzero.
 
 The table was measured on a Jetson AGX Thor T5000 with driver 580.00, CUDA
 13.0 (nvcc 13.0.88), and PyTorch 2.9.0a0+50eac811a6.nv25.09. The checkpoint

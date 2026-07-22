@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import json
 import math
+import operator
 from pathlib import Path
+from typing import cast
 
 import torch
 import torch.nn.functional as F
@@ -37,6 +39,35 @@ IMAGE_TOKEN_ID = 19
 VIDEO_TOKEN_ID = 18
 VISION_START_ID = 20  # verified against tokenizer at load time
 ATTN_SPLITS = 24
+
+_REASONER_COMMON_SYMBOLS = (
+    "rms_norm",
+    "relu2_inplace_bf16",
+)
+_REASONER_BF16_SYMBOLS = (
+    "ht_gemv_bf16_m1_w4",
+    "cosmos3_reasoner_rope_kv_bf16",
+    "cosmos3_reasoner_decode_attn_bf16",
+)
+_REASONER_FP4_SYMBOLS = (
+    "cosmos3_reasoner_gemv_w4a16_bf16",
+    "cosmos3_reasoner_rope_kv_fp8_bf16",
+    "cosmos3_reasoner_decode_attn_fp8kv_bf16",
+)
+
+
+def _require_reasoner_kernels(fvk: object, quant: str) -> None:
+    required = _REASONER_COMMON_SYMBOLS + (
+        _REASONER_FP4_SYMBOLS if quant == "fp4" else _REASONER_BF16_SYMBOLS
+    )
+    missing = [name for name in required if not hasattr(fvk, name)]
+    if missing:
+        joined = ", ".join(missing)
+        raise RuntimeError(
+            "FlashRT was built without the required Cosmos3 Reasoner kernels "
+            f"for quant={quant}: {joined}. Rebuild with "
+            "-DGPU_ARCH=110 -DFLASHRT_ENABLE_COSMOS3_REASONER=ON."
+        )
 
 # Vision tower (SigLIP2).
 V_NL, V_HID, V_NH, V_HD, V_FF = 27, 1152, 16, 72, 4304
@@ -69,11 +100,29 @@ class CosmosReasonerThor:
     ):
         if quant not in ("bf16", "fp4"):
             raise ValueError(f"unsupported quant: {quant}")
+        if isinstance(max_seq, bool) or not isinstance(max_seq, int) or max_seq <= 0:
+            raise ValueError(f"max_seq must be a positive integer, got {max_seq!r}")
+        if (isinstance(max_new_tokens, bool) or not isinstance(max_new_tokens, int) or
+                not 1 <= max_new_tokens <= max_seq):
+            raise ValueError(
+                "max_new_tokens must be an integer in "
+                f"[1, max_seq={max_seq}], got {max_new_tokens!r}"
+            )
+        try:
+            import flash_rt.flash_rt_kernels as fvk
+        except (ImportError, OSError) as exc:
+            raise RuntimeError(
+                "Cosmos3 Reasoner kernels are unavailable. Rebuild with "
+                "-DGPU_ARCH=110 -DFLASHRT_ENABLE_COSMOS3_REASONER=ON."
+            ) from exc
+        _require_reasoner_kernels(fvk, quant)
+
         self.quant = quant
         self.use_graph = bool(use_graph)
+        self.fvk = fvk
         self.ckpt = Path(checkpoint)
-        self.max_seq = int(max_seq)
-        self.max_new = int(max_new_tokens)
+        self.max_seq = max_seq
+        self.max_new = max_new_tokens
         idx = json.loads((self.ckpt / "model.safetensors.index.json").read_text())
         self._wmap = idx["weight_map"]
         self._shards: dict[str, object] = {}
@@ -105,10 +154,6 @@ class CosmosReasonerThor:
         return ((rows + 127) // 128) * ((cols // 16 + 3) // 4) * 512
 
     def _init_fp4_decode(self) -> None:
-        import flash_rt.flash_rt_kernels as fvk
-
-        self.fvk = fvk
-
         levels = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], device=DEV)
 
         def qw(w: torch.Tensor):
@@ -184,12 +229,6 @@ class CosmosReasonerThor:
 
     # ---------------- BF16 W16A16 decode path ----------------
     def _init_bf16_decode(self) -> None:
-        import flash_rt.flash_rt_kernels as fvk
-
-        self.fvk = fvk
-        if not hasattr(fvk, "ht_gemv_bf16_m1_w4"):
-            raise RuntimeError("FlashRT was built without the BF16 decode GEMV")
-
         # A single wide QKV GEMV is more efficient than three short-M launches.
         self.W16_qkv = []
         for li in range(NL):
@@ -471,6 +510,104 @@ class CosmosReasonerThor:
         return F.linear(x, self.w["lm_head.weight"])  # [1, VOCAB]
 
     # ---------------- public API ----------------
+    def _validate_request(
+        self,
+        input_ids: torch.Tensor,
+        pixel_values: torch.Tensor | None,
+        grid_thw: torch.Tensor | None,
+        is_video: bool,
+        max_new_tokens: int | None,
+    ) -> tuple[int, int]:
+        if not isinstance(input_ids, torch.Tensor) or input_ids.ndim != 1:
+            shape = getattr(input_ids, "shape", None)
+            raise ValueError(f"input_ids must be a rank-1 tensor, got shape={shape}")
+        if input_ids.dtype != torch.long:
+            raise ValueError(f"input_ids must have dtype=torch.long, got {input_ids.dtype}")
+        S = int(input_ids.shape[0])
+        if S <= 0:
+            raise ValueError("input_ids must contain at least one prompt token")
+
+        if max_new_tokens is None:
+            max_new = self.max_new
+        else:
+            if isinstance(max_new_tokens, bool):
+                raise ValueError(
+                    f"max_new_tokens must be an integer in [1, {self.max_new}], got {max_new_tokens!r}"
+                )
+            try:
+                max_new = operator.index(max_new_tokens)
+            except TypeError as exc:
+                raise ValueError(
+                    f"max_new_tokens must be an integer in [1, {self.max_new}], got {max_new_tokens!r}"
+                ) from exc
+        if not 1 <= max_new <= self.max_new:
+            raise ValueError(
+                f"max_new_tokens must be in [1, {self.max_new}], got {max_new}"
+            )
+        if S + max_new > self.max_seq:
+            raise ValueError(
+                f"prompt_tokens + max_new_tokens exceeds max_seq: "
+                f"{S} + {max_new} > {self.max_seq}"
+            )
+
+        has_pixels = pixel_values is not None
+        has_grid = grid_thw is not None
+        if has_pixels != has_grid:
+            raise ValueError("pixel_values and grid_thw must be provided together")
+        vision_token = VIDEO_TOKEN_ID if is_video else IMAGE_TOKEN_ID
+        vision_tokens = int((input_ids == vision_token).sum().item())
+        if not has_pixels:
+            if vision_tokens:
+                raise ValueError(
+                    f"input_ids contains {vision_tokens} vision tokens but no visual input was provided"
+                )
+            return S, max_new
+
+        pixel_values = cast(torch.Tensor, pixel_values)
+        grid_thw = cast(torch.Tensor, grid_thw)
+        if not isinstance(pixel_values, torch.Tensor) or pixel_values.ndim != 2:
+            shape = getattr(pixel_values, "shape", None)
+            raise ValueError(f"pixel_values must be a rank-2 tensor, got shape={shape}")
+        if not isinstance(grid_thw, torch.Tensor) or grid_thw.ndim != 2 or grid_thw.shape[1] != 3:
+            shape = getattr(grid_thw, "shape", None)
+            raise ValueError(f"grid_thw must have shape [num_media, 3], got shape={shape}")
+        if grid_thw.shape[0] <= 0 or grid_thw.dtype not in (
+            torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8
+        ):
+            raise ValueError(
+                f"grid_thw must be a non-empty integer tensor, got shape={grid_thw.shape} "
+                f"dtype={grid_thw.dtype}"
+            )
+        grid_cpu = grid_thw.detach().to(device="cpu", dtype=torch.long)
+        if bool((grid_cpu <= 0).any()):
+            raise ValueError(f"grid_thw entries must be positive, got {grid_cpu.tolist()}")
+        if bool((grid_cpu[:, 1:] % MERGE != 0).any()):
+            raise ValueError(
+                f"grid_thw spatial dimensions must be divisible by merge={MERGE}, "
+                f"got {grid_cpu.tolist()}"
+            )
+        expected_patches = int(grid_cpu.prod(dim=1).sum().item())
+        if pixel_values.shape[0] != expected_patches:
+            raise ValueError(
+                "pixel_values rows do not match grid_thw: "
+                f"rows={pixel_values.shape[0]}, expected={expected_patches}, "
+                f"grid_thw={grid_cpu.tolist()}"
+            )
+        expected_width = int(self.w["model.visual.embeddings.patch_embedding.weight"].shape[1])
+        if pixel_values.shape[1] != expected_width:
+            raise ValueError(
+                f"pixel_values width must be {expected_width}, got {pixel_values.shape[1]}"
+            )
+        expected_tokens = int(
+            (grid_cpu[:, 0] * (grid_cpu[:, 1] // MERGE) * (grid_cpu[:, 2] // MERGE)).sum().item()
+        )
+        if vision_tokens != expected_tokens:
+            raise ValueError(
+                f"input_ids contains {vision_tokens} token_id={vision_token} entries, "
+                f"but grid_thw requires {expected_tokens} merged vision tokens"
+            )
+        return S, max_new
+
     @torch.inference_mode()
     def generate(
         self,
@@ -484,22 +621,30 @@ class CosmosReasonerThor:
     ) -> tuple[list[int], dict[str, float]]:
         import time
 
-        max_new = int(max_new_tokens or self.max_new)
+        S, max_new = self._validate_request(
+            input_ids, pixel_values, grid_thw, is_video, max_new_tokens
+        )
+        # Capture before prefill. Graph warmup writes decode scratch KV slots;
+        # the real prefill below then overwrites the complete valid prompt range.
+        self._ensure_graph()
         input_ids = input_ids.to(DEV)
-        S = int(input_ids.shape[0])
-        assert S + max_new <= self.max_seq
 
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         embeds = F.embedding(input_ids, self.w["embed_tokens.weight"])
         if pixel_values is not None:
-            feats = self.encode_vision(pixel_values, grid_thw)
+            vision_grid = cast(torch.Tensor, grid_thw)
+            feats = self.encode_vision(pixel_values, vision_grid)
             token = VIDEO_TOKEN_ID if is_video else IMAGE_TOKEN_ID
             mask = input_ids == token
-            assert int(mask.sum()) == feats.shape[0], (int(mask.sum()), feats.shape)
+            if int(mask.sum()) != feats.shape[0]:
+                raise ValueError(
+                    f"encoded vision rows changed unexpectedly: tokens={int(mask.sum())}, "
+                    f"features={feats.shape[0]}"
+                )
             embeds = embeds.clone()
             embeds[mask] = feats
-            pos, nxt = self._rope_index(input_ids.cpu(), grid_thw.cpu(), is_video)
+            pos, nxt = self._rope_index(input_ids.cpu(), vision_grid.cpu(), is_video)
         else:
             pos = torch.arange(S, device=DEV).view(1, S).expand(3, S)
             nxt = S
@@ -516,7 +661,6 @@ class CosmosReasonerThor:
             self.k8_cache[:, :S].copy_(self.k_cache[:, :S].to(torch.float8_e4m3fn).view(torch.uint8))
             self.v8_cache[:, :S].copy_(self.v_cache[:, :S].to(torch.float8_e4m3fn).view(torch.uint8))
         if self.quant in ("fp4", "bf16"):
-            self._ensure_graph()
             self.d_tok.fill_(out[0])
             self.d_pos.fill_(nxt)
             self.d_slot.fill_(self.seq_len)

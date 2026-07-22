@@ -28,6 +28,28 @@ def build_processor(checkpoint: str):
     return build_processor_lazy(tokenizer_type=checkpoint)
 
 
+def decode_reasoner_video(path: str, target_fps: float | None) -> dict:
+    """Decode and uniformly sample the frame list consumed by the processor."""
+    import torchvision.io
+    from PIL import Image
+    from qwen_vl_utils.vision_process import smart_nframes
+
+    frames, _, info = torchvision.io.read_video(path, pts_unit="sec")
+    total = int(frames.shape[0])
+    if total <= 0:
+        raise ValueError(f"decoded zero frames from reasoner video: {path}")
+    source_fps = float(info.get("video_fps") or 0.0) or 1.0
+    requested_fps = 2.0 if target_fps is None else target_fps
+    count = smart_nframes(
+        {"fps": requested_fps}, total_frames=total, video_fps=source_fps
+    )
+    indices = torch.linspace(0, total - 1, count).round().long().tolist()
+    return {
+        "frames": [Image.fromarray(frames[index].numpy()) for index in indices],
+        "fps": count / total * source_fps,
+    }
+
+
 NVIDIA_PUBLIC_PROFILE = {
     "text": {
         "prompt": "Describe a modern robotics research laboratory in one sentence.",
@@ -66,6 +88,11 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--checkpoint", required=True)
     ap.add_argument("--golden-dir", default=None)
+    ap.add_argument(
+        "--performance-only",
+        action="store_true",
+        help="Allow a throughput-only run without official golden outputs",
+    )
     ap.add_argument("--inputs-dir", default=None)
     ap.add_argument(
         "--nvidia-assets-dir",
@@ -82,10 +109,17 @@ def main() -> None:
     args = ap.parse_args()
     if args.nvidia_assets_dir is None and args.inputs_dir is None:
         ap.error("one of --nvidia-assets-dir or --inputs-dir is required")
+    if args.golden_dir is None and not args.performance_only:
+        ap.error("--golden-dir is required unless --performance-only is explicit")
+    if args.golden_dir is not None and args.performance_only:
+        ap.error("--golden-dir and --performance-only are mutually exclusive")
+    if args.warmup_iters < 1:
+        ap.error("--warmup-iters must be at least 1 so the first public call is verified")
+    if args.iters < 1:
+        ap.error("--iters must be at least 1")
 
     from PIL import Image
 
-    from cosmos_framework.inference.inference import _decode_reasoner_video
     from flash_rt.models.cosmos3_reasoner.pipeline_thor import CosmosReasonerThor
 
     processor = build_processor(args.checkpoint)
@@ -113,7 +147,7 @@ def main() -> None:
         if mode == "image":
             media_item = {"type": "image", "image": Image.open(sample["vision_path"]).convert("RGB")}
         elif mode == "video":
-            v = _decode_reasoner_video(sample["vision_path"], sample.get("video_fps"))
+            v = decode_reasoner_video(sample["vision_path"], sample.get("video_fps"))
             media_item = {"type": "video", "video": v["frames"], "fps": v["fps"]}
 
         if media_item is None:
@@ -133,15 +167,26 @@ def main() -> None:
         elif mode == "video":
             kwargs = {"pixel_values": pin["pixel_values_videos"], "grid_thw": pin["video_grid_thw"], "is_video": True}
 
-        for _ in range(args.warmup_iters):
-            engine.generate(
+        # The first public call is a correctness sample, not a discarded setup
+        # call. Every later call must return the exact same greedy token IDs.
+        first_out, first_stats = engine.generate(
+            input_ids,
+            max_new_tokens=args.max_new_tokens,
+            ignore_eos=bool(profile),
+            **kwargs,
+        )
+        for _ in range(args.warmup_iters - 1):
+            warm_out, _ = engine.generate(
                 input_ids,
                 max_new_tokens=args.max_new_tokens,
                 ignore_eos=bool(profile),
                 **kwargs,
             )
+            if warm_out != first_out:
+                raise RuntimeError(f"{mode}: first-call token parity failed during warmup")
 
         samples = []
+        measured_outputs = []
         out = None
         for _ in range(args.iters):
             out, stats = engine.generate(
@@ -151,18 +196,23 @@ def main() -> None:
                 **kwargs,
             )
             samples.append(stats)
+            measured_outputs.append(out)
         stats = dict(samples[-1])
         stats["decode_s_p50"] = statistics.median(s["decode_s"] for s in samples)
         stats["decode_tok_s_p50"] = statistics.median(s["decode_tok_s"] for s in samples)
         stats["prefill_s_p50"] = statistics.median(s["prefill_s"] for s in samples)
         stats["prepared_prompt_tokens"] = prepared_prompt_tokens
+        stats["first_call_stats"] = first_stats
+        stats["first_call_token_match"] = all(tokens == first_out for tokens in measured_outputs)
         stats["raw_samples"] = samples
         text = tok.decode([t for t in out if t != engine.eos_token_id], skip_special_tokens=True)
 
         golden = None
-        if args.golden_dir is not None and not profile:
+        if args.golden_dir is not None:
             golden_path = Path(args.golden_dir) / f"reasoner_{mode}_0" / "reasoner_text.txt"
             golden = golden_path.read_text() if golden_path.exists() else None
+        if not args.performance_only and golden is None:
+            raise FileNotFoundError(f"{mode}: required official golden is missing")
         match = None
         first_diff = None
         if golden is not None:
@@ -180,13 +230,17 @@ def main() -> None:
             "first_char_diff": first_diff,
             "text": text,
             "token_ids": out,
+            "first_call_token_ids": first_out,
         }
         print(f"[{mode}] prompt={stats['prompt_tokens']} prefill_p50={stats['prefill_s_p50']:.3f}s "
               f"decode_p50={stats['decode_tok_s_p50']:.1f} tok/s new={stats['new_tokens']} "
+              f"first_call_match={stats['first_call_token_match']} "
               f"golden_match={match} first_diff={first_diff}")
 
     if args.json_out:
         Path(args.json_out).write_text(json.dumps(results, indent=2))
+    if any(not r["first_call_token_match"] for r in results.values()):
+        sys.exit(1)
     if any(r.get("golden_match") is False for r in results.values()):
         sys.exit(1)
 
