@@ -5,6 +5,54 @@ inverse-dynamics policy on Jetson AGX Thor (`sm_110`). The integration keeps
 the official Cosmos preprocessing and action contract while replacing the
 denoise boundary with a static, quantized FlashRT graph.
 
+## Reasoner (VLM chat) engine — `flash_rt/models/cosmos3_reasoner/`
+
+`CosmosReasonerThor` runs the checkpoint's understanding view (und text tower
+28L/2048/GQA 16:8/relu^2 MLP + SigLIP2 vision + PatchMerger + lm_head) for
+batch-1 greedy chat over text, image, and video inputs. Two paths share the
+weights:
+
+- vision + prefill: exact torch replica of the official
+  `nemotron_3_dense_vl` modules (parity-first; one pass per prompt).
+- decode (`quant="fp4"`): every weight in W4A16 (e2m1 codes packed 2/byte +
+  per-16 bf16 scales), a model-local SIMT dequant GEMV
+  (`cosmos3_reasoner_gemv_w4a16_bf16`), a split-KV single-query GQA
+  flash-decode attention with a device-side length
+  (`cosmos3_reasoner_decode_attn_bf16` — no fixed-window mask, CUDA-graph
+  safe on growing sequences), and the whole token step captured in one CUDA
+  graph.
+
+Parity: with `quant="bf16"` the engine reproduces the official
+`model_mode=reasoner` output **token-for-token on the video prompt
+(4815-token prefill, 128 generated)**; text/image diverge only at greedy
+near-ties with coherent continuations. The fp4 decode stays coherent on all
+three modalities.
+
+Thor T5000 decode throughput (batch 1, greedy, 128 new tokens, pure decode
+loop; the vLLM reference is the streaming chat API):
+
+| decode tok/s | Text | Image | Video |
+|---|---|---|---|
+| FlashRT NVFP4 + CUDA graph | **89.0** | **81.5** | **62.1** |
+| vLLM (chat API) | 68.2 | 67.2 | 67.1 |
+| HF Transformers eager (model card) | 37.3 | 42.6 | 41.8 |
+| Cosmos Framework eager | 30.0 | 33.3 | 20.7 |
+| FlashRT bf16 torch loop | 34.7 | 28.3 | 13.1 |
+
+```bash
+python benchmarks/cosmos3_reasoner_thor.py --modes text,image,video \
+  --quant fp4 --iters 3 --json-out out.json   # needs cosmos-framework on PYTHONPATH
+```
+
+Remaining levers: the W4A16 GEMV runs at ~100 GB/s effective (deeper tuning or
+an XQA rebuild at head_dim 128/group 2 lifts the video row past the vLLM
+number), and prefill is still the torch path.
+
+`config="cosmos3_edge"` is the Thor baseline runner for NVIDIA's official
+Cosmos Framework inference path. It is intentionally upstream-first: run this
+baseline, capture latency/outputs, then port the FlashRT optimized denoise/action
+path behind the same config.
+
 This page covers the supported path, measured performance, usage, and
 correctness requirements. The latency table measures denoise only. It does not
 include tokenization, video preprocessing, VAE encode, or response handling.

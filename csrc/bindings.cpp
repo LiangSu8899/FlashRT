@@ -164,6 +164,8 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #include "kernels/delayed_codebook_kernels.cuh"
 #endif
 #include "kernels/cosmos3_edge_misc.cuh"
+#include "kernels/cosmos3_reasoner_attn.cuh"
+#include "kernels/cosmos3_reasoner_gemv.cuh"
 #ifdef FLASHRT_HAVE_QWEN36_KERNELS
 #include "kernels/qwen36_misc.cuh"
 #endif
@@ -4644,6 +4646,38 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         },
         py::arg("src"), py::arg("dst"), py::arg("row_indices"),
         py::arg("rows"), py::arg("hidden"), py::arg("stream") = 0);
+
+    m.def("cosmos3_reasoner_decode_attn_bf16",
+        [](uintptr_t q, uintptr_t k_cache, uintptr_t v_cache, uintptr_t len_ptr,
+           uintptr_t out, uintptr_t part_acc, uintptr_t part_ml,
+           int num_heads, int num_kv_heads, float scale, uintptr_t stream) {
+            flash_rt::kernels::cosmos3_reasoner_decode_attn_bf16(
+                reinterpret_cast<const __nv_bfloat16*>(q),
+                reinterpret_cast<const __nv_bfloat16*>(k_cache),
+                reinterpret_cast<const __nv_bfloat16*>(v_cache),
+                reinterpret_cast<const int*>(len_ptr),
+                reinterpret_cast<__nv_bfloat16*>(out),
+                reinterpret_cast<float*>(part_acc),
+                reinterpret_cast<float*>(part_ml),
+                num_heads, num_kv_heads, scale, to_stream(stream));
+        },
+        py::arg("q"), py::arg("k_cache"), py::arg("v_cache"), py::arg("len_ptr"),
+        py::arg("out"), py::arg("part_acc"), py::arg("part_ml"),
+        py::arg("num_heads"), py::arg("num_kv_heads"),
+        py::arg("scale"), py::arg("stream") = 0);
+
+    m.def("cosmos3_reasoner_gemv_w4a16_bf16",
+        [](uintptr_t w_packed, uintptr_t w_scales, uintptr_t a, uintptr_t out,
+           int n_rows, int k, uintptr_t stream) {
+            flash_rt::kernels::cosmos3_reasoner_gemv_w4a16_bf16(
+                reinterpret_cast<const uint8_t*>(w_packed),
+                reinterpret_cast<const __nv_bfloat16*>(w_scales),
+                reinterpret_cast<const __nv_bfloat16*>(a),
+                reinterpret_cast<__nv_bfloat16*>(out),
+                n_rows, k, to_stream(stream));
+        },
+        py::arg("w_packed"), py::arg("w_scales"), py::arg("a"), py::arg("out"),
+        py::arg("n_rows"), py::arg("k"), py::arg("stream") = 0);
 
     m.def("cosmos3_edge_qk_norm_rope_strided_bf16",
         [](uintptr_t q_in, uintptr_t k_in, uintptr_t q_weight, uintptr_t k_weight,

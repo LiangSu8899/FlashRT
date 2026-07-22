@@ -1290,6 +1290,8 @@ pybind11_add_module(flash_rt_kernels
   csrc/kernels/attention_mha_causal.cu
   csrc/kernels/rope_qwen3.cu
   csrc/kernels/cosmos3_edge_misc.cu
+  csrc/kernels/cosmos3_reasoner_attn.cu
+  csrc/kernels/cosmos3_reasoner_gemv.cu
   csrc/kernels/decoder_fused.cu
   csrc/kernels/dit_bf16.cu
   csrc/kernels/attention_dit_bf16.cu
