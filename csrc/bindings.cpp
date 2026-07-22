@@ -4647,6 +4647,69 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("src"), py::arg("dst"), py::arg("row_indices"),
         py::arg("rows"), py::arg("hidden"), py::arg("stream") = 0);
 
+    m.def("cosmos3_reasoner_decode_attn_fp8kv_bf16",
+        [](uintptr_t q, uintptr_t k_cache, uintptr_t v_cache, uintptr_t len_ptr,
+           uintptr_t out, uintptr_t part_acc, uintptr_t part_ml,
+           int num_heads, int num_kv_heads, float scale, uintptr_t stream) {
+            flash_rt::kernels::cosmos3_reasoner_decode_attn_fp8kv_bf16(
+                reinterpret_cast<const __nv_bfloat16*>(q),
+                reinterpret_cast<const __nv_fp8_e4m3*>(k_cache),
+                reinterpret_cast<const __nv_fp8_e4m3*>(v_cache),
+                reinterpret_cast<const int*>(len_ptr),
+                reinterpret_cast<__nv_bfloat16*>(out),
+                reinterpret_cast<float*>(part_acc),
+                reinterpret_cast<float*>(part_ml),
+                num_heads, num_kv_heads, scale, to_stream(stream));
+        },
+        py::arg("q"), py::arg("k_cache"), py::arg("v_cache"), py::arg("len_ptr"),
+        py::arg("out"), py::arg("part_acc"), py::arg("part_ml"),
+        py::arg("num_heads"), py::arg("num_kv_heads"),
+        py::arg("scale"), py::arg("stream") = 0);
+
+    m.def("cosmos3_reasoner_rope_kv_fp8_bf16",
+        [](uintptr_t q_in, uintptr_t k_in, uintptr_t v_in, uintptr_t cos_t, uintptr_t sin_t,
+           uintptr_t pos_ptr, uintptr_t slot_ptr, uintptr_t q_out,
+           uintptr_t k_cache, uintptr_t v_cache, int num_heads, int num_kv_heads, uintptr_t stream) {
+            flash_rt::kernels::cosmos3_reasoner_rope_kv_fp8_bf16(
+                reinterpret_cast<const __nv_bfloat16*>(q_in),
+                reinterpret_cast<const __nv_bfloat16*>(k_in),
+                reinterpret_cast<const __nv_bfloat16*>(v_in),
+                reinterpret_cast<const __nv_bfloat16*>(cos_t),
+                reinterpret_cast<const __nv_bfloat16*>(sin_t),
+                reinterpret_cast<const long long*>(pos_ptr),
+                reinterpret_cast<const long long*>(slot_ptr),
+                reinterpret_cast<__nv_bfloat16*>(q_out),
+                reinterpret_cast<__nv_fp8_e4m3*>(k_cache),
+                reinterpret_cast<__nv_fp8_e4m3*>(v_cache),
+                num_heads, num_kv_heads, to_stream(stream));
+        },
+        py::arg("q_in"), py::arg("k_in"), py::arg("v_in"), py::arg("cos_t"), py::arg("sin_t"),
+        py::arg("pos_ptr"), py::arg("slot_ptr"), py::arg("q_out"),
+        py::arg("k_cache"), py::arg("v_cache"),
+        py::arg("num_heads"), py::arg("num_kv_heads"), py::arg("stream") = 0);
+
+    m.def("cosmos3_reasoner_rope_kv_bf16",
+        [](uintptr_t q_in, uintptr_t k_in, uintptr_t v_in, uintptr_t cos_t, uintptr_t sin_t,
+           uintptr_t pos_ptr, uintptr_t slot_ptr, uintptr_t q_out,
+           uintptr_t k_cache, uintptr_t v_cache, int num_heads, int num_kv_heads, uintptr_t stream) {
+            flash_rt::kernels::cosmos3_reasoner_rope_kv_bf16(
+                reinterpret_cast<const __nv_bfloat16*>(q_in),
+                reinterpret_cast<const __nv_bfloat16*>(k_in),
+                reinterpret_cast<const __nv_bfloat16*>(v_in),
+                reinterpret_cast<const __nv_bfloat16*>(cos_t),
+                reinterpret_cast<const __nv_bfloat16*>(sin_t),
+                reinterpret_cast<const long long*>(pos_ptr),
+                reinterpret_cast<const long long*>(slot_ptr),
+                reinterpret_cast<__nv_bfloat16*>(q_out),
+                reinterpret_cast<__nv_bfloat16*>(k_cache),
+                reinterpret_cast<__nv_bfloat16*>(v_cache),
+                num_heads, num_kv_heads, to_stream(stream));
+        },
+        py::arg("q_in"), py::arg("k_in"), py::arg("v_in"), py::arg("cos_t"), py::arg("sin_t"),
+        py::arg("pos_ptr"), py::arg("slot_ptr"), py::arg("q_out"),
+        py::arg("k_cache"), py::arg("v_cache"),
+        py::arg("num_heads"), py::arg("num_kv_heads"), py::arg("stream") = 0);
+
     m.def("cosmos3_reasoner_decode_attn_bf16",
         [](uintptr_t q, uintptr_t k_cache, uintptr_t v_cache, uintptr_t len_ptr,
            uintptr_t out, uintptr_t part_acc, uintptr_t part_ml,

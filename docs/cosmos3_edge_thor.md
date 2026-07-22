@@ -15,25 +15,29 @@ weights:
 - vision + prefill: exact torch replica of the official
   `nemotron_3_dense_vl` modules (parity-first; one pass per prompt).
 - decode (`quant="fp4"`): every weight in W4A16 (e2m1 codes packed 2/byte +
-  per-16 bf16 scales), a model-local SIMT dequant GEMV
-  (`cosmos3_reasoner_gemv_w4a16_bf16`), a split-KV single-query GQA
-  flash-decode attention with a device-side length
-  (`cosmos3_reasoner_decode_attn_bf16` — no fixed-window mask, CUDA-graph
-  safe on growing sequences), and the whole token step captured in one CUDA
-  graph.
+  per-16 bf16 scales) with q/k/v rows merged into one wide GEMV per layer, a
+  model-local SIMT dequant GEMV (`cosmos3_reasoner_gemv_w4a16_bf16`), a fused
+  RoPE + e4m3 KV-cache append (`cosmos3_reasoner_rope_kv_fp8_bf16`,
+  device-side position/slot scalars), a split-KV single-query GQA flash-decode
+  attention over the FP8 KV cache with a device-side length
+  (`cosmos3_reasoner_decode_attn_fp8kv_bf16` — no fixed-window mask,
+  CUDA-graph safe on growing sequences), and in-graph greedy sampling with
+  device-side loop-state advance, so the host decode loop is nothing but
+  `graph.replay()` calls on one captured token step.
 
 Parity: with `quant="bf16"` the engine reproduces the official
 `model_mode=reasoner` output **token-for-token on the video prompt
 (4815-token prefill, 128 generated)**; text/image diverge only at greedy
 near-ties with coherent continuations. The fp4 decode stays coherent on all
-three modalities.
+three modalities and its divergence points are unchanged across the decode
+optimizations.
 
 Thor T5000 decode throughput (batch 1, greedy, 128 new tokens, pure decode
 loop; the vLLM reference is the streaming chat API):
 
 | decode tok/s | Text | Image | Video |
 |---|---|---|---|
-| FlashRT NVFP4 + CUDA graph | **89.0** | **81.5** | **62.1** |
+| FlashRT NVFP4 + CUDA graph | **100.4** | **91.6** | **67.3** |
 | vLLM (chat API) | 68.2 | 67.2 | 67.1 |
 | HF Transformers eager (model card) | 37.3 | 42.6 | 41.8 |
 | Cosmos Framework eager | 30.0 | 33.3 | 20.7 |
@@ -44,9 +48,9 @@ python benchmarks/cosmos3_reasoner_thor.py --modes text,image,video \
   --quant fp4 --iters 3 --json-out out.json   # needs cosmos-framework on PYTHONPATH
 ```
 
-Remaining levers: the W4A16 GEMV runs at ~100 GB/s effective (deeper tuning or
-an XQA rebuild at head_dim 128/group 2 lifts the video row past the vLLM
-number), and prefill is still the torch path.
+Remaining levers: the W4A16 GEMV runs at ~100-115 GB/s effective (an XQA
+rebuild at head_dim 128/group 2 or a tensor-core dequant path lifts the video
+row further), and prefill is still the torch path.
 
 `config="cosmos3_edge"` is the Thor baseline runner for NVIDIA's official
 Cosmos Framework inference path. It is intentionally upstream-first: run this
