@@ -312,6 +312,7 @@ def main() -> None:
         "backend": "flashrt",
         "engine": args.engine,
         "bf16_projs": args.bf16_projs,
+        "ffn_fp4": args.ffn_fp4,
         "quant_graph": bool(args.engine != "bf16-eager" and not args.no_quant_graph),
         "teacache_steps": list(teacache_steps) if teacache_steps is not None else None,
         "teacache_computes": len(teacache_steps) if teacache_steps is not None else 30,

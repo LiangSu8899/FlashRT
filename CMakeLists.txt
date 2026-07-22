@@ -1650,6 +1650,7 @@ if(ENABLE_SM100_CUTLASS)
     csrc/fused_fp4/silu_mul_mul_fp4_sfa_v2.cu
     csrc/fused_fp4/silu_mul_two_fp4_to_fp4.cu
     csrc/gemm/fp4/cutlass_fp4_gemm_fp4out.cu
+    csrc/gemm/fp4/cosmos3_edge_fp4_gemm_relu2_fp4out.cu
   )
   set_target_properties(fp4_kernels_obj PROPERTIES
     CUDA_STANDARD 17

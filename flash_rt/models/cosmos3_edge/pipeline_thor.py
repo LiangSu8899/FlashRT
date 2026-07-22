@@ -137,7 +137,7 @@ class CosmosEdgeThor:
                     packed = torch.empty(n_out, k_in // 2, dtype=torch.uint8, device=DEV)
                     sfb = torch.empty(
                         self.fp4.sfa_size_bytes(n_out, k_in, True), dtype=torch.uint8, device=DEV)
-                    rc = self.fp4.quantize_fp4_dynamic_sfa_fp16(
+                    rc = self.fp4.quantize_fp4_dynamic_sfa_mse_fp16(
                         w16.data_ptr(), packed.data_ptr(), sfb.data_ptr(), n_out, k_in, True, 0)
                     if rc != 0:
                         raise RuntimeError(f"fp4 weight quant failed rc={rc} layer {li} {nm}")
@@ -212,7 +212,15 @@ class CosmosEdgeThor:
                 probe_out.data_ptr(), 2, FF, HID, 1.0, 0.0, 0)
             if rc != 0:
                 self.fp4_variant = -1
-            del probe, probe_sfa, probe_out
+            probe_relu = torch.empty(2, FF // 2, dtype=torch.uint8, device=DEV)
+            probe_relu_sfa = torch.empty(
+                self.fp4.sfa_size_bytes(2, FF, False), dtype=torch.uint8, device=DEV)
+            rc = self.fp4.cosmos3_edge_fp4_gemm_relu2_fp4out(
+                probe.data_ptr(), probe_sfa.data_ptr(),
+                self.Wf4[(0, "up")][0].data_ptr(), self.Wf4[(0, "up")][1].data_ptr(),
+                probe_relu.data_ptr(), probe_relu_sfa.data_ptr(), 2, FF, HID, 0)
+            self.fp4_relu2_epilogue = rc == 0
+            del probe, probe_sfa, probe_out, probe_relu, probe_relu_sfa
         self.a8h = self.a8f = self.asc = None
         # Per-(layer, site) static activation scales for the fused quant chain.
         # Sites: 0 = qkv input, 1 = attention output, 2 = FFN input, 3 = down input.
@@ -290,9 +298,18 @@ class CosmosEdgeThor:
         self.fp4.cosmos3_edge_res_rms_fp4_sfa_bf16(
             self.Hb.data_ptr(), x_bf16.data_ptr(), self.Wn[(li, "post_ln")].data_ptr(),
             self.a4h.data_ptr(), self.sfa_h.data_ptr(), NG, HID, EPS, s)
-        self._fp4_gemm(self.a4h, self.sfa_h, li, "up", self.up16, NG, FF, HID, s)
-        self.fp4.cosmos3_edge_relu2_fp4_sfa_fp16(
-            self.up16.data_ptr(), self.a4f.data_ptr(), self.sfa_f.data_ptr(), NG, FF, s)
+        if self.fp4_relu2_epilogue:
+            w_packed, w_sfb = self.Wf4[(li, "up")]
+            rc = self.fp4.cosmos3_edge_fp4_gemm_relu2_fp4out(
+                self.a4h.data_ptr(), self.sfa_h.data_ptr(),
+                w_packed.data_ptr(), w_sfb.data_ptr(),
+                self.a4f.data_ptr(), self.sfa_f.data_ptr(), NG, FF, HID, s)
+            if rc != 0:
+                raise RuntimeError(f"fused FP4 up+relu2 failed rc={rc} layer {li}")
+        else:
+            self._fp4_gemm(self.a4h, self.sfa_h, li, "up", self.up16, NG, FF, HID, s)
+            self.fp4.cosmos3_edge_relu2_fp4_sfa_fp16(
+                self.up16.data_ptr(), self.a4f.data_ptr(), self.sfa_f.data_ptr(), NG, FF, s)
         self._fp4_gemm(self.a4f, self.sfa_f, li, "down", self.dn16, NG, HID, FF, s)
         self.dn.copy_(self.dn16)
 
@@ -381,9 +398,18 @@ class CosmosEdgeThor:
                         self.action_hidden.data_ptr(), self.ob.data_ptr(),
                         self.Wn[(li, "post_ln")].data_ptr(),
                         self.a4h.data_ptr(), self.sfa_h.data_ptr(), NA, HID, EPS, s)
-                    self._fp4_gemm(self.a4h, self.sfa_h, li, "up", self.up16, NA, FF, HID, s)
-                    self.fp4.cosmos3_edge_relu2_fp4_sfa_fp16(
-                        self.up16.data_ptr(), self.a4f.data_ptr(), self.sfa_f.data_ptr(), NA, FF, s)
+                    if self.fp4_relu2_epilogue:
+                        w_packed, w_sfb = self.Wf4[(li, "up")]
+                        rc = self.fp4.cosmos3_edge_fp4_gemm_relu2_fp4out(
+                            self.a4h.data_ptr(), self.sfa_h.data_ptr(),
+                            w_packed.data_ptr(), w_sfb.data_ptr(),
+                            self.a4f.data_ptr(), self.sfa_f.data_ptr(), NA, FF, HID, s)
+                        if rc != 0:
+                            raise RuntimeError(f"fused FP4 up+relu2 failed rc={rc} layer {li}")
+                    else:
+                        self._fp4_gemm(self.a4h, self.sfa_h, li, "up", self.up16, NA, FF, HID, s)
+                        self.fp4.cosmos3_edge_relu2_fp4_sfa_fp16(
+                            self.up16.data_ptr(), self.a4f.data_ptr(), self.sfa_f.data_ptr(), NA, FF, s)
                     self._fp4_gemm(self.a4f, self.sfa_f, li, "down", self.dn16, NA, HID, FF, s)
                     self.dn[:NA].copy_(self.dn16[:NA])
                 else:

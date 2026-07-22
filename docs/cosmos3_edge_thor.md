@@ -95,15 +95,15 @@ checked with a second seed.
 |---|---:|---:|---:|---:|---:|
 | Official Cosmos3-Edge (eager) | 33.14 s | 1.00x | reference | reference | not recorded |
 | FlashRT FP8, no step cache | 5.792 s | **5.72x** | 0.999983 | 0.59% | 7.85 |
-| FlashRT FP8 + NVFP4 FFN, no step cache | 5.456 s | **6.07x** | 0.999707 | 2.42% | 7.54 |
+| FlashRT FP8 + NVFP4 FFN, no step cache | 5.020 s | **6.60x** | 0.999771 | 2.15% | 7.54 |
 | FlashRT FP8 + TeaCache, 15 computes | 2.877 s | **11.52x** | 0.999985 | 0.56% | 7.85 |
 | FlashRT FP8 + TeaCache, 6 computes | 1.153 s | **28.74x** | 0.999984 | 0.57% | 7.85 |
 | FlashRT FP8 + TeaCache, 3 computes | 0.576 s | **57.56x** | 0.999986 | 0.54% | 7.85 |
 | FlashRT FP8 + TeaCache, 2 computes | 0.384 s | **86.36x** | 0.999983 | 0.59% | 7.85 |
-| FlashRT FP8 + NVFP4 FFN + TeaCache, 2 computes | **0.362 s** | **91.57x** | 0.999727 | 2.34% | 7.54 |
+| FlashRT FP8 + NVFP4 FFN + TeaCache, 2 computes | **0.325 s** | **102.06x** | 0.999720 | 2.38% | 7.54 |
 
 The production optimization claim is the no-cache result: **5.72x with FP8**
-or **6.07x with FP8 plus NVFP4 FFN**. Those rows execute all 30 velocity
+or **6.60x with FP8 plus NVFP4 FFN**. Those rows execute all 30 velocity
 evaluations and isolate the benefit of the FlashRT engine from step caching.
 
 TeaCache is an optional approximation and its usable schedule is workload
@@ -163,6 +163,16 @@ export COSMOS_EDGE_OUTPUT=/path/to/output
 ```
 
 Build the extensions for Thor using the normal repository build flow:
+
+FP8 is the recommended default (large precision margin); `--ffn-fp4` trades
+about 13% latency for a still-passing but thinner gate margin. Measured negatives,
+kept default-off or not landed: a fused QKV wide GEMM (cuBLASLt N=4096 tactic
+regression, behind `qkv_fused=`) and SageAttention2 int8 gen attention (the
+SM80-era int8 mma core is both numerically wrong and slower than FA4 on
+SM110). Extending W4A4 to the final O projections also passed the accuracy gate
+but did not improve latency because activation quantization and output casting
+offset the smaller GEMM. The largest remaining denoise lever is a Thor-native
+int8/fp8 attention kernel.
 
 ```bash
 cmake -B build -S . -DGPU_ARCH=110
