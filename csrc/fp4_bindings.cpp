@@ -16,6 +16,7 @@
 
 #include "gemm/fp4/cutlass_fp4_gemm.cuh"
 #include "gemm/fp4/cutlass_fp4_gemm_fp4out.cuh"
+#include "gemm/fp4/cosmos3_edge_fp4_gemm_relu2_fp4out.cuh"
 #include "quantize/quantize_fp4_dynamic.cuh"
 #include "quantize/quantize_fp4_sfa.cuh"
 #include "quantize/reshape_scales_sfa.cuh"
@@ -94,6 +95,18 @@ tile-interleave conversion is required.
         py::arg("packed"), py::arg("scales"), py::arg("dst"),
         py::arg("N"), py::arg("D"), py::arg("stream") = 0,
         "Inverse of quantize_fp4_dynamic_fp16. Used for unit tests.");
+
+  m.def("quantize_fp4_dynamic_sfa_mse_fp16",
+        [](uintptr_t src, uintptr_t packed, uintptr_t sfa,
+           int N, int D, bool is_sfb, uintptr_t stream) -> int {
+          return flash_rt::fp4::quantize_fp4_dynamic_sfa_mse_fp16(
+              reinterpret_cast<void const*>(src),
+              reinterpret_cast<void*>(packed), reinterpret_cast<void*>(sfa),
+              N, D, is_sfb, reinterpret_cast<cudaStream_t>(stream));
+        },
+        py::arg("src"), py::arg("packed"), py::arg("sfa"),
+        py::arg("N"), py::arg("D"), py::arg("is_sfb"), py::arg("stream") = 0,
+        "FP16 to NVFP4 SFA/SFB quantization with per-block MSE scale search.");
 
   m.def("quantize_fp4_dynamic_sfa_fp16",
         [](uintptr_t src, uintptr_t packed, uintptr_t sfa,
@@ -369,6 +382,27 @@ reshape_linear_scales_to_sfa, in a single kernel launch.
 P1 NVFP4 GEMM:  D[M,N/2] (fp4) + D_SFD = LinCombBlockScaleFactor(A @ B^T).
 Drop-in for cutlass_fp4_sq_fp16 when downstream consumes FP4 + SFA directly.
 )pbdoc");
+
+  m.def("cosmos3_edge_fp4_gemm_relu2_fp4out",
+        [](uintptr_t A_packed, uintptr_t SFA,
+           uintptr_t B_packed, uintptr_t SFB,
+           uintptr_t D_packed, uintptr_t D_SFD,
+           int M, int N, int K, uintptr_t stream) -> int {
+          return flash_rt::fp4::cosmos3_edge_fp4_gemm_relu2_fp4out(
+              reinterpret_cast<void const*>(A_packed),
+              reinterpret_cast<void const*>(SFA),
+              reinterpret_cast<void const*>(B_packed),
+              reinterpret_cast<void const*>(SFB),
+              reinterpret_cast<void*>(D_packed),
+              reinterpret_cast<void*>(D_SFD), M, N, K,
+              reinterpret_cast<cudaStream_t>(stream));
+        },
+        py::arg("A_packed"), py::arg("SFA"),
+        py::arg("B_packed"), py::arg("SFB"),
+        py::arg("D_packed"), py::arg("D_SFD"),
+        py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("stream") = 0,
+        "Cosmos3-Edge fused NVFP4 up GEMM + ReLU squared + FP4 quantization.");
 
   // ── P1 + AWQ: geglu_two_mul_fp4_to_fp4 — GEGLU combiner with Down inv_s mul ──
   m.def("geglu_two_mul_fp4_to_fp4",

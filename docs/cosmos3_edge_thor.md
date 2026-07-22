@@ -123,8 +123,10 @@ selected by the caller.
   1.25), fused `residual_add_rms_norm_fp8` / `quantize_fp8_static` /
   `cosmos3_edge_relu2_to_fp8_static_bf16` quant chain.
 - `ffn_fp4=True` (opt-in): NVFP4 W4A4 up/down FFN GEMMs via `flash_rt_fp4`
-  (`cutlass_fp4_sq_fp16` + fused `cosmos3_edge_res_rms_fp4_sfa_bf16` and
-  `cosmos3_edge_relu2_fp4_sfa_fp16` quantizers, dynamic per-16-block scales).
+  with per-16-block dynamic activation scales and load-time MSE-selected weight
+  scales. The up projection fuses ReLU-squared and FP4 output quantization into
+  its CUTLASS epilogue, so the packed result and SFA feed the down projection
+  directly without an FP16 intermediate tensor.
 - The gen-stream fused qk-norm+RoPE kernel is the warp-per-head register
   variant (one warp per `(row, head)` vector, `__shfl_xor` rope-partner
   exchange, no shared memory or barriers).
@@ -152,15 +154,17 @@ second-seed dump.
 |---|---|---|---|---|---|
 | Official Cosmos3-Edge (eager) | 33.14 s | 1.00x | reference | reference | — |
 | FlashRT FP8, no step cache | 5.792 s | **5.72x** | 0.999983 | 0.59% | 7.85 |
-| FlashRT FP8 + NVFP4 FFN, no step cache | 5.456 s | **6.07x** | 0.999707 | 2.42% | 7.54 |
+| FlashRT FP8 + NVFP4 FFN, no step cache | 5.020 s | **6.60x** | 0.999771 | 2.15% | 7.54 |
 | FlashRT FP8 + TeaCache, 15 compute steps | 2.877 s | **11.52x** | 0.999985 | 0.56% | 7.85 |
 | FlashRT FP8 + TeaCache, 6 compute steps | 1.153 s | **28.74x** | 0.999984 | 0.57% | 7.85 |
 | FlashRT FP8 + TeaCache, 3 compute steps | 0.576 s | **57.56x** | 0.999986 | 0.54% | 7.85 |
 | FlashRT FP8 + TeaCache, 2 compute steps | 0.384 s | **86.36x** | 0.999983 | 0.59% | 7.85 |
-| FlashRT FP8 + NVFP4 FFN + TeaCache 2 | 0.362 s | **91.57x** | 0.999727 | 2.34% | 7.54 |
+| FlashRT FP8 + NVFP4 FFN + TeaCache 2 | 0.325 s | **102.06x** | 0.999720 | 2.38% | 7.54 |
 
-The 2-compute rows are an aggressive benchmark operating point, not yet a
-dataset-level task-success claim.
+TeaCache results are highly workload- and checkpoint-dependent, including on
+user fine-tunes. The 2-compute rows are aggressive benchmark operating points
+for this reference case, not dataset-level task-success claims; production
+compute schedules must be evaluated case by case on the target scenarios.
 
 ```bash
 python benchmarks/cosmos3_edge_thor_denoise.py --engine fp8 --iters 15 \
@@ -172,12 +176,14 @@ python benchmarks/cosmos3_edge_thor_denoise.py --engine fp8 \
 ```
 
 FP8 is the recommended default (large precision margin); `--ffn-fp4` trades
-~6% latency for a still-passing but thinner gate margin. Measured negatives,
+about 13% latency for a still-passing but thinner gate margin. Measured negatives,
 kept default-off or not landed: a fused QKV wide GEMM (cuBLASLt N=4096 tactic
 regression, behind `qkv_fused=`) and SageAttention2 int8 gen attention (the
 SM80-era int8 mma core is both numerically wrong and slower than FA4 on
-SM110). The largest remaining denoise levers are a relu2 epilogue fused into
-the up GEMM and a Thor-native int8/fp8 attention kernel.
+SM110). Extending W4A4 to the final O projections also passed the accuracy gate
+but did not improve latency because activation quantization and output casting
+offset the smaller GEMM. The largest remaining denoise lever is a Thor-native
+int8/fp8 attention kernel.
 
 ## Quickstart
 

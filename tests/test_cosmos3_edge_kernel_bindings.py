@@ -9,6 +9,76 @@ import torch
 import torch.nn.functional as F
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="NVFP4 epilogue canary requires CUDA")
+def test_cosmos3_edge_fp4_relu2_epilogue_matches_split_chain():
+    try:
+        fp4 = importlib.import_module("flash_rt.flash_rt_fp4")
+    except Exception as exc:  # pragma: no cover - build/env dependent
+        pytest.skip(f"flash_rt_fp4 not importable: {exc}")
+    required = (
+        "cosmos3_edge_fp4_gemm_relu2_fp4out",
+        "quantize_fp4_dynamic_sfa_mse_fp16",
+    )
+    if any(not hasattr(fp4, name) for name in required):
+        pytest.skip("Cosmos3-Edge fused FP4 epilogue is not built")
+
+    m, n, k = 128, 256, 256
+    torch.manual_seed(8675309)
+    x = torch.randn(m, k, device="cuda", dtype=torch.float16) * 0.2
+    w = torch.randn(n, k, device="cuda", dtype=torch.float16) * 0.02
+    stream = torch.cuda.current_stream().cuda_stream
+
+    def packed(rows: int, cols: int):
+        data = torch.empty(rows, cols // 2, device="cuda", dtype=torch.uint8)
+        sfa = torch.empty(fp4.sfa_size_bytes(rows, cols, False), device="cuda", dtype=torch.uint8)
+        return data, sfa
+
+    xp, xs = packed(m, k)
+    wp = torch.empty(n, k // 2, device="cuda", dtype=torch.uint8)
+    ws = torch.empty(fp4.sfa_size_bytes(n, k, True), device="cuda", dtype=torch.uint8)
+    assert fp4.quantize_fp4_dynamic_sfa_fp16(
+        x.data_ptr(), xp.data_ptr(), xs.data_ptr(), m, k, False, stream) == 0
+    assert fp4.quantize_fp4_dynamic_sfa_mse_fp16(
+        w.data_ptr(), wp.data_ptr(), ws.data_ptr(), n, k, True, stream) == 0
+
+    split16 = torch.empty(m, n, device="cuda", dtype=torch.float16)
+    split_p, split_s = packed(m, n)
+    fused_p, fused_s = packed(m, n)
+    assert fp4.cutlass_fp4_gemm_variant(
+        3, xp.data_ptr(), xs.data_ptr(), wp.data_ptr(), ws.data_ptr(),
+        split16.data_ptr(), m, n, k, 1.0, 0.0, stream) == 0
+    fp4.cosmos3_edge_relu2_fp4_sfa_fp16(
+        split16.data_ptr(), split_p.data_ptr(), split_s.data_ptr(), m, n, stream)
+    assert fp4.cosmos3_edge_fp4_gemm_relu2_fp4out(
+        xp.data_ptr(), xs.data_ptr(), wp.data_ptr(), ws.data_ptr(),
+        fused_p.data_ptr(), fused_s.data_ptr(), m, n, k, stream) == 0
+    torch.cuda.synchronize()
+
+    # Validate the actual interface contract: both packed outputs and their
+    # generated SFA must be consumable by the same downstream FP4 GEMM. Exact
+    # codes differ because the fused path activates FP32 accumulators while the
+    # split path rounds through FP16 first.
+    down_n = 128
+    down_w = torch.randn(down_n, n, device="cuda", dtype=torch.float16) * 0.02
+    down_wp = torch.empty(down_n, n // 2, device="cuda", dtype=torch.uint8)
+    down_ws = torch.empty(
+        fp4.sfa_size_bytes(down_n, n, True), device="cuda", dtype=torch.uint8)
+    assert fp4.quantize_fp4_dynamic_sfa_mse_fp16(
+        down_w.data_ptr(), down_wp.data_ptr(), down_ws.data_ptr(),
+        down_n, n, True, stream) == 0
+    split_out = torch.empty(m, down_n, device="cuda", dtype=torch.float16)
+    fused_out = torch.empty_like(split_out)
+    assert fp4.cutlass_fp4_gemm_variant(
+        3, split_p.data_ptr(), split_s.data_ptr(), down_wp.data_ptr(), down_ws.data_ptr(),
+        split_out.data_ptr(), m, down_n, n, 1.0, 0.0, stream) == 0
+    assert fp4.cutlass_fp4_gemm_variant(
+        3, fused_p.data_ptr(), fused_s.data_ptr(), down_wp.data_ptr(), down_ws.data_ptr(),
+        fused_out.data_ptr(), m, down_n, n, 1.0, 0.0, stream) == 0
+    torch.cuda.synchronize()
+    cosine = F.cosine_similarity(split_out.float().flatten(), fused_out.float().flatten(), dim=0)
+    assert cosine.item() > 0.999
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="relu2 kernel canary requires CUDA")
 @pytest.mark.parametrize("numel", [10000, 10001])
 def test_cosmos3_edge_relu2_inplace_bf16_matches_torch(numel: int):
