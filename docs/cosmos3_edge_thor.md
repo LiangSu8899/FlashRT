@@ -32,21 +32,37 @@ near-ties with coherent continuations. The fp4 decode stays coherent on all
 three modalities and its divergence points are unchanged across the decode
 optimizations.
 
-Thor T5000 decode throughput (batch 1, greedy, 128 new tokens, pure decode
-loop; the vLLM reference is the streaming chat API):
+Thor T5000 decode throughput (batch 1, greedy, 128 forced output tokens). The
+FlashRT values are P50 over five measured runs after one warmup. This profile
+uses NVIDIA's public Cosmos cookbook image/video assets and the published prompt
+lengths: text 1705, image 911, and video 1263 tokens.
 
 | decode tok/s | Text | Image | Video |
 |---|---|---|---|
-| FlashRT NVFP4 + CUDA graph | **100.4** | **91.6** | **67.3** |
-| vLLM (chat API) | 68.2 | 67.2 | 67.1 |
+| FlashRT NVFP4 + CUDA graph | **84.8** | **91.6** | **88.5** |
+| Jetson AI Lab vLLM BF16 (streaming chat API) | 68.2 | 67.2 | 67.1 |
+| FlashRT speedup | **1.24x** | **1.36x** | **1.32x** |
 | HF Transformers eager (model card) | 37.3 | 42.6 | 41.8 |
-| Cosmos Framework eager | 30.0 | 33.3 | 20.7 |
-| FlashRT bf16 torch loop | 34.7 | 28.3 | 13.1 |
 
 ```bash
+git clone --depth 1 --filter=blob:none --sparse https://github.com/NVIDIA/cosmos.git nvidia-cosmos
+git -C nvidia-cosmos sparse-checkout set cookbooks/cosmos3/reasoner
 python benchmarks/cosmos3_reasoner_thor.py --modes text,image,video \
-  --quant fp4 --iters 3 --json-out out.json   # needs cosmos-framework on PYTHONPATH
+  --quant fp4 --warmup-iters 1 --iters 5 \
+  --nvidia-assets-dir nvidia-cosmos/cookbooks/cosmos3/reasoner/assets \
+  --json-out out.json   # needs cosmos-framework on PYTHONPATH
 ```
+
+The text case uses deterministic synthetic padding to reach the published
+1705-token ISL. The official cookbook image and four-frame video requests
+naturally produce 911 and 1263 tokens with the checkpoint processor. The
+comparison otherwise matches the public hardware, model, batch, greedy decode,
+and output-length profile. It does not claim identical precision or service
+overhead: the published vLLM row is BF16 through its streaming chat API, while
+FlashRT uses NVFP4 weights, BF16 activations, an FP8 KV cache, and times the
+local post-first-token decode interval. NVIDIA publishes the AIPerf result but
+not the original per-modality request dataset, so the public Cosmos cookbook
+media and prompts are the reproducible input source here.
 
 Remaining levers: the W4A16 GEMV runs at ~100-115 GB/s effective (an XQA
 rebuild at head_dim 128/group 2 or a tensor-core dequant path lifts the video
