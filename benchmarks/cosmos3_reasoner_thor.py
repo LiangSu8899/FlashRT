@@ -8,8 +8,8 @@ text with the official golden outputs.
 
 Run inside the cosmos venv with cosmos-framework importable:
     python benchmarks/cosmos3_reasoner_thor.py \
-      --checkpoint /work/models/Cosmos3-Edge \
-      --golden-dir /work/.tmp_cosmos_edge_outputs_reasoner
+      --checkpoint /path/to/Cosmos3-Edge \
+      --nvidia-assets-dir /path/to/cosmos/cookbooks/cosmos3/reasoner/assets
 """
 from __future__ import annotations
 
@@ -64,9 +64,9 @@ def pad_prompt_tokens(input_ids: torch.Tensor, target: int, filler_id: int) -> t
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--checkpoint", default="/work/models/Cosmos3-Edge")
-    ap.add_argument("--golden-dir", default="/work/.tmp_cosmos_edge_outputs_reasoner")
-    ap.add_argument("--inputs-dir", default="/work/.tmp_cosmos_edge_inputs")
+    ap.add_argument("--checkpoint", required=True)
+    ap.add_argument("--golden-dir", default=None)
+    ap.add_argument("--inputs-dir", default=None)
     ap.add_argument(
         "--nvidia-assets-dir",
         default=None,
@@ -80,6 +80,8 @@ def main() -> None:
     ap.add_argument("--no-graph", action="store_true")
     ap.add_argument("--json-out", default=None)
     args = ap.parse_args()
+    if args.nvidia_assets_dir is None and args.inputs_dir is None:
+        ap.error("one of --nvidia-assets-dir or --inputs-dir is required")
 
     from PIL import Image
 
@@ -157,10 +159,10 @@ def main() -> None:
         stats["raw_samples"] = samples
         text = tok.decode([t for t in out if t != engine.eos_token_id], skip_special_tokens=True)
 
-        golden_path = Path(args.golden_dir) / f"reasoner_{mode}_0" / "reasoner_text.txt"
-        golden = golden_path.read_text() if golden_path.exists() else None
-        if profile:
-            golden = None
+        golden = None
+        if args.golden_dir is not None and not profile:
+            golden_path = Path(args.golden_dir) / f"reasoner_{mode}_0" / "reasoner_text.txt"
+            golden = golden_path.read_text() if golden_path.exists() else None
         match = None
         first_diff = None
         if golden is not None:

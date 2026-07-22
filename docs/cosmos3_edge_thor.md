@@ -45,14 +45,20 @@ and 1263 tokens for text, image, and video respectively.
 | FlashRT NVFP4 + CUDA graph | **104.3** | **112.6** | **108.7** |
 
 ```bash
-git clone --depth 1 --filter=blob:none --sparse https://github.com/NVIDIA/cosmos.git nvidia-cosmos
+git init nvidia-cosmos
+git -C nvidia-cosmos remote add origin https://github.com/NVIDIA/cosmos.git
+git -C nvidia-cosmos sparse-checkout init --cone
 git -C nvidia-cosmos sparse-checkout set cookbooks/cosmos3/reasoner
+git -C nvidia-cosmos fetch --depth 1 origin 19b2f1b2a8036d31c7a29a66966a52c71c97a56d
+git -C nvidia-cosmos checkout --detach FETCH_HEAD
 python benchmarks/cosmos3_reasoner_thor.py --modes text,image,video \
+  --checkpoint "$COSMOS_EDGE_CHECKPOINT" \
   --quant bf16 --warmup-iters 1 --iters 5 \
   --nvidia-assets-dir nvidia-cosmos/cookbooks/cosmos3/reasoner/assets \
   --json-out bf16.json
 
 python benchmarks/cosmos3_reasoner_thor.py --modes text,image,video \
+  --checkpoint "$COSMOS_EDGE_CHECKPOINT" \
   --quant fp4 --warmup-iters 1 --iters 5 \
   --nvidia-assets-dir nvidia-cosmos/cookbooks/cosmos3/reasoner/assets \
   --json-out nvfp4.json
@@ -67,6 +73,13 @@ Against the eager implementation, the first decode-step logits measured
 cosine 0.999937 and 1.12% relative L2 with the same argmax; later greedy tokens
 can diverge because the custom GEMV uses a different valid FP32 reduction order.
 The NVFP4 row instead uses NVFP4 weights, BF16 activations, and an FP8 KV cache.
+
+The table was measured on a Jetson AGX Thor T5000 with driver 580.00, CUDA
+13.0 (nvcc 13.0.88), and PyTorch 2.9.0a0+50eac811a6.nv25.09. The checkpoint
+revision was `6f58f6b4c91288838e60b6bcb2cc45d997e961de`. Each P50 is the median
+of five complete 128-token decode runs after one complete warmup run. The
+public Reasoner assets were taken from NVIDIA Cosmos revision
+`19b2f1b2a8036d31c7a29a66966a52c71c97a56d`.
 
 Replay-only profiling attributes about 79% of FP4 decode kernel time to W4A16
 GEMV (~138 GB/s effective) and 17% to FP8-KV attention. Material gains beyond
@@ -162,7 +175,10 @@ export WAN_VAE_CHECKPOINT=/path/to/Wan2.2_VAE.pth
 export COSMOS_EDGE_OUTPUT=/path/to/output
 ```
 
-Build the extensions for Thor using the normal repository build flow:
+Build the extensions for Thor using the normal repository build flow. Cosmos
+kernels are opt-in and are rejected at configure time for architectures other
+than `GPU_ARCH=110`. Enable only the component needed by a deployment; both
+are shown here because this page covers AV and Reasoner.
 
 FP8 is the recommended default (large precision margin); `--ffn-fp4` trades
 about 13% latency for a still-passing but thinner gate margin. Measured negatives,
@@ -175,8 +191,13 @@ offset the smaller GEMM. The largest remaining denoise lever is a Thor-native
 int8/fp8 attention kernel.
 
 ```bash
-cmake -B build -S . -DGPU_ARCH=110
-cmake --build build -j"$(nproc)" --target flash_rt_kernels flash_rt_fp4
+cmake -B build -S . \
+  -DGPU_ARCH=110 \
+  -DFLASHRT_ENABLE_COSMOS3_EDGE=ON \
+  -DFLASHRT_ENABLE_COSMOS3_REASONER=ON \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j"$(nproc)" \
+  --target flash_rt_kernels flash_rt_fp4 fmha_fp16_strided
 ```
 
 ## Official baseline
@@ -191,11 +212,62 @@ python examples/cosmos3_edge_thor_baseline.py \
   --output-dir "$COSMOS_EDGE_OUTPUT/official" \
   --vae-path "$WAN_VAE_CHECKPOINT" \
   --cosmos-root "$COSMOS_FRAMEWORK_ROOT" \
-  --backend official_action_only
+  --backend official_action_only \
+  --seed 0
 ```
 
 The full official backend remains available with `--backend official` when
 decoded vision output is needed.
+
+The performance and accuracy fixtures are generated from live requests. Run
+the reference command once for each seed, then run the boundary command once
+for each seed. The boundary command captures the official step-0 state before
+handing the remaining denoise steps to FlashRT.
+
+```bash
+for seed in 0 1; do
+  mkdir -p "$COSMOS_EDGE_OUTPUT/seed${seed}"
+  python examples/cosmos3_edge_thor_baseline.py \
+    --checkpoint "$COSMOS_EDGE_CHECKPOINT" \
+    --input-json "$COSMOS_EDGE_INPUT" \
+    --output-dir "$COSMOS_EDGE_OUTPUT/seed${seed}/reference" \
+    --vae-path "$WAN_VAE_CHECKPOINT" \
+    --cosmos-root "$COSMOS_FRAMEWORK_ROOT" \
+    --backend official_action_only \
+    --seed "$seed" \
+    --live-dump-out "$COSMOS_EDGE_OUTPUT/seed${seed}/reference.safetensors"
+
+  python examples/cosmos3_edge_thor_baseline.py \
+    --checkpoint "$COSMOS_EDGE_CHECKPOINT" \
+    --input-json "$COSMOS_EDGE_INPUT" \
+    --output-dir "$COSMOS_EDGE_OUTPUT/seed${seed}/boundary" \
+    --vae-path "$WAN_VAE_CHECKPOINT" \
+    --cosmos-root "$COSMOS_FRAMEWORK_ROOT" \
+    --backend official_action_only \
+    --seed "$seed" \
+    --live-flashrt-handoff \
+    --live-boundary-out "$COSMOS_EDGE_OUTPUT/seed${seed}/boundary.safetensors"
+done
+```
+
+The official denoise baseline was 33.135869 s. The FlashRT measurements use
+15 complete 30-step graph runs after 30 warmup steps; P50 is the median of
+those 15 runs. The official pipeline used Cosmos Framework revision
+`ed8287fd7477113f8ac4f6b84290514d55cf0cdc`. Accuracy for both validation
+seeds is shown explicitly below.
+
+| Configuration | Seed | Denoise P50 | Cosine | Rel-L2 |
+|---|---:|---:|---:|---:|
+| FP8, no step cache | 0 | 5.792 s | 0.999983 | 0.59% |
+| FP8, no step cache | 1 | 5.858 s | 0.999978 | 0.67% |
+| FP8 + NVFP4 FFN, no step cache | 0 | 5.020 s | 0.999771 | 2.15% |
+| FP8 + NVFP4 FFN, no step cache | 1 | 4.841 s | 0.999790 | 2.05% |
+| FP8 + TeaCache, 3 computes | 0 | 0.576 s | 0.999986 | 0.54% |
+| FP8 + TeaCache, 3 computes | 1 | 0.572 s | 0.999981 | 0.62% |
+| FP8 + TeaCache, 2 computes | 0 | 0.384 s | 0.999983 | 0.59% |
+| FP8 + TeaCache, 2 computes | 1 | 0.384 s | 0.999981 | 0.62% |
+| FP8 + NVFP4 FFN + TeaCache, 2 computes | 0 | 0.325 s | 0.999720 | 2.38% |
+| FP8 + NVFP4 FFN + TeaCache, 2 computes | 1 | 0.320 s | 0.999782 | 2.09% |
 
 ## FlashRT denoise benchmark
 
@@ -208,6 +280,9 @@ export COSMOS_EDGE_REFERENCE=/path/to/denoise/tensors.safetensors
 export COSMOS_EDGE_BOUNDARY=/path/to/step0_boundary/tensors.safetensors
 export COSMOS_EDGE_OFFICIAL_BENCHMARK=/path/to/official/benchmark.json
 ```
+
+Point these variables at the matching seed directory produced above. Never
+compare a boundary and reference generated from different seeds.
 
 FP8, all 30 computes:
 

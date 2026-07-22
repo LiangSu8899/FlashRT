@@ -1,6 +1,10 @@
 // Cosmos3-Reasoner M=1 W4A16 GEMV (plain layout, e2m1 codes + per-16 bf16 scale).
 #pragma once
 
+#ifndef FLASHRT_HAVE_COSMOS3_REASONER
+#error "cosmos3_reasoner_gemv.cuh requires FLASHRT_HAVE_COSMOS3_REASONER"
+#endif
+
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <cstdint>

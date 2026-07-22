@@ -421,6 +421,10 @@ __global__ void relu2_inplace_kernel(T* __restrict__ x, int n) {
 template __global__ void relu2_inplace_kernel<__nv_bfloat16>(__nv_bfloat16*, int);
 
 void relu2_inplace_bf16(__nv_bfloat16* x, int n, cudaStream_t stream) {
-    int n2 = n >> 1;
-    relu2_inplace_kernel<__nv_bfloat16><<<(n2 + 255) / 256, 256, 0, stream>>>(x, n);
+    if (n <= 0) {
+        return;
+    }
+    const int work_items = (n + 1) >> 1;
+    relu2_inplace_kernel<__nv_bfloat16>
+        <<<(work_items + 255) / 256, 256, 0, stream>>>(x, n);
 }

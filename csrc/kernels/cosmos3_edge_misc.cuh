@@ -2,6 +2,10 @@
 
 #pragma once
 
+#ifndef FLASHRT_HAVE_COSMOS3_EDGE
+#error "cosmos3_edge_misc.cuh requires FLASHRT_HAVE_COSMOS3_EDGE"
+#endif
+
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>

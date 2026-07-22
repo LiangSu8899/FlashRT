@@ -1,5 +1,9 @@
 #pragma once
 
+#ifndef FLASHRT_HAVE_COSMOS3_EDGE
+#error "cosmos3_edge_fp4_gemm_relu2_fp4out.cuh requires FLASHRT_HAVE_COSMOS3_EDGE"
+#endif
+
 #include <cuda_runtime.h>
 
 namespace flash_rt {

@@ -3,10 +3,117 @@
 from __future__ import annotations
 
 import importlib
+import os
 
 import pytest
 import torch
 import torch.nn.functional as F
+
+
+EDGE_KERNEL_SYMBOLS = {
+    "cosmos3_edge_add_action_bias_timestep_bf16",
+    "cosmos3_edge_add_bf16",
+    "cosmos3_edge_add_bias_zero_action_tail_bf16",
+    "cosmos3_edge_avgdown3d_bf16",
+    "cosmos3_edge_copy_action_tail_f32_to_bf16",
+    "cosmos3_edge_fill_flat_velocity_bf16",
+    "cosmos3_edge_gather_rows_bf16",
+    "cosmos3_edge_qk_norm_rope_bf16",
+    "cosmos3_edge_qk_norm_rope_strided_bf16",
+    "cosmos3_edge_relu2_to_fp8_static_bf16",
+    "cosmos3_edge_scatter_rows_bf16",
+    "cosmos3_edge_unipc_step_f32_bf16",
+}
+EDGE_FP4_SYMBOLS = {
+    "cosmos3_edge_fp4_gemm_relu2_fp4out",
+    "cosmos3_edge_relu2_fp4_sfa_fp16",
+    "cosmos3_edge_res_rms_fp4_sfa_bf16",
+}
+REASONER_KERNEL_SYMBOLS = {
+    "cosmos3_reasoner_decode_attn_bf16",
+    "cosmos3_reasoner_decode_attn_fp8kv_bf16",
+    "cosmos3_reasoner_gemv_w4a16_bf16",
+    "cosmos3_reasoner_rope_kv_bf16",
+    "cosmos3_reasoner_rope_kv_fp8_bf16",
+}
+
+
+def _module_symbols(module, prefix: str) -> set[str]:
+    return {name for name in dir(module) if name.startswith(prefix)}
+
+
+def test_cosmos3_symbol_inventory_is_atomic():
+    """A configured feature must export its complete model-owned inventory."""
+    try:
+        fvk = importlib.import_module("flash_rt.flash_rt_kernels")
+    except Exception as exc:  # pragma: no cover - build/env dependent
+        pytest.skip(f"flash_rt_kernels not importable: {exc}")
+
+    edge = _module_symbols(fvk, "cosmos3_edge_")
+    reasoner = _module_symbols(fvk, "cosmos3_reasoner_")
+    assert edge in (set(), EDGE_KERNEL_SYMBOLS)
+    assert reasoner in (set(), REASONER_KERNEL_SYMBOLS)
+
+    if os.environ.get("FLASHRT_TEST_COSMOS3_EDGE_REQUIRED") == "1":
+        assert edge == EDGE_KERNEL_SYMBOLS
+        fp4 = importlib.import_module("flash_rt.flash_rt_fp4")
+        assert _module_symbols(fp4, "cosmos3_edge_") == EDGE_FP4_SYMBOLS
+    if os.environ.get("FLASHRT_TEST_COSMOS3_REASONER_REQUIRED") == "1":
+        assert reasoner == REASONER_KERNEL_SYMBOLS
+
+
+def test_cosmos3_symbols_absent_when_requested():
+    if os.environ.get("FLASHRT_TEST_COSMOS3_EXPECT_ABSENT") != "1":
+        pytest.skip("absence check is selected by the non-Cosmos build job")
+    fvk = importlib.import_module("flash_rt.flash_rt_kernels")
+    assert _module_symbols(fvk, "cosmos3_edge_") == set()
+    assert _module_symbols(fvk, "cosmos3_reasoner_") == set()
+    if os.environ.get("FLASHRT_TEST_COSMOS3_FP4_EXPECT_ABSENT") != "1":
+        return
+    try:
+        fp4 = importlib.import_module("flash_rt.flash_rt_fp4")
+    except ImportError:
+        return
+    assert _module_symbols(fp4, "cosmos3_edge_") == set()
+
+
+def test_cosmos3_invalid_inputs_fail_fast():
+    try:
+        fvk = importlib.import_module("flash_rt.flash_rt_kernels")
+    except Exception as exc:  # pragma: no cover - build/env dependent
+        pytest.skip(f"flash_rt_kernels not importable: {exc}")
+    if not hasattr(fvk, "cosmos3_edge_add_bf16"):
+        pytest.skip("Cosmos3-Edge feature is not enabled in this build")
+
+    invalid_calls = (
+        ("cosmos3_edge_add_bf16", lambda: fvk.cosmos3_edge_add_bf16(0, 0, 0, 1, 0)),
+        ("cosmos3_edge_qk_norm_rope_bf16", lambda: fvk.cosmos3_edge_qk_norm_rope_bf16(
+            0, 0, 0, 0, 0, 0, 0, 0, 1, 16, 8, 128, 128, 1e-5, 0)),
+        ("cosmos3_edge_scatter_rows_bf16", lambda: fvk.cosmos3_edge_scatter_rows_bf16(
+            0, 0, 0, 1, 2048, 0)),
+        ("cosmos3_edge_avgdown3d_bf16", lambda: fvk.cosmos3_edge_avgdown3d_bf16(
+            0, 0, 1, 4, 3, 8, 8, 8, 2, 2, 4, 0)),
+        ("cosmos3_edge_unipc_step_f32_bf16", lambda: fvk.cosmos3_edge_unipc_step_f32_bf16(
+            0, 0, 0, 0, 0, 0, 0, 0, 1, 1.0, 0, 1,
+            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0)),
+    )
+    for kernel, call in invalid_calls:
+        with pytest.raises(ValueError, match=kernel):
+            call()
+
+
+def test_cosmos3_fp4_invalid_inputs_fail_fast():
+    try:
+        fp4 = importlib.import_module("flash_rt.flash_rt_fp4")
+    except Exception as exc:  # pragma: no cover - build/env dependent
+        pytest.skip(f"flash_rt_fp4 not importable: {exc}")
+    if not hasattr(fp4, "cosmos3_edge_res_rms_fp4_sfa_bf16"):
+        pytest.skip("Cosmos3-Edge FP4 feature is not enabled in this build")
+
+    with pytest.raises(ValueError, match="cosmos3_edge_res_rms_fp4_sfa_bf16"):
+        fp4.cosmos3_edge_res_rms_fp4_sfa_bf16(0, 0, 0, 0, 0, 1, 2048, 1e-5, 0)
+    with pytest.raises(ValueError, match="cosmos3_edge_fp4_gemm_relu2_fp4out"):
+        fp4.cosmos3_edge_fp4_gemm_relu2_fp4out(0, 0, 0, 0, 0, 0, 1, 16, 16, 0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="NVFP4 epilogue canary requires CUDA")
@@ -80,7 +187,7 @@ def test_cosmos3_edge_fp4_relu2_epilogue_matches_split_chain():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="relu2 kernel canary requires CUDA")
-@pytest.mark.parametrize("numel", [10000, 10001])
+@pytest.mark.parametrize("numel", [0, 1, 10000, 10001])
 def test_cosmos3_edge_relu2_inplace_bf16_matches_torch(numel: int):
     try:
         fvk = importlib.import_module("flash_rt.flash_rt_kernels")
@@ -101,6 +208,17 @@ def test_cosmos3_edge_relu2_inplace_bf16_matches_torch(numel: int):
     torch.cuda.synchronize()
 
     assert torch.equal(actual, expected)
+
+
+def test_relu2_inplace_bf16_rejects_negative_numel():
+    try:
+        fvk = importlib.import_module("flash_rt.flash_rt_kernels")
+    except Exception as exc:  # pragma: no cover - build/env dependent
+        pytest.skip(f"flash_rt_kernels not importable: {exc}")
+    if not hasattr(fvk, "relu2_inplace_bf16"):
+        pytest.skip("relu2_inplace_bf16 binding is not built")
+    with pytest.raises(ValueError, match="relu2_inplace_bf16.*n=-1"):
+        fvk.relu2_inplace_bf16(0, -1, 0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="qk norm+RoPE kernel canary requires CUDA")

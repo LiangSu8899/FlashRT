@@ -142,6 +142,20 @@ option(FLASHRT_ENABLE_NATIVE_CPP
 option(FLASHRT_BUILD_FA2_PYTHON_ADAPTER
        "Build the vendored FA2 Python adapter when FA2 is available" ON)
 
+# Cosmos3 deployment kernels are model- and architecture-specific. Keep them
+# out of the shared modules unless the corresponding Thor path is requested.
+option(FLASHRT_ENABLE_COSMOS3_EDGE
+       "Build Cosmos3-Edge AV kernels and bindings for Jetson AGX Thor" OFF)
+option(FLASHRT_ENABLE_COSMOS3_REASONER
+       "Build Cosmos3 Reasoner kernels and bindings for Jetson AGX Thor" OFF)
+if((FLASHRT_ENABLE_COSMOS3_EDGE OR FLASHRT_ENABLE_COSMOS3_REASONER) AND
+   NOT GPU_ARCH STREQUAL "110")
+  message(FATAL_ERROR
+    "Cosmos3 kernels require GPU_ARCH=110; current GPU_ARCH=${GPU_ARCH}. "
+    "Disable FLASHRT_ENABLE_COSMOS3_EDGE/FLASHRT_ENABLE_COSMOS3_REASONER "
+    "for non-Thor builds.")
+endif()
+
 # Motus beta integration. Motus-specific kernels are additive and must keep
 # their symbols prefixed with ``motus_``. Keeping a build tag lets the public
 # package compile without Motus kernels when debugging unrelated model paths.
@@ -242,7 +256,8 @@ if(MSVC)
 endif()
 
 # ── Paths ──
-set(CUTLASS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cutlass)
+set(CUTLASS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/cutlass" CACHE PATH
+    "Path to the CUTLASS source tree")
 set(CUTLASS_INCLUDE ${CUTLASS_DIR}/include)
 
 # Fail fast if CUTLASS isn't vendored — the main FP8/FP4 GEMM kernels
@@ -1289,9 +1304,6 @@ pybind11_add_module(flash_rt_kernels
   csrc/kernels/attention_mha.cu
   csrc/kernels/attention_mha_causal.cu
   csrc/kernels/rope_qwen3.cu
-  csrc/kernels/cosmos3_edge_misc.cu
-  csrc/kernels/cosmos3_reasoner_attn.cu
-  csrc/kernels/cosmos3_reasoner_gemv.cu
   csrc/kernels/decoder_fused.cu
   csrc/kernels/dit_bf16.cu
   csrc/kernels/attention_dit_bf16.cu
@@ -1320,6 +1332,24 @@ pybind11_add_module(flash_rt_kernels
 set_target_properties(flash_rt_kernels PROPERTIES
   LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
+
+if(FLASHRT_ENABLE_COSMOS3_EDGE)
+  target_sources(flash_rt_kernels PRIVATE csrc/kernels/cosmos3_edge_misc.cu)
+  target_compile_definitions(flash_rt_kernels PRIVATE FLASHRT_HAVE_COSMOS3_EDGE=1)
+  message(STATUS "Cosmos3-Edge AV kernels: ENABLED (sm_110)")
+else()
+  message(STATUS "Cosmos3-Edge AV kernels: DISABLED")
+endif()
+
+if(FLASHRT_ENABLE_COSMOS3_REASONER)
+  target_sources(flash_rt_kernels PRIVATE
+    csrc/kernels/cosmos3_reasoner_attn.cu
+    csrc/kernels/cosmos3_reasoner_gemv.cu)
+  target_compile_definitions(flash_rt_kernels PRIVATE FLASHRT_HAVE_COSMOS3_REASONER=1)
+  message(STATUS "Cosmos3 Reasoner kernels: ENABLED (sm_110)")
+else()
+  message(STATUS "Cosmos3 Reasoner kernels: DISABLED")
+endif()
 
 if(FLASHRT_ENABLE_AUDIO_CODEBOOK)
   target_sources(flash_rt_kernels PRIVATE
@@ -1644,14 +1674,18 @@ if(ENABLE_SM100_CUTLASS)
     csrc/fused_fp4/norm_silu_fp4_sfa.cu
     csrc/fused_fp4/silu_mul_fp4_sfa_v2.cu
     csrc/fused_fp4/res_rms_fp4_sfa_v2.cu
-    csrc/fused_fp4/cosmos3_edge_fp4.cu
     csrc/fused_fp4/per_channel_mul_fp16.cu
     csrc/fused_fp4/res_rms_mul_fp4_sfa.cu
     csrc/fused_fp4/silu_mul_mul_fp4_sfa_v2.cu
     csrc/fused_fp4/silu_mul_two_fp4_to_fp4.cu
     csrc/gemm/fp4/cutlass_fp4_gemm_fp4out.cu
-    csrc/gemm/fp4/cosmos3_edge_fp4_gemm_relu2_fp4out.cu
   )
+  if(FLASHRT_ENABLE_COSMOS3_EDGE)
+    target_sources(fp4_kernels_obj PRIVATE
+      csrc/fused_fp4/cosmos3_edge_fp4.cu
+      csrc/gemm/fp4/cosmos3_edge_fp4_gemm_relu2_fp4out.cu)
+    target_compile_definitions(fp4_kernels_obj PRIVATE FLASHRT_HAVE_COSMOS3_EDGE=1)
+  endif()
   set_target_properties(fp4_kernels_obj PROPERTIES
     CUDA_STANDARD 17
     POSITION_INDEPENDENT_CODE ON
@@ -1683,6 +1717,9 @@ if(ENABLE_SM100_CUTLASS)
   target_include_directories(flash_rt_fp4 PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc
   )
+  if(FLASHRT_ENABLE_COSMOS3_EDGE)
+    target_compile_definitions(flash_rt_fp4 PRIVATE FLASHRT_HAVE_COSMOS3_EDGE=1)
+  endif()
   target_link_libraries(flash_rt_fp4 PRIVATE CUDA::cudart)
   install(TARGETS flash_rt_fp4 DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
 endif()

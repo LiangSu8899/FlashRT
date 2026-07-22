@@ -166,7 +166,7 @@ Jetson AGX Thor, 30-step denoise boundary, 15 hot back-to-back iterations:
 |---|---:|---:|---:|---|
 | Official eager | 33.14 s | 1.00x | reference | [Cosmos3-Edge usage](docs/cosmos3_edge_thor.md#performance) |
 | FlashRT FP8, no step cache | 5.792 s | **5.72x** | cos 0.999983 | [Cosmos3-Edge usage](docs/cosmos3_edge_thor.md#performance) |
-| FlashRT FP8 + NVFP4 FFN, no step cache | 5.456 s | **6.07x** | cos 0.999707 | [Cosmos3-Edge usage](docs/cosmos3_edge_thor.md#performance) |
+| FlashRT FP8 + NVFP4 FFN, no step cache | 5.020 s | **6.60x** | cos 0.999771 | [Cosmos3-Edge usage](docs/cosmos3_edge_thor.md#performance) |
 | FlashRT FP8 + TeaCache, 3 computes | 0.576 s | **57.56x** | cos 0.999986 | [Cosmos3-Edge usage](docs/cosmos3_edge_thor.md#performance) |
 
 TeaCache results are workload-specific and require checkpoint- and task-level

@@ -1,5 +1,9 @@
 #include "gemm/fp4/cosmos3_edge_fp4_gemm_relu2_fp4out.cuh"
 
+#ifndef FLASHRT_HAVE_COSMOS3_EDGE
+#error "cosmos3_edge_fp4_gemm_relu2_fp4out.cu requires FLASHRT_HAVE_COSMOS3_EDGE"
+#endif
+
 #include "cute/tensor.hpp"
 #include "cutlass/cutlass.h"
 #include "cutlass/detail/sm100_blockscaled_layout.hpp"

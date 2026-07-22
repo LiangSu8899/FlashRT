@@ -1,6 +1,10 @@
 // Cosmos3-Edge model-specific fused NVFP4 quant kernels (additive).
 #pragma once
 
+#ifndef FLASHRT_HAVE_COSMOS3_EDGE
+#error "cosmos3_edge_fp4.cuh requires FLASHRT_HAVE_COSMOS3_EDGE"
+#endif
+
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>

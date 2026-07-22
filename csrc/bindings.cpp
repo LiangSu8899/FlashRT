@@ -5,8 +5,13 @@
 
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+#include <cmath>
 #include <cstdint>
+#include <initializer_list>
+#include <sstream>
 #include <stdexcept>
+#include <string>
+#include <utility>
 #include "context.h"
 #include "gemm/gemm_runner.h"
 #include "gemm/fp8_block128_gemm.cuh"
@@ -163,9 +168,13 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #ifdef FLASHRT_HAVE_AUDIO_CODEBOOK
 #include "kernels/delayed_codebook_kernels.cuh"
 #endif
+#ifdef FLASHRT_HAVE_COSMOS3_EDGE
 #include "kernels/cosmos3_edge_misc.cuh"
+#endif
+#ifdef FLASHRT_HAVE_COSMOS3_REASONER
 #include "kernels/cosmos3_reasoner_attn.cuh"
 #include "kernels/cosmos3_reasoner_gemv.cuh"
+#endif
 #ifdef FLASHRT_HAVE_QWEN36_KERNELS
 #include "kernels/qwen36_misc.cuh"
 #endif
@@ -230,6 +239,36 @@ namespace py = pybind11;
 static void* to_ptr(uintptr_t addr) { return reinterpret_cast<void*>(addr); }
 template<typename T> static T* typed_ptr(uintptr_t addr) { return reinterpret_cast<T*>(addr); }
 static cudaStream_t to_stream(uintptr_t s) { return reinterpret_cast<cudaStream_t>(s); }
+
+static std::string kernel_shape(
+    std::initializer_list<std::pair<const char*, long long>> dims) {
+    std::ostringstream out;
+    bool first = true;
+    for (const auto& [name, value] : dims) {
+        out << (first ? "" : ", ") << name << '=' << value;
+        first = false;
+    }
+    return out.str();
+}
+
+static void require_kernel(bool condition, const char* kernel,
+                           const std::string& reason,
+                           const std::string& shape) {
+    if (!condition) {
+        throw py::value_error(std::string(kernel) + ": " + reason +
+                              " (" + shape + ")");
+    }
+}
+
+static void require_kernel_ptrs(
+    const char* kernel,
+    std::initializer_list<std::pair<const char*, uintptr_t>> ptrs,
+    const std::string& shape) {
+    for (const auto& [name, value] : ptrs) {
+        require_kernel(value != 0, kernel,
+                       std::string(name) + " pointer must be non-null", shape);
+    }
+}
 
 // TurboQuant unpack + combine (csrc/quantize/tq_dequant_kv.cu)
 extern "C" void tq_unpack_packed_mixed_launch(
@@ -2298,6 +2337,12 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     }, py::arg("x"), py::arg("n"), py::arg("stream") = 0);
 
     m.def("relu2_inplace_bf16", [](uintptr_t x, int n, uintptr_t stream) {
+        const auto shape = kernel_shape({{"n", n}});
+        require_kernel(n >= 0, "relu2_inplace_bf16", "n must be non-negative", shape);
+        if (n == 0) {
+            return;
+        }
+        require_kernel_ptrs("relu2_inplace_bf16", {{"x", x}}, shape);
         extern void relu2_inplace_bf16(__nv_bfloat16*, int, cudaStream_t);
         relu2_inplace_bf16(reinterpret_cast<__nv_bfloat16*>(x), n, to_stream(stream));
     }, py::arg("x"), py::arg("n"), py::arg("stream") = 0);
@@ -4573,11 +4618,28 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("step"), py::arg("stream") = 0);
 #endif
 
+#ifdef FLASHRT_HAVE_COSMOS3_EDGE
     m.def("cosmos3_edge_qk_norm_rope_bf16",
         [](uintptr_t q_in, uintptr_t k_in, uintptr_t q_weight, uintptr_t k_weight,
            uintptr_t cos, uintptr_t sin, uintptr_t q_out, uintptr_t k_out,
            int rows, int q_heads, int k_heads, int head_dim, int rope_dim,
            float eps, uintptr_t stream) {
+            const auto shape = kernel_shape({{"rows", rows}, {"q_heads", q_heads},
+                                             {"k_heads", k_heads}, {"head_dim", head_dim},
+                                             {"rope_dim", rope_dim}});
+            require_kernel_ptrs("cosmos3_edge_qk_norm_rope_bf16",
+                {{"q_in", q_in}, {"k_in", k_in}, {"q_weight", q_weight},
+                 {"k_weight", k_weight}, {"cos", cos}, {"sin", sin},
+                 {"q_out", q_out}, {"k_out", k_out}}, shape);
+            require_kernel(rows > 0 && q_heads > 0 && k_heads > 0 &&
+                           head_dim > 0 && head_dim <= 512 && (head_dim % 2) == 0 &&
+                           rope_dim > 0 && rope_dim <= head_dim && (rope_dim % 2) == 0,
+                           "cosmos3_edge_qk_norm_rope_bf16",
+                           "dimensions must be positive; head_dim must be even and <= 512; "
+                           "rope_dim must be even and <= head_dim", shape);
+            require_kernel(std::isfinite(eps) && eps > 0.0f,
+                           "cosmos3_edge_qk_norm_rope_bf16",
+                           "eps must be finite and positive", shape);
             flash_rt::kernels::cosmos3_edge_qk_norm_rope_bf16(
                 reinterpret_cast<const __nv_bfloat16*>(q_in),
                 reinterpret_cast<const __nv_bfloat16*>(k_in),
@@ -4598,6 +4660,12 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
 
     m.def("cosmos3_edge_fill_flat_velocity_bf16",
         [](uintptr_t action, uintptr_t velocity, int flat_dim, int action_numel, uintptr_t stream) {
+            const auto shape = kernel_shape({{"flat_dim", flat_dim}, {"action_numel", action_numel}});
+            require_kernel_ptrs("cosmos3_edge_fill_flat_velocity_bf16",
+                                {{"action", action}, {"velocity", velocity}}, shape);
+            require_kernel(flat_dim > 0 && action_numel > 0 && action_numel <= flat_dim,
+                           "cosmos3_edge_fill_flat_velocity_bf16",
+                           "require 0 < action_numel <= flat_dim", shape);
             flash_rt::kernels::cosmos3_edge_fill_flat_velocity_bf16(
                 reinterpret_cast<const __nv_bfloat16*>(action),
                 reinterpret_cast<__nv_bfloat16*>(velocity),
@@ -4610,6 +4678,13 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
 
     m.def("cosmos3_edge_add_bias_zero_action_tail_bf16",
         [](uintptr_t action, uintptr_t bias, int rows, int cols, int valid_cols, uintptr_t stream) {
+            const auto shape = kernel_shape({{"rows", rows}, {"cols", cols},
+                                             {"valid_cols", valid_cols}});
+            require_kernel_ptrs("cosmos3_edge_add_bias_zero_action_tail_bf16",
+                                {{"action", action}, {"bias", bias}}, shape);
+            require_kernel(rows > 0 && cols > 0 && valid_cols >= 0 && valid_cols <= cols,
+                           "cosmos3_edge_add_bias_zero_action_tail_bf16",
+                           "require rows > 0, cols > 0, and 0 <= valid_cols <= cols", shape);
             flash_rt::kernels::cosmos3_edge_add_bias_zero_action_tail_bf16(
                 reinterpret_cast<__nv_bfloat16*>(action),
                 reinterpret_cast<const __nv_bfloat16*>(bias),
@@ -4623,6 +4698,11 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
 
     m.def("cosmos3_edge_scatter_rows_bf16",
         [](uintptr_t src, uintptr_t dst, uintptr_t row_indices, int rows, int hidden, uintptr_t stream) {
+            const auto shape = kernel_shape({{"rows", rows}, {"hidden", hidden}});
+            require_kernel_ptrs("cosmos3_edge_scatter_rows_bf16",
+                                {{"src", src}, {"dst", dst}, {"row_indices", row_indices}}, shape);
+            require_kernel(rows > 0 && hidden > 0, "cosmos3_edge_scatter_rows_bf16",
+                           "rows and hidden must be positive", shape);
             flash_rt::kernels::cosmos3_edge_scatter_rows_bf16(
                 reinterpret_cast<const __nv_bfloat16*>(src),
                 reinterpret_cast<__nv_bfloat16*>(dst),
@@ -4636,6 +4716,11 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
 
     m.def("cosmos3_edge_gather_rows_bf16",
         [](uintptr_t src, uintptr_t dst, uintptr_t row_indices, int rows, int hidden, uintptr_t stream) {
+            const auto shape = kernel_shape({{"rows", rows}, {"hidden", hidden}});
+            require_kernel_ptrs("cosmos3_edge_gather_rows_bf16",
+                                {{"src", src}, {"dst", dst}, {"row_indices", row_indices}}, shape);
+            require_kernel(rows > 0 && hidden > 0, "cosmos3_edge_gather_rows_bf16",
+                           "rows and hidden must be positive", shape);
             flash_rt::kernels::cosmos3_edge_gather_rows_bf16(
                 reinterpret_cast<const __nv_bfloat16*>(src),
                 reinterpret_cast<__nv_bfloat16*>(dst),
@@ -4646,11 +4731,27 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         },
         py::arg("src"), py::arg("dst"), py::arg("row_indices"),
         py::arg("rows"), py::arg("hidden"), py::arg("stream") = 0);
+#endif
 
+#ifdef FLASHRT_HAVE_COSMOS3_REASONER
     m.def("cosmos3_reasoner_decode_attn_fp8kv_bf16",
         [](uintptr_t q, uintptr_t k_cache, uintptr_t v_cache, uintptr_t len_ptr,
            uintptr_t out, uintptr_t part_acc, uintptr_t part_ml,
            int num_heads, int num_kv_heads, float scale, uintptr_t stream) {
+            const auto shape = kernel_shape({{"num_heads", num_heads},
+                                             {"num_kv_heads", num_kv_heads}});
+            require_kernel_ptrs("cosmos3_reasoner_decode_attn_fp8kv_bf16",
+                {{"q", q}, {"k_cache", k_cache}, {"v_cache", v_cache},
+                 {"len_ptr", len_ptr}, {"out", out}, {"part_acc", part_acc},
+                 {"part_ml", part_ml}}, shape);
+            require_kernel(num_heads > 0 && num_kv_heads > 0 &&
+                           (num_heads % num_kv_heads) == 0,
+                           "cosmos3_reasoner_decode_attn_fp8kv_bf16",
+                           "head counts must be positive and num_kv_heads must divide num_heads",
+                           shape);
+            require_kernel(std::isfinite(scale) && scale > 0.0f,
+                           "cosmos3_reasoner_decode_attn_fp8kv_bf16",
+                           "scale must be finite and positive", shape);
             flash_rt::kernels::cosmos3_reasoner_decode_attn_fp8kv_bf16(
                 reinterpret_cast<const __nv_bfloat16*>(q),
                 reinterpret_cast<const __nv_fp8_e4m3*>(k_cache),
@@ -4670,6 +4771,16 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         [](uintptr_t q_in, uintptr_t k_in, uintptr_t v_in, uintptr_t cos_t, uintptr_t sin_t,
            uintptr_t pos_ptr, uintptr_t slot_ptr, uintptr_t q_out,
            uintptr_t k_cache, uintptr_t v_cache, int num_heads, int num_kv_heads, uintptr_t stream) {
+            const auto shape = kernel_shape({{"num_heads", num_heads},
+                                             {"num_kv_heads", num_kv_heads}});
+            require_kernel_ptrs("cosmos3_reasoner_rope_kv_fp8_bf16",
+                {{"q_in", q_in}, {"k_in", k_in}, {"v_in", v_in},
+                 {"cos_t", cos_t}, {"sin_t", sin_t}, {"pos_ptr", pos_ptr},
+                 {"slot_ptr", slot_ptr}, {"q_out", q_out},
+                 {"k_cache", k_cache}, {"v_cache", v_cache}}, shape);
+            require_kernel(num_heads > 0 && num_kv_heads > 0,
+                           "cosmos3_reasoner_rope_kv_fp8_bf16",
+                           "head counts must be positive", shape);
             flash_rt::kernels::cosmos3_reasoner_rope_kv_fp8_bf16(
                 reinterpret_cast<const __nv_bfloat16*>(q_in),
                 reinterpret_cast<const __nv_bfloat16*>(k_in),
@@ -4692,6 +4803,16 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         [](uintptr_t q_in, uintptr_t k_in, uintptr_t v_in, uintptr_t cos_t, uintptr_t sin_t,
            uintptr_t pos_ptr, uintptr_t slot_ptr, uintptr_t q_out,
            uintptr_t k_cache, uintptr_t v_cache, int num_heads, int num_kv_heads, uintptr_t stream) {
+            const auto shape = kernel_shape({{"num_heads", num_heads},
+                                             {"num_kv_heads", num_kv_heads}});
+            require_kernel_ptrs("cosmos3_reasoner_rope_kv_bf16",
+                {{"q_in", q_in}, {"k_in", k_in}, {"v_in", v_in},
+                 {"cos_t", cos_t}, {"sin_t", sin_t}, {"pos_ptr", pos_ptr},
+                 {"slot_ptr", slot_ptr}, {"q_out", q_out},
+                 {"k_cache", k_cache}, {"v_cache", v_cache}}, shape);
+            require_kernel(num_heads > 0 && num_kv_heads > 0,
+                           "cosmos3_reasoner_rope_kv_bf16",
+                           "head counts must be positive", shape);
             flash_rt::kernels::cosmos3_reasoner_rope_kv_bf16(
                 reinterpret_cast<const __nv_bfloat16*>(q_in),
                 reinterpret_cast<const __nv_bfloat16*>(k_in),
@@ -4714,6 +4835,20 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         [](uintptr_t q, uintptr_t k_cache, uintptr_t v_cache, uintptr_t len_ptr,
            uintptr_t out, uintptr_t part_acc, uintptr_t part_ml,
            int num_heads, int num_kv_heads, float scale, uintptr_t stream) {
+            const auto shape = kernel_shape({{"num_heads", num_heads},
+                                             {"num_kv_heads", num_kv_heads}});
+            require_kernel_ptrs("cosmos3_reasoner_decode_attn_bf16",
+                {{"q", q}, {"k_cache", k_cache}, {"v_cache", v_cache},
+                 {"len_ptr", len_ptr}, {"out", out}, {"part_acc", part_acc},
+                 {"part_ml", part_ml}}, shape);
+            require_kernel(num_heads > 0 && num_kv_heads > 0 &&
+                           (num_heads % num_kv_heads) == 0,
+                           "cosmos3_reasoner_decode_attn_bf16",
+                           "head counts must be positive and num_kv_heads must divide num_heads",
+                           shape);
+            require_kernel(std::isfinite(scale) && scale > 0.0f,
+                           "cosmos3_reasoner_decode_attn_bf16",
+                           "scale must be finite and positive", shape);
             flash_rt::kernels::cosmos3_reasoner_decode_attn_bf16(
                 reinterpret_cast<const __nv_bfloat16*>(q),
                 reinterpret_cast<const __nv_bfloat16*>(k_cache),
@@ -4732,6 +4867,14 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     m.def("cosmos3_reasoner_gemv_w4a16_bf16",
         [](uintptr_t w_packed, uintptr_t w_scales, uintptr_t a, uintptr_t out,
            int n_rows, int k, uintptr_t stream) {
+            const auto shape = kernel_shape({{"n_rows", n_rows}, {"k", k}});
+            require_kernel_ptrs("cosmos3_reasoner_gemv_w4a16_bf16",
+                {{"w_packed", w_packed}, {"w_scales", w_scales},
+                 {"a", a}, {"out", out}}, shape);
+            require_kernel(n_rows > 0 && k > 0 && (k % 16) == 0,
+                           "cosmos3_reasoner_gemv_w4a16_bf16",
+                           "n_rows must be positive and k must be a positive multiple of 16",
+                           shape);
             flash_rt::kernels::cosmos3_reasoner_gemv_w4a16_bf16(
                 reinterpret_cast<const uint8_t*>(w_packed),
                 reinterpret_cast<const __nv_bfloat16*>(w_scales),
@@ -4741,12 +4884,31 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         },
         py::arg("w_packed"), py::arg("w_scales"), py::arg("a"), py::arg("out"),
         py::arg("n_rows"), py::arg("k"), py::arg("stream") = 0);
+#endif
 
+#ifdef FLASHRT_HAVE_COSMOS3_EDGE
     m.def("cosmos3_edge_qk_norm_rope_strided_bf16",
         [](uintptr_t q_in, uintptr_t k_in, uintptr_t q_weight, uintptr_t k_weight,
            uintptr_t cos, uintptr_t sin, uintptr_t q_out, uintptr_t k_out,
            int rows, int q_heads, int k_heads, int q_in_row_stride, int k_in_row_stride,
            float eps, uintptr_t stream) {
+            const auto shape = kernel_shape({{"rows", rows}, {"q_heads", q_heads},
+                                             {"k_heads", k_heads},
+                                             {"q_in_row_stride", q_in_row_stride},
+                                             {"k_in_row_stride", k_in_row_stride}});
+            require_kernel_ptrs("cosmos3_edge_qk_norm_rope_strided_bf16",
+                {{"q_in", q_in}, {"k_in", k_in}, {"q_weight", q_weight},
+                 {"k_weight", k_weight}, {"cos", cos}, {"sin", sin},
+                 {"q_out", q_out}, {"k_out", k_out}}, shape);
+            require_kernel(rows > 0 && q_heads > 0 && k_heads > 0 &&
+                           q_in_row_stride >= q_heads * 128 &&
+                           k_in_row_stride >= k_heads * 128,
+                           "cosmos3_edge_qk_norm_rope_strided_bf16",
+                           "rows/head counts must be positive and row strides must cover 128 values per head",
+                           shape);
+            require_kernel(std::isfinite(eps) && eps > 0.0f,
+                           "cosmos3_edge_qk_norm_rope_strided_bf16",
+                           "eps must be finite and positive", shape);
             flash_rt::kernels::cosmos3_edge_qk_norm_rope_strided_bf16(
                 reinterpret_cast<const __nv_bfloat16*>(q_in),
                 reinterpret_cast<const __nv_bfloat16*>(k_in),
@@ -4767,6 +4929,12 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
 
     m.def("cosmos3_edge_relu2_to_fp8_static_bf16",
         [](uintptr_t x, uintptr_t out, uintptr_t d_scale, int numel, uintptr_t stream) {
+            const auto shape = kernel_shape({{"numel", numel}});
+            require_kernel_ptrs("cosmos3_edge_relu2_to_fp8_static_bf16",
+                                {{"x", x}, {"out", out}, {"d_scale", d_scale}}, shape);
+            require_kernel(numel > 0 && (numel % 2) == 0,
+                           "cosmos3_edge_relu2_to_fp8_static_bf16",
+                           "numel must be a positive even number", shape);
             flash_rt::kernels::cosmos3_edge_relu2_to_fp8_static_bf16(
                 reinterpret_cast<const __nv_bfloat16*>(x),
                 reinterpret_cast<__nv_fp8_e4m3*>(out),
@@ -4779,6 +4947,12 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
 
     m.def("cosmos3_edge_copy_action_tail_f32_to_bf16",
         [](uintptr_t flat_noise, uintptr_t action, int flat_dim, int action_numel, uintptr_t stream) {
+            const auto shape = kernel_shape({{"flat_dim", flat_dim}, {"action_numel", action_numel}});
+            require_kernel_ptrs("cosmos3_edge_copy_action_tail_f32_to_bf16",
+                                {{"flat_noise", flat_noise}, {"action", action}}, shape);
+            require_kernel(flat_dim > 0 && action_numel > 0 && action_numel <= flat_dim,
+                           "cosmos3_edge_copy_action_tail_f32_to_bf16",
+                           "require 0 < action_numel <= flat_dim", shape);
             flash_rt::kernels::cosmos3_edge_copy_action_tail_f32_to_bf16(
                 reinterpret_cast<const float*>(flat_noise),
                 reinterpret_cast<__nv_bfloat16*>(action),
@@ -4791,6 +4965,13 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
 
     m.def("cosmos3_edge_add_action_bias_timestep_bf16",
         [](uintptr_t x, uintptr_t static_bias, uintptr_t timestep, int rows, int hidden, uintptr_t stream) {
+            const auto shape = kernel_shape({{"rows", rows}, {"hidden", hidden}});
+            require_kernel_ptrs("cosmos3_edge_add_action_bias_timestep_bf16",
+                                {{"x", x}, {"static_bias", static_bias},
+                                 {"timestep", timestep}}, shape);
+            require_kernel(rows > 0 && hidden > 0,
+                           "cosmos3_edge_add_action_bias_timestep_bf16",
+                           "rows and hidden must be positive", shape);
             flash_rt::kernels::cosmos3_edge_add_action_bias_timestep_bf16(
                 reinterpret_cast<__nv_bfloat16*>(x),
                 reinterpret_cast<const __nv_bfloat16*>(static_bias),
@@ -4804,6 +4985,11 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
 
     m.def("cosmos3_edge_add_bf16",
         [](uintptr_t a, uintptr_t b, uintptr_t out, int numel, uintptr_t stream) {
+            const auto shape = kernel_shape({{"numel", numel}});
+            require_kernel_ptrs("cosmos3_edge_add_bf16",
+                                {{"a", a}, {"b", b}, {"out", out}}, shape);
+            require_kernel(numel > 0, "cosmos3_edge_add_bf16",
+                           "numel must be positive", shape);
             flash_rt::kernels::cosmos3_edge_add_bf16(
                 reinterpret_cast<const __nv_bfloat16*>(a),
                 reinterpret_cast<const __nv_bfloat16*>(b),
@@ -4817,6 +5003,23 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     m.def("cosmos3_edge_avgdown3d_bf16",
         [](uintptr_t x, uintptr_t out, int b, int c, int t, int h, int w,
            int out_c, int factor_t, int factor_s, int group_size, uintptr_t stream) {
+            const auto shape = kernel_shape({{"b", b}, {"c", c}, {"t", t},
+                                             {"h", h}, {"w", w}, {"out_c", out_c},
+                                             {"factor_t", factor_t}, {"factor_s", factor_s},
+                                             {"group_size", group_size}});
+            require_kernel_ptrs("cosmos3_edge_avgdown3d_bf16",
+                                {{"x", x}, {"out", out}}, shape);
+            require_kernel(b > 0 && c > 0 && t > 0 && h > 0 && w > 0 &&
+                           out_c > 0 && factor_t > 0 && factor_s > 0 && group_size > 0,
+                           "cosmos3_edge_avgdown3d_bf16",
+                           "all dimensions and factors must be positive", shape);
+            const long long factor = static_cast<long long>(factor_t) * factor_s * factor_s;
+            require_kernel(static_cast<long long>(c) * factor ==
+                               static_cast<long long>(out_c) * group_size &&
+                           (h % factor_s) == 0 && (w % factor_s) == 0,
+                           "cosmos3_edge_avgdown3d_bf16",
+                           "channel packing must match and spatial dimensions must be divisible by factor_s",
+                           shape);
             flash_rt::kernels::cosmos3_edge_avgdown3d_bf16(
                 reinterpret_cast<const __nv_bfloat16*>(x),
                 reinterpret_cast<__nv_bfloat16*>(out),
@@ -4844,6 +5047,36 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
            float c_sample, float c_last, float c_prev_m1, float c_prev_m2,
            float c_curr_m, float p_sample, float p_curr_m, float p_prev_m1,
            uintptr_t stream) {
+            const auto shape = kernel_shape({{"numel", numel},
+                                             {"corrector_order", corrector_order},
+                                             {"predictor_order", predictor_order}});
+            require_kernel_ptrs("cosmos3_edge_unipc_step_f32_bf16",
+                {{"sample", sample}, {"velocity", velocity}, {"next_sample", next_sample},
+                 {"current_m", current_m}, {"current_last_sample", current_last_sample}}, shape);
+            require_kernel(numel > 0 && corrector_order >= 0 && corrector_order <= 2 &&
+                           predictor_order >= 1 && predictor_order <= 2,
+                           "cosmos3_edge_unipc_step_f32_bf16",
+                           "numel must be positive; corrector_order must be 0..2 and predictor_order 1..2",
+                           shape);
+            if (corrector_order >= 1 || predictor_order >= 2) {
+                require_kernel_ptrs("cosmos3_edge_unipc_step_f32_bf16",
+                                    {{"prev_m1", prev_m1}}, shape);
+            }
+            if (corrector_order >= 1) {
+                require_kernel_ptrs("cosmos3_edge_unipc_step_f32_bf16",
+                                    {{"prev_last_sample", prev_last_sample}}, shape);
+            }
+            if (corrector_order >= 2) {
+                require_kernel_ptrs("cosmos3_edge_unipc_step_f32_bf16",
+                                    {{"prev_m2", prev_m2}}, shape);
+            }
+            require_kernel(std::isfinite(sigma) && std::isfinite(c_sample) &&
+                           std::isfinite(c_last) && std::isfinite(c_prev_m1) &&
+                           std::isfinite(c_prev_m2) && std::isfinite(c_curr_m) &&
+                           std::isfinite(p_sample) && std::isfinite(p_curr_m) &&
+                           std::isfinite(p_prev_m1),
+                           "cosmos3_edge_unipc_step_f32_bf16",
+                           "scheduler coefficients must be finite", shape);
             flash_rt::kernels::cosmos3_edge_unipc_step_f32_bf16(
                 reinterpret_cast<const float*>(sample),
                 reinterpret_cast<const __nv_bfloat16*>(velocity),
@@ -4874,6 +5107,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("c_sample"), py::arg("c_last"), py::arg("c_prev_m1"),
         py::arg("c_prev_m2"), py::arg("c_curr_m"), py::arg("p_sample"),
         py::arg("p_curr_m"), py::arg("p_prev_m1"), py::arg("stream") = 0);
+#endif
 
 #ifdef FLASHRT_HAVE_QWEN36_KERNELS
     m.def("qwen36_embedding_lookup_bf16",

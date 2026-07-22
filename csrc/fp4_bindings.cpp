@@ -13,15 +13,24 @@
 
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+#include <cmath>
+#include <initializer_list>
+#include <sstream>
+#include <string>
+#include <utility>
 
 #include "gemm/fp4/cutlass_fp4_gemm.cuh"
 #include "gemm/fp4/cutlass_fp4_gemm_fp4out.cuh"
+#ifdef FLASHRT_HAVE_COSMOS3_EDGE
 #include "gemm/fp4/cosmos3_edge_fp4_gemm_relu2_fp4out.cuh"
+#endif
 #include "quantize/quantize_fp4_dynamic.cuh"
 #include "quantize/quantize_fp4_sfa.cuh"
 #include "quantize/reshape_scales_sfa.cuh"
 #include "fused_fp16/rms_norm_noweight_fp16.cuh"
+#ifdef FLASHRT_HAVE_COSMOS3_EDGE
 #include "fused_fp4/cosmos3_edge_fp4.cuh"
+#endif
 #include "fused_fp4/norm_silu_fp4_sfa.cuh"
 #include "fused_fp4/silu_mul_two_fp4_to_fp4.cuh"
 
@@ -29,6 +38,35 @@ extern "C" int flash_rt_per_channel_mul_fp16(
     uintptr_t x, uintptr_t inv_s, int S, int D, uintptr_t stream);
 
 namespace py = pybind11;
+
+static std::string fp4_kernel_shape(
+    std::initializer_list<std::pair<const char*, long long>> dims) {
+  std::ostringstream out;
+  bool first = true;
+  for (const auto& [name, value] : dims) {
+    out << (first ? "" : ", ") << name << '=' << value;
+    first = false;
+  }
+  return out.str();
+}
+
+static void require_fp4(bool condition, const char* kernel,
+                        const std::string& reason, const std::string& shape) {
+  if (!condition) {
+    throw py::value_error(std::string(kernel) + ": " + reason +
+                          " (" + shape + ")");
+  }
+}
+
+static void require_fp4_ptrs(
+    const char* kernel,
+    std::initializer_list<std::pair<const char*, uintptr_t>> ptrs,
+    const std::string& shape) {
+  for (const auto& [name, value] : ptrs) {
+    require_fp4(value != 0, kernel,
+                std::string(name) + " pointer must be non-null", shape);
+  }
+}
 
 PYBIND11_MODULE(flash_rt_fp4, m) {
   m.doc() = "FlashRT — NVFP4 (Thor SM110) add-on kernels";
@@ -99,6 +137,12 @@ tile-interleave conversion is required.
   m.def("quantize_fp4_dynamic_sfa_mse_fp16",
         [](uintptr_t src, uintptr_t packed, uintptr_t sfa,
            int N, int D, bool is_sfb, uintptr_t stream) -> int {
+          const auto shape = fp4_kernel_shape({{"N", N}, {"D", D}});
+          require_fp4_ptrs("quantize_fp4_dynamic_sfa_mse_fp16",
+                           {{"src", src}, {"packed", packed}, {"sfa", sfa}}, shape);
+          require_fp4(N > 0 && D > 0 && (D % 16) == 0,
+                      "quantize_fp4_dynamic_sfa_mse_fp16",
+                      "N must be positive and D must be a positive multiple of 16", shape);
           return flash_rt::fp4::quantize_fp4_dynamic_sfa_mse_fp16(
               reinterpret_cast<void const*>(src),
               reinterpret_cast<void*>(packed), reinterpret_cast<void*>(sfa),
@@ -249,11 +293,23 @@ reshape_linear_scales_to_sfa, in a single kernel launch.
         py::arg("seq_len"), py::arg("dim"), py::arg("stream") = 0,
         "F3: fused residual+rms_norm + fp4_quant + SFA write.");
 
+#ifdef FLASHRT_HAVE_COSMOS3_EDGE
   // Cosmos3-Edge model-specific fused FP4 quant kernels (bf16 residual chain).
   m.def("cosmos3_edge_res_rms_fp4_sfa_bf16",
         [](uintptr_t residual, uintptr_t x, uintptr_t weight,
            uintptr_t packed, uintptr_t sfa,
            int seq_len, int dim, float eps, uintptr_t stream) {
+          const auto shape = fp4_kernel_shape({{"seq_len", seq_len}, {"dim", dim}});
+          require_fp4_ptrs("cosmos3_edge_res_rms_fp4_sfa_bf16",
+              {{"residual", residual}, {"x", x}, {"weight", weight},
+               {"packed", packed}, {"sfa", sfa}}, shape);
+          require_fp4(seq_len > 0 && dim > 0 && dim <= 16384 && (dim % 16) == 0,
+                      "cosmos3_edge_res_rms_fp4_sfa_bf16",
+                      "seq_len must be positive and dim must be a multiple of 16 in [16, 16384]",
+                      shape);
+          require_fp4(std::isfinite(eps) && eps > 0.0f,
+                      "cosmos3_edge_res_rms_fp4_sfa_bf16",
+                      "eps must be finite and positive", shape);
           flash_rt::fused_fp4::cosmos3_edge_res_rms_fp4_sfa_bf16(
               reinterpret_cast<__nv_bfloat16*>(residual),
               reinterpret_cast<const __nv_bfloat16*>(x),
@@ -271,6 +327,13 @@ reshape_linear_scales_to_sfa, in a single kernel launch.
   m.def("cosmos3_edge_relu2_fp4_sfa_fp16",
         [](uintptr_t x, uintptr_t packed, uintptr_t sfa,
            int seq_len, int dim, uintptr_t stream) {
+          const auto shape = fp4_kernel_shape({{"seq_len", seq_len}, {"dim", dim}});
+          require_fp4_ptrs("cosmos3_edge_relu2_fp4_sfa_fp16",
+                           {{"x", x}, {"packed", packed}, {"sfa", sfa}}, shape);
+          require_fp4(seq_len > 0 && dim > 0 && (dim % 16) == 0,
+                      "cosmos3_edge_relu2_fp4_sfa_fp16",
+                      "seq_len must be positive and dim must be a positive multiple of 16",
+                      shape);
           flash_rt::fused_fp4::cosmos3_edge_relu2_fp4_sfa_fp16(
               reinterpret_cast<const __half*>(x),
               reinterpret_cast<uint8_t*>(packed),
@@ -281,6 +344,7 @@ reshape_linear_scales_to_sfa, in a single kernel launch.
         py::arg("x"), py::arg("packed"), py::arg("sfa"),
         py::arg("seq_len"), py::arg("dim"), py::arg("stream") = 0,
         "Cosmos3-Edge: relu(x)^2 (fp16 in) -> NVFP4 quant + SFA.");
+#endif
 
   // GEGLU (tanh-approx GELU(gate) * up) fused FP4 kernels.
   m.def("gate_geglu_fp4_sfa_fp16",
@@ -383,11 +447,20 @@ P1 NVFP4 GEMM:  D[M,N/2] (fp4) + D_SFD = LinCombBlockScaleFactor(A @ B^T).
 Drop-in for cutlass_fp4_sq_fp16 when downstream consumes FP4 + SFA directly.
 )pbdoc");
 
+#ifdef FLASHRT_HAVE_COSMOS3_EDGE
   m.def("cosmos3_edge_fp4_gemm_relu2_fp4out",
         [](uintptr_t A_packed, uintptr_t SFA,
            uintptr_t B_packed, uintptr_t SFB,
            uintptr_t D_packed, uintptr_t D_SFD,
            int M, int N, int K, uintptr_t stream) -> int {
+          const auto shape = fp4_kernel_shape({{"M", M}, {"N", N}, {"K", K}});
+          require_fp4_ptrs("cosmos3_edge_fp4_gemm_relu2_fp4out",
+              {{"A_packed", A_packed}, {"SFA", SFA}, {"B_packed", B_packed},
+               {"SFB", SFB}, {"D_packed", D_packed}, {"D_SFD", D_SFD}}, shape);
+          require_fp4(M > 0 && N > 0 && K > 0 && (N % 16) == 0 && (K % 16) == 0,
+                      "cosmos3_edge_fp4_gemm_relu2_fp4out",
+                      "M must be positive and N/K must be positive multiples of 16",
+                      shape);
           return flash_rt::fp4::cosmos3_edge_fp4_gemm_relu2_fp4out(
               reinterpret_cast<void const*>(A_packed),
               reinterpret_cast<void const*>(SFA),
@@ -403,6 +476,7 @@ Drop-in for cutlass_fp4_sq_fp16 when downstream consumes FP4 + SFA directly.
         py::arg("M"), py::arg("N"), py::arg("K"),
         py::arg("stream") = 0,
         "Cosmos3-Edge fused NVFP4 up GEMM + ReLU squared + FP4 quantization.");
+#endif
 
   // ── P1 + AWQ: geglu_two_mul_fp4_to_fp4 — GEGLU combiner with Down inv_s mul ──
   m.def("geglu_two_mul_fp4_to_fp4",

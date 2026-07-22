@@ -760,12 +760,13 @@ class EdgeTransformerFvkLinearReference(EdgeTransformerTorchReference):
         import flash_rt.flash_rt_kernels as fvk
 
         x_in = x.contiguous()
+        weight_in = weight.contiguous()
         out = torch.empty_like(x_in)
         dim = x_in.shape[-1]
         rows = x_in.numel() // dim
         fvk.rms_norm(
             x_in.data_ptr(),
-            weight.contiguous().data_ptr(),
+            weight_in.data_ptr(),
             out.data_ptr(),
             rows,
             dim,
@@ -839,15 +840,19 @@ class EdgeTransformerFvkLinearReference(EdgeTransformerTorchReference):
             return super().norm_rope(q, k, q_weight, k_weight, cos, sin)
         q_in = q.contiguous()
         k_in = k.contiguous()
+        q_weight_in = q_weight.contiguous()
+        k_weight_in = k_weight.contiguous()
+        cos_in = cos.contiguous()
+        sin_in = sin.contiguous()
         q_out = torch.empty_like(q_in)
         k_out = torch.empty_like(k_in)
         fvk.cosmos3_edge_qk_norm_rope_bf16(
             q_in.data_ptr(),
             k_in.data_ptr(),
-            q_weight.contiguous().data_ptr(),
-            k_weight.contiguous().data_ptr(),
-            cos.contiguous().data_ptr(),
-            sin.contiguous().data_ptr(),
+            q_weight_in.data_ptr(),
+            k_weight_in.data_ptr(),
+            cos_in.data_ptr(),
+            sin_in.data_ptr(),
             q_out.data_ptr(),
             k_out.data_ptr(),
             q_in.shape[0],

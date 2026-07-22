@@ -180,6 +180,14 @@ class EdgeStaticUniPCScheduler:
             raise TypeError(f"expected sample=float32 and velocity=bf16, got {sample.dtype} and {velocity.dtype}")
         if sample.device.type != "cuda" or velocity.device.type != "cuda":
             raise TypeError("native UniPC step requires CUDA tensors")
+        if sample.shape != velocity.shape:
+            raise ValueError(
+                f"native UniPC step requires matching shapes, got {sample.shape} and {velocity.shape}"
+            )
+        if not sample.is_contiguous() or not velocity.is_contiguous():
+            raise ValueError("native UniPC step requires contiguous sample and velocity tensors")
+        if step_index < 0 or step_index >= len(self.coefficients):
+            raise IndexError(f"UniPC step_index {step_index} is outside the configured schedule")
         if self.prev_m1 is None or self.prev_m2 is None or self.last_sample is None:
             self.reset(sample)
         assert self.prev_m1 is not None
@@ -194,7 +202,7 @@ class EdgeStaticUniPCScheduler:
         last_ptr = self.last_sample.data_ptr() if coeff.corrector_order >= 1 else 0
         self.native_step(
             sample.data_ptr(),
-            velocity.contiguous().data_ptr(),
+            velocity.data_ptr(),
             prev_m1_ptr,
             prev_m2_ptr,
             last_ptr,

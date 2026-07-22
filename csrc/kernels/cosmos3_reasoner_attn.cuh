@@ -1,6 +1,10 @@
 // Cosmos3-Reasoner single-query GQA decode attention (device-side length).
 #pragma once
 
+#ifndef FLASHRT_HAVE_COSMOS3_REASONER
+#error "cosmos3_reasoner_attn.cuh requires FLASHRT_HAVE_COSMOS3_REASONER"
+#endif
+
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>

@@ -96,6 +96,19 @@ def _audio_codebook_enabled() -> bool:
     return _cache_bool("FLASHRT_ENABLE_AUDIO_CODEBOOK")
 
 
+def _target_build_rules(target: str) -> str:
+    target_dir = BUILD_DIR / "CMakeFiles" / f"{target}.dir"
+    chunks = []
+    for name in ("build.make", "flags.make", "link.txt"):
+        path = target_dir / name
+        if path.is_file():
+            chunks.append(path.read_text(errors="replace"))
+    ninja = BUILD_DIR / "build.ninja"
+    if ninja.is_file():
+        chunks.append(ninja.read_text(errors="replace"))
+    return "\n".join(chunks)
+
+
 def _expected_tu() -> int:
     expected = SLIM_SM89_KERNELS_TU if _is_slim() else COMPAT_KERNELS_TU
     return expected if _audio_codebook_enabled() else expected - 1
@@ -176,6 +189,37 @@ def test_neutral_helpers_in_generic_core():
     generic = set(entry["category_sources"]["generic_shared"])
     assert "csrc/kernels/bf16_matmul_bf16.cu" in generic
     assert "csrc/kernels/embedding_lookup_bf16.cu" in generic
+
+
+def test_cosmos3_model_sources_and_definitions_follow_build_options():
+    """Configured SM89/SM120 builds must not inherit Thor model kernels."""
+    _require_build_dir()
+    arch = (_cache_value("GPU_ARCH") or "").strip()
+    edge_enabled = _cache_bool("FLASHRT_ENABLE_COSMOS3_EDGE")
+    reasoner_enabled = _cache_bool("FLASHRT_ENABLE_COSMOS3_REASONER")
+    assert not edge_enabled or arch == "110"
+    assert not reasoner_enabled or arch == "110"
+
+    core_rules = _target_build_rules("flash_rt_kernels")
+    assert ("csrc/kernels/cosmos3_edge_misc.cu" in core_rules) == edge_enabled
+    assert ("FLASHRT_HAVE_COSMOS3_EDGE" in core_rules) == edge_enabled
+    for source in (
+        "csrc/kernels/cosmos3_reasoner_attn.cu",
+        "csrc/kernels/cosmos3_reasoner_gemv.cu",
+    ):
+        assert (source in core_rules) == reasoner_enabled
+    assert ("FLASHRT_HAVE_COSMOS3_REASONER" in core_rules) == reasoner_enabled
+
+    if arch in {"100", "110"}:
+        fp4_rules = _target_build_rules("fp4_kernels_obj")
+        fp4_binding_rules = _target_build_rules("flash_rt_fp4")
+        for source in (
+            "csrc/fused_fp4/cosmos3_edge_fp4.cu",
+            "csrc/gemm/fp4/cosmos3_edge_fp4_gemm_relu2_fp4out.cu",
+        ):
+            assert (source in fp4_rules) == edge_enabled
+        assert ("FLASHRT_HAVE_COSMOS3_EDGE" in fp4_rules) == edge_enabled
+        assert ("FLASHRT_HAVE_COSMOS3_EDGE" in fp4_binding_rules) == edge_enabled
 
 
 def test_object_libraries_counted_in_total():

@@ -1,5 +1,9 @@
 #include "cosmos3_edge_misc.cuh"
 
+#ifndef FLASHRT_HAVE_COSMOS3_EDGE
+#error "cosmos3_edge_misc.cu requires FLASHRT_HAVE_COSMOS3_EDGE"
+#endif
+
 #include "common.cuh"
 
 #include <climits>

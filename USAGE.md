@@ -702,7 +702,7 @@ result = model.infer(
 ```
 
 The FlashRT denoise engine executes all 30 steps in one CUDA Graph and reaches
-5.72x with FP8 or 6.07x with FP8 plus NVFP4 FFN on the measured Thor workload.
+5.72x with FP8 or 6.60x with FP8 plus NVFP4 FFN on the measured Thor workload.
 Optional TeaCache schedules can be much faster, but must be qualified for each
 task distribution and fine-tuned checkpoint. See
 [`docs/cosmos3_edge_thor.md`](docs/cosmos3_edge_thor.md) for the complete table,

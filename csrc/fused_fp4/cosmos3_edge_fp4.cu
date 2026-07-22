@@ -12,6 +12,10 @@
 //
 //  Both feed cutlass_fp4_sq_fp16 (A-side packed + SFA).
 // ============================================================================
+#ifndef FLASHRT_HAVE_COSMOS3_EDGE
+#error "cosmos3_edge_fp4.cu requires FLASHRT_HAVE_COSMOS3_EDGE"
+#endif
+
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>

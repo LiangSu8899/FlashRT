@@ -10,6 +10,10 @@
 
 #include "cosmos3_reasoner_gemv.cuh"
 
+#ifndef FLASHRT_HAVE_COSMOS3_REASONER
+#error "cosmos3_reasoner_gemv.cu requires FLASHRT_HAVE_COSMOS3_REASONER"
+#endif
+
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp4.h>
