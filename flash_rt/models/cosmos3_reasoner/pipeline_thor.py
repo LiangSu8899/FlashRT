@@ -108,7 +108,6 @@ class CosmosReasonerThor:
         import flash_rt.flash_rt_kernels as fvk
 
         self.fvk = fvk
-        s = torch.cuda.current_stream().cuda_stream
 
         levels = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], device=DEV)
 

@@ -11,11 +11,13 @@
 #include "cosmos3_reasoner_gemv.cuh"
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_fp4.h>
 
 namespace flash_rt::kernels {
 namespace {
 
-__constant__ float kE2M1[16] = {
+[[maybe_unused]] __constant__ float kE2M1[16] = {
     0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
     -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f,
 };
@@ -29,14 +31,15 @@ __global__ void reasoner_gemv_w4a16_kernel(
     int n_rows,
     int k)
 {
-  // 16-entry nibble LUT in shared memory: divergent indexing into
-  // __constant__ serializes, while 16 floats span 16 smem banks.
+#if __CUDA_ARCH__ < 1000
+  // Pre-Blackwell fallback for targets without scalar FP4 conversion.
   __shared__ float sh_lut[16];
   const int tid = threadIdx.y * 32 + threadIdx.x;
   if (tid < 16) {
     sh_lut[tid] = kE2M1[tid];
   }
   __syncthreads();
+#endif
 
   const int row = blockIdx.x * blockDim.y + threadIdx.y;
   if (row >= n_rows) {
@@ -51,20 +54,29 @@ __global__ void reasoner_gemv_w4a16_kernel(
   const int n_blocks = k >> 4;
   for (int b = lane; b < n_blocks; b += 32) {
     const float scale = __bfloat162float(srow[b]);
-    const uint2 packed = reinterpret_cast<const uint2*>(wrow + (b << 3))[0];
+    const uint64_t packed = reinterpret_cast<const uint64_t*>(wrow + (b << 3))[0];
     const __nv_bfloat162* av2 = reinterpret_cast<const __nv_bfloat162*>(a + (b << 4));
     float part = 0.0f;
+#if __CUDA_ARCH__ >= 1000
 #pragma unroll
-    for (int j = 0; j < 2; ++j) {
-      uint32_t word = (j == 0) ? packed.x : packed.y;
-#pragma unroll
-      for (int byte = 0; byte < 4; ++byte) {
-        const uint32_t v = (word >> (byte * 8)) & 0xffu;
-        const __nv_bfloat162 a2 = av2[j * 4 + byte];
-        part += sh_lut[v & 0xfu] * __bfloat162float(a2.x);
-        part += sh_lut[v >> 4] * __bfloat162float(a2.y);
-      }
+    for (int j = 0; j < 8; ++j) {
+      const __nv_fp4x2_storage_t code =
+          static_cast<__nv_fp4x2_storage_t>(packed >> (j * 8));
+      const __half2_raw wr = __nv_cvt_fp4x2_to_halfraw2(code, __NV_E2M1);
+      const float2 wf = __half22float2(*reinterpret_cast<const __half2*>(&wr));
+      const float2 xf = __bfloat1622float2(av2[j]);
+      part = fmaf(wf.x, xf.x, part);
+      part = fmaf(wf.y, xf.y, part);
     }
+#else
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const uint32_t v = (packed >> (j * 8)) & 0xffu;
+      const __nv_bfloat162 a2 = av2[j];
+      part += sh_lut[v & 0xfu] * __bfloat162float(a2.x);
+      part += sh_lut[v >> 4] * __bfloat162float(a2.y);
+    }
+#endif
     acc += part * scale;
   }
 #pragma unroll

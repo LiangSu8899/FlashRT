@@ -19,7 +19,8 @@ weights:
   are captured as one whole-step CUDA graph.
 - decode (`quant="fp4"`): every weight in W4A16 (e2m1 codes packed 2/byte +
   per-16 bf16 scales) with q/k/v rows merged into one wide GEMV per layer, a
-  model-local SIMT dequant GEMV (`cosmos3_reasoner_gemv_w4a16_bf16`), a fused
+  model-local GEMV using native Blackwell e2m1x2 conversion with FP32
+  accumulation (`cosmos3_reasoner_gemv_w4a16_bf16`), a fused
   RoPE + e4m3 KV-cache append (`cosmos3_reasoner_rope_kv_fp8_bf16`,
   device-side position/slot scalars), a split-KV single-query GQA flash-decode
   attention over the FP8 KV cache with a device-side length
@@ -33,19 +34,15 @@ The BF16 path is validated against eager logits below. Greedy output is not
 claimed to be token-for-token identical because near-ties may choose a different
 token after valid floating-point reduction-order changes.
 
-Thor T5000 decode throughput (batch 1, greedy, 128 forced output tokens). The
-FlashRT values are P50 over five measured runs after one warmup. This profile
-uses NVIDIA's public Cosmos cookbook image/video assets and the published prompt
-lengths: text 1705, image 911, and video 1263 tokens.
+Thor T5000 decode throughput (batch 1, greedy, 128 forced output tokens). Values
+are P50 over five measured runs after one warmup. The reproducible profile uses
+the public Cosmos cookbook image/video assets and prompt lengths of 1705, 911,
+and 1263 tokens for text, image, and video respectively.
 
 | decode tok/s | Text | Image | Video |
 |---|---|---|---|
 | FlashRT BF16 + CUDA graph | **68.3** | **71.6** | **70.1** |
-| Jetson AI Lab vLLM BF16 (streaming chat API) | 68.2 | 67.2 | 67.1 |
-| FlashRT BF16 speedup | **1.00x** | **1.07x** | **1.04x** |
-| FlashRT NVFP4 + CUDA graph | **87.5** | **93.3** | **90.6** |
-| FlashRT NVFP4 speedup vs vLLM BF16 | **1.28x** | **1.39x** | **1.35x** |
-| HF Transformers eager (model card) | 37.3 | 42.6 | 41.8 |
+| FlashRT NVFP4 + CUDA graph | **104.3** | **112.6** | **108.7** |
 
 ```bash
 git clone --depth 1 --filter=blob:none --sparse https://github.com/NVIDIA/cosmos.git nvidia-cosmos
@@ -53,30 +50,29 @@ git -C nvidia-cosmos sparse-checkout set cookbooks/cosmos3/reasoner
 python benchmarks/cosmos3_reasoner_thor.py --modes text,image,video \
   --quant bf16 --warmup-iters 1 --iters 5 \
   --nvidia-assets-dir nvidia-cosmos/cookbooks/cosmos3/reasoner/assets \
-  --json-out bf16.json  # needs cosmos-framework on PYTHONPATH
+  --json-out bf16.json
 
-# Replace --quant bf16 with --quant fp4 for the NVFP4 row.
+python benchmarks/cosmos3_reasoner_thor.py --modes text,image,video \
+  --quant fp4 --warmup-iters 1 --iters 5 \
+  --nvidia-assets-dir nvidia-cosmos/cookbooks/cosmos3/reasoner/assets \
+  --json-out nvfp4.json
 ```
 
 The text case uses deterministic synthetic padding to reach the published
 1705-token ISL. The official cookbook image and four-frame video requests
 naturally produce 911 and 1263 tokens with the checkpoint processor. The
-comparison otherwise matches the public hardware, model, batch, greedy decode,
-and output-length profile. The BF16 row uses BF16 weights, activations, and KV
-cache. Against the eager implementation, the first decode-step logits measured
+profile fixes the hardware, model, batch, greedy decode, input lengths, and
+output length. The BF16 row uses BF16 weights, activations, and KV cache.
+Against the eager implementation, the first decode-step logits measured
 cosine 0.999937 and 1.12% relative L2 with the same argmax; later greedy tokens
 can diverge because the custom GEMV uses a different valid FP32 reduction order.
 The NVFP4 row instead uses NVFP4 weights, BF16 activations, and an FP8 KV cache.
 
-The published vLLM result includes its streaming chat API, while FlashRT times
-the local post-first-token decode interval. NVIDIA publishes the AIPerf result
-but not the original per-modality request dataset, so the public Cosmos cookbook
-media and prompts are the reproducible input source here rather than a claim of
-request-for-request AIPerf reproduction.
-
-Remaining levers: the W4A16 GEMV runs at ~100-115 GB/s effective (an XQA
-rebuild at head_dim 128/group 2 or a tensor-core dequant path lifts the video
-row further), and prefill is still the torch path.
+Replay-only profiling attributes about 79% of FP4 decode kernel time to W4A16
+GEMV (~138 GB/s effective) and 17% to FP8-KV attention. Material gains beyond
+this point require a precision-preserving native-scale/tensor-core W4 path and
+an XQA build specialized for head_dim 128/group 2; small elementwise fusions
+cannot close that remaining gap. Prefill is still the torch path.
 
 `config="cosmos3_edge"` is the Thor baseline runner for NVIDIA's official
 Cosmos Framework inference path. It is intentionally upstream-first: run this
