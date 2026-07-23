@@ -39,11 +39,7 @@ See [Supported Models](#supported-models), [Hardware Support](#hardware-support)
 
 ## News
 
-- [2026/07] **Cosmos3** now covers Cosmos3-Nano text-to-video on RTX 5090 and Cosmos3-Edge AV inverse dynamics plus multimodal Reasoner on Jetson AGX Thor. See [Cosmos3-Nano usage](docs/cosmos3_video_usage.md), [Cosmos3-Edge usage](docs/cosmos3_edge_thor.md), and [Benchmark](#benchmark).
-- [2026/07] **Native C++ PI0.5 and FlashRT Nexus** provide a Python-free checkpoint-to-action path, a stable model-runtime C ABI, native FP8 calibration, and embedded/HTTP state-first serving. Start with [native PI0.5](docs/pi05_native_cpp.md), [native calibration](docs/pi05_native_calibration.md), and [FlashRT Nexus](https://github.com/LiangSu8899/FlashRT-Nexus).
-- [2026/07] Community runtime and model work: [@diantoudedianshan](https://github.com/diantoudedianshan) added RTC temporal fusion and VLASh asynchronous runners; [@chenping9999](https://github.com/chenping9999) added the MiniMax-Remover FP8/NVFP4 video-inpainting pipeline.
-
-<details>
+<details open>
 <summary><strong>July 2026</strong> - Cosmos3, native C++, async runtimes, and multimodal pipelines</summary>
 
 - **Cosmos3-Edge on Jetson AGX Thor** reaches **6.60x** no-cache AV denoise speedup; its NVFP4 Reasoner decodes text/image/video at **104.3 / 112.6 / 108.7 tok/s**. The earlier **Cosmos3-Nano RTX 5090** path reaches **4.8 s E2E** with FP8 for a 480p, 49-frame, 10-step workload. See [Cosmos3-Edge](docs/cosmos3_edge_thor.md) and [Cosmos3-Nano](docs/cosmos3_video_usage.md).
