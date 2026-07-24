@@ -27,12 +27,28 @@ FP8 (``_kern_block``) block paths. No MiniMax-Remover imports -- tensors
 only.
 """
 
+import logging
 import math
 import os
 
 import torch
 
 from ._kernels import rms_norm_fp32stat, rope_apply_bshd, freqs_to_cos_sin
+
+logger = logging.getLogger(__name__)
+
+
+def _is_sm89_query_scale_shape_error(error):
+    """Return whether SageAttention rejected its known query-scale shape."""
+    message = str(error)
+    return "query_scale" in message and "must have shape" in message
+
+
+# Sequence lengths where SageAttention's fused int8-quant sm89 kernel
+# crashed (query_scale shape mismatch). Once blacklisted, those shapes
+# use the standard fp16 path (rmsnorm+rope → sage high-level API, which
+# handles any seq len). Populated at runtime via try/except fallback.
+_sage_blacklist: set = set()
 
 # Optional MiniMax-Remover fused kernels — used when both are available.
 _fvk = None
@@ -224,10 +240,13 @@ class FlashRTFA2Processor:
                     and (Dd & 7) == 0)
         # ── Fully-fused path: RMSNorm + RoPE + int8 quant → sm89 attn ──
         # Eliminates the fp16 intermediate between norm+rope and QK quantize.
+        # Skipped for seq lengths where SageAttention's sm89 kernel is known
+        # to crash (query_scale shape mismatch at certain S values).
         _fuse_quant = (_fuse_qk and _has_fused_rmsnorm_rope_quant
                        and mode in ("sage_fp8", "sage2")
                        and _get_sm89() is not None
-                       and _get_per_channel_fp8() is not None)
+                       and _get_per_channel_fp8() is not None
+                       and S not in _sage_blacklist)
 
         # Q/K GEMM: when the Q/K bias will be fused into the downstream
         # rmsnorm+rope+quant kernel (pre-norm add), fetch Q/K WITHOUT bias
@@ -315,17 +334,39 @@ class FlashRTFA2Processor:
             out = torch.empty(B, S, H, Dd, device=q.device, dtype=q.dtype)
 
             sm89 = _get_sm89()
-            sm89.qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf(
-                q_int8, k_int8, v_fp8, out, q_scale, k_scale, v_scale,
-                0, 0, 2, scale, 0)
-
-            hidden_states = out.view(B, S, H * Dd)
-            to_out0 = attn.to_out[0]
-            if no_out_bias and hasattr(to_out0, "gemm_no_bias"):
-                hidden_states = to_out0.gemm_no_bias(hidden_states)
+            try:
+                sm89.qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf(
+                    q_int8, k_int8, v_fp8, out, q_scale, k_scale, v_scale,
+                    0, 0, 2, scale, 0)
+            except RuntimeError as e:
+                if not _is_sm89_query_scale_shape_error(e):
+                    raise
+                # SageAttention sm89 tiling limitation at this seq len.
+                # Blacklist S and fall back to the standard rmsnorm+rope
+                # path, which routes through sage's high-level API (handles
+                # any seq len correctly).
+                _sage_blacklist.add(S)
+                logger.warning(
+                    "SageAttention fused-quant crashed at S=%d (%s); "
+                    "falling back to standard path for this seq len "
+                    "(~5%% slower, same precision)", S, e)
+                # Redo Q/K WITH bias (the nobias GEMM skipped it).
+                if _qk_nobias:
+                    if _use_fp8:
+                        q = attn.to_q.gemm_from_fp8_ext(fp8_hidden, fp8_scale)
+                        k = attn.to_k.gemm_from_fp8_ext(fp8_hidden, fp8_scale)
+                    else:
+                        q = attn.to_q(hidden_states)
+                        k = attn.to_k(hidden_states)
+                # Fall through to _fuse_qk standard path below.
             else:
-                hidden_states = to_out0(hidden_states)
-            return hidden_states
+                hidden_states = out.view(B, S, H * Dd)
+                to_out0 = attn.to_out[0]
+                if no_out_bias and hasattr(to_out0, "gemm_no_bias"):
+                    hidden_states = to_out0.gemm_no_bias(hidden_states)
+                else:
+                    hidden_states = to_out0(hidden_states)
+                return hidden_states
 
         if _fuse_qk:
             if not q.is_contiguous():

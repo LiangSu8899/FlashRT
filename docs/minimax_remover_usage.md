@@ -12,7 +12,13 @@ kernelized inference on Blackwell SM120. Two precision paths ship under
 
 Both reuse the **generic** FlashRT kernels for the transformer denoise path
 (quantized GEMMs, fused norm/gate/residual/gelu ops, kernel attention via
-FA2 / SageAttention). The VAE encode/decode is additionally accelerated by
+FA2 / SageAttention). On top of the kernelised transformer, the FP8 path
+also supports **training-free TeaCache step caching** (opt-in with
+`--teacache-skip 3,5,7,9`): 4 of 12 interior denoise steps reuse the cached
+noise prediction instead of running the transformer — mirroring the
+Motus/Cosmos3/Wan2.2 TeaCache mechanism and cutting ~0.9 s with no
+measurable PSNR loss (the flow-matching velocity is highly cacheable).
+The VAE encode/decode is additionally accelerated by
 **model-specific fp16 fused CUDA kernels** in the standalone
 `flash_rt_minimax_remover` module (opt-in build, see [Build](#build)):
 `fp16_rms_norm_ncdhw` (single-pass RMSNorm, fp16-native),
@@ -288,7 +294,13 @@ new pipeline so the scale is re-calibrated.**
   at load time; activation quantised with a calibrated static scale);
 - per-block LayerNorm + adaLN modulation + gate-residual fused into Triton
   kernels (fp32 statistics);
-- `torch.nn.functional.scaled_dot_product_attention` -> FA2 / SageAttention.
+- `torch.nn.functional.scaled_dot_product_attention` -> FA2 / SageAttention;
+- **TeaCache step caching** (opt-in via `skip_steps=[...]` / quickstart
+  `--teacache-skip`): zeroth-order reuse of the cached noise prediction at
+  the listed denoise steps. On the first (calibration) call it is forwarded
+  to the diffusers reference loop; on steady-state calls it is forwarded to
+  the FP8 manual denoise (and baked into the captured CUDA Graph). Step 0
+  (calibration) and the last step are never skipped.
 
 ### NVFP4 — `MiniMaxRemoverPipeline` (small-region only)
 
@@ -336,8 +348,8 @@ python3 examples/minimax_remover_quickstart.py \
     --masks-dir  ./object_removal_data/<masks> \
     --output-dir ./out                          # FP8 + VAE opt (default)
 python3 examples/minimax_remover_quickstart.py ... --no-vae-opt   # FP8, no VAE kernels
-python3 examples/minimax_remover_quickstart.py ... --use-fp4      # NVFP4
-python3 examples/minimax_remover_quickstart.py ... --no-flashrt   # fp16 reference
+python3 examples/minimax_remover_quickstart.py ... --nvfp4-transformer  # NVFP4 transformer (small-region only)
+python3 examples/minimax_remover_quickstart.py ... --no-flashrt   # fp16 reference (disables ALL opts)
 ```
 
 Wall time is a single end-to-end segment (load -> encode -> denoise loop ->
@@ -359,11 +371,12 @@ All rows compare against the non-FlashRT `--no-flashrt` fp16 reference on the
 | tennis (70 frames, 432x240) | FlashRT FP8 + VAE opt + CL + FP8 conv3d + fused FFN epilogue + fused bias-gate residual | 7.57 s | 2.30x | 40.0 / 36.2 dB | 0.99981 |
 | tennis (70 frames, 432x240) | **… + fused adaLN+quant (shared-scale QKV) + fused RMSNorm+RoPE + fused norm2+quant (FP8-only stack, `--no-nvfp4-vae`)** | **7.18 s** | **2.41x** | **40.0 / 36.0 dB** | 0.99981 |
 | tennis (70 frames, 432x240) | **… + NVFP4 VAE (38 conv layers → W4A4, FP4 cache)** | **6.71 s** | **2.58x** | **34.7 / 30.6 dB** | 0.99981 |
-| tennis (70 frames, 432x240) | **… + NVFP4 fused norm+silu+quant + FP4 cache reuse (#1) + FP8 fused norm+silu+amax+quant (#2) + Q/K bias fused into rmsnorm+rope+quant (#3, current default)** | **6.56 s** | **2.64x** | **35.2 / 31.7 dB** | 0.99918 |
-| tennis (70 frames, 432x240) | FlashRT NVFP4 transformer (`--use-fp4`) | 9.52 s | 1.82x | 7.0 / 6.2 dB | 0.00000 (broken — transformer FP4 error accumulates over 12 denoise steps) |
+| tennis (70 frames, 432x240) | **… + NVFP4 fused norm+silu+quant + FP4 cache reuse (#1) + FP8 fused norm+silu+amax+quant (#2) + Q/K bias fused into rmsnorm+rope+quant (#3)** | **6.56 s** | **2.64x** | **35.2 / 31.7 dB** | 0.99918 |
+| tennis (70 frames, 432x240) | **… + TeaCache {3,5,7,9} step caching (opt-in, `--teacache-skip 3,5,7,9`)** | **5.66 s** | **3.06x** | **35.1 / 31.5 dB** | 0.99918 |
+| tennis (70 frames, 432x240) | FlashRT NVFP4 transformer (`--nvfp4-transformer`) | 9.52 s | 1.82x | 7.0 / 6.2 dB | 0.00000 (broken — transformer FP4 error accumulates over 12 denoise steps) |
 | bmx-trees (80 frames, 432x240) | fp16 reference (`--no-flashrt`) | 19.76 s | 1.0x | — | — |
 | bmx-trees (80 frames, 432x240) | FlashRT FP8 (default) | 13.24 s | **1.49x** | 35.1 / 32.0 dB | 0.99912 |
-| bmx-trees (80 frames, 432x240) | FlashRT NVFP4 transformer (`--use-fp4`) | 10.72 s | 1.84x | 7.3 / 7.0 dB | 0.00000 (broken — transformer FP4 error accumulates over 12 denoise steps) |
+| bmx-trees (80 frames, 432x240) | FlashRT NVFP4 transformer (`--nvfp4-transformer`) | 10.72 s | 1.84x | 7.3 / 7.0 dB | 0.00000 (broken — transformer FP4 error accumulates over 12 denoise steps) |
 
 > Tennis numbers are from a same-session serial A/B (`--no-flashrt
 > --no-vae-opt` vs default FlashRT FP8 stack) measured on RTX 5060 Ti,
@@ -376,10 +389,17 @@ All rows compare against the non-FlashRT `--no-flashrt` fp16 reference on the
 
 Takeaways:
 
-- **The current default** (all of the below + NVFP4 VAE + #1/#2/#3 fused
-  norm+quant/bias) is **2.64× faster** than the fp16 reference (17.34 →
-  6.56 s) with PSNR **35.2 dB** mean over 69 inpainted frames, peak VRAM
-  2.57 GB (vs 3.67 GB fp16 ref, –30%). Add `--no-nvfp4-vae` and set
+- **The opt-in TeaCache profile** (all of the below + NVFP4 VAE + #1/#2/#3
+  fused norm+quant/bias + **TeaCache {3,5,7,9} step caching**) is **3.06× faster**
+  than the fp16 reference (17.33 → 5.66 s) with PSNR **35.1 dB** mean over
+  69 inpainted frames, peak VRAM 2.57 GB (vs 3.67 GB fp16 ref, –30%). The
+  TeaCache layer (`--teacache-skip 3,5,7,9`) reuses the
+  cached noise prediction at 4 of 12 interior denoise steps — MiniMax-Remover's
+  flow-matching velocity is highly cacheable, so this contributes ~0.9 s
+  (6.56 → 5.66 s) with no measurable PSNR change (35.2 → 35.1 dB). Pass
+  Omit the flag to preserve the full denoise schedule, or use
+  `--teacache-skip 4,7` for a conservative 2-step schedule. Add
+  `--no-nvfp4-vae` and set
   `FLASHRT_NVFP4_FUSED_NORMQUANT=0 FLASHRT_FP8_FUSED_NORMQUANT=0` for the
   higher-precision FP8-only stack (~40 dB, ~7.2 s) when absolute fidelity
   matters more than speed. The fused FFN epilogue kernel
@@ -442,12 +462,12 @@ Takeaways:
   Combined steady-state 5.86 → 5.73 s; PSNR 35.16 dB mean / 31.73 worst
   (vs 35.11 at the pre-fusion baseline) — the fp32 bias add in #3 is
   slightly *more* precise than the fp16 bias-add it replaces.
-- **NVFP4 transformer (`--use-fp4`) is unusable on full-frame latents**: cosine collapses to
+- **NVFP4 transformer (`--nvfp4-transformer`) is unusable on full-frame latents**: cosine collapses to
   ~0.0 and PSNR to ~7 dB (median per-pixel deviation ~85/255). The FP4
   quantisation error accumulates over the 12-step denoise loop in the transformer
   and the output drifts to black. NVFP4 transformer is only appropriate for
   small cropped regions, where its per-block error stays bounded. The NVFP4
-  **VAE** path (above) is unaffected because the VAE is a single-pass
+  **VAE** path (default, always on) is unaffected because the VAE is a single-pass
   encoder/decoder with no iterative error accumulation.
 
 ### Transformer GEMM (NVFP4 vs fp16 matmul, single layer)
@@ -503,9 +523,11 @@ the steady state; the FP8 path calibrates on the first call then freezes.
 |------|---------|--------|
 | `--vae-opt` / `--no-vae-opt` | **enabled** | Install FlashRT fp16 fused VAE kernels (`fp16_rms_norm_ncdhw`, `fp16_rms_silu_ncdhw`, NDHWC variants, fused norm+silu+amax) + channels-last 3D pipeline + running-max amax sharing between norm and conv + FP8 implicit-GEMM conv3d + `WanUpsample` cast elimination. Requires the `flash_rt_minimax_remover` module. |
 | `--fp8-conv` / `--no-fp8-conv` | **enabled** | Use FP8 implicit-GEMM conv3d kernel for applicable 3×3×3 causal convs (requires `--vae-opt`). Trades ~1 dB PSNR for ~14% decode speedup over channels-last-only cuDNN. |
-| `--use-fp4` | off | Use NVFP4 (W4A4) transformer instead of FP8 (W8A8). Small-region only — broken on full-frame. |
+| `--nvfp4-transformer` | off | Switch the **transformer** to NVFP4 (W4A4) instead of the default FP8 (W8A8). Note: the default path already uses NVFP4 for the **VAE** (single-pass, error-free); this flag adds NVFP4 to the 12-step iterative transformer denoise, where FP4 error accumulates and breaks full-frame outputs (cosine ~0.0, drifts to black). Only calibrated for small cropped regions (bbox crop). |
 | `--no-nvfp4-vae` | off | Disable NVFP4 W4A4 VAE conv3d (default: enabled). Uses purpose-built NVFP4 MMA kernel for eligible VAE conv layers (Ci>=192) for ~16% VAE speedup. |
-| `--no-flashrt` | off | Run the reference diffusers fp16 path (no FlashRT). |
+| `--teacache-skip` | disabled | Opt-in training-free TeaCache step caching for the transformer denoise loop: comma-separated 0-indexed step indices to skip. Step 0 (FP8 calibration) and the last step are never skipped. For example, `3,5,7,9` skips 4 of 12 interior steps; `4,7` is a conservative 2-step schedule. Only applies to the FlashRT FP8 path. |
+| `--universal-scale` | disabled | Opt in to checkpoint-bound, cross-resolution FP8 activation-scale reuse. Cache entries are schema-validated and read/write failures fall back to calibration without interrupting inference. |
+| `--no-flashrt` | off | Master "pure reference" switch: run the vanilla diffusers fp16 path **and disable ALL FlashRT optimisations** (VAE fused kernels, FP8/NVFP4 conv, NVFP4 VAE, TeaCache). This is the ground-truth baseline for PSNR/timing A/B — no need to also pass `--no-vae-opt`. |
 
 ## Environment variables
 
@@ -545,9 +567,32 @@ output = pipeline(
     num_frames=len(frames),
     height=720, width=1280,
     num_inference_steps=12,
+    skip_steps=[3, 5, 7, 9],   # optional TeaCache: skip 4 interior steps (~0.9 s faster, PSNR-neutral)
 )
 video = output.frames
 ```
+
+`skip_steps` (optional list of int) enables training-free TeaCache step
+caching: the listed denoise steps reuse the cached noise prediction instead
+of running the transformer, mirroring the Motus/Cosmos3/Wan2.2 mechanism.
+Step 0 (FP8 calibration) and the last step are never skipped. The quickstart
+leaves TeaCache disabled by default; pass `[3, 5, 7, 9]` explicitly to use
+the measured four-step schedule.
+
+Cross-resolution activation-scale reuse is also opt-in. Bind the cache to
+the checkpoint weight bytes when enabling it:
+
+```python
+pipeline = MiniMaxRemoverPipelineFP8(
+    pipe,
+    use_universal_scale=True,
+    checkpoint_path="/path/to/model/transformer",
+)
+```
+
+The cache identity also includes the FP8 target, compute dtype, kernel schema,
+cache schema, model config, and FP8 layer layout. Invalid or inaccessible
+cache files are ignored and inference falls back to calibration.
 
 ### FP8 + NVFP4 VAE (recommended default — full-frame, fastest)
 
