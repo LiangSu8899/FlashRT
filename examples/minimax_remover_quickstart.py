@@ -11,7 +11,7 @@ This is a FlashRT optimization of the upstream project:
 
 It wraps a loaded diffusers MiniMax-Remover pipeline with
 ``flash_rt.models.minimax_remover.MiniMaxRemoverPipelineFP8`` (default) or
-``MiniMaxRemoverPipeline`` (NVFP4, --use-fp4). The FP8 path rewrites the
+``MiniMaxRemoverPipeline`` (NVFP4 transformer, --nvfp4-transformer). The FP8 path rewrites the
 transformer denoise path onto FP8 (W8A8) GEMMs with static calibration,
 fused norm/RoPE/gelu kernels and kernel attention; the NVFP4 path adds a
 graph-captured manual flow-matching loop. FP8 stays close to the fp16
@@ -59,9 +59,17 @@ Run
 ------------------------------------------------------------------
 Precision note
 ------------------------------------------------------------------
-NVFP4 (W4A4) is calibrated for the model's large GEMMs. The fused
-norm/RoPE kernels keep the precision-critical path fp32-stat. For
-large full-frame latents, 4-bit weight/activation quantisation can
+The default path uses FP8 (W8A8) for the transformer and NVFP4 (W4A4)
+for the VAE conv layers. The NVFP4 VAE is safe because the VAE is a
+single-pass encoder/decoder (no error accumulation).
+
+`--nvfp4-transformer` additionally switches the TRANSFORMER to NVFP4
+(W4A4). The 12-step iterative denoise accumulates FP4 error, so
+full-frame latents drift to black (cosine ~0.0). Only use it for small
+cropped regions (bbox crop) where per-block error stays bounded.
+
+The fused norm/RoPE kernels keep the precision-critical path fp32-stat.
+For large full-frame latents, 4-bit weight/activation quantisation can
 accumulate small per-block error; if you observe colour drift on a
 high-resolution full-frame job, prefer the bbox-cropped regime (crop
 to the mask region before inference) where the quantisation grid is
@@ -94,6 +102,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
 
+# OpenCV's PNG/JPEG encoders are faster than PIL (notably ~20% on PNG) and
+# release the GIL, so prefer cv2 when available; fall back to PIL otherwise.
+# cv2's own import is ~0.19s, so only probe for its presence here and defer
+# the actual import to _save_one (startup-critical path stays untaxed).
+import importlib.util as _ilu
+_CV2_SPEC = _ilu.find_spec("cv2")
+
 # Make the flash_rt package importable when run directly from the repo root.
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -123,6 +138,7 @@ MASK_THRESHOLD = 127
 NUM_INFERENCE_STEPS = 12
 PIPE_ITERATIONS = 6
 RANDOM_SEED = 42
+TEACACHE_SKIP_DEFAULT = ""
 
 
 # =====================================================================
@@ -397,7 +413,8 @@ class MinimaxRemoverPipeline(DiffusionPipeline):
                  images: Optional[torch.Tensor] = None,
                  masks: Optional[torch.Tensor] = None,
                  latents: Optional[torch.Tensor] = None,
-                 output_type: Optional[str] = "np", iterations: int = 16):
+                 output_type: Optional[str] = "np", iterations: int = 16,
+                 skip_steps: Optional[List[int]] = None):
         device = self._execution_device
         batch_size = 1
         transformer_dtype = torch.float16
@@ -432,14 +449,28 @@ class MinimaxRemoverPipeline(DiffusionPipeline):
             masks_latents = (masks_latents - latents_mean) * latents_std
 
         self._num_timesteps = len(timesteps)
+        skip_set = set(skip_steps) if skip_steps else set()
+        skip_set.discard(0)
+        if len(timesteps) > 1:
+            skip_set.discard(len(timesteps) - 1)
+        cached_noise_pred = None
+        n_skipped = 0
         for i, t in enumerate(timesteps):
-            latent_model_input = latents.to(transformer_dtype)
-            latent_model_input = torch.cat(
-                [latent_model_input, masked_latents, masks_latents], dim=1)
-            timestep = t.expand(latents.shape[0])
-            noise_pred = self.transformer(
-                hidden_states=latent_model_input.half(), timestep=timestep)[0]
+            if i in skip_set and cached_noise_pred is not None:
+                noise_pred = cached_noise_pred
+                n_skipped += 1
+            else:
+                latent_model_input = latents.to(transformer_dtype)
+                latent_model_input = torch.cat(
+                    [latent_model_input, masked_latents, masks_latents], dim=1)
+                timestep = t.expand(latents.shape[0])
+                noise_pred = self.transformer(
+                    hidden_states=latent_model_input.half(), timestep=timestep)[0]
+                cached_noise_pred = noise_pred
             latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+        if n_skipped:
+            print(f"  [teacache] reused cached noise_pred at {n_skipped}/{len(timesteps)} "
+                  f"steps (training-free step caching)")
 
         latents = latents.half() / latents_std + latents_mean
         video = self.vae.decode(latents, return_dict=False)[0]
@@ -585,13 +616,14 @@ def parse_args() -> argparse.Namespace:
                    help="Denoise steps (default 12).")
     p.add_argument("--no-flashrt", action="store_true",
                    help="Run the reference diffusers path instead of FlashRT (for diffing).")
-    p.add_argument("--use-fp4", action="store_true",
-                   help="Use NVFP4 (W4A4) instead of the default FP8 (W8A8). "
-                        "NVFP4 is only calibrated for small cropped regions "
-                        "(bbox crop); full-frame inpainting will produce "
-                        "black/drift outputs. FP8 (default) is recommended "
-                        "for full-frame inpainting (end-to-end cosine >= 0.999, "
-                        "PSNR ~35-41 dB vs fp16).")
+    p.add_argument("--nvfp4-transformer", action="store_true",
+                   help="Switch the TRANSFORMER to NVFP4 (W4A4) instead of the "
+                        "default FP8 (W8A8). Note: the default path already uses "
+                        "NVFP4 for the VAE (single-pass, error-free); this flag "
+                        "adds NVFP4 to the 12-step iterative transformer denoise, "
+                        "where FP4 error accumulates and breaks full-frame "
+                        "outputs (cosine ~0.0, drifts to black). Only calibrated "
+                        "for small cropped regions (bbox crop). (default: off)")
     p.add_argument("--vae-opt", action=argparse.BooleanOptionalAction,
                    default=True,
                    help="Apply FlashRT VAE optimisations: fused fp16 RMS_norm "
@@ -609,6 +641,30 @@ def parse_args() -> argparse.Namespace:
                    help="Disable NVFP4 W4A4 VAE conv3d (default: enabled). "
                         "Uses purpose-built NVFP4 MMA kernel for eligible "
                         "decode conv layers (Ci>=192) for ~3-7%% VAE speedup.")
+    p.add_argument("--teacache-skip", type=str, default=TEACACHE_SKIP_DEFAULT,
+                   help="Training-free TeaCache step caching: comma-separated "
+                        "0-indexed denoise step indices to SKIP (reuse the "
+                        "cached noise prediction from the last computed step, "
+                        "matching the Motus/Cosmos3 TeaCache mechanism). Step 0 "
+                        "and the last step are never skipped. For example, "
+                        "'3,5,7,9' skips 4 of 12 interior steps. "
+                        "(default: disabled)")
+    p.add_argument("--universal-scale", action=argparse.BooleanOptionalAction,
+                   default=False,
+                   help="Persist FP8 activation scales to disk "
+                        "(~/.flash_rt/calibration/) after the first run and "
+                        "reuse them across ALL resolutions on subsequent runs "
+                        "(margin=--universal-margin). Eliminates the per-call "
+                        "FP8 calibration step + Triton JIT cold-start for a "
+                        "~23%% cold-call speedup. PSNR >= 36 dB vs fp16 across "
+                        "288x160..480x272. This approximate cross-resolution "
+                        "reuse path is opt-in. (default: disabled)")
+    p.add_argument("--universal-margin", type=float, default=1.3,
+                   help="FP8 act_scale margin for the universal-scale path "
+                        "(default 1.3). Cross-resolution amax varies <5%% in "
+                        "median but ~3%% of layers deviate >20%%; the enlarged "
+                        "margin safely covers this. Lower (1.1) = higher "
+                        "fidelity but saturation risk at unseen resolutions.")
     return p.parse_args()
 
 
@@ -663,14 +719,21 @@ def main() -> None:
 
     pipe = build_pipeline(model_dir)
 
-    if args.vae_opt:
+    # --no-flashrt is the master "pure reference" switch: it disables ALL
+    # FlashRT optimisations (VAE fused kernels, FP8/NVFP4 conv, step
+    # caching) so the run is a vanilla fp16 diffusers ground truth — the
+    # baseline for PSNR/timing A/B. Users need not also pass --no-vae-opt.
+    vae_opt = args.vae_opt and not args.no_flashrt
+    nvfp4_vae = (vae_opt and not args.nvfp4_transformer and not args.no_nvfp4_vae)
+
+    if vae_opt:
         from flash_rt.models.minimax_remover._vae_opt import install_vae_optimizations
         stats = install_vae_optimizations(pipe.vae,
                                            use_fp8_conv=args.fp8_conv)
         print(f"  VAE optimised: {stats}")
 
     # NVFP4 VAE conv3d (default ON for FlashRT FP8 path; --no-nvfp4-vae to disable)
-    if args.vae_opt and not args.no_flashrt and not args.use_fp4 and not args.no_nvfp4_vae:
+    if nvfp4_vae:
         from flash_rt.models.minimax_remover._vae_nvfp4 import install_vae_nvfp4
         nvfp4_stats = install_vae_nvfp4(pipe.vae)
         if nvfp4_stats.get('enabled'):
@@ -679,13 +742,17 @@ def main() -> None:
     if args.no_flashrt:
         runner = pipe
         tag = "reference (diffusers fp16)"
-    elif args.use_fp4:
+    elif args.nvfp4_transformer:
         from flash_rt.models.minimax_remover import MiniMaxRemoverPipeline
         runner = MiniMaxRemoverPipeline(pipe)
-        tag = "FlashRT NVFP4 W4A4 (small-region only)"
+        tag = "FlashRT NVFP4 W4A4 transformer (small-region only)"
     else:
         from flash_rt.models.minimax_remover import MiniMaxRemoverPipelineFP8
-        runner = MiniMaxRemoverPipelineFP8(pipe)
+        runner = MiniMaxRemoverPipelineFP8(
+            pipe,
+            use_universal_scale=args.universal_scale,
+            universal_margin=args.universal_margin,
+            checkpoint_path=model_dir / "transformer")
         tag = "FlashRT FP8 W8A8 (full-frame)"
 
     t, h, w, _ = frames_padded.shape
@@ -693,15 +760,27 @@ def main() -> None:
     images_tensor = images_tensor / 127.5 - 1.0
     masks_infer = torch.from_numpy(masks_padded.astype(np.float32))
 
+    skip_steps = None
+    # TeaCache only applies to the FlashRT FP8 path. The `--no-flashrt`
+    # reference is the fp16 ground truth (full N-step denoise) used for
+    # PSNR/timing A/B, so never skip steps there even if --teacache-skip
+    # is explicitly set. The `--nvfp4-transformer` NVFP4 wrapper
+    # does not accept skip_steps, so it is also excluded.
+    if args.teacache_skip.strip() and not args.no_flashrt and not args.nvfp4_transformer:
+        skip_steps = sorted({int(s) for s in args.teacache_skip.split(",") if s.strip()})
+
     print(f"  running inference [{tag}] (all frames at once)...")
     torch.cuda.reset_peak_memory_stats()
     torch.cuda.empty_cache()
     t0 = time.time()
-    out = runner(
+    call_kwargs = dict(
         images=images_tensor, masks=masks_infer, num_frames=t,
         height=h, width=w, num_inference_steps=args.num_inference_steps,
         generator=torch.Generator(device=DEVICE).manual_seed(RANDOM_SEED),
-        iterations=args.iterations).frames[0]
+        iterations=args.iterations)
+    if skip_steps is not None:
+        call_kwargs["skip_steps"] = skip_steps
+    out = runner(**call_kwargs).frames[0]
     torch.cuda.synchronize()
     elapsed = time.time() - t0
     print(f"  inference wall time: {elapsed:.2f}s")
@@ -710,19 +789,58 @@ def main() -> None:
     proc_len = out_u8.shape[0]
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    saved = inpainted = uncovered = 0
+    # Pre-build the per-frame output arrays, then fan out the (CPU-bound)
+    # PNG/JPEG encoding + disk writes across a thread pool. zlib/jpeg release
+    # the GIL while compressing, so this scales near-linearly with cores --
+    # the sequential loop below was a major fraction of end-to-end wall time.
+    tasks: List[Tuple[Path, np.ndarray, str]] = []
+    inpainted = uncovered = 0
     for local_i, path in enumerate(image_paths):
-        dst = output_dir / path.name
+        ext = path.suffix.lower()
         if local_i < proc_len and has_region[local_i]:
-            crop = out_u8[local_i, :orig_h, :orig_w, :]
-            Image.fromarray(crop, mode="RGB").save(dst)
+            tasks.append((output_dir / path.name,
+                          np.ascontiguousarray(out_u8[local_i, :orig_h, :orig_w, :]),
+                          ext))
             inpainted += 1
-        elif local_i >= proc_len and has_region[local_i]:
-            Image.fromarray(frames[local_i], mode="RGB").save(dst)
-            uncovered += 1
         else:
-            Image.fromarray(frames[local_i], mode="RGB").save(dst)
-        saved += 1
+            if local_i >= proc_len and has_region[local_i]:
+                uncovered += 1
+            tasks.append((output_dir / path.name,
+                          np.ascontiguousarray(frames[local_i]), ext))
+
+    def _save_one(task: Tuple[Path, np.ndarray, str]) -> None:
+        dst, arr, ext = task
+        if _CV2_SPEC is not None:
+            # Lazy import: cv2 is ~0.19s to import, paid once on first save
+            # rather than at process startup. Python caches it, so the cost
+            # is only incurred by the first thread; the import lock keeps
+            # concurrent threads safe.
+            import cv2
+            # cv2 expects BGR; our arrays are RGB.
+            bgr = np.ascontiguousarray(arr[:, :, ::-1])
+            if ext == ".png":
+                saved_ok = cv2.imwrite(
+                    str(dst), bgr, [cv2.IMWRITE_PNG_COMPRESSION, 3]
+                )
+            else:
+                saved_ok = cv2.imwrite(
+                    str(dst), bgr, [cv2.IMWRITE_JPEG_QUALITY, 95]
+                )
+            if not saved_ok:
+                raise OSError(f"failed to write output frame: {dst}")
+        elif ext == ".png":
+            Image.fromarray(arr).save(dst, compress_level=3)
+        else:
+            Image.fromarray(arr).save(dst, quality=95)
+
+    max_workers = max(1, min(8, (os.cpu_count() or 4), len(tasks)))
+    if len(tasks) <= 1 or max_workers <= 1:
+        for task in tasks:
+            _save_one(task)
+    else:
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            list(ex.map(_save_one, tasks))
+    saved = len(tasks)
 
     peak_alloc = torch.cuda.max_memory_allocated() / 1024 ** 3
     peak_reserved = torch.cuda.max_memory_reserved() / 1024 ** 3

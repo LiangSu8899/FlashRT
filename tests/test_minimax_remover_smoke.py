@@ -384,7 +384,11 @@ def test_fp8_pipeline_call_does_not_patch_pipe_class(monkeypatch):
     pipe2 = _CallablePipe("pipe2")
     original_call = _CallablePipe.__call__
 
-    wrapped = _fp8_pipeline.MiniMaxRemoverPipelineFP8(pipe1)
+    # use_universal_scale=False keeps this class-isolation test off the
+    # cross-resolution scale-cache path, which needs a realistic dict-like
+    # transformer.config and would write to ~/.flash_rt/calibration/.
+    wrapped = _fp8_pipeline.MiniMaxRemoverPipelineFP8(
+        pipe1, use_universal_scale=False)
 
     assert _CallablePipe.__call__ is original_call
     assert pipe2("unwrapped") == ("pipe2", ("unwrapped",), {})
@@ -406,6 +410,403 @@ def test_fp8_pipeline_call_does_not_patch_pipe_class(monkeypatch):
     assert wrapped("again") == ("pipe1", ("again",), {})
     assert set_calibration_calls == [True]
     assert freeze_calls == [1.1]
+
+
+# ── 5. TeaCache step-caching plumbing (skip_steps) ──
+
+def test_fp8_pipeline_call_forwards_skip_steps_to_pipe(monkeypatch):
+    """skip_steps reaches the wrapped pipe's __call__ on the calibration call.
+
+    The single-call quickstart runs the first (calibration) call through the
+    diffusers reference ``__call__``, so the TeaCache schedule must be
+    forwarded there for it to take effect without a warm-up pass.
+    """
+    import torch
+
+    from flash_rt.models.minimax_remover import _fp8_pipeline
+
+    # Exercise the delegation path (orig pipe __call__) rather than the
+    # eager-manual denoise default, so the stub does not need a real
+    # transformer/scheduler.
+    monkeypatch.setenv("FLASHRT_FP8_EAGER_MANUAL", "0")
+    monkeypatch.setattr(_fp8_pipeline, "load_fp8_kernels", lambda: object())
+
+    def _fake_runtime():
+        def install_flashrt_fp8(_t, verbose=True, target="all"):
+            return 0
+
+        def set_calibration(_t, on):
+            return None
+
+        def freeze_calibration(_t, margin=1.1):
+            return 3
+
+        def install_fused_blocks(_t):
+            return 0
+
+        def install_fa2_attention(_t):
+            return 0
+
+        return (install_flashrt_fp8, set_calibration, freeze_calibration,
+                install_fused_blocks, install_fa2_attention)
+
+    monkeypatch.setattr(_fp8_pipeline, "_import_runtime_fp8", _fake_runtime)
+
+    class _Param:
+        dtype = torch.float16
+
+    class _Transformer:
+        def __init__(self):
+            self.config = types.SimpleNamespace(eps=1e-6)
+            self._hooks = []
+
+        def to(self, _d):
+            return self
+
+        def parameters(self):
+            return iter([_Param()])
+
+        def register_forward_hook(self, fn):
+            self._hooks.append(fn)
+
+            class _Handle:
+                def remove(_self):
+                    pass
+
+            return _Handle()
+
+        def _fire_hooks(self):
+            for fn in list(self._hooks):
+                fn(self, None, None)
+
+    class _Vae:
+        def parameters(self):
+            return iter([_Param()])
+
+    received = []
+
+    class _Pipe:
+        def __init__(self):
+            self.transformer = _Transformer()
+            self.vae = _Vae()
+
+        def __call__(self, *args, **kwargs):
+            received.append(dict(kwargs))
+            # Fire the one-shot calibration freeze hook on the first call.
+            self.transformer._fire_hooks()
+            return ("ok", args, kwargs)
+
+    # use_universal_scale=False avoids the disk-backed scale cache so this
+    # skip_steps-forwarding test stays hermetic (no ~/.flash_rt writes).
+    wrapped = _fp8_pipeline.MiniMaxRemoverPipelineFP8(
+        _Pipe(), use_universal_scale=False)
+    out = wrapped(num_frames=5, skip_steps=[3, 5, 7, 9])
+
+    assert out[0] == "ok"
+    assert received, "wrapped pipe __call__ was never invoked"
+    assert received[0].get("skip_steps") == [3, 5, 7, 9], (
+        "skip_steps must be forwarded to the reference __call__ on the "
+        "calibration (first) call")
+
+
+def test_fp8_pipeline_does_not_forward_unsupported_skip_steps(caplog):
+    """A standard pipeline without ``skip_steps`` still calibrates safely."""
+    import logging
+
+    from flash_rt.models.minimax_remover import _fp8_pipeline
+
+    class _Handle:
+        def remove(self):
+            pass
+
+    class _Transformer:
+        def register_forward_hook(self, hook):
+            self.hook = hook
+            return _Handle()
+
+    class _Pipe:
+        def __call__(self, *, num_frames):
+            return num_frames
+
+    pipe = _Pipe()
+    wrapped = object.__new__(_fp8_pipeline.MiniMaxRemoverPipelineFP8)
+    wrapped._calibrated = False
+    wrapped._scale_dirty = False
+    wrapped._pipe_accepts_skip_steps = False
+    wrapped._warned_skip_steps_unsupported = False
+    wrapped._set_calibration = lambda _on: None
+    wrapped._freeze_calibration = lambda: 0
+    wrapped.transformer = _Transformer()
+    wrapped._orig_pipe_call = pipe.__call__
+    wrapped.calib_margin = 1.1
+
+    with caplog.at_level(logging.WARNING):
+        assert wrapped(num_frames=5, skip_steps=[3, 5]) == 5
+
+    assert "does not accept skip_steps" in caplog.text
+
+
+def test_fp8_manual_denoise_supports_skip_steps():
+    """The FP8 manual denoise carries skip_steps through every entry point."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    src = (root / "flash_rt/models/minimax_remover/_fp8_manual_denoise.py").read_text()
+
+    # Zeroth-order TeaCache reuse logic (skip step reuses cached noise_pred).
+    assert "cached_noise_pred" in src
+    assert "if step in skip_set and cached_noise_pred is not None:" in src
+    # The public denoise() / _denoise_loop_body() / _capture_graph() all
+    # carry the parameter.
+    assert src.count("skip_steps=None") >= 3
+    # The captured-graph cache key is per skip-schedule, because the skip
+    # set is baked into the graph at capture time (like Motus).
+    assert "skip_key" in src
+    assert "skip_steps=skip_steps" in src
+
+
+def test_fp8_pipeline_threads_skip_steps_to_manual_call():
+    """_manual_call carries skip_steps and forwards it to FP8ManualDenoise."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    src = (root / "flash_rt/models/minimax_remover/_fp8_pipeline.py").read_text()
+
+    # __call__ pops skip_steps out of the public kwargs...
+    assert 'skip_steps = kwargs.pop("skip_steps", None)' in src
+    # ...forwards it when the wrapped pipeline explicitly supports it...
+    assert "self._pipe_accepts_skip_steps" in src
+    assert 'fwd_kwargs["skip_steps"] = skip_steps' in src
+    # ...and threads it into _manual_call on the steady-state branches.
+    assert "skip_steps=skip_steps, **kwargs" in src
+    # _manual_call signature carries the parameter...
+    assert "skip_steps=None):" in src
+    # ...and forwards it to the FP8ManualDenoise.denoise().
+    assert "use_graph=use_graph, skip_steps=skip_steps" in src
+
+
+def test_quickstart_approximate_paths_are_opt_in():
+    """The quickstart preserves the original denoise and scale behavior."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    src = (root / "examples/minimax_remover_quickstart.py").read_text()
+
+    # Both approximate optimizations require explicit CLI flags.
+    assert 'TEACACHE_SKIP_DEFAULT = ""' in src
+    assert "default=TEACACHE_SKIP_DEFAULT" in src
+    universal_flag = src.index('p.add_argument("--universal-scale"')
+    assert "default=False" in src[universal_flag:universal_flag + 500]
+    # The reference __call__ carries the parameter...
+    assert "skip_steps: Optional[List[int]] = None" in src
+    # ...with zeroth-order reuse in the denoise loop.
+    assert "cached_noise_pred" in src
+    assert "if i in skip_set and cached_noise_pred is not None:" in src
+    # --no-flashrt is the master "pure reference" switch: it disables ALL
+    # FlashRT optimisations (no need to also pass --no-vae-opt).
+    assert "vae_opt = args.vae_opt and not args.no_flashrt" in src
+    # TeaCache is never applied on the reference path (ground truth = full
+    # N-step denoise for PSNR/timing A/B) nor on the NVFP4 transformer
+    # path (its wrapper does not accept skip_steps).
+    assert ("if args.teacache_skip.strip() and not args.no_flashrt "
+            "and not args.nvfp4_transformer:") in src
+
+
+def test_quickstart_checks_cv2_write_result():
+    """A failed OpenCV write must not be reported as a saved frame."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    src = (root / "examples/minimax_remover_quickstart.py").read_text()
+
+    assert "saved_ok = cv2.imwrite(" in src
+    assert "if not saved_ok:" in src
+    assert 'raise OSError(f"failed to write output frame: {dst}")' in src
+
+
+def test_sm89_attention_fallback_matches_only_known_error():
+    """Unrelated runtime errors must not be swallowed by the fallback."""
+    from flash_rt.models.minimax_remover._attention import (
+        _is_sm89_query_scale_shape_error,
+    )
+
+    assert _is_sm89_query_scale_shape_error(
+        RuntimeError("query_scale must have shape (1, 32)")
+    )
+    assert not _is_sm89_query_scale_shape_error(
+        RuntimeError("output must have shape (1, 32)")
+    )
+    assert not _is_sm89_query_scale_shape_error(
+        RuntimeError("query_scale is on the wrong device")
+    )
+
+
+def _make_scale_cache_wrapper(tmp_path, checkpoint_digest="a" * 64):
+    import torch
+
+    from flash_rt.models.minimax_remover import _fp8_pipeline
+
+    class _Layer:
+        in_features = 8
+        out_features = 16
+
+        def __init__(self):
+            self.weight_fp8 = torch.zeros(1)
+            self.act_amax_max = torch.tensor([224.0])
+            self.act_scale = torch.tensor([99.0])
+            self.calibrating = True
+
+    layer = _Layer()
+    wrapped = object.__new__(_fp8_pipeline.MiniMaxRemoverPipelineFP8)
+    wrapped.transformer = types.SimpleNamespace(config={"layers": 1})
+    wrapped.fp8_target = "all"
+    wrapped._compute_dtype_name = "float16"
+    wrapped._checkpoint_digest = checkpoint_digest
+    wrapped._scale_cache_dir = tmp_path
+    wrapped.universal_margin = 1.3
+    wrapped._scale_layers = lambda: [("block.proj", layer)]
+    return wrapped, layer
+
+
+def test_universal_scale_cache_is_checkpoint_bound(tmp_path):
+    """Changing checkpoint bytes changes both the digest and cache key."""
+    from flash_rt.models.minimax_remover import _fp8_pipeline
+
+    checkpoint = tmp_path / "model.safetensors"
+    checkpoint.write_bytes(b"first weights")
+    first = _fp8_pipeline._checkpoint_weights_digest(checkpoint)
+    checkpoint.write_bytes(b"second weights")
+    second = _fp8_pipeline._checkpoint_weights_digest(checkpoint)
+
+    assert first != second
+    first_wrapper, _ = _make_scale_cache_wrapper(tmp_path / "cache", first)
+    second_wrapper, _ = _make_scale_cache_wrapper(tmp_path / "cache", second)
+    assert first_wrapper._model_fingerprint() != second_wrapper._model_fingerprint()
+    assert first_wrapper._scale_cache_path() != second_wrapper._scale_cache_path()
+
+
+def test_universal_scale_cache_round_trip_and_validation(tmp_path):
+    """Only a complete, finite, schema-matching cache may mutate scales."""
+    import json
+
+    wrapped, layer = _make_scale_cache_wrapper(tmp_path)
+    assert wrapped._dump_universal_scales()
+    cache = wrapped._scale_cache_path()
+    payload = json.loads(cache.read_text())
+    assert payload["schema_version"] == 2
+    assert payload["checkpoint_digest"] == "a" * 64
+    assert payload["fp8_target"] == "all"
+    assert payload["compute_dtype"] == "float16"
+
+    layer.act_scale.fill_(99.0)
+    assert wrapped._load_universal_scales()
+    assert layer.act_scale.item() == pytest.approx(224.0 * 1.3 / 448.0)
+    assert not layer.calibrating
+
+    for invalid in (
+        [],
+        {**payload, "schema_version": 1},
+        {
+            **payload,
+            "layers": [{**payload["layers"][0], "amax_max": float("nan")}],
+        },
+    ):
+        cache.write_text(json.dumps(invalid))
+        layer.act_scale.fill_(77.0)
+        assert not wrapped._load_universal_scales()
+        assert layer.act_scale.item() == 77.0
+
+
+def test_universal_scale_cache_write_failure_is_nonfatal(
+        tmp_path, monkeypatch, caplog):
+    """Read-only or failed cache storage must not interrupt inference."""
+    import logging
+
+    from flash_rt.models.minimax_remover import _fp8_pipeline
+
+    wrapped, _ = _make_scale_cache_wrapper(tmp_path)
+
+    def _fail_replace(_source, _destination):
+        raise OSError("read-only cache")
+
+    monkeypatch.setattr(_fp8_pipeline.os, "replace", _fail_replace)
+    with caplog.at_level(logging.WARNING):
+        assert not wrapped._dump_universal_scales()
+    assert "inference will continue" in caplog.text
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_universal_scale_cache_read_failure_is_nonfatal(caplog):
+    """An inaccessible cache falls back without touching existing scales."""
+    import logging
+
+    wrapped, layer = _make_scale_cache_wrapper(None)
+
+    class _UnreadableCache:
+        @staticmethod
+        def is_file():
+            return True
+
+        @staticmethod
+        def read_text(**_kwargs):
+            raise OSError("cache is not readable")
+
+    wrapped._scale_cache_path = lambda: _UnreadableCache()
+    with caplog.at_level(logging.WARNING):
+        assert not wrapped._load_universal_scales()
+    assert layer.act_scale.item() == 99.0
+    assert "cache ignored" in caplog.text
+
+
+def test_fp8_pipeline_universal_scale_default_is_off():
+    """Constructing the wrapper must retain per-resolution calibration."""
+    import inspect
+
+    from flash_rt.models.minimax_remover import _fp8_pipeline
+
+    parameter = inspect.signature(
+        _fp8_pipeline.MiniMaxRemoverPipelineFP8
+    ).parameters["use_universal_scale"]
+    assert parameter.default is False
+
+
+# ── 6. --nvfp4-transformer naming (replaces the confusing --use-fp4) ──
+
+def test_quickstart_nvfp4_transformer_flag_naming():
+    """The transformer-NVFP4 flag is named --nvfp4-transformer, not --use-fp4.
+
+    The old ``--use-fp4`` name was misleading because the default path
+    *already* uses NVFP4 for the VAE. The renamed flag makes explicit that
+    it switches the **transformer** (the 12-step iterative denoise, where
+    FP4 error accumulates) — distinct from the always-on NVFP4 VAE.
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    src = (root / "examples/minimax_remover_quickstart.py").read_text()
+
+    # New flag is present...
+    assert '"--nvfp4-transformer"' in src
+    assert "args.nvfp4_transformer" in src
+    # ...and the old confusing name is gone from the quickstart.
+    assert '"--use-fp4"' not in src
+    assert "args.use_fp4" not in src
+    # The NVFP4 VAE install is gated on the new attribute.
+    assert "not args.nvfp4_transformer and not args.no_nvfp4_vae" in src
+
+
+def test_quickstart_nvfp4_transformer_excludes_nvfp4_vae():
+    """--nvfp4-transformer disables the NVFP4 VAE (the two NVFP4 paths are
+    mutually exclusive: VAE NVFP4 is validated only on the FP8 transformer
+    path, and the NVFP4 transformer path is a standalone small-region
+    experiment)."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    src = (root / "examples/minimax_remover_quickstart.py").read_text()
+
+    # nvfp4_vae is False when nvfp4_transformer is set.
+    assert "nvfp4_vae = (vae_opt and not args.nvfp4_transformer" in src
 
 
 # ── 4. Gated build: required symbols present and callable ──
