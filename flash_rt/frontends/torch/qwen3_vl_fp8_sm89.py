@@ -69,7 +69,8 @@ class Qwen3VlFp8Sm89TextFrontend:
                  fuse_gate_up: bool = True,
                  fuse_qk_postproc: bool = True,
                  use_fp8_lm_head: bool = True,
-                 max_decode_graphs: int | None = None) -> None:
+                 max_decode_graphs: int | None = None,
+                 use_silu_fold_prefill: bool = False) -> None:
         import json
 
         self.checkpoint_path = str(checkpoint_path)
@@ -80,6 +81,21 @@ class Qwen3VlFp8Sm89TextFrontend:
         self.fuse_gate_up = bool(fuse_gate_up)
         self.fuse_qk_postproc = bool(fuse_qk_postproc)
         self.use_fp8_lm_head = bool(use_fp8_lm_head)
+        # Opt-in: fuse gate_up GEMM + silu_mul + FP8 quant into one megakernel
+        # on the prefill path (only the small-M / launch-bound regime benefits;
+        # gated per-call on S below the crossover). Default off → baseline
+        # two-launch path runs unchanged. Env override:
+        # FLASH_RT_SM89_SILU_FOLD_PREFILL=1 forces on, =0 forces off.
+        env_fold = os.environ.get('FLASH_RT_SM89_SILU_FOLD_PREFILL')
+        self.use_silu_fold_prefill = (
+            bool(use_silu_fold_prefill) if env_fold is None
+            else env_fold == '1')
+        # The fused 32x128 tile beats the two-launch baseline only in the
+        # launch-bound (small-S) regime; above the crossover the gate_up GEMM
+        # is compute-bound and the fused kernel's two-pass drain loses. The
+        # winning S band is resolved per-inter after config load (see below).
+        self._silu_fold_band = None  # resolved after config load
+        self._silu_fold_tile = None  # resolved after self._fvk is set (below)
         self._tokenizer: Any = None
         self._weights = None
         self._cfg: dict | None = None
@@ -136,6 +152,10 @@ class Qwen3VlFp8Sm89TextFrontend:
                 'and build flash_rt_kernels flash_rt_fa2 '
                 'flash_rt_qwen3_vl_kernels.')
         self._fvk = fvk
+        if self.use_silu_fold_prefill:
+            self._silu_fold_tile = getattr(
+                fvk, 'fp8_bs_geglu_silu_fold_sm89_fp8out', None)
+            self.use_silu_fold_prefill = self._silu_fold_tile is not None
 
         cfg_path = os.path.join(self.checkpoint_path, 'config.json')
         cfg = json.load(open(cfg_path))
@@ -170,6 +190,16 @@ class Qwen3VlFp8Sm89TextFrontend:
                 'Qwen3VlFp8Sm89TextFrontend requires Qwen3-VL config '
                 'dimensions compatible with the SM89 block-128 FP8 kernels: '
                 + '; '.join(problems) + f' (from {cfg_path})')
+
+        # Resolve the silu-fold S crossover from inter: the fused 32x128 tile's
+        # two-pass drain tax scales with K=hidden and the gate_up compute
+        # density, so the wider-MLP 8B (inter=12288) crosses over sooner than
+        # 2B (inter=6144). Tuned on 4090 (issue #1 Phase 2 e2e sweep).
+        if self.use_silu_fold_prefill:
+            # Winning S band (tuned on 4090, issue #1 Phase 2): the fused
+            # 32x128 tile needs enough M-tiles to fill the 128-SM grid but
+            # stays below the compute-bound crossover. 2B: [64,192]; 8B: [96,128].
+            self._silu_fold_band = ((96, 192) if inter <= 8192 else (128, 128))
 
         self._load_fp8_path()
         self._alloc_buffers()
@@ -651,13 +681,28 @@ class Qwen3VlFp8Sm89TextFrontend:
         up_out = self._prefill_up_out[:S]
         ap_dn, sc_dn, down_out = self._prefill_fp8_scratch[(hidden, inter)]
         if self.fuse_gate_up:
-            _, _, gate_up_out = self._prefill_fp8_scratch[(2 * inter, hidden)]
-            self._prefill_gemm(
-                ap_mlp, sc_mlp, int(lw['gate_up_w']), int(lw['gate_up_s']),
-                gate_up_out, int(lw['gate_up_N']), hidden, S)
-            fvk.silu_mul_merged_to_fp8_block128_bf16(
-                gate_up_out[:S].data_ptr(),
-                ap_dn.data_ptr(), sc_dn.data_ptr(), S, inter, s)
+            # Opt-in megakernel: gate_up GEMM + silu_mul + FP8 quant in one
+            # launch, but only in the small-M (launch-bound) regime where the
+            # ncu/bench sweep showed it beats the two-launch baseline. Above the
+            # winning S band the gate_up GEMM is compute-bound and the fused
+            # kernel's two-pass drain + lower compute density loses.
+            lo, hi = self._silu_fold_band or (0, 0)
+            if (self.use_silu_fold_prefill and self._silu_fold_tile is not None
+                    and lo <= S <= hi
+                    and (inter % 128) == 0 and (hidden % 128) == 0):
+                self._silu_fold_tile(
+                    ap_mlp.data_ptr(), int(lw['gate_up_w']),
+                    S, inter, hidden,
+                    sc_mlp.data_ptr(), int(lw['gate_up_s']),
+                    ap_dn.data_ptr(), sc_dn.data_ptr(), s)
+            else:
+                _, _, gate_up_out = self._prefill_fp8_scratch[(2 * inter, hidden)]
+                self._prefill_gemm(
+                    ap_mlp, sc_mlp, int(lw['gate_up_w']), int(lw['gate_up_s']),
+                    gate_up_out, int(lw['gate_up_N']), hidden, S)
+                fvk.silu_mul_merged_to_fp8_block128_bf16(
+                    gate_up_out[:S].data_ptr(),
+                    ap_dn.data_ptr(), sc_dn.data_ptr(), S, inter, s)
         else:
             self._prefill_gemm(
                 ap_mlp, sc_mlp, int(lw['mlp_gate_w']), int(lw['mlp_gate_s']),

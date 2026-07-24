@@ -292,6 +292,45 @@ PYBIND11_MODULE(flash_rt_qwen3_vl_kernels, m) {
         py::arg("act_block_scale"), py::arg("w_block_scale"),
         py::arg("stream") = 0);
 
+    // GeGLU silu-fold (production entry, env-gated by the caller): fuses the
+    // gate_up GEMM + silu_mul + per-token block-128 FP8 quant into one launch.
+    // This is a NEW binding (no legacy alias replaced). Argument shapes:
+    //   A         : [M, K]        FP8 e4m3 row-major   (per-token quantized act)
+    //   B         : [2*N, K]      FP8 e4m3 row-major   (gate_up_w: gate rows
+    //                                                  [0,N), up rows [N,2N))
+    //   act_scale : [M, K/128]    fp32 row-major
+    //   w_scale   : [2*N/128, K/128] fp32 row-major    (gate_up_s; up row =
+    //                                                  gate row + N/128)
+    //   output    : [M, N]        FP8 e4m3 row-major
+    //   out_scale : [M, N/128]    fp32 row-major
+    // N and K must be multiples of 128. Beats the baseline (gate_up GEMM +
+    // silu_mul) only in the small-M (launch-bound) regime; the frontend
+    // dispatcher gates on M before calling this. Additive: the baseline path is
+    // unchanged when this is not selected. See fp8_bs_geglu_silu_fold_kernel in
+    // fp8_bs_gemm_device.cuh.
+    m.def("fp8_bs_geglu_silu_fold_sm89_fp8out",
+        [](uintptr_t A, uintptr_t B,
+           int M, int N, int K,
+           uintptr_t act_scale, uintptr_t w_scale,
+           uintptr_t output, uintptr_t out_scale,
+           uintptr_t stream) {
+            int rc = flash_rt::gemm::block128_sm89::
+                fp8_bs_geglu_silu_fold_sm89_32x128_w4_s1(
+                    to_ptr(A), to_ptr(B), M, N, K,
+                    reinterpret_cast<const float*>(act_scale),
+                    reinterpret_cast<const float*>(w_scale),
+                    to_ptr(output), reinterpret_cast<float*>(out_scale),
+                    to_stream(stream));
+            if (rc != 0)
+                throw std::runtime_error(
+                    "fp8_bs_geglu_silu_fold_sm89_fp8out launch failed");
+        },
+        py::arg("A"), py::arg("B"),
+        py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("act_block_scale"), py::arg("w_block_scale"),
+        py::arg("output"), py::arg("out_scale"),
+        py::arg("stream") = 0);
+
     // Bench-only tile-variant bindings for prefill GEMM tuning. Not used by
     // the frontend; exposed only for explicit Qwen3-VL dev builds so the
     // production pybind surface stays runtime-only.
@@ -306,6 +345,32 @@ PYBIND11_MODULE(flash_rt_qwen3_vl_kernels, m) {
     BIND_GEMM_TILE(fp8_block128_gemm_bs_sm89_64x128x128_w8);
     BIND_GEMM_TILE(fp8_block128_gemm_bs_sm89_128x128x128_w8);
 #undef BIND_GEMM_TILE
+
+    // Residual-fold GEMM bench bindings: D = bf16(acc) + resid. Same tile set
+    // as the residual-fold kernels (fp8_block128_gemm_*_resid). Exposed only for
+    // dev builds so the production pybind surface stays runtime-only.
+#define BIND_GEMM_TILE_RESID(NAME)                                                   m.def("bench_" #NAME,                                                          [](uintptr_t A, uintptr_t B, uintptr_t D, int M, int N, int K,                   uintptr_t act_scale, uintptr_t w_scale, uintptr_t resid, uintptr_t stream) { return flash_rt::gemm::block128_sm89::NAME(                                      to_ptr(A), to_ptr(B), to_ptr(D), M, N, K,                                     reinterpret_cast<const float*>(act_scale),                                       reinterpret_cast<const float*>(w_scale), to_ptr(resid), to_stream(stream));         },                                                                             py::arg("A"), py::arg("B"), py::arg("D"),                                      py::arg("M"), py::arg("N"), py::arg("K"),                                       py::arg("act_block_scale"), py::arg("w_block_scale"),                          py::arg("resid"), py::arg("stream") = 0)
+    BIND_GEMM_TILE_RESID(fp8_block128_gemm_bs_sm89_32x64x128_w4_resid);
+    BIND_GEMM_TILE_RESID(fp8_block128_gemm_bs_sm89_64x64x128_w4_resid);
+    BIND_GEMM_TILE_RESID(fp8_block128_gemm_bs_sm89_64x64x128_w4_s1_resid);
+    BIND_GEMM_TILE_RESID(fp8_block128_gemm_bs_sm89_128x128x128_w8_s1_resid);
+#undef BIND_GEMM_TILE_RESID
+
+    // GeGLU silu-fold bench bindings: fuse gate+up GEMM + silu(gate)*up +
+    // per-token block-128 FP8 quant into one launch (no [M,2N] BF16 transient).
+    // B = gate_up_w [2*N, K], w_scale = gate_up_s [2*N/128, K/128]; outputs
+    // FP8 [M,N] + scale [M,N/128]. Dev-builds only.
+#define BIND_GEGLU_TILE(NAME)                                                  m.def("bench_" #NAME,                                                        [](uintptr_t A, uintptr_t B, int M, int N, int K,                          uintptr_t act_scale, uintptr_t w_scale, uintptr_t output,                  uintptr_t out_scale, uintptr_t stream) {                                  return flash_rt::gemm::block128_sm89::NAME(                                 to_ptr(A), to_ptr(B), M, N, K,                                           reinterpret_cast<const float*>(act_scale),                                    reinterpret_cast<const float*>(w_scale), to_ptr(output),                       reinterpret_cast<float*>(out_scale), to_stream(stream));                },                                                                          py::arg("A"), py::arg("B"), py::arg("M"), py::arg("N"), py::arg("K"),        py::arg("act_block_scale"), py::arg("w_block_scale"), py::arg("output"),  py::arg("out_scale"), py::arg("stream") = 0)
+    BIND_GEGLU_TILE(fp8_bs_geglu_silu_fold_sm89_32x128_w4_s2);
+    BIND_GEGLU_TILE(fp8_bs_geglu_silu_fold_sm89_16x128_w4_s2);
+    BIND_GEGLU_TILE(fp8_bs_geglu_silu_fold_sm89_64x128_w4_s2);
+    BIND_GEGLU_TILE(fp8_bs_geglu_silu_fold_sm89_128x128_w8_s1);
+    BIND_GEGLU_TILE(fp8_bs_geglu_silu_fold_sm89_32x128_w4_s1);
+    BIND_GEGLU_TILE(fp8_bs_geglu_silu_fold_sm89_16x128_w4_s1);
+    BIND_GEGLU_TILE(fp8_bs_geglu_silu_fold_apersist_sm89_32x128_w4_s1);
+    BIND_GEGLU_TILE(fp8_bs_geglu_silu_fold_apersist_sm89_16x128_w4_s1);
+    BIND_GEGLU_TILE(fp8_bs_geglu_silu_fold_apersist_sm89_32x128_w4_s2);
+#undef BIND_GEGLU_TILE
 #endif
 
     m.def("qwen3_qk_norm_rope_kvwrite_bf16",
