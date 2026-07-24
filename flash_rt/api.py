@@ -299,7 +299,20 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                use_fp16=False,
                use_fp8=True,
                state_prompt_mode="exact",
-               state_prompt_fixed_max_len=None):
+               state_prompt_fixed_max_len=None,
+               *,
+               mmproj_path=None,
+               backend="cpu",
+               action_steps=None,
+               action_dim=None,
+               lib_path=None,
+               n_ctx=0,
+               n_threads=0,
+               temp=0.8,
+               top_k=40,
+               top_p=0.9,
+               seed=1,
+               max_tokens=512):
     """Load a FlashRT model.
 
     Args:
@@ -436,16 +449,64 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             "Qwen3VlTorchFrontendRtx\n"
             "See docs/qwen3_vl_fp8_sm89.md and docs/qwen3_vl_nvfp4.md.")
 
-    if config not in ("pi05", "groot", "groot_n17", "pi0", "pi0fast",
+    if framework == "jetson_pi":
+        if config not in ("pi0", "pi05", "llm", "mllm"):
+            raise ValueError(
+                f"Unknown Jetson-PI config: {config}. "
+                "Supported: pi0, pi05, llm, mllm")
+    elif config not in ("pi05", "groot", "groot_n17", "pi0", "pi0fast",
                       "motus", "wan22_ti2v_5b", "cosmos3_video",
                       "cosmos3_edge", "nexn2"):
         raise ValueError(
             f"Unknown config: {config}. "
             f"Supported: pi05, groot, groot_n17, pi0, pi0fast, motus, "
             f"wan22_ti2v_5b, cosmos3_video, cosmos3_edge, nexn2")
-    if framework not in ("torch", "jax"):
+    if framework not in ("torch", "jax", "jetson_pi"):
         raise ValueError(
-            f"Unknown framework: {framework}. Supported: torch, jax")
+            f"Unknown framework: {framework}. Supported: torch, jax, jetson_pi")
+
+    # Drives the Jetson-PI provider through frt_model_runtime_v1 via ctypes.
+    # No torch/jax or GPU architecture detection is involved. The action chunk
+    # shape is passed explicitly by the caller (the verified pi0_base is 50x32).
+    if framework == "jetson_pi":
+        if config == "llm":
+            from flash_rt.frontends.jetson_pi.llm import LlmJetsonPiFrontend
+            return LlmJetsonPiFrontend(
+                checkpoint,
+                backend=backend,
+                n_ctx=n_ctx,
+                n_threads=n_threads,
+                temp=temp,
+                top_k=top_k,
+                top_p=top_p,
+                seed=seed,
+                max_tokens=max_tokens,
+                lib_path=lib_path)
+        if config == "mllm":
+            from flash_rt.frontends.jetson_pi.mllm import MllmJetsonPiFrontend
+            return MllmJetsonPiFrontend(
+                checkpoint,
+                mmproj_path=mmproj_path,
+                backend=backend,
+                n_ctx=n_ctx,
+                n_threads=n_threads,
+                temp=temp,
+                top_k=top_k,
+                top_p=top_p,
+                seed=seed,
+                max_tokens=max_tokens,
+                lib_path=lib_path)
+        # default / "pi0": VLA path
+        from flash_rt.frontends.jetson_pi.pi0 import Pi0JetsonPiFrontend
+        pipe = Pi0JetsonPiFrontend(
+            checkpoint,
+            mmproj_path=mmproj_path,
+            backend=backend,
+            num_views=num_views,
+            action_steps=action_steps,
+            action_dim=action_dim,
+            lib_path=lib_path)
+        return VLAModel(pipe, framework)
 
     # When use_fp4=True, the default resolves to the best-known production
     # FP4 config (full 18 encoder FFN layers + AWQ + P1 split-GU). Passing

@@ -1,0 +1,6 @@
+FLASHRT_LLAMA_CPP_PROVIDER_1.0 {
+  global:
+    frt_model_runtime_open_v1;
+  local:
+    *;
+};

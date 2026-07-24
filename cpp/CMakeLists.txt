@@ -33,6 +33,14 @@ option(FLASHRT_CPP_WITH_PI05_SM120_TARGET
        "Build the PI0.5 SM120 frontend target" OFF)
 option(FLASHRT_CPP_WITH_PI05_SM110_TARGET
        "Build the PI0.5 SM110 frontend target" OFF)
+option(FLASHRT_CPP_WITH_LLAMA_CPP_PROVIDER
+       "Build the optional llama.cpp provider frontend" OFF)
+option(FLASHRT_CPP_WITH_JETSON_PI
+       "Back the llama.cpp provider with Jetson-PI" OFF)
+set(JETSON_PI_ROOT "" CACHE PATH
+    "Jetson-PI source root for an in-tree provider build")
+set(JetsonPI_ROOT "" CACHE PATH
+    "Jetson-PI install prefix for a packaged provider build")
 if((FLASHRT_CPP_WITH_PI05 OR FLASHRT_CPP_WITH_SENTENCEPIECE) AND
    NOT FLASHRT_ENABLE_NATIVE_CPP)
   message(FATAL_ERROR
@@ -44,6 +52,12 @@ if((FLASHRT_CPP_WITH_PI05_SM120_TARGET OR
    NOT FLASHRT_CPP_WITH_PI05)
   message(FATAL_ERROR
     "PI0.5 hardware targets require FLASHRT_CPP_WITH_PI05=ON")
+endif()
+if(FLASHRT_CPP_WITH_JETSON_PI AND
+   NOT FLASHRT_CPP_WITH_LLAMA_CPP_PROVIDER)
+  message(FATAL_ERROR
+    "FLASHRT_CPP_WITH_JETSON_PI requires "
+    "FLASHRT_CPP_WITH_LLAMA_CPP_PROVIDER=ON")
 endif()
 if(FLASHRT_ENABLE_NATIVE_CPP AND NOT FLASHRT_CPP_WITH_EXEC)
   message(FATAL_ERROR
@@ -71,6 +85,46 @@ endif()
 if(FLASHRT_CPP_WITH_CUDA_KERNELS)
   enable_language(CUDA)
   find_package(CUDAToolkit REQUIRED)
+endif()
+if(FLASHRT_CPP_WITH_JETSON_PI)
+  if(JETSON_PI_ROOT AND JetsonPI_ROOT)
+    message(FATAL_ERROR
+      "Set only one Jetson-PI integration root: JETSON_PI_ROOT for a "
+      "source build or JetsonPI_ROOT for an installed package")
+  endif()
+  if(NOT JETSON_PI_ROOT AND NOT JetsonPI_ROOT)
+    message(FATAL_ERROR
+      "FLASHRT_CPP_WITH_JETSON_PI requires JETSON_PI_ROOT or JetsonPI_ROOT")
+  endif()
+
+  if(JETSON_PI_ROOT)
+    if(NOT EXISTS "${JETSON_PI_ROOT}/CMakeLists.txt")
+      message(FATAL_ERROR
+        "JETSON_PI_ROOT does not identify a Jetson-PI source tree")
+    endif()
+    set(LLAMA_BUILD_COMMON ON CACHE BOOL "" FORCE)
+    set(LLAMA_CURL OFF CACHE BOOL "" FORCE)
+    set(LLAMA_HTTPLIB OFF CACHE BOOL "" FORCE)
+    set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(LLAMA_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+    set(JETSON_PI_BUILD_MTMD ON CACHE BOOL "" FORCE)
+    set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)
+    set(LLAMA_TOOLS_INSTALL OFF CACHE BOOL "" FORCE)
+    add_subdirectory("${JETSON_PI_ROOT}"
+                     "${CMAKE_CURRENT_BINARY_DIR}/jetson-pi"
+                     EXCLUDE_FROM_ALL)
+    set(_flashrt_jetson_pi_pi0 jetson_pi_pi0)
+    set(_flashrt_jetson_pi_llm jetson_pi_llm)
+    set(_flashrt_jetson_pi_mllm jetson_pi_mllm)
+  else()
+    list(PREPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/../cmake)
+    find_package(JetsonPI REQUIRED)
+    list(POP_FRONT CMAKE_MODULE_PATH)
+    set(_flashrt_jetson_pi_pi0 JetsonPI::jetson_pi_pi0)
+    set(_flashrt_jetson_pi_llm JetsonPI::jetson_pi_llm)
+    set(_flashrt_jetson_pi_mllm JetsonPI::jetson_pi_mllm)
+  endif()
 endif()
 if(FLASHRT_CPP_WITH_PI05_SM120_TARGET)
   if(NOT FLASHRT_CPP_WITH_CUDA_KERNELS)
@@ -226,6 +280,62 @@ target_include_directories(flashrt_cpp_vla
   INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/families/vla/include)
 target_link_libraries(flashrt_cpp_vla
   INTERFACE flashrt_cpp_modalities flashrt_cpp)
+
+if(FLASHRT_CPP_WITH_LLAMA_CPP_PROVIDER)
+  add_library(flashrt_cpp_llama_cpp_provider STATIC
+    providers/llama_cpp/src/checkpoint_identity.cpp
+    providers/llama_cpp/src/pi0_runtime.cpp
+    providers/llama_cpp/src/llm_runtime.cpp
+    providers/llama_cpp/src/mllm_runtime.cpp)
+  target_include_directories(flashrt_cpp_llama_cpp_provider
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/providers/llama_cpp/include)
+  target_link_libraries(flashrt_cpp_llama_cpp_provider
+    PUBLIC flashrt_runtime)
+
+  if(FLASHRT_CPP_WITH_JETSON_PI)
+    target_sources(flashrt_cpp_llama_cpp_provider PRIVATE
+      providers/llama_cpp/src/jetson_pi_engine.cpp
+      providers/llama_cpp/src/jetson_pi_link_check.cpp)
+    target_compile_definitions(flashrt_cpp_llama_cpp_provider PRIVATE
+      FLASHRT_CPP_WITH_JETSON_PI=1)
+    target_link_libraries(flashrt_cpp_llama_cpp_provider PRIVATE
+      ${_flashrt_jetson_pi_pi0}
+      ${_flashrt_jetson_pi_llm}
+      ${_flashrt_jetson_pi_mllm})
+
+    add_library(flashrt_cpp_llama_cpp_provider_c SHARED
+      providers/llama_cpp/src/checkpoint_identity.cpp
+      providers/llama_cpp/src/pi0_runtime.cpp
+      providers/llama_cpp/src/llm_runtime.cpp
+      providers/llama_cpp/src/mllm_runtime.cpp
+      providers/llama_cpp/src/jetson_pi_engine.cpp
+      providers/llama_cpp/src/provider_open.cpp)
+    target_include_directories(flashrt_cpp_llama_cpp_provider_c PUBLIC
+      ${CMAKE_CURRENT_SOURCE_DIR}/providers/llama_cpp/include)
+    target_compile_definitions(flashrt_cpp_llama_cpp_provider_c PRIVATE
+      FLASHRT_CPP_WITH_JETSON_PI=1)
+    target_compile_options(flashrt_cpp_llama_cpp_provider_c PRIVATE
+      $<$<COMPILE_LANGUAGE:CXX>:-fvisibility=hidden>)
+    target_link_libraries(flashrt_cpp_llama_cpp_provider_c PRIVATE
+      flashrt_runtime
+      ${_flashrt_jetson_pi_pi0}
+      ${_flashrt_jetson_pi_llm}
+      ${_flashrt_jetson_pi_mllm})
+    if(UNIX AND NOT APPLE)
+      target_link_options(flashrt_cpp_llama_cpp_provider_c PRIVATE
+        "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/providers/llama_cpp/provider_exports.map"
+        "LINKER:--disable-new-dtags")
+    endif()
+    set_target_properties(flashrt_cpp_llama_cpp_provider_c PROPERTIES
+      INSTALL_RPATH "$ORIGIN")
+    install(TARGETS flashrt_cpp_llama_cpp_provider_c flashrt_runtime
+      LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+    install(FILES
+      ${CMAKE_CURRENT_SOURCE_DIR}/../runtime/include/flashrt/model_runtime.h
+      ${CMAKE_CURRENT_SOURCE_DIR}/../runtime/include/flashrt/runtime.h
+      DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/flashrt)
+  endif()
+endif()
 
 if(FLASHRT_ENABLE_NATIVE_CPP)
   add_library(flashrt_cpp_native STATIC
@@ -532,6 +642,90 @@ if(FLASHRT_CPP_WITH_PI05)
 endif()
 
 if(BUILD_TESTING)
+  if(FLASHRT_CPP_WITH_LLAMA_CPP_PROVIDER)
+    add_executable(test_llama_cpp_provider
+      tests/test_llama_cpp_provider.cpp)
+    target_link_libraries(test_llama_cpp_provider
+      PRIVATE flashrt_cpp_llama_cpp_provider flashrt_runtime)
+    add_test(NAME llama_cpp_provider COMMAND test_llama_cpp_provider)
+
+    if(FLASHRT_CPP_WITH_JETSON_PI)
+      add_executable(test_llama_cpp_jetson_pi_link
+        tests/test_llama_cpp_jetson_pi_link.cpp)
+      target_link_libraries(test_llama_cpp_jetson_pi_link
+        PRIVATE flashrt_cpp_llama_cpp_provider)
+      add_test(NAME llama_cpp_jetson_pi_link
+        COMMAND test_llama_cpp_jetson_pi_link)
+
+      if(UNIX AND NOT APPLE)
+        add_test(NAME llama_cpp_provider_exports
+          COMMAND ${CMAKE_COMMAND}
+            -DPROVIDER_DSO=$<TARGET_FILE:flashrt_cpp_llama_cpp_provider_c>
+            -DCMAKE_NM_TOOL=${CMAKE_NM}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_llama_cpp_provider_exports.cmake)
+      endif()
+
+      add_executable(test_llama_cpp_jetson_pi_llm
+        tests/test_llama_cpp_jetson_pi_llm.cpp)
+      target_link_libraries(test_llama_cpp_jetson_pi_llm
+        PRIVATE flashrt_cpp_llama_cpp_provider ${_flashrt_jetson_pi_llm})
+      add_test(NAME llama_cpp_jetson_pi_llm
+        COMMAND test_llama_cpp_jetson_pi_llm)
+
+      add_executable(test_llama_cpp_jetson_pi_mllm
+        tests/test_llama_cpp_jetson_pi_mllm.cpp)
+      target_link_libraries(test_llama_cpp_jetson_pi_mllm
+        PRIVATE flashrt_cpp_llama_cpp_provider ${_flashrt_jetson_pi_mllm})
+      add_test(NAME llama_cpp_jetson_pi_mllm
+        COMMAND test_llama_cpp_jetson_pi_mllm)
+
+      add_executable(test_llama_cpp_jetson_pi_llm_parity
+        tests/test_llama_cpp_jetson_pi_llm_parity.cpp)
+      target_link_libraries(test_llama_cpp_jetson_pi_llm_parity
+        PRIVATE flashrt_cpp_llama_cpp_provider ${_flashrt_jetson_pi_llm})
+      add_test(NAME llama_cpp_jetson_pi_llm_parity
+        COMMAND test_llama_cpp_jetson_pi_llm_parity)
+
+      add_executable(test_llama_cpp_jetson_pi_mllm_parity
+        tests/test_llama_cpp_jetson_pi_mllm_parity.cpp)
+      target_link_libraries(test_llama_cpp_jetson_pi_mllm_parity
+        PRIVATE flashrt_cpp_llama_cpp_provider ${_flashrt_jetson_pi_mllm})
+      add_test(NAME llama_cpp_jetson_pi_mllm_parity
+        COMMAND test_llama_cpp_jetson_pi_mllm_parity)
+
+      if(JETSON_PI_ROOT AND EXISTS "${JETSON_PI_ROOT}/vendor")
+        add_executable(test_llama_cpp_jetson_pi_engine
+          tests/test_llama_cpp_jetson_pi_engine.cpp)
+        target_include_directories(test_llama_cpp_jetson_pi_engine PRIVATE
+          ${JETSON_PI_ROOT}/vendor)
+        target_link_libraries(test_llama_cpp_jetson_pi_engine
+          PRIVATE flashrt_cpp_llama_cpp_provider ${_flashrt_jetson_pi_pi0})
+        add_test(NAME llama_cpp_jetson_pi_engine
+          COMMAND test_llama_cpp_jetson_pi_engine)
+
+        add_executable(test_llama_cpp_jetson_pi_parity
+          tests/test_llama_cpp_jetson_pi_parity.cpp)
+        target_include_directories(test_llama_cpp_jetson_pi_parity PRIVATE
+          ${JETSON_PI_ROOT}/vendor)
+        target_link_libraries(test_llama_cpp_jetson_pi_parity
+          PRIVATE flashrt_cpp_llama_cpp_provider ${_flashrt_jetson_pi_pi0})
+        add_test(NAME llama_cpp_jetson_pi_parity
+          COMMAND test_llama_cpp_jetson_pi_parity)
+
+        # Opt-in PI0.5 reference-policy state-parity test. CI skips it when the
+        # external checkpoint and fixture environment are unavailable.
+        add_executable(test_llama_cpp_jetson_pi_state_parity
+          tests/test_llama_cpp_jetson_pi_state_parity.cpp)
+        target_include_directories(test_llama_cpp_jetson_pi_state_parity PRIVATE
+          ${JETSON_PI_ROOT}/vendor)
+        target_link_libraries(test_llama_cpp_jetson_pi_state_parity
+          PRIVATE flashrt_cpp_llama_cpp_provider ${_flashrt_jetson_pi_pi0})
+        add_test(NAME llama_cpp_jetson_pi_state_parity
+          COMMAND test_llama_cpp_jetson_pi_state_parity)
+      endif()
+    endif()
+  endif()
+
   if(TARGET flashrt_native_cpp_cuda_support)
     add_executable(test_csrc_rope_table tests/test_csrc_rope_table.cu)
     target_link_libraries(test_csrc_rope_table PRIVATE
