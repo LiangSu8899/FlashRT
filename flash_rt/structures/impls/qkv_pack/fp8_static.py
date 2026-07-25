@@ -38,6 +38,10 @@ from .. import hub_kernel
 _FP8 = torch.float8_e4m3fn
 
 
+def _all_zero(t: torch.Tensor) -> bool:
+    return not bool(t.any())
+
+
 def _pack_weights(mods: Sequence[torch.nn.Module]):
     ws = [m.weight.detach() for m in mods]
     w = torch.cat(ws, 0)
@@ -74,8 +78,14 @@ class PackedLinear(torch.nn.Module):
         for i, n in enumerate(splits[1:], 1):
             self.register_buffer(f"stash{i}", torch.zeros(
                 rows, n, device=dev, dtype=torch.bfloat16))
+        # a bias-add is its own kernel. Hosts whose projections carry no
+        # bias (the whole Gemma family) would otherwise pay a launch per
+        # call to add zeros — measured 3 kernels/call with the bias
+        # entry against 1 without it at the same shapes.
+        self.no_bias = _all_zero(bias)
         if in_dtype == "fp8_static":
-            self._fn = kf.fp8_linear_bias_bf16
+            self._fn = (kf.fp8_gemm_bf16 if self.no_bias
+                        else kf.fp8_linear_bias_bf16)
         else:
             self._fn = kf.bf16_fp8_linear_bias_bf16
             k = mods[0].weight.shape[1]
@@ -87,8 +97,10 @@ class PackedLinear(torch.nn.Module):
     def forward(self, x):
         flat = x.reshape(-1, x.shape[-1])
         if self.in_dtype == "fp8_static":
-            y = self._fn(flat, self.w8, self.bias_cat, self.act_scale,
-                         self.w_scale)
+            y = (self._fn(flat, self.w8, self.act_scale, self.w_scale)
+                 if self.no_bias else
+                 self._fn(flat, self.w8, self.bias_cat, self.act_scale,
+                          self.w_scale))
         else:
             y = self._fn(flat.to(torch.bfloat16).contiguous(),
                          self.w8, self.bias_cat, self.act_scale,
