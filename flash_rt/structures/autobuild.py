@@ -74,7 +74,8 @@ def auto_swaps(
     *,
     structures: tuple[str, ...] = ("decoder_ffn", "vision_ffn",
                                    "qkv_pack", "adaln_producer",
-                                   "linear_proj", "norm_fused"),
+                                   "linear_proj", "norm_fused",
+                                   "attention_core"),
     negotiate_fp8: bool = True,
     frames: int = 1,
     verbose: bool = False,
@@ -94,7 +95,8 @@ def auto_swaps(
     seams = [s for s in seams
              if not (s.structure == "linear_proj" and s.path in packed)]
     say(f"discovered {len(seams)} seam(s)")
-    if not seams:
+    adapter_only = not seams and "attention_core" in structures
+    if not seams and not adapter_only:
         return AutoPlan()
 
     # ---- one calibration pass, structure-aware capture ----
@@ -134,12 +136,13 @@ def auto_swaps(
             hooks.append(target.register_forward_hook(
                 cap_input(seam.path), with_kwargs=True))
 
-    with torch.no_grad():
-        for _ in range(max(1, frames)):
-            forward()
-    for h in hooks:
-        h.remove()
-    say("calibration pass done")
+    if hooks:
+        with torch.no_grad():
+            for _ in range(max(1, frames)):
+                forward()
+        for h in hooks:
+            h.remove()
+        say("calibration pass done")
 
     # ---- fp8 seam negotiation: the load-bearing structure combination.
     # A single kernel need not win alone (fp8 qkv at M=50 is marginal,
