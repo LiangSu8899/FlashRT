@@ -2,9 +2,9 @@
 
 This document records the strict end-to-end development of the Pi0.5 NVFP4
 path on NVIDIA Thor SM110. The first run isolated the action-expert decoder;
-the current production run combines the validated encoder FFN preset with the
-decoder NVFP4 path and requires both p50 and p95 complete-inference latency to
-remain at or below 40 ms.
+the current SOTA candidate combines all 18 encoder FFN NVFP4 layers with the
+decoder NVFP4 path. Its performance target is two milliseconds faster than the
+published 2-view encoder-FP4 + decoder-FP8 result: p50 must be at most 34.3 ms.
 
 Latency covers the full `infer()` call: image preprocessing and upload, SigLIP,
 encoder, all 18 decoder layers across 10 denoising steps, CUDA Graph replay,
@@ -19,7 +19,7 @@ GEMMs at the production `M=10` shape:
 |---|---:|---:|---:|---:|
 | `qkv` | 10 | 2560 | 1024 | v7 |
 | `o` | 10 | 1024 | 2048 | v7 |
-| `gate_up` | 10 | 8192 | 1024 | v9 |
+| `gate_up` | 10 | 8192 | 1024 | v10 |
 | `down` | 10 | 1024 | 4096 | v7 |
 
 Weights are loaded directly from the FP16 safetensors checkpoint, transformed
@@ -34,6 +34,13 @@ Runtime activation preprocessing is CUDA-Graph capturable and uses:
 - Gated residual update + Pi0.5 AdaRMSNorm + gate output + NVFP4/SFA in one
   launch before Gate+Up and the next layer's QKV.
 - Existing fused GeGLU + NVFP4/SFA before Down.
+
+The 34.3 ms candidate additionally uses register-only decoder AdaRMSNorm
+preprocessing and native SM110 E2M1x2 conversion. The encoder P1 path uses two
+FP4-output Gate/Up GEMMs, a gate LUT plus native E2M1x2 combiner, and encoder
+Down variant v8. Native FP4 conversion uses round-to-nearest-even, so it is an
+explicit numerical mode rather than a bit-exact alias for the historical
+midpoint implementation.
 
 The 40 ms production configuration also enables the established full encoder
 FFN NVFP4 preset with AWQ and P1 split-GU. The standard uint8 image hot path
@@ -126,3 +133,60 @@ The local result files contain all 200 retained latency samples and are not
 committed because they include machine-local paths. The reproducible method,
 precision configuration, and acceptance thresholds are committed in the
 harness.
+
+## FP4+FP4 SOTA Candidate (2026-07-25)
+
+This run uses commit `78ba9bf8f5481ad78d0c53143570a724dd073db7` and the
+strict default configuration in `tests/bench_pi05_decoder_fp4_e2e.py`:
+
+- Encoder layers 0-17: NVFP4 Gate, Up, and Down FFN projections with AWQ and
+  P1 split-GU. Encoder attention projections remain on the existing FP8 path.
+- Decoder layers 0-17 across all 10 denoising steps: NVFP4 QKV, O, Gate+Up,
+  and Down projections. There is no decoder FP8 projection fallback.
+- FA4 is active for SigLIP/encoder attention; the precision record is
+  `fa4_siglip_encoder`.
+- Two views, eight fixed LIBERO observations, 20 warmups, and 100 complete
+  `infer()` samples in separate FP8 and FP4 processes.
+
+The locked-clock result is:
+
+| Metric | Same-run FP8 | FP4+FP4 | Change / gate |
+|---|---:|---:|---:|
+| p50 latency | 42.2269 ms | **33.8018 ms** | -8.4251 ms, 1.2492x |
+| p95 latency | 42.4982 ms | **34.0627 ms** | below 40 ms |
+| Published encoder-FP4 + decoder-FP8 p50 | 36.3000 ms | **33.8018 ms** | **-2.4982 ms** |
+
+The requested latency gate passed with 0.4982 ms of headroom against 34.3 ms.
+The published SOTA comparison also passed the required 2.0 ms margin.
+
+Matched-noise fidelity across the eight observations:
+
+| Metric | Result | Gate |
+|---|---:|---:|
+| Internal raw 32D action cosine | 0.99715861 | >= 0.995, pass |
+| Worst raw per-sample cosine | 0.99358474 | >= 0.995, **fail** |
+| Raw max absolute difference | 0.32897949 | recorded |
+| Final returned 7D action cosine | 0.99919508 | >= 0.999, pass |
+| Worst final-action per-sample cosine | 0.99777615 | >= 0.995, pass |
+| Final-action max absolute difference | 0.12324846 | recorded |
+
+The result is therefore a performance SOTA candidate, not a full strict-suite
+pass: every latency and returned-action gate passed, but one internal raw
+per-sample cosine gate did not. The harness threshold was not relaxed.
+
+Reproduction command:
+
+```bash
+LD_LIBRARY_PATH=/home/tianjianyang/miniconda3/envs/flashrt/lib/python3.12/site-packages/nvidia/cu13/lib \
+CUTE_DSL_ARCH=sm_110a FLASH_ATTENTION_ARCH=sm110 \
+/home/tianjianyang/miniconda3/envs/flashrt/bin/python \
+  tests/bench_pi05_decoder_fp4_e2e.py \
+  --output-dir /tmp/flashrt-fp4-fp4-sota-78ba9bf
+```
+
+Artifacts:
+
+- `flash_rt_fp4`: `2c66b308661a142765af9cad8ee6a54eff465665829964359d0cada1c4a0ec96`
+- `flash_rt_kernels`: `3c4071ed7447b1aba743d7b92bbc180773f84e2271129e0510128c5dbf826d29`
+- `result.json`: `9ccb9498593b1076a7015d6f4365db7edbf35804e5261b6a0f4befcdd4948ae2`
+- Local result directory: `/tmp/flashrt-fp4-fp4-sota-78ba9bf`
