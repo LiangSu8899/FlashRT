@@ -398,6 +398,11 @@ class Pi05TorchFrontendThor:
         self._infer_uint8_to_fp16 = (
             np.arange(256, dtype=np.float32) / 127.5 - 1.0
         ).astype(np.float16)
+        self._img_u8_buf = CudaBuffer.device_empty(
+            nv * 224 * 224 * 3, np.uint8)
+        self._img_u8_lut = CudaBuffer.from_numpy(self._infer_uint8_to_fp16)
+        self._infer_images_u8_np = np.empty(
+            (nv, 224, 224, 3), dtype=np.uint8)
         self._patches_buf = CudaBuffer.device_empty(S_sig * 588, np.float16)
 
         # PostLN weights
@@ -1416,11 +1421,17 @@ class Pi05TorchFrontendThor:
     # Patch embedding (SigLIP input)
     # -----------------------------------------------------------------------
 
-    def _patch_embed_ops(self, stream_int):
+    def _patch_embed_ops(self, stream_int, *, uint8_input=False):
         """im2col -> GEMM -> bias+pos.  Output in self._sig_x."""
         S_sig, D_sig = self.sig_S, self.sig_D
-        fvk.patch_im2col(self._img_buf.ptr.value, self._patches_buf.ptr.value,
-                         self.num_views, stream_int)
+        if uint8_input:
+            fvk.patch_im2col_uint8(
+                self._img_u8_buf.ptr.value, self._img_u8_lut.ptr.value,
+                self._patches_buf.ptr.value, self.num_views, stream_int)
+        else:
+            fvk.patch_im2col(
+                self._img_buf.ptr.value, self._patches_buf.ptr.value,
+                self.num_views, stream_int)
         self._gemm.fp16_nn(self._patches_buf.ptr.value, self._pe_w.ptr.value,
                            self._sig_x.data_ptr(), S_sig, D_sig, 588, stream_int)
         fvk.patch_embed_bias_pos(self._sig_x.data_ptr(), self._pe_b.ptr.value,
@@ -1484,6 +1495,32 @@ class Pi05TorchFrontendThor:
                            use_fp8=self.use_fp8)
             self._postln_project_ops(s_int)
             self._siglip_graph.capture_end()
+        torch.cuda.synchronize()
+
+        dummy_u8 = np.full(
+            (self.num_views, 224, 224, 3), 128, dtype=np.uint8)
+        self._img_u8_buf.upload(dummy_u8)
+        for _ in range(3):
+            self._patch_embed_ops(0, uint8_input=True)
+            self._sig_x.zero_()
+            siglip_forward(self._gemm, fvk, self._sig_bufs, self._sig_weights,
+                           self._sig_dims, stream=0, attn=self._attn,
+                           use_fp8=self.use_fp8)
+            self._postln_project_ops(0)
+        torch.cuda.synchronize()
+
+        uint8_stream = torch.cuda.Stream()
+        self._siglip_u8_graph = torch.cuda.CUDAGraph()
+        uint8_stream_int = uint8_stream.cuda_stream
+        with torch.cuda.stream(uint8_stream):
+            self._siglip_u8_graph.capture_begin()
+            self._patch_embed_ops(uint8_stream_int, uint8_input=True)
+            siglip_forward(
+                self._gemm, fvk, self._sig_bufs, self._sig_weights,
+                self._sig_dims, stream=uint8_stream_int, attn=self._attn,
+                use_fp8=self.use_fp8)
+            self._postln_project_ops(uint8_stream_int)
+            self._siglip_u8_graph.capture_end()
         torch.cuda.synchronize()
         logger.info("SigLIP CUDA graph captured (S=%d)", self.sig_S)
 
@@ -2540,23 +2577,34 @@ class Pi05TorchFrontendThor:
                 img_list.append(
                     observation.get('wrist_image_right', img_list[-1]))
 
-        for index, image in enumerate(img_list[:nv]):
-            if isinstance(image, torch.Tensor):
-                image = image.to(dtype=torch.float16).cpu().numpy()
-            if image.dtype == np.uint8:
-                np.take(
-                    self._infer_uint8_to_fp16, image,
-                    out=self._infer_images_np[index])
-            elif image.dtype == np.float16:
-                np.copyto(self._infer_images_np[index], image)
-            else:
-                np.copyto(
-                    self._infer_images_np[index],
-                    (image.astype(np.float32) / 127.5 - 1.0).astype(np.float16))
-        self._img_buf.upload(self._infer_images_np)
+        use_uint8_graph = all(
+            isinstance(image, np.ndarray) and image.dtype == np.uint8
+            for image in img_list[:nv])
+        if use_uint8_graph:
+            for index, image in enumerate(img_list[:nv]):
+                np.copyto(self._infer_images_u8_np[index], image)
+            self._img_u8_buf.upload(self._infer_images_u8_np)
+        else:
+            for index, image in enumerate(img_list[:nv]):
+                if isinstance(image, torch.Tensor):
+                    image = image.to(dtype=torch.float16).cpu().numpy()
+                if image.dtype == np.uint8:
+                    np.take(
+                        self._infer_uint8_to_fp16, image,
+                        out=self._infer_images_np[index])
+                elif image.dtype == np.float16:
+                    np.copyto(self._infer_images_np[index], image)
+                else:
+                    np.copyto(
+                        self._infer_images_np[index],
+                        (image.astype(np.float32) / 127.5 - 1.0).astype(np.float16))
+            self._img_buf.upload(self._infer_images_np)
 
         # ---- Graph 1: SigLIP + PostLN ----
-        self._siglip_graph.replay()
+        if use_uint8_graph:
+            self._siglip_u8_graph.replay()
+        else:
+            self._siglip_graph.replay()
 
         # ---- Lazy real-data recalibration on first call ----
         # Skip when use_fp8=False: the FP16 baseline path has no FP8

@@ -39,7 +39,7 @@ flash-attn = ["flash-attn"]
 # is vendored (privately, as `flashrt_fa4`) at csrc/attention/flash_attn_4_src
 # (no flash-attn wheel needed); these are its runtime deps. Without them,
 # LingBot silently falls back to the fmha path (correct, ~+18ms@25). The loader
-# (flash_rt/hardware/thor/fa4_backend.py) sets CUTE_DSL_ARCH=sm_101a.
+# (flash_rt/hardware/thor/fa4_backend.py) sets CUTE_DSL_ARCH=sm_110a.
 # Requires an editable / source-tree install (pip install -e). pip install ".[thor-fa4]".
 thor-fa4 = ["nvidia-cutlass-dsl==4.5.1", "quack-kernels==0.4.1"]
 all = ["flash-rt[torch,jax,server,eval,minimax-remover]"]

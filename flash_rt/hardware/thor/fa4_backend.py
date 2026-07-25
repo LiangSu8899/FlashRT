@@ -1,7 +1,6 @@
 """Isolated FlashAttention-4 (CuTe-DSL) backend for Thor (sm_110).
 
-FA4's SM100 Blackwell forward kernel runs on Thor when compiled for ``sm_101a``
-(the legacy alias of sm_110; the ``sm_110a`` path hits a cutlass-dsl chip bug).
+FA4's SM100 Blackwell forward kernel runs on Thor when compiled for ``sm_110a``.
 At the LingBot denoise shape (Sq=51, Skv~891, GQA 16/2, HD=128) with
 ``pack_gqa`` it is ~17% faster than the vendored fmha kernel, cos=1.0, and is
 CUDA-graph capture-safe.

@@ -754,7 +754,7 @@ def attention_fmha_strided_fused(
 
 
 # ════════════════════════════════════════════════════════════════════
-#  FA4 (FlashAttention-4, CuTe-DSL) denoise attention — Thor sm_101a
+#  FA4 (FlashAttention-4, CuTe-DSL) denoise attention — Thor sm_110a
 # ════════════════════════════════════════════════════════════════════
 #
 # FA4 (FlashAttention-4, CuTe-DSL) is the optional Thor fast path for the

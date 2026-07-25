@@ -55,8 +55,8 @@ PY
 ## 3. FlashAttention-4 (the Thor fast path)
 
 FA4 (CuTe-DSL) gives the denoise + prefix attention ~17% over the fmha path
-(`pack_gqa`, cosine preserved). On Thor it must be compiled for **sm_101a** (the
-sm_110 Blackwell alias; `fa4_backend` sets `CUTE_DSL_ARCH=sm_101a` for you).
+(`pack_gqa`, cosine preserved). On Thor it must be compiled for **sm_110a**
+(`fa4_backend` sets `CUTE_DSL_ARCH=sm_110a` for you).
 
 - The FA4 forward source is **vendored, trimmed, and privately namespaced** at
   `csrc/attention/flash_attn_4_src/` (package `flashrt_fa4`, a forward /

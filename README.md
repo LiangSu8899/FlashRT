@@ -624,21 +624,26 @@ model = flash_rt.load_model(
 ```
 
 `use_fp4=True` resolves to the best-known production preset automatically:
-- `fp4_layers` = full 18 encoder FFN layers
+- `fp4_layers` = all 17 live encoder FFN layers (0-16)
 - `use_awq` = `True` — activation-aware weight quantization (AWQ)
 - `use_p1_split_gu` = `True` — P1 split-GU 2-GEMM path
+
+When the experimental decoder path is also selected with
+`use_fp4_decoder=True`, the preset uses `awq_alpha=0.8`. The decoder path is a
+strict opt-in: unavailable kernels and unsupported modes raise errors rather
+than selecting FP8 projections.
 
 Advanced users can override any sub-flag explicitly at `load_model()` call
 time (e.g. `fp4_layers=(7, 8, 9), use_awq=False` reverts to the conservative
 L7-9 subset).
 
 **What it does**:
-- Gate+Up and Down GEMMs across all 18 encoder FFN layers run in NVFP4
+- Gate+Up and Down GEMMs across all 17 live encoder FFN layers run in NVFP4
   (block-size 16, UE4M3 block scales) instead of FP8.
 - **AWQ** applies activation-aware per-input-channel pre-scaling to the
   quantized weights, with the inverse scale fused into pre-GEMM kernels
   (`residual_add_rms_norm_mul_fp4_sfa`, `geglu_two_mul_fp4_to_fp4`). This
-  preserves precision under 18-layer FP4 (without AWQ, full-scope FP4 cos
+  preserves precision under full-scope FP4 (without AWQ, full-scope FP4 cos
   drops from ~0.998 to ~0.33 due to cumulative multi-layer drift).
 - **P1 split-GU** splits the merged Gate+Up GEMM into separate gate_proj /
   up_proj NVFP4 GEMMs that emit packed FP4 + SFA directly (via
@@ -658,10 +663,10 @@ L7-9 subset).
 | Config | Task success | E2E P50 (normal) |
 |---|---|---|
 | FP8 baseline | 491 / 500 (98.2%) | ~43.5 ms |
-| **NVFP4 full-18 + AWQ + P1 (`--use_fp4`)** | **491 / 500 (98.2%)** | **~43.5 ms** |
+| **NVFP4 full-17 + AWQ + P1 (`--use_fp4`)** | **491 / 500 (98.2%)** | **~43.5 ms** |
 
 Task-level parity with the FP8 baseline (491/500 for both — P1 + AWQ
-preserves FP4 precision across all 18 FFN layers).
+preserves FP4 precision across all 17 live FFN layers).
 
 **Replay-latency benchmark (1-view / 2-view / 3-view, N=8 LIBERO
 stratified calibration, 50 graph replays, Thor SM110)**:
@@ -683,7 +688,9 @@ Reproduce with
 (defaults now include `jax_fp4`).
 
 **What's next**:
-- Decoder FP4 (S2 precision-validated set — 72 weight tensors, ~-6 ms estimated)
+- Decoder FP4 is implemented as a draft all-projection W4A4 path. The current
+  multi-view latency and precision blockers are tracked in
+  [`docs/pi05_thor_decoder_fp4_e2e.md`](docs/pi05_thor_decoder_fp4_e2e.md).
 - `geglu_two_mul` SFA-prefetch optimization (O1, ~-0.5-1.1 ms)
 - SigLIP FFN FP4 / AWQ auto-tune / Pi0.6 port
 

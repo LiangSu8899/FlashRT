@@ -304,7 +304,7 @@ def test_load_model_routes_pi05_jax_thor_fp4_and_preset_kwargs(monkeypatch):
         "weight_cache": True,
         "use_fp8": True,
         "use_fp4_encoder_ffn": True,
-        "fp4_layers": tuple(range(18)),
+        "fp4_layers": tuple(range(17)),
         "use_awq": True,
         "awq_alpha": 0.5,
         "use_p1_split_gu": True,
@@ -378,7 +378,7 @@ def test_load_model_routes_pi05_torch_thor_decoder_fp4(monkeypatch):
         "use_fp4_decoder": True,
         "fp4_layers": (),
         "use_awq": False,
-        "awq_alpha": 0.5,
+        "awq_alpha": 0.8,
         "use_p1_split_gu": False,
         "state_prompt_mode": "exact",
     }

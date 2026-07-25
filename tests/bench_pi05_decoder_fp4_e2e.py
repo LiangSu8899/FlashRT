@@ -3,8 +3,8 @@
 
 The suite launches FP8 and FP4 in separate processes. Both use the same
 checkpoint, explicit prompt tokens, eight LIBERO observations, calibration,
-and matched NumPy noise seeds. The FP4 mode combines the production 18-layer
-encoder FFN preset with the decoder NVFP4 path. Latency covers the complete
+and matched NumPy noise seeds. The FP4 mode combines all 17 live encoder FFN
+layers with the decoder NVFP4 path. Latency covers the complete
 ``infer()`` call.
 """
 from __future__ import annotations
@@ -26,9 +26,8 @@ import numpy as np
 
 EXPECTED_DEVICE = "NVIDIA Thor"
 EXPECTED_CC = (11, 0)
-PUBLISHED_2V_SOTA_P50_MS = 36.3
+PUBLISHED_SOTA_P50_MS = {1: 30.5, 2: 36.3, 3: 42.8}
 REQUIRED_MARGIN_MS = 2.0
-TARGET_LATENCY_MS = PUBLISHED_2V_SOTA_P50_MS - REQUIRED_MARGIN_MS
 TAIL_LATENCY_MS = 40.0
 PROMPT_TOKENS = [
     2, 18075, 908, 573, 3118, 3963, 578,
@@ -78,9 +77,8 @@ def main() -> int:
         "--checkpoint", default=os.environ.get("PI05_CHECKPOINT"),
         help="Pi0.5 checkpoint directory (defaults to $PI05_CHECKPOINT)")
     parser.add_argument(
-        "--fixture",
-        default=("/home/tianjianyang/models/pi05_jax_fp4_validation/"
-                 "fixtures/libero_obs_2v_n8.npz"))
+        "--fixture", help="exact N=8 fixture; defaults to the selected view count")
+    parser.add_argument("--num-views", type=int, choices=(1, 2, 3), default=2)
     parser.add_argument("--output-dir")
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=100)
@@ -92,6 +90,10 @@ def main() -> int:
         default="lut_native")
     parser.add_argument("--encoder-down-variant", type=int, default=8)
     parser.add_argument("--decoder-gate-up-variant", type=int, default=10)
+    parser.add_argument("--awq-alpha", type=float, default=0.8)
+    parser.add_argument(
+        "--encoder-fp4-layer-count", type=int, choices=range(18),
+        default=17, help="FP4-quantize this many leading live encoder FFNs")
     parser.add_argument(
         "--cuda-profile", action="store_true",
         help="capture one stable-state infer with cudaProfilerStart/Stop")
@@ -99,6 +101,12 @@ def main() -> int:
 
     if args.warmup < 5 or args.iters < 20:
         raise ValueError("strict E2E requires --warmup >= 5 and --iters >= 20")
+    if args.awq_alpha <= 0:
+        raise ValueError("--awq-alpha must be positive")
+    if args.fixture is None:
+        args.fixture = (
+            "/home/tianjianyang/models/pi05_jax_fp4_validation/fixtures/"
+            f"libero_obs_{args.num_views}v_n8.npz")
     state = machine_state()
 
     if args.child_mode is not None:
@@ -129,15 +137,17 @@ def main() -> int:
             from flash_rt.frontends.torch.pi05_thor import (
                 Pi05TorchFrontendThor)
             pipe = Pi05TorchFrontendThor(
-                args.checkpoint, num_views=2, autotune=3, use_fa4=True)
+                args.checkpoint, num_views=args.num_views, autotune=3,
+                use_fa4=True)
         else:
             from flash_rt.frontends.torch.pi05_thor_fp4 import (
                 Pi05TorchFrontendThorFP4)
             pipe = Pi05TorchFrontendThorFP4(
-                args.checkpoint, num_views=2, autotune=3,
+                args.checkpoint, num_views=args.num_views, autotune=3,
                 use_fp4_encoder_ffn=True,
-                fp4_layers=tuple(range(18)),
+                fp4_layers=tuple(range(args.encoder_fp4_layer_count)),
                 use_awq=True,
+                awq_alpha=args.awq_alpha,
                 use_p1_split_gu=args.encoder_gu_mode == "p1",
                 encoder_p1_combiner=args.encoder_p1_combiner,
                 encoder_down_variant=args.encoder_down_variant,
@@ -149,14 +159,18 @@ def main() -> int:
         count = int(data["n"])
         if count != 8:
             raise ValueError(f"strict E2E fixture requires 8 samples, got {count}")
-        observations = [
-            {
+        observations = []
+        for index in range(count):
+            observation = {
                 "image": data[f"img_{index}"],
-                "wrist_image": data[f"wrist_{index}"],
                 "state": data[f"state_{index}"],
             }
-            for index in range(count)
-        ]
+            if args.num_views >= 2:
+                observation["wrist_image"] = data[f"wrist_{index}"]
+            if args.num_views == 3:
+                observation["wrist_image_right"] = data[
+                    f"wrist_right_{index}"]
+            observations.append(observation)
 
         pipe.set_prompt(PROMPT_TOKENS)
         pipe.calibrate(observations, percentile=99.9, verbose=False)
@@ -214,8 +228,10 @@ def main() -> int:
                 if args.child_mode == "fp8"
                 else {
                     "encoder": "nvfp4_ffn",
-                    "encoder_fp4_layers": list(range(18)),
+                    "encoder_fp4_layers": list(range(
+                        args.encoder_fp4_layer_count)),
                     "encoder_awq": True,
+                    "encoder_awq_alpha": args.awq_alpha,
                     "encoder_gu_mode": args.encoder_gu_mode,
                     "encoder_p1_combiner": args.encoder_p1_combiner,
                     "encoder_down_variant": args.encoder_down_variant,
@@ -233,7 +249,7 @@ def main() -> int:
                 "flash_attention_arch": os.environ.get(
                     "FLASH_ATTENTION_ARCH"),
             },
-            "num_views": 2,
+            "num_views": args.num_views,
             "denoise_steps": 10,
             "warmup": args.warmup,
             "iters": args.iters,
@@ -270,6 +286,7 @@ def main() -> int:
             "--child-mode", mode,
             "--checkpoint", str(Path(args.checkpoint).resolve()),
             "--fixture", str(Path(args.fixture).resolve()),
+            "--num-views", str(args.num_views),
             "--output-dir", str(output_dir.resolve()),
             "--warmup", str(args.warmup),
             "--iters", str(args.iters),
@@ -278,6 +295,8 @@ def main() -> int:
             "--encoder-p1-combiner", args.encoder_p1_combiner,
             "--encoder-down-variant", str(args.encoder_down_variant),
             "--decoder-gate-up-variant", str(args.decoder_gate_up_variant),
+            "--awq-alpha", str(args.awq_alpha),
+            "--encoder-fp4-layer-count", str(args.encoder_fp4_layer_count),
         ]
         child = subprocess.run(
             command, check=False, capture_output=True, text=True,
@@ -321,6 +340,8 @@ def main() -> int:
     fp8_p50 = float(child_results["fp8"]["p50_ms"])
     fp4_p50 = float(child_results["fp4"]["p50_ms"])
     fp4_p95 = float(child_results["fp4"]["p95_ms"])
+    published_sota = PUBLISHED_SOTA_P50_MS[args.num_views]
+    target_latency = published_sota - REQUIRED_MARGIN_MS
     comparison = {
         "raw_cosine": float(
             raw_lhs @ raw_rhs /
@@ -337,9 +358,10 @@ def main() -> int:
         "fp4_p95_ms": fp4_p95,
         "p50_delta_ms": fp4_p50 - fp8_p50,
         "p50_speedup": fp8_p50 / fp4_p50,
-        "published_2v_sota_p50_ms": PUBLISHED_2V_SOTA_P50_MS,
+        "num_views": args.num_views,
+        "published_sota_p50_ms": published_sota,
         "required_margin_ms": REQUIRED_MARGIN_MS,
-        "target_p50_ms": TARGET_LATENCY_MS,
+        "target_p50_ms": target_latency,
     }
     gates = {
         "raw_cosine_at_least_0_995": comparison["raw_cosine"] >= 0.995,
@@ -349,9 +371,12 @@ def main() -> int:
         "action_min_sample_cosine_at_least_0_995": (
             comparison["action_min_sample_cosine"] >= 0.995),
         "fp4_p50_faster_than_fp8": fp4_p50 < fp8_p50,
-        "fp4_fa4_p50_at_most_34_3_ms": fp4_p50 <= TARGET_LATENCY_MS,
-        "fp4_fa4_p95_at_most_40_ms": fp4_p95 <= TAIL_LATENCY_MS,
+        "fp4_fa4_p50_beats_published_by_2ms": fp4_p50 <= target_latency,
     }
+    if args.num_views == 2:
+        gates["fp4_fa4_2v_p95_at_most_40_ms"] = fp4_p95 <= TAIL_LATENCY_MS
+    if args.num_views == 3:
+        gates["fp4_fa4_3v_p50_at_most_40_ms"] = fp4_p50 <= TAIL_LATENCY_MS
     result = {
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "commit": commit,

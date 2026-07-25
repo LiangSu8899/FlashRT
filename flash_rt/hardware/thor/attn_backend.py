@@ -120,13 +120,12 @@ class ThorFlashAttnBackend(AttentionBackendBase):
         # call sites work without further conditioning in run().
         self._ctx_cpp = ctx.cpp if hasattr(ctx, "cpp") else ctx
         self._use_fa4 = bool(use_fa4)
-        self._fa4_func = None
-        self._fa4_outputs = []
+        self._fa4_fwd = None
         if self._use_fa4:
             from flash_rt.hardware.thor import fa4_backend
 
-            self._fa4_func = fa4_backend.fa4_func()
-            if self._fa4_func is None:
+            self._fa4_fwd = fa4_backend.fa4_fwd()
+            if self._fa4_fwd is None:
                 raise RuntimeError(
                     "Pi0.5 use_fa4=True requires an active Thor FA4 runtime: "
                     f"{fa4_backend.status()}")
@@ -361,14 +360,11 @@ class ThorFlashAttnBackend(AttentionBackendBase):
                 v_tensor = _fp16_tensor_from_ptr(
                     Q, (nv, q_seq, NH, HD), tensor_strides,
                     offset=2 * NH * HD)
-                output = self._fa4_func(
+                output = _fp16_tensor_from_ptr(
+                    int(s["O"]), (nv, q_seq, NH, HD))
+                self._fa4_fwd(
                     q_tensor, k_tensor, v_tensor, causal=False,
-                    num_splits=1, pack_gqa=False)
-                if isinstance(output, tuple):
-                    output = output[0]
-                self._fa4_outputs.append(output)
-                _fp16_tensor_from_ptr(
-                    int(s["O"]), (nv, q_seq, NH, HD)).copy_(output)
+                    num_splits=1, pack_gqa=False, out=output)
             else:
                 fvk.fmha_strided_full(Q, K, V, int(s["O"]),
                                        nv, q_seq, kv_seq, NH, NH, HD,
@@ -414,12 +410,12 @@ class ThorFlashAttnBackend(AttentionBackendBase):
                     K_ptr, (1, kv_seq, 1, site_spec.head_dim))
                 v_tensor = _fp16_tensor_from_ptr(
                     V_ptr, (1, kv_seq, 1, site_spec.head_dim))
-                output = self._fa4_func(
+                output = _fp16_tensor_from_ptr(
+                    int(s["logits"]),
+                    (1, q_seq, site_spec.num_q_heads, site_spec.head_dim))
+                self._fa4_fwd(
                     q_tensor, k_tensor, v_tensor, causal=False,
-                    num_splits=1, pack_gqa=True)
-                if isinstance(output, tuple):
-                    output = output[0]
-                self._fa4_outputs.append(output)
+                    num_splits=1, pack_gqa=True, out=output)
                 q_tensor.copy_(output)
                 return int(s["Q_O"])
             if self._fixed_shape and site in ("encoder", "decoder"):

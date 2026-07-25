@@ -2,9 +2,11 @@
 
 This document records the strict end-to-end development of the Pi0.5 NVFP4
 path on NVIDIA Thor SM110. The first run isolated the action-expert decoder;
-the current SOTA candidate combines all 18 encoder FFN NVFP4 layers with the
-decoder NVFP4 path. Its performance target is two milliseconds faster than the
-published 2-view encoder-FP4 + decoder-FP8 result: p50 must be at most 34.3 ms.
+the current candidate combines all 17 live encoder FFN NVFP4 layers with the
+decoder NVFP4 path. For 1/2/3 views, p50 must be at least two milliseconds
+faster than the published encoder-FP4 + decoder-FP8 results: at most
+28.5/34.3/40.8 ms respectively. The earlier explicit 3-view 40 ms target is
+also retained.
 
 Latency covers the full `infer()` call: image preprocessing and upload, SigLIP,
 encoder, all 18 decoder layers across 10 denoising steps, CUDA Graph replay,
@@ -35,18 +37,18 @@ Runtime activation preprocessing is CUDA-Graph capturable and uses:
   launch before Gate+Up and the next layer's QKV.
 - Existing fused GeGLU + NVFP4/SFA before Down.
 
-The 34.3 ms candidate additionally uses register-only decoder AdaRMSNorm
+The current candidate additionally uses register-only decoder AdaRMSNorm
 preprocessing and native SM110 E2M1x2 conversion. The encoder P1 path uses two
 FP4-output Gate/Up GEMMs, a gate LUT plus native E2M1x2 combiner, and encoder
 Down variant v8. Native FP4 conversion uses round-to-nearest-even, so it is an
 explicit numerical mode rather than a bit-exact alias for the historical
 midpoint implementation.
 
-The 40 ms production configuration also enables the established full encoder
-FFN NVFP4 preset with AWQ and P1 split-GU. The standard uint8 image hot path
-uses a precomputed 256-entry FP16 normalization table and a reused host buffer.
-This replaces per-frame uint8-to-FP32-to-FP16 allocations while producing
-bit-identical normalized images and bit-identical model outputs.
+The candidate also enables the established 17-layer encoder FFN NVFP4 preset
+with AWQ and P1 split-GU. Its AWQ exponent is 0.8. The standard uint8 image hot
+path uses a precomputed 256-entry FP16 normalization table and a reused host
+buffer. This replaces per-frame uint8-to-FP32-to-FP16 allocations while
+producing bit-identical normalized images and bit-identical model outputs.
 
 The production FP8 frontend remains the default. The opt-in is exposed through
 `load_model(..., use_fp4=True, use_fp4_decoder=True)`. The decoder FP4 path
@@ -57,27 +59,28 @@ raise; none select FP8 implicitly.
 
 ## Verification Contract
 
-The committed harness is `tests/bench_pi05_decoder_fp4_e2e.py`. The 40 ms run
-used:
+The committed harness is `tests/bench_pi05_decoder_fp4_e2e.py`. The current
+multi-view run used:
 
-- Commit `82ad7621fd6bd7920a41e69d8532ed6d0447cb96`.
 - NVIDIA Thor, compute capability 11.0, MAXN.
 - GPC min/max/current 1.575 GHz.
 - NVD min/max/current 1.692 GHz.
 - EMC cap 4.266 GHz.
 - Torch 2.10.0 with CUDA 13.0.
 - Production graph autotune level 3.
-- Two camera views and the explicit 13-token prompt in the harness.
+- One, two, or three camera views and the explicit 13-token prompt in the
+  harness.
 - Eight LIBERO observations with N=8, percentile 99.9 calibration.
 - Matched NumPy noise seeds for action comparison.
 - Separate FP8 and FP4 processes.
 - 20 warmup calls and 100 complete `infer()` samples per mode.
 
 The suite requires a clean tracked worktree and fails unless clocks and device
-identity match, all outputs are finite, FP4 is faster than FP8, FP4 p50 and p95
-are both at most 40 ms, final 7D action cosine is at least 0.999 globally and
-0.995 for every sample, and internal raw cosine is at least 0.995 globally and
-for every sample.
+identity match, all outputs are finite, FP4 is faster than FP8, and the
+per-view published-minus-2-ms p50 target passes. It also requires 2-view p95
+at most 40 ms and 3-view p50 at most 40 ms. Final 7D action cosine must be at
+least 0.999 globally and 0.995 for every sample; internal raw cosine must be at
+least 0.995 globally and for every sample.
 
 ## 40 ms Production Result
 
@@ -134,59 +137,62 @@ committed because they include machine-local paths. The reproducible method,
 precision configuration, and acceptance thresholds are committed in the
 harness.
 
-## FP4+FP4 SOTA Candidate (2026-07-25)
+## FP4+FP4 Multi-View Candidate (2026-07-25)
 
-This run uses commit `78ba9bf8f5481ad78d0c53143570a724dd073db7` and the
-strict default configuration in `tests/bench_pi05_decoder_fp4_e2e.py`:
+The PR candidate uses the strict default configuration in
+`tests/bench_pi05_decoder_fp4_e2e.py`:
 
-- Encoder layers 0-17: NVFP4 Gate, Up, and Down FFN projections with AWQ and
-  P1 split-GU. Encoder attention projections remain on the existing FP8 path.
+- Encoder layers 0-16: NVFP4 Gate, Up, and Down FFN projections with AWQ
+  alpha 0.8 and P1 split-GU. Encoder attention projections remain FP8.
 - Decoder layers 0-17 across all 10 denoising steps: NVFP4 QKV, O, Gate+Up,
-  and Down projections. There is no decoder FP8 projection fallback.
-- FA4 is active for SigLIP/encoder attention; the precision record is
-  `fa4_siglip_encoder`.
-- Two views, eight fixed LIBERO observations, 20 warmups, and 100 complete
-  `infer()` samples in separate FP8 and FP4 processes.
+  and Down projections. No decoder projection selects FP8 implicitly.
+- FA4 is active for SigLIP and encoder attention.
+- Each view count uses its matching eight-observation fixture, 20 warmups, and
+  100 complete `infer()` samples in separate FP8 and FP4 processes.
 
-The locked-clock result is:
+Locked-clock latency:
 
-| Metric | Same-run FP8 | FP4+FP4 | Change / gate |
-|---|---:|---:|---:|
-| p50 latency | 42.2269 ms | **33.8018 ms** | -8.4251 ms, 1.2492x |
-| p95 latency | 42.4982 ms | **34.0627 ms** | below 40 ms |
-| Published encoder-FP4 + decoder-FP8 p50 | 36.3000 ms | **33.8018 ms** | **-2.4982 ms** |
+| Views | Same-run FP8 p50 / p95 | FP4+FP4 p50 / p95 | Published FP4+FA4 p50 | Published delta | Gate |
+|---:|---:|---:|---:|---:|---|
+| 1 | 35.473 / 35.696 ms | **29.088 / 29.280 ms** | 30.5 ms | -1.412 ms | **fail**, target <=28.5 ms |
+| 2 | 41.650 / 41.857 ms | **32.772 / 33.008 ms** | 36.3 ms | **-3.528 ms** | pass |
+| 3 | 49.451 / 49.802 ms | **39.366 / 39.498 ms** | 42.8 ms | **-3.434 ms** | pass, including <40 ms |
 
-The requested latency gate passed with 0.4982 ms of headroom against 34.3 ms.
-The published SOTA comparison also passed the required 2.0 ms margin.
+Matched-noise fidelity across eight observations per view count:
 
-Matched-noise fidelity across the eight observations:
+| Views | Raw cosine / worst sample | Raw max abs | Final action cosine / worst sample | Action max abs | Gate |
+|---:|---:|---:|---:|---:|---|
+| 1 | 0.902456 / 0.480090 | 2.005371 | 0.697944 / -0.358415 | 1.887612 | **fail** |
+| 2 | 0.997764 / 0.995729 | 0.380005 | 0.999295 / 0.998271 | 0.096136 | pass |
+| 3 | 0.998375 / 0.997610 | 0.211670 | 0.999444 / 0.998854 | 0.095402 | pass |
 
-| Metric | Result | Gate |
-|---|---:|---:|
-| Internal raw 32D action cosine | 0.99715861 | >= 0.995, pass |
-| Worst raw per-sample cosine | 0.99358474 | >= 0.995, **fail** |
-| Raw max absolute difference | 0.32897949 | recorded |
-| Final returned 7D action cosine | 0.99919508 | >= 0.999, pass |
-| Worst final-action per-sample cosine | 0.99777615 | >= 0.995, pass |
-| Final-action max absolute difference | 0.12324846 | recorded |
+The 1-view failure is reproducible and is not caused by an unstable FP8
+reference: an independent FP8 rerun was elementwise identical. A decoder-only
+FP4 diagnostic, with every encoder FFN left on FP8, still produced final-action
+cosine 0.859115 because one sample's gripper sign changed. Quantizing encoder
+layers 0-15 or all 0-16 produced nearly the same failure, so excluding the last
+live encoder layer is not a fix. AWQ alpha 0.5 also failed. These diagnostic
+configurations are not runtime fallback paths and are not the proposed preset.
 
-The result is therefore a performance SOTA candidate, not a full strict-suite
-pass: every latency and returned-action gate passed, but one internal raw
-per-sample cosine gate did not. The harness threshold was not relaxed.
+This candidate must not merge yet. Two blockers remain:
 
-Reproduction command:
+1. Fix 1-view FP4+FP4 numerical fidelity without relaxing the cosine gates.
+2. Run task-level LIBERO rollouts. The local environments do not currently
+   contain the `libero` Python package, so this validation has not been run.
+
+Reproduction command, repeated with `--num-views 1`, `2`, and `3`:
 
 ```bash
+PYTHONPATH=/home/tianjianyang/code/FlashRT \
 LD_LIBRARY_PATH=/home/tianjianyang/miniconda3/envs/flashrt/lib/python3.12/site-packages/nvidia/cu13/lib \
-CUTE_DSL_ARCH=sm_110a FLASH_ATTENTION_ARCH=sm110 \
-/home/tianjianyang/miniconda3/envs/flashrt/bin/python \
+/tmp/flashrt-pi05-fa4-repro-venv/bin/python \
   tests/bench_pi05_decoder_fp4_e2e.py \
-  --output-dir /tmp/flashrt-fp4-fp4-sota-78ba9bf
+  --num-views 2 \
+  --output-dir /tmp/flashrt-pi05-fp4-fp4-2v
 ```
 
-Artifacts:
+Current shared artifacts:
 
 - `flash_rt_fp4`: `2c66b308661a142765af9cad8ee6a54eff465665829964359d0cada1c4a0ec96`
-- `flash_rt_kernels`: `3c4071ed7447b1aba743d7b92bbc180773f84e2271129e0510128c5dbf826d29`
-- `result.json`: `9ccb9498593b1076a7015d6f4365db7edbf35804e5261b6a0f4befcdd4948ae2`
-- Local result directory: `/tmp/flashrt-fp4-fp4-sota-78ba9bf`
+- `flash_rt_kernels`: `30270002a9646ec230fd69f2cb76ef33acbb5d683872c5833796aa15e10c0c91`
+- Local candidate root: `/tmp/flashrt-pr2-multiview-BBUYMy`

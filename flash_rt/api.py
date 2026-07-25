@@ -292,7 +292,7 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                use_fa4=False,
                fp4_layers=None,
                use_awq=None,
-               awq_alpha=0.5,
+               awq_alpha=None,
                use_p1_split_gu=None,
                num_steps=None,
                vision_pool_factor=None,
@@ -391,9 +391,11 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             this option never selects an alternate attention implementation.
         fp4_layers: Tuple of encoder layer indices to FP4-quantize (only
             applies when use_fp4=True). ``None`` resolves to the production
-            preset, full 18 encoder FFN layers with AWQ + P1 split-GU.
+            preset, all 17 live encoder FFN layers with AWQ + P1 split-GU.
             Explicit tuples override the preset; `(7, 8, 9)` is the
             conservative middle-FFN subset.
+        awq_alpha: AWQ activation scaling exponent. ``None`` selects 0.8 for
+            the encoder-FP4 + decoder-FP4 preset and 0.5 otherwise.
         use_fp8: Enable FP8 execution where the selected frontend supports
             an FP8/BF16 switch. Defaults to True to preserve existing
             performance-oriented behavior.
@@ -526,15 +528,17 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         return VLAModel(pipe, framework)
 
     # When use_fp4=True, the default resolves to the best-known production
-    # FP4 config (full 18 encoder FFN layers + AWQ + P1 split-GU). Passing
+    # FP4 config (all 17 live encoder FFN layers + AWQ + P1 split-GU). Passing
     # any sub-flag explicitly overrides the preset; None means "use preset".
     if use_fp4:
         if fp4_layers is None:
-            fp4_layers = tuple(range(18))
+            fp4_layers = tuple(range(17))
         if use_awq is None:
             use_awq = True
         if use_p1_split_gu is None:
             use_p1_split_gu = True
+        if awq_alpha is None:
+            awq_alpha = 0.8 if use_fp4_decoder else 0.5
     else:
         if fp4_layers is None:
             fp4_layers = (7, 8, 9)
@@ -542,6 +546,8 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             use_awq = False
         if use_p1_split_gu is None:
             use_p1_split_gu = False
+        if awq_alpha is None:
+            awq_alpha = 0.5
 
     # Nex-N2-mini (qwen3_5_moe) is a text LLM, not a VLA: its frontend exposes
     # infer()->logits / generate() rather than the predict(images, ...) surface

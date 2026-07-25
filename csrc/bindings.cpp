@@ -1431,6 +1431,16 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
                      reinterpret_cast<half*>(output), nv, to_stream(stream));
     }, py::arg("input"), py::arg("output"), py::arg("nv"), py::arg("stream") = 0);
 
+    m.def("patch_im2col_uint8",
+          [](uintptr_t input, uintptr_t lut, uintptr_t output, int nv,
+             uintptr_t stream) {
+              patch_im2col_uint8(
+                  reinterpret_cast<const uint8_t*>(input),
+                  reinterpret_cast<const half*>(lut),
+                  reinterpret_cast<half*>(output), nv, to_stream(stream));
+          }, py::arg("input"), py::arg("lut"), py::arg("output"),
+             py::arg("nv"), py::arg("stream") = 0);
+
     m.def("patch_embed_bias_pos", [](uintptr_t output, uintptr_t bias, uintptr_t pos_emb,
                                       int S, int D, int S_per_view, uintptr_t stream) {
         patch_embed_bias_pos(reinterpret_cast<half*>(output),

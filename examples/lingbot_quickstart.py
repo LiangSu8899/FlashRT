@@ -14,7 +14,7 @@ Build first (one shared module — LingBot kernels live inside flash_rt_kernels)
     pip install ".[torch,thor-fa4]"      # thor-fa4 = FA4 deps (cutlass-dsl + quack)
 
 Run (FA4 source is vendored at csrc/attention/flash_attn_4_src; the loader sets
-the Thor arch alias CUTE_DSL_ARCH=sm_101a for you):
+the Thor target CUTE_DSL_ARCH=sm_110a for you):
 
     python examples/lingbot_quickstart.py \
         --checkpoint /path/to/lingbot-vla-4b \
