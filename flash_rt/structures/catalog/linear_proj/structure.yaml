@@ -49,3 +49,26 @@ gates:
                                    # discovery groups sibling q/k/v/o
                                    # into one family, never blind-scans
                                    # every nn.Linear
+    # work (M*N*K) bands, per executable form. A form is qualified by
+    # what it amortizes, so the bands are not the same number and a
+    # projection outside one may still sit inside another — a refusal
+    # names the form it was refused in, never the projection.
+    work_band:
+      bias: [2.0e+8, .inf]      # fused quantize needs a large GEMM
+      no_bias: [2.0e+7, 1.0e+9]  # one quantize launch to amortize; above
+                               # the band the bundled quantize of the
+                               # bias form wins even with no bias to add
+      fp8_in: [0, .inf]        # the producer already paid
+
+evidence:
+  - "form matters as much as the seam: at pi05 expert o_proj
+     (M=50, K=2048, N=1024) the bias form ties the host BF16 Linear
+     (6.68 vs 6.66 us) and was refused, while the no-bias form runs
+     5.64 us — the refusal was about the form, not the projection"
+  - "band edges measured against the host Linear on RTX 5090: no_bias
+     wins 0.67us at 2.6e7 and loses 0.25us at 1.3e7; it loses 0.17us at
+     3.0e9 where the bias form's bundled quantize wins"
+  - "pi05 auto stack, paired interleaved timing: per-form bands vs one
+     shared floor -0.153 ms (range -0.149/-0.184), 18 expert o_proj
+     seams move from refused to bound, refusal list goes to zero,
+     tick parity 0.999939 -> 0.999906"
