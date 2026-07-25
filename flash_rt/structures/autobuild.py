@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import itertools
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, Iterable, Sequence
 
 import torch
 
@@ -61,8 +61,18 @@ class AutoPlan:
     notes: dict[str, Any] = field(default_factory=dict)
 
 
-def _amax(tensors) -> float:
-    return max(t.float().abs().max().item() for t in tensors)
+def _amax(cap) -> float:
+    """The seam's activation amax over every call it saw.
+
+    Accumulated online during calibration, so it does not depend on how
+    many activations were kept — a run that holds four of them still
+    scales from all of them. Falls back to the held ones for a cap that
+    predates the accumulator (a loaded receipt, a hand-built dict).
+    """
+    value = cap.get("amax")
+    if value is not None:
+        return float(value)
+    return max(t.float().abs().max().item() for t in cap["x"])
 
 
 def _rows(t: torch.Tensor) -> int:
@@ -71,21 +81,58 @@ def _rows(t: torch.Tensor) -> int:
 
 def auto_swaps(
     model: torch.nn.Module,
-    forward: Callable[[], Any],
+    forward: Callable[..., Any] | Sequence[Callable[[], Any]],
     *,
     structures: tuple[str, ...] = ("decoder_ffn", "vision_ffn",
                                    "qkv_pack", "adaln_producer",
                                    "linear_proj", "norm_fused",
                                    "attention_core", "decoder_block"),
     negotiate_fp8: bool = True,
-    frames: int = 1,
+    frames: int | None = None,
+    samples: Iterable[Any] | None = None,
+    keep_samples: int | None = None,
     verbose: bool = False,
 ) -> AutoPlan:
-    """Discover, calibrate in one pass, and bind every applicable seam."""
+    """Discover, calibrate in one pass, and bind every applicable seam.
+
+    Calibration comes from running the host, and there are three ways to
+    say how much of it to run. They are one axis, not three interfaces:
+    ``forward`` is always "run the host once".
+
+        auto_swaps(model, forward)                    # one frame
+        auto_swaps(model, forward, frames=8)          # eight, the closure
+                                                      # advancing its own data
+        auto_swaps(model, [f0, f1, f2])               # one thunk per frame
+        auto_swaps(model, feed, samples=dataset)      # feed(sample) per sample
+
+    ``samples`` is any iterable; with it, ``forward`` takes one sample.
+    Nothing here is bound to a particular loader type, because the shape
+    of an observation is the host's business.
+
+    ``frames`` defaults to one, and to the whole of ``samples`` when a
+    sample source is given.
+
+    Static scales are accumulated over *every* call the seam sees, not
+    over the samples that are kept: the running amax is exact regardless
+    of ``keep_samples``, which only bounds how many activations are held
+    for the parity self-check and the statistics an implementation
+    derives itself. It defaults to unbounded at one frame — exactly the
+    behaviour before this argument existed — and to a cap above it, so
+    that asking for more frames costs more time and not more memory.
+    """
 
     def say(msg: str) -> None:
         if verbose:
             print(f"[autobuild] {msg}", flush=True)
+
+    thunks, source = _calibration_thunks(forward, frames, samples)
+    # unbounded at one frame is exactly the behaviour that existed before
+    # this could be bounded at all, so asking for one frame changes no
+    # number anywhere
+    hold = keep_samples
+    if hold is None:
+        hold = None if len(thunks) == 1 else _HOLD_PER_SEAM
+    plan_notes_calibration: dict[str, Any] = {}
 
     seams = discover(model, structures)
     # a packed group owns its q/k/v; linear_proj keeps only what the
@@ -107,8 +154,19 @@ def auto_swaps(
     def cap_input(path):
         def hook(module, args, kwargs, out):
             x = args[0] if args else next(iter(kwargs.values()))
-            caps[path].setdefault("x", []).append(x.detach())
-            caps[path]["rows"] = _rows(x)
+            cap = caps[path]
+            held = cap.setdefault("x", [])
+            seen = cap.get("seen", 0)
+            cap["seen"] = seen + 1
+            # the scale follows every call; the held activations only
+            # have to be enough to check the result and to derive the
+            # statistics an impl computes for itself
+            amax = x.detach().float().abs().max()
+            cap["amax"] = (amax if "amax" not in cap
+                           else torch.maximum(cap["amax"], amax))
+            if hold is None or len(held) < hold:
+                held.append(x.detach())
+            cap["rows"] = _rows(x)
             return None
         return hook
 
@@ -160,11 +218,16 @@ def auto_swaps(
 
     if hooks:
         with torch.no_grad():
-            for _ in range(max(1, frames)):
-                forward()
+            for thunk in thunks:
+                thunk()
         for h in hooks:
             h.remove()
-        say("calibration pass done")
+        plan_notes_calibration = {
+            "frames": len(thunks), "source": source,
+            "stat": "amax", "keep_samples": hold,
+        }
+        say(f"calibration pass done ({len(thunks)} frame(s) from "
+            f"{source}, scale stat amax over every call)")
 
     # ---- fp8 seam negotiation: the load-bearing structure combination.
     # A single kernel need not win alone (fp8 qkv at M=50 is marginal,
@@ -223,7 +286,7 @@ def auto_swaps(
                 # is the one static scale both sides share
                 keep[p_slot], keep[c_slot] = g[p_slot], g[c_slot]
                 act_scales[f"{lay}|{c_slot}"] = torch.tensor(
-                    [max(_amax(c_cap["x"]) / 448.0, 1e-8)], device=dev)
+                    [max(_amax(c_cap) / 448.0, 1e-8)], device=dev)
             if keep:
                 negotiated[lay] = keep
 
@@ -282,7 +345,12 @@ def auto_swaps(
         from . import adapters as _adapters  # noqa: F401 (registers)
         for adapter in _ATTENTION_ADAPTERS:
             try:
-                result = adapter(model, forward)
+                # the adapter needs "run the host once", which is what a
+                # thunk is. Handing it the caller's callable breaks the
+                # sample entry, where that callable takes a sample —
+                # the whole point of normalising the three ways in was
+                # that nothing downstream should see the difference
+                result = adapter(model, thunks[0])
             except (ValueError, RuntimeError) as refusal:
                 plan.notes.setdefault("refused", []).append(
                     ("attention_core", str(refusal)[:80]))
@@ -325,6 +393,11 @@ def auto_swaps(
             plan.swaps.pop(seam.path + "." + child, None)
         plan.swaps[seam.path] = block
 
+    if plan_notes_calibration:
+        # the calibration method is part of the result, not a detail of
+        # how it was produced: a parity band means something different
+        # depending on how much of the distribution it was scaled from
+        plan.notes["calibration"] = plan_notes_calibration
     say(f"bound {len(plan.swaps)} seam(s), "
         f"{len(plan.notes.get('refused', []))} refused")
     return plan
@@ -493,7 +566,7 @@ def _bind_auto(model, seam, cap, plan, act_scales, negotiate_fp8):
             return None
         block = _resolve(model, seam.path)
         act_scale = torch.tensor(
-            [max(_amax(cap["x"]) / 448.0, 1e-8)],
+            [max(_amax(cap) / 448.0, 1e-8)],
             device=getattr(block, seam.pack_attrs[0]).weight.device)
         if seam.variant.get("bind") == "module":
             # the whole block: packed projections *and* the attention
@@ -599,6 +672,39 @@ def _bind_negotiated(model, p_seam, k_seam, p_cap, c_cap, scale, plan):
     swaps.update({k_seam.path + "." + a: m
                   for a, m in zip(k_seam.pack_attrs, parts)})
     return swaps
+
+
+_HOLD_PER_SEAM = 16     # bound for multi-frame runs; see auto_swaps
+
+
+def _calibration_thunks(forward, frames, samples):
+    """Turn the three ways of asking for calibration into one list.
+
+    They differ only in where a frame's input comes from, so they end as
+    the same thing: a list of callables, each of which runs the host
+    once. Keeping them one axis is what stops "how much calibration" and
+    "how to run the host" from becoming two interfaces that can disagree.
+    """
+    if samples is not None:
+        if not callable(forward):
+            raise ValueError(
+                "auto_swaps: with samples=, forward takes one sample")
+        taken = list(samples) if frames is None else [
+            s for _, s in zip(range(max(1, frames)), samples)]
+        if not taken:
+            raise ValueError("auto_swaps: samples is empty")
+        return [(lambda s=s: forward(s)) for s in taken], "samples"
+    if isinstance(forward, (list, tuple)):
+        if not forward:
+            raise ValueError("auto_swaps: no forward thunks given")
+        if frames is not None and frames != len(forward):
+            raise ValueError(
+                f"auto_swaps: {len(forward)} thunk(s) given but "
+                f"frames={frames}; the thunks decide")
+        return list(forward), "thunks"
+    if not callable(forward):
+        raise ValueError("auto_swaps: forward must be callable")
+    return [forward] * max(1, frames or 1), "forward"
 
 
 def _adaln_form(cap) -> tuple[int, str]:
