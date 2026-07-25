@@ -193,6 +193,19 @@ def discover(
                           "S": cond_proj.out_features},
                     variant={"bind": "table_only", "out_dtype": "bf16"},
                     family=family, layer_index=idx))
+        if "norm_fused" in structures and isinstance(module, nn.LayerNorm):
+            if (getattr(module, "weight", None) is not None
+                    and getattr(module, "bias", None) is not None):
+                family, idx = _family_key(path)
+                seams.append(Seam(
+                    structure="norm_fused", path=path,
+                    parent_path=parent_path, norm_attr=None,
+                    # take the dim from the affine weight: subclasses
+                    # (fused LayerNorm variants) may not carry
+                    # normalized_shape
+                    dims={"D": int(module.weight.shape[-1])},
+                    variant={"norm": "layer", "compute_dtype": "bf16"},
+                    family=family, layer_index=idx))
         if "linear_proj" in structures:
             for group in _ATTN_PROJ:
                 projs = [getattr(module, a, None) for a in group]

@@ -74,7 +74,7 @@ def auto_swaps(
     *,
     structures: tuple[str, ...] = ("decoder_ffn", "vision_ffn",
                                    "qkv_pack", "adaln_producer",
-                                   "linear_proj"),
+                                   "linear_proj", "norm_fused"),
     negotiate_fp8: bool = True,
     frames: int = 1,
     verbose: bool = False,
@@ -255,6 +255,11 @@ def _bind_auto(model, seam, cap, plan, act_scales, negotiate_fp8):
             return None
         h = get(seam.structure)
         return h.bind(_resolve(model, seam.path), cap["x"], gate_cos=0.0)
+
+    if seam.structure == "norm_fused":
+        from .impls.norm_fused import bind_norm_fused
+        return bind_norm_fused(_resolve(model, seam.path),
+                               calibration=cap.get("x"))
 
     if seam.structure == "linear_proj":
         if not cap.get("x"):
