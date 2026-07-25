@@ -175,7 +175,15 @@ def auto_swaps(
         # on the calibrated row count, not on host names.
         dev = next(model.parameters()).device
         for lay, g in by_parent.items():
-            pairs = [("producer", "pack"), ("producer_ffn", "ffn")]
+            # only the attention pack is negotiated. The FFN chain was
+            # measured and refused: replacing the norm with a fused fp8
+            # producer costs a kernel (gate_residual, +180 launches) plus
+            # its style materialization (+180) to save the FFN's own
+            # input quantize (-180) — net +0.17ms of kernel time. The
+            # host's compiler-fused norm is already cheap, so the
+            # producer only pays off where it feeds a consumer that
+            # cannot fuse the quantize itself (the packed projections).
+            pairs = [("producer", "pack")]
             keep = {}
             for p_slot, c_slot in pairs:
                 if p_slot not in g or c_slot not in g:
