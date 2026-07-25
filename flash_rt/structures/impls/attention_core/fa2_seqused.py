@@ -145,6 +145,32 @@ class PackedKVAttention(torch.nn.Module):
             softmax_lse=sc.lse, workspace=sc.workspace,
             softmax_scale=scale)
 
+    def forward_suffix(self, query, key, value, *, scale=None):
+        """Kernel layout (B, S, H, D), with **suffix-only** keys/values.
+
+        Two things separate this from :meth:`forward`. The layout: the
+        host builds (B, H, S, D) because that is what eager SDPA wants
+        and :meth:`forward` transposes it back — two cancelling
+        transposes plus the copies that make each of them contiguous. A
+        caller that owns the whole attention sublayer never builds the
+        host layout at all; the projections' own output view *is* this
+        one. And the extent: the host hands attention the full
+        cache-concatenated KV and the suffix gets sliced back out here,
+        while a sublayer's projections produce exactly the new tokens —
+        which is the suffix already. Binding checks that equality rather
+        than assuming it.
+        """
+        plan = self.plan
+        q = query if query.is_contiguous() else query.contiguous()
+        if plan.suffix_len:
+            self.packed_k[:, plan.prefix:].copy_(key)
+            self.packed_v[:, plan.prefix:].copy_(value)
+        sc = self._scratch
+        return self._kfa.forward_static(
+            q, self.packed_k, self.packed_v, out=sc.out,
+            softmax_lse=sc.lse, workspace=sc.workspace,
+            softmax_scale=scale)
+
 
 def bind_attention_core(captures, *, prefix_static_rtol: float = 1e-3):
     """Bind one packed-KV attention per site from real captures.
