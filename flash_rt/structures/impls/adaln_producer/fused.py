@@ -154,7 +154,11 @@ class AdaLNProducer(torch.nn.Module):
             else:
                 self._fn = ka.ada_rms_norm_style_bf16
         # residual=0 / gate=1 turn the gated-residual kernel into a
-        # plain modulated norm; both are preallocated for graph replay
+        # plain modulated norm; both are preallocated for graph replay.
+        # The kernel writes the residual buffer in place, so the zero
+        # has to be re-established on every call — a buffer that is
+        # merely allocated zeroed drifts silently from the second tick
+        # onward, and the drift compounds.
         self.register_buffer("w_ones", torch.ones(
             dim, device=dev, dtype=torch.bfloat16))
         self.register_buffer("resid", torch.zeros(
@@ -177,6 +181,7 @@ class AdaLNProducer(torch.nn.Module):
         style2d = style.expand(rows, -1).contiguous()
         x2d = x.reshape(-1, x.shape[-1])
         if self.out_fp8:
+            self.resid.zero_()      # in-place residual: reset per call
             _, y, gate = self._fn(self.resid, x2d, self.gate_ones,
                                   self.w_ones, style2d, self.act_scale)
         else:
