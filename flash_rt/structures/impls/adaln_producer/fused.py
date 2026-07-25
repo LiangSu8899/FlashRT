@@ -166,19 +166,38 @@ class AdaLNProducer(torch.nn.Module):
         self.register_buffer("gate_ones", torch.ones(
             rows, dim, device=dev, dtype=torch.bfloat16))
 
-    def forward(self, x: torch.Tensor, cond: torch.Tensor | None = None):
-        idx = self.locator(cond)
+    # ---- block-facing entries -------------------------------------
+    # A caller that owns the whole block (see ``impls.decoder_block``)
+    # can do two things a norm-boundary caller cannot: resolve the step
+    # once and share it across the producers on the same conditioning
+    # stream, and hand this producer the residual that is still pending
+    # from the previous sublayer. The kernel already computes
+    # ``residual + x * gate`` before it norms — at the norm boundary
+    # there is nothing to hand it, so the residual is zeroed and the
+    # host pays a separate elementwise add. These entries expose the
+    # wider contract without changing the standalone one below.
+
+    @property
+    def can_absorb(self) -> bool:
+        """Whether this producer can fold a pending gated residual."""
+        return self.out_fp8 and self.norm == "rms"
+
+    def resolve(self, cond: torch.Tensor) -> torch.Tensor:
+        """Step index for this conditioning — shareable across siblings."""
+        return self.locator(cond)
+
+    def _style2d(self, idx: torch.Tensor) -> torch.Tensor:
         style = self.styles.index_select(0, idx)
-        if self.norm == "layer":
-            scale, shift = style[0].chunk(2, dim=-1)
-            y = self._fn(
-                x.reshape(-1, x.shape[-1]).to(torch.bfloat16)
-                .contiguous(),
-                scale.contiguous(), shift.contiguous(),
-                self.act_scale)
-            return y.reshape(x.shape)
-        rows = self.resid.shape[0]
-        style2d = style.expand(rows, -1).contiguous()
+        return style.expand(self.resid.shape[0], -1).contiguous()
+
+    def produce(self, x: torch.Tensor, idx: torch.Tensor):
+        """Normed output plus the full-width gate, both 2D.
+
+        The standalone ``forward`` slices the gate down to one row for
+        the host's broadcast add; a block caller keeps the full rows so
+        it can feed the gate straight back into :meth:`absorb`.
+        """
+        style2d = self._style2d(idx)
         x2d = x.reshape(-1, x.shape[-1])
         if self.out_fp8:
             self.resid.zero_()      # in-place residual: reset per call
@@ -186,6 +205,40 @@ class AdaLNProducer(torch.nn.Module):
                                   self.w_ones, style2d, self.act_scale)
         else:
             y, gate = self._fn(x2d, self.w_ones, style2d)
+        return y, gate
+
+    def absorb(self, residual: torch.Tensor, x: torch.Tensor,
+               gate: torch.Tensor, idx: torch.Tensor):
+        """Fold a pending ``residual + x * gate`` into this norm.
+
+        Returns the updated residual stream, the normed (fp8) output and
+        this producer's own gate. The residual is copied into the
+        kernel's in-place buffer rather than written through: the caller
+        owns its tensor and a hidden mutation of it is exactly the kind
+        of silent aliasing that only shows up as drift.
+        """
+        if not self.can_absorb:
+            raise ValueError(
+                "adaln_producer: absorb needs the rms form with fp8 "
+                "output — the plain entry has no residual argument")
+        style2d = self._style2d(idx)
+        shape = self.resid.shape
+        self.resid.copy_(residual.reshape(shape))
+        return self._fn(self.resid, x.reshape(shape), gate,
+                        self.w_ones, style2d, self.act_scale)
+
+    def forward(self, x: torch.Tensor, cond: torch.Tensor | None = None):
+        idx = self.locator(cond)
+        if self.norm == "layer":
+            style = self.styles.index_select(0, idx)
+            scale, shift = style[0].chunk(2, dim=-1)
+            y = self._fn(
+                x.reshape(-1, x.shape[-1]).to(torch.bfloat16)
+                .contiguous(),
+                scale.contiguous(), shift.contiguous(),
+                self.act_scale)
+            return y.reshape(x.shape)
+        y, gate = self.produce(x, idx)
         return (y.reshape(x.shape),
                 gate[:1].reshape(1, 1, gate.shape[-1]).to(x.dtype))
 
