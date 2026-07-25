@@ -21,6 +21,11 @@ _VISION_PROJ = (("fc1", "fc2"), ("linear_fc1", "linear_fc2"))
 _NORM_ATTRS = ("post_attention_layernorm", "layer_norm2", "norm2")
 _ATTN_PROJ = (("q_proj", "k_proj", "v_proj", "o_proj"),
               ("q_proj", "k_proj", "v_proj", "out_proj"))
+# the HF decoder-layer shape: two sublayers, each a norm feeding a
+# compute region. Matched by slots, not by class name, so every host
+# built on that layout is the same seam.
+_BLOCK_SLOTS = ("self_attn", "mlp", "input_layernorm",
+                "post_attention_layernorm")
 # sibling groups that qkv_pack packs into one GEMM: same input, fixed
 # consumption order. The trailing o_proj/out_proj is not part of the
 # pack (it consumes the attention output, not the shared input).
@@ -154,6 +159,26 @@ def discover(
                 variant={"activation": act, "norm_weight_mode": "direct"},
                 family=family, layer_index=idx))
             continue
+        if "decoder_block" in structures and all(
+            isinstance(getattr(module, a, None), nn.Module)
+            for a in _BLOCK_SLOTS
+        ):
+            norm_in = module.input_layernorm
+            gated = _has_cond_forward(norm_in)
+            width = getattr(module, "hidden_size", None)
+            if width is None:
+                w = getattr(norm_in, "weight", None)
+                width = (int(w.shape[-1]) if w is not None
+                         else getattr(norm_in, "dim", 0))
+            family, idx = _family_key(path)
+            seams.append(Seam(
+                structure="decoder_block", path=path,
+                parent_path=parent_path, norm_attr="input_layernorm",
+                dims={"D": int(width)},
+                variant={"residual": "gated" if gated else "plain",
+                         "norm": "adaln_rms" if gated else "rms",
+                         "ffn_entry": "fp8_static"},
+                family=family, layer_index=idx))
         if "qkv_pack" in structures:
             for group in _QKV_PACK:
                 projs = [getattr(module, a, None) for a in group]
