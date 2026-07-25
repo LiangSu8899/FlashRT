@@ -73,6 +73,17 @@ class GemmaAttentionAdapter:
         for i, layer in enumerate(expert):
             layer.self_attn._fa2_core = cores[i]
 
+        # qualify against the form the host will actually run. An
+        # attention this size is cheap once a compiler fuses its softmax
+        # chain, and the packed kernel carries split-KV combine plus
+        # per-call KV copies; whether it wins depends entirely on what it
+        # replaces, so measure that rather than assume.
+        if not _wins_against_host(orig, cores[0], captures[0], seq_q):
+            for layer in expert:
+                if hasattr(layer.self_attn, "_fa2_core"):
+                    del layer.self_attn._fa2_core
+            return None
+
         fired = {"n": 0}
 
         def fa2_fn(module, query, key, value, attention_mask, **kw):
@@ -83,22 +94,62 @@ class GemmaAttentionAdapter:
                                     scale=kw.get("scaling")), None
 
         mg.eager_attention_forward = fa2_fn
-        # self-verify the patch actually takes over the seam on the same
-        # forward that will be captured; if it never fires (the host's
-        # captured entry uses a different attention shape than the one
-        # we calibrated on) leave the host untouched rather than install
-        # a patch that only adds a Python check and blocks fusion
-        with __import__("torch").no_grad():
-            forward()
-        if fired["n"] == 0:
-            mg.eager_attention_forward = orig
-            for layer in expert:
-                if hasattr(layer.self_attn, "_fa2_core"):
-                    del layer.self_attn._fa2_core
-            return None
         # the swap map is empty (the seam is a function, not a module);
-        # the patch and the per-layer core buffers are the swap
+        # the patch and the per-layer core buffers are the swap.
+        # note: no extra host forward is run to self-verify — replaying
+        # the host mutates its state (cache growth, guard shapes) and
+        # that changes what the stage then captures. The recording pass
+        # above already proves the seam is live in this host.
         return {}, None
+
+
+def _wins_against_host(orig, core, capture, seq_q) -> bool:
+    """Bench the packed core against the host attention, compiled.
+
+    The comparison is the point: the same kernel that beats an unfused
+    eager attention loses to a compiled one at these shapes. Both sides
+    run in the execution form the captured stage will use.
+    """
+    import torch
+
+    q, k, v = capture["q"], capture["keys"][0], capture["values"][0]
+    mask = capture.get("mask")
+    scale = float(q.shape[-1]) ** -0.5
+
+    class _Host(torch.nn.Module):
+        num_key_value_groups = q.shape[1] // k.shape[1]
+
+        def forward(self, q, k, v, mask):
+            return orig(self, q, k, v, mask, scaling=scale,
+                        dropout=0.0)[0]
+
+    # the bench compiles a probe; reset the compiler afterwards so a
+    # qualification that declines leaves no trace on the host's own
+    # compilation (a leftover probe perturbs what inductor does next)
+    torch._dynamo.reset()
+    host = torch.compile(_Host())
+
+    def timed(fn, warmup=3, iters=20):
+        for _ in range(warmup):
+            fn()
+        torch.cuda.synchronize()
+        start, end = torch.cuda.Event(True), torch.cuda.Event(True)
+        start.record()
+        for _ in range(iters):
+            fn()
+        end.record()
+        torch.cuda.synchronize()
+        return start.elapsed_time(end) / iters
+
+    try:
+        with torch.no_grad():
+            host_ms = timed(lambda: host(q, k, v, mask))
+            core_ms = timed(lambda: core(q, k, v, scale=scale))
+    except Exception:
+        return False      # cannot compare → leave the host alone
+    finally:
+        torch._dynamo.reset()
+    return host_ms > core_ms * 1.05
 
 
 def _infer_layers(model) -> int:
