@@ -1,10 +1,14 @@
-# Pi0.5 Thor Decoder NVFP4 End-to-End Result
+# Pi0.5 Thor NVFP4 End-to-End Results
 
-This document records the first strict end-to-end result for the Pi0.5
-action-expert decoder NVFP4 path on NVIDIA Thor SM110. It follows the separately
-recorded M=10 primitive baseline and includes activation preprocessing, every
-decoder layer and denoising step, CUDA Graph replay, image upload/preprocessing,
-synchronization, and action postprocessing.
+This document records the strict end-to-end development of the Pi0.5 NVFP4
+path on NVIDIA Thor SM110. The first run isolated the action-expert decoder;
+the current production run combines the validated encoder FFN preset with the
+decoder NVFP4 path and requires both p50 and p95 complete-inference latency to
+remain at or below 40 ms.
+
+Latency covers the full `infer()` call: image preprocessing and upload, SigLIP,
+encoder, all 18 decoder layers across 10 denoising steps, CUDA Graph replay,
+synchronization, action download, and postprocessing.
 
 ## Implemented Path
 
@@ -31,37 +35,82 @@ Runtime activation preprocessing is CUDA-Graph capturable and uses:
   launch before Gate+Up and the next layer's QKV.
 - Existing fused GeGLU + NVFP4/SFA before Down.
 
-The production FP8 frontend remains the default. The opt-in is exposed through
-`load_model(..., use_fp4=True, use_fp4_decoder=True)`. Decoder-only A/B runs can
-keep the encoder in FP8 with `fp4_layers=()`, `use_awq=False`, and
-`use_p1_split_gu=False`.
+The 40 ms production configuration also enables the established full encoder
+FFN NVFP4 preset with AWQ and P1 split-GU. The standard uint8 image hot path
+uses a precomputed 256-entry FP16 normalization table and a reused host buffer.
+This replaces per-frame uint8-to-FP32-to-FP16 allocations while producing
+bit-identical normalized images and bit-identical model outputs.
 
-The decoder FP4 path currently supports standard Torch B=1 inference only.
-CFG, batched inference, and model-runtime export raise explicit errors when the
-path is enabled. Unsupported hardware, shapes, missing NVFP4 kernels, invalid
-variants, or failed GEMM launches also raise; none select FP8 implicitly.
+The production FP8 frontend remains the default. The opt-in is exposed through
+`load_model(..., use_fp4=True, use_fp4_decoder=True)`. The decoder FP4 path
+currently supports standard Torch B=1 inference only. CFG, batched inference,
+and model-runtime export raise explicit errors when enabled. Unsupported
+hardware, shapes, missing kernels, invalid variants, or failed launches also
+raise; none select FP8 implicitly.
 
 ## Verification Contract
 
-The committed harness is `tests/bench_pi05_decoder_fp4_e2e.py`. The official
-run used:
+The committed harness is `tests/bench_pi05_decoder_fp4_e2e.py`. The 40 ms run
+used:
 
-- Commit `bc070ae5ae3764d872efced263c401d3c05f91fb`.
+- Commit `82ad7621fd6bd7920a41e69d8532ed6d0447cb96`.
 - NVIDIA Thor, compute capability 11.0, MAXN.
 - GPC min/max/current 1.575 GHz.
 - NVD min/max/current 1.692 GHz.
 - EMC cap 4.266 GHz.
 - Torch 2.10.0 with CUDA 13.0.
-- Two camera views and the 13-token prompt encoded in the harness.
+- Production graph autotune level 3.
+- Two camera views and the explicit 13-token prompt in the harness.
 - Eight LIBERO observations with N=8, percentile 99.9 calibration.
 - Matched NumPy noise seeds for action comparison.
 - Separate FP8 and FP4 processes.
-- 20 warmup calls and 100 complete `infer()` latency samples per mode.
+- 20 warmup calls and 100 complete `infer()` samples per mode.
 
-The suite requires a clean tracked worktree and fails if clocks, hardware,
-finite outputs, action fidelity, or FP4 p50 speedup do not meet the contract.
+The suite requires a clean tracked worktree and fails unless clocks and device
+identity match, all outputs are finite, FP4 is faster than FP8, FP4 p50 and p95
+are both at most 40 ms, final 7D action cosine is at least 0.999 globally and
+0.995 for every sample, and internal raw cosine is at least 0.995 globally and
+for every sample.
 
-## Locked End-to-End Result
+## 40 ms Production Result
+
+| Metric | Production FP8 | Full NVFP4 | Change |
+|---|---:|---:|---:|
+| p50 latency | 44.1315 ms | 39.1045 ms | -5.0270 ms |
+| p95 latency | 44.4170 ms | 39.2420 ms | -5.1749 ms |
+| p50 speedup | 1.0000x | 1.1286x | +12.86% |
+
+Both absolute latency gates passed with 0.8955 ms of p50 headroom and 0.7580 ms
+of p95 headroom.
+
+Matched-noise fidelity across all eight observations:
+
+| Metric | Result |
+|---|---:|
+| Internal raw 32D action cosine | 0.99764686 |
+| Worst raw per-sample cosine | 0.99506149 |
+| Raw max absolute difference | 0.24609375 |
+| Final returned 7D action cosine | 0.99913207 |
+| Worst final-action per-sample cosine | 0.99635148 |
+| Final-action max absolute difference | 0.16438568 |
+
+The full encoder FP4 preset has a documented raw-output cosine around 0.998.
+The final 7D action is the API output consumed by the LIBERO robot, so it keeps
+the stricter 0.999 global gate; the full 32D tensor remains a recorded internal
+diagnostic. These checks establish matched-input numerical fidelity, not robot
+task success rate.
+
+The measured artifacts were:
+
+- `flash_rt_fp4`: `a944449f4a1f763461fb92b6e87d3796c6b6dfbde58e8550eaa62bf15d61a345`
+- `flash_rt_kernels`: `c16f817c9ea924b1d88c97e9b510bd61cdbecf3422f483609bb9de8e38b0292b`
+- `result.json`: `0bc9e539cd0225d254cff4f674e8befdcd00acae8264af28a336d1ddb66bbcb3`
+
+## Decoder-Isolation Baseline
+
+The earlier run at commit `bc070ae5ae3764d872efced263c401d3c05f91fb`
+kept the encoder in FP8 and changed only the decoder. It established the
+decoder contribution independently of the production encoder preset:
 
 | Metric | FP8 | Decoder FP4 | Change |
 |---|---:|---:|---:|
@@ -69,27 +118,11 @@ finite outputs, action fidelity, or FP4 p50 speedup do not meet the contract.
 | p95 latency | 44.9634 ms | 43.2874 ms | -1.6760 ms |
 | p50 speedup | 1.0000x | 1.0381x | +3.81% |
 
-Matched-noise fidelity across all eight observations:
+Its final 7D action cosine was 0.99980575 and raw 32D cosine was 0.99956287.
+The result JSON SHA-256 was
+`cf64f3e470448881a35dfbcb7219609413633ca55197e07379f929999492fc83`.
 
-| Metric | Result |
-|---|---:|
-| Raw 32D action cosine | 0.99956287 |
-| Worst raw per-sample cosine | 0.99921848 |
-| Raw max absolute difference | 0.09716797 |
-| Final 7D action cosine | 0.99980575 |
-| Worst final-action per-sample cosine | 0.99975416 |
-| Final-action max absolute difference | 0.04827201 |
-
-All correctness and latency gates passed. These action metrics establish
-numerical fidelity against the production FP8 decoder; they are not a robot
-task-success-rate claim.
-
-The measured extension hashes were:
-
-- `flash_rt_fp4`: `a944449f4a1f763461fb92b6e87d3796c6b6dfbde58e8550eaa62bf15d61a345`
-- `flash_rt_kernels`: `c16f817c9ea924b1d88c97e9b510bd61cdbecf3422f483609bb9de8e38b0292b`
-- `result.json`: `cf64f3e470448881a35dfbcb7219609413633ca55197e07379f929999492fc83`
-
-The full local result contains all 200 latency samples and is intentionally not
-committed because it records machine-local paths. The reproducible method and
-all acceptance thresholds are in the committed harness.
+The local result files contain all 200 retained latency samples and are not
+committed because they include machine-local paths. The reproducible method,
+precision configuration, and acceptance thresholds are committed in the
+harness.
