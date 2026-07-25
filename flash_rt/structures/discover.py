@@ -33,6 +33,23 @@ _PROJ_WEIGHT_FLOOR = 262144  # candidacy filter only; impls add their own
                              # work-based qualification and gates decide
 
 
+def _is_attn_block(module: nn.Module) -> bool:
+    """A whole attention block, not just sibling projections.
+
+    When the host exposes q/k/v/out plus head_dim and scale, the pack
+    can replace the block itself and declare the attention compute
+    dtype too — strictly more than packing the projections alone.
+    """
+    if not all(isinstance(getattr(module, a, None), nn.Linear)
+               for a in ("q_proj", "k_proj", "v_proj", "out_proj")):
+        return False
+    if not (hasattr(module, "head_dim") and hasattr(module, "scale")):
+        return False
+    widths = {getattr(module, a).out_features
+              for a in ("q_proj", "k_proj", "v_proj")}
+    return len(widths) == 1
+
+
 def _has_cond_forward(module: nn.Module) -> bool:
     """A norm takes a conditioning argument (adaptive norm) if its
     forward accepts a second positional / a ``cond``/``temb`` keyword."""
@@ -147,12 +164,14 @@ def discover(
                 if projs[0].weight.numel() < _PROJ_WEIGHT_FLOOR:
                     continue
                 family, idx = _family_key(path)
+                bind = "module" if _is_attn_block(module) else "leaf"
                 seams.append(Seam(
                     structure="qkv_pack", path=path, parent_path=parent_path,
                     norm_attr=None, pack_attrs=group,
                     dims={"K": projs[0].in_features,
                           "N": sum(p.out_features for p in projs)},
-                    variant={"bind": "leaf", "in_dtype": "bf16_fused_quant"},
+                    variant={"bind": bind,
+                             "in_dtype": "bf16_fused_quant"},
                     family=family, layer_index=idx))
                 break
         if "adaln_producer" in structures:
