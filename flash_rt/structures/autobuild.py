@@ -408,9 +408,44 @@ def _bind_block(model, seam, cap, plan):
         attn = builder(host)
         if attn is not None:
             break
+    if attn is not None:
+        _alias_kv_region(plan, seam.path, attn)
     return bind_decoder_block(
         host, prod_in, prod_out, ffn, cond_kw=_cond_kw(host),
         returns_tuple=bool(cap.get("returns_tuple")), attn=attn)
+
+
+def _alias_kv_region(plan, path: str, sublayer) -> None:
+    """Let the packed projections write into the core's packed KV region.
+
+    Both sides can express this (see ``beta.joins``); the qualification
+    is that nothing transforms the tensor in between. Value goes straight
+    from the projection to the kernel and qualifies. Key does not on this
+    family: a rotary embedding runs after the projection, so aliasing it
+    would leave untransformed keys in the packed region — writing the
+    transformed ones back is the copy this was meant to remove. Hosts
+    without a rotary step qualify for both; the attribute is general and
+    the qualification is per join.
+    """
+    from .impls.qkv_pack import PackedLinear
+
+    head = plan.swaps.get(path + ".self_attn.q_proj")
+    core = getattr(sublayer, "core", None)
+    if not isinstance(head, PackedLinear) or core is None:
+        return
+    if not hasattr(core, "alias_suffix"):
+        return
+    _, v_region = core.alias_suffix(key=False, value=True)
+    if v_region is None:
+        return
+    try:
+        head.alias_stash(2, v_region)          # sibling order q, k, v
+    except (ValueError, RuntimeError) as refusal:
+        core._alias_v = False
+        plan.notes.setdefault("refused", []).append(
+            (path + " [kv alias]", str(refusal)[:80]))
+        return
+    plan.notes.setdefault("aliased_kv", []).append(path)
 
 
 def _bind_auto(model, seam, cap, plan, act_scales, negotiate_fp8):

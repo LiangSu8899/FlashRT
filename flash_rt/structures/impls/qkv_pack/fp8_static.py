@@ -70,6 +70,7 @@ class PackedLinear(torch.nn.Module):
         self.in_dtype = in_dtype
         w8, w_scale, bias, splits = _pack_weights(mods)
         self.splits = splits
+        self.rows = rows
         self.register_buffer("w8", w8)
         self.register_buffer("w_scale", w_scale)
         self.register_buffer("bias_cat", bias)
@@ -93,6 +94,44 @@ class PackedLinear(torch.nn.Module):
                 rows, k, device=dev, dtype=_FP8))
             self.register_buffer("y_buf", torch.empty(
                 rows, sum(splits), device=dev, dtype=torch.bfloat16))
+
+    def alias_stash(self, index: int, region: torch.Tensor) -> None:
+        """Write sibling ``index`` straight into a buffer someone else owns.
+
+        The stash exists because the later siblings' outputs have to live
+        somewhere until the host asks for them. When the consumer of that
+        output already owns a region of the right shape, that region can
+        *be* the stash and the consumer's own copy disappears — one
+        buffer instead of two, which is the join the two structures could
+        never see from inside either of them.
+        """
+        if not 1 <= index < len(self.splits):
+            raise ValueError(f"qkv_pack: no sibling {index} to alias")
+        want = (self.rows, self.splits[index])
+        if region.dtype is not torch.bfloat16:
+            raise ValueError(
+                f"qkv_pack: aliased region is {region.dtype}, the packed "
+                "output is bfloat16")
+        # An alias has to be checked for actually aliasing, not for a
+        # property that usually comes with it. Two ways to lose it, both
+        # silent: reshape *copies* when it cannot view, leaving a
+        # detached buffer that looks right and is connected to nothing;
+        # and a view that does succeed can still be strided, so the
+        # writes would land on every other row of the consumer's region.
+        try:
+            buf = region.view(want)
+        except RuntimeError as exc:
+            raise ValueError(
+                f"qkv_pack: aliased region is not viewable at {want} "
+                "without a copy") from exc
+        if buf.data_ptr() != region.data_ptr():
+            raise ValueError(
+                "qkv_pack: aliased view does not start at the region")
+        if not buf.is_contiguous():
+            raise ValueError(
+                f"qkv_pack: aliased region is strided at {want} — the "
+                "stash write would skip rows of the consumer's buffer")
+        setattr(self, f"stash{index}", buf)
 
     def forward(self, x):
         flat = x.reshape(-1, x.shape[-1])

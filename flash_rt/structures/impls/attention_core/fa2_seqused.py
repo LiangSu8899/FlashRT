@@ -108,6 +108,9 @@ class PackedKVAttention(torch.nn.Module):
         self.plan = plan
         b, heads, seq_q, head_dim = q_shape
         self.seq_q = seq_q
+        # set by alias_suffix when a producer writes that side in place
+        self._alias_k = False
+        self._alias_v = False
         self._kfa = hub_kernel("flashrt/fa2-seqused-runtime", ">=1")
         self.register_buffer("packed_k", torch.zeros(
             b, plan.packed, kv_heads, head_dim, device=device,
@@ -145,6 +148,36 @@ class PackedKVAttention(torch.nn.Module):
             softmax_lse=sc.lse, workspace=sc.workspace,
             softmax_scale=scale)
 
+    def alias_suffix(self, *, key: bool = False, value: bool = False):
+        """Hand out the packed suffix rows for a producer to write into.
+
+        The declarative form of what a hand-written runtime does when it
+        gives the next stage a pointer: instead of the producer filling
+        its own buffer and this module copying it in, the producer's
+        output *is* the region.
+
+        Only legal where nothing transforms the tensor between the two —
+        a rotary embedding applied after the projection would leave the
+        untransformed values here. Callers therefore alias key and value
+        independently, and take ``None`` for whatever does not qualify.
+        """
+        plan = self.plan
+        if not plan.suffix_len or self.packed_k.shape[0] != 1:
+            return None, None          # only a single batch row slices
+        regions = []                   # into a contiguous suffix
+        for want, packed, flag in ((key, self.packed_k, "_alias_k"),
+                                   (value, self.packed_v, "_alias_v")):
+            if not want:
+                regions.append(None)
+                continue
+            region = packed[0, plan.prefix:]
+            if not region.is_contiguous():
+                regions.append(None)
+                continue
+            setattr(self, flag, True)
+            regions.append(region)
+        return tuple(regions)
+
     def forward_suffix(self, query, key, value, *, scale=None):
         """Kernel layout (B, S, H, D), with **suffix-only** keys/values.
 
@@ -163,8 +196,11 @@ class PackedKVAttention(torch.nn.Module):
         plan = self.plan
         q = query if query.is_contiguous() else query.contiguous()
         if plan.suffix_len:
-            self.packed_k[:, plan.prefix:].copy_(key)
-            self.packed_v[:, plan.prefix:].copy_(value)
+            # an aliased side already wrote itself here
+            if not self._alias_k:
+                self.packed_k[:, plan.prefix:].copy_(key)
+            if not self._alias_v:
+                self.packed_v[:, plan.prefix:].copy_(value)
         sc = self._scratch
         return self._kfa.forward_static(
             q, self.packed_k, self.packed_v, out=sc.out,
