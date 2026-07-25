@@ -157,28 +157,40 @@ def auto_swaps(
         by_parent: dict[str, dict[str, Seam]] = {}
         for seam in seams:
             layer = _layer_of(seam.path)
-            if seam.structure == "adaln_producer" and _feeds_attention(
-                    seam.path):
-                by_parent.setdefault(layer, {})["producer"] = seam
+            if seam.structure == "adaln_producer":
+                # a layer has two producer→consumer seams: the norm
+                # before attention feeds the projections, the norm after
+                # it feeds the MLP. Both can hand fp8 downstream.
+                slot = ("producer" if _feeds_attention(seam.path)
+                        else "producer_ffn")
+                by_parent.setdefault(layer, {})[slot] = seam
             elif seam.structure == "qkv_pack":
                 by_parent.setdefault(layer, {})["pack"] = seam
+            elif seam.structure == "decoder_ffn":
+                by_parent.setdefault(layer, {})["ffn"] = seam
         # the chain wins at small M (denoise): fp8 is bandwidth-bound and
         # pays there, while a large-M prefill GEMM is compute-bound and
         # fp8 buys little — and an fp8 producer feeding a big compiled
         # prefill region is where the triton fp8 codegen chokes. Qualify
         # on the calibrated row count, not on host names.
+        dev = next(model.parameters()).device
         for lay, g in by_parent.items():
-            if "producer" not in g or "pack" not in g:
-                continue
-            pack_cap = caps.get(g["pack"].path, {})
-            rows = pack_cap.get("rows", 1 << 30)
-            if pack_cap.get("x") and rows <= _FP8_CHAIN_MAX_ROWS:
-                # the pack's input == the producer's output; its amax is
-                # the one static scale both sides share
-                negotiated[lay] = g
-                act_scales[lay] = torch.tensor(
-                    [max(_amax(pack_cap["x"]) / 448.0, 1e-8)],
-                    device=next(model.parameters()).device)
+            pairs = [("producer", "pack"), ("producer_ffn", "ffn")]
+            keep = {}
+            for p_slot, c_slot in pairs:
+                if p_slot not in g or c_slot not in g:
+                    continue
+                c_cap = caps.get(g[c_slot].path, {})
+                rows = c_cap.get("rows", 1 << 30)
+                if not c_cap.get("x") or rows > _FP8_CHAIN_MAX_ROWS:
+                    continue
+                # the consumer's input == the producer's output; its amax
+                # is the one static scale both sides share
+                keep[p_slot], keep[c_slot] = g[p_slot], g[c_slot]
+                act_scales[f"{lay}|{c_slot}"] = torch.tensor(
+                    [max(_amax(c_cap["x"]) / 448.0, 1e-8)], device=dev)
+            if keep:
+                negotiated[lay] = keep
 
     # ---- the negotiated chain binds as one unit ----
     # producer and consumer must agree on the seam dtype: a pack bound
@@ -188,22 +200,28 @@ def auto_swaps(
     plan = AutoPlan(seams=seams)
     handled: set[str] = set()
     for lay, g in negotiated.items():
-        p_seam, k_seam = g["producer"], g["pack"]
-        p_cap, k_cap = caps.get(p_seam.path, {}), caps.get(k_seam.path, {})
-        if not (p_cap.get("pairs") and k_cap.get("x")):
-            continue
-        try:
-            pair = _bind_negotiated(model, p_seam, k_seam, p_cap, k_cap,
-                                    act_scales[lay], plan)
-        except (ValueError, RuntimeError) as refusal:
-            plan.notes.setdefault("refused", []).append(
-                (lay + " [chain]", str(refusal)[:80]))
-            continue
-        plan.swaps.update(pair)
-        handled.update({p_seam.path, k_seam.path})
+        for p_slot, c_slot in (("producer", "pack"),
+                               ("producer_ffn", "ffn")):
+            if p_slot not in g or c_slot not in g:
+                continue
+            p_seam, c_seam = g[p_slot], g[c_slot]
+            p_cap = caps.get(p_seam.path, {})
+            c_cap = caps.get(c_seam.path, {})
+            if not (p_cap.get("pairs") and c_cap.get("x")):
+                continue
+            try:
+                pair = _bind_negotiated(
+                    model, p_seam, c_seam, p_cap, c_cap,
+                    act_scales[f"{lay}|{c_slot}"], plan)
+            except (ValueError, RuntimeError) as refusal:
+                plan.notes.setdefault("refused", []).append(
+                    (f"{lay} [{c_slot} chain]", str(refusal)[:80]))
+                continue
+            plan.swaps.update(pair)
+            handled.update({p_seam.path, c_seam.path})
     plan.notes["negotiated_layers"] = sorted(
         lay for lay, g in negotiated.items()
-        if g["pack"].path in handled)
+        if any(sm.path in handled for sm in g.values()))
 
     # ---- bind the remaining seams individually ----
     for name, members in group_families(seams).items():
@@ -341,7 +359,7 @@ def _eager(module):
     return _Eager(module)
 
 
-def _bind_negotiated(model, p_seam, k_seam, p_cap, k_cap, scale, plan):
+def _bind_negotiated(model, p_seam, k_seam, p_cap, c_cap, scale, plan):
     """Bind an fp8 producer and the pack it feeds as one chain.
 
     This is the combination the structure layer exists for: neither half
@@ -354,20 +372,32 @@ def _bind_negotiated(model, p_seam, k_seam, p_cap, k_cap, scale, plan):
     from .impls.qkv_pack import bind_qkv_pack
 
     norm = _resolve(model, p_seam.path)
+    consumer = _resolve(model, k_seam.path)
     loc = plan.notes.setdefault("_locators", {}).get(p_seam.family)
     style_width = p_cap["pairs"][0][1].shape[-1]
     prod = bind_adaln_producer(
         norm, p_cap["pairs"], act_scale=scale,
-        rows=p_cap.get("rows") or k_cap["rows"],
+        rows=p_cap.get("rows") or c_cap["rows"],
         dim=getattr(norm, "dim", style_width // 3),
         locator=loc, norm="rms")
     plan.notes["_locators"][p_seam.family] = prod.locator
 
-    block = _resolve(model, k_seam.path)
-    mods = [getattr(block, a) for a in k_seam.pack_attrs]
-    parts = bind_qkv_pack(mods, scale, rows=k_cap["rows"],
-                          in_dtype="fp8_static")
     swaps = {p_seam.path: prod}
+    if k_seam.structure == "decoder_ffn":
+        from .impls.decoder_ffn import fp8_static as ffn_impl
+        # the calibration samples are the BF16 activations the host
+        # produced; the fp8 entry needs them in the seam dtype, and the
+        # scale is the one the producer upstream will quantize with
+        w = seam_weights(model, k_seam)
+        bound = ffn_impl.bind_mlp_seam(
+            w, variant={**k_seam.variant, "in_dtype": "fp8_static"},
+            calibration_normed=[t for t in c_cap["x"]],
+            original=consumer)
+        swaps[k_seam.path] = bound
+        return swaps
+    mods = [getattr(consumer, a) for a in k_seam.pack_attrs]
+    parts = bind_qkv_pack(mods, scale, rows=c_cap["rows"],
+                          in_dtype="fp8_static")
     swaps.update({k_seam.path + "." + a: m
                   for a, m in zip(k_seam.pack_attrs, parts)})
     return swaps

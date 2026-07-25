@@ -28,6 +28,11 @@ _FP8 = torch.float8_e4m3fn
 _FP8_MAX = 448.0
 _ENTRYPOINTS = {"gelu": "bf16_fp8_geglu_mlp_bf16",
                 "silu": "bf16_fp8_swiglu_mlp_bf16"}
+# fp8 entry: the upstream producer already emitted fp8 with the shared
+# activation scale, so the kernel's own input quantization is dead work.
+# Same math, one less kernel per call.
+_ENTRYPOINTS_FP8 = {"gelu": "fp8_geglu_mlp_bf16",
+                    "silu": "fp8_swiglu_mlp_bf16"}
 
 SUPPORT = {
     "D": {"min": 512, "max": 16384},
@@ -142,12 +147,22 @@ class BoundDecoderFfnFp8:
     down_scale: torch.Tensor
     norm_weight_mode: str
     eps: float
+    in_dtype: str = "bf16"
 
     def ffn(self, normed: torch.Tensor) -> torch.Tensor:
         """The normed-input -> ffn-output slice (no norm, no residual).
 
-        Input quantization is fused inside the kernel's BF16 entry."""
+        On the BF16 entry the kernel quantizes the input itself; on the
+        FP8 entry the producer already did, and the input passes
+        straight through."""
         shape = normed.shape
+        if getattr(self, "in_dtype", "bf16") == "fp8_static":
+            out = self.fused_mlp(
+                normed.reshape(-1, shape[-1]),
+                self.gate_up_fp8, self.down_fp8,
+                self.input_scale.view(1), self.gate_up_scale.view(1),
+                self.hidden_scale.view(1), self.down_scale.view(1))
+            return out.reshape(*shape[:-1], out.shape[-1])
         out = self.fused_mlp(
             normed.reshape(-1, shape[-1]).to(torch.bfloat16).contiguous(),
             self.gate_up_fp8,
@@ -206,8 +221,11 @@ class FusedGeGluMlp(torch.nn.Module):
 def _build(weights, variant, input_scale, hidden_scale, eps):
     name, _ = _activation(variant)
     gate_up, down, gate_up_scale, down_scale = _check_and_pack(weights)
+    in_dtype = variant.get("in_dtype", "bf16")
+    table = (_ENTRYPOINTS_FP8 if in_dtype == "fp8_static"
+             else _ENTRYPOINTS)
     return BoundDecoderFfnFp8(
-        fused_mlp=getattr(_kernel(), _ENTRYPOINTS[name]),
+        fused_mlp=getattr(_kernel(), table[name]),
         w_norm=weights["w_norm"],
         gate_up_fp8=_quantize(gate_up, gate_up_scale),
         down_fp8=_quantize(down, down_scale),
@@ -215,6 +233,7 @@ def _build(weights, variant, input_scale, hidden_scale, eps):
         gate_up_scale=gate_up_scale,
         hidden_scale=hidden_scale,
         down_scale=down_scale,
+        in_dtype=in_dtype,
         norm_weight_mode=variant.get("norm_weight_mode", "offset"),
         eps=eps,
     )
