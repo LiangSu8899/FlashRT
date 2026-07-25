@@ -35,6 +35,10 @@ variants:
   norm: [rms, layer]
   out_dtype: [bf16, fp8_static]
   epilogue: [none, gate_residual]
+  style_cadence: [per_call, per_step]   # per_step shares one
+                                        # materialisation across every
+                                        # producer on one conditioning
+                                        # stream (see the broker below)
 
 calibration:
   points: [cond, x]
@@ -64,9 +68,39 @@ qualification:
      only where it also feeds a downstream seam (pi05 r15: fused_norm
      at the 19 bf16 sites cost 1.9% against table_only)"
 
+style_broker:
+  # The kernel takes style as a contiguous (rows, W) tensor, so the one
+  # style row of a step has to be repeated to the row count. Done per
+  # producer that is correct and, across a stream, redundant: every
+  # producer on one conditioning stream resolves the same step, so the
+  # whole stream's styles are fixed for the step's duration. The broker
+  # fills one (P, rows, W) buffer per step and each producer reads a
+  # contiguous slice — the kernel's contract is untouched.
+  qualification:
+    - "producers must share one step locator (same conditioning stream),
+       one style width and one row count; anything else cannot share a
+       buffer and keeps its own materialisation"
+    - "the writer is the producer the host calls first, taken from the
+       observed call order of the calibration pass rather than from the
+       module tree's order, which need not match the forward's"
+    - "the fill is an opaque op on purpose: written as plain tensor work
+       the compiler inlines it into each reader — a correct buffer
+       elimination that undoes the sharing"
+  note: >
+    This removes launches, not bytes: the same (steps * P * rows * W)
+    elements are still written each tick. A kernel entry taking a
+    broadcast style would remove the bytes, and the two compose.
+
 evidence:
   - "pi05 expert AdaRMS — r4 step table (fp32 GEMV 3.67ms bucket
      removed), r11 fingerprint locator (cuBLAS GEMV 370x removed)"
   - "pi05 expert fused fp8 producer — r7..r14, feeds the packed
      projection seam"
   - "GROOT DiT AdaLayerNorm — round3 fp8 producer, 32 blocks"
+  - "pi05 style broker, 36 producers on one stream — paired interleaved
+     timing -0.419 ms (range -0.418/-0.431), tick parity unchanged at
+     0.999906 either way: the broker reorganises work, it does not
+     change arithmetic"
+  - "the opacity is load-bearing, not defensive: as plain tensor work
+     the same broker measured -0.164 ms, because the fill stayed at 720
+     launches and merely moved bucket. Behind an opaque op: -0.419 ms"

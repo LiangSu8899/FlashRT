@@ -132,6 +132,11 @@ class AdaLNProducer(torch.nn.Module):
         self.host_norm = host_norm
         self.locator = locator
         self.norm = norm
+        # set by attach_broker when this producer joins a stream-scoped
+        # materialisation; alone, it materialises its own style
+        self.broker = None
+        self.slot = 0
+        self.writer = True
         self.register_buffer("styles",
                              styles.to(torch.bfloat16).contiguous())
         self.out_fp8 = act_scale is not None
@@ -182,11 +187,26 @@ class AdaLNProducer(torch.nn.Module):
         """Whether this producer can fold a pending gated residual."""
         return self.out_fp8 and self.norm == "rms"
 
-    def resolve(self, cond: torch.Tensor) -> torch.Tensor:
-        """Step index for this conditioning — shareable across siblings."""
-        return self.locator(cond)
+    def attach_broker(self, broker, slot: int, *, writer: bool) -> None:
+        """Take styles from a stream-scoped broker (see :mod:`.broker`)."""
+        self.broker = broker
+        self.slot = slot
+        self.writer = writer
+
+    def resolve(self, cond: torch.Tensor):
+        """Step index for this conditioning — shareable across siblings.
+
+        With a broker only the stream's writer resolves anything: the
+        step is a property of the stream, not of this producer, and the
+        readers take their styles from the buffer the writer filled.
+        """
+        if self.broker is None:
+            return self.locator(cond)
+        return self.broker.refresh(cond) if self.writer else None
 
     def _style2d(self, idx: torch.Tensor) -> torch.Tensor:
+        if self.broker is not None:
+            return self.broker.slice(self.slot)
         style = self.styles.index_select(0, idx)
         return style.expand(self.resid.shape[0], -1).contiguous()
 
