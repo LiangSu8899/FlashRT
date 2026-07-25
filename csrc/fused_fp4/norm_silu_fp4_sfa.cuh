@@ -50,6 +50,19 @@ void pi05_gate_res_adarms_fp4_sfa_fp16(
     const __half* style, uint8_t* packed, uint8_t* sfa, __half* gate,
     int seq_len, int dim, cudaStream_t stream);
 
+// Same Pi0.5 fused preprocessing with native SM110 round-to-nearest-even
+// E2M1x2 output conversion. RMS, fp16 rounding, SFA, residual, and gate
+// semantics are unchanged.
+void pi05_adarms_fp4_sfa_native_fp16(
+    const __half* x, const __half* style,
+    uint8_t* packed, uint8_t* sfa, __half* gate,
+    int seq_len, int dim, cudaStream_t stream);
+
+void pi05_gate_res_adarms_fp4_sfa_native_fp16(
+    const __half* x, const __half* prev_gate, __half* residual,
+    const __half* style, uint8_t* packed, uint8_t* sfa, __half* gate,
+    int seq_len, int dim, cudaStream_t stream);
+
 // F4: gate_silu_mul_merged(merged [S, 2H]) → hid [S, H] → fp4 packed + SFA.
 //     GELU(gate) * up, where merged = [gate || up] along dim 1.
 void gate_silu_mul_fp4_sfa_fp16(

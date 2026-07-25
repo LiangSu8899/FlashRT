@@ -94,6 +94,7 @@ def encoder_forward_with_fp4_subset(gemm, fvk, fvk_fp4, bufs, weights, dims,
             p1_gate_sfa  = fp4_scratch['p1_gate_sfa']
             p1_up_p4     = fp4_scratch['p1_up_p4']
             p1_up_sfa    = fp4_scratch['p1_up_sfa']
+            p1_combiner = fp4_scratch['p1_combiner']
             # Down input scratch for P1 (replaces sc_dn in this branch — same buffers)
 
     for l in range(L):
@@ -188,13 +189,30 @@ def encoder_forward_with_fp4_subset(gemm, fvk, fvk_fp4, bufs, weights, dims,
                             p1_up_p4,   p1_up_sfa,
                             sc_dn.packed.data_ptr(), sc_dn.sfa.data_ptr(),
                             Se, H, stream)
-                    else:
+                    elif p1_combiner == 'lut':
+                        fvk_fp4.geglu_two_mul_fp4_to_fp4_lut(
+                            p1_gate_p4, p1_gate_sfa,
+                            p1_up_p4,   p1_up_sfa,
+                            awq_dn,
+                            sc_dn.packed.data_ptr(), sc_dn.sfa.data_ptr(),
+                            Se, H, stream)
+                    elif p1_combiner == 'lut_native':
+                        fvk_fp4.geglu_two_mul_fp4_to_fp4_lut_native(
+                            p1_gate_p4, p1_gate_sfa,
+                            p1_up_p4,   p1_up_sfa,
+                            awq_dn,
+                            sc_dn.packed.data_ptr(), sc_dn.sfa.data_ptr(),
+                            Se, H, stream)
+                    elif p1_combiner == 'direct':
                         fvk_fp4.geglu_two_mul_fp4_to_fp4(
                             p1_gate_p4, p1_gate_sfa,
                             p1_up_p4,   p1_up_sfa,
                             awq_dn,
                             sc_dn.packed.data_ptr(), sc_dn.sfa.data_ptr(),
                             Se, H, stream)
+                    else:
+                        raise ValueError(
+                            f"unknown P1 combiner: {p1_combiner!r}")
                 else:
                     # ── Original AWQ-fused (or non-AWQ) path ──
                     fvk_fp4.cutlass_fp4_gemm_variant(

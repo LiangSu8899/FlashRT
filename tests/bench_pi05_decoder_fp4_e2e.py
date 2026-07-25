@@ -86,6 +86,13 @@ def main() -> int:
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--seed", type=int, default=20260725)
     parser.add_argument(
+        "--encoder-gu-mode", choices=("p1", "merged"), default="p1")
+    parser.add_argument(
+        "--encoder-p1-combiner", choices=("direct", "lut", "lut_native"),
+        default="lut_native")
+    parser.add_argument("--encoder-down-variant", type=int, default=8)
+    parser.add_argument("--decoder-gate-up-variant", type=int, default=10)
+    parser.add_argument(
         "--cuda-profile", action="store_true",
         help="capture one stable-state infer with cudaProfilerStart/Stop")
     args = parser.parse_args()
@@ -131,7 +138,10 @@ def main() -> int:
                 use_fp4_encoder_ffn=True,
                 fp4_layers=tuple(range(18)),
                 use_awq=True,
-                use_p1_split_gu=True,
+                use_p1_split_gu=args.encoder_gu_mode == "p1",
+                encoder_p1_combiner=args.encoder_p1_combiner,
+                encoder_down_variant=args.encoder_down_variant,
+                decoder_gate_up_variant=args.decoder_gate_up_variant,
                 use_fp4_decoder=True,
                 use_fa4=True)
 
@@ -165,8 +175,8 @@ def main() -> int:
             torch.cuda.synchronize()
             torch.cuda.cudart().cudaProfilerStart()
             pipe.infer(observations[0])
-            torch.cuda.cudart().cudaProfilerStop()
             torch.cuda.synchronize()
+            torch.cuda.cudart().cudaProfilerStop()
 
         latencies = []
         for index in range(args.iters):
@@ -206,8 +216,11 @@ def main() -> int:
                     "encoder": "nvfp4_ffn",
                     "encoder_fp4_layers": list(range(18)),
                     "encoder_awq": True,
-                    "encoder_p1_split_gu": True,
+                    "encoder_gu_mode": args.encoder_gu_mode,
+                    "encoder_p1_combiner": args.encoder_p1_combiner,
+                    "encoder_down_variant": args.encoder_down_variant,
                     "decoder": "nvfp4_all_projections",
+                    "decoder_gate_up_variant": args.decoder_gate_up_variant,
                     "attention": "fa4_siglip_encoder",
                 }
             ),
@@ -261,6 +274,10 @@ def main() -> int:
             "--warmup", str(args.warmup),
             "--iters", str(args.iters),
             "--seed", str(args.seed),
+            "--encoder-gu-mode", args.encoder_gu_mode,
+            "--encoder-p1-combiner", args.encoder_p1_combiner,
+            "--encoder-down-variant", str(args.encoder_down_variant),
+            "--decoder-gate-up-variant", str(args.decoder_gate_up_variant),
         ]
         child = subprocess.run(
             command, check=False, capture_output=True, text=True,

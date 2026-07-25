@@ -15,6 +15,7 @@
 // ============================================================================
 #include "fused_fp4/norm_silu_fp4_sfa.cuh"
 
+#include <cuda_fp4.h>
 #include <cuda_fp8.h>
 
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED) || defined(__CUDA_ARCH__)
@@ -86,11 +87,54 @@ __device__ __forceinline__ void quant_block_from_smem(
     }
 }
 
-// Pi0.5 action-expert decoder AdaRMSNorm followed by NVFP4 activation
-// quantization. The normalized value is rounded to fp16 before block
-// quantization, matching an explicit fp16 -> FP4 path.
-template <class LayoutSF>
-__global__ void pi05_adarms_fp4_sfa_kernel(
+// Register-only Pi0.5 kernels keep the original 256-thread reduction order,
+// then quantize four strided 256-element segments with 16-lane warp groups.
+// This removes the shared-memory round trip without changing fp16 rounding.
+template <bool UseNativeFp4, class LayoutSF>
+__device__ __forceinline__ void pi05_quantize_register_value(
+    float value,
+    uint8_t* packed_row,
+    uint8_t* dst_sfa,
+    LayoutSF layout,
+    int row,
+    int block_idx,
+    int lane_in_block) {
+    float amax = fabsf(value);
+    #pragma unroll
+    for (int offset = 8; offset > 0; offset >>= 1) {
+        amax = fmaxf(
+            amax, __shfl_xor_sync(0xffffffff, amax, offset, 16));
+    }
+
+    float desired = amax / 6.f;
+    if (desired < 1e-12f) desired = 1e-12f;
+    __nv_fp8_e4m3 bs_q = quantize_ue4m3(desired);
+    const float inv_bs = 1.f / static_cast<float>(bs_q);
+    if (lane_in_block == 0) {
+        const int sfa_off = layout(row, block_idx * 16, 0);
+        dst_sfa[sfa_off] = *reinterpret_cast<uint8_t*>(&bs_q);
+    }
+    if constexpr (UseNativeFp4) {
+        const float next = __shfl_down_sync(0xffffffff, value, 1, 16);
+        if ((lane_in_block & 1) == 0) {
+            packed_row[block_idx * 8 + lane_in_block / 2] =
+                static_cast<uint8_t>(__nv_cvt_float2_to_fp4x2(
+                    make_float2(value * inv_bs, next * inv_bs),
+                    __NV_E2M1, cudaRoundNearest));
+        }
+    } else {
+        const uint8_t code = fp32_to_e2m1(value * inv_bs);
+        const uint8_t next = static_cast<uint8_t>(__shfl_down_sync(
+            0xffffffff, static_cast<unsigned>(code), 1, 16));
+        if ((lane_in_block & 1) == 0) {
+            packed_row[block_idx * 8 + lane_in_block / 2] =
+                code | (next << 4);
+        }
+    }
+}
+
+template <bool UseNativeFp4, class LayoutSF>
+__global__ void pi05_adarms_fp4_sfa_register_kernel(
     const __half* __restrict__ x,
     const __half* __restrict__ style,
     uint8_t* __restrict__ packed,
@@ -98,22 +142,27 @@ __global__ void pi05_adarms_fp4_sfa_kernel(
     __half* __restrict__ gate,
     LayoutSF layout,
     int D) {
-    const int r = blockIdx.x;
-    const __half* row = x + r * D;
-    const __half* sc = style + r * 3 * D;
+    const int row_idx = blockIdx.x;
+    const __half* row = x + row_idx * D;
+    const __half* sc = style + row_idx * 3 * D;
     const __half* sh = sc + D;
     const __half* gt = sh + D;
-    uint8_t* packed_row = packed + r * (D / 2);
+    uint8_t* packed_row = packed + row_idx * (D / 2);
 
+    float values[4];
     float sum_sq = 0.f;
-    for (int i = threadIdx.x; i < D; i += blockDim.x) {
-        const float v = __half2float(row[i]);
-        sum_sq += v * v;
+    #pragma unroll
+    for (int segment = 0; segment < 4; ++segment) {
+        const int i = threadIdx.x + segment * blockDim.x;
+        const float value = __half2float(row[i]);
+        values[segment] = value;
+        sum_sq += value * value;
     }
 
     __shared__ float reduction[8];
-    const int lane = threadIdx.x % 32;
-    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
         sum_sq += __shfl_xor_sync(0xffffffff, sum_sq, offset);
     }
@@ -121,6 +170,7 @@ __global__ void pi05_adarms_fp4_sfa_kernel(
     __syncthreads();
     if (warp == 0) {
         sum_sq = lane < 8 ? reduction[lane] : 0.f;
+        #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
             sum_sq += __shfl_xor_sync(0xffffffff, sum_sq, offset);
         }
@@ -129,55 +179,57 @@ __global__ void pi05_adarms_fp4_sfa_kernel(
     if (threadIdx.x == 0) reduction[0] = sum_sq;
     __syncthreads();
 
-    extern __shared__ __half smem_normed[];
     const float rstd = rsqrtf(reduction[0] / D + 1e-6f);
-    for (int i = threadIdx.x; i < D; i += blockDim.x) {
-        const float normed = __half2float(row[i]) * rstd *
+    const int lane_in_block = threadIdx.x & 15;
+    const int block_group = threadIdx.x >> 4;
+    #pragma unroll
+    for (int segment = 0; segment < 4; ++segment) {
+        const int i = threadIdx.x + segment * blockDim.x;
+        const float normed = values[segment] * rstd *
             (1.f + __half2float(sc[i])) + __half2float(sh[i]);
-        smem_normed[i] = __float2half(normed);
-        gate[r * D + i] = gt[i];
-    }
-    __syncthreads();
-
-    const int n_blocks = D / 16;
-    for (int b = threadIdx.x; b < n_blocks; b += blockDim.x) {
-        quant_block_from_smem(
-            smem_normed, packed_row, dst_sfa, layout, r, b);
+        const __half rounded = __float2half(normed);
+        gate[row_idx * D + i] = gt[i];
+        pi05_quantize_register_value<UseNativeFp4>(
+            __half2float(rounded), packed_row, dst_sfa, layout, row_idx,
+            segment * 16 + block_group, lane_in_block);
     }
 }
 
-// Preserve the production fused kernel ordering: accumulate the unrounded
-// fp32 residual value for RMS, store the residual as fp16, then read that fp16
-// value for normalization and FP4 quantization.
-template <class LayoutSF>
-__global__ void pi05_gate_res_adarms_fp4_sfa_kernel(
+template <bool UseNativeFp4, class LayoutSF>
+__global__ void pi05_gate_res_adarms_fp4_sfa_register_kernel(
     const __half* __restrict__ x,
-    const __half* prev_gate,
+    const __half* __restrict__ prev_gate,
     __half* __restrict__ residual,
     const __half* __restrict__ style,
     uint8_t* __restrict__ packed,
     uint8_t* __restrict__ dst_sfa,
-    __half* gate,
+    __half* __restrict__ gate,
     LayoutSF layout,
     int D) {
-    const int r = blockIdx.x;
-    const __half* sc = style + r * 3 * D;
+    const int row_idx = blockIdx.x;
+    const __half* sc = style + row_idx * 3 * D;
     const __half* sh = sc + D;
     const __half* gt = sh + D;
-    uint8_t* packed_row = packed + r * (D / 2);
+    uint8_t* packed_row = packed + row_idx * (D / 2);
 
+    float values[4];
     float sum_sq = 0.f;
-    for (int i = threadIdx.x; i < D; i += blockDim.x) {
-        const int elem = r * D + i;
-        const float res = __half2float(residual[elem]) +
+    #pragma unroll
+    for (int segment = 0; segment < 4; ++segment) {
+        const int i = threadIdx.x + segment * blockDim.x;
+        const int elem = row_idx * D + i;
+        const float value = __half2float(residual[elem]) +
             __half2float(x[elem]) * __half2float(prev_gate[elem]);
-        residual[elem] = __float2half(res);
-        sum_sq += res * res;
+        const __half rounded = __float2half(value);
+        residual[elem] = rounded;
+        values[segment] = __half2float(rounded);
+        sum_sq += value * value;
     }
 
     __shared__ float reduction[8];
-    const int lane = threadIdx.x % 32;
-    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
         sum_sq += __shfl_xor_sync(0xffffffff, sum_sq, offset);
     }
@@ -185,6 +237,7 @@ __global__ void pi05_gate_res_adarms_fp4_sfa_kernel(
     __syncthreads();
     if (warp == 0) {
         sum_sq = lane < 8 ? reduction[lane] : 0.f;
+        #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
             sum_sq += __shfl_xor_sync(0xffffffff, sum_sq, offset);
         }
@@ -193,21 +246,20 @@ __global__ void pi05_gate_res_adarms_fp4_sfa_kernel(
     if (threadIdx.x == 0) reduction[0] = sum_sq;
     __syncthreads();
 
-    extern __shared__ __half smem_normed[];
     const float rstd = rsqrtf(reduction[0] / D + 1e-6f);
-    for (int i = threadIdx.x; i < D; i += blockDim.x) {
-        const int elem = r * D + i;
-        const float normed = __half2float(residual[elem]) * rstd *
+    const int lane_in_block = threadIdx.x & 15;
+    const int block_group = threadIdx.x >> 4;
+    #pragma unroll
+    for (int segment = 0; segment < 4; ++segment) {
+        const int i = threadIdx.x + segment * blockDim.x;
+        const int elem = row_idx * D + i;
+        const float normed = values[segment] * rstd *
             (1.f + __half2float(sc[i])) + __half2float(sh[i]);
-        smem_normed[i] = __float2half(normed);
+        const __half rounded = __float2half(normed);
         gate[elem] = gt[i];
-    }
-    __syncthreads();
-
-    const int n_blocks = D / 16;
-    for (int b = threadIdx.x; b < n_blocks; b += blockDim.x) {
-        quant_block_from_smem(
-            smem_normed, packed_row, dst_sfa, layout, r, b);
+        pi05_quantize_register_value<UseNativeFp4>(
+            __half2float(rounded), packed_row, dst_sfa, layout, row_idx,
+            segment * 16 + block_group, lane_in_block);
     }
 }
 
@@ -437,7 +489,7 @@ void pi05_adarms_fp4_sfa_fp16(
 #if FV_HAVE_CUTLASS
     auto shape = cute::make_shape(seq_len, 1, dim, 1);
     auto layout = Cfg::tile_atom_to_shape_SFA(shape);
-    pi05_adarms_fp4_sfa_kernel<<<seq_len, 256, dim * sizeof(__half), stream>>>(
+    pi05_adarms_fp4_sfa_register_kernel<false><<<seq_len, 256, 0, stream>>>(
         x, style, packed, sfa, gate, layout, dim);
 #else
     (void)x; (void)style; (void)packed; (void)sfa; (void)gate;
@@ -452,8 +504,39 @@ void pi05_gate_res_adarms_fp4_sfa_fp16(
 #if FV_HAVE_CUTLASS
     auto shape = cute::make_shape(seq_len, 1, dim, 1);
     auto layout = Cfg::tile_atom_to_shape_SFA(shape);
-    pi05_gate_res_adarms_fp4_sfa_kernel<<<
-        seq_len, 256, dim * sizeof(__half), stream>>>(
+    pi05_gate_res_adarms_fp4_sfa_register_kernel<false><<<seq_len, 256, 0, stream>>>(
+            x, prev_gate, residual, style, packed, sfa, gate, layout, dim);
+#else
+    (void)x; (void)prev_gate; (void)residual; (void)style;
+    (void)packed; (void)sfa; (void)gate;
+    (void)seq_len; (void)dim; (void)stream;
+#endif
+}
+
+void pi05_adarms_fp4_sfa_native_fp16(
+    const __half* x, const __half* style,
+    uint8_t* packed, uint8_t* sfa, __half* gate,
+    int seq_len, int dim, cudaStream_t stream) {
+#if FV_HAVE_CUTLASS
+    auto shape = cute::make_shape(seq_len, 1, dim, 1);
+    auto layout = Cfg::tile_atom_to_shape_SFA(shape);
+    pi05_adarms_fp4_sfa_register_kernel<true><<<seq_len, 256, 0, stream>>>(
+        x, style, packed, sfa, gate, layout, dim);
+#else
+    (void)x; (void)style; (void)packed; (void)sfa; (void)gate;
+    (void)seq_len; (void)dim; (void)stream;
+#endif
+}
+
+void pi05_gate_res_adarms_fp4_sfa_native_fp16(
+    const __half* x, const __half* prev_gate, __half* residual,
+    const __half* style, uint8_t* packed, uint8_t* sfa, __half* gate,
+    int seq_len, int dim, cudaStream_t stream) {
+#if FV_HAVE_CUTLASS
+    auto shape = cute::make_shape(seq_len, 1, dim, 1);
+    auto layout = Cfg::tile_atom_to_shape_SFA(shape);
+    pi05_gate_res_adarms_fp4_sfa_register_kernel<true><<<
+        seq_len, 256, 0, stream>>>(
             x, prev_gate, residual, style, packed, sfa, gate, layout, dim);
 #else
     (void)x; (void)prev_gate; (void)residual; (void)style;

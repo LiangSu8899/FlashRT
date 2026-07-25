@@ -336,7 +336,7 @@ def decoder_forward_fp4(ctx, fvk, fvk_fp4, bufs, weights, dims, stream=0, *,
             sf_ptr = sf + si * 2
 
             if l == 0:
-                fvk_fp4.pi05_adarms_fp4_sfa_fp16(
+                fvk_fp4.pi05_adarms_fp4_sfa_native_fp16(
                     x, sa_ptr, xn_fp4, xn_sfa, gate, S, D, stream)
 
             rc = fvk_fp4.cutlass_fp4_gemm_variant(
@@ -380,7 +380,7 @@ def decoder_forward_fp4(ctx, fvk, fvk_fp4, bufs, weights, dims, stream=0, *,
                 raise RuntimeError(
                     f"Pi0.5 decoder FP4 O layer {l} failed rc={rc}")
 
-            fvk_fp4.pi05_gate_res_adarms_fp4_sfa_fp16(
+            fvk_fp4.pi05_gate_res_adarms_fp4_sfa_native_fp16(
                 fg, gate, x, sf_ptr, xn_fp4, xn_sfa, gate, S, D, stream)
             rc = fvk_fp4.cutlass_fp4_gemm_variant(
                 variant_gu, xn_fp4, xn_sfa,
@@ -403,7 +403,7 @@ def decoder_forward_fp4(ctx, fvk, fvk_fp4, bufs, weights, dims, stream=0, *,
             if l < layers - 1:
                 si_next = (s * layers + l + 1) * S * D3
                 sa_next_ptr = sa + si_next * 2
-                fvk_fp4.pi05_gate_res_adarms_fp4_sfa_fp16(
+                fvk_fp4.pi05_gate_res_adarms_fp4_sfa_native_fp16(
                     fg, gate, x, sa_next_ptr,
                     xn_fp4, xn_sfa, gate, S, D, stream)
             else:

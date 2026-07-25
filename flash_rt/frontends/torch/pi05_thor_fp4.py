@@ -55,6 +55,9 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                  awq_alpha: float = 0.5,
                  awq_calib_iters: int = 8,
                  use_p1_split_gu: bool = False,
+                 encoder_p1_combiner: str = "lut_native",
+                 encoder_down_variant: int = 8,
+                 decoder_gate_up_variant: int = 10,
                  use_fp8: bool = True,
                  state_prompt_mode: str = "exact",
                  state_prompt_fixed_max_len=None,
@@ -78,12 +81,26 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
         self.awq_calib_iters = int(awq_calib_iters)
         # P1: split-GU 2-GEMM path (eliminates F4 v2; -2.9ms expected)
         self.use_p1_split_gu = bool(use_p1_split_gu) and self.use_fp4_encoder_ffn
+        if encoder_p1_combiner not in ("direct", "lut", "lut_native"):
+            raise ValueError(
+                "encoder_p1_combiner must be 'direct', 'lut', or "
+                "'lut_native', got "
+                f"{encoder_p1_combiner!r}")
+        self.encoder_p1_combiner = encoder_p1_combiner
+        self.encoder_down_variant = int(encoder_down_variant)
+        self.decoder_gate_up_variant = int(decoder_gate_up_variant)
 
         if self._fp4_layers:
             if not _HAS_FP4:
                 raise RuntimeError(
                     "use_fp4_encoder_ffn=True but flash_rt_fp4 not available. "
                     "Ensure flash_rt_fp4.so is built with NVFP4 support.")
+            fp4_variant_count = int(fvk_fp4.cutlass_fp4_gemm_num_variants())
+            if not 0 <= self.encoder_down_variant < fp4_variant_count:
+                raise ValueError(
+                    "encoder_down_variant must be in "
+                    f"[0, {fp4_variant_count}), got "
+                    f"{self.encoder_down_variant}")
             self._prepare_fp4_encoder()
             logger.info("Pi05 FP4 enabled on encoder layers: %s  (AWQ=%s)",
                         sorted(self._fp4_layers), self.use_awq)
@@ -100,13 +117,13 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                     "Pi0.5 decoder FP4 requires NVIDIA Thor SM110; got "
                     f"{device_name} CC {capability}")
 
-            variants = (7, 7, 9, 7)
+            variants = (7, 7, self.decoder_gate_up_variant, 7)
             variant_count = int(fvk_fp4.cutlass_fp4_gemm_num_variants())
-            if max(variants) >= variant_count:
-                raise RuntimeError(
-                    "Pi0.5 decoder FP4 baseline variants "
-                    f"{variants} require at least 10 variants; extension has "
-                    f"{variant_count}")
+            if not 0 <= self.decoder_gate_up_variant < variant_count:
+                raise ValueError(
+                    "decoder_gate_up_variant must be in "
+                    f"[0, {variant_count}), got "
+                    f"{self.decoder_gate_up_variant}")
             self._decoder_fp4_variants = variants
             self._decoder_fp4_weights = []
 
@@ -351,7 +368,7 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
 
         # Variant selection (empirically tuned @ Se=968, see Step B test).
         self._fp4_variant_gu = pick_variant(2 * He, De)
-        self._fp4_variant_dn = pick_variant(De, He)
+        self._fp4_variant_dn = self.encoder_down_variant
 
         self._fp4_scratch_dict = None
         self._fp4_scratch_Se = -1
@@ -632,6 +649,7 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
             self._fp4_scratch_dict['p1_gate_sfa'] = self._fp4_p1_gate.sfa.data_ptr()
             self._fp4_scratch_dict['p1_up_p4']    = self._fp4_p1_up.packed.data_ptr()
             self._fp4_scratch_dict['p1_up_sfa']   = self._fp4_p1_up.sfa.data_ptr()
+            self._fp4_scratch_dict['p1_combiner'] = self.encoder_p1_combiner
         self._fp4_scratch_Se = Se
 
     # -------------------------------------------------------------------
