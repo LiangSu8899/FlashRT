@@ -391,6 +391,11 @@ class Pi05TorchFrontendThor:
         self._pos_emb = CudaBuffer.from_numpy(
             g(f'{vp}.embeddings.position_embedding.weight')[:256].cpu().numpy().copy())
         self._img_buf = CudaBuffer.device_empty(nv * 224 * 224 * 3, np.float16)
+        self._infer_images_np = np.empty(
+            (nv, 224, 224, 3), dtype=np.float16)
+        self._infer_uint8_to_fp16 = (
+            np.arange(256, dtype=np.float32) / 127.5 - 1.0
+        ).astype(np.float16)
         self._patches_buf = CudaBuffer.device_empty(S_sig * 588, np.float16)
 
         # PostLN weights
@@ -2532,15 +2537,20 @@ class Pi05TorchFrontendThor:
                 img_list.append(
                     observation.get('wrist_image_right', img_list[-1]))
 
-        def _to_np16(im):
-            if isinstance(im, torch.Tensor):
-                return im.to(dtype=torch.float16).cpu().numpy()
-            if im.dtype == np.float16:
-                return im
-            return (im.astype(np.float32) / 127.5 - 1.0).astype(np.float16)
-
-        images_np = np.stack([_to_np16(im) for im in img_list[:nv]])
-        self._img_buf.upload(images_np)
+        for index, image in enumerate(img_list[:nv]):
+            if isinstance(image, torch.Tensor):
+                image = image.to(dtype=torch.float16).cpu().numpy()
+            if image.dtype == np.uint8:
+                np.take(
+                    self._infer_uint8_to_fp16, image,
+                    out=self._infer_images_np[index])
+            elif image.dtype == np.float16:
+                np.copyto(self._infer_images_np[index], image)
+            else:
+                np.copyto(
+                    self._infer_images_np[index],
+                    (image.astype(np.float32) / 127.5 - 1.0).astype(np.float16))
+        self._img_buf.upload(self._infer_images_np)
 
         # ---- Graph 1: SigLIP + PostLN ----
         self._siglip_graph.replay()

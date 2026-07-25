@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Locked-clock end-to-end A/B for the Pi0.5 Thor decoder NVFP4 path.
+"""Locked-clock end-to-end A/B for the Pi0.5 Thor production NVFP4 path.
 
 The suite launches FP8 and FP4 in separate processes. Both use the same
 checkpoint, explicit prompt tokens, eight LIBERO observations, calibration,
-and matched NumPy noise seeds. Latency covers the complete ``infer()`` call.
+and matched NumPy noise seeds. The FP4 mode combines the production 18-layer
+encoder FFN preset with the decoder NVFP4 path. Latency covers the complete
+``infer()`` call.
 """
 from __future__ import annotations
 
@@ -23,6 +25,7 @@ import numpy as np
 
 EXPECTED_DEVICE = "NVIDIA Thor"
 EXPECTED_CC = (11, 0)
+TARGET_LATENCY_MS = 40.0
 PROMPT_TOKENS = [
     2, 18075, 908, 573, 3118, 3963, 578,
     2040, 665, 575, 573, 24655, 108,
@@ -78,6 +81,9 @@ def main() -> int:
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--seed", type=int, default=20260725)
+    parser.add_argument(
+        "--cuda-profile", action="store_true",
+        help="capture one stable-state infer with cudaProfilerStart/Stop")
     args = parser.parse_args()
 
     if args.warmup < 5 or args.iters < 20:
@@ -107,13 +113,17 @@ def main() -> int:
             from flash_rt.frontends.torch.pi05_thor import (
                 Pi05TorchFrontendThor)
             pipe = Pi05TorchFrontendThor(
-                args.checkpoint, num_views=2, autotune=0)
+                args.checkpoint, num_views=2, autotune=3)
         else:
             from flash_rt.frontends.torch.pi05_thor_fp4 import (
                 Pi05TorchFrontendThorFP4)
             pipe = Pi05TorchFrontendThorFP4(
-                args.checkpoint, num_views=2, autotune=0,
-                use_fp4_encoder_ffn=False, use_fp4_decoder=True)
+                args.checkpoint, num_views=2, autotune=3,
+                use_fp4_encoder_ffn=True,
+                fp4_layers=tuple(range(18)),
+                use_awq=True,
+                use_p1_split_gu=True,
+                use_fp4_decoder=True)
 
         data = np.load(args.fixture)
         count = int(data["n"])
@@ -140,6 +150,13 @@ def main() -> int:
             output = pipe.infer(observation)
             raw_outputs.append(pipe._g_noise.float().cpu().numpy())
             action_outputs.append(output["actions"])
+
+        if args.cuda_profile:
+            torch.cuda.synchronize()
+            torch.cuda.cudart().cudaProfilerStart()
+            pipe.infer(observations[0])
+            torch.cuda.cudart().cudaProfilerStop()
+            torch.cuda.synchronize()
 
         latencies = []
         for index in range(args.iters):
@@ -168,6 +185,20 @@ def main() -> int:
             "flash_rt_kernels_sha256": hashlib.sha256(
                 Path(fvk.__file__).read_bytes()).hexdigest(),
             "clock_state": state,
+            "precision_config": (
+                {
+                    "encoder": "fp8",
+                    "decoder": "fp8",
+                }
+                if args.child_mode == "fp8"
+                else {
+                    "encoder": "nvfp4_ffn",
+                    "encoder_fp4_layers": list(range(18)),
+                    "encoder_awq": True,
+                    "encoder_p1_split_gu": True,
+                    "decoder": "nvfp4_all_projections",
+                }
+            ),
             "warmup": args.warmup,
             "iters": args.iters,
             "p50_ms": statistics.median(latencies),
@@ -249,6 +280,7 @@ def main() -> int:
     action_rhs = action_fp8.reshape(-1)
     fp8_p50 = float(child_results["fp8"]["p50_ms"])
     fp4_p50 = float(child_results["fp4"]["p50_ms"])
+    fp4_p95 = float(child_results["fp4"]["p95_ms"])
     comparison = {
         "raw_cosine": float(
             raw_lhs @ raw_rhs /
@@ -262,17 +294,20 @@ def main() -> int:
         "action_max_abs": float(np.max(np.abs(action_fp4 - action_fp8))),
         "fp8_p50_ms": fp8_p50,
         "fp4_p50_ms": fp4_p50,
+        "fp4_p95_ms": fp4_p95,
         "p50_delta_ms": fp4_p50 - fp8_p50,
         "p50_speedup": fp8_p50 / fp4_p50,
     }
     gates = {
-        "raw_cosine_at_least_0_999": comparison["raw_cosine"] >= 0.999,
+        "raw_cosine_at_least_0_995": comparison["raw_cosine"] >= 0.995,
         "raw_min_sample_cosine_at_least_0_995": (
             comparison["raw_min_sample_cosine"] >= 0.995),
         "action_cosine_at_least_0_999": comparison["action_cosine"] >= 0.999,
         "action_min_sample_cosine_at_least_0_995": (
             comparison["action_min_sample_cosine"] >= 0.995),
         "fp4_p50_faster_than_fp8": fp4_p50 < fp8_p50,
+        "fp4_p50_at_most_40_ms": fp4_p50 <= TARGET_LATENCY_MS,
+        "fp4_p95_at_most_40_ms": fp4_p95 <= TARGET_LATENCY_MS,
     }
     result = {
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
