@@ -91,6 +91,7 @@ class GemmaAttentionAdapter:
                                     scale=kw.get("scaling")), None
 
         mg.eager_attention_forward = fa2_fn
+        self._seq_q = seq_q
         # the swap map is empty (the seam is a function, not a module);
         # the patch and the per-layer core buffers are the swap.
         # note: no extra host forward is run to self-verify — replaying
@@ -99,6 +100,22 @@ class GemmaAttentionAdapter:
         # above already proves the seam is live in this host.
         return {}, None
 
+    def sublayer(self, layer):
+        """An attention sublayer for one host block, or ``None``.
+
+        Offered to the ``decoder_block`` structure, which owns the
+        boundary where the projections' layout meets the kernel's. This
+        family is half-split rotary, and the core bound above is what
+        the function patch would otherwise route to — so the sublayer
+        replaces a routed call, not a host path, and returning ``None``
+        simply leaves that routing in place.
+        """
+        from ..impls.decoder_block import bind_attn_sublayer
+
+        attn = getattr(layer, "self_attn", None)
+        if attn is None:
+            return None
+        return bind_attn_sublayer(attn, getattr(attn, "_fa2_core", None))
 
 
 def _infer_layers(model) -> int:

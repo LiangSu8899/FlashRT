@@ -75,7 +75,7 @@ def auto_swaps(
     structures: tuple[str, ...] = ("decoder_ffn", "vision_ffn",
                                    "qkv_pack", "adaln_producer",
                                    "linear_proj", "norm_fused",
-                                   "attention_core"),
+                                   "attention_core", "decoder_block"),
     negotiate_fp8: bool = True,
     frames: int = 1,
     verbose: bool = False,
@@ -118,10 +118,21 @@ def auto_swaps(
             return None
         return hook
 
+    def cap_shape(path):
+        # a block seam needs no tensors of its own, only the host's
+        # return convention (bare tensor or 1-tuple)
+        def hook(module, args, kwargs, out):
+            caps[path]["returns_tuple"] = isinstance(out, tuple)
+            return None
+        return hook
+
     for seam in seams:
         caps[seam.path] = {}
         target = _resolve(model, seam.path)
-        if seam.structure == "adaln_producer":
+        if seam.structure == "decoder_block":
+            hooks.append(target.register_forward_hook(
+                cap_shape(seam.path), with_kwargs=True))
+        elif seam.structure == "adaln_producer":
             # the norm's own input gives rows; the cond projection gives
             # the (cond, style) pairs the table is built from
             hooks.append(target.register_forward_hook(
@@ -174,16 +185,21 @@ def auto_swaps(
         # prefill region is where the triton fp8 codegen chokes. Qualify
         # on the calibrated row count, not on host names.
         dev = next(model.parameters()).device
+        blocks = {s.path for s in seams if s.structure == "decoder_block"}
         for lay, g in by_parent.items():
-            # only the attention pack is negotiated. The FFN chain was
-            # measured and refused: replacing the norm with a fused fp8
-            # producer costs a kernel (gate_residual, +180 launches) plus
-            # its style materialization (+180) to save the FFN's own
-            # input quantize (-180) — net +0.17ms of kernel time. The
-            # host's compiler-fused norm is already cheap, so the
-            # producer only pays off where it feeds a consumer that
-            # cannot fuse the quantize itself (the packed projections).
+            # the attention pack is always negotiated. The FFN chain is
+            # negotiated only where a decoder_block owns the boundary,
+            # and the reason is the boundary rather than the kernel: at
+            # the norm seam the fused producer costs a kernel
+            # (gate_residual, +180 launches) plus its style
+            # materialization (+180) to save the FFN's own input
+            # quantize (-180) — measured net +0.17ms, so it is refused
+            # there. Inside a block the same kernel *replaces* the
+            # host's gated residual add instead of adding to it, which
+            # is the whole point of owning the block.
             pairs = [("producer", "pack")]
+            if lay in blocks:
+                pairs.append(("producer_ffn", "ffn"))
             keep = {}
             for p_slot, c_slot in pairs:
                 if p_slot not in g or c_slot not in g:
@@ -270,9 +286,73 @@ def auto_swaps(
                 if hasattr(adapter, "__name__") else str(adapter)
             break
 
+    # ---- decoder_block: compose the bound sublayers into one block ----
+    # last, because it is assembled from what the region structures
+    # produced. The swaps it absorbs are dropped from the plan: the
+    # block holds those modules directly, and a swap that also targeted
+    # the host child would leave two live copies of the same seam.
+    for seam in (s for s in seams if s.structure == "decoder_block"):
+        try:
+            block = _bind_block(model, seam, caps.get(seam.path, {}), plan)
+        except (ValueError, RuntimeError) as refusal:
+            plan.notes.setdefault("refused", []).append(
+                (seam.path + " [block]", str(refusal)[:80]))
+            continue
+        if block is None:
+            continue
+        for child in _BLOCK_OWNED:
+            plan.swaps.pop(seam.path + "." + child, None)
+        plan.swaps[seam.path] = block
+
     say(f"bound {len(plan.swaps)} seam(s), "
         f"{len(plan.notes.get('refused', []))} refused")
     return plan
+
+
+_BLOCK_OWNED = ("input_layernorm", "post_attention_layernorm", "mlp")
+
+
+def _cond_kw(host) -> str:
+    """The keyword the host threads its conditioning through."""
+    import inspect
+    try:
+        params = list(inspect.signature(host.forward).parameters)
+    except (TypeError, ValueError):
+        params = []
+    for name in ("adarms_cond", "cond", "temb", "emb"):
+        if name in params:
+            return name
+    return "adarms_cond"
+
+
+def _bind_block(model, seam, cap, plan):
+    """Assemble one decoder_block from its already-bound sublayers."""
+    from .impls.decoder_block import bind_decoder_block
+
+    prod_in = plan.swaps.get(seam.path + ".input_layernorm")
+    prod_out = plan.swaps.get(seam.path + ".post_attention_layernorm")
+    ffn = plan.swaps.get(seam.path + ".mlp")
+    if prod_in is None or prod_out is None or ffn is None:
+        # a sublayer that did not bind leaves the host block intact:
+        # the block structure adds composition, it does not substitute
+        # for the region seams it is made of
+        return None
+    host = _resolve(model, seam.path)
+    # the attention sublayer is family-specific (where the attention runs
+    # and which rotary form it uses), so it comes from the same adapters
+    # that bound the attention core. None keeps the host's attention
+    # module, which is the pre-block behaviour.
+    attn = None
+    for adapter in _ATTENTION_ADAPTERS:
+        builder = getattr(adapter, "sublayer", None)
+        if builder is None:
+            continue
+        attn = builder(host)
+        if attn is not None:
+            break
+    return bind_decoder_block(
+        host, prod_in, prod_out, ffn, cond_kw=_cond_kw(host),
+        returns_tuple=bool(cap.get("returns_tuple")), attn=attn)
 
 
 def _bind_auto(model, seam, cap, plan, act_scales, negotiate_fp8):
@@ -325,9 +405,10 @@ def _bind_auto(model, seam, cap, plan, act_scales, negotiate_fp8):
             return None
         norm = _resolve(model, seam.path)
         proj = getattr(norm, seam.cond_attr)
-        loc = plan.notes.setdefault("_locators", {}).get(seam.family)
+        key = _stream_key(cap["pairs"])
+        loc = plan.notes.setdefault("_locators", {}).get(key)
         table = bind_style_table(proj, cap["pairs"], locator=loc)
-        plan.notes["_locators"][seam.family] = table.locator
+        plan.notes["_locators"][key] = table.locator
         return {seam.path + "." + seam.cond_attr: table}
 
     return None
@@ -381,14 +462,15 @@ def _bind_negotiated(model, p_seam, k_seam, p_cap, c_cap, scale, plan):
 
     norm = _resolve(model, p_seam.path)
     consumer = _resolve(model, k_seam.path)
-    loc = plan.notes.setdefault("_locators", {}).get(p_seam.family)
+    key = _stream_key(p_cap["pairs"])
+    loc = plan.notes.setdefault("_locators", {}).get(key)
     style_width = p_cap["pairs"][0][1].shape[-1]
     prod = bind_adaln_producer(
         norm, p_cap["pairs"], act_scale=scale,
         rows=p_cap.get("rows") or c_cap["rows"],
         dim=getattr(norm, "dim", style_width // 3),
         locator=loc, norm="rms")
-    plan.notes["_locators"][p_seam.family] = prod.locator
+    plan.notes["_locators"][key] = prod.locator
 
     swaps = {p_seam.path: prod}
     if k_seam.structure == "decoder_ffn":
@@ -409,6 +491,27 @@ def _bind_negotiated(model, p_seam, k_seam, p_cap, c_cap, scale, plan):
     swaps.update({k_seam.path + "." + a: m
                   for a, m in zip(k_seam.pack_attrs, parts)})
     return swaps
+
+
+def _stream_key(pairs) -> str:
+    """Identify the conditioning stream a producer was calibrated on.
+
+    Locators were keyed by seam family, which gives every family its own
+    lookup even when they all read the same conditioning — the two norms
+    of one block among them. Keying by the observed conditioning instead
+    shares one locator across the whole stream. It is safe by
+    construction rather than by convention: the key is a digest of the
+    conditioning rows themselves, so two seams share a locator only when
+    they saw byte-identical inputs, and identical inputs resolve to
+    identical indices whichever seam built the table.
+    """
+    import hashlib
+
+    digest = hashlib.blake2b(digest_size=16)
+    for cond, _ in pairs:
+        c = cond.detach().reshape(-1, cond.shape[-1]).to(torch.float32)
+        digest.update(c.cpu().numpy().tobytes())
+    return digest.hexdigest()
 
 
 def _layer_of(path: str) -> str:
