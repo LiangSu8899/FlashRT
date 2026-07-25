@@ -38,31 +38,47 @@ class PackedAttnSublayer(nn.Module):
     """Packed projections -> rotary -> fused core -> output projection."""
 
     def __init__(self, attn: nn.Module, core, *, scale: float,
-                 rotate=rotate_half):
+                 rotate=rotate_half, q_heads: int = 0):
         super().__init__()
         self.attn = attn
         self.core = core
         self.scale = scale
         self.rotate = rotate
+        self.q_heads = q_heads
 
     def forward(self, x: torch.Tensor, position_embeddings=None, **kw):
         a = self.attn
         bsz, seq, _ = x.shape
         hd = a.head_dim
-        # the host's own call order is the data dependency the packed
-        # projection relies on: the first call runs the GEMM, the others
-        # read its stash
-        q = a.q_proj(x).view(bsz, seq, -1, hd)
-        k = a.k_proj(x).view(bsz, seq, -1, hd)
-        v = a.v_proj(x).view(bsz, seq, -1, hd)
-        if position_embeddings is not None:
-            cos, sin = position_embeddings
-            cos = cos.unsqueeze(2).to(q.dtype)
-            sin = sin.unsqueeze(2).to(q.dtype)
-            q = q * cos + self.rotate(q) * sin
-            k = k * cos + self.rotate(k) * sin
+        pack = a.q_proj if getattr(a.q_proj, "joint_slots", 0) else None
+        if pack is not None:
+            # q and k are one contiguous run of the packed output and
+            # the rotary embedding is the same arithmetic on both, so it
+            # runs once over the pair. Splitting them first would cost a
+            # kernel and the copies that separate them.
+            qk = pack.joint(x).view(bsz, seq, -1, hd)
+            qk = self._rope(qk, position_embeddings)
+            q, k = qk[:, :, :self.q_heads], qk[:, :, self.q_heads:]
+            v = a.v_proj(x).view(bsz, seq, -1, hd)
+        else:
+            # the host's own call order is the data dependency the
+            # packed projection relies on: the first call runs the GEMM,
+            # the others read its stash
+            q = a.q_proj(x).view(bsz, seq, -1, hd)
+            k = a.k_proj(x).view(bsz, seq, -1, hd)
+            v = a.v_proj(x).view(bsz, seq, -1, hd)
+            q = self._rope(q, position_embeddings)
+            k = self._rope(k, position_embeddings)
         out = self.core.forward_suffix(q, k, v, scale=self.scale)
         return a.o_proj(out.reshape(bsz, seq, -1))
+
+    def _rope(self, t: torch.Tensor, position_embeddings):
+        if position_embeddings is None:
+            return t
+        cos, sin = position_embeddings
+        cos = cos.unsqueeze(2).to(t.dtype)
+        sin = sin.unsqueeze(2).to(t.dtype)
+        return t * cos + self.rotate(t) * sin
 
 
 def bind_attn_sublayer(attn: nn.Module, core, *, rotate=rotate_half):
@@ -89,5 +105,6 @@ def bind_attn_sublayer(attn: nn.Module, core, *, rotate=rotate_half):
         scale = getattr(attn, "scale", None)
     if scale is None:
         return None
+    q_heads = attn.q_proj.out_features // attn.head_dim
     return PackedAttnSublayer(attn, core, scale=float(scale),
-                              rotate=rotate)
+                              rotate=rotate, q_heads=q_heads)

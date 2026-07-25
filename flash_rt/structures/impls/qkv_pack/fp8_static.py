@@ -63,7 +63,7 @@ class PackedLinear(torch.nn.Module):
 
     def __init__(self, mods: Sequence[torch.nn.Module],
                  act_scale: torch.Tensor, rows: int,
-                 in_dtype: str = "fp8_static"):
+                 in_dtype: str = "fp8_static", joint_slots: int = 0):
         super().__init__()
         self.host_linear = mods[0]
         kf = hub_kernel("flashrt/flashrt-fp8-ffn", ">=1")
@@ -84,6 +84,16 @@ class PackedLinear(torch.nn.Module):
         # call to add zeros — measured 3 kernels/call with the bias
         # entry against 1 without it at the same shapes.
         self.no_bias = _all_zero(bias)
+        # A caller that consumes the first `joint_slots` siblings
+        # together takes the packed output whole: they are one
+        # contiguous run in it, and splitting them apart only to apply
+        # the same elementwise transform to each half costs a kernel and
+        # two copies. Zero keeps the sibling-by-sibling contract.
+        self.joint_slots = joint_slots
+        if joint_slots:
+            self.register_buffer("packed", torch.empty(
+                rows, sum(splits), device=w8.device,
+                dtype=torch.bfloat16))
         if in_dtype == "fp8_static":
             self._fn = (kf.fp8_gemm_bf16 if self.no_bias
                         else kf.fp8_linear_bias_bf16)
@@ -133,22 +143,62 @@ class PackedLinear(torch.nn.Module):
                 "stash write would skip rows of the consumer's buffer")
         setattr(self, f"stash{index}", buf)
 
-    def forward(self, x):
-        flat = x.reshape(-1, x.shape[-1])
+    def enable_joint(self, slots: int) -> None:
+        """Let a caller take the first ``slots`` siblings together.
+
+        Enabled after binding, because whether anyone consumes them
+        jointly is a property of the composition around this pack, not
+        of the pack. Refused when the siblings do not divide evenly by
+        the head dim they would be viewed at — then they are not one
+        run of equal-width heads and the caller cannot treat them alike.
+        """
+        if not 2 <= slots <= len(self.splits):
+            raise ValueError(f"qkv_pack: cannot join {slots} sibling(s)")
+        self.joint_slots = slots
+        self.packed = torch.empty(
+            self.rows, sum(self.splits), device=self.w8.device,
+            dtype=torch.bfloat16)
+
+    def joint(self, x):
+        """Run the pack and return the first ``joint_slots`` siblings whole.
+
+        They are one contiguous run of the packed output, so a caller
+        that applies the same transform to all of them (a rotary
+        embedding over q and k, whose head dims match by construction)
+        can do it in one pass instead of splitting them apart first.
+        """
+        if not self.joint_slots:
+            raise ValueError("qkv_pack: this pack has no joint slots")
+        self._run(x.reshape(-1, x.shape[-1]))
+        width = sum(self.splits[:self.joint_slots])
+        return self.packed[:, :width]
+
+    def _run(self, flat):
+        out = self.packed if self.joint_slots else None
         if self.in_dtype == "fp8_static":
-            y = (self._fn(flat, self.w8, self.act_scale, self.w_scale)
+            y = (self._fn(flat, self.w8, self.act_scale, self.w_scale,
+                          out=out)
                  if self.no_bias else
                  self._fn(flat, self.w8, self.bias_cat, self.act_scale,
-                          self.w_scale))
+                          self.w_scale, out=out))
         else:
             y = self._fn(flat.to(torch.bfloat16).contiguous(),
                          self.w8, self.bias_cat, self.act_scale,
                          self.w_scale, input_fp8=self.x8_buf,
-                         out=self.y_buf)
-        off = self.splits[0]
+                         out=out if out is not None else self.y_buf)
+        # siblings the caller takes jointly are read straight out of the
+        # packed buffer; only the rest need stashing
+        off = sum(self.splits[:max(1, self.joint_slots)])
         for i, n in enumerate(self.splits[1:], 1):
+            if i < self.joint_slots:
+                continue
             getattr(self, f"stash{i}").copy_(y[:, off:off + n])
             off += n
+        return y
+
+    def forward(self, x):
+        flat = x.reshape(-1, x.shape[-1])
+        y = self._run(flat)
         out = y[:, :self.splits[0]].contiguous()
         out = out.reshape(*x.shape[:-1], self.splits[0])
         # the kernel's output dtype is BF16 by contract; only cast back

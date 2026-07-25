@@ -447,6 +447,22 @@ def _alias_kv_region(plan, path: str, sublayer) -> None:
         return
     plan.notes.setdefault("aliased_kv", []).append(path)
 
+    # The joint q|k view is deliberately not enabled here. q and k are
+    # one contiguous run of the packed output and take the same rotary
+    # arithmetic, so one pass over the pair should replace two — and
+    # measured, it replaces nothing: the rotary kernels keep their exact
+    # launch counts (180/162/63) because the compiler splits the merged
+    # pass back apart, fusing it into each consumer (q is made
+    # contiguous for the kernel, k is copied into the packed region).
+    # Paired timing: -0.014 ms on 23.1, which is below the margin this
+    # stack ships at. Expressing "do this once" in tensor ops does not
+    # survive a compiler that re-derives its fusion boundaries from the
+    # consumers; the style broker only survived by being opaque, and an
+    # opaque wrapper here would be worse, since the rotary would then run
+    # as several eager ops instead of one fused kernel. Merging these
+    # needs a rotary kernel, not a rearrangement. The capability stays
+    # on the impl for a host where the arithmetic is not launch-bound.
+
 
 def _bind_auto(model, seam, cap, plan, act_scales, negotiate_fp8):
     """Route one seam to its impl with the captured calibration."""
