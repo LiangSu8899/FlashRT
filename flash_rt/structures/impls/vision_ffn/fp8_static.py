@@ -62,12 +62,22 @@ class BoundVisionFfnFp8:
     hidden_scale: torch.Tensor
     fc2_scale: torch.Tensor
     eps: float
+    in_dtype: str = "bf16"
 
     def ffn(self, normed: torch.Tensor) -> torch.Tensor:
         """The normed-input -> ffn-output slice (no norm, no residual).
 
-        Input quantization is fused inside the kernel's BF16 entry."""
+        On the BF16 entry the kernel quantizes the input itself; on the
+        FP8 entry an upstream producer already did, with the shared
+        activation scale, so the input passes straight through."""
         shape = normed.shape
+        if getattr(self, "in_dtype", "bf16") == "fp8_static":
+            out = self.fused_mlp(
+                normed.reshape(-1, shape[-1]),
+                self.fc1_fp8, self.b_fc1, self.fc2_fp8, self.b_fc2,
+                self.input_scale.view(1), self.fc1_scale.view(1),
+                self.hidden_scale.view(1), self.fc2_scale.view(1))
+            return out.reshape(*shape[:-1], out.shape[-1])
         out = self.fused_mlp(
             normed.reshape(-1, shape[-1]).to(torch.bfloat16).contiguous(),
             self.fc1_fp8,
@@ -151,13 +161,17 @@ def _check(weights: Mapping[str, torch.Tensor]) -> tuple[int, int]:
     return dim_d, dim_f
 
 
-def _build(weights, input_scale, hidden_scale, eps):
+def _build(weights, input_scale, hidden_scale, eps, variant=None):
+    variant = variant or {}
     _check(weights)
     fc1_scale = _amax_scale(weights["w_fc1"])
     fc2_scale = _amax_scale(weights["w_fc2"])
     to_bf16 = lambda t: t.to(torch.bfloat16)
     return BoundVisionFfnFp8(
-        fused_mlp=_kernel().bf16_fp8_gelu_mlp_bf16,
+        fused_mlp=(_kernel().fp8_gelu_mlp_bf16
+                   if variant.get("in_dtype") == "fp8_static"
+                   else _kernel().bf16_fp8_gelu_mlp_bf16),
+        in_dtype=variant.get("in_dtype", "bf16"),
         w_norm=weights["w_norm"],
         b_norm=weights["b_norm"],
         fc1_fp8=_quantize(weights["w_fc1"], fc1_scale),
