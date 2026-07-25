@@ -139,8 +139,9 @@ harness.
 
 ## FP4+FP4 Multi-View Candidate (2026-07-25)
 
-The PR candidate uses the strict default configuration in
-`tests/bench_pi05_decoder_fp4_e2e.py`:
+The formal runs use commit
+`8c09371586b70e7a0c53fb79cc017f16100cbeab` and the strict default
+configuration in `tests/bench_pi05_decoder_fp4_e2e.py`:
 
 - Encoder layers 0-16: NVFP4 Gate, Up, and Down FFN projections with AWQ
   alpha 0.8 and P1 split-GU. Encoder attention projections remain FP8.
@@ -154,9 +155,9 @@ Locked-clock latency:
 
 | Views | Same-run FP8 p50 / p95 | FP4+FP4 p50 / p95 | Published FP4+FA4 p50 | Published delta | Gate |
 |---:|---:|---:|---:|---:|---|
-| 1 | 35.473 / 35.696 ms | **29.088 / 29.280 ms** | 30.5 ms | -1.412 ms | **fail**, target <=28.5 ms |
-| 2 | 41.650 / 41.857 ms | **32.772 / 33.008 ms** | 36.3 ms | **-3.528 ms** | pass |
-| 3 | 49.451 / 49.802 ms | **39.366 / 39.498 ms** | 42.8 ms | **-3.434 ms** | pass, including <40 ms |
+| 1 | 35.614 / 35.878 ms | **28.884 / 29.025 ms** | 30.5 ms | -1.616 ms | **fail**, target <=28.5 ms |
+| 2 | 41.727 / 41.948 ms | **33.095 / 33.340 ms** | 36.3 ms | **-3.205 ms** | pass |
+| 3 | 49.816 / 50.076 ms | **39.821 / 39.985 ms** | 42.8 ms | **-2.979 ms** | pass, including <40 ms |
 
 Matched-noise fidelity across eight observations per view count:
 
@@ -183,16 +184,19 @@ This candidate must not merge yet. Two blockers remain:
 Reproduction command, repeated with `--num-views 1`, `2`, and `3`:
 
 ```bash
-PYTHONPATH=/home/tianjianyang/code/FlashRT \
-LD_LIBRARY_PATH=/home/tianjianyang/miniconda3/envs/flashrt/lib/python3.12/site-packages/nvidia/cu13/lib \
-/tmp/flashrt-pi05-fa4-repro-venv/bin/python \
-  tests/bench_pi05_decoder_fp4_e2e.py \
+PYTHONPATH=<repo-root> python tests/bench_pi05_decoder_fp4_e2e.py \
   --num-views 2 \
-  --output-dir /tmp/flashrt-pi05-fp4-fp4-2v
+  --output-dir <output-dir>
 ```
+
+The FA4 path additionally needs its runtime dependencies on the
+interpreter's path (the `thor-fa4` pip extra) and the CUDA runtime
+libraries of the active torch install on `LD_LIBRARY_PATH`.
 
 Current shared artifacts:
 
 - `flash_rt_fp4`: `2c66b308661a142765af9cad8ee6a54eff465665829964359d0cada1c4a0ec96`
 - `flash_rt_kernels`: `30270002a9646ec230fd69f2cb76ef33acbb5d683872c5833796aa15e10c0c91`
-- Local candidate root: `/tmp/flashrt-pr2-multiview-BBUYMy`
+- 1-view `result.json`: `9a5c911dd3a867d7b58abf25bcfeb7201e3a6649baafc7d529a2c0f92bd53267`
+- 2-view `result.json`: `43d7c80ca06528a76c183e3e51a018b27eabbb4cb44f38406fd8dacf3b0e4df1`
+- 3-view `result.json`: `0780386b4281bf057425a710fcb821dee0dd8cc552d045e3426cf56f38fb6ade`
