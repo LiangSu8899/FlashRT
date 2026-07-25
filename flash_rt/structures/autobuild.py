@@ -557,12 +557,11 @@ def _bind_negotiated(model, p_seam, k_seam, p_cap, c_cap, scale, plan):
     consumer = _resolve(model, k_seam.path)
     key = _stream_key(p_cap["pairs"])
     loc = plan.notes.setdefault("_locators", {}).get(key)
-    style_width = p_cap["pairs"][0][1].shape[-1]
+    dim, form = _adaln_form(p_cap)
     prod = bind_adaln_producer(
         norm, p_cap["pairs"], act_scale=scale,
         rows=p_cap.get("rows") or c_cap["rows"],
-        dim=getattr(norm, "dim", style_width // 3),
-        locator=loc, norm="rms")
+        dim=dim, locator=loc, norm=form)
     plan.notes["_locators"][key] = prod.locator
 
     swaps = {p_seam.path: prod}
@@ -584,6 +583,37 @@ def _bind_negotiated(model, p_seam, k_seam, p_cap, c_cap, scale, plan):
     swaps.update({k_seam.path + "." + a: m
                   for a, m in zip(k_seam.pack_attrs, parts)})
     return swaps
+
+
+def _adaln_form(cap) -> tuple[int, str]:
+    """Read the producer's width and form off the calibration.
+
+    Both were assumed before: the form was hard-coded to rms and the
+    width taken as ``style_width // 3``. That holds only where the style
+    carries three parts. A host whose adaptive norm emits (scale, shift)
+    — the layer form — got bound as rms at two thirds of its real width,
+    and the plan built cleanly and then could not run. It took a second
+    host and an actual forward to see it, because nothing on the way
+    there had to disagree.
+
+    The norm's own input says how wide it is, and the ratio to the style
+    says which form it is. Neither is a guess.
+    """
+    samples = cap.get("x") or []
+    if not samples:
+        raise ValueError(
+            "adaln_producer: no captured input, cannot tell the form "
+            "from the style width alone")
+    dim = int(samples[0].shape[-1])
+    style_width = int(cap["pairs"][0][1].shape[-1])
+    if style_width == 3 * dim:
+        return dim, "rms"           # scale, shift, gate
+    if style_width == 2 * dim:
+        return dim, "layer"         # scale, shift
+    raise ValueError(
+        f"adaln_producer: style width {style_width} is neither two nor "
+        f"three times the norm width {dim} — the modulation is a shape "
+        "this structure does not model")
 
 
 def _stream_key(pairs) -> str:

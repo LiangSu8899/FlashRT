@@ -187,6 +187,17 @@ class AdaLNProducer(torch.nn.Module):
         """Whether this producer can fold a pending gated residual."""
         return self.out_fp8 and self.norm == "rms"
 
+    @property
+    def takes_style_rows(self) -> bool:
+        """Whether this form consumes a materialised ``(rows, W)`` style.
+
+        Only the rms form does. The layer form's kernel takes scale and
+        shift as separate one-row arguments, so there is nothing to
+        repeat to the row count and nothing for a broker to share — it
+        would attach, never be read, and still be reported as active.
+        """
+        return self.norm == "rms"
+
     def attach_broker(self, broker, slot: int, *, writer: bool) -> None:
         """Take styles from a stream-scoped broker (see :mod:`.broker`)."""
         self.broker = broker

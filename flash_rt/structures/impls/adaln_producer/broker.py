@@ -98,6 +98,11 @@ def bind_style_broker(producers, rows: int) -> StyleBroker | None:
     materialisation — this composes onto bound producers and can only
     remove work, never add a requirement.
     """
+    # a form that never reads a materialised style has nothing to share:
+    # attaching anyway would hold a buffer nobody reads and still report
+    # a broker as active. Found on the second host, where every producer
+    # is the layer form.
+    producers = [p for p in producers if p.takes_style_rows]
     if len(producers) < 2:
         return None
     locator = producers[0].locator
