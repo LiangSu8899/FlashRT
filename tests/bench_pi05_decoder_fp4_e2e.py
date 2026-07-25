@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import hashlib
+import importlib.metadata
 import json
 import os
 from pathlib import Path
@@ -25,7 +26,10 @@ import numpy as np
 
 EXPECTED_DEVICE = "NVIDIA Thor"
 EXPECTED_CC = (11, 0)
-TARGET_LATENCY_MS = 40.0
+PUBLISHED_2V_SOTA_P50_MS = 36.3
+REQUIRED_MARGIN_MS = 2.0
+TARGET_LATENCY_MS = PUBLISHED_2V_SOTA_P50_MS - REQUIRED_MARGIN_MS
+TAIL_LATENCY_MS = 40.0
 PROMPT_TOKENS = [
     2, 18075, 908, 573, 3118, 3963, 578,
     2040, 665, 575, 573, 24655, 108,
@@ -95,6 +99,7 @@ def main() -> int:
 
         import flash_rt.flash_rt_fp4 as fvk_fp4
         import flash_rt.flash_rt_kernels as fvk
+        from flash_rt.hardware.thor import fa4_backend
 
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is required")
@@ -106,6 +111,10 @@ def main() -> int:
                 f"{device_name} {capability}")
         if not fvk_fp4.has_nvfp4():
             raise RuntimeError("flash_rt_fp4 lacks NVFP4 support")
+        if not fa4_backend.is_available():
+            raise RuntimeError(
+                "strict FP4+FA4 E2E requires active FA4: "
+                f"{fa4_backend.status()}")
         if args.output_dir is None:
             raise ValueError("child mode requires --output-dir")
 
@@ -113,7 +122,7 @@ def main() -> int:
             from flash_rt.frontends.torch.pi05_thor import (
                 Pi05TorchFrontendThor)
             pipe = Pi05TorchFrontendThor(
-                args.checkpoint, num_views=2, autotune=3)
+                args.checkpoint, num_views=2, autotune=3, use_fa4=True)
         else:
             from flash_rt.frontends.torch.pi05_thor_fp4 import (
                 Pi05TorchFrontendThorFP4)
@@ -123,7 +132,8 @@ def main() -> int:
                 fp4_layers=tuple(range(18)),
                 use_awq=True,
                 use_p1_split_gu=True,
-                use_fp4_decoder=True)
+                use_fp4_decoder=True,
+                use_fa4=True)
 
         data = np.load(args.fixture)
         count = int(data["n"])
@@ -189,6 +199,7 @@ def main() -> int:
                 {
                     "encoder": "fp8",
                     "decoder": "fp8",
+                    "attention": "fa4_siglip_encoder",
                 }
                 if args.child_mode == "fp8"
                 else {
@@ -197,8 +208,20 @@ def main() -> int:
                     "encoder_awq": True,
                     "encoder_p1_split_gu": True,
                     "decoder": "nvfp4_all_projections",
+                    "attention": "fa4_siglip_encoder",
                 }
             ),
+            "fa4_status": fa4_backend.status(),
+            "fa4_runtime": {
+                "nvidia_cutlass_dsl": importlib.metadata.version(
+                    "nvidia-cutlass-dsl"),
+                "quack_kernels": importlib.metadata.version("quack-kernels"),
+                "cute_dsl_arch": os.environ.get("CUTE_DSL_ARCH"),
+                "flash_attention_arch": os.environ.get(
+                    "FLASH_ATTENTION_ARCH"),
+            },
+            "num_views": 2,
+            "denoise_steps": 10,
             "warmup": args.warmup,
             "iters": args.iters,
             "p50_ms": statistics.median(latencies),
@@ -297,6 +320,9 @@ def main() -> int:
         "fp4_p95_ms": fp4_p95,
         "p50_delta_ms": fp4_p50 - fp8_p50,
         "p50_speedup": fp8_p50 / fp4_p50,
+        "published_2v_sota_p50_ms": PUBLISHED_2V_SOTA_P50_MS,
+        "required_margin_ms": REQUIRED_MARGIN_MS,
+        "target_p50_ms": TARGET_LATENCY_MS,
     }
     gates = {
         "raw_cosine_at_least_0_995": comparison["raw_cosine"] >= 0.995,
@@ -306,8 +332,8 @@ def main() -> int:
         "action_min_sample_cosine_at_least_0_995": (
             comparison["action_min_sample_cosine"] >= 0.995),
         "fp4_p50_faster_than_fp8": fp4_p50 < fp8_p50,
-        "fp4_p50_at_most_40_ms": fp4_p50 <= TARGET_LATENCY_MS,
-        "fp4_p95_at_most_40_ms": fp4_p95 <= TARGET_LATENCY_MS,
+        "fp4_fa4_p50_at_most_34_3_ms": fp4_p50 <= TARGET_LATENCY_MS,
+        "fp4_fa4_p95_at_most_40_ms": fp4_p95 <= TAIL_LATENCY_MS,
     }
     result = {
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),

@@ -289,6 +289,7 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                action_horizon=None,
                use_fp4=False,
                use_fp4_decoder=False,
+               use_fa4=False,
                fp4_layers=None,
                use_awq=None,
                awq_alpha=0.5,
@@ -384,6 +385,10 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             ``use_fp4=True``. Default False. Requires ``use_fp4=True`` and a
             working SM110 NVFP4 extension; unsupported configurations raise
             instead of selecting another precision path.
+        use_fa4: Pi0.5 torch on Thor only. Explicitly require FA4 for SigLIP
+            and encoder attention. Default False. Missing runtime dependencies
+            and unsupported fixed-shape state-prompt mode raise immediately;
+            this option never selects an alternate attention implementation.
         fp4_layers: Tuple of encoder layer indices to FP4-quantize (only
             applies when use_fp4=True). ``None`` resolves to the production
             preset, full 18 encoder FFN layers with AWQ + P1 split-GU.
@@ -760,6 +765,13 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                     "decoder=%s",
                     framework, sorted(fp4_layers), use_fp4_decoder)
 
+    if use_fa4 and (
+            config != "pi05" or framework != "torch" or arch != "thor"):
+        raise ValueError(
+            "use_fa4=True only supports config='pi05', framework='torch' "
+            f"on Thor; got config={config!r}, framework={framework!r}, "
+            f"hardware={arch!r}")
+
     # Build the kwarg set per-model so we only pass args the target class
     # actually accepts. Keeps the dispatch table simple while still letting
     # users specify groot/pi0fast knobs.
@@ -770,6 +782,8 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         kwargs["hardware"] = arch
     if "use_fp8" in sig.parameters:
         kwargs["use_fp8"] = use_fp8
+    if use_fa4 and "use_fa4" in sig.parameters:
+        kwargs["use_fa4"] = True
     if config == "pi0fast":
         kwargs.update(
             autotune=autotune,

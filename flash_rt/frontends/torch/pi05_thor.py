@@ -129,7 +129,8 @@ class Pi05TorchFrontendThor:
     def __init__(self, checkpoint_dir: str, num_views: int = 2,
                  use_cuda_graph: bool = True, autotune: int = 3,
                  use_fp8: bool = True, state_prompt_mode: str = "exact",
-                 state_prompt_fixed_max_len: Optional[int] = None):
+                 state_prompt_fixed_max_len: Optional[int] = None,
+                 use_fa4: bool = False):
         """
         Args:
             autotune: CUDA Graph autotune trials per set_prompt().
@@ -158,6 +159,7 @@ class Pi05TorchFrontendThor:
         self.num_views = num_views
         self.use_cuda_graph = use_cuda_graph
         self.use_fp8 = bool(use_fp8)
+        self.use_fa4 = bool(use_fa4)
         self.autotune = int(autotune) if autotune is not True else 3
         if autotune is False:
             self.autotune = 0
@@ -1140,6 +1142,7 @@ class Pi05TorchFrontendThor:
                 "layer_stride": layer_stride,
                 "scale":        attn_scale,
             },
+            use_fa4=self.use_fa4,
         )
         self._attn.set_fixed_shape(fixed_shape)
         if fixed_shape:

@@ -57,7 +57,8 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                  use_p1_split_gu: bool = False,
                  use_fp8: bool = True,
                  state_prompt_mode: str = "exact",
-                 state_prompt_fixed_max_len=None):
+                 state_prompt_fixed_max_len=None,
+                 use_fa4: bool = False):
         if use_fp4_decoder and not use_fp8:
             raise ValueError(
                 "use_fp4_decoder=True requires the FP8 Thor encoder path")
@@ -66,7 +67,8 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                          use_cuda_graph=use_cuda_graph, autotune=autotune,
                          use_fp8=use_fp8,
                          state_prompt_mode=state_prompt_mode,
-                         state_prompt_fixed_max_len=state_prompt_fixed_max_len)
+                         state_prompt_fixed_max_len=state_prompt_fixed_max_len,
+                         use_fa4=use_fa4)
 
         self.use_fp4_encoder_ffn = bool(use_fp4_encoder_ffn)
         self.use_fp4_decoder = bool(use_fp4_decoder)

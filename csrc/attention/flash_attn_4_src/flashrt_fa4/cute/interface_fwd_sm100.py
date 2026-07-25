@@ -56,7 +56,9 @@ FlashAttentionForwardSm80 = _fa4_trimmed("FlashAttentionForwardSm80")
 FlashAttentionForwardSm90 = _fa4_trimmed("FlashAttentionForwardSm90")
 FlashAttentionForwardSm120 = _fa4_trimmed("FlashAttentionForwardSm120")
 FlashAttentionMLAForwardSm100 = _fa4_trimmed("FlashAttentionMLAForwardSm100")
-BlackwellFusedMultiHeadAttentionForward = _fa4_trimmed("BlackwellFusedMultiHeadAttentionForward")
+from flashrt_fa4.cute.sm100_hd256_2cta_fmha_forward import (
+    BlackwellFusedMultiHeadAttentionForward,
+)
 
 from flashrt_fa4.cute.block_sparsity import (
     BlockSparseTensorsTorch,

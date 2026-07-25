@@ -218,6 +218,58 @@ def test_reject_extra_site():
     raise AssertionError("extra site should have been rejected")
 
 
+def test_required_fa4_unavailable_raises():
+    from flash_rt.hardware.thor import fa4_backend
+    from flash_rt.hardware.thor.attn_backend import (
+        ThorFlashAttnBackend, make_pi05_attention_spec,
+    )
+
+    siglip, encoder, decoder, _, _ = _fake_slots()
+    spec = make_pi05_attention_spec(num_views=2, enc_seq_max=600)
+    original_func = fa4_backend.fa4_func
+    original_status = fa4_backend.status
+    fa4_backend.fa4_func = lambda: None
+    fa4_backend.status = lambda: "missing-test-runtime"
+    try:
+        class _C: cpp = 0
+        try:
+            ThorFlashAttnBackend(
+                spec, _C(), siglip_slots=siglip, encoder_slots=encoder,
+                decoder_slots=decoder, use_fa4=True)
+        except RuntimeError as exc:
+            assert "missing-test-runtime" in str(exc), str(exc)
+        else:
+            raise AssertionError("required FA4 must not select another kernel")
+    finally:
+        fa4_backend.fa4_func = original_func
+        fa4_backend.status = original_status
+
+
+def test_required_fa4_rejects_fixed_shape():
+    from flash_rt.hardware.thor import fa4_backend
+    from flash_rt.hardware.thor.attn_backend import (
+        ThorFlashAttnBackend, make_pi05_attention_spec,
+    )
+
+    siglip, encoder, decoder, _, _ = _fake_slots()
+    spec = make_pi05_attention_spec(num_views=2, enc_seq_max=600)
+    original_func = fa4_backend.fa4_func
+    fa4_backend.fa4_func = lambda: object()
+    try:
+        class _C: cpp = 0
+        backend = ThorFlashAttnBackend(
+            spec, _C(), siglip_slots=siglip, encoder_slots=encoder,
+            decoder_slots=decoder, use_fa4=True)
+        try:
+            backend.set_fixed_shape(True)
+        except RuntimeError as exc:
+            assert "does not support fixed-shape" in str(exc), str(exc)
+        else:
+            raise AssertionError("FA4 fixed-shape must fail explicitly")
+    finally:
+        fa4_backend.fa4_func = original_func
+
+
 def _make_pi0_backend():
     """Helper: build a Pi0-spec'd ThorFlashAttnBackend with fake ptrs."""
     from flash_rt.hardware.thor.attn_backend import (
@@ -306,6 +358,8 @@ def main() -> int:
         test_reject_null_ptr,
         test_reject_bad_D,
         test_reject_extra_site,
+        test_required_fa4_unavailable_raises,
+        test_required_fa4_rejects_fixed_shape,
         test_pi0_spec_decoder_extra,
         test_state_masked_requires_state_nk,
         test_state_masked_state_nk_range,

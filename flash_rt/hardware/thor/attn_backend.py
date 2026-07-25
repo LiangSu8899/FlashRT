@@ -32,6 +32,26 @@ from typing import Optional
 from flash_rt.hardware.backend import AttentionBackendBase, AttentionSpec
 
 
+def _fp16_tensor_from_ptr(ptr: int, shape, strides=None, offset: int = 0):
+    """Create a zero-copy CUDA torch tensor view over a raw fp16 pointer."""
+    import torch
+
+    interface = {
+        "data": (int(ptr) + int(offset) * 2, False),
+        "shape": tuple(int(dim) for dim in shape),
+        "typestr": "<f2",
+        "version": 3,
+    }
+    if strides is not None:
+        interface["strides"] = tuple(int(stride) * 2 for stride in strides)
+    owner = type(
+        "_Fp16CudaArrayInterface",
+        (),
+        {"__cuda_array_interface__": interface},
+    )()
+    return torch.as_tensor(owner, device="cuda")
+
+
 class ThorFlashAttnBackend(AttentionBackendBase):
     """Pi0.5 attention backend on Thor (SM110).
 
@@ -48,7 +68,8 @@ class ThorFlashAttnBackend(AttentionBackendBase):
     def __init__(self, spec: AttentionSpec, ctx, *,
                  siglip_slots: dict, encoder_slots: dict,
                  decoder_slots: dict,
-                 fixed_control: Optional[dict] = None) -> None:
+                 fixed_control: Optional[dict] = None,
+                 use_fa4: bool = False) -> None:
         """
         Args:
             spec: AttentionSpec with exactly the sites
@@ -75,6 +96,9 @@ class ThorFlashAttnBackend(AttentionBackendBase):
                 allocates the three int32 device scalars itself. JAX callers
                 pass CudaBuffer-backed pointers plus a setter callback to keep
                 this module independent of PyTorch.
+            use_fa4: explicitly require FA4 for SigLIP and encoder attention.
+                Construction fails if FA4 is unavailable. Decoder attention
+                remains on the lower-overhead fvk kernel.
 
         Invariants enforced:
             * spec has the three expected sites with correct layer counts.
@@ -95,6 +119,17 @@ class ThorFlashAttnBackend(AttentionBackendBase):
         # fvk.FvkContext through. Both Pi0.5 (raw) and Pi0/Groot (wrapper)
         # call sites work without further conditioning in run().
         self._ctx_cpp = ctx.cpp if hasattr(ctx, "cpp") else ctx
+        self._use_fa4 = bool(use_fa4)
+        self._fa4_func = None
+        self._fa4_outputs = []
+        if self._use_fa4:
+            from flash_rt.hardware.thor import fa4_backend
+
+            self._fa4_func = fa4_backend.fa4_func()
+            if self._fa4_func is None:
+                raise RuntimeError(
+                    "Pi0.5 use_fa4=True requires an active Thor FA4 runtime: "
+                    f"{fa4_backend.status()}")
         self._slots = {
             "siglip":  dict(siglip_slots),
             "encoder": dict(encoder_slots),
@@ -199,6 +234,10 @@ class ThorFlashAttnBackend(AttentionBackendBase):
         ``attention_qkv_fp16_seqused``. The captured K/V max shape stays fixed;
         :meth:`set_fixed_valid_len` updates the device-side valid lengths.
         """
+        if enabled and self._use_fa4:
+            raise RuntimeError(
+                "Pi0.5 use_fa4=True does not support fixed-shape state-prompt "
+                "attention")
         if enabled and not (
             self._enc_seqused_ptr and self._dec_seqused_ptr
             and self._dec_devpos_ptr
@@ -312,9 +351,28 @@ class ThorFlashAttnBackend(AttentionBackendBase):
             Q = int(s["qkv"])
             K = Q + D * 2
             V = Q + 2 * D * 2
-            fvk.fmha_strided_full(Q, K, V, int(s["O"]),
-                                   nv, q_seq, kv_seq, NH, NH, HD,
-                                   stride, stride, stream)
+            if self._use_fa4:
+                tensor_strides = (q_seq * stride, stride, HD, 1)
+                q_tensor = _fp16_tensor_from_ptr(
+                    Q, (nv, q_seq, NH, HD), tensor_strides)
+                k_tensor = _fp16_tensor_from_ptr(
+                    Q, (nv, q_seq, NH, HD), tensor_strides,
+                    offset=NH * HD)
+                v_tensor = _fp16_tensor_from_ptr(
+                    Q, (nv, q_seq, NH, HD), tensor_strides,
+                    offset=2 * NH * HD)
+                output = self._fa4_func(
+                    q_tensor, k_tensor, v_tensor, causal=False,
+                    num_splits=1, pack_gqa=False)
+                if isinstance(output, tuple):
+                    output = output[0]
+                self._fa4_outputs.append(output)
+                _fp16_tensor_from_ptr(
+                    int(s["O"]), (nv, q_seq, NH, HD)).copy_(output)
+            else:
+                fvk.fmha_strided_full(Q, K, V, int(s["O"]),
+                                       nv, q_seq, kv_seq, NH, NH, HD,
+                                       stride, stride, stream)
             return int(s["O"])
 
         # encoder / decoder — kernel chosen by site.extra
@@ -348,6 +406,22 @@ class ThorFlashAttnBackend(AttentionBackendBase):
                 float(s["scale"]), stream,
             )
         elif kernel == "standard":
+            if self._use_fa4 and site == "encoder":
+                q_tensor = _fp16_tensor_from_ptr(
+                    int(s["Q_O"]),
+                    (1, q_seq, site_spec.num_q_heads, site_spec.head_dim))
+                k_tensor = _fp16_tensor_from_ptr(
+                    K_ptr, (1, kv_seq, 1, site_spec.head_dim))
+                v_tensor = _fp16_tensor_from_ptr(
+                    V_ptr, (1, kv_seq, 1, site_spec.head_dim))
+                output = self._fa4_func(
+                    q_tensor, k_tensor, v_tensor, causal=False,
+                    num_splits=1, pack_gqa=True)
+                if isinstance(output, tuple):
+                    output = output[0]
+                self._fa4_outputs.append(output)
+                q_tensor.copy_(output)
+                return int(s["Q_O"])
             if self._fixed_shape and site in ("encoder", "decoder"):
                 seqused = (self._enc_seqused_ptr if site == "encoder"
                            else self._dec_seqused_ptr)
