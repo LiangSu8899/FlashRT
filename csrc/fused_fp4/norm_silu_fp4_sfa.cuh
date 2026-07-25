@@ -36,6 +36,20 @@ void residual_add_rms_norm_fp4_sfa_v2_fp16(
     uint8_t* packed, uint8_t* sfa,
     int seq_len, int dim, cudaStream_t stream);
 
+// Pi0.5 decoder C1: AdaRMSNorm(x, style) -> FP4 + SFA and fp16 gate.
+// style is [S, 3D] with scale, shift, gate contiguous along the last axis.
+void pi05_adarms_fp4_sfa_fp16(
+    const __half* x, const __half* style,
+    uint8_t* packed, uint8_t* sfa, __half* gate,
+    int seq_len, int dim, cudaStream_t stream);
+
+// Pi0.5 decoder C4->C5 / C7->C1: residual += x * prev_gate, then
+// AdaRMSNorm(residual, style) -> FP4 + SFA and the next fp16 gate.
+void pi05_gate_res_adarms_fp4_sfa_fp16(
+    const __half* x, const __half* prev_gate, __half* residual,
+    const __half* style, uint8_t* packed, uint8_t* sfa, __half* gate,
+    int seq_len, int dim, cudaStream_t stream);
+
 // F4: gate_silu_mul_merged(merged [S, 2H]) → hid [S, H] → fp4 packed + SFA.
 //     GELU(gate) * up, where merged = [gate || up] along dim 1.
 void gate_silu_mul_fp4_sfa_fp16(

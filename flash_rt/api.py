@@ -288,6 +288,7 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                embodiment_tag=None,
                action_horizon=None,
                use_fp4=False,
+               use_fp4_decoder=False,
                fp4_layers=None,
                use_awq=None,
                awq_alpha=0.5,
@@ -378,6 +379,11 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             Validated on LIBERO Spatial for the torch path: 491/500 = 98.2%
             (matches baseline). JAX FP4 has Thor precision / replay-latency
             validation against a same-origin PyTorch reference.
+        use_fp4_decoder: Pi0.5 torch on Thor only. Explicitly enable NVFP4 for
+            all four action-expert decoder projections in addition to
+            ``use_fp4=True``. Default False. Requires ``use_fp4=True`` and a
+            working SM110 NVFP4 extension; unsupported configurations raise
+            instead of selecting another precision path.
         fp4_layers: Tuple of encoder layer indices to FP4-quantize (only
             applies when use_fp4=True). ``None`` resolves to the production
             preset, full 18 encoder FFN layers with AWQ + P1 split-GU.
@@ -594,6 +600,15 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                 "('groot', 'torch', 'thor'/'rtx_sm120'), and "
                 "('groot_n17', 'torch', 'thor'/'rtx_sm120'/'rtx_sm89')")
 
+    if use_fp4_decoder:
+        if not use_fp4:
+            raise ValueError("use_fp4_decoder=True requires use_fp4=True")
+        if (config, framework, arch) != ("pi05", "torch", "thor"):
+            raise ValueError(
+                "use_fp4_decoder=True only supports config='pi05', "
+                "framework='torch', hardware='thor'; got "
+                f"config={config!r}, framework={framework!r}, hardware={arch!r}")
+
     pipe_cls = resolve_pipeline_class(config, framework, arch)
 
     # GROOT N1.7 on RTX defaults to the framework-conforming FP8 frontend.
@@ -712,11 +727,19 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             try:
                 import flash_rt.flash_rt_fp4 as _fvk_fp4
                 if not _fvk_fp4.has_nvfp4():
+                    if use_fp4_decoder:
+                        raise RuntimeError(
+                            "use_fp4_decoder=True requires flash_rt_fp4 built "
+                            "with SM110 NVFP4 support")
                     logger.warning(
                         "flash_rt_fp4 loaded but has_nvfp4()=False (SM100+ required). "
                         "Falling back to FP8.")
                     use_fp4 = False
-            except ImportError:
+            except ImportError as exc:
+                if use_fp4_decoder:
+                    raise RuntimeError(
+                        "use_fp4_decoder=True requires the flash_rt_fp4 "
+                        "extension") from exc
                 logger.warning(
                     "flash_rt_fp4 extension not available. Falling back to FP8.")
                 use_fp4 = False
@@ -733,8 +756,9 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                     )
                     pipe_cls = Pi05JaxFrontendThorFP4
                 logger.info(
-                    "FP4 enabled (framework=%s): encoder FFN layers %s",
-                    framework, sorted(fp4_layers))
+                    "FP4 enabled (framework=%s): encoder FFN layers %s, "
+                    "decoder=%s",
+                    framework, sorted(fp4_layers), use_fp4_decoder)
 
     # Build the kwarg set per-model so we only pass args the target class
     # actually accepts. Keeps the dispatch table simple while still letting
@@ -798,6 +822,8 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         if use_fp4 and "use_fp4_encoder_ffn" in sig.parameters:
             kwargs["use_fp4_encoder_ffn"] = True
             kwargs["fp4_layers"] = fp4_layers
+            if use_fp4_decoder and "use_fp4_decoder" in sig.parameters:
+                kwargs["use_fp4_decoder"] = True
             if "use_awq" in sig.parameters:
                 kwargs["use_awq"] = bool(use_awq)
                 kwargs["awq_alpha"] = float(awq_alpha)

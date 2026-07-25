@@ -1,14 +1,15 @@
-"""Pi05TorchFrontendThor with NVFP4 encoder-FFN subset support (Phase 4.3).
+"""Pi05TorchFrontendThor with explicit NVFP4 encoder and decoder paths.
 
-STRICTLY ADDITIVE. Does not modify pi05_thor.py. Subclasses Pi05TorchFrontendThor
-and overrides only the graph-capture method to route encoder forward through
-shared_primitives_fp4.encoder_forward_with_fp4_subset when FP4 is enabled.
+STRICTLY ADDITIVE. Does not modify pi05_thor.py. Subclasses
+Pi05TorchFrontendThor and routes explicitly selected encoder and decoder
+projections through the NVFP4 extension.
 
 Usage:
     pipe = Pi05TorchFrontendThorFP4(
         "/path/to/checkpoint",
         num_views=2,
         use_fp4_encoder_ffn=True,    # default False → bit-identical to base
+        use_fp4_decoder=True,        # all four action-expert projections
         fp4_layers=(7, 8, 9),         # precision-safe middle encoder FFN
     )
     pipe.set_prompt("pick up the red cup")
@@ -24,7 +25,7 @@ import torch
 import flash_rt.flash_rt_kernels as fvk
 from flash_rt.frontends.torch.pi05_thor import Pi05TorchFrontendThor
 from flash_rt.hardware.thor.shared_primitives import encoder_forward
-from flash_rt.models.pi05.pipeline_thor import decoder_forward
+from flash_rt.models.pi05.pipeline_thor import decoder_forward, decoder_forward_fp4
 from flash_rt.hardware.thor.shared_primitives_fp4 import encoder_forward_with_fp4_subset
 from flash_rt.executors.fp4_utils import (
     FP4ActScratch, pick_variant, quant_weight_nvfp4, quant_weight_nvfp4_inplace,
@@ -42,12 +43,13 @@ fp16 = torch.float16
 
 
 class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
-    """Pi0.5 Thor frontend with optional NVFP4 encoder-FFN layers."""
+    """Pi0.5 Thor frontend with optional NVFP4 encoder and decoder paths."""
 
     def __init__(self, checkpoint_dir, num_views: int = 2,
                  use_cuda_graph: bool = True, autotune: int = 3,
                  *,
                  use_fp4_encoder_ffn: bool = False,
+                 use_fp4_decoder: bool = False,
                  fp4_layers: Iterable[int] = (7, 8, 9),
                  use_awq: bool = False,
                  awq_alpha: float = 0.5,
@@ -56,6 +58,9 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                  use_fp8: bool = True,
                  state_prompt_mode: str = "exact",
                  state_prompt_fixed_max_len=None):
+        if use_fp4_decoder and not use_fp8:
+            raise ValueError(
+                "use_fp4_decoder=True requires the FP8 Thor encoder path")
         # Base init (loads weights, allocates all FP8 buffers, etc.)
         super().__init__(checkpoint_dir, num_views=num_views,
                          use_cuda_graph=use_cuda_graph, autotune=autotune,
@@ -64,6 +69,7 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                          state_prompt_fixed_max_len=state_prompt_fixed_max_len)
 
         self.use_fp4_encoder_ffn = bool(use_fp4_encoder_ffn)
+        self.use_fp4_decoder = bool(use_fp4_decoder)
         self._fp4_layers = frozenset(fp4_layers) if self.use_fp4_encoder_ffn else frozenset()
         self.use_awq = bool(use_awq) and self.use_fp4_encoder_ffn
         self.awq_alpha = float(awq_alpha)
@@ -79,6 +85,81 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
             self._prepare_fp4_encoder()
             logger.info("Pi05 FP4 enabled on encoder layers: %s  (AWQ=%s)",
                         sorted(self._fp4_layers), self.use_awq)
+
+        if self.use_fp4_decoder:
+            if not _HAS_FP4:
+                raise RuntimeError(
+                    "use_fp4_decoder=True but flash_rt_fp4 is unavailable or "
+                    "was built without NVFP4 support")
+            device_name = torch.cuda.get_device_name(0)
+            capability = tuple(torch.cuda.get_device_capability(0))
+            if device_name != "NVIDIA Thor" or capability != (11, 0):
+                raise RuntimeError(
+                    "Pi0.5 decoder FP4 requires NVIDIA Thor SM110; got "
+                    f"{device_name} CC {capability}")
+
+            variants = (7, 7, 9, 7)
+            variant_count = int(fvk_fp4.cutlass_fp4_gemm_num_variants())
+            if max(variants) >= variant_count:
+                raise RuntimeError(
+                    "Pi0.5 decoder FP4 baseline variants "
+                    f"{variants} require at least 10 variants; extension has "
+                    f"{variant_count}")
+            self._decoder_fp4_variants = variants
+            self._decoder_fp4_weights = []
+
+            from safetensors import safe_open
+            from flash_rt.executors.torch_weights import (
+                _autodetect_strip_prefix,
+                _interleave_qk_core,
+            )
+            root = "paligemma_with_expert.gemma_expert.model.layers"
+            with safe_open(self._checkpoint_path, framework='pt', device='cuda') as sf:
+                strip = _autodetect_strip_prefix(set(sf.keys()))
+
+                def get(key):
+                    return sf.get_tensor((strip + key) if strip else key)
+
+                for layer in range(self.La):
+                    prefix = f"{root}.{layer}"
+                    q = _interleave_qk_core(
+                        get(f"{prefix}.self_attn.q_proj.weight").float(), 8)
+                    k = _interleave_qk_core(
+                        get(f"{prefix}.self_attn.k_proj.weight").float(), 1)
+                    v = get(f"{prefix}.self_attn.v_proj.weight").float()
+                    qkv = torch.cat([q, k, v], dim=0).to(fp16).contiguous()
+                    o = get(f"{prefix}.self_attn.o_proj.weight").to(
+                        fp16).contiguous()
+                    gate = get(f"{prefix}.mlp.gate_proj.weight").to(fp16)
+                    up = get(f"{prefix}.mlp.up_proj.weight").to(fp16)
+                    gate_up = torch.cat([gate, up], dim=0).contiguous()
+                    down = get(f"{prefix}.mlp.down_proj.weight").to(
+                        fp16).contiguous()
+                    actual = (qkv.shape, o.shape, gate_up.shape, down.shape)
+                    expected = (
+                        (2560, self.Da), (self.Da, 2048),
+                        (2 * self.Ha, self.Da), (self.Da, self.Ha),
+                    )
+                    if actual != expected:
+                        raise ValueError(
+                            f"decoder FP4 layer {layer} shapes {actual} != "
+                            f"{expected}")
+                    self._decoder_fp4_weights.append({
+                        'qkv': quant_weight_nvfp4(qkv),
+                        'o': quant_weight_nvfp4(o),
+                        'gate_up': quant_weight_nvfp4(gate_up),
+                        'down': quant_weight_nvfp4(down),
+                    })
+
+            self._decoder_fp4_xn = FP4ActScratch(
+                self.Sa, self.Da, device='cuda')
+            self._decoder_fp4_ctx = FP4ActScratch(
+                self.Sa, 2048, device='cuda')
+            self._decoder_fp4_hid = FP4ActScratch(
+                self.Sa, self.Ha, device='cuda')
+            logger.info(
+                "Pi0.5 decoder NVFP4 enabled: variants=%s, layers=%d",
+                self._decoder_fp4_variants, self.La)
 
     # -------------------------------------------------------------------
     # Calibration override — block multi-sample on active FP4 layers
@@ -262,15 +343,9 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
         # safetensors and apply FusedGateUp (gate/up concat with norm_fuse)
         # in fp16, then NVFP4-quantize directly. Bypasses the FP8 dequant step
         # and its double-lossy precision loss.
-        # Falls back to FP8→fp16 dequant if safetensors load fails.
         self._fp4_weights = {}
-        try:
-            self._load_fp4_weights_from_safetensors()
-            logger.info("FP4 weights loaded via fp16-native path (no FP8 intermediate)")
-        except Exception as e:
-            logger.warning("FP4-native weight load failed (%s); falling back to "
-                           "FP8→fp16 dequant path", e)
-            self._load_fp4_weights_from_fp8_dequant()
+        self._load_fp4_weights_from_safetensors()
+        logger.info("FP4 weights loaded via fp16-native path (no FP8 intermediate)")
 
         # Variant selection (empirically tuned @ Se=968, see Step B test).
         self._fp4_variant_gu = pick_variant(2 * He, De)
@@ -516,23 +591,6 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
         torch.cuda.empty_cache()
         return act_gu, act_dn
 
-    def _load_fp4_weights_from_fp8_dequant(self):
-        """Fallback path: dequant existing FP8 weights to fp16, then NVFP4.
-        Double-lossy but does not require safetensors re-read."""
-        De = self.De; He = self.He
-        scales = self._enc_w_scales  # list of 72 fp32 floats (q,o,gu,d * 18)
-        for l in self._fp4_layers:
-            gu_fp8 = self._enc_gu_w[l]
-            d_fp8  = self._enc_d_w[l]
-            gu_scale = float(scales[l * 4 + 2])
-            d_scale  = float(scales[l * 4 + 3])
-            gu_fp16 = (gu_fp8.view(torch.float8_e4m3fn).float() * gu_scale).to(fp16).contiguous()
-            d_fp16  = (d_fp8.view(torch.float8_e4m3fn).float()  * d_scale ).to(fp16).contiguous()
-            self._fp4_weights[l] = {
-                'gate_up': quant_weight_nvfp4(gu_fp16),
-                'down':    quant_weight_nvfp4(d_fp16),
-            }
-
     def _alloc_fp4_scratch_for_Se(self, Se: int):
         """Allocate/resize FP4 scratch buffers for current encoder seq length."""
         if self._fp4_scratch_Se == Se and self._fp4_scratch_dict is not None:
@@ -599,15 +657,14 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
     # Graph capture — reroute encoder forward when FP4 enabled
     # -------------------------------------------------------------------
     def _capture_enc_ae_graph(self):
-        if not self._fp4_layers:
+        if not self._fp4_layers and not self.use_fp4_decoder:
             # No FP4 → defer to base class (zero behaviour change)
             return super()._capture_enc_ae_graph()
 
-        # FP4 path — same capture logic as base, with encoder_forward swapped
-        # for encoder_forward_with_fp4_subset. Duplication is intentional
-        # (framework constraint: do not modify base class method).
+        # FP4 path. Duplication keeps the base production frontend unchanged.
         Se = self.Se
-        self._alloc_fp4_scratch_for_Se(Se)
+        if self._fp4_layers:
+            self._alloc_fp4_scratch_for_Se(Se)
         total_keys = self.total_keys
         Le = self.Le; De = self.De; He = self.He
         NHe = self.NHe; HDe = self.HDe
@@ -658,6 +715,15 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
             'hid_fp8': self._ae_hid_fp8.data_ptr(),
             'ctx_fp8': self._ae_ctx_fp8.data_ptr(),
         }
+        if self.use_fp4_decoder:
+            ae_bufs.update({
+                'xn_fp4': self._decoder_fp4_xn.packed.data_ptr(),
+                'xn_sfa': self._decoder_fp4_xn.sfa.data_ptr(),
+                'ctx_fp4': self._decoder_fp4_ctx.packed.data_ptr(),
+                'ctx_sfa': self._decoder_fp4_ctx.sfa.data_ptr(),
+                'hid_fp4': self._decoder_fp4_hid.packed.data_ptr(),
+                'hid_sfa': self._decoder_fp4_hid.sfa.data_ptr(),
+            })
         ae_weights = {
             'ain_w':      self._ain_w.data_ptr(),
             'ain_b':      self._ain_b.data_ptr(),
@@ -679,28 +745,59 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
             'w_scales':   self._ae_w_dev.data_ptr(),
             'act_scales': self._ae_calib_scales.data_ptr(),
         }
+        if self.use_fp4_decoder:
+            ae_weights.update({
+                'qw_fp4': [w['qkv']['packed'].data_ptr()
+                           for w in self._decoder_fp4_weights],
+                'qw_sfb': [w['qkv']['sfb'].data_ptr()
+                           for w in self._decoder_fp4_weights],
+                'ow_fp4': [w['o']['packed'].data_ptr()
+                           for w in self._decoder_fp4_weights],
+                'ow_sfb': [w['o']['sfb'].data_ptr()
+                           for w in self._decoder_fp4_weights],
+                'gw_fp4': [w['gate_up']['packed'].data_ptr()
+                           for w in self._decoder_fp4_weights],
+                'gw_sfb': [w['gate_up']['sfb'].data_ptr()
+                           for w in self._decoder_fp4_weights],
+                'dw_fp4': [w['down']['packed'].data_ptr()
+                           for w in self._decoder_fp4_weights],
+                'dw_sfb': [w['down']['sfb'].data_ptr()
+                           for w in self._decoder_fp4_weights],
+            })
         ae_dims = {
             'S': Sa, 'D': Da, 'H': Ha, 'NH': 8, 'HD': 256,
             'steps': 10, 'layers': La, 'enc_seq': Se,
             'total_keys': total_keys,
             'fixed_shape': self._fixed_shape_active,
         }
+        if self.use_fp4_decoder:
+            ae_dims['fp4_variants'] = self._decoder_fp4_variants
 
         fp4_layers = self._fp4_layers
-        fp4_weights = self._fp4_weights
-        fp4_scratch = self._fp4_scratch_dict
+        fp4_weights = self._fp4_weights if fp4_layers else None
+        fp4_scratch = self._fp4_scratch_dict if fp4_layers else None
 
         # Warmup
         for _ in range(3):
             self._Kc.zero_(); self._Vc.zero_()
-            encoder_forward_with_fp4_subset(
-                self._gemm, fvk, fvk_fp4, enc_bufs, enc_weights, enc_dims,
-                stream=0, attn=self._attn,
-                fp4_layers=fp4_layers, fp4_weights=fp4_weights,
-                fp4_scratch=fp4_scratch,
-                use_p1_split_gu=self.use_p1_split_gu)
-            decoder_forward(self._ctx, fvk, ae_bufs, ae_weights,
-                            ae_dims, stream=0, attn=self._attn)
+            if fp4_layers:
+                encoder_forward_with_fp4_subset(
+                    self._gemm, fvk, fvk_fp4, enc_bufs, enc_weights, enc_dims,
+                    stream=0, attn=self._attn,
+                    fp4_layers=fp4_layers, fp4_weights=fp4_weights,
+                    fp4_scratch=fp4_scratch,
+                    use_p1_split_gu=self.use_p1_split_gu)
+            else:
+                encoder_forward(
+                    self._gemm, fvk, enc_bufs, enc_weights, enc_dims,
+                    stream=0, attn=self._attn, use_fp8=self.use_fp8)
+            if self.use_fp4_decoder:
+                decoder_forward_fp4(
+                    self._ctx, fvk, fvk_fp4, ae_bufs, ae_weights,
+                    ae_dims, stream=0, attn=self._attn)
+            else:
+                decoder_forward(self._ctx, fvk, ae_bufs, ae_weights,
+                                ae_dims, stream=0, attn=self._attn)
         torch.cuda.synchronize()
 
         # Capture
@@ -710,15 +807,57 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
         with torch.cuda.stream(stream):
             self._enc_ae_graph.capture_begin()
             self._Kc.zero_(); self._Vc.zero_()
-            encoder_forward_with_fp4_subset(
-                self._gemm, fvk, fvk_fp4, enc_bufs, enc_weights, enc_dims,
-                stream=s_int, attn=self._attn,
-                fp4_layers=fp4_layers, fp4_weights=fp4_weights,
-                fp4_scratch=fp4_scratch,
-                use_p1_split_gu=self.use_p1_split_gu)
-            decoder_forward(self._ctx, fvk, ae_bufs, ae_weights,
-                            ae_dims, stream=s_int, attn=self._attn)
+            if fp4_layers:
+                encoder_forward_with_fp4_subset(
+                    self._gemm, fvk, fvk_fp4, enc_bufs, enc_weights, enc_dims,
+                    stream=s_int, attn=self._attn,
+                    fp4_layers=fp4_layers, fp4_weights=fp4_weights,
+                    fp4_scratch=fp4_scratch,
+                    use_p1_split_gu=self.use_p1_split_gu)
+            else:
+                encoder_forward(
+                    self._gemm, fvk, enc_bufs, enc_weights, enc_dims,
+                    stream=s_int, attn=self._attn, use_fp8=self.use_fp8)
+            if self.use_fp4_decoder:
+                decoder_forward_fp4(
+                    self._ctx, fvk, fvk_fp4, ae_bufs, ae_weights,
+                    ae_dims, stream=s_int, attn=self._attn)
+            else:
+                decoder_forward(self._ctx, fvk, ae_bufs, ae_weights,
+                                ae_dims, stream=s_int, attn=self._attn)
             self._enc_ae_graph.capture_end()
         torch.cuda.synchronize()
-        logger.info("Enc+AE CUDA graph captured with FP4 layers=%s P1=%s (Se=%d)",
-                    sorted(self._fp4_layers), self.use_p1_split_gu, Se)
+        self._model_runtime_full_graph = None
+        self._model_runtime_context_graph = None
+        self._model_runtime_decode_only_graph = None
+        self._model_runtime_rtc_prefix_graphs = {}
+        self.pipeline._decoder_only_graph = None
+        logger.info(
+            "Enc+AE CUDA graph captured with encoder FP4 layers=%s, "
+            "decoder FP4=%s, P1=%s (Se=%d)",
+            sorted(self._fp4_layers), self.use_fp4_decoder,
+            self.use_p1_split_gu, Se)
+
+    def set_rl_mode(self, *, cfg_enable: bool = True, cfg_beta: float = 1.5,
+                    advantage_positive: bool = True) -> None:
+        if self.use_fp4_decoder and cfg_enable:
+            raise RuntimeError(
+                "Pi0.5 decoder FP4 currently supports standard B=1 inference "
+                "only; CFG is not implemented")
+        return super().set_rl_mode(
+            cfg_enable=cfg_enable, cfg_beta=cfg_beta,
+            advantage_positive=advantage_positive)
+
+    def set_batched_mode(self, *, enable: bool = True,
+                         batch_size: int = 2) -> None:
+        if self.use_fp4_decoder and enable:
+            raise RuntimeError(
+                "Pi0.5 decoder FP4 currently supports standard B=1 inference "
+                "only; batched inference is not implemented")
+        return super().set_batched_mode(enable=enable, batch_size=batch_size)
+
+    def _ensure_model_runtime_export(self) -> None:
+        if self.use_fp4_decoder:
+            raise RuntimeError(
+                "Pi0.5 decoder FP4 model-runtime export is not implemented")
+        return super()._ensure_model_runtime_export()

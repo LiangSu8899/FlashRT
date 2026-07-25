@@ -296,6 +296,61 @@ reshape_linear_scales_to_sfa, in a single kernel launch.
         py::arg("seq_len"), py::arg("dim"), py::arg("stream") = 0,
         "F3: fused residual+rms_norm + fp4_quant + SFA write.");
 
+  m.def("pi05_adarms_fp4_sfa_fp16",
+        [](uintptr_t x, uintptr_t style, uintptr_t packed, uintptr_t sfa,
+           uintptr_t gate, int seq_len, int dim, uintptr_t stream) {
+          const auto shape = fp4_kernel_shape(
+              {{"seq_len", seq_len}, {"dim", dim}});
+          require_fp4_ptrs("pi05_adarms_fp4_sfa_fp16",
+                           {{"x", x}, {"style", style}, {"packed", packed},
+                            {"sfa", sfa}, {"gate", gate}}, shape);
+          require_fp4(seq_len == 10 && dim == 1024,
+                      "pi05_adarms_fp4_sfa_fp16",
+                      "the Pi0.5 decoder business shape is seq_len=10, dim=1024",
+                      shape);
+          flash_rt::fused_fp4::pi05_adarms_fp4_sfa_fp16(
+              reinterpret_cast<const __half*>(x),
+              reinterpret_cast<const __half*>(style),
+              reinterpret_cast<uint8_t*>(packed),
+              reinterpret_cast<uint8_t*>(sfa),
+              reinterpret_cast<__half*>(gate), seq_len, dim,
+              reinterpret_cast<cudaStream_t>(stream));
+        },
+        py::arg("x"), py::arg("style"), py::arg("packed"), py::arg("sfa"),
+        py::arg("gate"), py::arg("seq_len"), py::arg("dim"),
+        py::arg("stream") = 0,
+        "Pi0.5 AdaRMSNorm(style) to NVFP4 SFA plus fp16 gate.");
+
+  m.def("pi05_gate_res_adarms_fp4_sfa_fp16",
+        [](uintptr_t x, uintptr_t prev_gate, uintptr_t residual,
+           uintptr_t style, uintptr_t packed, uintptr_t sfa, uintptr_t gate,
+           int seq_len, int dim, uintptr_t stream) {
+          const auto shape = fp4_kernel_shape(
+              {{"seq_len", seq_len}, {"dim", dim}});
+          require_fp4_ptrs("pi05_gate_res_adarms_fp4_sfa_fp16",
+                           {{"x", x}, {"prev_gate", prev_gate},
+                            {"residual", residual}, {"style", style},
+                            {"packed", packed}, {"sfa", sfa}, {"gate", gate}},
+                           shape);
+          require_fp4(seq_len == 10 && dim == 1024,
+                      "pi05_gate_res_adarms_fp4_sfa_fp16",
+                      "the Pi0.5 decoder business shape is seq_len=10, dim=1024",
+                      shape);
+          flash_rt::fused_fp4::pi05_gate_res_adarms_fp4_sfa_fp16(
+              reinterpret_cast<const __half*>(x),
+              reinterpret_cast<const __half*>(prev_gate),
+              reinterpret_cast<__half*>(residual),
+              reinterpret_cast<const __half*>(style),
+              reinterpret_cast<uint8_t*>(packed),
+              reinterpret_cast<uint8_t*>(sfa),
+              reinterpret_cast<__half*>(gate), seq_len, dim,
+              reinterpret_cast<cudaStream_t>(stream));
+        },
+        py::arg("x"), py::arg("prev_gate"), py::arg("residual"),
+        py::arg("style"), py::arg("packed"), py::arg("sfa"), py::arg("gate"),
+        py::arg("seq_len"), py::arg("dim"), py::arg("stream") = 0,
+        "Pi0.5 gated residual + AdaRMSNorm to NVFP4 SFA plus next fp16 gate.");
+
 #ifdef FLASHRT_HAVE_COSMOS3_EDGE
   // Cosmos3-Edge model-specific fused FP4 quant kernels (bf16 residual chain).
   m.def("cosmos3_edge_res_rms_fp4_sfa_bf16",

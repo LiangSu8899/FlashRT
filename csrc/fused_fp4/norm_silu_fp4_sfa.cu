@@ -86,6 +86,131 @@ __device__ __forceinline__ void quant_block_from_smem(
     }
 }
 
+// Pi0.5 action-expert decoder AdaRMSNorm followed by NVFP4 activation
+// quantization. The normalized value is rounded to fp16 before block
+// quantization, matching an explicit fp16 -> FP4 path.
+template <class LayoutSF>
+__global__ void pi05_adarms_fp4_sfa_kernel(
+    const __half* __restrict__ x,
+    const __half* __restrict__ style,
+    uint8_t* __restrict__ packed,
+    uint8_t* __restrict__ dst_sfa,
+    __half* __restrict__ gate,
+    LayoutSF layout,
+    int D) {
+    const int r = blockIdx.x;
+    const __half* row = x + r * D;
+    const __half* sc = style + r * 3 * D;
+    const __half* sh = sc + D;
+    const __half* gt = sh + D;
+    uint8_t* packed_row = packed + r * (D / 2);
+
+    float sum_sq = 0.f;
+    for (int i = threadIdx.x; i < D; i += blockDim.x) {
+        const float v = __half2float(row[i]);
+        sum_sq += v * v;
+    }
+
+    __shared__ float reduction[8];
+    const int lane = threadIdx.x % 32;
+    const int warp = threadIdx.x / 32;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum_sq += __shfl_xor_sync(0xffffffff, sum_sq, offset);
+    }
+    if (lane == 0) reduction[warp] = sum_sq;
+    __syncthreads();
+    if (warp == 0) {
+        sum_sq = lane < 8 ? reduction[lane] : 0.f;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sum_sq += __shfl_xor_sync(0xffffffff, sum_sq, offset);
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) reduction[0] = sum_sq;
+    __syncthreads();
+
+    extern __shared__ __half smem_normed[];
+    const float rstd = rsqrtf(reduction[0] / D + 1e-6f);
+    for (int i = threadIdx.x; i < D; i += blockDim.x) {
+        const float normed = __half2float(row[i]) * rstd *
+            (1.f + __half2float(sc[i])) + __half2float(sh[i]);
+        smem_normed[i] = __float2half(normed);
+        gate[r * D + i] = gt[i];
+    }
+    __syncthreads();
+
+    const int n_blocks = D / 16;
+    for (int b = threadIdx.x; b < n_blocks; b += blockDim.x) {
+        quant_block_from_smem(
+            smem_normed, packed_row, dst_sfa, layout, r, b);
+    }
+}
+
+// Preserve the production fused kernel ordering: accumulate the unrounded
+// fp32 residual value for RMS, store the residual as fp16, then read that fp16
+// value for normalization and FP4 quantization.
+template <class LayoutSF>
+__global__ void pi05_gate_res_adarms_fp4_sfa_kernel(
+    const __half* __restrict__ x,
+    const __half* prev_gate,
+    __half* __restrict__ residual,
+    const __half* __restrict__ style,
+    uint8_t* __restrict__ packed,
+    uint8_t* __restrict__ dst_sfa,
+    __half* gate,
+    LayoutSF layout,
+    int D) {
+    const int r = blockIdx.x;
+    const __half* sc = style + r * 3 * D;
+    const __half* sh = sc + D;
+    const __half* gt = sh + D;
+    uint8_t* packed_row = packed + r * (D / 2);
+
+    float sum_sq = 0.f;
+    for (int i = threadIdx.x; i < D; i += blockDim.x) {
+        const int elem = r * D + i;
+        const float res = __half2float(residual[elem]) +
+            __half2float(x[elem]) * __half2float(prev_gate[elem]);
+        residual[elem] = __float2half(res);
+        sum_sq += res * res;
+    }
+
+    __shared__ float reduction[8];
+    const int lane = threadIdx.x % 32;
+    const int warp = threadIdx.x / 32;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum_sq += __shfl_xor_sync(0xffffffff, sum_sq, offset);
+    }
+    if (lane == 0) reduction[warp] = sum_sq;
+    __syncthreads();
+    if (warp == 0) {
+        sum_sq = lane < 8 ? reduction[lane] : 0.f;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sum_sq += __shfl_xor_sync(0xffffffff, sum_sq, offset);
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) reduction[0] = sum_sq;
+    __syncthreads();
+
+    extern __shared__ __half smem_normed[];
+    const float rstd = rsqrtf(reduction[0] / D + 1e-6f);
+    for (int i = threadIdx.x; i < D; i += blockDim.x) {
+        const int elem = r * D + i;
+        const float normed = __half2float(residual[elem]) * rstd *
+            (1.f + __half2float(sc[i])) + __half2float(sh[i]);
+        smem_normed[i] = __float2half(normed);
+        gate[elem] = gt[i];
+    }
+    __syncthreads();
+
+    const int n_blocks = D / 16;
+    for (int b = threadIdx.x; b < n_blocks; b += blockDim.x) {
+        quant_block_from_smem(
+            smem_normed, packed_row, dst_sfa, layout, r, b);
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────
 // F2: rms_norm(x) → fp4 + SFA
 // Grid: (S,)  Block: 256  Shared: D * sizeof(__half)
@@ -301,6 +426,38 @@ void residual_add_rms_norm_fp4_sfa_fp16(
         residual, x, packed, sfa, layout, dim);
 #else
     (void)residual; (void)x; (void)packed; (void)sfa;
+    (void)seq_len; (void)dim; (void)stream;
+#endif
+}
+
+void pi05_adarms_fp4_sfa_fp16(
+    const __half* x, const __half* style,
+    uint8_t* packed, uint8_t* sfa, __half* gate,
+    int seq_len, int dim, cudaStream_t stream) {
+#if FV_HAVE_CUTLASS
+    auto shape = cute::make_shape(seq_len, 1, dim, 1);
+    auto layout = Cfg::tile_atom_to_shape_SFA(shape);
+    pi05_adarms_fp4_sfa_kernel<<<seq_len, 256, dim * sizeof(__half), stream>>>(
+        x, style, packed, sfa, gate, layout, dim);
+#else
+    (void)x; (void)style; (void)packed; (void)sfa; (void)gate;
+    (void)seq_len; (void)dim; (void)stream;
+#endif
+}
+
+void pi05_gate_res_adarms_fp4_sfa_fp16(
+    const __half* x, const __half* prev_gate, __half* residual,
+    const __half* style, uint8_t* packed, uint8_t* sfa, __half* gate,
+    int seq_len, int dim, cudaStream_t stream) {
+#if FV_HAVE_CUTLASS
+    auto shape = cute::make_shape(seq_len, 1, dim, 1);
+    auto layout = Cfg::tile_atom_to_shape_SFA(shape);
+    pi05_gate_res_adarms_fp4_sfa_kernel<<<
+        seq_len, 256, dim * sizeof(__half), stream>>>(
+            x, prev_gate, residual, style, packed, sfa, gate, layout, dim);
+#else
+    (void)x; (void)prev_gate; (void)residual; (void)style;
+    (void)packed; (void)sfa; (void)gate;
     (void)seq_len; (void)dim; (void)stream;
 #endif
 }
