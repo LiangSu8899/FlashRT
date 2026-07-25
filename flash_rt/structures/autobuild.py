@@ -24,6 +24,7 @@ pack takes the shared act scale, skipping its own input quantization.
 
 from __future__ import annotations
 
+import itertools
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -111,9 +112,19 @@ def auto_swaps(
             return None
         return hook
 
+    # observed call order across the whole calibration pass. Anything
+    # that has to know which seam runs first (a stream-scoped buffer
+    # needs a writer, and the writer has to be the one the host calls
+    # first) reads it from here rather than assuming the module tree's
+    # order matches the forward's.
+    call_order = itertools.count()
+
     def cap_cond(path):
         def hook(module, args, out):
-            caps[path].setdefault("pairs", []).append(
+            cap = caps[path]
+            if "order" not in cap:
+                cap["order"] = next(call_order)
+            cap.setdefault("pairs", []).append(
                 (args[0].detach().clone(), out.detach().clone()))
             return None
         return hook
@@ -286,6 +297,16 @@ def auto_swaps(
                 if hasattr(adapter, "__name__") else str(adapter)
             break
 
+    # ---- one step-scoped style materialisation per conditioning stream
+    # Every adaptive-norm producer on one stream resolves the same step,
+    # so the whole stream's styles are fixed for the step's duration.
+    # Materialising them once beats materialising them per call by the
+    # launch count, which is what that work actually costs. Runs before
+    # the block assembly: a block holds its producers directly and drops
+    # them from the swap map, so afterwards they are no longer findable
+    # here.
+    _attach_brokers(caps, plan, say)
+
     # ---- decoder_block: compose the bound sublayers into one block ----
     # last, because it is assembled from what the region structures
     # produced. The swaps it absorbs are dropped from the plan: the
@@ -307,6 +328,43 @@ def auto_swaps(
     say(f"bound {len(plan.swaps)} seam(s), "
         f"{len(plan.notes.get('refused', []))} refused")
     return plan
+
+
+def _attach_brokers(caps, plan, say) -> None:
+    from .impls.adaln_producer import AdaLNProducer, bind_style_broker
+
+    groups: dict[tuple, list] = {}
+    for path, module in plan.swaps.items():
+        if not isinstance(module, AdaLNProducer):
+            continue
+        cap = caps.get(path, {})
+        order = cap.get("order")
+        if order is None or not cap.get("pairs"):
+            continue
+        # one broker per (stream, style width, row count): producers
+        # that differ in any of those cannot share a buffer
+        key = (_stream_key(cap["pairs"]), int(module.styles.shape[-1]),
+               int(module.resid.shape[0]))
+        groups.setdefault(key, []).append((order, path, module))
+
+    for key, members in groups.items():
+        # the writer is the producer the host calls first, taken from the
+        # observed order of the calibration pass — not from the module
+        # tree's order, which need not match the forward's
+        members.sort(key=lambda entry: entry[0])
+        try:
+            broker = bind_style_broker([m for _, _, m in members], key[2])
+        except (ValueError, RuntimeError) as refusal:
+            plan.notes.setdefault("refused", []).append(
+                (f"style_broker[{key[1]}x{key[2]}]", str(refusal)[:80]))
+            continue
+        if broker is None:
+            continue
+        plan.notes.setdefault("brokers", []).append(
+            {"slots": broker.slots, "rows": key[2], "width": key[1],
+             "writer": members[0][1]})
+        say(f"style broker: {broker.slots} producer(s) share one "
+            f"step-scoped materialisation (writer {members[0][1]})")
 
 
 _BLOCK_OWNED = ("input_layernorm", "post_attention_layernorm", "mlp")
