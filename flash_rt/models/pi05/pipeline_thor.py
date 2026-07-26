@@ -394,8 +394,11 @@ def decoder_forward_fp4(ctx, fvk, fvk_fp4, bufs, weights, dims, stream=0, *,
                 raise RuntimeError(
                     f"Pi0.5 decoder FP4 gate_up layer {l} failed rc={rc}")
 
-            fvk_fp4.gate_geglu_fp4_sfa_v2_fp16(
+            rc = fvk_fp4.gate_geglu_fp4_sfa_vec_fp16(
                 fg, hid_fp4, hid_sfa, S, H, stream)
+            if rc != 0:
+                raise RuntimeError(
+                    f"Pi0.5 decoder FP4 GeGLU layer {l} failed rc={rc}")
             rc = fvk_fp4.cutlass_fp4_gemm_variant(
                 variant_down, hid_fp4, hid_sfa,
                 weights['dw_fp4'][l], weights['dw_sfb'][l], fg,

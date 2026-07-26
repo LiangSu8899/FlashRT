@@ -75,6 +75,14 @@ void gate_silu_mul_fp4_sfa_v2_fp16(
     const __half* merged, uint8_t* packed, uint8_t* sfa,
     int seq_len, int half_dim, cudaStream_t stream);
 
+// Vectorized bit-exact variant of gate_silu_mul_fp4_sfa_v2_fp16 (16B loads,
+// 8B packed stores). Returns nonzero without launching on unaligned
+// buffers; callers fall back to the v2 kernel. Implemented in
+// silu_mul_fp4_sfa_vec.cu.
+int gate_silu_mul_fp4_sfa_vec_fp16(
+    const __half* merged, uint8_t* packed, uint8_t* sfa,
+    int seq_len, int half_dim, cudaStream_t stream);
+
 // F3 + AWQ multiply: residual_add + rms_norm + per-channel inv_s multiply +
 // fp4 quant + SFA write — all in one kernel. Used by the AWQ frontend path
 // to avoid the extra per_channel_mul + unfused quant launches.

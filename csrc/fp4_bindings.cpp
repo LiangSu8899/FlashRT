@@ -506,6 +506,21 @@ callers fall back to the scalar kernel.
         py::arg("seq_len"), py::arg("half_dim"), py::arg("stream") = 0,
         "F4 v2 (register-only, no smem): same semantics as v1, faster at H=8192.");
 
+  m.def("gate_geglu_fp4_sfa_vec_fp16",
+        [](uintptr_t merged, uintptr_t packed, uintptr_t sfa,
+           int seq_len, int half_dim, uintptr_t stream) -> int {
+          return flash_rt::fused_fp4::gate_silu_mul_fp4_sfa_vec_fp16(
+              reinterpret_cast<const __half*>(merged),
+              reinterpret_cast<uint8_t*>(packed),
+              reinterpret_cast<uint8_t*>(sfa),
+              seq_len, half_dim,
+              reinterpret_cast<cudaStream_t>(stream));
+        },
+        py::arg("merged"), py::arg("packed"), py::arg("sfa"),
+        py::arg("seq_len"), py::arg("half_dim"), py::arg("stream") = 0,
+        "Vectorized bit-exact variant of gate_geglu_fp4_sfa_v2_fp16; "
+        "returns nonzero on unaligned buffers without launching.");
+
   // ── AWQ fused: F3 + per-channel-mul ──
   m.def("residual_add_rms_norm_mul_fp4_sfa_fp16",
         [](uintptr_t residual, uintptr_t x, uintptr_t inv_s,
