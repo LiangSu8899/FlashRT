@@ -69,7 +69,7 @@ class GemmaAttentionAdapter:
             return None      # head_dim unsupported → host keeps its path
         cores, prefix_update = bound
         seq_q = recs["q"].shape[2]
-        expert = _expert_layers(model)
+        expert, expert_path = _expert_layers_at(model)
         for i, layer in enumerate(expert):
             layer.self_attn._fa2_core = cores[i]
 
@@ -92,13 +92,61 @@ class GemmaAttentionAdapter:
 
         mg.eager_attention_forward = fa2_fn
         self._seq_q = seq_q
+
+        def enable() -> None:
+            mg.eager_attention_forward = fa2_fn
+
+        def disable() -> None:
+            """Route attention back to the host without unbinding.
+
+            The gate needs a baseline arm that is the host, and this seam
+            is the one that cannot be turned off by restoring a module:
+            it is a patched function, so it stays live through
+            ``detach()`` of every swap around it. Without a toggle the
+            "off" arm would still be running this kernel and the net-win
+            measurement would be comparing the attachment against itself.
+            The bound cores stay where they are — the patch is what
+            routes to them, and rebuilding them per arm would recapture.
+            """
+            if mg.eager_attention_forward is fa2_fn:
+                mg.eager_attention_forward = orig
+
+        def revert() -> None:
+            """Undo everything this adapter did to the host and to
+            ``transformers``.
+
+            The patch above is a module-level rebinding, so without this
+            it outlives the attachment: ``handle.detach()`` would restore
+            every swapped module and leave the attention seam patched, and
+            the promise that detaching gives back the original model would
+            be false for the one seam that is not a module. The core
+            attributes go too — a core still hanging off the host would
+            keep the routed path reachable and keep reporting itself as
+            live.
+            """
+            if mg.eager_attention_forward is fa2_fn:
+                mg.eager_attention_forward = orig
+            for layer in expert or ():
+                if getattr(layer.self_attn, "_fa2_core", None) is not None:
+                    del layer.self_attn._fa2_core
+
         # the swap map is empty (the seam is a function, not a module);
-        # the patch and the per-layer core buffers are the swap.
+        # the patch and the per-layer core buffers are the swap. They are
+        # handed back as ``observed`` so the cores still appear in the
+        # attachment's ledger: a seam that cannot be swapped at a path can
+        # still be counted, and "the shape guard sent every call to the
+        # host" has to be visible somewhere. The shape check inside
+        # ``fa2_fn`` deliberately keeps no counter of its own (that is a
+        # graph break per attention call); it shows up instead as a core
+        # whose own call count stayed at zero.
         # note: no extra host forward is run to self-verify — replaying
         # the host mutates its state (cache growth, guard shapes) and
         # that changes what the stage then captures. The recording pass
         # above already proves the seam is live in this host.
-        return {}, None
+        observed = {f"{expert_path}.{i}.self_attn::fa2_core": core
+                    for i, core in enumerate(cores)}
+        return {}, None, {"revert": [revert], "observed": observed,
+                          "toggle": (enable, disable)}
 
     def sublayer(self, layer):
         """An attention sublayer for one host block, or ``None``.
@@ -126,6 +174,16 @@ def _infer_layers(model) -> int:
 def _expert_layers(model):
     """Find the denoise decoder layers under either the model or a
     policy wrapper — callers hand us whichever root they hold."""
+    return _expert_layers_at(model)[0]
+
+
+def _expert_layers_at(model) -> tuple[object, str]:
+    """The denoise decoder layers and the dotted path they were found at.
+
+    The path matters to the receipt: this adapter's seam is a patched
+    function rather than a swapped module, so the only way it can be named
+    in a report is by the layers it attached its cores to.
+    """
     for path in ("paligemma_with_expert.gemma_expert.model.layers",
                  "model.paligemma_with_expert.gemma_expert.model.layers"):
         node = model
@@ -134,5 +192,5 @@ def _expert_layers(model):
             if node is None:
                 break
         else:
-            return node
-    return None
+            return node, path
+    return None, ""

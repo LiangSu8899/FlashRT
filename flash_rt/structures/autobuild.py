@@ -59,6 +59,36 @@ class AutoPlan:
     updates: list[Callable[[], None]] = field(default_factory=list)
     seams: list[Seam] = field(default_factory=list)
     notes: dict[str, Any] = field(default_factory=dict)
+    #: modules that carry a guard but are not swapped at a path — an
+    #: adapter's routed seam. Reported by the attachment's ledger, never
+    #: installed by it, so a seam that cannot be swapped can still be
+    #: counted instead of being invisible.
+    observed: dict[str, torch.nn.Module] = field(default_factory=dict)
+    #: undo callables for host mutations that had to happen while the plan
+    #: was being built rather than when it was attached (a patched
+    #: module-level function). Handed to ``attach`` so ``detach`` really
+    #: does give back the model that came in.
+    revert: list[Callable[[], None]] = field(default_factory=list)
+    #: ``(enable, disable)`` pairs for those same non-module seams, so a
+    #: gate can put the host back for the baseline arm without unbinding
+    #: anything. A seam that cannot be turned off cannot be measured.
+    toggles: list[tuple[Callable[[], None], Callable[[], None]]] = field(
+        default_factory=list)
+
+    def enable_routed(self) -> None:
+        for on, _ in self.toggles:
+            on()
+
+    def disable_routed(self) -> None:
+        for _, off in self.toggles:
+            off()
+
+    def revert_all(self) -> None:
+        """Undo the plan-time host mutations. Idempotent per adapter."""
+        for undo in reversed(self.revert):
+            undo()
+        self.revert.clear()
+        self.observed.clear()
 
 
 def _amax(cap) -> float:
@@ -217,11 +247,19 @@ def auto_swaps(
                 cap_input(seam.path), with_kwargs=True))
 
     if hooks:
-        with torch.no_grad():
-            for thunk in thunks:
-                thunk()
-        for h in hooks:
-            h.remove()
+        # the calibration pass is a transaction over the host: if a thunk
+        # raises, the hooks come off and no plan is returned. Removing
+        # them only on the success path leaves a failed calibration's
+        # hooks on the model, where they keep firing into a dict nobody
+        # reads and slow down every later forward for reasons that are
+        # nowhere in sight.
+        try:
+            with torch.no_grad():
+                for thunk in thunks:
+                    thunk()
+        finally:
+            for h in hooks:
+                h.remove()
         plan_notes_calibration = {
             "frames": len(thunks), "source": source,
             "stat": "amax", "keep_samples": hold,
@@ -357,8 +395,16 @@ def auto_swaps(
                 continue
             if result is None:
                 continue
-            att_swaps, update = result
+            # an adapter may hand back a third element for the parts of
+            # its seam that are not modules at paths: how to undo them,
+            # and what to report
+            att_swaps, update = result[0], result[1]
+            extras = result[2] if len(result) > 2 else {}
             plan.swaps.update(att_swaps)
+            plan.observed.update(extras.get("observed", {}))
+            plan.revert.extend(extras.get("revert", ()))
+            if extras.get("toggle") is not None:
+                plan.toggles.append(extras["toggle"])
             if update is not None:
                 plan.updates.append(update)
             plan.notes["attention_adapter"] = type(adapter).__name__ \
@@ -392,6 +438,16 @@ def auto_swaps(
         for child in _BLOCK_OWNED:
             plan.swaps.pop(seam.path + "." + child, None)
         plan.swaps[seam.path] = block
+
+    # what discovery took on trust, for the seams that actually bound. An
+    # assumption that reaches the model without reaching the receipt is
+    # indistinguishable from something that was checked.
+    assumed = [(s.path, note) for s in seams if s.assumptions
+               and s.path in plan.swaps for note in s.assumptions]
+    if assumed:
+        plan.notes["assumed"] = assumed
+        say(f"{len(assumed)} seam(s) carry an assumption the parity gate "
+            f"has to check (see notes['assumed'])")
 
     if plan_notes_calibration:
         # the calibration method is part of the result, not a detail of
