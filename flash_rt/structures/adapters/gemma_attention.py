@@ -47,14 +47,6 @@ class GemmaAttentionAdapter:
             import transformers.models.gemma.modeling_gemma as mg
         except ImportError:
             return None
-        if not prefix_cadence:
-            raise ValueError(
-                "attention_core: this seam holds the attention prefix "
-                "across calls and is only correct while someone refreshes "
-                "it when the observation changes. Pass "
-                "prefix_cadence=True and call plan.updates on every new "
-                "observation, or leave it unbound — unbound is 0.9997 "
-                "output match on Pi0.5 against 0.9957 bound-and-stale")
         orig = mg.eager_attention_forward
 
         recs = {"q": None, "masks": [], "keys": [], "values": []}
@@ -77,6 +69,16 @@ class GemmaAttentionAdapter:
             mg.eager_attention_forward = orig
         if recs["q"] is None:
             return None      # host never called this seam — not our family
+        if not prefix_cadence:
+            # after the family check, not before it: a refusal recorded
+            # against a host that never had this seam is misinformation
+            raise ValueError(
+                "attention_core: this seam holds the attention prefix "
+                "across calls and is only correct while someone refreshes "
+                "it when the observation changes. Pass prefix_cadence=True "
+                "and call plan.updates on every new observation, or leave "
+                "it unbound — unbound measured 0.9997 output match on "
+                "Pi0.5 unseen frames against 0.9957 bound-and-stale")
 
         n_layers = _infer_layers(model)
         if n_layers == 0 or len(recs["keys"]) % n_layers != 0:
