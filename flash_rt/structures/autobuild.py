@@ -128,6 +128,7 @@ def auto_swaps(
                                    "linear_proj", "norm_fused",
                                    "attention_core", "decoder_block"),
     negotiate_fp8: bool = True,
+    prefix_cadence: bool = False,
     observations: Iterable[Any] | None = None,
     percentile: float = 99.9,
     max_samples: int | None = None,
@@ -152,6 +153,12 @@ def auto_swaps(
     difference from a frontend's ``calibrate``, and it exists because a
     host here is an arbitrary ``nn.Module`` with no common observation
     contract — not because the calibration standard differs.
+
+    ``prefix_cadence`` declares that the caller will run ``plan.updates``
+    whenever the observation changes. Structures that hold per-observation
+    host state — the attention core keeps the prefix keys and values — are
+    only offered when it is set, because without the refresh they attend to
+    whatever the calibration saw. Leaving it off is the accurate default.
 
     On ``percentile``: it reduces *across* samples. Within one sample the
     reduction is a max over every call, which is required rather than
@@ -311,9 +318,18 @@ def auto_swaps(
             # there. Inside a block the same kernel *replaces* the
             # host's gated residual add instead of adding to it, which
             # is the whole point of owning the block.
-            pairs = [("producer", "pack")]
-            if lay in blocks:
-                pairs.append(("producer_ffn", "ffn"))
+            # Both chains need the block boundary, and for the same
+            # reason: a negotiated producer emits FP8, and only a caller
+            # that owns the block consumes it. Bound at the norm boundary
+            # the *host* is the consumer, and the host expects its norm to
+            # return a compute dtype — handed FP8 it keeps going and the
+            # output is garbage (measured 0.24 output match, and NaN on a
+            # neighbouring configuration) with nothing to see, because
+            # every shape and dtype is inside its contract. The FFN chain
+            # was already gated this way; the attention chain was not.
+            if lay not in blocks:
+                continue
+            pairs = [("producer", "pack"), ("producer_ffn", "ffn")]
             keep = {}
             for p_slot, c_slot in pairs:
                 if p_slot not in g or c_slot not in g:
@@ -393,7 +409,8 @@ def auto_swaps(
                 # sample entry, where that callable takes a sample —
                 # the whole point of normalising the three ways in was
                 # that nothing downstream should see the difference
-                result = adapter(model, thunks[0])
+                result = adapter(model, thunks[0],
+                                 prefix_cadence=prefix_cadence)
             except (ValueError, RuntimeError) as refusal:
                 plan.notes.setdefault("refused", []).append(
                     ("attention_core", str(refusal)[:80]))

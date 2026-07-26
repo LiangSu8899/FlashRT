@@ -24,11 +24,37 @@ class GemmaAttentionAdapter:
 
     __name__ = "gemma_attention"
 
-    def __call__(self, model, forward):
+    def __call__(self, model, forward, *, prefix_cadence: bool = False):
+        """Wire the fa2 seam, or refuse when nobody will refresh its prefix.
+
+        This structure keeps the attention prefix — the vision and language
+        tokens — in a packed region and only rewrites the suffix per step.
+        That is correct within one observation, and it is what the bind-time
+        check proves: the prefix does not move across the denoise loop.
+
+        It is *not* correct across observations. A new image produces a new
+        prefix, and the packed region still holds the one calibration
+        captured, so the model attends to the wrong frame. Measured on
+        Pi0.5 over twelve unseen frames: output match 0.9957 with this seam
+        against 0.9997 without it, and max deviation 0.113 against 0.035.
+
+        The refresh exists (``bind_attention_core`` returns it) and the
+        tick pipeline drives it at the observation cadence. A caller that
+        cannot must not get this seam, so it is offered only when
+        ``prefix_cadence`` says the refresh will be called.
+        """
         try:
             import transformers.models.gemma.modeling_gemma as mg
         except ImportError:
             return None
+        if not prefix_cadence:
+            raise ValueError(
+                "attention_core: this seam holds the attention prefix "
+                "across calls and is only correct while someone refreshes "
+                "it when the observation changes. Pass "
+                "prefix_cadence=True and call plan.updates on every new "
+                "observation, or leave it unbound — unbound is 0.9997 "
+                "output match on Pi0.5 against 0.9957 bound-and-stale")
         orig = mg.eager_attention_forward
 
         recs = {"q": None, "masks": [], "keys": [], "values": []}
@@ -145,8 +171,10 @@ class GemmaAttentionAdapter:
         # above already proves the seam is live in this host.
         observed = {f"{expert_path}.{i}.self_attn::fa2_core": core
                     for i, core in enumerate(cores)}
-        return {}, None, {"revert": [revert], "observed": observed,
-                          "toggle": (enable, disable)}
+        # the refresh goes back to the caller. Discarding it was the whole
+        # defect: the prefix then had no way to follow the observation.
+        return {}, prefix_update, {"revert": [revert], "observed": observed,
+                                   "toggle": (enable, disable)}
 
     def sublayer(self, layer):
         """An attention sublayer for one host block, or ``None``.

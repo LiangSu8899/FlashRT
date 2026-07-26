@@ -268,6 +268,7 @@ def attach(
     *,
     structures: tuple[str, ...] = ALL_STRUCTURES,
     observations: Iterable[Any] | None = None,
+    prefix_cadence: bool = False,
     percentile: float = 99.9,
     max_samples: int | None = None,
     output: Callable[[], Any] | None = None,
@@ -319,7 +320,8 @@ def attach(
     # ---- bind: one path, the same one the plain call uses --------------
     plan = auto_swaps(model, forward, structures=structures,
                       observations=observations, percentile=percentile,
-                      max_samples=max_samples, verbose=verbose)
+                      max_samples=max_samples, prefix_cadence=prefix_cadence,
+                      verbose=verbose)
     if not plan.swaps:
         plan.revert_all()
         return Plan({}, {}, {"digest": "none", "seams": 0,
