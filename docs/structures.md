@@ -213,6 +213,15 @@ at plan time, which is the intent.
 
 ## 7. Norms that came from being wrong
 
+- **Calibrate and judge on the host's real inference distribution.**
+  Training-domain data through the host's own preprocessing chain, or
+  deployment inputs — never a neighbouring dataset with a hand-assembled
+  mapping, and never synthetic text repeated and padded to length. Two
+  hosts here measured 0.02 of cosine and 13 points of token agreement
+  worse on such inputs than on their real data, with the mechanism
+  unchanged; the dirty figures nearly became a quantisation-scheme
+  decision. Before attaching, prove the measurement itself: rerun the
+  host unmodified and require bit-identical output.
 - **Grep the repo before writing a mechanism.** Percentile reduction,
   stratified sampling, dispersion diagnostics, scale-ceiling warnings and
   the precision receipt all existed before this layer reimplemented worse
