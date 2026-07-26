@@ -98,6 +98,143 @@ def parity_metrics(got: torch.Tensor, want: torch.Tensor) -> dict[str, float]:
     return _parity_metrics(got, want)
 
 
+# ---- which metric a host's output deserves ----------------------------
+#
+# A cosine over the whole output tensor is the right measure for a host
+# whose output *is* the answer — an action chunk, a hidden state, a
+# feature map. It is the wrong measure for a host whose output is a
+# distribution over a vocabulary, and measuring both is what showed why.
+# Same bindings, same weights, only the prompt length changed:
+#
+#     tokens   cosine over all logits   top-1 agreement
+#     15       0.9991                   93.3%
+#     360      0.9450                   99.4%
+#
+# The two move in opposite directions with length. Aggregated over every
+# position, the cosine is dominated by positions that never drive a
+# decision, so it tracks sequence length more than output fidelity, while
+# the quantities generation actually depends on — the last position, top-1
+# agreement, per-token KL — are stable across both lengths.
+#
+# So the metric is not a library-wide constant. It belongs to the host's
+# output type, and the gate has to select it rather than assume one.
+
+OUTPUT_KINDS = ("values", "distribution")
+
+#: parity floors per output kind. Per the shipping band: 0.99 is the hard
+#: floor and 0.99-0.999 is a WARN band that passes with the calibration
+#: method recorded next to it.
+DEFAULT_FLOORS: dict[str, dict[str, float]] = {
+    "values": {"cosine": 0.99},
+    "distribution": {"top1_agreement": 0.99, "last_position_cosine": 0.99},
+}
+
+
+def infer_output_kind(output: Any) -> str:
+    """``"distribution"`` if the host returns logits, else ``"values"``.
+
+    Read off the object the host actually returned rather than guessed
+    from its class name: a forward that hands back something carrying
+    ``logits`` is scoring a vocabulary, whatever the model is called.
+    Callers who know better pass the kind explicitly.
+    """
+    if output is None:
+        return "values"
+    if hasattr(output, "logits") and torch.is_tensor(
+            getattr(output, "logits")):
+        return "distribution"
+    if isinstance(output, Mapping) and torch.is_tensor(
+            output.get("logits")):
+        return "distribution"
+    return "values"
+
+
+def distribution_metrics(got: torch.Tensor,
+                         want: torch.Tensor) -> dict[str, float]:
+    """Agreement metrics for logits over a vocabulary.
+
+    ``top1_agreement`` is the fraction of positions choosing the same
+    token, ``last_position_cosine`` scores the position generation reads,
+    and ``kl_per_token`` is summed over the vocabulary and averaged over
+    positions — nats per token, not per batch. (``reduction="batchmean"``
+    divides by the batch dimension, which for a single sequence is one,
+    and reports the whole sequence's KL as if it were one token's.)
+    """
+    if got.shape != want.shape:
+        raise ValueError(
+            f"output shape mismatch: impl {tuple(got.shape)} vs "
+            f"reference {tuple(want.shape)}")
+    got_f, want_f = got.double(), want.double()
+    flat_got = got_f.reshape(-1, got_f.shape[-1])
+    flat_want = want_f.reshape(-1, want_f.shape[-1])
+    top1 = (flat_got.argmax(-1) == flat_want.argmax(-1)).double().mean()
+    last = torch.nn.functional.cosine_similarity(
+        flat_got[-1], flat_want[-1], dim=0)
+    kl = torch.nn.functional.kl_div(
+        flat_got.log_softmax(-1), flat_want.log_softmax(-1),
+        log_target=True, reduction="none").sum(-1).mean()
+    return {
+        "top1_agreement": float(top1),
+        "last_position_cosine": float(last),
+        "kl_per_token": float(kl),
+        "positions": int(flat_got.shape[0]),
+        # kept as evidence, deliberately not thresholded: this is the
+        # number whose length dependence is the reason for this function
+        "cosine_all_positions": float(torch.nn.functional.cosine_similarity(
+            got_f.flatten(), want_f.flatten(), dim=0)),
+    }
+
+
+def metrics_for(kind: str, got: torch.Tensor,
+                want: torch.Tensor) -> dict[str, float]:
+    """Score ``got`` against ``want`` the way ``kind`` should be scored."""
+    if kind not in OUTPUT_KINDS:
+        raise ValueError(f"unknown output kind: {kind!r} "
+                         f"(expected one of {OUTPUT_KINDS})")
+    if kind == "distribution":
+        return distribution_metrics(got, want)
+    return _parity_metrics(got, want)
+
+
+def passes(metrics: Mapping[str, float],
+           floors: Mapping[str, float]) -> tuple[bool, str]:
+    """Judge scored metrics against floors; report the first shortfall.
+
+    ``cosine``-like names and agreement fractions are floors; anything
+    named for an error or a divergence is a ceiling. Naming the metric
+    that failed is the point — "refused" with no number attached is how a
+    refusal turns into folklore.
+    """
+    for name, floor in floors.items():
+        if name not in metrics:
+            raise ValueError(
+                f"floor on a metric that was not measured: {name!r} "
+                f"(have {sorted(metrics)})")
+        value = metrics[name]
+        ceiling = any(tok in name for tok in ("abs", "kl", "err"))
+        if (value > floor) if ceiling else (value < floor):
+            return False, (f"{name}={value:.6f} "
+                           f"{'above' if ceiling else 'below'} {floor}")
+    return True, ""
+
+
+def band_of(metrics: Mapping[str, float], kind: str) -> str:
+    """``pass`` / ``warn`` / ``fail`` for the headline metric of ``kind``.
+
+    The WARN band exists because a static per-tensor scale calibrated
+    from one frame is a workload's parity, not a host's: the band is
+    recorded next to the calibration method rather than collapsed into a
+    yes or no.
+    """
+    key = ("top1_agreement" if kind == "distribution" else "cosine")
+    value = metrics.get(key)
+    if value is None:
+        return "unknown"
+    if value < 0.99:
+        return "fail"
+    return "warn" if value < 0.999 else "pass"
+
+
 def _parity_metrics(got: torch.Tensor, want: torch.Tensor) -> dict[str, float]:
     if got.shape != want.shape:
         raise ValueError(
