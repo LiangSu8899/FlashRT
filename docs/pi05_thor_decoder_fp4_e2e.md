@@ -1,5 +1,50 @@
 # Pi0.5 Thor NVFP4 End-to-End Results
 
+## Vectorized Kernels + Encoder Attention O NVFP4 (2026-07-26)
+
+Three follow-up optimizations on top of the merged FP4+FP4 path, at
+commits `e2a3f99` (vectorized QKV split-RoPE and FP4 activation
+quantize), `73b5c2f` (vectorized decoder GeGLU quantize), and `1ee2d37`
+(NVFP4 encoder attention O projections; QKV stays FP8 because 4-bit Q/K
+weights break the raw-cosine gate). The kernel rewrites are bit-exact
+with their scalar predecessors; the O-projection quantization is the
+only numerical change.
+
+Formal runs with the strict harness defaults (20 warmups, 100 samples,
+locked GPC/NVD clocks, separate FP8/FP4 processes) at commit `1ee2d37`:
+
+| Views | Same-run FP8 p50 | FP4+FP4 p50 / p95 | Speedup | Gates |
+|---:|---:|---:|---:|---|
+| 2 | 38.584 ms | **30.277 / 30.335 ms** | 1.2744 | all pass |
+| 3 | 46.372 ms | **35.877 / 35.956 ms** | 1.2925 | all pass |
+
+Matched-noise fidelity versus the same-run FP8 reference:
+
+| Views | Raw cosine / worst | Final action cosine / worst |
+|---:|---:|---:|
+| 2 | 0.999213 / 0.998429 | 0.999674 / 0.999164 |
+| 3 | 0.998692 / 0.996296 | 0.999512 / 0.998731 |
+
+Measurement note: Thor drifts between two sustained-load clock regimes
+roughly 3 ms apart even with GPC/NVD locked (the EMC cap is a ceiling,
+not a lock), which also moves the FP8 reference — earlier formal runs
+recorded FP8 at 41.5/49.5 ms where these runs recorded 38.6/46.4 ms.
+Both children of each run above executed entirely in the same regime,
+so the speedup ratios and cosine comparisons are like-for-like; compare
+absolute milliseconds only against the same-run FP8 column. At commit
+`e2a3f99` a mixed-regime formal 3-view run recorded FP4 38.426 ms
+against FP8 49.211 ms (speedup 1.2807, all gates passed).
+
+Artifacts for the runs above:
+
+- `flash_rt_fp4`: `5d40c96503938b89cc6d68ae00ef16bde4a0cfa6ecda053f2c04525a94502b1a`
+- `flash_rt_kernels`: `b9173596a459cec26fc9044ba796ab042e40ada89709eec6854dbdee8c486b37`
+- 2-view `result.json`: `fa87026d5737fe307b84ead943d4f6a6305fa63332ca932c600e379729ddefdd`
+- 3-view `result.json`: `1fb0eb90f959ce902431626df9a2f506902a62cc20658fd204a647457768dcb3`
+
+The 1-view fidelity blocker and the LIBERO rollout validation recorded
+below remain outstanding and are unaffected by these changes.
+
 This document records the strict end-to-end development of the Pi0.5 NVFP4
 path on NVIDIA Thor SM110. The first run isolated the action-expert decoder;
 the current candidate combines all 17 live encoder FFN NVFP4 layers with the
