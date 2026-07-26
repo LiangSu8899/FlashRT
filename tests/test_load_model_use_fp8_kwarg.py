@@ -326,6 +326,8 @@ def test_load_model_routes_pi05_torch_thor_decoder_fp4(monkeypatch):
                      use_fp8=True, use_fp4_encoder_ffn=False,
                      use_fp4_decoder=False, fp4_layers=(), use_awq=False,
                      awq_alpha=0.5, use_p1_split_gu=False,
+                     encoder_p1_combiner="direct", encoder_down_variant=7,
+                     decoder_gate_up_variant=10,
                      state_prompt_mode="exact"):
             type(self).seen = {
                 "checkpoint": checkpoint,
@@ -338,6 +340,9 @@ def test_load_model_routes_pi05_torch_thor_decoder_fp4(monkeypatch):
                 "use_awq": use_awq,
                 "awq_alpha": awq_alpha,
                 "use_p1_split_gu": use_p1_split_gu,
+                "encoder_p1_combiner": encoder_p1_combiner,
+                "encoder_down_variant": encoder_down_variant,
+                "decoder_gate_up_variant": decoder_gate_up_variant,
                 "state_prompt_mode": state_prompt_mode,
             }
 
@@ -380,6 +385,9 @@ def test_load_model_routes_pi05_torch_thor_decoder_fp4(monkeypatch):
         "use_awq": False,
         "awq_alpha": 0.8,
         "use_p1_split_gu": False,
+        "encoder_p1_combiner": "lut_native",
+        "encoder_down_variant": 7,
+        "decoder_gate_up_variant": 10,
         "state_prompt_mode": "exact",
     }
 

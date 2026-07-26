@@ -314,7 +314,10 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                top_k=40,
                top_p=0.9,
                seed=1,
-               max_tokens=512):
+               max_tokens=512,
+               encoder_p1_combiner="lut_native",
+               encoder_down_variant=7,
+               decoder_gate_up_variant=10):
     """Load a FlashRT model.
 
     Args:
@@ -396,6 +399,13 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             conservative middle-FFN subset.
         awq_alpha: AWQ activation scaling exponent. ``None`` selects 0.8 for
             the encoder-FP4 + decoder-FP4 preset and 0.5 otherwise.
+        encoder_p1_combiner: FP4 encoder split-GU combiner. The production
+            default is ``"lut_native"``; ``"direct"`` and ``"lut"`` remain
+            available for explicit A/B runs.
+        encoder_down_variant: Cutlass NVFP4 encoder Down GEMM variant
+            (production default ``7``).
+        decoder_gate_up_variant: Cutlass NVFP4 decoder Gate+Up GEMM variant
+            (production default ``10``).
         use_fp8: Enable FP8 execution where the selected frontend supports
             an FP8/BF16 switch. Defaults to True to preserve existing
             performance-oriented behavior.
@@ -466,6 +476,11 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             "Qwen3VlTorchFrontendRtxBF16\n"
             "See docs/qwen3_vl_fp8_sm89.md, docs/qwen3_vl_nvfp4.md, "
             "docs/qwen3_vl_thor.md and docs/qwen3_vl_rtx_bf16.md.")
+
+    if framework == "jetson_pi" and (use_fp4_decoder or use_fa4):
+        raise ValueError(
+            "use_fp4_decoder/use_fa4 are unsupported with framework="
+            "'jetson_pi'; use the Thor torch FP4/FA4 frontend instead")
 
     if framework == "jetson_pi":
         if config not in ("pi0", "pi05", "llm", "mllm"):
@@ -849,6 +864,13 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                 kwargs["awq_alpha"] = float(awq_alpha)
             if "use_p1_split_gu" in sig.parameters:
                 kwargs["use_p1_split_gu"] = bool(use_p1_split_gu)
+            if "encoder_p1_combiner" in sig.parameters:
+                kwargs["encoder_p1_combiner"] = encoder_p1_combiner
+            if "encoder_down_variant" in sig.parameters:
+                kwargs["encoder_down_variant"] = int(encoder_down_variant)
+            if "decoder_gate_up_variant" in sig.parameters:
+                kwargs["decoder_gate_up_variant"] = int(
+                    decoder_gate_up_variant)
 
     pipe = pipe_cls(checkpoint, **kwargs)
 

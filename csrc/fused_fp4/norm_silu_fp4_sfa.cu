@@ -17,6 +17,8 @@
 
 #include <cuda_fp4.h>
 #include <cuda_fp8.h>
+#include <stdexcept>
+#include <string>
 
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED) || defined(__CUDA_ARCH__)
 #  include "cutlass/cutlass.h"
@@ -33,6 +35,15 @@ namespace fused_fp4 {
 #if FV_HAVE_CUTLASS
 
 using Cfg = cutlass::detail::Sm1xxBlockScaledConfig<16>;
+
+inline void check_fp4_kernel_launch(const char* kernel_name) {
+    const cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess) {
+        throw std::runtime_error(
+            std::string(kernel_name) + " launch failed: "
+            + cudaGetErrorString(error));
+    }
+}
 
 // ── Device helpers (local copies to keep this TU standalone) ──
 __device__ __forceinline__ uint8_t fp32_to_e2m1(float x) {
@@ -491,6 +502,7 @@ void pi05_adarms_fp4_sfa_fp16(
     auto layout = Cfg::tile_atom_to_shape_SFA(shape);
     pi05_adarms_fp4_sfa_register_kernel<false><<<seq_len, 256, 0, stream>>>(
         x, style, packed, sfa, gate, layout, dim);
+    check_fp4_kernel_launch("pi05_adarms_fp4_sfa_fp16");
 #else
     (void)x; (void)style; (void)packed; (void)sfa; (void)gate;
     (void)seq_len; (void)dim; (void)stream;
@@ -506,6 +518,7 @@ void pi05_gate_res_adarms_fp4_sfa_fp16(
     auto layout = Cfg::tile_atom_to_shape_SFA(shape);
     pi05_gate_res_adarms_fp4_sfa_register_kernel<false><<<seq_len, 256, 0, stream>>>(
             x, prev_gate, residual, style, packed, sfa, gate, layout, dim);
+    check_fp4_kernel_launch("pi05_gate_res_adarms_fp4_sfa_fp16");
 #else
     (void)x; (void)prev_gate; (void)residual; (void)style;
     (void)packed; (void)sfa; (void)gate;
@@ -522,6 +535,7 @@ void pi05_adarms_fp4_sfa_native_fp16(
     auto layout = Cfg::tile_atom_to_shape_SFA(shape);
     pi05_adarms_fp4_sfa_register_kernel<true><<<seq_len, 256, 0, stream>>>(
         x, style, packed, sfa, gate, layout, dim);
+    check_fp4_kernel_launch("pi05_adarms_fp4_sfa_native_fp16");
 #else
     (void)x; (void)style; (void)packed; (void)sfa; (void)gate;
     (void)seq_len; (void)dim; (void)stream;
@@ -538,6 +552,7 @@ void pi05_gate_res_adarms_fp4_sfa_native_fp16(
     pi05_gate_res_adarms_fp4_sfa_register_kernel<true><<<
         seq_len, 256, 0, stream>>>(
             x, prev_gate, residual, style, packed, sfa, gate, layout, dim);
+    check_fp4_kernel_launch("pi05_gate_res_adarms_fp4_sfa_native_fp16");
 #else
     (void)x; (void)prev_gate; (void)residual; (void)style;
     (void)packed; (void)sfa; (void)gate;

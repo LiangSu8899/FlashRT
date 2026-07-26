@@ -18,6 +18,11 @@ there are no `.cu`/`.cpp` sources here and nothing is compiled into
 `flash_rt_kernels`. The runtime deps (`nvidia-cutlass-dsl`, `quack-kernels`)
 ship via the `thor-fa4` pip extra.
 
+On Thor, the loader compiles with `CUTE_DSL_ARCH=sm_110a` but intentionally
+uses `FLASH_ATTENTION_ARCH=sm_100a` for dispatch. This vendor retains the
+SM100-compatible forward implementation; the runtime key is not claiming a
+separate SM110 kernel.
+
 ## Private package name (isolation)
 
 The package is renamed `flash_attn` → **`flashrt_fa4`** so that importing it

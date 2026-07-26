@@ -55,7 +55,7 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                  awq_alpha: float = 0.5,
                  awq_calib_iters: int = 8,
                  use_p1_split_gu: bool = False,
-                 encoder_p1_combiner: str = "direct",
+                 encoder_p1_combiner: str = "lut_native",
                  encoder_down_variant: int = 7,
                  decoder_gate_up_variant: int = 10,
                  use_fp8: bool = True,
@@ -81,6 +81,12 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
         self.awq_calib_iters = int(awq_calib_iters)
         # P1: split-GU 2-GEMM path (eliminates F4 v2; -2.9ms expected)
         self.use_p1_split_gu = bool(use_p1_split_gu) and self.use_fp4_encoder_ffn
+        invalid_layers = sorted(
+            l for l in self._fp4_layers if l < 0 or l >= self.Le - 1)
+        if invalid_layers:
+            raise ValueError(
+                "fp4_layers contains non-live encoder FFN layers "
+                f"{invalid_layers}; valid layers are [0, {self.Le - 2}]")
         if encoder_p1_combiner not in ("direct", "lut", "lut_native"):
             raise ValueError(
                 "encoder_p1_combiner must be 'direct', 'lut', or "

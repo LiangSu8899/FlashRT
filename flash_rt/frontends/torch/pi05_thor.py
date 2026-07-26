@@ -2587,7 +2587,10 @@ class Pi05TorchFrontendThor:
         else:
             for index, image in enumerate(img_list[:nv]):
                 if isinstance(image, torch.Tensor):
-                    image = image.to(dtype=torch.float16).cpu().numpy()
+                    if image.dtype == torch.uint8:
+                        image = image.detach().cpu().numpy()
+                    else:
+                        image = image.to(dtype=torch.float16).cpu().numpy()
                 if image.dtype == np.uint8:
                     np.take(
                         self._infer_uint8_to_fp16, image,

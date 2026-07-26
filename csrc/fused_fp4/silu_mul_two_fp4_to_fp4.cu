@@ -27,6 +27,9 @@
 #include <cuda_fp16.h>
 #include <cuda_fp4.h>
 #include <cuda_fp8.h>
+#include <mutex>
+#include <stdexcept>
+#include <string>
 
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED) || defined(__CUDA_ARCH__)
 #  include "cutlass/cutlass.h"
@@ -74,6 +77,17 @@ __device__ __forceinline__ float silu_mul_p1(float g, float u) {
 
 __device__ float geglu_gate_lut_p1[256 * 16];
 
+std::once_flag g_geglu_gate_lut_once;
+
+inline void check_fp4_kernel_launch(const char* kernel_name) {
+    const cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess) {
+        throw std::runtime_error(
+            std::string(kernel_name) + " launch failed: "
+            + cudaGetErrorString(error));
+    }
+}
+
 __global__ void init_geglu_gate_lut_p1_kernel() {
     const int index = blockIdx.x * blockDim.x + threadIdx.x;
     if (index >= 256 * 16) return;
@@ -85,6 +99,36 @@ __global__ void init_geglu_gate_lut_p1_kernel() {
     geglu_gate_lut_p1[index] =
         g / (1.0f + expf(
             -1.5957691216057308f * g * (1.0f + 0.044715f * g * g)));
+}
+
+inline void ensure_geglu_gate_lut(cudaStream_t stream) {
+    std::call_once(g_geglu_gate_lut_once, [stream] {
+        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+        cudaError_t error = cudaStreamIsCapturing(stream, &capture_status);
+        if (error != cudaSuccess) {
+            throw std::runtime_error(
+                std::string("cudaStreamIsCapturing failed: ")
+                + cudaGetErrorString(error));
+        }
+        if (capture_status != cudaStreamCaptureStatusNone) {
+            throw std::runtime_error(
+                "geglu gate LUT must be initialized before CUDA graph capture");
+        }
+
+        init_geglu_gate_lut_p1_kernel<<<16, 256, 0, stream>>>();
+        error = cudaGetLastError();
+        if (error != cudaSuccess) {
+            throw std::runtime_error(
+                std::string("init_geglu_gate_lut_p1_kernel launch failed: ")
+                + cudaGetErrorString(error));
+        }
+        error = cudaStreamSynchronize(stream);
+        if (error != cudaSuccess) {
+            throw std::runtime_error(
+                std::string("init_geglu_gate_lut_p1_kernel execution failed: ")
+                + cudaGetErrorString(error));
+        }
+    });
 }
 
 template <class LayoutSF>
@@ -314,6 +358,7 @@ void silu_mul_two_fp4_to_fp4(
     silu_mul_two_fp4_to_fp4_kernel<<<grid, block, 0, stream>>>(
         gate_packed, gate_sfa, up_packed, up_sfa,
         out_packed, out_sfa, layout, layout, H);
+    check_fp4_kernel_launch("silu_mul_two_fp4_to_fp4");
 #else
     (void)gate_packed; (void)gate_sfa; (void)up_packed; (void)up_sfa;
     (void)out_packed; (void)out_sfa; (void)seq_len; (void)H; (void)stream;
@@ -337,6 +382,7 @@ void silu_mul_two_mul_fp4_to_fp4(
     silu_mul_two_mul_fp4_to_fp4_kernel<false, false, false><<<grid, block, 0, stream>>>(
         gate_packed, gate_sfa, up_packed, up_sfa, inv_s,
         out_packed, out_sfa, layout, layout, H);
+    check_fp4_kernel_launch("silu_mul_two_mul_fp4_to_fp4");
 #else
     (void)gate_packed; (void)gate_sfa; (void)up_packed; (void)up_sfa;
     (void)inv_s; (void)out_packed; (void)out_sfa;
@@ -351,11 +397,7 @@ void silu_mul_two_mul_fp4_to_fp4_lut(
     uint8_t* out_packed, uint8_t* out_sfa,
     int seq_len, int H, cudaStream_t stream) {
 #if FV_HAVE_CUTLASS
-    static bool lut_initialized = false;
-    if (!lut_initialized) {
-        init_geglu_gate_lut_p1_kernel<<<16, 256, 0, stream>>>();
-        lut_initialized = true;
-    }
+    ensure_geglu_gate_lut(stream);
     auto shape = cute::make_shape(seq_len, 1, H, 1);
     auto layout = CfgF4P1::tile_atom_to_shape_SFA(shape);
     const int n_blocks = H / 16;
@@ -366,6 +408,7 @@ void silu_mul_two_mul_fp4_to_fp4_lut(
     silu_mul_two_mul_fp4_to_fp4_kernel<true, true, false><<<grid, block, 0, stream>>>(
         gate_packed, gate_sfa, up_packed, up_sfa, inv_s,
         out_packed, out_sfa, layout, layout, H);
+    check_fp4_kernel_launch("silu_mul_two_mul_fp4_to_fp4_lut");
 #else
     (void)gate_packed; (void)gate_sfa; (void)up_packed; (void)up_sfa;
     (void)inv_s; (void)out_packed; (void)out_sfa;
@@ -380,11 +423,7 @@ void silu_mul_two_mul_fp4_to_fp4_lut_native(
     uint8_t* out_packed, uint8_t* out_sfa,
     int seq_len, int H, cudaStream_t stream) {
 #if FV_HAVE_CUTLASS
-    static bool lut_initialized = false;
-    if (!lut_initialized) {
-        init_geglu_gate_lut_p1_kernel<<<16, 256, 0, stream>>>();
-        lut_initialized = true;
-    }
+    ensure_geglu_gate_lut(stream);
     auto shape = cute::make_shape(seq_len, 1, H, 1);
     auto layout = CfgF4P1::tile_atom_to_shape_SFA(shape);
     const int n_blocks = H / 16;
@@ -395,6 +434,7 @@ void silu_mul_two_mul_fp4_to_fp4_lut_native(
     silu_mul_two_mul_fp4_to_fp4_kernel<true, true, true><<<grid, block, 0, stream>>>(
         gate_packed, gate_sfa, up_packed, up_sfa, inv_s,
         out_packed, out_sfa, layout, layout, H);
+    check_fp4_kernel_launch("silu_mul_two_mul_fp4_to_fp4_lut_native");
 #else
     (void)gate_packed; (void)gate_sfa; (void)up_packed; (void)up_sfa;
     (void)inv_s; (void)out_packed; (void)out_sfa;

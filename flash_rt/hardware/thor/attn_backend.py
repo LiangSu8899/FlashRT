@@ -27,6 +27,7 @@ addressed in later stages.
 from __future__ import annotations
 
 import math
+from contextlib import nullcontext
 from typing import Optional
 
 from flash_rt.hardware.backend import AttentionBackendBase, AttentionSpec
@@ -226,6 +227,28 @@ class ThorFlashAttnBackend(AttentionBackendBase):
             self._fvk = fvk
         return self._fvk
 
+    def _fa4_stream_context(self, stream: int):
+        """Run FA4 tensor operations on the caller-provided CUDA stream.
+
+        The fvk API carries a raw ``cudaStream_t`` while FA4 follows PyTorch's
+        current stream.  Bind both stream zero (the CUDA default stream) and
+        explicit non-zero streams to the same stream, including any output
+        copy enclosed by the caller.
+        """
+        stream = int(stream)
+        import torch
+
+        current = int(torch.cuda.current_stream().cuda_stream)
+        if stream == 0:
+            target = int(torch.cuda.default_stream().cuda_stream)
+        else:
+            target = stream
+        if current == target:
+            return nullcontext()
+        if stream == 0:
+            return torch.cuda.stream(torch.cuda.default_stream())
+        return torch.cuda.stream(torch.cuda.ExternalStream(target))
+
     def set_fixed_shape(self, enabled: bool) -> None:
         """Enable/disable fixed-shape state-prompt masking.
 
@@ -362,9 +385,10 @@ class ThorFlashAttnBackend(AttentionBackendBase):
                     offset=2 * NH * HD)
                 output = _fp16_tensor_from_ptr(
                     int(s["O"]), (nv, q_seq, NH, HD))
-                self._fa4_fwd(
-                    q_tensor, k_tensor, v_tensor, causal=False,
-                    num_splits=1, pack_gqa=False, out=output)
+                with self._fa4_stream_context(stream):
+                    self._fa4_fwd(
+                        q_tensor, k_tensor, v_tensor, causal=False,
+                        num_splits=1, pack_gqa=False, out=output)
             else:
                 fvk.fmha_strided_full(Q, K, V, int(s["O"]),
                                        nv, q_seq, kv_seq, NH, NH, HD,
@@ -413,10 +437,11 @@ class ThorFlashAttnBackend(AttentionBackendBase):
                 output = _fp16_tensor_from_ptr(
                     int(s["logits"]),
                     (1, q_seq, site_spec.num_q_heads, site_spec.head_dim))
-                self._fa4_fwd(
-                    q_tensor, k_tensor, v_tensor, causal=False,
-                    num_splits=1, pack_gqa=True, out=output)
-                q_tensor.copy_(output)
+                with self._fa4_stream_context(stream):
+                    self._fa4_fwd(
+                        q_tensor, k_tensor, v_tensor, causal=False,
+                        num_splits=1, pack_gqa=True, out=output)
+                    q_tensor.copy_(output)
                 return int(s["Q_O"])
             if self._fixed_shape and site in ("encoder", "decoder"):
                 seqused = (self._enc_seqused_ptr if site == "encoder"

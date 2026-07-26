@@ -540,6 +540,15 @@ reshape_linear_scales_to_sfa, in a single kernel launch.
            uintptr_t B_packed, uintptr_t SFB,
            uintptr_t D_packed, uintptr_t D_SFD,
            int M, int N, int K, uintptr_t stream) -> int {
+          const auto shape = fp4_kernel_shape({{"M", M}, {"N", N}, {"K", K}});
+          require_fp4_ptrs("cutlass_fp4_gemm_fp4out",
+                           {{"A_packed", A_packed}, {"SFA", SFA},
+                            {"B_packed", B_packed}, {"SFB", SFB},
+                            {"D_packed", D_packed}, {"D_SFD", D_SFD}}, shape);
+          require_fp4(M > 0 && N > 0 && K > 0 && (N % 16) == 0 && (K % 16) == 0,
+                      "cutlass_fp4_gemm_fp4out",
+                      "M must be positive and N/K must be positive multiples of 16",
+                      shape);
           return flash_rt::fp4::cutlass_fp4_gemm_fp4out(
               reinterpret_cast<void const*>(A_packed),
               reinterpret_cast<void const*>(SFA),
@@ -598,6 +607,17 @@ Drop-in for cutlass_fp4_sq_fp16 when downstream consumes FP4 + SFA directly.
            uintptr_t inv_s,
            uintptr_t out_packed,  uintptr_t out_sfa,
            int seq_len, int half_dim, uintptr_t stream) {
+          const auto shape = fp4_kernel_shape({{"seq_len", seq_len},
+                                                {"half_dim", half_dim}});
+          require_fp4_ptrs("geglu_two_mul_fp4_to_fp4",
+                           {{"gate_packed", gate_packed}, {"gate_sfa", gate_sfa},
+                            {"up_packed", up_packed}, {"up_sfa", up_sfa},
+                            {"inv_s", inv_s}, {"out_packed", out_packed},
+                            {"out_sfa", out_sfa}}, shape);
+          require_fp4(seq_len > 0 && half_dim > 0 && (half_dim % 16) == 0,
+                      "geglu_two_mul_fp4_to_fp4",
+                      "seq_len must be positive and half_dim must be a positive multiple of 16",
+                      shape);
           flash_rt::fused_fp4::silu_mul_two_mul_fp4_to_fp4(
               reinterpret_cast<const uint8_t*>(gate_packed),
               reinterpret_cast<const uint8_t*>(gate_sfa),
@@ -622,6 +642,17 @@ Drop-in for cutlass_fp4_sq_fp16 when downstream consumes FP4 + SFA directly.
            uintptr_t inv_s,
            uintptr_t out_packed,  uintptr_t out_sfa,
            int seq_len, int half_dim, uintptr_t stream) {
+          const auto shape = fp4_kernel_shape({{"seq_len", seq_len},
+                                                {"half_dim", half_dim}});
+          require_fp4_ptrs("geglu_two_mul_fp4_to_fp4_lut",
+                           {{"gate_packed", gate_packed}, {"gate_sfa", gate_sfa},
+                            {"up_packed", up_packed}, {"up_sfa", up_sfa},
+                            {"inv_s", inv_s}, {"out_packed", out_packed},
+                            {"out_sfa", out_sfa}}, shape);
+          require_fp4(seq_len > 0 && half_dim > 0 && (half_dim % 16) == 0,
+                      "geglu_two_mul_fp4_to_fp4_lut",
+                      "seq_len must be positive and half_dim must be a positive multiple of 16",
+                      shape);
           flash_rt::fused_fp4::silu_mul_two_mul_fp4_to_fp4_lut(
               reinterpret_cast<const uint8_t*>(gate_packed),
               reinterpret_cast<const uint8_t*>(gate_sfa),
@@ -646,6 +677,17 @@ Drop-in for cutlass_fp4_sq_fp16 when downstream consumes FP4 + SFA directly.
            uintptr_t inv_s,
            uintptr_t out_packed,  uintptr_t out_sfa,
            int seq_len, int half_dim, uintptr_t stream) {
+          const auto shape = fp4_kernel_shape({{"seq_len", seq_len},
+                                                {"half_dim", half_dim}});
+          require_fp4_ptrs("geglu_two_mul_fp4_to_fp4_lut_native",
+                           {{"gate_packed", gate_packed}, {"gate_sfa", gate_sfa},
+                            {"up_packed", up_packed}, {"up_sfa", up_sfa},
+                            {"inv_s", inv_s}, {"out_packed", out_packed},
+                            {"out_sfa", out_sfa}}, shape);
+          require_fp4(seq_len > 0 && half_dim > 0 && (half_dim % 16) == 0,
+                      "geglu_two_mul_fp4_to_fp4_lut_native",
+                      "seq_len must be positive and half_dim must be a positive multiple of 16",
+                      shape);
           flash_rt::fused_fp4::silu_mul_two_mul_fp4_to_fp4_lut_native(
               reinterpret_cast<const uint8_t*>(gate_packed),
               reinterpret_cast<const uint8_t*>(gate_sfa),
@@ -670,6 +712,16 @@ Drop-in for cutlass_fp4_sq_fp16 when downstream consumes FP4 + SFA directly.
            uintptr_t up_packed,   uintptr_t up_sfa,
            uintptr_t out_packed,  uintptr_t out_sfa,
            int seq_len, int half_dim, uintptr_t stream) {
+          const auto shape = fp4_kernel_shape({{"seq_len", seq_len},
+                                                {"half_dim", half_dim}});
+          require_fp4_ptrs("geglu_two_fp4_to_fp4",
+                           {{"gate_packed", gate_packed}, {"gate_sfa", gate_sfa},
+                            {"up_packed", up_packed}, {"up_sfa", up_sfa},
+                            {"out_packed", out_packed}, {"out_sfa", out_sfa}}, shape);
+          require_fp4(seq_len > 0 && half_dim > 0 && (half_dim % 16) == 0,
+                      "geglu_two_fp4_to_fp4",
+                      "seq_len must be positive and half_dim must be a positive multiple of 16",
+                      shape);
           flash_rt::fused_fp4::silu_mul_two_fp4_to_fp4(
               reinterpret_cast<const uint8_t*>(gate_packed),
               reinterpret_cast<const uint8_t*>(gate_sfa),
