@@ -82,7 +82,7 @@ at most 40 ms and 3-view p50 at most 40 ms. Final 7D action cosine must be at
 least 0.999 globally and 0.995 for every sample; internal raw cosine must be at
 least 0.995 globally and for every sample.
 
-## Encoder Down v7 Multi-View Result (2026-07-26)
+## Encoder Down v7 Multi-View Result (commit `8424808`, 2026-07-26)
 
 The encoder Down GEMM was re-swept with complete `infer()` calls at the actual
 per-view encoder shapes. Variant v7 (`tile128x128x256`, cluster `1x1x1`) was
@@ -93,15 +93,27 @@ Locked-clock results use 20 warmups and 100 retained samples per mode:
 
 | Views | Same-run FP8 p50 / p95 | FP4+FP4 p50 / p95 | Published FP4+FA4 p50 | Gain vs published |
 |---:|---:|---:|---:|---:|
-| 1 | 35.360 / 35.553 ms | **27.861 / 28.002 ms** | 30.5 ms | **2.639 ms** |
-| 2 | 41.341 / 41.532 ms | **32.971 / 33.112 ms** | 36.3 ms | **3.329 ms** |
-| 3 | 49.528 / 49.868 ms | **39.402 / 39.697 ms** | 42.8 ms | **3.398 ms** |
+| 1 | 35.315 / 35.588 ms | **28.035 / 28.269 ms** | 30.5 ms | **2.465 ms** |
+| 2 | 41.485 / 41.652 ms | **32.986 / 33.138 ms** | 36.3 ms | **3.314 ms** |
+| 3 | 49.461 / 49.726 ms | **39.393 / 39.743 ms** | 42.8 ms | **3.407 ms** |
+
+The same matched-noise run recorded the following raw and final-action
+cosines, measured against the FP16 reference path; the Down variant changes
+only the GEMM schedule.
+
+| Views | Raw cosine / worst sample | Final action cosine / worst sample |
+|---:|---:|---:|
+| 1 | 0.954346 / 0.720291 | 0.870413 / 0.021278 |
+| 2 | 0.997625 / 0.995526 | 0.999380 / 0.998825 |
+| 3 | 0.997289 / 0.995878 | 0.999062 / 0.996514 |
 
 The variant sweep used complete FP4 child processes with the 1-view fixture,
 5 warmups, and 20 retained calls. The screened p50 values were v0 28.352 ms,
 v1 28.686 ms, v3 28.791 ms, v4 28.358 ms, v6 28.897 ms, v7 28.022 ms,
 v8 28.962 ms, and v10 28.541 ms. The formal multi-view measurements above
-then confirmed v7 with the full sampling contract.
+then confirmed v7 with the full sampling contract. The tree also retains the decoder MSE
+quantization diagnostic used for that precision comparison; it does not add
+a runtime fallback.
 
 ## 40 ms Production Result
 
