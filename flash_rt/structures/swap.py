@@ -206,10 +206,29 @@ def attach(
         raise
 
     # ---- give every guard its site and its own way out ----
+    # keyed by guard identity as well as by site: one module can be
+    # reachable by two routes (a composed block holds the host block, so a
+    # core hanging off the host's attention is found twice), and counting
+    # it twice would overstate how many seams an attachment has
     guards: dict[str, SeamGuard] = {}
+    seen: set[int] = set()
+    # named seams first: an adapter knows what its routed seam should be
+    # called, and the same object found by walking a composed structure
+    # would otherwise claim it under an incidental path
+    for site, module in (observe or {}).items():
+        for child, guard in _collect_guards(module):
+            if id(guard) in seen:
+                continue
+            seen.add(id(guard))
+            key = site if not child else f"{site}::{child}"
+            guard.bind_site(key, restore=None, mode=on_guard_fail)
+            guards[key] = guard
     for (parent, attr, original), (path, replacement) in zip(
             entries, swaps.items()):
         for child, guard in _collect_guards(replacement):
+            if id(guard) in seen:
+                continue
+            seen.add(id(guard))
             site = path if not child else f"{path}::{child}"
             # only the module actually swapped in at a path can restore
             # itself; a guard held inside a composed structure reports but
@@ -218,14 +237,6 @@ def attach(
                        if not child else None)
             guard.bind_site(site, restore=restore, mode=on_guard_fail)
             guards[site] = guard
-
-    # seams that are not modules at paths: counted, never installed, and
-    # with no path of their own to restore
-    for site, module in (observe or {}).items():
-        for child, guard in _collect_guards(module):
-            key = site if not child else f"{site}::{child}"
-            guard.bind_site(key, restore=None, mode=on_guard_fail)
-            guards[key] = guard
 
     return AttachHandle(_entries=entries, records=dict(records or {}),
                         _guards=guards, _revert=list(revert or ()))
