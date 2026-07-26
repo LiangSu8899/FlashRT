@@ -23,7 +23,7 @@ from typing import Sequence
 
 import torch
 
-from .discover import _VISION_PROJ, _activation_of
+from .discover import _VISION_PROJ, activation_for
 from .gates import parity_metrics
 from .registry import StructureSpec, load
 
@@ -79,7 +79,7 @@ class StructureHandle:
             gate = module.gate_proj
             device = gate.weight.device
             dims = {"D": gate.in_features, "F": gate.out_features}
-            var = {"activation": _activation_of(module) or "silu",
+            var = {"activation": activation_for(module, "silu"),
                    "norm_weight_mode": "direct"}
             weights = {
                 "w_norm": (norm.weight.detach() if norm is not None
@@ -102,7 +102,7 @@ class StructureHandle:
             fc2 = getattr(module, fc_attrs[1])
             device = fc1.weight.device
             dims = {"D": fc1.in_features, "F": fc1.out_features}
-            var = {"activation": _activation_of(module) or "gelu"}
+            var = {"activation": activation_for(module, "gelu")}
             weights = {
                 "w_norm": (norm.weight.detach() if norm is not None
                            else torch.ones(dims["D"], device=device)),

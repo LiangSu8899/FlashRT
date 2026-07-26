@@ -87,23 +87,71 @@ class Seam:
     family: str = ""
     layer_index: int = -1
     m_profile: list[int] = field(default_factory=list)
+    #: what discovery had to take on trust to describe this seam. Carried
+    #: to the receipt: an assumption nobody can see is indistinguishable
+    #: from a fact, and these are the ones the parity gate has to check.
+    assumptions: tuple[str, ...] = ()
 
 
-def _activation_of(module: nn.Module) -> str | None:
+_ACT_ATTRS = ("act_fn", "activation_fn", "act", "activation")
+
+
+def _activation_of(module: nn.Module) -> tuple[str | None, bool]:
+    """``(name, declared)`` for this module's activation.
+
+    Two different unknowns, and conflating them was a silent failure. A
+    module with *no* activation attribute tells us nothing, and the family
+    default is a reasonable assumption to record and let the parity gate
+    check. A module that *declares* an activation we cannot classify tells
+    us something specific: it is not one of the two this library
+    implements, so assuming otherwise would substitute a different
+    function and the seam is refused instead.
+
+    Returns ``(None, True)`` for the second case — declared but not ours.
+    """
     fn = None
-    for attr in ("act_fn", "activation_fn", "act", "activation"):
+    for attr in _ACT_ATTRS:
         fn = getattr(module, attr, None)
         if fn is not None:
             break
     if fn is None:
-        return None
+        return None, False
     label = " ".join(
         [getattr(fn, "__name__", ""), type(fn).__name__, repr(fn)]).lower()
     if "silu" in label or "swish" in label:
-        return "silu"
+        return "silu", True
     if "gelu" in label:
-        return "gelu"
-    return None
+        return "gelu", True
+    return None, True
+
+
+def _activation_or_default(module: nn.Module, default: str
+                           ) -> tuple[str | None, tuple[str, ...]]:
+    """Resolve the activation, or refuse; report what was assumed.
+
+    ``(None, ())`` means refuse this seam. Discovery turns that into
+    "skip"; the explicit door turns it into an error — see
+    :func:`activation_for`, which is the same decision with the other
+    outcome, so the two doors cannot drift apart.
+    """
+    name, declared = _activation_of(module)
+    if name is not None:
+        return name, ()
+    if declared:
+        return None, ()          # declared, and not one of ours: refuse
+    return default, (f"activation assumed {default} (host declares none)",)
+
+
+def activation_for(module: nn.Module, default: str) -> str:
+    """The activation name for an explicitly bound module, or raise."""
+    name, _ = _activation_or_default(module, default)
+    if name is None:
+        fn = next((getattr(module, a) for a in _ACT_ATTRS
+                   if getattr(module, a, None) is not None), None)
+        raise ValueError(
+            f"activation {type(fn).__name__!r} is declared by this module "
+            f"and is not one this library implements (silu or gelu)")
+    return name
 
 
 def _resolve(root: nn.Module, path: str) -> nn.Module:
@@ -150,14 +198,16 @@ def discover(
             for a in _DECODER_PROJ
         ):
             gate = module.gate_proj
-            act = _activation_of(module) or "silu"
+            act, assumed = _activation_or_default(module, "silu")
+            if act is None:
+                continue
             family, idx = _family_key(path)
             seams.append(Seam(
                 structure="decoder_ffn", path=path, parent_path=parent_path,
                 norm_attr=_norm_attr_of(model, parent_path),
                 dims={"D": gate.in_features, "F": gate.out_features},
                 variant={"activation": act, "norm_weight_mode": "direct"},
-                family=family, layer_index=idx))
+                family=family, layer_index=idx, assumptions=assumed))
             continue
         if "decoder_block" in structures and all(
             isinstance(getattr(module, a, None), nn.Module)
@@ -265,14 +315,16 @@ def discover(
                 norm_attr = _norm_attr_of(model, parent_path)
                 if norm_attr is None:
                     continue  # vision_ffn boundary includes a LayerNorm
-                act = _activation_of(module) or "gelu"
+                act, assumed = _activation_or_default(module, "gelu")
+                if act is None:
+                    break
                 family, idx = _family_key(path)
                 seams.append(Seam(
                     structure="vision_ffn", path=path,
                     parent_path=parent_path, norm_attr=norm_attr,
                     dims={"D": fc1.in_features, "F": fc1.out_features},
                     variant={"activation": act}, fc_attrs=(fc1_attr, fc2_attr),
-                    family=family, layer_index=idx))
+                    family=family, layer_index=idx, assumptions=assumed))
                 break
     return seams
 
