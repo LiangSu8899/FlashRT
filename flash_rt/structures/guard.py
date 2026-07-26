@@ -168,12 +168,16 @@ class SeamGuard:
 
     def refuse(self, reason: str) -> None:
         """Record a fallback; speak up the first time and at the end."""
+        where = self.site or f"<unattached {self.kind}>"
+        if self.mode == "raise":
+            # before counting: in strict mode nothing fell back, the call
+            # was refused, and a ledger claiming otherwise would be one
+            # more thing that says something that did not happen
+            self.last_reason = reason
+            raise GuardRefused(f"{where}: {reason}")
         self.fallbacks += 1
         self.consecutive += 1
         self.last_reason = reason
-        where = self.site or f"<unattached {self.kind}>"
-        if self.mode == "raise":
-            raise GuardRefused(f"{where}: {reason}")
         if reason not in self._warned:
             self._warned.add(reason)
             warnings.warn(
