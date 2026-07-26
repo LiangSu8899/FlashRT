@@ -61,10 +61,14 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                  use_fp8: bool = True,
                  state_prompt_mode: str = "exact",
                  state_prompt_fixed_max_len=None,
-                 use_fa4: bool = False):
+                 use_fa4: bool = False,
+                 use_fp4_encoder_attn: bool = False):
         if use_fp4_decoder and not use_fp8:
             raise ValueError(
                 "use_fp4_decoder=True requires the FP8 Thor encoder path")
+        if use_fp4_encoder_attn and not use_fp4_encoder_ffn:
+            raise ValueError(
+                "use_fp4_encoder_attn=True requires use_fp4_encoder_ffn=True")
         # Base init (loads weights, allocates all FP8 buffers, etc.)
         super().__init__(checkpoint_dir, num_views=num_views,
                          use_cuda_graph=use_cuda_graph, autotune=autotune,
@@ -75,6 +79,7 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
 
         self.use_fp4_encoder_ffn = bool(use_fp4_encoder_ffn)
         self.use_fp4_decoder = bool(use_fp4_decoder)
+        self.use_fp4_encoder_attn = bool(use_fp4_encoder_attn)
         self._fp4_layers = frozenset(fp4_layers) if self.use_fp4_encoder_ffn else frozenset()
         self.use_awq = bool(use_awq) and self.use_fp4_encoder_ffn
         self.awq_alpha = float(awq_alpha)
@@ -108,8 +113,12 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                     f"[0, {fp4_variant_count}), got "
                     f"{self.encoder_down_variant}")
             self._prepare_fp4_encoder()
-            logger.info("Pi05 FP4 enabled on encoder layers: %s  (AWQ=%s)",
-                        sorted(self._fp4_layers), self.use_awq)
+            if self.use_fp4_encoder_attn:
+                self._prepare_fp4_encoder_attn()
+            logger.info(
+                "Pi05 FP4 enabled on encoder layers: %s  (AWQ=%s, attn=%s)",
+                sorted(self._fp4_layers), self.use_awq,
+                self.use_fp4_encoder_attn)
 
         if self.use_fp4_decoder:
             if not _HAS_FP4:
@@ -451,6 +460,51 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                     self._fp4_weights[l]['gate'] = quant_weight_nvfp4(g_fp16)
                     self._fp4_weights[l]['up']   = quant_weight_nvfp4(u_fp16)
 
+    def _prepare_fp4_encoder_attn(self):
+        """NVFP4-quantize the encoder attention output (O) projections.
+
+        Covers the layers that run attention (all but the last), with the
+        per-block MSE scale search used by the decoder weights. The QKV
+        projections stay FP8: 4-bit Q/K weights shift the attention logits
+        enough to break the raw-output cosine gate (worst sample 0.97
+        versus the required 0.995), while O-only passes every gate.
+        """
+        from safetensors import safe_open
+        from flash_rt.executors.torch_weights import _autodetect_strip_prefix
+
+        De = self.De
+        model_root = (
+            "paligemma_with_expert.paligemma.model.language_model.layers")
+        self._enc_attn_fp4_weights = {}
+        with safe_open(self._checkpoint_path, framework='pt',
+                       device='cuda') as sf:
+            _strip = _autodetect_strip_prefix(set(sf.keys()))
+
+            def get(k):
+                return sf.get_tensor((_strip + k) if _strip else k)
+
+            for l in range(self.Le - 1):
+                p = f"{model_root}.{l}"
+                o_fp16 = get(
+                    f"{p}.self_attn.o_proj.weight").to(fp16).contiguous()
+                if o_fp16.shape != (De, De):
+                    raise ValueError(
+                        f"encoder o shape {tuple(o_fp16.shape)} != "
+                        f"{(De, De)}")
+                packed = quant_weight_nvfp4(o_fp16)
+                rc = fvk_fp4.quantize_fp4_dynamic_sfa_mse_fp16(
+                    o_fp16.data_ptr(), packed['packed'].data_ptr(),
+                    packed['sfb'].data_ptr(), packed['N'], packed['K'],
+                    True, 0)
+                if rc != 0:
+                    raise RuntimeError(
+                        "encoder attn O FP4 MSE quantization failed at "
+                        f"layer {l}: rc={rc}")
+                torch.cuda.synchronize()
+                self._enc_attn_fp4_weights[l] = {'o': packed}
+        logger.info("Pi05 FP4 encoder attention O projections quantized "
+                    "(%d layers)", len(self._enc_attn_fp4_weights))
+
     def _awq_scale_weight(self, W: torch.Tensor,
                            activation_amax: torch.Tensor | None = None,
                           ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -667,6 +721,10 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
             self._fp4_scratch_dict['p1_up_p4']    = self._fp4_p1_up.packed.data_ptr()
             self._fp4_scratch_dict['p1_up_sfa']   = self._fp4_p1_up.sfa.data_ptr()
             self._fp4_scratch_dict['p1_combiner'] = self.encoder_p1_combiner
+        if self.use_fp4_encoder_attn:
+            self._fp4_attn_scratch = FP4ActScratch(Se, De, device='cuda')
+            self._fp4_scratch_dict['attn_act'] = self._fp4_attn_scratch
+            self._fp4_scratch_dict['attn_variant'] = 7
         self._fp4_scratch_Se = Se
 
     # -------------------------------------------------------------------
@@ -823,7 +881,9 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                     stream=0, attn=self._attn,
                     fp4_layers=fp4_layers, fp4_weights=fp4_weights,
                     fp4_scratch=fp4_scratch,
-                    use_p1_split_gu=self.use_p1_split_gu)
+                    use_p1_split_gu=self.use_p1_split_gu,
+                    fp4_attn_weights=(self._enc_attn_fp4_weights
+                                      if self.use_fp4_encoder_attn else None))
             else:
                 encoder_forward(
                     self._gemm, fvk, enc_bufs, enc_weights, enc_dims,
@@ -850,7 +910,9 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                     stream=s_int, attn=self._attn,
                     fp4_layers=fp4_layers, fp4_weights=fp4_weights,
                     fp4_scratch=fp4_scratch,
-                    use_p1_split_gu=self.use_p1_split_gu)
+                    use_p1_split_gu=self.use_p1_split_gu,
+                    fp4_attn_weights=(self._enc_attn_fp4_weights
+                                      if self.use_fp4_encoder_attn else None))
             else:
                 encoder_forward(
                     self._gemm, fvk, enc_bufs, enc_weights, enc_dims,

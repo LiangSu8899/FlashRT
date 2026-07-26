@@ -28,7 +28,8 @@ def encoder_forward_with_fp4_subset(gemm, fvk, fvk_fp4, bufs, weights, dims,
                                      fp4_layers: set = None,
                                      fp4_weights: dict = None,
                                      fp4_scratch: dict = None,
-                                     use_p1_split_gu: bool = False):
+                                     use_p1_split_gu: bool = False,
+                                     fp4_attn_weights: dict = None):
     """Encoder forward with FP4 Gate+Up / Down on selected layers.
 
     When fp4_layers is empty / None, behaves identically to encoder_forward.
@@ -53,6 +54,11 @@ def encoder_forward_with_fp4_subset(gemm, fvk, fvk_fp4, bufs, weights, dims,
     fp4_layers = set(fp4_layers or ())
     if fp4_layers and (fp4_weights is None or fp4_scratch is None):
         raise ValueError("fp4_weights and fp4_scratch required when fp4_layers non-empty")
+    attn_fp4 = fp4_attn_weights or {}
+    if attn_fp4 and not fp4_layers:
+        raise ValueError(
+            "fp4_attn_weights requires the FP4 encoder scratch "
+            "(fp4_layers must be non-empty)")
 
     Se = dims['Se']
     D = dims['D']
@@ -88,6 +94,9 @@ def encoder_forward_with_fp4_subset(gemm, fvk, fvk_fp4, bufs, weights, dims,
         fg_fp16_ptr = fp4_scratch['fg_fp16']
         variant_gu = fp4_scratch['variant_gu']
         variant_dn = fp4_scratch['variant_dn']
+        if attn_fp4:
+            sc_at = fp4_scratch['attn_act']
+            attn_variant = fp4_scratch['attn_variant']
         # P1 split-GU scratch (only used when use_p1_split_gu=True)
         if use_p1_split_gu:
             p1_gate_p4   = fp4_scratch['p1_gate_p4']
@@ -106,7 +115,11 @@ def encoder_forward_with_fp4_subset(gemm, fvk, fvk_fp4, bufs, weights, dims,
         as_gu  = act_scales + (l * 4 + 2) * 4
         as_d   = act_scales + (l * 4 + 3) * 4
 
-        # 1. RMSNorm → FP8 (unchanged, QKV path always FP8)
+        aw_attn = attn_fp4.get(l)
+
+        # 1. RMSNorm → FP8 (unchanged, QKV path always FP8: 4-bit Q/K
+        # weights break the raw-cosine gate, see Pi05TorchFrontendThorFP4.
+        # _prepare_fp4_encoder_attn)
         #
         # NOTE: on paper, this step for layer l>=1 is redundant with the
         # previous layer's step 11 (same scale, unchanged x). However, the
@@ -145,10 +158,30 @@ def encoder_forward_with_fp4_subset(gemm, fvk, fvk_fp4, bufs, weights, dims,
                                         logits, attn_out,
                                         Se, Se, NH, HD, attn_scale, stream)
 
-            # 6. quantize attn→FP8 + O GEMM (unchanged)
-            fvk.quantize_fp8_static_fp16(attn_out, o_fp8, as_o, Se * D, stream)
-            fvk.cutlass_fp8_sq(o_fp8, weights['o_w'][l], fg,
-                               Se, D, D, alpha_host[l * 4 + 1], 0.0, stream)
+            # 6. quantize attn output + O GEMM (FP8 static scales, or
+            # dynamic NVFP4 with fp4_attn_weights).
+            if aw_attn is not None and 'o' in aw_attn:
+                rc = fvk_fp4.quantize_fp4_dynamic_sfa_fp16_vec(
+                    attn_out, sc_at.packed.data_ptr(),
+                    sc_at.sfa.data_ptr(), Se, D, False, stream)
+                if rc != 0:
+                    raise RuntimeError(
+                        f"encoder FP4 O quantize layer {l} failed rc={rc}")
+                rc = fvk_fp4.cutlass_fp4_gemm_variant(
+                    attn_variant,
+                    sc_at.packed.data_ptr(), sc_at.sfa.data_ptr(),
+                    aw_attn['o']['packed'].data_ptr(),
+                    aw_attn['o']['sfb'].data_ptr(),
+                    fg, Se, D, D, 1.0, 0.0, stream)
+                if rc != 0:
+                    raise RuntimeError(
+                        f"encoder FP4 O GEMM layer {l} failed rc={rc}")
+            else:
+                fvk.quantize_fp8_static_fp16(attn_out, o_fp8, as_o, Se * D,
+                                             stream)
+                fvk.cutlass_fp8_sq(o_fp8, weights['o_w'][l], fg,
+                                   Se, D, D, alpha_host[l * 4 + 1], 0.0,
+                                   stream)
 
             if is_fp4:
                 # ── FP4 path. Residual stream stays fp16.
