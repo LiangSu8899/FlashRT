@@ -54,15 +54,21 @@ class FusedNorm(GuardedSeam, torch.nn.Module):
 
 
 def bind_norm_fused(original: torch.nn.Module,
-                    calibration=None) -> FusedNorm:
-    """Bind a fused norm, refusing where there is nothing to collapse."""
+                    host_dtypes=None) -> FusedNorm:
+    """Bind a fused norm, refusing where there is nothing to collapse.
+
+    ``host_dtypes`` is the set of input dtypes this norm was observed with
+    during calibration — one observation, not a statistic. A host already
+    running the norm at a compute dtype has nothing for this structure to
+    collapse, and the refusal names the dtype so it reads as "not in this
+    form" rather than "not supported".
+    """
     if getattr(original, "weight", None) is None or \
             getattr(original, "bias", None) is None:
         raise ValueError("norm_fused: needs an affine norm (weight+bias)")
-    if calibration:
-        dtypes = {t.dtype for t in calibration}
-        if dtypes and torch.float32 not in dtypes:
-            raise ValueError(
-                "norm_fused: host already runs this norm at compute "
-                f"dtype ({dtypes}) — nothing to collapse")
+    if host_dtypes and torch.float32 not in set(host_dtypes):
+        raise ValueError(
+            "norm_fused: host already runs this norm at compute "
+            f"dtype ({sorted(str(d) for d in host_dtypes)}) — nothing "
+            "to collapse")
     return FusedNorm(original)

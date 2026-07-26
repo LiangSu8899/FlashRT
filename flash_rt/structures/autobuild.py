@@ -32,6 +32,7 @@ import torch
 
 from .discover import (Seam, _resolve, discover, group_families,
                        seam_weights)
+from .points import Collector, Point, resolve as resolve_points
 
 _FP8 = torch.float8_e4m3fn
 _FP8_CHAIN_MAX_ROWS = 256  # fp8 producer chain qualifies at denoise
@@ -74,6 +75,10 @@ class AutoPlan:
     #: anything. A seam that cannot be turned off cannot be measured.
     toggles: list[tuple[Callable[[], None], Callable[[], None]]] = field(
         default_factory=list)
+    #: ``flash_rt.core.precision_spec.ModelPrecisionSpec`` for the scales
+    #: this plan baked in — the repo's introspection format, not a private
+    #: one, so ``plan.precision_spec`` reads like ``rt.precision_spec``
+    precision_spec: Any = None
 
     def enable_routed(self) -> None:
         for on, _ in self.toggles:
@@ -91,22 +96,27 @@ class AutoPlan:
         self.observed.clear()
 
 
-def _amax(cap) -> float:
-    """The seam's activation amax over every call it saw.
+def _spec_points(seam) -> tuple[str, ...]:
+    """The point names this seam's structure spec declares."""
+    from .registry import load
 
-    Accumulated online during calibration, so it does not depend on how
-    many activations were kept — a run that holds four of them still
-    scales from all of them. Falls back to the held ones for a cap that
-    predates the accumulator (a loaded receipt, a hand-built dict).
+    try:
+        return tuple(load(seam.structure).calibration.get("points", ()))
+    except Exception:                                   # noqa: BLE001
+        return ()
+
+
+def _consumer_point(seam) -> tuple[str, str]:
+    """Where a negotiated consumer's input is observed.
+
+    The producer's output *is* this tensor, so one amax serves both sides
+    of the chain — which is why the pair can share a static scale at all.
     """
-    value = cap.get("amax")
-    if value is not None:
-        return float(value)
-    return max(t.float().abs().max().item() for t in cap["x"])
-
-
-def _rows(t: torch.Tensor) -> int:
-    return int(t.reshape(-1, t.shape[-1]).shape[0])
+    if seam.structure == "qkv_pack":
+        return (seam.path + "." + (seam.pack_attrs or ("q_proj",))[0], "x")
+    if seam.structure == "decoder_ffn":
+        return (seam.path, "x_after_norm")
+    return (seam.path, "x")
 
 
 def auto_swaps(
@@ -118,51 +128,48 @@ def auto_swaps(
                                    "linear_proj", "norm_fused",
                                    "attention_core", "decoder_block"),
     negotiate_fp8: bool = True,
-    frames: int | None = None,
-    samples: Iterable[Any] | None = None,
-    keep_samples: int | None = None,
+    observations: Iterable[Any] | None = None,
+    percentile: float = 99.9,
+    max_samples: int | None = None,
     verbose: bool = False,
 ) -> AutoPlan:
     """Discover, calibrate in one pass, and bind every applicable seam.
 
-    Calibration comes from running the host, and there are three ways to
-    say how much of it to run. They are one axis, not three interfaces:
-    ``forward`` is always "run the host once".
+    The calibration arguments are the repo's, not this layer's: the names,
+    the defaults and the meaning of ``percentile`` / ``max_samples`` /
+    ``observations`` are ``flash_rt.api.FlashRT.calibrate``'s, and the
+    reduction is ``flash_rt.core.calibration.accumulate_amax``. A second
+    vocabulary for the same thing is the one thing this layer must not
+    add.
 
-        auto_swaps(model, forward)                    # one frame
-        auto_swaps(model, forward, frames=8)          # eight, the closure
-                                                      # advancing its own data
-        auto_swaps(model, [f0, f1, f2])               # one thunk per frame
-        auto_swaps(model, feed, samples=dataset)      # feed(sample) per sample
+        auto_swaps(model, forward)                        # one sample
+        auto_swaps(model, [f0, f1, f2])                    # one thunk each
+        auto_swaps(model, feed, observations=dataset)      # feed(obs) per obs
+        auto_swaps(model, feed, observations=ds, percentile=95.0)
 
-    ``samples`` is any iterable; with it, ``forward`` takes one sample.
-    Nothing here is bound to a particular loader type, because the shape
-    of an observation is the host's business.
+    ``forward`` is always "run the host once"; with ``observations`` it
+    takes one observation. That indirection is this layer's only
+    difference from a frontend's ``calibrate``, and it exists because a
+    host here is an arbitrary ``nn.Module`` with no common observation
+    contract — not because the calibration standard differs.
 
-    ``frames`` defaults to one, and to the whole of ``samples`` when a
-    sample source is given.
-
-    Static scales are accumulated over *every* call the seam sees, not
-    over the samples that are kept: the running amax is exact regardless
-    of ``keep_samples``, which only bounds how many activations are held
-    for the parity self-check and the statistics an implementation
-    derives itself. It defaults to unbounded at one frame — exactly the
-    behaviour before this argument existed — and to a cap above it, so
-    that asking for more frames costs more time and not more memory.
+    On ``percentile``: it reduces *across* samples. Within one sample the
+    reduction is a max over every call, which is required rather than
+    chosen — see ``docs/calibration.md`` §4.2. And note §10's own caveat
+    that at small N a 99.9 percentile barely clips at all (it interpolates
+    between the top two ranks); with N ≤ 64 and suspected outliers, pass a
+    lower one.
     """
 
     def say(msg: str) -> None:
         if verbose:
             print(f"[autobuild] {msg}", flush=True)
 
-    thunks, source = _calibration_thunks(forward, frames, samples)
-    # unbounded at one frame is exactly the behaviour that existed before
-    # this could be bounded at all, so asking for one frame changes no
-    # number anywhere
-    hold = keep_samples
-    if hold is None:
-        hold = None if len(thunks) == 1 else _HOLD_PER_SEAM
+    thunks, source = _calibration_thunks(forward, None, observations)
+    if max_samples is not None and len(thunks) > max_samples:
+        thunks = thunks[:max_samples]
     plan_notes_calibration: dict[str, Any] = {}
+    plan_refusals: list[tuple[str, str]] = []
 
     seams = discover(model, structures)
     # a packed group owns its q/k/v; linear_proj keeps only what the
@@ -178,27 +185,22 @@ def auto_swaps(
         return AutoPlan()
 
     # ---- one calibration pass, structure-aware capture ----
+    # Activation scales go through the house two-level statistic: a max
+    # over every call inside one sample (docs/calibration.md §4.2 — a
+    # flow-matching host runs every step inside one forward and per-step
+    # scales crashed the compiler), then accumulate_amax's percentile
+    # across samples. Nothing holds an activation tensor for this: each
+    # point is one float, measured where the spec says it is
+    # (:mod:`.points`).
     caps: dict[str, dict[str, Any]] = {}
     hooks = []
-
-    def cap_input(path):
-        def hook(module, args, kwargs, out):
-            x = args[0] if args else next(iter(kwargs.values()))
-            cap = caps[path]
-            held = cap.setdefault("x", [])
-            seen = cap.get("seen", 0)
-            cap["seen"] = seen + 1
-            # the scale follows every call; the held activations only
-            # have to be enough to check the result and to derive the
-            # statistics an impl computes for itself
-            amax = x.detach().float().abs().max()
-            cap["amax"] = (amax if "amax" not in cap
-                           else torch.maximum(cap["amax"], amax))
-            if hold is None or len(held) < hold:
-                held.append(x.detach())
-            cap["rows"] = _rows(x)
-            return None
-        return hook
+    all_points: list[Point] = []
+    for seam in seams:
+        try:
+            all_points.extend(resolve_points(seam, _spec_points(seam)))
+        except ValueError as refusal:
+            plan_refusals.append((seam.path, str(refusal)[:120]))
+    collector = Collector(points=all_points)
 
     # observed call order across the whole calibration pass. Anything
     # that has to know which seam runs first (a stream-scoped buffer
@@ -225,6 +227,10 @@ def auto_swaps(
             return None
         return hook
 
+    # the amax points are hooked by the collector; only the two
+    # content/observation captures need their own hooks here, and neither
+    # is a statistic: a step table is memoised host output, a return
+    # convention is one boolean
     for seam in seams:
         caps[seam.path] = {}
         target = _resolve(model, seam.path)
@@ -232,19 +238,9 @@ def auto_swaps(
             hooks.append(target.register_forward_hook(
                 cap_shape(seam.path), with_kwargs=True))
         elif seam.structure == "adaln_producer":
-            # the norm's own input gives rows; the cond projection gives
-            # the (cond, style) pairs the table is built from
-            hooks.append(target.register_forward_hook(
-                cap_input(seam.path), with_kwargs=True))
             hooks.append(getattr(target, seam.cond_attr)
                          .register_forward_hook(cap_cond(seam.path)))
-        elif seam.structure == "qkv_pack":
-            first = getattr(target, seam.pack_attrs[0])
-            hooks.append(first.register_forward_hook(
-                cap_input(seam.path), with_kwargs=True))
-        else:
-            hooks.append(target.register_forward_hook(
-                cap_input(seam.path), with_kwargs=True))
+    hooks.extend(collector.hooks(lambda path: _resolve(model, path)))
 
     if hooks:
         # the calibration pass is a transaction over the host: if a thunk
@@ -257,15 +253,20 @@ def auto_swaps(
             with torch.no_grad():
                 for thunk in thunks:
                     thunk()
+                    # one vector per sample, so the percentile across them
+                    # is possible at all
+                    collector.end_sample()
         finally:
             for h in hooks:
                 h.remove()
-        plan_notes_calibration = {
-            "frames": len(thunks), "source": source,
-            "stat": "amax", "keep_samples": hold,
-        }
-        say(f"calibration pass done ({len(thunks)} frame(s) from "
-            f"{source}, scale stat amax over every call)")
+        plan_notes_calibration = dict(
+            collector.reduce(percentile, verbose=verbose,
+                             label=f"structures_N{len(thunks)}"),
+            source=source)
+        say(f"calibration pass done ({len(thunks)} sample(s) from "
+            f"{source}, {plan_notes_calibration['points']} point(s), "
+            f"{plan_notes_calibration['method']}"
+            + (f" p={percentile}" if len(thunks) > 1 else "") + ")")
 
     # ---- fp8 seam negotiation: the load-bearing structure combination.
     # A single kernel need not win alone (fp8 qkv at M=50 is marginal,
@@ -275,6 +276,7 @@ def auto_swaps(
     # producer→pack pair together with one shared act scale wherever a
     # producer feeds a pack under the same parent layer. ----
     act_scales: dict[str, torch.Tensor] = {}
+    chain_rows: dict[str, int] = {}
     negotiated: dict[str, dict[str, Seam]] = {}
     if negotiate_fp8:
         by_parent: dict[str, dict[str, Seam]] = {}
@@ -316,15 +318,18 @@ def auto_swaps(
             for p_slot, c_slot in pairs:
                 if p_slot not in g or c_slot not in g:
                     continue
-                c_cap = caps.get(g[c_slot].path, {})
-                rows = c_cap.get("rows", 1 << 30)
-                if not c_cap.get("x") or rows > _FP8_CHAIN_MAX_ROWS:
+                c_path, c_name = _consumer_point(g[c_slot])
+                amax = collector.amax(c_path, c_name)
+                rows_seen = collector.row_profile(c_path, c_name)
+                rows = rows_seen[len(rows_seen) // 2] if rows_seen else 1 << 30
+                if amax is None or rows > _FP8_CHAIN_MAX_ROWS:
                     continue
                 # the consumer's input == the producer's output; its amax
                 # is the one static scale both sides share
                 keep[p_slot], keep[c_slot] = g[p_slot], g[c_slot]
                 act_scales[f"{lay}|{c_slot}"] = torch.tensor(
-                    [max(_amax(c_cap) / 448.0, 1e-8)], device=dev)
+                    [max(amax / 448.0, 1e-8)], device=dev)
+                chain_rows[f"{lay}|{c_slot}"] = rows
             if keep:
                 negotiated[lay] = keep
 
@@ -342,13 +347,13 @@ def auto_swaps(
                 continue
             p_seam, c_seam = g[p_slot], g[c_slot]
             p_cap = caps.get(p_seam.path, {})
-            c_cap = caps.get(c_seam.path, {})
-            if not (p_cap.get("pairs") and c_cap.get("x")):
+            if not p_cap.get("pairs"):
                 continue
             try:
                 pair = _bind_negotiated(
-                    model, p_seam, c_seam, p_cap, c_cap,
-                    act_scales[f"{lay}|{c_slot}"], plan)
+                    model, p_seam, c_seam, p_cap, collector,
+                    act_scales[f"{lay}|{c_slot}"],
+                    chain_rows[f"{lay}|{c_slot}"], plan)
             except (ValueError, RuntimeError) as refusal:
                 plan.notes.setdefault("refused", []).append(
                     (f"{lay} [{c_slot} chain]", str(refusal)[:80]))
@@ -367,7 +372,7 @@ def auto_swaps(
             cap = caps.get(seam.path, {})
             try:
                 bound = _bind_auto(model, seam, cap, plan, act_scales,
-                                   negotiate_fp8)
+                                   negotiate_fp8, points=collector)
             except (ValueError, RuntimeError) as refusal:
                 plan.notes.setdefault("refused", []).append(
                     (seam.path, str(refusal)[:80]))
@@ -454,6 +459,12 @@ def auto_swaps(
         # how it was produced: a parity band means something different
         # depending on how much of the distribution it was scaled from
         plan.notes["calibration"] = plan_notes_calibration
+        # and the receipt itself is the repo's, so a structures attachment
+        # answers ``precision_spec`` the same way a frontend does
+        from .points import precision_spec as _spec
+        plan.precision_spec = _spec(collector, plan_notes_calibration)
+    if plan_refusals:
+        plan.notes.setdefault("refused", []).extend(plan_refusals)
     say(f"bound {len(plan.swaps)} seam(s), "
         f"{len(plan.notes.get('refused', []))} refused")
     return plan
@@ -593,37 +604,73 @@ def _alias_kv_region(plan, path: str, sublayer) -> None:
     # on the impl for a host where the arithmetic is not launch-bound.
 
 
-def _bind_auto(model, seam, cap, plan, act_scales, negotiate_fp8):
-    """Route one seam to its impl with the captured calibration."""
-    from .handle import get
+def _bind_auto(model, seam, cap, plan, act_scales, negotiate_fp8,
+               points=None):
+    """Route one seam to its impl with the calibrated scales.
 
-    if seam.structure in ("decoder_ffn", "vision_ffn"):
-        if not cap.get("x"):
+    ``points`` is the reduced collector: every scale an impl needs is one
+    float looked up by (path, spec point name). No activation tensors are
+    threaded through here, because none are needed — the two scales that
+    used to be recomputed from held inputs are measured at the GEMM whose
+    input they are (:mod:`.points`).
+    """
+    from .impls.decoder_ffn import fp8_static as ffn_impl
+    from .impls.vision_ffn import fp8_static as vis_impl
+
+    def scale(name, path=None):
+        return None if points is None else points.scale(path or seam.path,
+                                                        name)
+
+    if seam.structure == "decoder_ffn":
+        in_s = scale("x_after_norm")
+        hid_s = scale("act_after_mul", seam.path + ".down_proj")
+        if in_s is None or hid_s is None:
             return None
-        h = get(seam.structure)
-        return h.bind(_resolve(model, seam.path), cap["x"], gate_cos=0.0)
+        return ffn_impl.bind_mlp_seam(
+            seam_weights(model, seam), variant=seam.variant,
+            input_scale=in_s, hidden_scale=hid_s,
+            original=_resolve(model, seam.path))
+
+    if seam.structure == "vision_ffn":
+        fc2 = (seam.fc_attrs or ("fc1", "fc2"))[1]
+        in_s = scale("x_after_norm")
+        hid_s = scale("hidden_after_act", seam.path + "." + fc2)
+        if in_s is None or hid_s is None:
+            return None
+        return vis_impl.bind_mlp_seam(
+            seam_weights(model, seam), input_scale=in_s,
+            hidden_scale=hid_s, original=_resolve(model, seam.path))
 
     if seam.structure == "norm_fused":
         from .impls.norm_fused import bind_norm_fused
-        return bind_norm_fused(_resolve(model, seam.path),
-                               calibration=cap.get("x"))
+        return bind_norm_fused(
+            _resolve(model, seam.path),
+            host_dtypes=(None if points is None
+                         else points.seen_dtypes(seam.path, "x")))
 
     if seam.structure == "linear_proj":
-        if not cap.get("x"):
+        in_s = scale("x")
+        if in_s is None:
             return None
         from .impls.linear_proj import fp8_static as proj_impl
         return proj_impl.bind_proj_seam(
-            seam_weights(model, seam), calibration=cap["x"],
+            seam_weights(model, seam), input_scale=in_s,
+            row_profile=points.row_profile(seam.path, "x"),
             original=_resolve(model, seam.path))
 
     if seam.structure == "qkv_pack":
         from .impls.qkv_pack import bind_attn_block, bind_qkv_pack
-        if not cap.get("x"):
+        first = (seam.pack_attrs or ("q_proj",))[0]
+        amax = None if points is None else points.amax(
+            seam.path + "." + first, "x")
+        if amax is None:
             return None
         block = _resolve(model, seam.path)
+        rows = points.row_profile(seam.path + "." + first, "x")
+        cap = dict(cap or {}, rows=rows[len(rows) // 2] if rows else 1)
         act_scale = torch.tensor(
-            [max(_amax(cap) / 448.0, 1e-8)],
-            device=getattr(block, seam.pack_attrs[0]).weight.device)
+            [max(amax / 448.0, 1e-8)],
+            device=getattr(block, first).weight.device)
         if seam.variant.get("bind") == "module":
             # the whole block: packed projections *and* the attention
             # compute dtype (hosts that run SDPA in fp32 pay for it)
@@ -686,7 +733,8 @@ def _eager(module):
     return _Eager(module)
 
 
-def _bind_negotiated(model, p_seam, k_seam, p_cap, c_cap, scale, plan):
+def _bind_negotiated(model, p_seam, k_seam, p_cap, points, scale, rows,
+                     plan):
     """Bind an fp8 producer and the pack it feeds as one chain.
 
     This is the combination the structure layer exists for: neither half
@@ -702,35 +750,34 @@ def _bind_negotiated(model, p_seam, k_seam, p_cap, c_cap, scale, plan):
     consumer = _resolve(model, k_seam.path)
     key = _stream_key(p_cap["pairs"])
     loc = plan.notes.setdefault("_locators", {}).get(key)
-    dim, form = _adaln_form(p_cap)
+    dim, form = _adaln_form(p_cap, points, p_seam)
     prod = bind_adaln_producer(
-        norm, p_cap["pairs"], act_scale=scale,
-        rows=p_cap.get("rows") or c_cap["rows"],
+        norm, p_cap["pairs"], act_scale=scale, rows=rows,
         dim=dim, locator=loc, norm=form)
     plan.notes["_locators"][key] = prod.locator
 
     swaps = {p_seam.path: prod}
     if k_seam.structure == "decoder_ffn":
         from .impls.decoder_ffn import fp8_static as ffn_impl
-        # the calibration samples are the BF16 activations the host
-        # produced; the fp8 entry needs them in the seam dtype, and the
-        # scale is the one the producer upstream will quantize with
+        # the input scale is the one the producer upstream will quantize
+        # with — the same number, because the producer's output is this
+        # consumer's input; the hidden scale is measured at the down
+        # projection whose input it is
         w = seam_weights(model, k_seam)
         bound = ffn_impl.bind_mlp_seam(
             w, variant={**k_seam.variant, "in_dtype": "fp8_static"},
-            calibration_normed=[t for t in c_cap["x"]],
+            input_scale=float(scale.item()),
+            hidden_scale=points.scale(k_seam.path + ".down_proj",
+                                      "act_after_mul"),
             original=consumer)
         swaps[k_seam.path] = bound
         return swaps
     mods = [getattr(consumer, a) for a in k_seam.pack_attrs]
-    parts = bind_qkv_pack(mods, scale, rows=c_cap["rows"],
+    parts = bind_qkv_pack(mods, scale, rows=rows,
                           in_dtype="fp8_static")
     swaps.update({k_seam.path + "." + a: m
                   for a, m in zip(k_seam.pack_attrs, parts)})
     return swaps
-
-
-_HOLD_PER_SEAM = 16     # bound for multi-frame runs; see auto_swaps
 
 
 def _calibration_thunks(forward, frames, samples):
@@ -756,14 +803,15 @@ def _calibration_thunks(forward, frames, samples):
         if frames is not None and frames != len(forward):
             raise ValueError(
                 f"auto_swaps: {len(forward)} thunk(s) given but "
-                f"frames={frames}; the thunks decide")
+                "observations= and a thunk list are alternatives, "
+                "not a pair; the thunks decide")
         return list(forward), "thunks"
     if not callable(forward):
         raise ValueError("auto_swaps: forward must be callable")
     return [forward] * max(1, frames or 1), "forward"
 
 
-def _adaln_form(cap) -> tuple[int, str]:
+def _adaln_form(cap, points, seam) -> tuple[int, str]:
     """Read the producer's width and form off the calibration.
 
     Both were assumed before: the form was hard-coded to rms and the
@@ -777,12 +825,11 @@ def _adaln_form(cap) -> tuple[int, str]:
     The norm's own input says how wide it is, and the ratio to the style
     says which form it is. Neither is a guess.
     """
-    samples = cap.get("x") or []
-    if not samples:
+    dim = points.width(seam.path, "x")
+    if dim is None:
         raise ValueError(
-            "adaln_producer: no captured input, cannot tell the form "
-            "from the style width alone")
-    dim = int(samples[0].shape[-1])
+            "adaln_producer: the norm's own input was never observed, so "
+            "the form cannot be told from the style width alone")
     style_width = int(cap["pairs"][0][1].shape[-1])
     if style_width == 3 * dim:
         return dim, "rms"           # scale, shift, gate

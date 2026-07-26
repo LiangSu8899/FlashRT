@@ -286,13 +286,25 @@ def bind_mlp_seam(
     weights: Mapping[str, torch.Tensor],
     *,
     variant: Mapping[str, str],
-    calibration_normed: Sequence[torch.Tensor],
+    input_scale: float,
+    hidden_scale: float,
     original: torch.nn.Module | None = None,
     eps: float = 1e-6,
 ) -> FusedGeGluMlp:
-    """Bind the MLP-seam slice: calibration inputs are normed activations."""
-    _, act = _activation(variant)
-    input_scale, hidden_scale = _calibrate_scales(
-        calibration_normed, weights["w_gate"], weights["w_up"], act)
-    bound = _build(weights, variant, input_scale, hidden_scale, eps)
+    """Bind the MLP-seam slice from two already-calibrated scales.
+
+    The scales arrive measured, not derived: ``input_scale`` is the amax at
+    this MLP's input and ``hidden_scale`` the amax at its down
+    projection's input — which is exactly the gated activation this kernel
+    quantises. Recomputing the second one here would mean keeping the
+    seam's inputs alive to run gate/up over them again, and the amax it
+    would arrive at is the one the host already produced.
+
+    Both are per-tensor FP8 scales (amax/448), reduced across calibration
+    samples by the caller through ``flash_rt.core.calibration``.
+    """
+    dev = weights["w_gate"].device
+    bound = _build(weights, variant,
+                   torch.tensor(float(input_scale), device=dev),
+                   torch.tensor(float(hidden_scale), device=dev), eps)
     return FusedGeGluMlp(bound, original=original)

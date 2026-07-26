@@ -208,18 +208,21 @@ def _form_for(bias: torch.Tensor | None, in_dtype: str,
 def bind_proj_seam(
     weights: Mapping[str, torch.Tensor],
     *,
-    calibration: Sequence[torch.Tensor],
+    input_scale: float,
+    row_profile: Sequence[int],
     original: torch.nn.Module | None = None,
     in_dtype: str = "bf16",
 ) -> FusedLinearProj:
     """Bind one projection: ``weights['w']`` is checkpoint-layout [N, K].
 
-    ``calibration``: real inputs of the projection. Work-based
-    qualification uses the median calibration M, against the floor of
-    the form this projection actually takes.
+    ``input_scale`` is the calibrated per-tensor FP8 scale at this
+    projection's input. ``row_profile`` is the row counts that input
+    arrived with across calibration — a shape observation, not a
+    statistic, and the median of it is what the work-based form
+    qualification is measured against.
     """
-    if not calibration:
-        raise ValueError("calibration must be non-empty")
+    if not row_profile:
+        raise ValueError("row_profile must be non-empty")
     w = weights["w"]
     n, k = w.shape
     for name, dim in (("K", k), ("N", n)):
@@ -227,8 +230,7 @@ def bind_proj_seam(
         if not lo <= dim <= hi:
             raise ValueError(f"{name}={dim} outside support envelope")
     raw_bias = weights.get("b")
-    ms = sorted(int(t.reshape(-1, t.shape[-1]).shape[0])
-                for t in calibration)
+    ms = sorted(int(m) for m in row_profile)
     m_med = ms[len(ms) // 2]
     work = float(m_med) * n * k
     form = _form_for(raw_bias, in_dtype, work)
@@ -244,16 +246,13 @@ def bind_proj_seam(
     device = w.device
     w_scale = _amax_scale(w)
     w_fp8 = (w.float() / w_scale).clamp(-_FP8_MAX, _FP8_MAX).to(_FP8)
-    amax = torch.zeros((), device=device)
-    for t in calibration:
-        amax = torch.maximum(amax, t.float().abs().max().to(device))
-    input_scale = (amax / _FP8_MAX).clamp(min=1e-8)
+    scale = torch.tensor(float(input_scale), device=device)
     bias = raw_bias
     if bias is None:
         bias = torch.zeros(n, device=device, dtype=torch.bfloat16)
     else:
         bias = bias.detach().to(torch.bfloat16)
-    bound = FusedLinearProj(w_fp8, bias, input_scale.view(1),
+    bound = FusedLinearProj(w_fp8, bias, scale.view(1),
                             w_scale.view(1), original=original, form=form)
     for m in set(ms):  # pre-allocate per calibrated M: keeps the hot
         bound._bufs[m] = (  # path allocation-free (graph/compile safe)

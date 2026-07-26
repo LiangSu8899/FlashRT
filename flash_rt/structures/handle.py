@@ -51,6 +51,7 @@ class StructureHandle:
         norm: torch.nn.Module | None = None,
         residual: torch.Tensor | Sequence[torch.Tensor] | None = None,
         gate_cos: float = 0.999,
+        percentile: float = 99.9,
     ) -> torch.nn.Module:
         """Build a gated drop-in replacement for ``module``.
 
@@ -117,9 +118,37 @@ class StructureHandle:
                 "stage pipelines go through the capture door")
         var.update(variant or {})
 
-        bound = impl.bind_mlp_seam(weights, variant=var,
-                                   calibration_normed=samples,
-                                   original=module)
+        # the explicit door owns real samples, so it measures the seam's
+        # points by running the host module under the same hooks the
+        # distribution layer uses — one path for what a point is and where
+        # it lives, whichever door asked
+        from .points import Collector, Point
+
+        points = [Point("x_after_norm", "", "input")]
+        second = ("down_proj" if self.name == "decoder_ffn"
+                  else (fc_attrs[1] if self.name == "vision_ffn" else None))
+        second_name = ("act_after_mul" if self.name == "decoder_ffn"
+                       else "hidden_after_act")
+        if second is not None:
+            points.append(Point(second_name, second, "input"))
+        collector = Collector(points=points)
+        handles = collector.hooks(
+            lambda path: module if not path else getattr(module, path))
+        try:
+            with torch.no_grad():
+                for sample in samples:
+                    module(sample.to(device))
+                    collector.end_sample()
+        finally:
+            for handle in handles:
+                handle.remove()
+        collector.reduce(percentile)
+        kwargs = {} if self.name == "vision_ffn" else {"variant": var}
+        bound = impl.bind_mlp_seam(
+            weights,
+            input_scale=collector.scale("", "x_after_norm"),
+            hidden_scale=collector.scale(second or "", second_name),
+            original=module, **kwargs)
 
         worst = 1.0
         with torch.no_grad():

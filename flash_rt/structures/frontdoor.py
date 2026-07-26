@@ -266,9 +266,9 @@ def attach(
     forward: Callable[[], Any] | Sequence[Callable[[], Any]],
     *,
     structures: tuple[str, ...] = ALL_STRUCTURES,
-    frames: int | None = None,
-    samples: Iterable[Any] | None = None,
-    keep_samples: int | None = None,
+    observations: Iterable[Any] | None = None,
+    percentile: float = 99.9,
+    max_samples: int | None = None,
     output: Callable[[], Any] | None = None,
     output_kind: str = "auto",
     floors: Mapping[str, float] | None = None,
@@ -280,8 +280,9 @@ def attach(
 ) -> Plan:
     """Discover, calibrate, gate and activate structures in one call.
 
-    ``forward`` runs the host once; ``frames`` / ``samples`` widen the
-    calibration exactly as in :func:`~flash_rt.structures.auto_swaps`.
+    ``forward`` runs the host once; ``observations`` / ``percentile`` /
+    ``max_samples`` are the repo's calibration arguments and mean exactly
+    what they mean in ``flash_rt.api.FlashRT.calibrate``.
 
     ``output_kind`` picks how accuracy is measured — ``"values"`` for a
     host whose output is the answer, ``"distribution"`` for one whose
@@ -315,9 +316,9 @@ def attach(
     band_floors = dict(floors or DEFAULT_FLOORS[kind])
 
     # ---- bind: one path, the same one the plain call uses --------------
-    plan = auto_swaps(model, forward, structures=structures, frames=frames,
-                      samples=samples, keep_samples=keep_samples,
-                      verbose=verbose)
+    plan = auto_swaps(model, forward, structures=structures,
+                      observations=observations, percentile=percentile,
+                      max_samples=max_samples, verbose=verbose)
     if not plan.swaps:
         plan.revert_all()
         return Plan({}, {}, {"digest": "none", "seams": 0,

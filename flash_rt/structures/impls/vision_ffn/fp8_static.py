@@ -227,15 +227,20 @@ def bind(
 def bind_mlp_seam(
     weights: Mapping[str, torch.Tensor],
     *,
-    variant: Mapping[str, str],
-    calibration_normed: Sequence[torch.Tensor],
+    input_scale: float,
+    hidden_scale: float,
     original: torch.nn.Module | None = None,
     eps: float = 1e-6,
 ) -> FusedGeluMlp:
-    """Bind the MLP-seam slice: calibration inputs are normed activations."""
-    if variant.get("activation", "gelu") != "gelu":
-        raise ValueError("vision_ffn fp8_static supports gelu only")
-    input_scale, hidden_scale = _calibrate(
-        calibration_normed, weights["w_fc1"], weights["b_fc1"])
-    bound = _build(weights, input_scale, hidden_scale, eps)
+    """Bind the MLP-seam slice from two already-calibrated scales.
+
+    ``input_scale`` is the amax at this MLP's input, ``hidden_scale`` the
+    amax at its second projection's input — which is the post-activation
+    hidden this kernel quantises. Measured where they are, not recomputed
+    from kept inputs.
+    """
+    dev = weights["w_fc1"].device
+    bound = _build(weights,
+                   torch.tensor(float(input_scale), device=dev),
+                   torch.tensor(float(hidden_scale), device=dev), eps)
     return FusedGeluMlp(bound, original=original)
