@@ -41,14 +41,15 @@ import json
 import pathlib
 import statistics
 import time
+import warnings
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import torch
 
 from .autobuild import AutoPlan, _layer_of, auto_swaps
-from .gates import (DEFAULT_FLOORS, band_of, infer_output_kind, metrics_for,
-                    passes)
+from .gates import (DEFAULT_FLOORS, band_note, band_of, infer_output_kind,
+                    metrics_for, passes)
 from .swap import AttachHandle as _AttachHandle, attach as _swap_attach
 
 #: the full catalog, which is what "one call" has to mean
@@ -324,6 +325,7 @@ def attach(
         return Plan({}, {}, {"digest": "none", "seams": 0,
                              "output_kind": kind}, _plan=plan)
 
+    calibration = plan.notes.get("calibration") or {}
     groups = _gate_groups(plan)
     say(f"{len(plan.swaps)} bound seam(s) in {len(groups)} gate unit(s): "
         + ", ".join(f"{k}×{len(v)}" for k, v in sorted(groups.items())))
@@ -348,9 +350,12 @@ def attach(
                 metrics = metrics_for(kind, scored(), want)
                 stat["metrics"] = _round(metrics)
                 stat["band"] = band_of(metrics, kind)
+                stat["band_note"] = band_note(metrics, kind, calibration)
+                _say_band(name, stat["band"], stat["band_note"], say)
                 ok, why = passes(metrics, band_floors)
                 if not ok:
-                    stat["outcome"], stat["reason"] = "refused", why
+                    stat["outcome"] = "refused"
+                    stat["reason"] = f"{why} (caller floor)"
                     continue
             # read before the timing loop: it is this unit's own scoring
             # forward that the accuracy number came from
@@ -413,6 +418,10 @@ def attach(
             e2e_final = timing
             e2e_final["metrics"] = _round(metrics)
             e2e_final["band"] = band_of(metrics, kind) if metrics else "n/a"
+            if metrics:
+                e2e_final["band_note"] = band_note(metrics, kind, calibration)
+                _say_band("e2e", e2e_final["band"],
+                          e2e_final["band_note"], say)
             say(f"active: {len(winners)} seam(s), "
                 f"{timing['base_ms']:.2f} -> {timing['ms']:.2f} ms "
                 f"({timing['speedup']:.3f}x, spread {timing['spread']:.3f})"
@@ -441,6 +450,23 @@ def attach(
         json.dumps(receipt, sort_keys=True, default=str).encode()
     ).hexdigest()
     return Plan(winners, stats, receipt, _handle=handle, _plan=plan)
+
+
+def _say_band(where: str, band: str, note: str, say) -> None:
+    """Report the band; say it out loud when it is the one to look at.
+
+    A ``low`` band is not a refusal — see :mod:`.gates`. It is the caller's
+    call, so it has to reach the caller rather than sit in a receipt nobody
+    opens.
+    """
+    say(f"{where}: {note}")
+    if band == "low":
+        warnings.warn(
+            f"structures: {where} is in the low accuracy band — {note}. "
+            "This is reported, not refused: whether it is acceptable "
+            "depends on the deployment. Pass floors={...} to make it a "
+            "hard requirement, or widen the calibration set.",
+            RuntimeWarning, stacklevel=3)
 
 
 def _round(metrics: Mapping[str, Any]) -> dict[str, Any]:

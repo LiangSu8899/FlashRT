@@ -121,12 +121,23 @@ def parity_metrics(got: torch.Tensor, want: torch.Tensor) -> dict[str, float]:
 
 OUTPUT_KINDS = ("values", "distribution")
 
-#: parity floors per output kind. Per the shipping band: 0.99 is the hard
-#: floor and 0.99-0.999 is a WARN band that passes with the calibration
-#: method recorded next to it.
+#: Band edges for the headline accuracy metric. ``>= BAND_PASS`` is clean,
+#: ``>= BAND_WARN`` is the recorded WARN band, and below that is ``low``.
+#:
+#: ``low`` warns; it does not refuse. Low-precision execution is
+#: increasingly the intent rather than a defect — a W4A4 or MXFP4 host sits
+#: here by design, and a layer that hard-refused at a fixed cosine would be
+#: deciding something only the caller can. So the band, the number and the
+#: calibration method are reported and said out loud, and whether that is
+#: acceptable belongs to the deployment.
+BAND_PASS, BAND_WARN = 0.999, 0.995
+
+#: no hard accuracy floor by default, for the reason above. Pass ``floors=``
+#: to impose one — that is the caller stating a requirement, which is the
+#: only place such a number can honestly come from.
 DEFAULT_FLOORS: dict[str, dict[str, float]] = {
-    "values": {"cosine": 0.99},
-    "distribution": {"top1_agreement": 0.99, "last_position_cosine": 0.99},
+    "values": {},
+    "distribution": {},
 }
 
 
@@ -177,6 +188,7 @@ def distribution_metrics(got: torch.Tensor,
         "top1_agreement": float(top1),
         "last_position_cosine": float(last),
         "kl_per_token": float(kl),
+        "max_abs": float((got_f - want_f).abs().max()),
         "positions": int(flat_got.shape[0]),
         # kept as evidence, deliberately not thresholded: this is the
         # number whose length dependence is the reason for this function
@@ -218,21 +230,44 @@ def passes(metrics: Mapping[str, float],
     return True, ""
 
 
-def band_of(metrics: Mapping[str, float], kind: str) -> str:
-    """``pass`` / ``warn`` / ``fail`` for the headline metric of ``kind``.
+def headline(kind: str) -> str:
+    """The metric a band is read off for this output kind."""
+    return "top1_agreement" if kind == "distribution" else "cosine"
 
-    The WARN band exists because a static per-tensor scale calibrated
-    from one frame is a workload's parity, not a host's: the band is
-    recorded next to the calibration method rather than collapsed into a
-    yes or no.
+
+def band_of(metrics: Mapping[str, float], kind: str) -> str:
+    """``pass`` / ``warn`` / ``low`` for the headline metric of ``kind``.
+
+    None of the three is a refusal. A static per-tensor scale calibrated
+    from a handful of frames gives a workload's parity, not a host's, and
+    at four-bit weights the honest number is simply lower — so the band is
+    recorded next to the calibration method and the sample count rather
+    than collapsed into a yes or no. ``low`` is the band a caller should
+    look at before deploying, not one this layer rejects for them.
     """
-    key = ("top1_agreement" if kind == "distribution" else "cosine")
-    value = metrics.get(key)
+    value = metrics.get(headline(kind))
     if value is None:
         return "unknown"
-    if value < 0.99:
-        return "fail"
-    return "warn" if value < 0.999 else "pass"
+    if value >= BAND_PASS:
+        return "pass"
+    return "warn" if value >= BAND_WARN else "low"
+
+
+def band_note(metrics: Mapping[str, float], kind: str,
+              calibration: Mapping[str, Any] | None = None) -> str:
+    """One line a caller can act on: the band, the number, how it was got."""
+    key = headline(kind)
+    value = metrics.get(key)
+    worst = metrics.get("max_abs")
+    parts = [f"band {band_of(metrics, kind)}",
+             f"{key}={value:.6f}" if value is not None else f"{key}=n/a"]
+    if worst is not None:
+        parts.append(f"max_abs={worst:.4g}")
+    if calibration:
+        parts.append(
+            f"from {calibration.get('samples')} sample(s), "
+            f"{calibration.get('method')}")
+    return ", ".join(parts)
 
 
 def _parity_metrics(got: torch.Tensor, want: torch.Tensor) -> dict[str, float]:

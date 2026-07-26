@@ -134,13 +134,23 @@ Content and observation are plan-time captures, bounded by construction,
 and they get **no public calibration surface of their own**. Giving them
 one would be exactly the extra entry point this layer must not add.
 
-### 3.4 Reporting parity
+### 3.4 Reporting parity, and what the bands mean
 
 Report **held-out** parity, and say when a figure is not. A parity measured
-on the frame its scales were fitted to is a fit residual: on Pi0.5 that
-gap is about 0.0026. Report cosine **and** max-abs against the reference —
-multi-sample calibration's benefit shows up mostly in the worst case, so
-cosine alone can miss it entirely (`calibration.md` §10).
+on the frame its scales were fitted to is a fit residual: on Pi0.5 that gap
+is about 0.0029, measured three times. Report cosine **and** max-abs
+against the reference — multi-sample calibration's benefit shows up mostly
+in the worst case, so cosine alone can miss it entirely
+(`calibration.md` §10).
+
+Bands, from `gates.py`: `pass` at 0.999 and above, `warn` from 0.995, and
+`low` below that. **None of the three refuses.** Low-precision execution is
+increasingly the intent rather than a defect — a four-bit host belongs in
+the bottom band by design — so a `low` band warns with the number and the
+calibration method attached, and whether it is acceptable is the
+deployment's call. Pass `floors={...}` to turn a number into a hard
+requirement; that is the caller stating a requirement, which is the only
+place such a number can honestly come from.
 
 ## 4. Doors
 
