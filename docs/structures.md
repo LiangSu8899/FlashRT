@@ -143,8 +143,15 @@ against the reference — multi-sample calibration's benefit shows up mostly
 in the worst case, so cosine alone can miss it entirely
 (`calibration.md` §10).
 
-Bands, from `gates.py`: `pass` at 0.999 and above, `warn` from 0.995, and
-`low` below that. **None of the three refuses.** Low-precision execution is
+Bands, from `gates.py`, are per output kind. Value outputs (a policy's
+action tensor): `pass` at cosine 0.999 and above, `warn` from 0.995, and
+`low` below that. Distribution outputs (a language model's logits) are
+judged on **token agreement**, where cosine-grade edges do not transfer:
+a clean static W8A8 with every per-seam gate passing sits at 0.95–0.98
+agreement on real text — that is the grade of the quantisation, not
+damage, which instead looks like agreement collapsing while seam-level
+parity stays fine. So `pass` from 0.95, `warn` from 0.85, `low` below.
+**None of the three refuses.** Low-precision execution is
 increasingly the intent rather than a defect — a four-bit host belongs in
 the bottom band by design — so a `low` band warns with the number and the
 calibration method attached, and whether it is acceptable is the

@@ -132,6 +132,17 @@ OUTPUT_KINDS = ("values", "distribution")
 #: acceptable belongs to the deployment.
 BAND_PASS, BAND_WARN = 0.999, 0.995
 
+#: Band edges for distribution outputs (language hosts), judged on token
+#: agreement. Cosine-grade edges do not transfer: a language model's
+#: headline is "does it pick the same next token", and a clean static
+#: W8A8 measured on real text sits at 0.95-0.98 agreement with the
+#: per-seam structure gates all passing — that is the honest level of the
+#: quantisation, not damage. Damage looks like agreement falling through
+#: the floor while seam-level parity stays fine. So: >= 0.95 is ``pass``
+#: (the quantisation grade measured when every structure qualifies),
+#: >= 0.85 is ``warn``, and below that is ``low``.
+DIST_BAND_PASS, DIST_BAND_WARN = 0.95, 0.85
+
 #: no hard accuracy floor by default, for the reason above. Pass ``floors=``
 #: to impose one — that is the caller stating a requirement, which is the
 #: only place such a number can honestly come from.
@@ -248,9 +259,11 @@ def band_of(metrics: Mapping[str, float], kind: str) -> str:
     value = metrics.get(headline(kind))
     if value is None:
         return "unknown"
-    if value >= BAND_PASS:
+    hi, lo = ((DIST_BAND_PASS, DIST_BAND_WARN)
+              if kind == "distribution" else (BAND_PASS, BAND_WARN))
+    if value >= hi:
         return "pass"
-    return "warn" if value >= BAND_WARN else "low"
+    return "warn" if value >= lo else "low"
 
 
 def band_note(metrics: Mapping[str, float], kind: str,
