@@ -15,6 +15,8 @@ from typing import Callable, Mapping, Sequence
 
 import torch
 
+from ...guard import CAST_OK, FP8_ONLY, PROCEED, GuardedSeam
+
 KERNEL_DEP = {
     "provider": "hf",
     "repo": "flashrt/flashrt-fp8-ffn",
@@ -98,13 +100,17 @@ class BoundVisionFfnFp8:
         return x + self.ffn(h).to(x.dtype)
 
 
-class FusedGeluMlp(torch.nn.Module):
+class FusedGeluMlp(GuardedSeam, torch.nn.Module):
     """MLP-seam module: the host keeps its own norm and residual.
 
     ``original`` is retained whole (host MLP naming varies across model
     families), and attribute lookups fall through to it so hosts that
-    introspect the module they call keep working.
+    introspect the module they call keep working. It is also the per-call
+    way back: an input outside the calibrated form runs the host MLP.
     """
+
+    _frt_host_attr = "host_mlp"
+    _frt_can_fallback = True
 
     def __init__(self, bound: BoundVisionFfnFp8,
                  original: torch.nn.Module | None = None):
@@ -112,6 +118,10 @@ class FusedGeluMlp(torch.nn.Module):
         self._bound = bound
         if original is not None:
             self.host_mlp = original
+        self._frt_arm(
+            dtypes=(FP8_ONLY if bound.in_dtype == "fp8_static" else CAST_OK),
+            device=bound.fc1_fp8.device,
+            k=int(bound.fc1_fp8.shape[1]))
 
     def __getattr__(self, name):
         try:
@@ -122,6 +132,9 @@ class FusedGeluMlp(torch.nn.Module):
             return getattr(super().__getattr__("host_mlp"), name)
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        admitted = self._frt_admit(hidden)
+        if admitted is not PROCEED:
+            return admitted
         return self._bound.ffn(hidden)
 
 

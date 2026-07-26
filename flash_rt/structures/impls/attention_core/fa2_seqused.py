@@ -35,6 +35,7 @@ from dataclasses import dataclass
 import torch
 
 from .. import hub_kernel
+from ...guard import PROCEED, GuardedSeam
 
 SUPPORTED_HEAD_DIMS = (64, 96, 128, 256)
 
@@ -93,12 +94,20 @@ def plan_packed_kv(mask: torch.Tensor | None, seq_kv: int) -> PackedKVPlan:
     return PackedKVPlan(lo, hi + 1, seq_kv - (hi + 1), seq_kv)
 
 
-class PackedKVAttention(torch.nn.Module):
+class PackedKVAttention(GuardedSeam, torch.nn.Module):
     """Attention over packed keys/values, on the FlashRT FA2 kernel.
 
     Holds one host module's packed buffers. Call it in place of the
     host's attention body; the prefix half is refreshed by the update
     function returned from :func:`bind_attention_core`.
+
+    The packed region, the output and the split-KV workspace are all
+    allocated for one query length, and this module is reached through a
+    routed call rather than a module path, so there is no host module to
+    revert to per call: a query outside the calibrated form raises. That
+    is the whole reason to check — handing the kernel a scratch buffer
+    sized for a different sequence is the failure that does not announce
+    itself.
     """
 
     def __init__(self, plan: PackedKVPlan, q_shape, kv_heads: int,
@@ -132,9 +141,14 @@ class PackedKVAttention(torch.nn.Module):
             scratch = _Scratch(out, lse, self._kfa.allocate_workspace(
                 q_sample, self.packed_k))
         self._scratch = scratch
+        self._frt_arm(dtypes=(dtype,), device=self.packed_k.device,
+                      k=int(head_dim), rows=int(b * heads * seq_q))
 
     def forward(self, query, key, value, *, scale=None):
         """``query``/``key``/``value`` in the host's (B, H, S, D)."""
+        admitted = self._frt_admit(query)
+        if admitted is not PROCEED:            # unreachable: no host path
+            return admitted                    # to revert to, so it raises
         plan = self.plan
         q = query.transpose(1, 2).contiguous()
         if plan.suffix_len:
@@ -193,6 +207,11 @@ class PackedKVAttention(torch.nn.Module):
         which is the suffix already. Binding checks that equality rather
         than assuming it.
         """
+        # the contract is the same one ``forward`` checks: it counts rows
+        # against the head dim, which is what both layouts agree on
+        admitted = self._frt_admit(query)
+        if admitted is not PROCEED:
+            return admitted
         plan = self.plan
         q = query if query.is_contiguous() else query.contiguous()
         if plan.suffix_len:

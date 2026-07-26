@@ -36,6 +36,8 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+from ...guard import CAST_OK, PROCEED, GuardedSeam
+
 _BLOCK_ATTRS = ("self_attn", "mlp", "input_layernorm",
                 "post_attention_layernorm")
 
@@ -45,8 +47,18 @@ def _parameterised_children(module: nn.Module) -> set[str]:
             if any(True for _ in child.parameters())}
 
 
-class FusedDecoderBlock(nn.Module):
-    """Pre-norm block whose sublayer dataflow runs through the producers."""
+class FusedDecoderBlock(GuardedSeam, nn.Module):
+    """Pre-norm block whose sublayer dataflow runs through the producers.
+
+    The host block is retained whole, which makes this the widest way back
+    in the library: a call outside the calibrated form runs the entire
+    original block. That is exact rather than approximate, because the
+    block never swapped the host's own children — it holds separately
+    bound copies and leaves the host's sublayers where they were.
+    """
+
+    _frt_host_attr = "host"
+    _frt_can_fallback = True
 
     def __init__(self, host: nn.Module, producer_in, producer_out,
                  ffn: nn.Module, *, cond_kw: str = "adarms_cond",
@@ -62,8 +74,16 @@ class FusedDecoderBlock(nn.Module):
         # the host's attention module (which owns the layout itself)
         self.attn = attn
         self.own_attn = attn is not None
+        rows, dim = producer_in.resid.shape
+        self._frt_arm(dtypes=CAST_OK, device=producer_in.resid.device,
+                      k=int(dim), rows=int(rows))
 
     def forward(self, hidden_states: torch.Tensor, *args, **kwargs):
+        # before the conditioning is taken out of kwargs: the host block
+        # expects its own signature back if this call has to go to it
+        admitted = self._frt_admit(hidden_states, *args, **kwargs)
+        if admitted is not PROCEED:
+            return admitted
         cond = kwargs.pop(self.cond_kw, None)
         idx = self.producer_in.resolve(cond)
 

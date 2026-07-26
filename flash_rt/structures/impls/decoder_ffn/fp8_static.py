@@ -18,6 +18,8 @@ from typing import Callable, Mapping, Sequence
 
 import torch
 
+from ...guard import CAST_OK, FP8_ONLY, PROCEED, GuardedSeam
+
 KERNEL_DEP = {
     "provider": "hf",
     "repo": "flashrt/flashrt-fp8-swiglu-ffn",
@@ -190,14 +192,19 @@ class BoundDecoderFfnFp8:
         return x + out.to(x.dtype)
 
 
-class FusedGeGluMlp(torch.nn.Module):
+class FusedGeGluMlp(GuardedSeam, torch.nn.Module):
     """MLP-seam module for hosts whose replaceable boundary is the MLP.
 
     The host keeps its own norm, AdaLN gate, and residual. ``original``
     is retained whole (host MLP naming varies across model families), and
     attribute lookups fall through to it so hosts that introspect the
-    projection attributes of the module they call keep working.
+    projection attributes of the module they call keep working. Retaining
+    it is also what makes the seam reversible per call: an input outside
+    the calibrated form runs the host MLP instead of this kernel.
     """
+
+    _frt_host_attr = "host_mlp"
+    _frt_can_fallback = True
 
     def __init__(self, bound: BoundDecoderFfnFp8,
                  original: torch.nn.Module | None = None):
@@ -205,6 +212,10 @@ class FusedGeGluMlp(torch.nn.Module):
         self._bound = bound
         if original is not None:
             self.host_mlp = original
+        self._frt_arm(
+            dtypes=(FP8_ONLY if bound.in_dtype == "fp8_static" else CAST_OK),
+            device=bound.gate_up_fp8.device,
+            k=int(bound.gate_up_fp8.shape[1]))
 
     def __getattr__(self, name):
         try:
@@ -215,6 +226,9 @@ class FusedGeGluMlp(torch.nn.Module):
             return getattr(super().__getattr__("host_mlp"), name)
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        admitted = self._frt_admit(hidden)
+        if admitted is not PROCEED:
+            return admitted
         return self._bound.ffn(hidden)
 
 

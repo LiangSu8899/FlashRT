@@ -47,6 +47,8 @@ from typing import Mapping, Sequence
 
 import torch
 
+from ...guard import CAST_OK, FP8_ONLY, PROCEED, GuardedSeam
+
 KERNEL_DEP = {
     "provider": "hf",
     "repo": "flashrt/flashrt-fp8-ffn",
@@ -100,13 +102,16 @@ def _amax_scale(t: torch.Tensor) -> torch.Tensor:
     return (t.float().abs().max() / _FP8_MAX).clamp(min=1e-8)
 
 
-class FusedLinearProj(torch.nn.Module):
+class FusedLinearProj(GuardedSeam, torch.nn.Module):
     """Drop-in replacement for one nn.Linear projection.
 
     ``original`` is retained whole and attribute lookups fall through to
     it, so host code that introspects ``weight``/``bias``/``in_features``
-    keeps working.
+    keeps working — and a call outside the calibrated form runs it.
     """
+
+    _frt_host_attr = "host_linear"
+    _frt_can_fallback = True
 
     def __init__(self, w_fp8, bias, input_scale, weight_scale,
                  original: torch.nn.Module | None = None,
@@ -135,6 +140,9 @@ class FusedLinearProj(torch.nn.Module):
                                     dtype=torch.bfloat16)
         if original is not None:
             self.host_linear = original
+        self._frt_arm(
+            dtypes=FP8_ONLY if form == "fp8_in" else CAST_OK,
+            device=w_fp8.device, k=int(w_fp8.shape[1]))
 
     def __getattr__(self, name):
         try:
@@ -145,6 +153,9 @@ class FusedLinearProj(torch.nn.Module):
             return getattr(super().__getattr__("host_linear"), name)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        admitted = self._frt_admit(x)
+        if admitted is not PROCEED:
+            return admitted
         shape = x.shape
         flat = x.reshape(-1, shape[-1])
         m = flat.shape[0]

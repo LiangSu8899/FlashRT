@@ -16,10 +16,14 @@ from __future__ import annotations
 import torch
 
 from .. import hub_kernel
+from ...guard import CAST_OK, PROCEED, GuardedSeam
 
 
-class FusedNorm(torch.nn.Module):
+class FusedNorm(GuardedSeam, torch.nn.Module):
     """Drop-in for an affine LayerNorm, computed by a fused kernel."""
+
+    _frt_host_attr = "host_norm"
+    _frt_can_fallback = True
 
     def __init__(self, original: torch.nn.Module):
         super().__init__()
@@ -31,8 +35,13 @@ class FusedNorm(torch.nn.Module):
         self.register_buffer("b", original.bias.detach().to(
             torch.bfloat16))
         self.eps = float(getattr(original, "eps", 1e-6))
+        self._frt_arm(dtypes=CAST_OK, device=self.w.device,
+                      k=int(self.w.shape[0]))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        admitted = self._frt_admit(x)
+        if admitted is not PROCEED:
+            return admitted
         y = self._fn(x.to(torch.bfloat16), None, self.w, self.b,
                      self.eps)
         return y.to(x.dtype)

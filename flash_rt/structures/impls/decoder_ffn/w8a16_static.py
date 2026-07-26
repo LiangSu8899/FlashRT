@@ -18,6 +18,8 @@ from functools import lru_cache
 
 import torch
 
+from ...guard import CAST_OK, PROCEED, GuardedSeam
+
 KERNEL_DEP = {
     "provider": "huggingface_kernels",
     "repo": "flashrt/weight-only-ffn",
@@ -99,19 +101,25 @@ class BoundDecoderFfnW8A16:
     __call__ = ffn
 
 
-class FusedGluMlpW8A16(torch.nn.Module):
+class FusedGluMlpW8A16(GuardedSeam, torch.nn.Module):
     """MLP-seam module with declared M-dispatch.
 
     The weight-only kernel covers the decode band (M in [1, 8]); calls
     with larger M are dispatched to the retained host module. This is
     part of the declared plan — per-M dispatch on the real workload —
     not a fallback: both paths are first-class and the qualification
-    record states which band the kernel serves.
+    record states which band the kernel serves. The ledger keeps the two
+    apart under separate names for exactly that reason, and still counts
+    the dispatch: "by design" is a reason for a path to exist, not a
+    reason for its share of the calls to be unknown.
 
     ``original`` is retained whole (host MLP naming varies across model
     families), and attribute lookups fall through to it so hosts that
     introspect the module they call keep working.
     """
+
+    _frt_host_attr = "host_mlp"
+    _frt_can_fallback = True
 
     def __init__(self, bound: BoundDecoderFfnW8A16,
                  original: torch.nn.Module | None = None):
@@ -119,6 +127,10 @@ class FusedGluMlpW8A16(torch.nn.Module):
         self._bound = bound
         if original is not None:
             self.host_mlp = original
+        guard = self._frt_arm(dtypes=CAST_OK,
+                              device=bound._gate_up_q.device,
+                              k=int(bound._dim_d))
+        guard.notes["dispatched_by_band"] = 0
 
     def __getattr__(self, name):
         try:
@@ -129,13 +141,16 @@ class FusedGluMlpW8A16(torch.nn.Module):
             return getattr(super().__getattr__("host_mlp"), name)
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        admitted = self._frt_admit(hidden)
+        if admitted is not PROCEED:
+            return admitted
         m = hidden.numel() // hidden.shape[-1]
         if m > SUPPORT["M"]["max"]:
-            try:
-                host = super().__getattr__("host_mlp")
-            except AttributeError:
-                pass
-            else:
+            host = self._frt_host()
+            if host is not None:
+                guard = self._frt_guard
+                if guard is not None and not torch.compiler.is_compiling():
+                    guard.notes["dispatched_by_band"] += 1
                 return host(hidden)
         return self._bound.ffn(hidden)
 

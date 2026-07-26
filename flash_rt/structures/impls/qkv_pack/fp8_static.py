@@ -34,6 +34,7 @@ from typing import Sequence
 import torch
 
 from .. import hub_kernel
+from ...guard import CAST_OK, FP8_ONLY, PROCEED, GuardedSeam
 
 _FP8 = torch.float8_e4m3fn
 
@@ -58,8 +59,17 @@ def _pack_weights(mods: Sequence[torch.nn.Module]):
     return w8, scale, torch.cat(biases), splits
 
 
-class PackedLinear(torch.nn.Module):
-    """Leaf-form head: one packed GEMM, later siblings stashed."""
+class PackedLinear(GuardedSeam, torch.nn.Module):
+    """Leaf-form head: one packed GEMM, later siblings stashed.
+
+    The stash and quantize buffers are allocated once for the calibrated
+    row count, so the row count is part of this seam's contract rather
+    than a free dimension: a call with a different one would hand the
+    kernel an output buffer of the wrong length.
+    """
+
+    _frt_host_attr = "host_linear"
+    _frt_can_fallback = True
 
     def __init__(self, mods: Sequence[torch.nn.Module],
                  act_scale: torch.Tensor, rows: int,
@@ -104,6 +114,9 @@ class PackedLinear(torch.nn.Module):
                 rows, k, device=dev, dtype=_FP8))
             self.register_buffer("y_buf", torch.empty(
                 rows, sum(splits), device=dev, dtype=torch.bfloat16))
+        self._frt_arm(
+            dtypes=FP8_ONLY if in_dtype == "fp8_static" else CAST_OK,
+            device=dev, k=int(mods[0].weight.shape[1]), rows=rows)
 
     def alias_stash(self, index: int, region: torch.Tensor) -> None:
         """Write sibling ``index`` straight into a buffer someone else owns.
@@ -197,6 +210,9 @@ class PackedLinear(torch.nn.Module):
         return y
 
     def forward(self, x):
+        admitted = self._frt_admit(x)
+        if admitted is not PROCEED:
+            return admitted
         flat = x.reshape(-1, x.shape[-1])
         y = self._run(flat)
         out = y[:, :self.splits[0]].contiguous()
@@ -215,8 +231,16 @@ class PackedLinear(torch.nn.Module):
             return getattr(super().__getattr__("host_linear"), name)
 
 
-class StashReader(torch.nn.Module):
-    """Leaf-form tail: return the packed head's stashed output."""
+class StashReader(GuardedSeam, torch.nn.Module):
+    """Leaf-form tail: return the packed head's stashed output.
+
+    Shares the head's contract, because it shares the head's input: the
+    host hands the same activation to every sibling, so head and tails
+    admit or refuse a call together and the group never half-runs.
+    """
+
+    _frt_host_attr = "host_linear"
+    _frt_can_fallback = True
 
     def __init__(self, orig: torch.nn.Module, packed: PackedLinear,
                  index: int):
@@ -224,8 +248,14 @@ class StashReader(torch.nn.Module):
         self.host_linear = orig
         self._packed = (packed,)
         self.index = index
+        head = packed._frt_guard
+        self._frt_arm(dtypes=head.dtypes, device=head.device, k=head.k,
+                      rows=head.rows)
 
     def forward(self, x):
+        admitted = self._frt_admit(x)
+        if admitted is not PROCEED:
+            return admitted
         buf = getattr(self._packed[0], f"stash{self.index}")
         out = buf.reshape(*x.shape[:-1], buf.shape[-1])
         return out if x.dtype is _FP8 else out.to(x.dtype)
@@ -253,13 +283,16 @@ def bind_qkv_pack(mods: Sequence[torch.nn.Module],
     return out
 
 
-class AttnBlockPacked(torch.nn.Module):
+class AttnBlockPacked(GuardedSeam, torch.nn.Module):
     """Module-form: packed QKV + SDPA at a declared dtype + out_proj.
 
     Fits attention modules exposing ``q_proj/k_proj/v_proj/out_proj``,
     ``head_dim`` and ``scale`` with the standard block forward
     (SigLIP/CLIP-family vision towers and friends).
     """
+
+    _frt_host_attr = "host_attn"
+    _frt_can_fallback = True
 
     def __init__(self, orig: torch.nn.Module, act_scale: torch.Tensor,
                  rows: int, sdpa_dtype: torch.dtype = torch.bfloat16):
@@ -283,8 +316,12 @@ class AttnBlockPacked(torch.nn.Module):
         self.register_buffer("y_buf", torch.empty(
             rows, 3 * self.e, device=dev, dtype=torch.bfloat16))
         self.sdpa_dtype = sdpa_dtype
+        self._frt_arm(dtypes=CAST_OK, device=dev, k=int(k), rows=rows)
 
     def forward(self, hidden_states, attention_mask=None, **kw):
+        admitted = self._frt_admit(hidden_states, attention_mask, **kw)
+        if admitted is not PROCEED:
+            return admitted
         a = self.host_attn
         bsz, seq, dim = hidden_states.shape
         flat = hidden_states.reshape(-1, dim).to(

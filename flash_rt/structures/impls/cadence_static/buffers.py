@@ -26,16 +26,42 @@ from typing import Callable, Sequence
 
 import torch
 
+from ...guard import PROCEED, GuardedSeam
 
-class StaticOutput(torch.nn.Module):
-    """Return a buffer the host refreshes at the slower cadence."""
+
+class StaticOutput(GuardedSeam, torch.nn.Module):
+    """Return a buffer the host refreshes at the slower cadence.
+
+    This structure has no input contract to check — ignoring its inputs
+    is the point. Its failure mode is the other one: the host stops
+    calling the update function and the buffer goes stale while every
+    read still succeeds. So the ledger counts reads against refreshes,
+    and a seam read many times and refreshed never is visible as exactly
+    that instead of as a seam that worked.
+    """
+
+    _frt_host_attr = "host_module"
+    _frt_can_fallback = True
 
     def __init__(self, original: torch.nn.Module, value: torch.Tensor):
         super().__init__()
         self.host_module = original
         self.register_buffer("buffer", value.contiguous().clone())
+        guard = self._frt_arm(dtypes=None, device=self.buffer.device)
+        guard.notes.update(reads=0, refreshes=0)
+
+    def refreshed(self) -> None:
+        """Record that the slower cadence ran. Called by the updater."""
+        guard = self._frt_guard
+        if guard is not None:
+            guard.notes["refreshes"] += 1
 
     def forward(self, *args, **kwargs):
+        # same rule as the contract check: no Python bookkeeping while a
+        # compiler is tracing this forward
+        if not torch.compiler.is_compiling():
+            self._frt_touch()
+            self._frt_guard.notes["reads"] += 1
         return self.buffer
 
     def __getattr__(self, name):
@@ -87,5 +113,6 @@ def bind_cadence_static(
             fresh = recompute()
             for static, value in zip(statics, fresh):
                 static.buffer.copy_(value)
+                static.refreshed()
 
     return statics, update

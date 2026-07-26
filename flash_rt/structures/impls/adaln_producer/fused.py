@@ -36,6 +36,7 @@ from __future__ import annotations
 import torch
 
 from .. import hub_kernel
+from ...guard import CAST_OK, PROCEED, GuardedSeam
 
 
 def _dedup(pairs, max_steps, rtol):
@@ -93,7 +94,7 @@ class StepLocator(torch.nn.Module):
         return scores.argmax(-1)
 
 
-class StyleTable(torch.nn.Module):
+class StyleTable(GuardedSeam, torch.nn.Module):
     """Replace only the conditioning projection with its step table.
 
     The narrower of the two bind forms: the host keeps its own norm
@@ -103,14 +104,23 @@ class StyleTable(torch.nn.Module):
     its kernel only when it also serves a downstream seam.
     """
 
+    _frt_host_attr = "host_linear"
+    _frt_can_fallback = True
+
     def __init__(self, host_proj: torch.nn.Module, styles: torch.Tensor,
                  locator: StepLocator):
         super().__init__()
         self.host_linear = host_proj
         self.locator = locator
         self.register_buffer("table", styles.contiguous())
+        weight = getattr(host_proj, "weight", None)
+        self._frt_arm(dtypes=CAST_OK, device=self.table.device,
+                      k=None if weight is None else int(weight.shape[1]))
 
     def forward(self, cond: torch.Tensor) -> torch.Tensor:
+        admitted = self._frt_admit(cond)
+        if admitted is not PROCEED:
+            return admitted
         out = self.table.index_select(0, self.locator(cond))
         return out.reshape(*cond.shape[:-1], out.shape[-1])
 
@@ -121,8 +131,21 @@ class StyleTable(torch.nn.Module):
             return getattr(super().__getattr__("host_linear"), name)
 
 
-class AdaLNProducer(torch.nn.Module):
-    """Adaptive norm replacement: step lookup + fused norm/quantize."""
+class AdaLNProducer(GuardedSeam, torch.nn.Module):
+    """Adaptive norm replacement: step lookup + fused norm/quantize.
+
+    This is the one structure in the library that refuses instead of
+    falling back, and the reason is that its output dtype is half of an
+    agreement with a downstream seam. On the fp8 entry it hands a packed
+    projection FP8 activations under a shared static scale; quietly
+    reverting to the host norm would hand that consumer BF16 under an FP8
+    scale. Two seams negotiated the form together, so neither can leave it
+    alone — a call outside the calibrated form raises here and the caller
+    detaches the attachment rather than running half of it.
+    """
+
+    _frt_host_attr = "host_norm"
+    _frt_can_fallback = False
 
     def __init__(self, host_norm: torch.nn.Module,
                  styles: torch.Tensor, locator: StepLocator,
@@ -170,6 +193,11 @@ class AdaLNProducer(torch.nn.Module):
             rows, dim, device=dev, dtype=torch.bfloat16))
         self.register_buffer("gate_ones", torch.ones(
             rows, dim, device=dev, dtype=torch.bfloat16))
+        # the rms form works through the preallocated residual and gate
+        # buffers, so its row count is fixed; the layer form's kernel
+        # takes scale and shift directly and leaves rows free
+        self._frt_arm(dtypes=CAST_OK, device=dev, k=int(dim),
+                      rows=None if norm == "layer" else int(rows))
 
     # ---- block-facing entries -------------------------------------
     # A caller that owns the whole block (see ``impls.decoder_block``)
@@ -228,6 +256,11 @@ class AdaLNProducer(torch.nn.Module):
         the host's broadcast add; a block caller keeps the full rows so
         it can feed the gate straight back into :meth:`absorb`.
         """
+        # a block reaches this entry instead of ``forward``, and the
+        # block's own contract already covered the form; count the call so
+        # the ledger does not report a producer that ran every tick as one
+        # that never ran
+        self._frt_touch()
         style2d = self._style2d(idx)
         x2d = x.reshape(-1, x.shape[-1])
         if self.out_fp8:
@@ -252,6 +285,7 @@ class AdaLNProducer(torch.nn.Module):
             raise ValueError(
                 "adaln_producer: absorb needs the rms form with fp8 "
                 "output — the plain entry has no residual argument")
+        self._frt_touch()
         style2d = self._style2d(idx)
         shape = self.resid.shape
         self.resid.copy_(residual.reshape(shape))
@@ -259,6 +293,9 @@ class AdaLNProducer(torch.nn.Module):
                         self.w_ones, style2d, self.act_scale)
 
     def forward(self, x: torch.Tensor, cond: torch.Tensor | None = None):
+        admitted = self._frt_admit(x, cond)
+        if admitted is not PROCEED:            # unreachable: this form
+            return admitted                    # refuses rather than reverts
         idx = self.locator(cond)
         if self.norm == "layer":
             style = self.styles.index_select(0, idx)
