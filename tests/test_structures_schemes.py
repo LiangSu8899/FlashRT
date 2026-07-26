@@ -42,8 +42,8 @@ def test_unmeasurable_granularity_fails_loudly():
     # per-tensor numbers of the wrong shape
     with pytest.raises(NotImplementedError, match="block16"):
         validate_request({"w|weight_sf": PointStat("amax", "block16")})
-    with pytest.raises(NotImplementedError, match="second_moment"):
-        validate_request({"w|cols": PointStat("second_moment", "channel")})
+    with pytest.raises(NotImplementedError, match="histogram"):
+        validate_request({"w|hist": PointStat("histogram", "tensor")})
 
 
 def test_dynamic_no_statistic_is_a_legal_declaration():
@@ -70,6 +70,58 @@ def test_keep_outliers_consumes_the_house_criterion():
     assert Fp8Static(keep_outliers=100.0).decide(report).keep_host == ()
 
 
+def test_channel_statistics_are_measurable_now():
+    validate_request({"a|x": PointStat("amax", "channel"),
+                      "b|x": PointStat("second_moment", "channel")})
+    # block16 stays walled until the collector measures it
+    with pytest.raises(NotImplementedError):
+        validate_request({"a|x": PointStat("amax", "block16")})
+
+
+def test_collector_channel_amax_and_second_moment():
+    import numpy as np
+    import torch
+
+    from flash_rt.structures.points import Collector, Point
+
+    pt = Point(name="x", path="m.proj")
+    key = f"{pt.path}|{pt.name}"
+    for stat, expect in (("amax", None), ("second_moment", None)):
+        col = Collector(points=[pt], request={key: PointStat(stat,
+                                                             "channel")})
+        a = torch.tensor([[1.0, -2.0], [0.5, 4.0]])
+        b = torch.tensor([[-3.0, 1.0]])
+        col._record(pt, a)
+        col._record(pt, b)          # second call, same sample
+        col.end_sample()
+        col.reduce(99.9)
+        if stat == "amax":
+            got = col.channel_amax(pt.path, pt.name)
+            assert np.allclose(got, [3.0, 4.0])   # max over both calls
+            assert col.second_moment(pt.path, pt.name) is None
+        else:
+            got = col.second_moment(pt.path, pt.name)
+            # E[x^2] per channel over all 3 rows of the sample
+            assert np.allclose(got, [(1 + 0.25 + 9) / 3,
+                                     (4 + 16 + 1) / 3])
+        # the scalar per-tensor amax rides along regardless — it keeps
+        # the per-sample vectors aligned
+        assert col.amax(pt.path, pt.name) == 4.0
+
+
+def test_w8a16_scheme_routes_ffn_and_keeps_the_rest():
+    scheme = schemes.get("w8a16_decode")
+    req = scheme.statistics([_Pt("l.mlp", "x_after_norm")])
+    assert all(ps.stat is None for ps in req.values())   # zero calibration
+    decision = scheme.decide({
+        "l.mlp": {"l.mlp|x_after_norm": None,
+                  "l.mlp.down_proj|act_after_mul": None},
+        "l.self_attn": {"l.self_attn.q_proj|x": None},
+    })
+    assert decision.formats == {"l.mlp": "w8a16_static"}
+    assert decision.keep_host == ("l.self_attn",)
+
+
 def test_scheme_subclass_owns_only_two_methods():
     class Imatrix(QuantScheme):
         name = "imatrix_demo"
@@ -82,7 +134,8 @@ def test_scheme_subclass_owns_only_two_methods():
     schemes.register("imatrix_demo", Imatrix())
     try:
         got = schemes.get("imatrix_demo")
-        with pytest.raises(NotImplementedError):
-            validate_request(got.statistics([_Pt("a", "x")]))
+        # the imatrix statistic (per-channel second moment) is now
+        # measurable, so the demo's request validates
+        validate_request(got.statistics([_Pt("a", "x")]))
     finally:
         schemes._REGISTRY.pop("imatrix_demo", None)

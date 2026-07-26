@@ -140,6 +140,19 @@ class Collector:
     widths: dict[tuple[str, str], int] = field(default_factory=dict)
     dtypes: dict[tuple[str, str], set] = field(default_factory=dict)
     final: dict[tuple[str, str], float] = field(default_factory=dict)
+    #: per-point extra statistic requests, keyed ``"path|name"`` — objects
+    #: with ``.stat`` / ``.granularity`` (a scheme's ``PointStat``). The
+    #: scalar amax is always collected regardless (it keeps the per-sample
+    #: vectors aligned and costs one float); a channel request adds a
+    #: per-channel track beside it, it does not replace it.
+    request: dict[str, Any] = field(default_factory=dict)
+    _cur_chan: dict[tuple[str, str], torch.Tensor] = field(
+        default_factory=dict)
+    _cur_sm: dict[tuple[str, str], tuple] = field(default_factory=dict)
+    chan_samples: dict[tuple[str, str], list] = field(default_factory=dict)
+    sm_samples: dict[tuple[str, str], list] = field(default_factory=dict)
+    chan_final: dict[tuple[str, str], Any] = field(default_factory=dict)
+    sm_final: dict[tuple[str, str], Any] = field(default_factory=dict)
 
     # ---- capture -----------------------------------------------------
 
@@ -147,6 +160,23 @@ class Collector:
         if not torch.is_tensor(x):
             return
         key = point.key
+        req = self.request.get(f"{point.path}|{point.name}")
+        if req is not None and getattr(req, "granularity", None) == "channel":
+            flat = x.detach().float().reshape(-1, x.shape[-1])
+            if req.stat == "amax":
+                chan = flat.abs().amax(dim=0)
+                prev = self._cur_chan.get(key)
+                self._cur_chan[key] = (chan if prev is None
+                                       else torch.maximum(prev, chan))
+            elif req.stat == "second_moment":
+                # per-sample (sum of squares, token count) so the
+                # per-sample values survive to the reduction, same
+                # discipline as the amax vectors
+                sq = (flat * flat).sum(dim=0)
+                prev = self._cur_sm.get(key)
+                self._cur_sm[key] = ((sq, flat.shape[0]) if prev is None
+                                     else (prev[0] + sq,
+                                           prev[1] + flat.shape[0]))
         amax = x.detach().float().abs().max()
         prev = self._cur.get(key)
         self._cur[key] = amax if prev is None else torch.maximum(prev, amax)
@@ -187,6 +217,14 @@ class Collector:
             np.array([float(self._cur[k]) for k in self.keys],
                      dtype=np.float32))
         self._cur = {}
+        for k, chan in self._cur_chan.items():
+            self.chan_samples.setdefault(k, []).append(
+                chan.cpu().numpy().astype(np.float32))
+        self._cur_chan = {}
+        for k, (sq, n) in self._cur_sm.items():
+            self.sm_samples.setdefault(k, []).append(
+                (sq.cpu().numpy().astype(np.float64), int(n)))
+        self._cur_sm = {}
 
     # ---- reduce ------------------------------------------------------
 
@@ -202,6 +240,19 @@ class Collector:
             return {"points": 0, "samples": 0}
         final = accumulate_amax(self.per_sample, percentile=percentile)
         self.final = {k: float(v) for k, v in zip(self.keys or [], final)}
+        # channel amax reduces with the same house helper, per point —
+        # it is elementwise over vectors, the vector is just per-channel
+        # instead of per-point
+        for k, samples in self.chan_samples.items():
+            self.chan_final[k] = accumulate_amax(samples,
+                                                 percentile=percentile)
+        # a second moment is a mean, not an amax: combine the per-sample
+        # (sum, count) pairs. Per-sample values are kept so a robust
+        # cross-sample reduction stays possible later.
+        for k, samples in self.sm_samples.items():
+            total = sum(s for s, _ in samples)
+            count = sum(n for _, n in samples)
+            self.sm_final[k] = total / max(count, 1)
         note: dict[str, Any] = {
             "points": len(self.final),
             "samples": len(self.per_sample),
@@ -226,6 +277,15 @@ class Collector:
 
     def amax(self, path: str, name: str) -> float | None:
         return self.final.get((path, name))
+
+    def channel_amax(self, path: str, name: str):
+        """Per-channel amax vector for a point that requested it."""
+        return self.chan_final.get((path, name))
+
+    def second_moment(self, path: str, name: str):
+        """Per-channel E[x^2] for a point that requested it (imatrix
+        statistic: what each input column contributes, on real data)."""
+        return self.sm_final.get((path, name))
 
     def scale(self, path: str, name: str, *,
               fp8_max: float = 448.0) -> float | None:

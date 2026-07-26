@@ -217,7 +217,6 @@ def auto_swaps(
             continue
         seam_points[seam.path] = pts
         all_points.extend(pts)
-    collector = Collector(points=all_points)
 
     from . import schemes as _schemes
     scheme_obj = (_schemes.get(scheme) if isinstance(scheme, str)
@@ -225,7 +224,9 @@ def auto_swaps(
     # loud wall before any calibration work: a scheme asking for a
     # granularity the collector cannot measure must not silently get
     # per-tensor numbers of the wrong shape
-    _schemes.validate_request(scheme_obj.statistics(tuple(all_points)))
+    stat_request = scheme_obj.statistics(tuple(all_points))
+    _schemes.validate_request(stat_request)
+    collector = Collector(points=all_points, request=dict(stat_request))
 
     # observed call order across the whole calibration pass. Anything
     # that has to know which seam runs first (a stream-scoped buffer
@@ -310,6 +311,11 @@ def auto_swaps(
             p: decision.reasons.get(p, "") for p in sorted(kept)}
         say(f"scheme {scheme_note['name']}: {len(kept)} seam(s) kept at "
             f"host precision")
+    formats: dict[str, str] = dict(decision.formats or {})
+    if formats:
+        scheme_note["formats"] = dict(sorted(formats.items()))
+        say(f"scheme {scheme_note['name']}: {len(formats)} seam(s) "
+            f"routed to a non-default format")
 
     # ---- fp8 seam negotiation: the load-bearing structure combination.
     # A single kernel need not win alone (fp8 qkv at M=50 is marginal,
@@ -324,6 +330,11 @@ def auto_swaps(
     if negotiate_fp8:
         by_parent: dict[str, dict[str, Seam]] = {}
         for seam in seams:
+            if formats.get(seam.path):
+                # a chain shares one scale and one wire dtype; a member
+                # routed to another format has neither, so it binds
+                # standalone through its own impl instead
+                continue
             layer = _layer_of(seam.path)
             if seam.structure == "adaln_producer":
                 # a layer has two producer→consumer seams: the norm
@@ -425,7 +436,8 @@ def auto_swaps(
             cap = caps.get(seam.path, {})
             try:
                 bound = _bind_auto(model, seam, cap, plan, act_scales,
-                                   negotiate_fp8, points=collector)
+                                   negotiate_fp8, points=collector,
+                                   fmt=formats.get(seam.path))
             except (ValueError, RuntimeError) as refusal:
                 plan.notes.setdefault("refused", []).append(
                     (seam.path, str(refusal)[:80]))
@@ -659,7 +671,7 @@ def _alias_kv_region(plan, path: str, sublayer) -> None:
 
 
 def _bind_auto(model, seam, cap, plan, act_scales, negotiate_fp8,
-               points=None):
+               points=None, fmt=None):
     """Route one seam to its impl with the calibrated scales.
 
     ``points`` is the reduced collector: every scale an impl needs is one
@@ -667,6 +679,11 @@ def _bind_auto(model, seam, cap, plan, act_scales, negotiate_fp8,
     threaded through here, because none are needed — the two scales that
     used to be recomputed from held inputs are measured at the GEMM whose
     input they are (:mod:`.points`).
+
+    ``fmt`` is the scheme's per-seam format routing. ``None`` binds the
+    structure's default impl; a named format binds that variant instead,
+    and a name with no variant for this structure fails loudly — the
+    scheme author's error surfaces at bind time, not as accuracy.
     """
     from .impls.decoder_ffn import fp8_static as ffn_impl
     from .impls.vision_ffn import fp8_static as vis_impl
@@ -675,7 +692,31 @@ def _bind_auto(model, seam, cap, plan, act_scales, negotiate_fp8,
         return None if points is None else points.scale(path or seam.path,
                                                         name)
 
+    if fmt and seam.structure != "decoder_ffn":
+        raise ValueError(f"scheme routed {seam.structure} to format "
+                         f"{fmt!r}, which has no impl variant here")
+
     if seam.structure == "decoder_ffn":
+        if fmt == "w8a16_static":
+            from .impls.decoder_ffn import w8a16_static as w8_impl
+
+            # two callers, two layout conventions: ``seam_weights``
+            # serves the fp8 impl transposed ([D, F]); this binder is
+            # checkpoint-native ([F, D]) and its dim check passes with
+            # the names swapped, so handing it the transposed dict binds
+            # a guard with k = F and every call falls back. Transpose
+            # back here, at the seam between the conventions.
+            w = seam_weights(model, seam)
+            w = dict(w,
+                     w_gate=w["w_gate"].t().contiguous(),
+                     w_up=w["w_up"].t().contiguous(),
+                     w_down=w["w_down"].t().contiguous())
+            return w8_impl.bind_mlp_seam(
+                w, variant=seam.variant,
+                original=_resolve(model, seam.path))
+        if fmt not in (None, "fp8_static"):
+            raise ValueError(f"scheme routed decoder_ffn to format "
+                             f"{fmt!r}, which has no impl variant here")
         in_s = scale("x_after_norm")
         hid_s = scale("act_after_mul", seam.path + ".down_proj")
         if in_s is None or hid_s is None:

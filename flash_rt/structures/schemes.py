@@ -46,7 +46,8 @@ __all__ = ["PointStat", "Decision", "QuantScheme", "Fp8Static",
 #: per-channel — but the collector does not measure them yet, so a
 #: scheme requesting one fails loudly at plan time instead of silently
 #: getting per-tensor numbers with the wrong shape.
-_EXECUTABLE = {("amax", "tensor"), (None, "tensor")}
+_EXECUTABLE = {("amax", "tensor"), (None, "tensor"),
+               ("amax", "channel"), ("second_moment", "channel")}
 
 
 @dataclass(frozen=True)
@@ -71,10 +72,17 @@ class Decision:
     ``keep_host`` lists seam paths that stay on the host module at host
     precision — a first-class outcome, recorded in the plan notes, not a
     refusal. ``reasons`` says why, per path, so the receipt can print it.
+    ``formats`` routes a seam to a named impl variant instead of the
+    structure's default (``"w8a16_static"`` on a ``decoder_ffn`` seam
+    binds the weight-only path). A seam routed to a non-default format
+    is excluded from FP8 seam negotiation — a chain shares one scale and
+    one wire dtype, and a member in another format has neither. An
+    unknown format fails loudly at bind time.
     """
 
     keep_host: tuple[str, ...] = ()
     reasons: Mapping[str, str] = field(default_factory=dict)
+    formats: Mapping[str, str] = field(default_factory=dict)
 
 
 class QuantScheme:
@@ -132,6 +140,39 @@ class Fp8Static(QuantScheme):
         return Decision(keep_host=tuple(keep), reasons=reasons)
 
 
+class W8A16Decode(QuantScheme):
+    """Weight-only INT8, activations untouched — the decode-band recipe.
+
+    Needs no calibration data at all (quantisation is per-output-channel
+    on weights, done at bind time), so every point declares ``None``.
+    Routes ``decoder_ffn`` seams to the ``w8a16_static`` impl, whose own
+    M-dispatch sends decode shapes to the kernel and prefill back to the
+    host. Other structures stay at host precision: this scheme is the
+    decode recipe, not a whole-host FP8 replacement.
+
+    A ``decoder_ffn`` seam is recognised by the point its spec declares
+    (``act_after_mul`` — the gated activation), which is
+    backend-independent by construction.
+    """
+
+    name = "w8a16_decode"
+
+    def statistics(self, points: Sequence) -> dict[str, PointStat]:
+        return {f"{p.path}|{p.name}": PointStat(None) for p in points}
+
+    def decide(self, report: Mapping[str, Mapping[str, float]]) -> Decision:
+        formats, keep = {}, []
+        for seam_path, pts in report.items():
+            if any(k.endswith("|act_after_mul") for k in pts):
+                formats[seam_path] = "w8a16_static"
+            else:
+                keep.append(seam_path)
+        return Decision(keep_host=tuple(keep),
+                        reasons={p: "w8a16_decode binds decoder_ffn only"
+                                 for p in keep},
+                        formats=formats)
+
+
 _REGISTRY: dict[str, QuantScheme] = {}
 
 
@@ -173,3 +214,4 @@ def validate_request(request: Mapping[str, PointStat]) -> None:
 
 register("fp8_static", Fp8Static())
 register("fp8_static_keep_outliers", Fp8Static(keep_outliers=20.0))
+register("w8a16_decode", W8A16Decode())
