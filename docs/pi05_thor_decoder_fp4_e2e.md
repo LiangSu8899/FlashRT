@@ -40,7 +40,7 @@ Runtime activation preprocessing is CUDA-Graph capturable and uses:
 The current candidate additionally uses register-only decoder AdaRMSNorm
 preprocessing and native SM110 E2M1x2 conversion. The encoder P1 path uses two
 FP4-output Gate/Up GEMMs, a gate LUT plus native E2M1x2 combiner, and encoder
-Down variant v8. Native FP4 conversion uses round-to-nearest-even, so it is an
+Down variant v7. Native FP4 conversion uses round-to-nearest-even, so it is an
 explicit numerical mode rather than a bit-exact alias for the historical
 midpoint implementation.
 
@@ -81,6 +81,27 @@ per-view published-minus-2-ms p50 target passes. It also requires 2-view p95
 at most 40 ms and 3-view p50 at most 40 ms. Final 7D action cosine must be at
 least 0.999 globally and 0.995 for every sample; internal raw cosine must be at
 least 0.995 globally and for every sample.
+
+## Encoder Down v7 Multi-View Result (2026-07-26)
+
+The encoder Down GEMM was re-swept with complete `infer()` calls at the actual
+per-view encoder shapes. Variant v7 (`tile128x128x256`, cluster `1x1x1`) was
+the fastest end-to-end choice. It changes only the CUTLASS tile schedule; the
+FP4 inputs, weights, scale layouts, and outputs are unchanged.
+
+Locked-clock results use 20 warmups and 100 retained samples per mode:
+
+| Views | Same-run FP8 p50 / p95 | FP4+FP4 p50 / p95 | Published FP4+FA4 p50 | Gain vs published |
+|---:|---:|---:|---:|---:|
+| 1 | 35.360 / 35.553 ms | **27.861 / 28.002 ms** | 30.5 ms | **2.639 ms** |
+| 2 | 41.341 / 41.532 ms | **32.971 / 33.112 ms** | 36.3 ms | **3.329 ms** |
+| 3 | 49.528 / 49.868 ms | **39.402 / 39.697 ms** | 42.8 ms | **3.398 ms** |
+
+The variant sweep used complete FP4 child processes with the 1-view fixture,
+5 warmups, and 20 retained calls. The screened p50 values were v0 28.352 ms,
+v1 28.686 ms, v3 28.791 ms, v4 28.358 ms, v6 28.897 ms, v7 28.022 ms,
+v8 28.962 ms, and v10 28.541 ms. The formal multi-view measurements above
+then confirmed v7 with the full sampling contract.
 
 ## 40 ms Production Result
 

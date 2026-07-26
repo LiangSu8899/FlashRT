@@ -55,8 +55,8 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                  awq_alpha: float = 0.5,
                  awq_calib_iters: int = 8,
                  use_p1_split_gu: bool = False,
-                 encoder_p1_combiner: str = "lut_native",
-                 encoder_down_variant: int = 8,
+                 encoder_p1_combiner: str = "direct",
+                 encoder_down_variant: int = 7,
                  decoder_gate_up_variant: int = 10,
                  use_fp8: bool = True,
                  state_prompt_mode: str = "exact",
@@ -163,12 +163,22 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                         raise ValueError(
                             f"decoder FP4 layer {layer} shapes {actual} != "
                             f"{expected}")
-                    self._decoder_fp4_weights.append({
-                        'qkv': quant_weight_nvfp4(qkv),
-                        'o': quant_weight_nvfp4(o),
-                        'gate_up': quant_weight_nvfp4(gate_up),
-                        'down': quant_weight_nvfp4(down),
-                    })
+                    quantized = {}
+                    for name, weight in (
+                            ('qkv', qkv), ('o', o),
+                            ('gate_up', gate_up), ('down', down)):
+                        packed = quant_weight_nvfp4(weight)
+                        rc = fvk_fp4.quantize_fp4_dynamic_sfa_mse_fp16(
+                            weight.data_ptr(), packed['packed'].data_ptr(),
+                            packed['sfb'].data_ptr(), packed['N'], packed['K'],
+                            True, 0)
+                        if rc != 0:
+                            raise RuntimeError(
+                                f"decoder {name} FP4 MSE quantization failed "
+                                f"at layer {layer}: rc={rc}")
+                        quantized[name] = packed
+                    torch.cuda.synchronize()
+                    self._decoder_fp4_weights.append(quantized)
 
             self._decoder_fp4_xn = FP4ActScratch(
                 self.Sa, self.Da, device='cuda')
@@ -273,7 +283,6 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
         De = self.De; He = self.He
         per_sample_gu: dict = {l: [] for l in self._fp4_layers}
         per_sample_dn: dict = {l: [] for l in self._fp4_layers}
-
         for i, obs in enumerate(obs_list):
             if 'images' in obs:
                 img_list = obs['images']
@@ -344,6 +353,7 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
         act_dn_dev = {l: torch.from_numpy(final_dn[l]).cuda()
                       for l in self._fp4_layers}
         self._requant_fp4_weights_with_awq(act_gu_dev, act_dn_dev)
+
         self._awq_calibrated = True
 
         logger.info(
@@ -440,9 +450,10 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                           ) -> tuple[torch.Tensor, torch.Tensor]:
         """AWQ per-input-channel (K axis) pre-scale.
 
-        If ``activation_amax`` is provided (shape [K], fp32), uses AWQ proper:
+        If ``activation_amax`` is provided (shape [K], fp32), uses standard
+        activation-aware weight quantization:
             s[k] = (activation_amax[k] / activation_amax.mean())^alpha
-        Otherwise falls back to weight-only amax.
+        Otherwise fall back to the weight-only amax estimate.
 
         Returns (W' = W * s broadcast along N, inv_s = 1/s).
         Activation must be scaled by inv_s before the FP4 GEMM:
@@ -485,13 +496,14 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
 
                 gu_scaled, inv_s_gu = self._awq_scale_weight(gu_fp16, act_amax_gu[l])
                 d_scaled,  inv_s_dn = self._awq_scale_weight(d_fp16,  act_amax_dn[l])
-
                 # Update inv_s and packed/sfb buffers in place — pointer
                 # addresses unchanged, so the captured graph remains valid.
                 self._awq_inv_s_gu[l].copy_(inv_s_gu)
                 self._awq_inv_s_dn[l].copy_(inv_s_dn)
-                quant_weight_nvfp4_inplace(gu_scaled, self._fp4_weights[l]['gate_up'])
-                quant_weight_nvfp4_inplace(d_scaled,  self._fp4_weights[l]['down'])
+                quant_weight_nvfp4_inplace(
+                    gu_scaled, self._fp4_weights[l]['gate_up'])
+                quant_weight_nvfp4_inplace(
+                    d_scaled, self._fp4_weights[l]['down'])
                 if self.use_p1_split_gu and 'gate' in self._fp4_weights[l]:
                     quant_weight_nvfp4_inplace(
                         gu_scaled[:He, :].contiguous(), self._fp4_weights[l]['gate'])
@@ -505,7 +517,6 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
         Le = self.Le; total_keys = self.total_keys
         act_gu = {l: torch.zeros(De, dtype=torch.float32, device='cuda') for l in self._fp4_layers}
         act_dn = {l: torch.zeros(He, dtype=torch.float32, device='cuda') for l in self._fp4_layers}
-
         # Snapshot scratch buffers (one-per-FP4-layer to avoid re-alloc)
         x_snap = {l: torch.empty(Se, De, dtype=fp16, device='cuda') for l in self._fp4_layers}
         h_snap = {l: torch.empty(Se, He, dtype=fp16, device='cuda') for l in self._fp4_layers}
@@ -601,10 +612,10 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                 Se, De, as_next, 0)
 
         torch.cuda.synchronize()
-        # Compute per-channel amax from snapshots
+        # Per-channel activation amax, matching the reference calibration.
         for l in self._fp4_layers:
-            act_gu[l] = x_snap[l].abs().float().amax(dim=0)  # [De]
-            act_dn[l] = h_snap[l].abs().float().amax(dim=0)  # [He]
+            act_gu[l] = x_snap[l].abs().float().amax(dim=0)
+            act_dn[l] = h_snap[l].abs().float().amax(dim=0)
         # Free snapshots
         del x_snap, h_snap
         torch.cuda.empty_cache()
