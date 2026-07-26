@@ -66,5 +66,7 @@ def attach(model, forward, **kwargs):
     return _attach(model, forward, **kwargs)
 
 
+from . import schemes  # noqa: E402  (registry: quantisation schemes)
+
 __all__ = ["StructureSpec", "attach", "capture", "get", "list_structures",
-           "load", "run_recipe"]
+           "load", "run_recipe", "schemes"]

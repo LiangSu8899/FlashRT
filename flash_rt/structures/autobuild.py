@@ -132,6 +132,7 @@ def auto_swaps(
     observations: Iterable[Any] | None = None,
     percentile: float = 99.9,
     max_samples: int | None = None,
+    scheme: str | Any = "fp8_static",
     verbose: bool = False,
 ) -> AutoPlan:
     """Discover, calibrate in one pass, and bind every applicable seam.
@@ -147,6 +148,11 @@ def auto_swaps(
         auto_swaps(model, [f0, f1, f2])                    # one thunk each
         auto_swaps(model, feed, observations=dataset)      # feed(obs) per obs
         auto_swaps(model, feed, observations=ds, percentile=95.0)
+
+    ``scheme`` names a registered quantisation scheme (:mod:`.schemes`):
+    what statistic each point needs, and per seam whether to bind or keep
+    the host at host precision. The default is the static-FP8 behaviour
+    this layer shipped with, unchanged; it adds no calibration entry.
 
     ``forward`` is always "run the host once"; with ``observations`` it
     takes one observation. That indirection is this layer's only
@@ -202,12 +208,24 @@ def auto_swaps(
     caps: dict[str, dict[str, Any]] = {}
     hooks = []
     all_points: list[Point] = []
+    seam_points: dict[str, list[Point]] = {}
     for seam in seams:
         try:
-            all_points.extend(resolve_points(seam, _spec_points(seam)))
+            pts = resolve_points(seam, _spec_points(seam))
         except ValueError as refusal:
             plan_refusals.append((seam.path, str(refusal)[:120]))
+            continue
+        seam_points[seam.path] = pts
+        all_points.extend(pts)
     collector = Collector(points=all_points)
+
+    from . import schemes as _schemes
+    scheme_obj = (_schemes.get(scheme) if isinstance(scheme, str)
+                  else scheme)
+    # loud wall before any calibration work: a scheme asking for a
+    # granularity the collector cannot measure must not silently get
+    # per-tensor numbers of the wrong shape
+    _schemes.validate_request(scheme_obj.statistics(tuple(all_points)))
 
     # observed call order across the whole calibration pass. Anything
     # that has to know which seam runs first (a stream-scoped buffer
@@ -274,6 +292,24 @@ def auto_swaps(
             f"{source}, {plan_notes_calibration['points']} point(s), "
             f"{plan_notes_calibration['method']}"
             + (f" p={percentile}" if len(thunks) > 1 else "") + ")")
+
+    # ---- the scheme turns statistics into decisions. Keep-host is a
+    # first-class outcome recorded in the receipt, not a refusal: the
+    # seam is healthy, the scheme chose host precision for it. ----
+    scheme_report = {
+        path: {f"{pt.path}|{pt.name}": collector.amax(pt.path, pt.name)
+               for pt in pts}
+        for path, pts in seam_points.items()}
+    decision = scheme_obj.decide(scheme_report)
+    scheme_note: dict[str, Any] = {
+        "name": getattr(scheme_obj, "name", type(scheme_obj).__name__)}
+    if decision.keep_host:
+        kept = set(decision.keep_host)
+        seams = [s for s in seams if s.path not in kept]
+        scheme_note["keep_host"] = {
+            p: decision.reasons.get(p, "") for p in sorted(kept)}
+        say(f"scheme {scheme_note['name']}: {len(kept)} seam(s) kept at "
+            f"host precision")
 
     # ---- fp8 seam negotiation: the load-bearing structure combination.
     # A single kernel need not win alone (fp8 qkv at M=50 is marginal,
@@ -355,6 +391,7 @@ def auto_swaps(
     # and the host would silently grow a quantize fused into whatever
     # produced it. Bind the pair together, or leave both on BF16.
     plan = AutoPlan(seams=seams)
+    plan.notes["scheme"] = scheme_note
     handled: set[str] = set()
     for lay, g in negotiated.items():
         for p_slot, c_slot in (("producer", "pack"),

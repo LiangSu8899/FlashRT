@@ -218,6 +218,22 @@ where they are not.
 implementation second. A spec whose points nothing can locate fails loudly
 at plan time, which is the intent.
 
+**A quantisation scheme**: register an instance in `schemes.py` — two
+methods and nothing else. `statistics` declares what each calibration
+point needs (statistic and granularity: per-tensor, per-channel,
+per-16-block; `None` is legal and means the format quantises that point
+dynamically at runtime). `decide` turns the reduced statistics into
+per-seam outcomes: bind with these values, or keep the host at host
+precision — a first-class decision recorded in the receipt with its
+reason, not a refusal. Bytes are not the scheme's: scale-factor layouts,
+sub-normal handling, packing and kernel choice live in the impl variant
+that executes the decision, which is what lets one decision serve
+different kernels. A statistic the collector cannot measure yet fails
+loudly at plan time; extending the collector is the supported path, and
+silently substituting per-tensor is not. Schemes add no calibration
+entry point — the calibration axis is fixed, a scheme only declares what
+to measure along it.
+
 ## 7. Norms that came from being wrong
 
 - **Calibrate and judge on the host's real inference distribution.**
