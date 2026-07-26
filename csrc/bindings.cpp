@@ -1509,6 +1509,24 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
        py::arg("S"), py::arg("Q_dim"), py::arg("K_dim"), py::arg("HD"), py::arg("qkv_stride"),
        py::arg("kc_offset"), py::arg("kc_stride"), py::arg("stream") = 0);
 
+    // Vectorized bit-exact variant (16B moves); returns nonzero without
+    // launching on unaligned shapes so callers can use the scalar kernel.
+    m.def("qkv_split_rope_kvcache_fp16_vec", [](uintptr_t qkv, uintptr_t rope,
+                                              uintptr_t Q, uintptr_t Kc, uintptr_t Vc,
+                                              int S, int Q_dim, int K_dim, int HD, int qkv_stride,
+                                              long kc_offset, int kc_stride, uintptr_t stream) {
+        return qkv_split_rope_kvcache_fp16_vec(
+                                     reinterpret_cast<const __half*>(qkv),
+                                     reinterpret_cast<const __half*>(rope),
+                                     reinterpret_cast<__half*>(Q),
+                                     reinterpret_cast<__half*>(Kc),
+                                     reinterpret_cast<__half*>(Vc),
+                                     S, Q_dim, K_dim, HD, qkv_stride,
+                                     kc_offset, kc_stride, to_stream(stream));
+    }, py::arg("qkv"), py::arg("rope"), py::arg("Q"), py::arg("Kc"), py::arg("Vc"),
+       py::arg("S"), py::arg("Q_dim"), py::arg("K_dim"), py::arg("HD"), py::arg("qkv_stride"),
+       py::arg("kc_offset"), py::arg("kc_stride"), py::arg("stream") = 0);
+
     // QKV Split + RoPE + KV Cache (FP16) with runtime device K/V row offset.
     // Same shape contract as qkv_split_rope_kvcache_fp16; K/V row =
     // devpos[0] + token row inside the layer slab.

@@ -173,6 +173,24 @@ Bit-exact equivalent of quantize_fp4_dynamic_fp16 followed by
 reshape_linear_scales_to_sfa, in a single kernel launch.
 )pbdoc");
 
+  m.def("quantize_fp4_dynamic_sfa_fp16_vec",
+        [](uintptr_t src, uintptr_t packed, uintptr_t sfa,
+           int N, int D, bool is_sfb, uintptr_t stream) -> int {
+          return flash_rt::fp4::quantize_fp4_dynamic_sfa_fp16_vec(
+              reinterpret_cast<void const*>(src),
+              reinterpret_cast<void*>(packed),
+              reinterpret_cast<void*>(sfa),
+              N, D, is_sfb,
+              reinterpret_cast<cudaStream_t>(stream));
+        },
+        py::arg("src"), py::arg("packed"), py::arg("sfa"),
+        py::arg("N"), py::arg("D"), py::arg("is_sfb"), py::arg("stream") = 0,
+        R"pbdoc(
+Vectorized bit-exact variant of quantize_fp4_dynamic_sfa_fp16 (16B loads,
+8B packed stores). Returns nonzero without launching on unaligned buffers;
+callers fall back to the scalar kernel.
+)pbdoc");
+
   m.def("reshape_linear_scales_to_sfa",
         [](uintptr_t src, uintptr_t dst, int rows, int D, bool is_sfb,
            uintptr_t stream) -> int {

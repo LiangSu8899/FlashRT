@@ -123,13 +123,16 @@ def encoder_forward_with_fp4_subset(gemm, fvk, fvk_fp4, bufs, weights, dims,
         fvk.cutlass_fp8_sq(x_fp8, weights['qkv_w'][l], qkv,
                            Se, 2560, D, alpha_host[l * 4 + 0], 0.0, stream)
 
-        # 3+4. QKV split + RoPE + KV cache write (unchanged)
+        # 3+4. QKV split + RoPE + KV cache write (vectorized, bit-exact)
         kv_elem_off = l * total_keys * HD
-        fvk.qkv_split_rope_kvcache_fp16(
+        rc = fvk.qkv_split_rope_kvcache_fp16_vec(
             qkv, weights['rope'], attn_out,
             weights['Kc'], weights['Vc'],
             Se, Q_dim, K_dim, HD, 2560,
             kv_elem_off, HD, stream)
+        if rc != 0:
+            raise RuntimeError(
+                f"encoder qkv split layer {l} failed rc={rc}")
 
         if not last:
             # 5. Attention (unchanged)

@@ -354,9 +354,13 @@ def decoder_forward_fp4(ctx, fvk, fvk_fp4, bufs, weights, dims, stream=0, *,
                     S, Q_dim, K_dim, HD, 2560, kv_offset, HD, stream)
             else:
                 kv_offset = l * total_keys * HD + enc_seq * HD
-                fvk.qkv_split_rope_kvcache_fp16(
+                rc = fvk.qkv_split_rope_kvcache_fp16_vec(
                     qkv, rope, attn_out, Kc, Vc,
                     S, Q_dim, K_dim, HD, 2560, kv_offset, HD, stream)
+                if rc != 0:
+                    raise RuntimeError(
+                        f"Pi0.5 decoder FP4 qkv split layer {l} failed "
+                        f"rc={rc}")
 
             if attn is not None:
                 attn.run("decoder", l, q_seq=S, kv_seq=total_keys, stream=stream)
@@ -367,7 +371,7 @@ def decoder_forward_fp4(ctx, fvk, fvk_fp4, bufs, weights, dims, stream=0, *,
                     ctx, attn_out, K_ptr, V_ptr, logits, attn_out,
                     S, total_keys, NH, HD, attn_scale, stream)
 
-            rc = fvk_fp4.quantize_fp4_dynamic_sfa_fp16(
+            rc = fvk_fp4.quantize_fp4_dynamic_sfa_fp16_vec(
                 attn_out, ctx_fp4, ctx_sfa, S, NH * HD, False, stream)
             if rc != 0:
                 raise RuntimeError(

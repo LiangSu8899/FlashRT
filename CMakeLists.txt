@@ -1330,6 +1330,7 @@ pybind11_add_module(flash_rt_kernels
   csrc/kernels/norm.cu
   csrc/kernels/activation.cu
   csrc/kernels/rope.cu
+  csrc/kernels/rope_vec.cu
   csrc/kernels/quantize.cu
   csrc/kernels/elementwise.cu
   csrc/kernels/fusion.cu
@@ -1721,6 +1722,7 @@ if(ENABLE_SM100_CUTLASS)
     csrc/quantize/quantize_fp4_dynamic.cu
     csrc/quantize/reshape_scales_sfa.cu
     csrc/quantize/quantize_fp4_sfa.cu
+    csrc/quantize/quantize_fp4_sfa_vec.cu
     csrc/fused_fp16/rms_norm_noweight_fp16.cu
     csrc/fused_fp4/norm_silu_fp4_sfa.cu
     csrc/fused_fp4/silu_mul_fp4_sfa_v2.cu
