@@ -26,6 +26,8 @@
 #endif
 #include "quantize/quantize_fp4_dynamic.cuh"
 #include "quantize/quantize_fp4_sfa.cuh"
+#include "quantize/quantize_e0m3_sfa.cuh"
+#include "gemm/fp4/cutlass_fp4_gemm_e0m3w_sm100.cuh"
 #include "quantize/reshape_scales_sfa.cuh"
 #include "fused_fp16/rms_norm_noweight_fp16.cuh"
 #ifdef FLASHRT_HAVE_COSMOS3_EDGE
@@ -252,6 +254,25 @@ tile-interleave conversion is required.
         py::arg("N"), py::arg("D"), py::arg("is_sfb"), py::arg("stream") = 0,
         "FP16 to NVFP4 SFA/SFB quantization with per-block MSE scale search.");
 
+  m.def("quantize_e0m3_dynamic_sfa_fp16",
+        [](uintptr_t src, uintptr_t packed, uintptr_t sfa,
+           int N, int D, bool is_sfb, uintptr_t stream) -> int {
+          const auto shape = fp4_kernel_shape({{"N", N}, {"D", D}});
+          require_fp4_ptrs("quantize_e0m3_dynamic_sfa_fp16",
+                           {{"src", src}, {"packed", packed}, {"sfa", sfa}}, shape);
+          require_fp4(N > 0 && D > 0 && (D % 16) == 0,
+                      "quantize_e0m3_dynamic_sfa_fp16",
+                      "N must be positive and D must be a positive multiple of 16", shape);
+          return flash_rt::fp4::quantize_e0m3_dynamic_sfa_fp16(
+              reinterpret_cast<void const*>(src),
+              reinterpret_cast<void*>(packed), reinterpret_cast<void*>(sfa),
+              N, D, is_sfb, reinterpret_cast<cudaStream_t>(stream));
+        },
+        py::arg("src"), py::arg("packed"), py::arg("sfa"),
+        py::arg("N"), py::arg("D"), py::arg("is_sfb"), py::arg("stream") = 0,
+        "FP16 to E0M3 (uniform INT4) quantization with per-16 UE4M3 SFA/SFB "
+        "scales; packed/scale layouts match the NVFP4 quantizers.");
+
   m.def("quantize_fp4_dynamic_sfa_fp16",
         [](uintptr_t src, uintptr_t packed, uintptr_t sfa,
            int N, int D, bool is_sfb, uintptr_t stream) -> int {
@@ -324,6 +345,24 @@ callers fall back to the scalar kernel.
         py::arg("alpha") = 1.0f, py::arg("beta") = 0.0f,
         py::arg("stream") = 0,
         "Call one of the NVFP4 GEMM variants by index. Used for tile/schedule tuning.");
+
+  m.def("cutlass_fp4_gemm_e0m3w",
+        [](uintptr_t A, uintptr_t SFA, uintptr_t B, uintptr_t SFB,
+           uintptr_t D, int M, int N, int K, float alpha, float beta,
+           uintptr_t stream) -> int {
+          return flash_rt::fp4::cutlass_fp4_gemm_e0m3w(
+              reinterpret_cast<void const*>(A), reinterpret_cast<void const*>(SFA),
+              reinterpret_cast<void const*>(B), reinterpret_cast<void const*>(SFB),
+              reinterpret_cast<void*>(D), M, N, K, alpha, beta,
+              reinterpret_cast<cudaStream_t>(stream));
+        },
+        py::arg("A"), py::arg("SFA"),
+        py::arg("B"), py::arg("SFB"), py::arg("D"),
+        py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("alpha") = 1.0f, py::arg("beta") = 0.0f,
+        py::arg("stream") = 0,
+        "Block-scaled GEMM with E2M1 activations and E0M3 (uniform INT4) "
+        "weights via the SM110 runtime instruction descriptor (tile 128x64x256).");
 
   m.def("cutlass_fp4_gemm_variant_name", &flash_rt::fp4::cutlass_fp4_gemm_variant_name,
         py::arg("idx"), "Human-readable name of variant at index.");

@@ -61,6 +61,7 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                  decoder_o_variant: int = 10,
                  decoder_gate_up_variant: int = 10,
                  decoder_down_variant: int = 10,
+                 decoder_weight_format: str = "nvfp4",
                  use_fp8: bool = True,
                  state_prompt_mode: str = "exact",
                  state_prompt_fixed_max_len=None,
@@ -122,6 +123,11 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
         self.decoder_o_variant = int(decoder_o_variant)
         self.decoder_gate_up_variant = int(decoder_gate_up_variant)
         self.decoder_down_variant = int(decoder_down_variant)
+        if decoder_weight_format not in ("nvfp4", "e0m3"):
+            raise ValueError(
+                "decoder_weight_format must be 'nvfp4' or 'e0m3', got "
+                f"{decoder_weight_format!r}")
+        self.decoder_weight_format = decoder_weight_format
 
         if self._fp4_layers:
             if not _HAS_FP4:
@@ -213,14 +219,25 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                             ('qkv', qkv), ('o', o),
                             ('gate_up', gate_up), ('down', down)):
                         packed = quant_weight_nvfp4(weight)
-                        rc = fvk_fp4.quantize_fp4_dynamic_sfa_mse_fp16(
-                            weight.data_ptr(), packed['packed'].data_ptr(),
-                            packed['sfb'].data_ptr(), packed['N'], packed['K'],
-                            True, 0)
+                        if self.decoder_weight_format == "e0m3":
+                            # Uniform-INT4 weights for the runtime-idesc
+                            # GEMM; same packed/scale buffer layout.
+                            rc = fvk_fp4.quantize_e0m3_dynamic_sfa_fp16(
+                                weight.data_ptr(),
+                                packed['packed'].data_ptr(),
+                                packed['sfb'].data_ptr(),
+                                packed['N'], packed['K'], True, 0)
+                        else:
+                            rc = fvk_fp4.quantize_fp4_dynamic_sfa_mse_fp16(
+                                weight.data_ptr(),
+                                packed['packed'].data_ptr(),
+                                packed['sfb'].data_ptr(),
+                                packed['N'], packed['K'], True, 0)
                         if rc != 0:
                             raise RuntimeError(
-                                f"decoder {name} FP4 MSE quantization failed "
-                                f"at layer {layer}: rc={rc}")
+                                f"decoder {name} {self.decoder_weight_format} "
+                                f"quantization failed at layer {layer}: "
+                                f"rc={rc}")
                         quantized[name] = packed
                     torch.cuda.synchronize()
                     self._decoder_fp4_weights.append(quantized)
@@ -1230,6 +1247,7 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
         }
         if self.use_fp4_decoder:
             ae_dims['fp4_variants'] = self._decoder_fp4_variants
+            ae_dims['weight_format'] = self.decoder_weight_format
 
         fp4_layers = self._fp4_layers
         fp4_weights = self._fp4_weights if fp4_layers else None

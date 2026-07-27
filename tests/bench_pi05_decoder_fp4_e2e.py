@@ -90,6 +90,12 @@ def main() -> int:
         default="lut_native")
     parser.add_argument("--encoder-down-variant", type=int, default=7)
     parser.add_argument("--decoder-gate-up-variant", type=int, default=10)
+    parser.add_argument(
+        "--decoder-weight-format", choices=("nvfp4", "e0m3"),
+        default="nvfp4",
+        help="Decoder projection weight element format: nvfp4 (E2M1, "
+             "default) or e0m3 (uniform INT4 via the runtime instruction "
+             "descriptor)")
     parser.add_argument("--awq-alpha", type=float, default=0.8)
     parser.add_argument(
         "--encoder-attn-o-fp4", type=int, choices=(0, 1), default=1,
@@ -164,6 +170,7 @@ def main() -> int:
                 encoder_p1_combiner=args.encoder_p1_combiner,
                 encoder_down_variant=args.encoder_down_variant,
                 decoder_gate_up_variant=args.decoder_gate_up_variant,
+                decoder_weight_format=args.decoder_weight_format,
                 use_fp4_decoder=True,
                 use_fa4=True,
                 use_fp4_encoder_attn=bool(args.encoder_attn_o_fp4),
@@ -259,6 +266,7 @@ def main() -> int:
                     "encoder_p1_combiner": args.encoder_p1_combiner,
                     "encoder_down_variant": args.encoder_down_variant,
                     "decoder": "nvfp4_all_projections",
+                    "decoder_weight_format": args.decoder_weight_format,
                     "decoder_gate_up_variant": args.decoder_gate_up_variant,
                     "attention": "fa4_siglip_encoder",
                 }
@@ -318,6 +326,7 @@ def main() -> int:
             "--encoder-p1-combiner", args.encoder_p1_combiner,
             "--encoder-down-variant", str(args.encoder_down_variant),
             "--decoder-gate-up-variant", str(args.decoder_gate_up_variant),
+            "--decoder-weight-format", args.decoder_weight_format,
             "--awq-alpha", str(args.awq_alpha),
             "--encoder-fp4-layer-count", str(args.encoder_fp4_layer_count),
             "--encoder-attn-o-fp4", str(args.encoder_attn_o_fp4),

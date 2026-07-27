@@ -283,6 +283,17 @@ def decoder_forward_fp4(ctx, fvk, fvk_fp4, bufs, weights, dims, stream=0, *,
         raise ValueError(
             "Pi0.5 Thor decoder FP4 requires four non-negative GEMM variants")
     variant_qkv, variant_o, variant_gu, variant_down = variants
+    weight_format = str(dims.get('weight_format', 'nvfp4'))
+    if weight_format == 'e0m3':
+        # Uniform-INT4 weights: route every projection through the
+        # runtime-idesc GEMM (fixed v10 tile); the variant index is unused.
+        def dec_gemm(variant, *args):
+            return fvk_fp4.cutlass_fp4_gemm_e0m3w(*args)
+    elif weight_format == 'nvfp4':
+        dec_gemm = fvk_fp4.cutlass_fp4_gemm_variant
+    else:
+        raise ValueError(
+            f"Pi0.5 Thor decoder FP4 unknown weight_format {weight_format!r}")
     for name in ('qw_fp4', 'qw_sfb', 'ow_fp4', 'ow_sfb',
                  'gw_fp4', 'gw_sfb', 'dw_fp4', 'dw_sfb'):
         if len(weights[name]) != layers:
@@ -339,7 +350,7 @@ def decoder_forward_fp4(ctx, fvk, fvk_fp4, bufs, weights, dims, stream=0, *,
                 fvk_fp4.pi05_adarms_fp4_sfa_native_fp16(
                     x, sa_ptr, xn_fp4, xn_sfa, gate, S, D, stream)
 
-            rc = fvk_fp4.cutlass_fp4_gemm_variant(
+            rc = dec_gemm(
                 variant_qkv, xn_fp4, xn_sfa,
                 weights['qw_fp4'][l], weights['qw_sfb'][l], qkv,
                 S, 2560, D, 1.0, 0.0, stream)
@@ -376,7 +387,7 @@ def decoder_forward_fp4(ctx, fvk, fvk_fp4, bufs, weights, dims, stream=0, *,
             if rc != 0:
                 raise RuntimeError(
                     f"Pi0.5 decoder FP4 O activation layer {l} failed rc={rc}")
-            rc = fvk_fp4.cutlass_fp4_gemm_variant(
+            rc = dec_gemm(
                 variant_o, ctx_fp4, ctx_sfa,
                 weights['ow_fp4'][l], weights['ow_sfb'][l], fg,
                 S, D, NH * HD, 1.0, 0.0, stream)
@@ -386,7 +397,7 @@ def decoder_forward_fp4(ctx, fvk, fvk_fp4, bufs, weights, dims, stream=0, *,
 
             fvk_fp4.pi05_gate_res_adarms_fp4_sfa_native_fp16(
                 fg, gate, x, sf_ptr, xn_fp4, xn_sfa, gate, S, D, stream)
-            rc = fvk_fp4.cutlass_fp4_gemm_variant(
+            rc = dec_gemm(
                 variant_gu, xn_fp4, xn_sfa,
                 weights['gw_fp4'][l], weights['gw_sfb'][l], fg,
                 S, H * 2, D, 1.0, 0.0, stream)
@@ -399,7 +410,7 @@ def decoder_forward_fp4(ctx, fvk, fvk_fp4, bufs, weights, dims, stream=0, *,
             if rc != 0:
                 raise RuntimeError(
                     f"Pi0.5 decoder FP4 GeGLU layer {l} failed rc={rc}")
-            rc = fvk_fp4.cutlass_fp4_gemm_variant(
+            rc = dec_gemm(
                 variant_down, hid_fp4, hid_sfa,
                 weights['dw_fp4'][l], weights['dw_sfb'][l], fg,
                 S, D, H, 1.0, 0.0, stream)
