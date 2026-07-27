@@ -88,7 +88,7 @@ def main() -> int:
     parser.add_argument(
         "--encoder-p1-combiner",
         choices=("direct", "lut", "lut_native", "epilogue", "epilogue_hw"),
-        default="lut_native")
+        default="epilogue_hw")
     parser.add_argument("--encoder-down-variant", type=int, default=7)
     parser.add_argument("--encoder-down-x-variant", type=int, default=6)
     parser.add_argument("--decoder-gate-up-variant", type=int, default=10)

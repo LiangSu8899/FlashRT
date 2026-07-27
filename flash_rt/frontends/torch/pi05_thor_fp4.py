@@ -84,7 +84,7 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                  awq_alpha: float = 0.5,
                  awq_calib_iters: int = 8,
                  use_p1_split_gu: bool = False,
-                 encoder_p1_combiner: str = "lut_native",
+                 encoder_p1_combiner: str = "epilogue_hw",
                  encoder_down_variant: int = 7,
                  encoder_down_x_variant: int = 6,
                  decoder_qkv_variant: int = 10,
