@@ -1,5 +1,42 @@
 # Pi0.5 Thor NVFP4 End-to-End Results
 
+## Encoder Attention QKV NVFP4 + Scale-Factor Zero-Init (2026-07-27)
+
+Two changes landed together in this round.
+
+**Scale-factor buffer zero-init (fix, `cefb181`).** The tile-interleaved
+SFA/SFB layouts round K up to 64-element atoms while the quantize kernels
+and fp4out epilogues only write real (row, block) entries. With K not a
+multiple of 64 — the SigLIP FFN's padded hidden dim 4320 is the only such
+shape in the pipeline — the padding entries kept allocation garbage. Bytes
+0x7F/0xFF there decode as UE4M3 NaN and poison the block-scaled GEMM
+accumulator, so whether the pipeline produced NaN vision embeddings
+depended on allocator history (reusing freed weight-staging memory
+triggered it deterministically; fresh pages hid it). All six SFA/SFB
+allocation sites are now zero-initialized. Init-time cost only; healthy
+runs are bit-identical.
+
+**Encoder attention QKV NVFP4 with AWQ (`3b2b678`, off by default).** The
+QKV projections quantize to NVFP4 with the input LayerNorm folded and a
+fused weightless-RMSNorm x AWQ-inverse-scale -> NVFP4 kernel replacing the
+FP8 RMSNorm. Plain 4-bit Q/K weights break the raw-cosine gate (worst
+sample 0.97), and per-channel AWQ collected at the QKV input during
+multi-sample calibration recovers it. Formal 3-view result with the full
+FP4 stack and SigLIP FFN enabled, all gates PASS:
+
+| config | p50 (ms) | FP8 ref | speedup | raw min | act min |
+|---|---|---|---|---|---|
+| QKV NVFP4 on | 37.132 | 49.321 | 1.3283 | 0.99661 | 0.99889 |
+| QKV FP8 (default) | 36.773 | 49.652 | 1.3502 | 0.99833 | 0.99899 |
+
+The flag ships **disabled**: at encoder sequence length the QKV GEMM is
+compute-bound rather than weight-bandwidth-bound, so NVFP4 only matches
+the FP8 GEMM while the extra fused quantize kernel costs ~18 us per layer
+(~0.33 ms per frame) and the quantization consumes raw-cosine margin.
+The kernels and calibration path remain available behind
+`--encoder-attn-qkv-fp4 1` for shapes where the projection is
+bandwidth-bound.
+
 ## SigLIP AWQ, 27-Layer Preset (2026-07-27)
 
 Commit `dde9809` adds activation-aware requantization for the SigLIP FFN

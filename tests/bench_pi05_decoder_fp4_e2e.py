@@ -95,8 +95,11 @@ def main() -> int:
         "--encoder-attn-o-fp4", type=int, choices=(0, 1), default=1,
         help="NVFP4 encoder attention O projections")
     parser.add_argument(
-        "--encoder-attn-qkv-fp4", type=int, choices=(0, 1), default=1,
-        help="NVFP4 encoder attention QKV projections (AWQ-calibrated)")
+        "--encoder-attn-qkv-fp4", type=int, choices=(0, 1), default=0,
+        help="NVFP4 encoder attention QKV projections (AWQ-calibrated). "
+             "Off by default: passes every gate but the encoder-M QKV GEMM "
+             "is not weight-bandwidth-bound, so FP4 only matches FP8 while "
+             "the extra quantize step costs ~0.3 ms and precision margin")
     parser.add_argument(
         "--siglip-ffn-fp4", type=int, choices=(0, 1), default=1,
         help="NVFP4 SigLIP FFN on the validated 16-layer preset")
