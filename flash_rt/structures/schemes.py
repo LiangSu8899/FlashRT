@@ -38,7 +38,8 @@ from dataclasses import dataclass, field
 from typing import Mapping, Sequence
 
 __all__ = ["PointStat", "Decision", "QuantScheme", "Fp8Static",
-           "register", "get", "names", "validate_request"]
+           "NoQuant", "W8A16Decode", "W4A16Decode",
+           "register", "get", "names", "resolve_auto", "validate_request"]
 
 #: statistics the collector can currently execute. Granularities other
 #: than per-tensor (per-channel, per-block16) are part of the declared
@@ -156,6 +157,7 @@ class W8A16Decode(QuantScheme):
     """
 
     name = "w8a16_decode"
+    _format = "w8a16_static"
 
     def statistics(self, points: Sequence) -> dict[str, PointStat]:
         return {f"{p.path}|{p.name}": PointStat(None) for p in points}
@@ -164,13 +166,47 @@ class W8A16Decode(QuantScheme):
         formats, keep = {}, []
         for seam_path, pts in report.items():
             if any(k.endswith("|act_after_mul") for k in pts):
-                formats[seam_path] = "w8a16_static"
+                formats[seam_path] = self._format
             else:
                 keep.append(seam_path)
         return Decision(keep_host=tuple(keep),
-                        reasons={p: "w8a16_decode binds decoder_ffn only"
+                        reasons={p: f"{self.name} binds decoder_ffn only"
                                  for p in keep},
                         formats=formats)
+
+
+class W4A16Decode(W8A16Decode):
+    """Weight-only NVFP4 (E2M1 packed + block scale factors) twin of
+    :class:`W8A16Decode` — same decode band, same M-dispatch, half the
+    weight bytes. The ``flashrt/weight-only-ffn`` package quantises
+    weights per 16-element block at bind time; activations stay BF16,
+    so like the INT8 twin it needs no calibration data.
+    """
+
+    name = "w4a16_decode"
+    _format = "w4a16_static"
+
+
+class NoQuant(QuantScheme):
+    """Quantisation off: every quantised seam stays at host precision.
+
+    This is the explicit off-switch, not a degraded mode. Structures
+    that are pure fusion (the attention core, cadence buffers) never
+    consult a scheme decision and attach as usual — a BF16/FP16 host
+    under this scheme still gets every fusion structure, it just gets
+    no quantised GEMMs. Zero calibration, zero kernel dependencies.
+    """
+
+    name = "none"
+
+    def statistics(self, points: Sequence) -> dict[str, PointStat]:
+        return {f"{p.path}|{p.name}": PointStat(None) for p in points}
+
+    def decide(self, report: Mapping[str, Mapping[str, float]]) -> Decision:
+        keep = tuple(report)
+        return Decision(keep_host=keep,
+                        reasons={p: "quantisation off (scheme 'none')"
+                                 for p in keep})
 
 
 _REGISTRY: dict[str, QuantScheme] = {}
@@ -212,6 +248,27 @@ def validate_request(request: Mapping[str, PointStat]) -> None:
             f"supported path — do not fall back to per-tensor silently.")
 
 
+def resolve_auto() -> str:
+    """Resolve the ``"auto"`` profile: highest performance this device
+    can execute, from the registered names.
+
+    FP8-capable hardware (SM >= 89) gets ``fp8_static`` — bit-identical
+    to the behaviour before ``auto`` existed. Anything else gets
+    ``none``: fusion structures still attach, quantised seams stay at
+    host precision, and the receipt records why. The resolution table is
+    deliberately one function so a future profile that measures faster
+    (an FP4 mix, say) is promoted by editing exactly one line.
+    """
+    try:
+        from flash_rt.core.utils.hardware import supports_fp8
+        fp8 = bool(supports_fp8())
+    except Exception:
+        fp8 = False
+    return "fp8_static" if fp8 else "none"
+
+
 register("fp8_static", Fp8Static())
 register("fp8_static_keep_outliers", Fp8Static(keep_outliers=20.0))
 register("w8a16_decode", W8A16Decode())
+register("w4a16_decode", W4A16Decode())
+register("none", NoQuant())

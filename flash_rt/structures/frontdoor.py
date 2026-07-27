@@ -278,6 +278,7 @@ def attach(
     rounds: int = 5,
     iters: int = 10,
     on_guard_fail: str = "fallback",
+    scheme: str | Any = "auto",
     verbose: bool = True,
 ) -> Plan:
     """Discover, calibrate, gate and activate structures in one call.
@@ -285,6 +286,11 @@ def attach(
     ``forward`` runs the host once; ``observations`` / ``percentile`` /
     ``max_samples`` are the repo's calibration arguments and mean exactly
     what they mean in ``flash_rt.api.FlashRT.calibrate``.
+
+    ``scheme`` selects the precision profile by registered name
+    (:mod:`.schemes`); the default ``"auto"`` resolves to the fastest
+    profile the device can execute, and ``"none"`` is the explicit
+    quantisation off-switch.
 
     ``output_kind`` picks how accuracy is measured — ``"values"`` for a
     host whose output is the answer, ``"distribution"`` for one whose
@@ -321,7 +327,7 @@ def attach(
     plan = auto_swaps(model, forward, structures=structures,
                       observations=observations, percentile=percentile,
                       max_samples=max_samples, prefix_cadence=prefix_cadence,
-                      verbose=verbose)
+                      scheme=scheme, verbose=verbose)
     if not plan.swaps:
         plan.revert_all()
         return Plan({}, {}, {"digest": "none", "seams": 0,

@@ -147,7 +147,7 @@ def auto_swaps(
     observations: Iterable[Any] | None = None,
     percentile: float = 99.9,
     max_samples: int | None = None,
-    scheme: str | Any = "fp8_static",
+    scheme: str | Any = "auto",
     verbose: bool = False,
 ) -> AutoPlan:
     """Discover, calibrate in one pass, and bind every applicable seam.
@@ -166,8 +166,13 @@ def auto_swaps(
 
     ``scheme`` names a registered quantisation scheme (:mod:`.schemes`):
     what statistic each point needs, and per seam whether to bind or keep
-    the host at host precision. The default is the static-FP8 behaviour
-    this layer shipped with, unchanged; it adds no calibration entry.
+    the host at host precision. The default ``"auto"`` resolves to the
+    highest-performing profile the device can execute — on FP8-capable
+    hardware that is ``fp8_static``, bit-identical to the behaviour this
+    layer shipped with; elsewhere it is ``none`` (fusion structures
+    attach, quantised seams stay at host precision). Explicit selection
+    (``scheme="none"``, ``scheme="w4a16_decode"``, ...) overrides. It
+    adds no calibration entry.
 
     ``forward`` is always "run the host once"; with ``observations`` it
     takes one observation. That indirection is this layer's only
@@ -234,6 +239,10 @@ def auto_swaps(
         all_points.extend(pts)
 
     from . import schemes as _schemes
+    auto_resolved = isinstance(scheme, str) and scheme == "auto"
+    if auto_resolved:
+        scheme = _schemes.resolve_auto()
+        say(f"scheme auto -> {scheme}")
     scheme_obj = (_schemes.get(scheme) if isinstance(scheme, str)
                   else scheme)
     # loud wall before any calibration work: a scheme asking for a
@@ -319,6 +328,8 @@ def auto_swaps(
     decision = scheme_obj.decide(scheme_report)
     scheme_note: dict[str, Any] = {
         "name": getattr(scheme_obj, "name", type(scheme_obj).__name__)}
+    if auto_resolved:
+        scheme_note["auto"] = True
     if decision.keep_host:
         kept = set(decision.keep_host)
         seams = [s for s in seams if s.path not in kept]
@@ -716,21 +727,24 @@ def _bind_auto(model, seam, cap, plan, act_scales, negotiate_fp8,
                          f"{fmt!r}, which has no impl variant here")
 
     if seam.structure == "decoder_ffn":
-        if fmt == "w8a16_static":
-            from .impls.decoder_ffn import w8a16_static as w8_impl
+        if fmt in ("w8a16_static", "w4a16_static"):
+            if fmt == "w8a16_static":
+                from .impls.decoder_ffn import w8a16_static as wq_impl
+            else:
+                from .impls.decoder_ffn import w4a16_static as wq_impl
 
             # two callers, two layout conventions: ``seam_weights``
-            # serves the fp8 impl transposed ([D, F]); this binder is
-            # checkpoint-native ([F, D]) and its dim check passes with
-            # the names swapped, so handing it the transposed dict binds
-            # a guard with k = F and every call falls back. Transpose
-            # back here, at the seam between the conventions.
+            # serves the fp8 impl transposed ([D, F]); these binders are
+            # checkpoint-native ([F, D]) and their dim check passes with
+            # the names swapped, so handing them the transposed dict
+            # binds a guard with k = F and every call falls back.
+            # Transpose back here, at the seam between the conventions.
             w = seam_weights(model, seam)
             w = dict(w,
                      w_gate=w["w_gate"].t().contiguous(),
                      w_up=w["w_up"].t().contiguous(),
                      w_down=w["w_down"].t().contiguous())
-            return w8_impl.bind_mlp_seam(
+            return wq_impl.bind_mlp_seam(
                 w, variant=seam.variant,
                 original=_resolve(model, seam.path))
         if fmt not in (None, "fp8_static"):
