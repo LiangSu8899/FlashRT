@@ -147,6 +147,27 @@ Phase 4 will add the layout conversion helper.
         "NVFP4 GEMM, epilogue acc + bias[N] + C (residual), fp16 output; "
         "C may alias D.");
 
+  m.def("layer_norm_mul_fp4_sfa_fp16",
+        [](uintptr_t x, uintptr_t gamma, uintptr_t beta, uintptr_t inv_s,
+           uintptr_t packed, uintptr_t sfa,
+           int seq_len, int dim, float eps, uintptr_t stream) -> int {
+          return flash_rt::fused_fp4::layer_norm_mul_fp4_sfa_fp16(
+              reinterpret_cast<const __half*>(x),
+              reinterpret_cast<const __half*>(gamma),
+              reinterpret_cast<const __half*>(beta),
+              reinterpret_cast<const __half*>(inv_s),
+              reinterpret_cast<void*>(packed),
+              reinterpret_cast<void*>(sfa),
+              seq_len, dim, eps,
+              reinterpret_cast<cudaStream_t>(stream));
+        },
+        py::arg("x"), py::arg("gamma"), py::arg("beta"), py::arg("inv_s"),
+        py::arg("packed"), py::arg("sfa"),
+        py::arg("seq_len"), py::arg("dim"), py::arg("eps") = 1e-5f,
+        py::arg("stream") = 0,
+        "Fused LayerNorm + per-channel AWQ inverse scale + NVFP4/SFA "
+        "quantize (inv_s = 0 for the plain path).");
+
   m.def("layer_norm_fp4_sfa_fp16",
         [](uintptr_t x, uintptr_t gamma, uintptr_t beta,
            uintptr_t packed, uintptr_t sfa,

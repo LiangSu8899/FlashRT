@@ -86,12 +86,13 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
         self.use_fp4_decoder = bool(use_fp4_decoder)
         self.use_fp4_encoder_attn = bool(use_fp4_encoder_attn)
         self.use_fp4_siglip_ffn = bool(use_fp4_siglip_ffn)
-        # Validated preset: the first 16 SigLIP layers. Deeper-layer FP4
-        # FFNs (tested at 20/23/27 of 27) push the worst-sample raw cosine
-        # below the 0.995 acceptance gate.
+        # Default: all 27 layers. Without AWQ, deep-layer FP4 FFNs push the
+        # worst-sample raw cosine below the 0.995 gate (0.989 at 27 of 27);
+        # the activation-aware Up-weight requant during multi-sample
+        # calibration recovers it to 0.998.
         self._fp4_siglip_layers = (
             frozenset(fp4_siglip_layers) if fp4_siglip_layers is not None
-            else frozenset(range(16)))
+            else frozenset(range(27)))
         self._fp4_layers = frozenset(fp4_layers) if self.use_fp4_encoder_ffn else frozenset()
         self.use_awq = bool(use_awq) and self.use_fp4_encoder_ffn
         self.awq_alpha = float(awq_alpha)
@@ -321,6 +322,9 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
         De = self.De; He = self.He
         per_sample_gu: dict = {l: [] for l in self._fp4_layers}
         per_sample_dn: dict = {l: [] for l in self._fp4_layers}
+        sig_layers = (sorted(self._sig_fp4_weights)
+                      if self.use_fp4_siglip_ffn else [])
+        per_sample_sig: dict = {l: [] for l in sig_layers}
         for i, obs in enumerate(obs_list):
             if 'images' in obs:
                 img_list = obs['images']
@@ -359,6 +363,16 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                 per_sample_dn[l].append(
                     act_dn[l].detach().cpu().numpy().astype(np.float32))
 
+            if sig_layers:
+                # Runs after the encoder collection: the eager SigLIP pass
+                # overwrites the SigLIP buffers, which the next sample's
+                # graph replay rewrites anyway.
+                sig_amax = self._collect_siglip_awq_amax()
+                for l in sig_layers:
+                    per_sample_sig[l].append(
+                        sig_amax[l].detach().cpu().numpy().astype(
+                            np.float32))
+
             if verbose and (i + 1) % max(1, n // 10) == 0:
                 logger.info("  AWQ sample %d/%d", i + 1, n)
 
@@ -381,6 +395,15 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
         check_scale_ceiling(
             {f"L{l}_dn_max": float(final_dn[l].max()) for l in self._fp4_layers},
             label=f"pi05_thor_fp4_awq_N{n}")
+
+        if sig_layers:
+            final_sig = {
+                l: accumulate_amax(per_sample_sig[l], percentile=percentile)
+                for l in sig_layers}
+            self._requant_sig_fp4_weights_with_awq({
+                l: torch.as_tensor(final_sig[l], device='cuda')
+                for l in sig_layers})
+            self._sig_awq_calibrated = True
 
         # Hand the reduced per-channel amax dicts to the existing single-
         # frame AWQ requant routine. It updates inv_s + NVFP4 packed/sfb
@@ -544,6 +567,8 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                 "vision_model.encoder.layers")
         self._sig_fp4_weights = {}
         self._sig_fp4_up_bias = []       # keep padded bias tensors alive
+        self._sig_fp4_up_fp16 = {}
+        self._sig_awq_inv_s = {}
         with safe_open(self._checkpoint_path, framework='pt',
                        device='cuda') as sf:
             _strip = _autodetect_strip_prefix(set(sf.keys()))
@@ -581,6 +606,13 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                     entry[name] = packed
                 entry['up_bias'] = b_up_p.data_ptr()
                 self._sig_fp4_up_bias.append(b_up_p)
+                # Keep the fp16 padded Up weight for the AWQ requant and
+                # allocate the per-channel inverse scale (identity until
+                # real-data calibration).
+                self._sig_fp4_up_fp16[l] = w_up_p.contiguous()
+                inv = torch.ones(D, dtype=fp16, device='cuda')
+                self._sig_awq_inv_s[l] = inv
+                entry['ln_inv_s'] = inv.data_ptr()
                 torch.cuda.synchronize()
                 self._sig_fp4_weights[l] = entry
         self._sig_fp4_scratch = {
@@ -882,6 +914,15 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
         # Run production FP8 calibration + non-AWQ FP4 graph capture.
         super()._recalibrate_with_real_data()
 
+        if (self.use_fp4_siglip_ffn
+                and not getattr(self, '_sig_awq_calibrated', False)):
+            logger.info(
+                "Running SigLIP AWQ calibration on %d FP4 FFN layers...",
+                len(self._sig_fp4_weights))
+            sig_amax = self._collect_siglip_awq_amax()
+            self._requant_sig_fp4_weights_with_awq(sig_amax)
+            self._sig_awq_calibrated = True
+
         if not self.use_awq or getattr(self, '_awq_calibrated', False):
             return
 
@@ -895,6 +936,84 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
         # and inv_s buffers in place, so the captured graph picks up the new
         # values on the next replay. Saves ~1 s of set_prompt time.
         logger.info("AWQ calibration complete (graph reused, in-place requant)")
+
+    def _collect_siglip_awq_amax(self):
+        """One eager FP8 SigLIP pass on the current calibration image,
+        snapshotting the FFN LayerNorm input at each NVFP4 layer; returns
+        {layer: per-channel amax of the fp16 LayerNorm output} (the Up GEMM
+        activation)."""
+        import torch.nn.functional as F
+        S, D, H = self.sig_S, self.sig_D, self.sig_H
+        L = self.sig_L
+        spv = 256
+        w = self._sig_weights
+        alpha = w['alpha']
+        unit = w['unit_scale']
+
+        x = self._sig_x
+        x_fp8 = self._sig_x_fp8
+        qkv = self._sig_qkv
+        attn_out = self._sig_attn
+        hidden = self._sig_hidden
+        hid_fp8 = self._sig_hid_fp8
+
+        amax = {}
+        self._patch_embed_ops(0)
+        for l in range(L):
+            a_qkv = alpha[l * 4 + 0]
+            a_o = alpha[l * 4 + 1]
+            a_up = alpha[l * 4 + 2]
+            a_down = alpha[l * 4 + 3]
+            fvk.layer_norm_fp8(x.data_ptr(), x_fp8.data_ptr(),
+                               w['ln_attn_w'][l], w['ln_attn_b'][l],
+                               S, D, 1e-5, 0)
+            self._gemm.fp8_nn_bias(x_fp8.data_ptr(), w['qkv_w'][l],
+                                   qkv.data_ptr(), w['qkv_b'][l],
+                                   S, 3 * D, D, a_qkv, 0)
+            self._attn.run("siglip", 0, q_seq=spv, stream=0)
+            fvk.quantize_fp8_static_fp16(attn_out.data_ptr(),
+                                         x_fp8.data_ptr(), unit, S * D, 0)
+            self._gemm.fp8_nn_bias_res(x_fp8.data_ptr(), w['o_w'][l],
+                                       x.data_ptr(), w['o_b'][l],
+                                       S, D, D, a_o, 0)
+            if l in self._sig_fp4_weights:
+                torch.cuda.synchronize()
+                xn = F.layer_norm(
+                    x.float(), (D,), self._sig_ln_ffn_w[l].float(),
+                    self._sig_ln_ffn_b[l].float(), 1e-5)
+                amax[l] = xn.abs().amax(dim=0)
+            fvk.layer_norm_fp8(x.data_ptr(), x_fp8.data_ptr(),
+                               w['ln_ffn_w'][l], w['ln_ffn_b'][l],
+                               S, D, 1e-5, 0)
+            self._gemm.fp8_nn_gelu_bias(x_fp8.data_ptr(), w['up_w'][l],
+                                        hidden.data_ptr(), w['up_b'][l],
+                                        S, H, D, a_up, 0)
+            fvk.quantize_fp8_static_fp16(hidden.data_ptr(),
+                                         hid_fp8.data_ptr(), unit, S * H, 0)
+            self._gemm.fp8_nn_bias_res(hid_fp8.data_ptr(), w['down_w'][l],
+                                       x.data_ptr(), w['down_b'][l],
+                                       S, D, H, a_down, 0)
+        torch.cuda.synchronize()
+        return amax
+
+    def _requant_sig_fp4_weights_with_awq(self, sig_amax: dict):
+        """In-place AWQ requant of the SigLIP Up weights (packed/sfb keep
+        their addresses, so the captured graphs pick up the new values)."""
+        for l, a in sig_amax.items():
+            w_fp16 = self._sig_fp4_up_fp16[l]
+            w_scaled, inv_s = self._awq_scale_weight(w_fp16,
+                                                     activation_amax=a)
+            packed = self._sig_fp4_weights[l]['up']
+            rc = fvk_fp4.quantize_fp4_dynamic_sfa_mse_fp16(
+                w_scaled.data_ptr(), packed['packed'].data_ptr(),
+                packed['sfb'].data_ptr(), packed['N'], packed['K'], True, 0)
+            if rc != 0:
+                raise RuntimeError(
+                    f"SigLIP AWQ Up requant failed at layer {l}: rc={rc}")
+            self._sig_awq_inv_s[l].copy_(inv_s)
+        torch.cuda.synchronize()
+        logger.info("SigLIP AWQ requant complete (%d layers, in place)",
+                    len(sig_amax))
 
     # -------------------------------------------------------------------
     # Graph capture — reroute encoder forward when FP4 enabled

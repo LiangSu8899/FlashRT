@@ -73,6 +73,7 @@ __global__ void layer_norm_fp4_sfa_kernel(
     const __half* __restrict__ x,
     const __half* __restrict__ gamma,
     const __half* __restrict__ beta,
+    const __half* __restrict__ inv_s,  // [D] AWQ inverse scales, or nullptr
     uint2* __restrict__ packed,        // [S, D/16] 8-byte blocks
     uint8_t* __restrict__ dst_sfa,
     LayoutSF layout,
@@ -109,13 +110,23 @@ __global__ void layer_norm_fp4_sfa_kernel(
         const __half* xh = reinterpret_cast<const __half*>(xr);
         const __half* gh = reinterpret_cast<const __half*>(gr);
         const __half* bh = reinterpret_cast<const __half*>(br);
+        int4 ir[2];
+        const __half* ih = nullptr;
+        if (inv_s != nullptr) {
+            const int4* i4 = reinterpret_cast<const int4*>(inv_s);
+            ir[0] = i4[2 * blk];
+            ir[1] = i4[2 * blk + 1];
+            ih = reinterpret_cast<const __half*>(ir);
+        }
         float vals[16];
         float amax = 0.f;
         #pragma unroll
         for (int i = 0; i < 16; ++i) {
-            const float normed =
+            float normed =
                 (__half2float(xh[i]) - mean) * rstd * __half2float(gh[i]) +
                 __half2float(bh[i]);
+            if (inv_s != nullptr)
+                normed *= __half2float(ih[i]);
             // fp16 rounding to stay bit-identical with the two-step
             // (fp16 LayerNorm, then quantize) reference.
             vals[i] = __half2float(__float2half(normed));
@@ -148,23 +159,33 @@ int layer_norm_fp4_sfa_fp16(
     const __half* x, const __half* gamma, const __half* beta,
     void* packed, void* sfa,
     int seq_len, int dim, float eps, cudaStream_t stream) {
+    return layer_norm_mul_fp4_sfa_fp16(
+        x, gamma, beta, nullptr, packed, sfa, seq_len, dim, eps, stream);
+}
+
+int layer_norm_mul_fp4_sfa_fp16(
+    const __half* x, const __half* gamma, const __half* beta,
+    const __half* inv_s,
+    void* packed, void* sfa,
+    int seq_len, int dim, float eps, cudaStream_t stream) {
 #if FV_HAVE_CUTLASS
     if (dim % 16 != 0 || dim % 2 != 0) return -1;
     if ((reinterpret_cast<uintptr_t>(x) & 15) ||
         (reinterpret_cast<uintptr_t>(gamma) & 15) ||
         (reinterpret_cast<uintptr_t>(beta) & 15) ||
+        (reinterpret_cast<uintptr_t>(inv_s) & 15) ||
         (reinterpret_cast<uintptr_t>(packed) & 7)) return -1;
     auto shape = cute::make_shape(seq_len, 1, dim, 1);
     auto layout = CfgLN::tile_atom_to_shape_SFA(shape);
     layer_norm_fp4_sfa_kernel<<<seq_len, 128, 0, stream>>>(
-        x, gamma, beta,
+        x, gamma, beta, inv_s,
         reinterpret_cast<uint2*>(packed),
         reinterpret_cast<uint8_t*>(sfa),
         layout, dim, eps);
     const cudaError_t e = cudaGetLastError();
     return (e == cudaSuccess) ? 0 : -static_cast<int>(e);
 #else
-    (void)x; (void)gamma; (void)beta; (void)packed; (void)sfa;
+    (void)x; (void)gamma; (void)beta; (void)inv_s; (void)packed; (void)sfa;
     (void)seq_len; (void)dim; (void)eps; (void)stream;
     return -2;
 #endif

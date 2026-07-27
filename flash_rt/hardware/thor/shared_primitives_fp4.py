@@ -390,8 +390,9 @@ def siglip_forward_with_fp4_ffn(gemm, fvk, fvk_fp4, bufs, weights, dims,
                                  weights['down_b'][l], S, D, H, a_down,
                                  stream)
             continue
-        rc = fvk_fp4.layer_norm_fp4_sfa_fp16(
+        rc = fvk_fp4.layer_norm_mul_fp4_sfa_fp16(
             x, weights['ln_ffn_w'][l], weights['ln_ffn_b'][l],
+            w.get('ln_inv_s', 0),
             sc_ln.packed.data_ptr(), sc_ln.sfa.data_ptr(),
             S, D, 1e-5, stream)
         if rc != 0:
