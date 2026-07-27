@@ -885,6 +885,48 @@ gelu(gate)*up duplicated into both columns of each pair; replaces the
 gate GEMM + up GEMM + combiner chain.
 )pbdoc");
 
+  m.def("cutlass_fp4_gemm_geglu_il_hw",
+        [](uintptr_t A_packed, uintptr_t SFA,
+           uintptr_t B_packed, uintptr_t SFB,
+           uintptr_t D_dummy, uintptr_t compact_packed, uintptr_t compact_sfa,
+           int M, int N_il, int K, uintptr_t stream) -> int {
+          const auto shape = fp4_kernel_shape({{"M", M}, {"N_il", N_il}, {"K", K}});
+          require_fp4_ptrs("cutlass_fp4_gemm_geglu_il_hw",
+                           {{"A_packed", A_packed}, {"SFA", SFA},
+                            {"B_packed", B_packed}, {"SFB", SFB},
+                            {"D_dummy", D_dummy},
+                            {"compact_packed", compact_packed},
+                            {"compact_sfa", compact_sfa}}, shape);
+          require_fp4(M > 0 && N_il > 0 && K > 0 && (N_il % 32) == 0 &&
+                      (K % 16) == 0,
+                      "cutlass_fp4_gemm_geglu_il_hw",
+                      "M must be positive, N_il a positive multiple of 32 "
+                      "and K a positive multiple of 16",
+                      shape);
+          return flash_rt::fp4::cutlass_fp4_gemm_geglu_il_hw(
+              reinterpret_cast<void const*>(A_packed),
+              reinterpret_cast<void const*>(SFA),
+              reinterpret_cast<void const*>(B_packed),
+              reinterpret_cast<void const*>(SFB),
+              reinterpret_cast<void*>(D_dummy),
+              reinterpret_cast<void*>(compact_packed),
+              reinterpret_cast<void*>(compact_sfa),
+              M, N_il, K,
+              reinterpret_cast<cudaStream_t>(stream));
+        },
+        py::arg("A_packed"), py::arg("SFA"),
+        py::arg("B_packed"), py::arg("SFB"),
+        py::arg("D_dummy"), py::arg("compact_packed"), py::arg("compact_sfa"),
+        py::arg("M"), py::arg("N_il"), py::arg("K"),
+        py::arg("stream") = 0,
+        R"pbdoc(
+Half-width fused GeGLU interleaved GEMM: the epilogue quantizes
+gelu(gate)*up at compact granularity and writes compact_packed
+[M, N_il/2] + compact_sfa (SFA tile-atom layout) directly; D_dummy
+[M, N_il] receives zeros and may be one buffer shared across layers.
+The downstream GEMM keeps its original K = N_il/2 weight.
+)pbdoc");
+
 #ifdef FLASHRT_HAVE_COSMOS3_EDGE
   m.def("cosmos3_edge_fp4_gemm_relu2_fp4out",
         [](uintptr_t A_packed, uintptr_t SFA,

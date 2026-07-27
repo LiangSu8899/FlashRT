@@ -87,7 +87,7 @@ def main() -> int:
         "--encoder-gu-mode", choices=("p1", "merged"), default="p1")
     parser.add_argument(
         "--encoder-p1-combiner",
-        choices=("direct", "lut", "lut_native", "epilogue"),
+        choices=("direct", "lut", "lut_native", "epilogue", "epilogue_hw"),
         default="lut_native")
     parser.add_argument("--encoder-down-variant", type=int, default=7)
     parser.add_argument("--encoder-down-x-variant", type=int, default=6)

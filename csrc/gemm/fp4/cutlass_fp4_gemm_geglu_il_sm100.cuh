@@ -28,5 +28,20 @@ int cutlass_fp4_gemm_geglu_il(
     int M, int N_il, int K,
     cudaStream_t stream);
 
+// Half-width variant: the epilogue quantizes gelu(gate)*up at compact
+// granularity (16 unique values per scale block, combiner-equivalent) and
+// writes compact_packed [M, N_il/2] + compact_sfa (SFA tile-atom layout on
+// (M, N_il/2)) directly; D_dummy [M, N_il] receives zeros and can be one
+// small buffer shared across layers. The downstream GEMM consumes the
+// compact outputs with its original K = N_il/2 weight.
+int cutlass_fp4_gemm_geglu_il_hw(
+    void const* A_packed, void const* SFA,
+    void const* B_packed, void const* SFB,
+    void*       D_dummy,
+    void*       compact_packed,
+    void*       compact_sfa,
+    int M, int N_il, int K,
+    cudaStream_t stream);
+
 }  // namespace fp4
 }  // namespace flash_rt

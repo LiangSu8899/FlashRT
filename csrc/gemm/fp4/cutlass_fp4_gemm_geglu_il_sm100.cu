@@ -104,6 +104,42 @@ using StrideD = typename Gemm::GemmKernel::StrideD;
 using Sm1xxBlkScaledConfig =
     typename Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
 
+// ── Half-width (compact-store) instantiation — only the fusion op differs ──
+using FusionOperationHw = cutlass::epilogue::fusion::GeluMulCompactBlockScaleFactor<
+    OutputSFVectorSize,
+    ElementD,
+    ElementCompute,
+    ElementSFD, LayoutSFDTag,
+    ElementC>;
+
+using CollectiveEpilogueHw = typename cutlass::epilogue::collective::CollectiveBuilder<
+    ArchTag, OperatorClass,
+    MmaTileShape, ClusterShape,
+    cutlass::epilogue::collective::EpilogueTileAuto,
+    ElementAccumulator, ElementAccumulator,
+    ElementC, LayoutCTag, AlignmentC,
+    ElementD, LayoutDTag, AlignmentD,
+    cutlass::epilogue::collective::EpilogueScheduleAuto,
+    FusionOperationHw
+>::CollectiveOp;
+
+using CollectiveMainloopHw = typename cutlass::gemm::collective::CollectiveBuilder<
+    ArchTag, OperatorClass,
+    ElementA, LayoutATag, AlignmentA,
+    ElementB, LayoutBTag, AlignmentB,
+    ElementAccumulator,
+    MmaTileShape, ClusterShape,
+    cutlass::gemm::collective::StageCountAutoCarveout<
+        static_cast<int>(sizeof(typename CollectiveEpilogueHw::SharedStorage))>,
+    cutlass::gemm::collective::KernelScheduleAuto
+>::CollectiveOp;
+
+using GemmKernelHw = cutlass::gemm::kernel::GemmUniversal<
+    Shape<int, int, int, int>,
+    CollectiveMainloopHw, CollectiveEpilogueHw, void>;
+
+using GemmHw = cutlass::gemm::device::GemmUniversalAdapter<GemmKernelHw>;
+
 }  // namespace geglu_il
 
 int cutlass_fp4_gemm_geglu_il(
@@ -152,6 +188,57 @@ int cutlass_fp4_gemm_geglu_il(
   auto st = gemm.can_implement(args);
   if (st != cutlass::Status::kSuccess) return static_cast<int>(st) | 0x10000;
   size_t ws_sz = Gemm::get_workspace_size(args);
+  void* ws = nullptr;
+  if (ws_sz > 0 && cudaMalloc(&ws, ws_sz) != cudaSuccess) return -1;
+  st = gemm.initialize(args, ws, stream);
+  if (st != cutlass::Status::kSuccess) {
+    if (ws) cudaFree(ws);
+    return static_cast<int>(st) | 0x20000;
+  }
+  st = gemm.run(stream);
+  if (ws) cudaFree(ws);
+  return (st == cutlass::Status::kSuccess) ? 0 : (static_cast<int>(st) | 0x30000);
+}
+
+int cutlass_fp4_gemm_geglu_il_hw(
+    void const* A_packed, void const* SFA,
+    void const* B_packed, void const* SFB,
+    void*       D_dummy,
+    void*       compact_packed,
+    void*       compact_sfa,
+    int M, int N_il, int K,
+    cudaStream_t stream) {
+  using namespace geglu_il;
+
+  auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, {M, K, 1});
+  auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, {N_il, K, 1});
+  auto stride_C = cutlass::make_cute_packed_stride(StrideC{}, {M, N_il, 1});
+  auto stride_D = cutlass::make_cute_packed_stride(StrideD{}, {M, N_il, 1});
+  auto layout_SFA = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(make_shape(M, N_il, K, 1));
+  auto layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(M, N_il, K, 1));
+
+  using EA = typename ElementA::DataType;
+  using SA = typename ElementA::ScaleFactorType;
+  using EB = typename ElementB::DataType;
+  using SB = typename ElementB::ScaleFactorType;
+
+  typename GemmHw::Arguments args{
+      cutlass::gemm::GemmUniversalMode::kGemm, {M, N_il, K, 1},
+      { reinterpret_cast<EA const*>(A_packed), stride_A,
+        reinterpret_cast<EB const*>(B_packed), stride_B,
+        reinterpret_cast<SA const*>(SFA), layout_SFA,
+        reinterpret_cast<SB const*>(SFB), layout_SFB },
+      { /* thread args (FusionCallbacks::Arguments) */ { 1.0f, 0.0f },
+        reinterpret_cast<ElementC*>(D_dummy), stride_C,
+        reinterpret_cast<ElementD*>(D_dummy), stride_D }
+  };
+  args.epilogue.thread.compact_ptr    = reinterpret_cast<uint8_t*>(compact_packed);
+  args.epilogue.thread.compact_sf_ptr = reinterpret_cast<uint8_t*>(compact_sfa);
+
+  GemmHw gemm;
+  auto st = gemm.can_implement(args);
+  if (st != cutlass::Status::kSuccess) return static_cast<int>(st) | 0x10000;
+  size_t ws_sz = GemmHw::get_workspace_size(args);
   void* ws = nullptr;
   if (ws_sz > 0 && cudaMalloc(&ws, ws_sz) != cudaSuccess) return -1;
   st = gemm.initialize(args, ws, stream);

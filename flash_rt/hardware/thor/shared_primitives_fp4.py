@@ -104,6 +104,8 @@ def encoder_forward_with_fp4_subset(gemm, fvk, fvk_fp4, bufs, weights, dims,
                 p1_il_p4     = fp4_scratch['p1_il_p4']
                 p1_il_sfa    = fp4_scratch['p1_il_sfa']
                 variant_dn_x = fp4_scratch['variant_dn_x']
+            elif p1_combiner == 'epilogue_hw':
+                p1_dummy = fp4_scratch['p1_dummy']
             else:
                 p1_gate_p4   = fp4_scratch['p1_gate_p4']
                 p1_gate_sfa  = fp4_scratch['p1_gate_sfa']
@@ -227,16 +229,26 @@ def encoder_forward_with_fp4_subset(gemm, fvk, fvk_fp4, bufs, weights, dims,
                 if use_p1_split_gu and 'gu_il' in fp4_weights[l]:
                     # ── P1 fused-epilogue path: one interleaved GeGLU GEMM ──
                     # The gate/up weight is pairwise interleaved along N and
-                    # the epilogue computes gelu(gate)*up per column pair
-                    # (full-width duplicated output); the combiner kernel and
-                    # the separate gate/up GEMMs disappear. Down consumes the
-                    # full-width buffer via its K-expanded weight below.
+                    # the epilogue computes gelu(gate)*up per column pair;
+                    # the combiner kernel and the separate gate/up GEMMs
+                    # disappear. 'epilogue' duplicates the result full-width
+                    # (Down reads it via a K-expanded weight below);
+                    # 'epilogue_hw' quantizes at compact granularity in the
+                    # epilogue and writes Down's stock input buffer directly.
                     w_il = fp4_weights[l]['gu_il']
-                    fvk_fp4.cutlass_fp4_gemm_geglu_il(
-                        sc_gu.packed.data_ptr(), sc_gu.sfa.data_ptr(),
-                        w_il['packed'].data_ptr(), w_il['sfb'].data_ptr(),
-                        p1_il_p4, p1_il_sfa,
-                        Se, 2 * H, D, stream)
+                    if p1_combiner == 'epilogue_hw':
+                        fvk_fp4.cutlass_fp4_gemm_geglu_il_hw(
+                            sc_gu.packed.data_ptr(), sc_gu.sfa.data_ptr(),
+                            w_il['packed'].data_ptr(), w_il['sfb'].data_ptr(),
+                            p1_dummy,
+                            sc_dn.packed.data_ptr(), sc_dn.sfa.data_ptr(),
+                            Se, 2 * H, D, stream)
+                    else:
+                        fvk_fp4.cutlass_fp4_gemm_geglu_il(
+                            sc_gu.packed.data_ptr(), sc_gu.sfa.data_ptr(),
+                            w_il['packed'].data_ptr(), w_il['sfb'].data_ptr(),
+                            p1_il_p4, p1_il_sfa,
+                            Se, 2 * H, D, stream)
                 elif use_p1_split_gu and 'gate' in fp4_weights[l]:
                     # ── P1 split-GU path: 2× fp4out GEMM + geglu_two_fp4 ──
                     w_g = fp4_weights[l]['gate']
@@ -304,7 +316,8 @@ def encoder_forward_with_fp4_subset(gemm, fvk, fvk_fp4, bufs, weights, dims,
                             sc_dn.packed.data_ptr(), sc_dn.sfa.data_ptr(),
                             Se, H, stream)
 
-                if use_p1_split_gu and 'gu_il' in fp4_weights[l]:
+                if (use_p1_split_gu and 'gu_il' in fp4_weights[l]
+                        and p1_combiner == 'epilogue'):
                     w_dx = fp4_weights[l]['down_x']
                     fvk_fp4.cutlass_fp4_gemm_variant(
                         variant_dn_x,

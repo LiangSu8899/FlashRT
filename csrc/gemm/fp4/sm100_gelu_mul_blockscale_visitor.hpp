@@ -22,6 +22,8 @@
 
 #pragma once
 
+#include <cuda_fp8.h>
+
 #include "cute/tensor.hpp"
 #include "cutlass/cutlass.h"
 #include "cutlass/detail/sm100_blockscaled_layout.hpp"
@@ -363,6 +365,327 @@ struct FusionCallbacks<
   };
 
   // Ctor inheritance
+  using Impl::Impl;
+};
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Half-width variant: the geglu result is quantized at compact granularity
+// (16 unique values per scale block, matching the standalone combiner) and
+// written by the visitor itself to a compact [M, N/2] FP4 buffer + SFD via
+// direct gmem stores — the same self-partitioned store pattern the stock
+// node uses for its scale factors. The collective's own D path receives
+// garbage (zeros) and should be pointed at a small reusable dummy buffer;
+// the downstream GEMM consumes only the compact outputs, so its weight
+// keeps the original K (no K-expansion, no doubled weight streaming).
+//
+// Fragment contract (verified on the production tile): each visit covers
+// FragmentSize contiguous columns of one row, FragmentSize % 32 == 0, and
+// the fragment base column is 32-aligned, so every visit folds whole
+// compact scale blocks. Threads may hold duplicate fragments; duplicate
+// stores write identical bytes and are benign.
+// ═════════════════════════════════════════════════════════════════════════════
+template <
+  int SFVecSize,
+  class EpilogueTile,
+  class ElementOutput,
+  class ElementCompute,
+  class ElementBlockScaleFactor,
+  FloatRoundStyle RoundStyle = FloatRoundStyle::round_to_nearest
+>
+struct Sm100GeluMulCompactBlockScaleFactorRowStore {
+  static_assert(size<1>(EpilogueTile{}) % SFVecSize == 0, "EpilogueTileN should be divisible by SFVecSize");
+  using NormalConstStrideMNL = Stride<_0,_0,int64_t>;
+  struct SharedStorage { };
+
+  struct Arguments {
+    ElementBlockScaleFactor* ptr_scale_factor = nullptr;  // unused (kept for arg shape)
+    ElementCompute const* norm_constant_ptr = nullptr;    // unused
+    NormalConstStrideMNL norm_constant_stride = {};
+    uint8_t* compact_ptr = nullptr;     // packed e2m1 [M, N/2] row-major
+    uint8_t* compact_sf_ptr = nullptr;  // UE4M3 SFA tile-atom layout on (M, N/2)
+  };
+
+  using Params = Arguments;
+
+  using UnderlyingElementBlockScaleFactor = cute::remove_pointer_t<ElementBlockScaleFactor>;
+
+  template <class ProblemShape>
+  static constexpr Params
+  to_underlying_arguments(ProblemShape const& problem_shape, Arguments const& args, void* workspace) {
+    return args;
+  }
+
+  template <class ProblemShape>
+  static bool
+  can_implement(ProblemShape const& problem_shape, Arguments const& args) {
+    auto problem_shape_MNKL = append<4>(problem_shape, 1);
+    auto [M,N,K,L] = problem_shape_MNKL;
+    // Whole compact scale blocks per fragment: N in units of 2*SFVecSize.
+    return (N % (2 * SFVecSize) == 0) && args.compact_ptr && args.compact_sf_ptr;
+  }
+
+  template <class ProblemShape>
+  static size_t
+  get_workspace_size(ProblemShape const& problem_shape, Arguments const& args) {
+    return 0;
+  }
+
+  template <class ProblemShape>
+  static cutlass::Status
+  initialize_workspace(ProblemShape const& problem_shape, Arguments const& args, void* workspace, cudaStream_t stream,
+    CudaHostAdapter* cuda_adapter = nullptr) {
+    return cutlass::Status::kSuccess;
+  }
+
+  CUTLASS_HOST_DEVICE
+  Sm100GeluMulCompactBlockScaleFactorRowStore() { }
+
+  CUTLASS_HOST_DEVICE
+  Sm100GeluMulCompactBlockScaleFactorRowStore(Params const& params, SharedStorage const& shared_storage)
+      : params_ptr(&params) { }
+
+  Params const* params_ptr = nullptr;
+
+  CUTLASS_DEVICE bool
+  is_producer_load_needed() const {
+    return false;
+  }
+
+  CUTLASS_DEVICE bool
+  is_C_load_needed() const {
+    return false;
+  }
+
+  template <class... Args>
+  CUTLASS_DEVICE auto
+  get_producer_load_callbacks(ProducerLoadArgs<Args...> const& args) {
+    return EmptyProducerLoadCallbacks{};
+  }
+
+  CUTLASS_DEVICE static float
+  gelu_tanh_(float g) {
+    return g / (1.0f + expf(-1.5957691216057308f * g * (1.0f + 0.044715f * g * g)));
+  }
+
+  // Branch-ladder e2m1 round-to-nearest — matches the combiner kernels.
+  CUTLASS_DEVICE static uint8_t
+  fp32_to_e2m1_(float x) {
+    uint8_t sign = (x < 0.f) ? 0x8u : 0x0u;
+    float ax = fabsf(x);
+    uint8_t mant;
+    if      (ax <= 0.25f) mant = 0u;
+    else if (ax <= 0.75f) mant = 1u;
+    else if (ax <= 1.25f) mant = 2u;
+    else if (ax <= 1.75f) mant = 3u;
+    else if (ax <= 2.5f)  mant = 4u;
+    else if (ax <= 3.5f)  mant = 5u;
+    else if (ax <= 5.0f)  mant = 6u;
+    else                  mant = 7u;
+    return sign | mant;
+  }
+
+  template <
+    class CoordGTensor,
+    class ThrResidue,
+    class LayoutSFC
+  >
+  struct ConsumerStoreCallbacks : EmptyConsumerStoreCallbacks {
+    CUTLASS_DEVICE
+    ConsumerStoreCallbacks(
+          CoordGTensor tC_cD_,
+          ThrResidue residue_tC_cD_,
+          Params const* params_ptr_,
+          LayoutSFC layout_sfc_,
+          int n_compact_bytes_,
+          int tile_row_off_,
+          int tile_col_off_)
+      : tC_cD(tC_cD_)
+      , residue_tC_cD(residue_tC_cD_)
+      , params_ptr(params_ptr_)
+      , layout_sfc(layout_sfc_)
+      , n_compact_bytes(n_compact_bytes_)
+      , tile_row_off(tile_row_off_)
+      , tile_col_off(tile_col_off_) {}
+
+    CoordGTensor tC_cD;
+    ThrResidue residue_tC_cD;
+    Params const* params_ptr;
+    LayoutSFC layout_sfc;
+    int n_compact_bytes;  // (N/2)/2 bytes per compact row
+    // The coordinate tensor is thread-relative (its layout drops the
+    // per-thread iterator offset); the thread's global base coordinate is
+    // recovered as (M, N) - residue, computed per tile by the caller.
+    int tile_row_off;
+    int tile_col_off;
+
+    template <class ElementAccumulator, class ElementInput, int FragmentSize>
+    CUTLASS_DEVICE auto
+    visit(Array<ElementAccumulator, FragmentSize> const& frg_acc,
+          int epi_v,
+          int epi_m,
+          int epi_n,
+          Array<ElementInput, FragmentSize> const& frg_input)
+    {
+      static_assert(FragmentSize % (2 * SFVecSize) == 0,
+                    "fragment must cover whole compact scale blocks");
+      constexpr int CompactBlocks = FragmentSize / (2 * SFVecSize);
+
+      Tensor pred = tC_cD(_, _, _, epi_m, epi_n);
+      auto c0 = pred(0);
+#ifdef FRT_GELU_IL_PROBE
+      if (epi_m == 0 && epi_n == 0 && threadIdx.x == 128 && epi_v == 0 &&
+          blockIdx.x < 3 && blockIdx.y < 2) {
+        printf("HWPROBE b(%d,%d) off(%d,%d) c0=(%d,%d) resid=(%d,%d) less=%d "
+               "FRAG=%d\n",
+               (int)blockIdx.x, (int)blockIdx.y, tile_row_off, tile_col_off,
+               (int)get<0>(c0), (int)get<1>(c0),
+               (int)get<0>(residue_tC_cD), (int)get<1>(residue_tC_cD),
+               (int)elem_less(c0, residue_tC_cD), FragmentSize);
+      }
+#endif
+      if (elem_less(c0, residue_tC_cD)) {
+        const int row = tile_row_off + get<0>(c0);
+        const int n0  = tile_col_off + get<1>(c0);
+        uint8_t* cptr = params_ptr->compact_ptr
+                        + static_cast<long>(row) * n_compact_bytes + (n0 >> 2);
+        // One compact scale block (16 unique values) at a time keeps the
+        // working set register-resident.
+        CUTLASS_PRAGMA_UNROLL
+        for (int j = 0; j < CompactBlocks; ++j) {
+          float vals[SFVecSize];
+          float amax = 0.f;
+          CUTLASS_PRAGMA_UNROLL
+          for (int t = 0; t < SFVecSize; ++t) {
+            float g = static_cast<float>(frg_input[2 * SFVecSize * j + 2 * t]);
+            float u = static_cast<float>(
+                frg_input[2 * SFVecSize * j + 2 * t + 1]);
+            vals[t] = gelu_tanh_(g) * u;
+            const float a = fabsf(vals[t]);
+            if (a > amax) amax = a;
+          }
+          float desired = amax / 6.f;
+          if (desired < 1e-12f) desired = 1e-12f;
+          __nv_fp8_e4m3 bs_q = __nv_fp8_e4m3(desired);
+          const float inv_bs = 1.f / static_cast<float>(bs_q);
+          params_ptr->compact_sf_ptr[
+              layout_sfc(row, (n0 >> 1) + j * SFVecSize, 0)] =
+              *reinterpret_cast<uint8_t*>(&bs_q);
+          // Hardware e2m1 conversion; the packed subbyte Array puts element
+          // 2p in the low nibble of byte p, matching the consumer layout.
+          Array<ElementCompute, SFVecSize> scaled;
+          CUTLASS_PRAGMA_UNROLL
+          for (int t = 0; t < SFVecSize; ++t) {
+            scaled[t] = static_cast<ElementCompute>(vals[t] * inv_bs);
+          }
+          auto packed_e2m1 =
+              NumericArrayConverter<cutlass::float_e2m1_t, ElementCompute,
+                                    SFVecSize, RoundStyle>{}(scaled);
+          *reinterpret_cast<uint2*>(cptr + j * 8) =
+              *reinterpret_cast<uint2 const*>(&packed_e2m1);
+        }
+      }
+
+      // The collective's D path lands in a dummy buffer; feed it zeros.
+      Array<ElementOutput, FragmentSize> frg_output;
+      frg_output.fill(ElementOutput(0));
+      return frg_output;
+    }
+  };
+
+  template <
+    bool ReferenceSrc,
+    class... Args
+  >
+  CUTLASS_DEVICE auto
+  get_consumer_store_callbacks(ConsumerStoreArgs<Args...> const& args) {
+    auto [M, N, K, L] = args.problem_shape_mnkl;
+    using Cfg = cutlass::detail::Sm1xxBlockScaledConfig<SFVecSize>;
+    // SFA layout convention places the quantized axis in the K slot
+    // (the compact buffer is consumed as the next GEMM's A operand).
+    auto layout_sfc = Cfg::tile_atom_to_shape_SFA(make_shape(M, 1, N / 2, 1));
+    return ConsumerStoreCallbacks<decltype(args.tCcD),
+                                  decltype(args.residue_tCcD),
+                                  decltype(layout_sfc)>(
+        args.tCcD, args.residue_tCcD, params_ptr, layout_sfc, N / 4,
+        M - static_cast<int>(get<0>(args.residue_tCcD)),
+        N - static_cast<int>(get<1>(args.residue_tCcD)));
+  }
+};
+
+// EVT tree + op tag + callbacks for the compact store.
+template <
+  int SFVecsize, class EpilogueTile, class ElementOutput, class ElementCompute,
+  class ElementBlockScaleFactor,
+  class ElementSource = ElementOutput, class ElementScalar = ElementCompute,
+  FloatRoundStyle RoundStyle = FloatRoundStyle::round_to_nearest
+>
+using Sm100GeluMulCompactRowBlockScaleFactor =
+  Sm90EVT<Sm100GeluMulCompactBlockScaleFactorRowStore<SFVecsize, EpilogueTile, ElementOutput, ElementCompute, ElementBlockScaleFactor, RoundStyle>,
+    Sm90LinearCombination<ElementCompute, ElementCompute, ElementSource, ElementScalar, RoundStyle>
+  >;
+
+template <
+  int SFVecSize, class ElementOutput, class ElementCompute,
+  class ElementBlockScaleFactor, class GmemLayoutTagScalefactor,
+  class ElementSource = ElementOutput, class ElementScalar = ElementCompute,
+  FloatRoundStyle RoundStyle = FloatRoundStyle::round_to_nearest
+>
+struct GeluMulCompactBlockScaleFactor
+    : LinCombBlockScaleFactor<SFVecSize, ElementOutput, ElementCompute,
+        ElementBlockScaleFactor, GmemLayoutTagScalefactor, ElementSource,
+        ElementScalar, RoundStyle> {};
+
+template <
+  int StagesC, int StagesD, int FragmentSize, bool ReuseSmemC, bool DelayTmaStore,
+  class ElementOutput, class ElementCompute, class ElementBlockScaleFactor,
+  int SFVecSize, class ElementSource, class ElementScalar,
+  FloatRoundStyle RoundStyle, class CtaTileShapeMNK, class EpilogueTile
+>
+struct FusionCallbacks<
+    epilogue::Sm100TmaWarpSpecialized<StagesC, StagesD, FragmentSize, ReuseSmemC, DelayTmaStore>,
+    GeluMulCompactBlockScaleFactor<SFVecSize, ElementOutput, ElementCompute, ElementBlockScaleFactor, cutlass::layout::RowMajor, ElementSource, ElementScalar, RoundStyle>,
+    CtaTileShapeMNK,
+    EpilogueTile
+> : Sm100GeluMulCompactRowBlockScaleFactor<SFVecSize, EpilogueTile, typename cutlass::detail::get_unpacked_element_type<ElementOutput>::type, ElementCompute, ElementBlockScaleFactor, ElementSource, ElementScalar, RoundStyle> {
+
+  using Impl = Sm100GeluMulCompactRowBlockScaleFactor<SFVecSize, EpilogueTile, typename cutlass::detail::get_unpacked_element_type<ElementOutput>::type, ElementCompute, ElementBlockScaleFactor, ElementSource, ElementScalar, RoundStyle>;
+  using Operation = GeluMulCompactBlockScaleFactor<SFVecSize, ElementOutput, ElementCompute, ElementBlockScaleFactor, cutlass::layout::RowMajor, ElementSource, ElementScalar, RoundStyle>;
+
+  struct Arguments {
+    ElementScalar alpha = ElementScalar(1);
+    ElementScalar beta = ElementScalar(0);
+    ElementScalar const* alpha_ptr = nullptr;
+    ElementScalar const* beta_ptr = nullptr;
+    ElementBlockScaleFactor* block_scale_factor_ptr = nullptr;
+    using StrideNormConst = Stride<_0,_0,int64_t>;
+    ElementCompute const* norm_constant_ptr = nullptr;
+    StrideNormConst dNormConst = {_0{}, _0{}, 0};
+    using StrideAlpha = Stride<_0,_0,int64_t>;
+    using StrideBeta  = Stride<_0,_0,int64_t>;
+    StrideAlpha dAlpha = {_0{}, _0{}, 0};
+    StrideBeta  dBeta  = {_0{}, _0{}, 0};
+    uint8_t* compact_ptr = nullptr;
+    uint8_t* compact_sf_ptr = nullptr;
+
+    operator typename Impl::Arguments() const {
+      return
+        {
+          {
+            {{beta}, {beta_ptr}, {dBeta}},
+            {},
+            {
+              {{alpha}, {alpha_ptr}, {dAlpha}},
+              {},
+              {}
+            },
+            {}
+          },
+          {block_scale_factor_ptr, norm_constant_ptr, dNormConst,
+           compact_ptr, compact_sf_ptr}
+        };
+    }
+  };
+
   using Impl::Impl;
 };
 
