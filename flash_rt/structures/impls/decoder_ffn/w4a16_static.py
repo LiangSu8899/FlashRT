@@ -184,4 +184,15 @@ def bind_mlp_seam(
     down_q, down_sfb = k.quantize_w4_weight_bf16(down)
     bound = BoundDecoderFfnW4A16(
         ffn_fn, gate_up_q, gate_up_sfb, down_q, down_sfb, dim_d)
+    # bind-time smoke: one M=1 launch through the real entry point before
+    # the seam is handed out. A stale build or missing symbol must
+    # surface here as a clean bind refusal, not later inside the host's
+    # forward — identical output cannot catch it there, because the
+    # fallback path is numerically exact.
+    probe = bound.ffn(torch.zeros(1, dim_d, device=gate_up_q.device,
+                                  dtype=torch.bfloat16))
+    if probe.shape != (1, dim_d) or not torch.isfinite(probe).all():
+        raise ValueError(
+            f"refused: w4a16 bind smoke produced shape "
+            f"{tuple(probe.shape)}, finite={bool(torch.isfinite(probe).all())}")
     return FusedGluMlpW4A16(bound, original=original)

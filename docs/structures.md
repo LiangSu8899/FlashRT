@@ -177,6 +177,31 @@ both arms in every round.
 `auto_swaps` builds and does not judge. If you use it, you own the gate —
 and read the ledger, or you have not checked that what you measured was on.
 
+### 4.1 Selecting a precision profile
+
+`scheme=` is the one precision entry, on both doors. A profile is a
+registered quantisation scheme (§6) selected by name:
+
+| name | what it does |
+|---|---|
+| `"auto"` (default) | resolves to the fastest profile this device can execute: `fp8_static` on FP8-capable hardware (bit-identical to the pre-profile default), `"none"` elsewhere. The resolution table is one function, so a profile that measures faster is promoted by editing one line |
+| `"fp8_static"` | static per-tensor FP8, the shipped behaviour; `"fp8_static_keep_outliers"` keeps outlier seams at host precision by the house scale-ceiling criterion |
+| `"w8a16_decode"` / `"w4a16_decode"` | weight-only INT8 / NVFP4 on `decoder_ffn`, decode band only, everything else at host precision |
+| `"none"` | quantisation off. An explicit choice, not a degraded mode: fusion structures never consult a scheme decision and attach as usual, so a BF16/FP16 host under `"none"` still gets every fusion structure |
+
+Quantisation happens **at attach time, from the host's own weights** —
+the same discipline as this repo's native pipelines. The checkpoint is
+loaded at host precision; weight scales and packed formats are derived
+from the floating weights at bind, activation statistics come from
+running the host's own forward. Nothing is destroyed: the original
+module is retained, and detach restores it bit-exactly.
+
+Hardware support is not declared here at all. A Hub kernel package
+ships the archs it was built for in its own metadata; the shared loader
+reads that declaration and refuses a device outside it with the package
+name and both arch strings in the message. The structures layer keeps
+no second table — hardware support is maintained where the kernels are.
+
 ## 5. Runtime contract and the ledger
 
 Every swapped-in structure declares the form it was calibrated for

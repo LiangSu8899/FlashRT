@@ -96,6 +96,17 @@ A structure must *not* be discovered on hosts it does not describe;
    missing", with the shapes and the roofline. Do not emulate it with
    a chain of eager ops; a merge that is not one real kernel loses to
    the compiler's own fusion.
+7. **Hardware support comes from the package, not from you.** The Hub
+   package's own metadata declares the archs it was built for, and the
+   shared loader enforces it with a clean refusal. Do not write arch
+   tables into an impl — a second table drifts, and hardware support is
+   maintained on the kernels side.
+8. **A binder that loads a kernel runs a bind-time smoke**: one
+   real launch through the entry point at the seam's own width before
+   the seam is handed out (`w4a16_static.bind_mlp_seam` is the
+   precedent). A stale build or missing symbol must surface as a bind
+   refusal — in a fallback-capable system it can never be caught by
+   comparing outputs, because falling back is numerically exact.
 
 ---
 
@@ -166,9 +177,12 @@ A structure must *not* be discovered on hosts it does not describe;
 2. **Grep before building.** Reuse the repo's existing mechanisms
    (calibration, diagnostics, sampling, receipts). Claiming something
    is "not implemented" requires grep evidence.
-3. **No new calibration entry points.** The calibration axis is
-   `forward`/`samples`, once. A scheme declares and consumes
-   statistics; it does not open a second door.
+3. **No new calibration entry points, and no new precision entry
+   points.** The calibration axis is `forward`/`samples`, once. A
+   scheme declares and consumes statistics; it does not open a second
+   door. Precision profiles are registered schemes selected by the
+   existing `scheme=` parameter (`docs/structures.md` §4.1) — a new
+   precision mode is a scheme registration, never a new parameter.
 4. **Fail loudly; never degrade silently.** Unmeasurable granularity,
    unknown format variants, unlocatable points — raise, with the
    reason. No silent approximations.
