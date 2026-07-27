@@ -9,9 +9,12 @@ BF16, so binding needs no calibration data, and qualification still
 runs the parity gate on real host activations like every other
 implementation.
 
-The kernel's optimized dispatch covers the decode band (M in [1, 8]);
-larger M is outside the support envelope and is dispatched to the
-retained host module by declared plan, counted in the ledger.
+The kernel's auto dispatch is qualified more narrowly than the INT8
+twin's, and this impl mirrors that table exactly rather than stretching
+it: M in [1, 3], with a per-M minimum on total weight elements (the
+kernel refuses below it — ``weight-only-ffn`` ``torch_binding.cpp``,
+the W4 branch). Calls outside the band are dispatched to the retained
+host module by declared plan, counted in the ledger.
 """
 
 from __future__ import annotations
@@ -34,9 +37,21 @@ _ENTRYPOINTS = {"gelu": "w4a16_geglu_ffn_bf16", "silu": "w4a16_swiglu_ffn_bf16"}
 SUPPORT = {
     "D": {"min": 512, "max": 16384, "multiple_of": 64},
     "F": {"min": 1024, "max": 16384, "multiple_of": 64},
-    "M": {"min": 1, "max": 8},
+    "M": {"min": 1, "max": 3},
     "m_classes": ("micro",),
 }
+
+#: the kernel's own auto-dispatch qualification: per M, the minimum
+#: total weight elements (gate+up+down) it accepts. Copied from the W4
+#: branch of the package's torch_binding.cpp — the kernel raises below
+#: these, so the band dispatch must agree with them, not rediscover
+#: them as runtime errors.
+_AUTO_FLOOR = {1: 12 << 20, 2: 32 << 20, 3: 64 << 20}
+
+
+def _in_band(m: int, weight_elements: int) -> bool:
+    floor = _AUTO_FLOOR.get(m)
+    return floor is not None and weight_elements >= floor
 
 
 @lru_cache(maxsize=1)
@@ -78,27 +93,28 @@ class BoundDecoderFfnW4A16:
     """MLP-seam callable: normed activations in, FFN output out (BF16)."""
 
     def __init__(self, ffn_fn, gate_up_q, gate_up_sfb, down_q, down_sfb,
-                 dim_d):
+                 dim_d, weight_elements):
         self._ffn = ffn_fn
         self._gate_up_q = gate_up_q
         self._gate_up_sfb = gate_up_sfb
         self._down_q = down_q
         self._down_sfb = down_sfb
         self._dim_d = dim_d
+        self._weight_elements = weight_elements
 
     def ffn(self, normed: torch.Tensor) -> torch.Tensor:
         shape = normed.shape
         x = normed.reshape(-1, shape[-1])
         m = x.shape[0]
-        m_max = SUPPORT["M"]["max"]
-        if m > m_max:
+        if not _in_band(m, self._weight_elements):
             raise ValueError(
-                f"M={m} outside the weight-only decode envelope "
-                f"[1, {m_max}]")
-        variant = 0 if m <= 4 else 3
+                f"M={m} outside the W4A16 auto-dispatch qualification "
+                f"(M in [1, 3], weight elements >= "
+                f"{_AUTO_FLOOR.get(min(m, 3), 0)} at this M; "
+                f"have {self._weight_elements})")
         out = self._ffn(x.to(torch.bfloat16).contiguous(),
                         self._gate_up_q, self._gate_up_sfb,
-                        self._down_q, self._down_sfb, variant=variant)
+                        self._down_q, self._down_sfb, variant=0)
         return out.reshape(shape).to(normed.dtype)
 
     __call__ = ffn
@@ -148,7 +164,7 @@ class FusedGluMlpW4A16(GuardedSeam, torch.nn.Module):
         if admitted is not PROCEED:
             return admitted
         m = hidden.numel() // hidden.shape[-1]
-        if m > SUPPORT["M"]["max"]:
+        if not _in_band(m, self._bound._weight_elements):
             host = self._frt_host()
             if host is not None:
                 guard = self._frt_guard
@@ -173,7 +189,13 @@ def bind_mlp_seam(
     on weights only (``quantize_w4_weight_bf16`` returns the packed
     E2M1 data and the SFB scale tensor the FFN entry points consume).
     """
-    dim_d, _ = _check(weights)
+    dim_d, dim_f = _check(weights)
+    weight_elements = 3 * dim_d * dim_f
+    if weight_elements < _AUTO_FLOOR[1]:
+        raise ValueError(
+            f"refused: {weight_elements} weight elements is below the "
+            f"kernel's auto-dispatch floor ({_AUTO_FLOOR[1]}) even at "
+            f"M=1; the W4A16 path cannot serve this seam at any M")
     k = _kernel()
     ffn_fn = _entrypoint(variant)
     gate_up = torch.cat(
@@ -183,7 +205,8 @@ def bind_mlp_seam(
     gate_up_q, gate_up_sfb = k.quantize_w4_weight_bf16(gate_up)
     down_q, down_sfb = k.quantize_w4_weight_bf16(down)
     bound = BoundDecoderFfnW4A16(
-        ffn_fn, gate_up_q, gate_up_sfb, down_q, down_sfb, dim_d)
+        ffn_fn, gate_up_q, gate_up_sfb, down_q, down_sfb, dim_d,
+        weight_elements)
     # bind-time smoke: one M=1 launch through the real entry point before
     # the seam is handed out. A stale build or missing symbol must
     # surface here as a clean bind refusal, not later inside the host's

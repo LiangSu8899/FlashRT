@@ -107,6 +107,22 @@ def test_w4a16_impl_contract_surface():
         w4a16_static._check(narrow)
 
 
+def test_w4a16_band_mirrors_the_kernel_qualification():
+    # the kernel's auto dispatch accepts M in [1,3] with a per-M floor
+    # on total weight elements; the impl's band table must agree with
+    # it, not rediscover it as runtime errors
+    from flash_rt.structures.impls.decoder_ffn.w4a16_static import (
+        _AUTO_FLOOR, _in_band)
+
+    assert _AUTO_FLOOR == {1: 12 << 20, 2: 32 << 20, 3: 64 << 20}
+    assert _in_band(1, 12 << 20)
+    assert not _in_band(1, (12 << 20) - 1)
+    assert _in_band(2, 32 << 20)
+    assert not _in_band(2, (32 << 20) - 1)
+    assert _in_band(3, 64 << 20)
+    assert not _in_band(4, 1 << 40)      # M=4 never qualifies
+
+
 def test_bind_router_accepts_w4a16_format():
     # the router must not wall the 4-bit twin the way it walls unknown
     # formats; unknown names still fail loudly (pinned elsewhere)
