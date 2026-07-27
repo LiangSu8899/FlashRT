@@ -190,6 +190,59 @@ reference stayed slow, which inflates that speedup ratio; read it as
 FP4 p50 34.9 ms in the fast regime with a 37.2 ms slow-regime tail
 (p95), not as a like-for-like 1.42x.
 
+## Fused GeGLU Epilogue for the P1 Encoder FFN (2026-07-27)
+
+Commits `68e82ae` + `5909b71` add a single-GEMM alternative to the P1
+split-GU chain, parameter-isolated behind
+`encoder_p1_combiner='epilogue'` (default `lut_native` unchanged). The
+gate and up projection rows are pairwise interleaved along N and a
+forked SM100 block-scale row-store visitor computes `gelu(gate)*up` on
+adjacent accumulator column pairs before scale-factor generation
+(`csrc/gemm/fp4/sm100_gelu_mul_blockscale_visitor.hpp`), emitting the
+FP4+SFD result directly. The separate gate/up fp4out GEMMs and the
+GeGLU combiner kernel disappear. The down-projection AWQ `inv_s` is
+folded into the up weight rows at quantization time (algebraically
+exact), so the epilogue needs no per-column vector.
+
+Full-width stage: the folded value is duplicated into both columns of
+each pair, so the down projection consumes N=16384 through a K-expanded
+weight with zero odd columns.
+
+Measured verdict on Thor (3v, single-frame kernel attribution via
+`nsys --cuda-graph-trace=node` + `--cuda-profile`, regime-immune):
+
+| chain component        | `lut_native` | `epilogue` |
+|------------------------|--------------|------------|
+| gate+up / interleaved GEMM | 4.89 ms  | 4.91 ms    |
+| GeGLU combiner         | 2.22 ms      | —          |
+| down (K=8192 / 16384)  | 3.07 ms      | 5.55 ms    |
+| P1 FFN chain total     | 10.18 ms     | 10.45 ms   |
+
+The fused epilogue itself is free (the interleaved GEMM matches the two
+split GEMMs within 0.5%), and precision improves slightly (single
+quantization: formal 3v raw_min 0.99713 vs 0.99708, action_min 0.99928
+vs 0.99904; all gates pass at 1v-3v tier parity). But the K-expanded
+down projection is DRAM-weight-bandwidth-bound: doubling the streamed
+weight costs 1.8x even with the best tile, which cancels the combiner
+saving exactly. Formal 3v/2v A/B confirms a wash (3v 34.49 vs 34.31,
+2v 28.94 vs 29.08, speedups 1.342/1.360 and 1.327/1.323).
+
+Two tile findings worth keeping:
+
+- Cluster-launch GEMM variants invert between isolated and pipeline
+  benchmarks on Thor: in isolation the 2x1-cluster tile was fastest for
+  the K=16384 down, but in the pipeline it costs +2.2 ms e2e, and
+  2x2/2x4 clusters cost +11-14 ms. The plain 128x256x128 tile
+  (`encoder_down_x_variant=6`, now the default) is the only sane
+  choice.
+- Absolute latencies from different benchmark batches must not be
+  compared: the whole-machine regime moved ~2 ms between batches during
+  this work while back-to-back in-batch comparisons stayed consistent.
+
+The path is kept as the foundation for a half-width store stage, which
+would restore the down projection to its K=8192 cost and turn the
+chain into a ~2 ms net win.
+
 ## SigLIP FFN NVFP4, 16-Layer Preset (2026-07-27)
 
 Commit `1e07ea2` moves the SigLIP vision-tower FFN to NVFP4 on the first
