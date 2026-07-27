@@ -243,6 +243,43 @@ The path is kept as the foundation for a half-width store stage, which
 would restore the down projection to its K=8192 cost and turn the
 chain into a ~2 ms net win.
 
+## Half-Width Fused GeGLU Epilogue — New Default (2026-07-28)
+
+Commit `ccf35b9` delivers that half-width stage and makes it the default
+P1 combiner (`encoder_p1_combiner='epilogue_hw'`; `lut_native` and the
+full-width `epilogue` remain selectable). A second store-node variant
+quantizes `gelu(gate)*up` at compact granularity — 16 unique values per
+scale block, the same block geometry the standalone combiner produced —
+and writes the packed FP4 + SFA buffers for the down projection directly
+from the visitor. The collective's own D path lands in one small
+reusable dummy buffer, and the down projection keeps its original
+weight, K extent, and tile variant. Same-batch formal A/B (identical
+FP8 references):
+
+| views | `lut_native` | `epilogue_hw` | speedup | raw_min | act_min |
+|-------|--------------|---------------|---------|---------|---------|
+| 3v    | 34.30 ms     | **32.25 ms**  | 1.3478 → **1.4355** | 0.99708 → 0.99754 | 0.99904 → 0.99947 |
+| 2v    | 29.13 ms     | **27.74 ms**  | 1.3207 → **1.3856** | 0.99764 → 0.99794 | 0.99898 → 0.99906 |
+
+All gates pass on both view counts, and both cosine floors improve
+(the chain quantizes the FFN hidden state once instead of twice). A
+same-batch A/B/A sandwich (34.32 / 32.23 / 34.33 ms) bounds regime
+drift at 0.01 ms over the comparison window.
+
+Implementation notes for future epilogue work of this kind:
+
+- The visitor's coordinate tensor is thread-relative: its layout is
+  rebuilt without the per-thread iterator offset, so every thread reads
+  the same local coordinates. The thread's global base coordinate is
+  recovered as the problem extent minus the per-thread residue, which
+  is computed from the offset-carrying tensor.
+- The SFA tile-atom layout helper takes the quantized axis in the K
+  slot of its (M, N, K, L) shape argument.
+- Quantize with the hardware e2m1 converter (`NumericArrayConverter`
+  over a packed subbyte `Array`). A branch-ladder scalar conversion at
+  this volume (7.9M values per GEMM) cost 2.9x kernel time for
+  bit-identical output.
+
 ## SigLIP FFN NVFP4, 16-Layer Preset (2026-07-27)
 
 Commit `1e07ea2` moves the SigLIP vision-tower FFN to NVFP4 on the first
