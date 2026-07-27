@@ -21,6 +21,7 @@
 
 #include "gemm/fp4/cutlass_fp4_gemm.cuh"
 #include "gemm/fp4/cutlass_fp4_gemm_fp4out.cuh"
+#include "gemm/fp4/cutlass_fp4_gemm_geglu_il_sm100.cuh"
 #ifdef FLASHRT_HAVE_COSMOS3_EDGE
 #include "gemm/fp4/cosmos3_edge_fp4_gemm_relu2_fp4out.cuh"
 #endif
@@ -844,6 +845,44 @@ callers fall back to the scalar kernel.
         R"pbdoc(
 P1 NVFP4 GEMM:  D[M,N/2] (fp4) + D_SFD = LinCombBlockScaleFactor(A @ B^T).
 Drop-in for cutlass_fp4_sq_fp16 when downstream consumes FP4 + SFA directly.
+)pbdoc");
+
+  m.def("cutlass_fp4_gemm_geglu_il",
+        [](uintptr_t A_packed, uintptr_t SFA,
+           uintptr_t B_packed, uintptr_t SFB,
+           uintptr_t D_packed, uintptr_t D_SFD,
+           int M, int N_il, int K, uintptr_t stream) -> int {
+          const auto shape = fp4_kernel_shape({{"M", M}, {"N_il", N_il}, {"K", K}});
+          require_fp4_ptrs("cutlass_fp4_gemm_geglu_il",
+                           {{"A_packed", A_packed}, {"SFA", SFA},
+                            {"B_packed", B_packed}, {"SFB", SFB},
+                            {"D_packed", D_packed}, {"D_SFD", D_SFD}}, shape);
+          require_fp4(M > 0 && N_il > 0 && K > 0 && (N_il % 32) == 0 &&
+                      (K % 16) == 0,
+                      "cutlass_fp4_gemm_geglu_il",
+                      "M must be positive, N_il a positive multiple of 32 "
+                      "and K a positive multiple of 16",
+                      shape);
+          return flash_rt::fp4::cutlass_fp4_gemm_geglu_il(
+              reinterpret_cast<void const*>(A_packed),
+              reinterpret_cast<void const*>(SFA),
+              reinterpret_cast<void const*>(B_packed),
+              reinterpret_cast<void const*>(SFB),
+              reinterpret_cast<void*>(D_packed),
+              reinterpret_cast<void*>(D_SFD),
+              M, N_il, K,
+              reinterpret_cast<cudaStream_t>(stream));
+        },
+        py::arg("A_packed"), py::arg("SFA"),
+        py::arg("B_packed"), py::arg("SFB"),
+        py::arg("D_packed"), py::arg("D_SFD"),
+        py::arg("M"), py::arg("N_il"), py::arg("K"),
+        py::arg("stream") = 0,
+        R"pbdoc(
+P1 NVFP4 GEMM with fused GeGLU epilogue over a column-interleaved gate/up
+weight (B_il[2j] = gate[j], B_il[2j+1] = up[j]). D[M, N_il] (fp4) + D_SFD hold
+gelu(gate)*up duplicated into both columns of each pair; replaces the
+gate GEMM + up GEMM + combiner chain.
 )pbdoc");
 
 #ifdef FLASHRT_HAVE_COSMOS3_EDGE

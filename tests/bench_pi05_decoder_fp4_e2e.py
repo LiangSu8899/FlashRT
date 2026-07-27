@@ -86,9 +86,11 @@ def main() -> int:
     parser.add_argument(
         "--encoder-gu-mode", choices=("p1", "merged"), default="p1")
     parser.add_argument(
-        "--encoder-p1-combiner", choices=("direct", "lut", "lut_native"),
+        "--encoder-p1-combiner",
+        choices=("direct", "lut", "lut_native", "epilogue"),
         default="lut_native")
     parser.add_argument("--encoder-down-variant", type=int, default=7)
+    parser.add_argument("--encoder-down-x-variant", type=int, default=1)
     parser.add_argument("--decoder-gate-up-variant", type=int, default=10)
     parser.add_argument(
         "--decoder-weight-format", choices=("nvfp4", "e0m3"),
@@ -178,6 +180,7 @@ def main() -> int:
                 use_p1_split_gu=args.encoder_gu_mode == "p1",
                 encoder_p1_combiner=args.encoder_p1_combiner,
                 encoder_down_variant=args.encoder_down_variant,
+                encoder_down_x_variant=args.encoder_down_x_variant,
                 decoder_gate_up_variant=args.decoder_gate_up_variant,
                 decoder_weight_format=args.decoder_weight_format,
                 decoder_act_format=args.decoder_act_format,
@@ -276,6 +279,7 @@ def main() -> int:
                     "encoder_gu_mode": args.encoder_gu_mode,
                     "encoder_p1_combiner": args.encoder_p1_combiner,
                     "encoder_down_variant": args.encoder_down_variant,
+                    "encoder_down_x_variant": args.encoder_down_x_variant,
                     "decoder": "nvfp4_all_projections",
                     "decoder_weight_format": args.decoder_weight_format,
                     "decoder_act_format": args.decoder_act_format,
@@ -338,6 +342,7 @@ def main() -> int:
             "--encoder-gu-mode", args.encoder_gu_mode,
             "--encoder-p1-combiner", args.encoder_p1_combiner,
             "--encoder-down-variant", str(args.encoder_down_variant),
+            "--encoder-down-x-variant", str(args.encoder_down_x_variant),
             "--decoder-gate-up-variant", str(args.decoder_gate_up_variant),
             "--decoder-weight-format", args.decoder_weight_format,
             "--decoder-act-format", args.decoder_act_format,

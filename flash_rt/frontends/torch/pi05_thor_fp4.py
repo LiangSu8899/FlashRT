@@ -42,6 +42,35 @@ logger = logging.getLogger(__name__)
 fp16 = torch.float16
 
 
+def _interleave_gu_rows(g_fp16: torch.Tensor, u_fp16: torch.Tensor,
+                        inv_s_dn: torch.Tensor | None = None) -> torch.Tensor:
+    """Pairwise interleave gate/up rows along N for the fused GeGLU
+    epilogue GEMM (il[2j] = gate[j], il[2j+1] = up[j]).
+
+    Any per-output-column scale must live in the weights because the
+    epilogue applies no per-column vector; the down-projection AWQ inv_s
+    is folded into the up rows (gelu(g) * u * inv_s == gelu(g) * (u * inv_s)).
+    """
+    if inv_s_dn is not None:
+        u_fp16 = (u_fp16.float()
+                  * inv_s_dn.float().unsqueeze(1)).to(fp16)
+    il = torch.empty(2 * g_fp16.shape[0], g_fp16.shape[1],
+                     dtype=fp16, device=g_fp16.device)
+    il[0::2] = g_fp16
+    il[1::2] = u_fp16
+    return il.contiguous()
+
+
+def _expand_down_k(d_fp16: torch.Tensor) -> torch.Tensor:
+    """K-expand the down weight for the full-width interleaved GeGLU
+    output: even columns hold the original weight, odd columns are zero
+    (the duplicated odd input columns must contribute nothing)."""
+    dx = torch.zeros(d_fp16.shape[0], 2 * d_fp16.shape[1],
+                     dtype=fp16, device=d_fp16.device)
+    dx[:, 0::2] = d_fp16
+    return dx.contiguous()
+
+
 class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
     """Pi0.5 Thor frontend with optional NVFP4 encoder and decoder paths."""
 
@@ -57,6 +86,7 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                  use_p1_split_gu: bool = False,
                  encoder_p1_combiner: str = "lut_native",
                  encoder_down_variant: int = 7,
+                 encoder_down_x_variant: int = 1,
                  decoder_qkv_variant: int = 10,
                  decoder_o_variant: int = 10,
                  decoder_gate_up_variant: int = 10,
@@ -114,13 +144,17 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
             raise ValueError(
                 "fp4_layers contains non-live encoder FFN layers "
                 f"{invalid_layers}; valid layers are [0, {self.Le - 2}]")
-        if encoder_p1_combiner not in ("direct", "lut", "lut_native"):
+        if encoder_p1_combiner not in ("direct", "lut", "lut_native",
+                                       "epilogue"):
             raise ValueError(
-                "encoder_p1_combiner must be 'direct', 'lut', or "
-                "'lut_native', got "
+                "encoder_p1_combiner must be 'direct', 'lut', "
+                "'lut_native', or 'epilogue', got "
                 f"{encoder_p1_combiner!r}")
         self.encoder_p1_combiner = encoder_p1_combiner
         self.encoder_down_variant = int(encoder_down_variant)
+        # Tile variant for the K-expanded Down GEMM of the 'epilogue' P1
+        # combiner (K doubles, so the best tile differs from the stock Down).
+        self.encoder_down_x_variant = int(encoder_down_x_variant)
         self.decoder_qkv_variant = int(decoder_qkv_variant)
         self.decoder_o_variant = int(decoder_o_variant)
         self.decoder_gate_up_variant = int(decoder_gate_up_variant)
@@ -573,8 +607,21 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                 if self.use_p1_split_gu:
                     g_fp16 = gu_fp16[:He, :].contiguous()
                     u_fp16 = gu_fp16[He:, :].contiguous()
-                    self._fp4_weights[l]['gate'] = quant_weight_nvfp4(g_fp16)
-                    self._fp4_weights[l]['up']   = quant_weight_nvfp4(u_fp16)
+                    if self.encoder_p1_combiner == 'epilogue':
+                        # Fused-epilogue path: single interleaved gate/up
+                        # weight (down AWQ inv_s folded into the up rows) +
+                        # K-expanded down weight.
+                        inv_dn = (self._awq_inv_s_dn[l]
+                                  if self.use_awq else None)
+                        self._fp4_weights[l]['gu_il'] = quant_weight_nvfp4(
+                            _interleave_gu_rows(g_fp16, u_fp16, inv_dn))
+                        self._fp4_weights[l]['down_x'] = quant_weight_nvfp4(
+                            _expand_down_k(d_fp16))
+                    else:
+                        self._fp4_weights[l]['gate'] = quant_weight_nvfp4(
+                            g_fp16)
+                        self._fp4_weights[l]['up'] = quant_weight_nvfp4(
+                            u_fp16)
 
     def _prepare_fp4_encoder_attn(self):
         """NVFP4-quantize the encoder attention projections.
@@ -879,6 +926,16 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                         gu_scaled[:He, :].contiguous(), self._fp4_weights[l]['gate'])
                     quant_weight_nvfp4_inplace(
                         gu_scaled[He:, :].contiguous(), self._fp4_weights[l]['up'])
+                if self.use_p1_split_gu and 'gu_il' in self._fp4_weights[l]:
+                    quant_weight_nvfp4_inplace(
+                        _interleave_gu_rows(
+                            gu_scaled[:He, :].contiguous(),
+                            gu_scaled[He:, :].contiguous(),
+                            inv_s_dn),
+                        self._fp4_weights[l]['gu_il'])
+                    quant_weight_nvfp4_inplace(
+                        _expand_down_k(d_scaled),
+                        self._fp4_weights[l]['down_x'])
 
     def _collect_awq_activation_amax(self, collect_qkv=False):
         """Run calibration forward with hook that snapshots fp16 activations
@@ -1022,8 +1079,13 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
         # and geglu_two combiner). Each is [Se, He/2] packed + SFA.
         if self.use_p1_split_gu:
             from flash_rt.executors.fp4_utils import FP4Buffer
-            self._fp4_p1_gate = FP4Buffer(Se, He, device='cuda')
-            self._fp4_p1_up   = FP4Buffer(Se, He, device='cuda')
+            if self.encoder_p1_combiner == 'epilogue':
+                # Fused-epilogue path: one full-width [Se, 2H] FP4 buffer
+                # between the interleaved GEMM and the K-expanded Down.
+                self._fp4_p1_il = FP4Buffer(Se, 2 * He, device='cuda')
+            else:
+                self._fp4_p1_gate = FP4Buffer(Se, He, device='cuda')
+                self._fp4_p1_up   = FP4Buffer(Se, He, device='cuda')
         self._fp4_scratch_dict = {
             'gu_act':     self._fp4_gu_scratch,
             'down_act':   self._fp4_dn_scratch,
@@ -1042,11 +1104,16 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                 if self.use_awq else None),
         }
         if self.use_p1_split_gu:
-            self._fp4_scratch_dict['p1_gate_p4']  = self._fp4_p1_gate.packed.data_ptr()
-            self._fp4_scratch_dict['p1_gate_sfa'] = self._fp4_p1_gate.sfa.data_ptr()
-            self._fp4_scratch_dict['p1_up_p4']    = self._fp4_p1_up.packed.data_ptr()
-            self._fp4_scratch_dict['p1_up_sfa']   = self._fp4_p1_up.sfa.data_ptr()
             self._fp4_scratch_dict['p1_combiner'] = self.encoder_p1_combiner
+            if self.encoder_p1_combiner == 'epilogue':
+                self._fp4_scratch_dict['p1_il_p4']  = self._fp4_p1_il.packed.data_ptr()
+                self._fp4_scratch_dict['p1_il_sfa'] = self._fp4_p1_il.sfa.data_ptr()
+                self._fp4_scratch_dict['variant_dn_x'] = self.encoder_down_x_variant
+            else:
+                self._fp4_scratch_dict['p1_gate_p4']  = self._fp4_p1_gate.packed.data_ptr()
+                self._fp4_scratch_dict['p1_gate_sfa'] = self._fp4_p1_gate.sfa.data_ptr()
+                self._fp4_scratch_dict['p1_up_p4']    = self._fp4_p1_up.packed.data_ptr()
+                self._fp4_scratch_dict['p1_up_sfa']   = self._fp4_p1_up.sfa.data_ptr()
         if self.use_fp4_encoder_attn:
             self._fp4_attn_scratch = FP4ActScratch(Se, De, device='cuda')
             self._fp4_scratch_dict['attn_act'] = self._fp4_attn_scratch
