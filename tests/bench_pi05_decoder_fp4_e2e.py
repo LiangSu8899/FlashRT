@@ -108,11 +108,11 @@ def main() -> int:
         help="Per-16 Hadamard rotation on decoder weights + activations "
              "(requires --decoder-act-format e0m3)")
     parser.add_argument(
-        "--decoder-fused-attn", type=int, choices=(0, 1), default=0,
+        "--decoder-fused-attn", type=int, choices=(0, 1), default=1,
         help="Fold the decoder attention seqused mask into the softmax "
              "kernel (one fewer launch per layer-step)")
     parser.add_argument(
-        "--decoder-fused-geglu", type=int, choices=(0, 1), default=0,
+        "--decoder-fused-geglu", type=int, choices=(0, 1), default=1,
         help="Fused-epilogue decoder FFN: one interleaved GeGLU GEMM "
              "replaces the gate_up GEMM + GeGLU kernel (nvfp4 weights only)")
     parser.add_argument("--awq-alpha", type=float, default=0.8)
