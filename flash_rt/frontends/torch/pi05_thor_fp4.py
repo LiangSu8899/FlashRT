@@ -57,7 +57,10 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                  use_p1_split_gu: bool = False,
                  encoder_p1_combiner: str = "lut_native",
                  encoder_down_variant: int = 7,
+                 decoder_qkv_variant: int = 10,
+                 decoder_o_variant: int = 10,
                  decoder_gate_up_variant: int = 10,
+                 decoder_down_variant: int = 10,
                  use_fp8: bool = True,
                  state_prompt_mode: str = "exact",
                  state_prompt_fixed_max_len=None,
@@ -108,7 +111,10 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                 f"{encoder_p1_combiner!r}")
         self.encoder_p1_combiner = encoder_p1_combiner
         self.encoder_down_variant = int(encoder_down_variant)
+        self.decoder_qkv_variant = int(decoder_qkv_variant)
+        self.decoder_o_variant = int(decoder_o_variant)
         self.decoder_gate_up_variant = int(decoder_gate_up_variant)
+        self.decoder_down_variant = int(decoder_down_variant)
 
         if self._fp4_layers:
             if not _HAS_FP4:
@@ -145,13 +151,17 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                     "Pi0.5 decoder FP4 requires NVIDIA Thor SM110; got "
                     f"{device_name} CC {capability}")
 
-            variants = (7, 7, self.decoder_gate_up_variant, 7)
+            variants = (self.decoder_qkv_variant, self.decoder_o_variant,
+                        self.decoder_gate_up_variant,
+                        self.decoder_down_variant)
             variant_count = int(fvk_fp4.cutlass_fp4_gemm_num_variants())
-            if not 0 <= self.decoder_gate_up_variant < variant_count:
-                raise ValueError(
-                    "decoder_gate_up_variant must be in "
-                    f"[0, {variant_count}), got "
-                    f"{self.decoder_gate_up_variant}")
+            for name, v in (("decoder_qkv_variant", variants[0]),
+                            ("decoder_o_variant", variants[1]),
+                            ("decoder_gate_up_variant", variants[2]),
+                            ("decoder_down_variant", variants[3])):
+                if not 0 <= v < variant_count:
+                    raise ValueError(
+                        f"{name} must be in [0, {variant_count}), got {v}")
             self._decoder_fp4_variants = variants
             self._decoder_fp4_weights = []
 

@@ -101,10 +101,15 @@ GEMMs at the production `M=10` shape:
 
 | Projection | M | N | K | CUTLASS variant |
 |---|---:|---:|---:|---:|
-| `qkv` | 10 | 2560 | 1024 | v7 |
-| `o` | 10 | 1024 | 2048 | v7 |
+| `qkv` | 10 | 2560 | 1024 | v10 |
+| `o` | 10 | 1024 | 2048 | v10 |
 | `gate_up` | 10 | 8192 | 1024 | v10 |
-| `down` | 10 | 1024 | 4096 | v7 |
+| `down` | 10 | 1024 | 4096 | v10 |
+
+All four projections use the narrow-N v10 tile (128x64x256): per-kernel
+nsys times inside the CUDA-graph pipeline (regime-checked against the
+fixed gate_up kernel) measure qkv 10.6 to 10.1 us, o 9.4 to 9.0 us, and
+down 14.3 to 13.5 us against the earlier v7 schedules.
 
 Weights are loaded directly from the FP16 safetensors checkpoint, transformed
 with the same Q/K head interleave and Gate+Up concatenation as the FP8 loader,
