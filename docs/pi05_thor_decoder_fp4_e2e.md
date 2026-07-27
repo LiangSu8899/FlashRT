@@ -1,5 +1,20 @@
 # Pi0.5 Thor NVFP4 End-to-End Results
 
+## Vectorized SigLIP LayerNorms (2026-07-27)
+
+The two per-layer SigLIP LayerNorms were the largest non-GEMM item in
+the steady-state kernel profile (1.3 ms of the 2.7 ms normalization
+bucket at 3 views). Register-resident single-pass variants (16-byte
+loads, one 16-element block per thread, all three stages from registers)
+replace them with fallback to the originals on unsupported dims:
+LayerNorm-to-FP8 23.9 -> 11.1 us (2.16x), LayerNorm-to-NVFP4
+28.8 -> 24.7 us at the production shape, about 0.35-0.44 ms per 3-view
+frame. Outputs agree byte-for-byte on real shapes (reduction order
+differs at floating-point rounding level). Formal 3-view run passes all
+gates (raw min 0.99708, action min 0.99904); the end-to-end delta is
+within run-to-run regime noise, consistent with the kernel-level
+measurement.
+
 ## One-View Fidelity: Diagnosis and Passing Configuration (2026-07-27)
 
 The long-standing 1-view blocker is now characterized. It is not an
