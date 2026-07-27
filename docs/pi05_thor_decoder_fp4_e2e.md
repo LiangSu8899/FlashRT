@@ -1,5 +1,33 @@
 # Pi0.5 Thor NVFP4 End-to-End Results
 
+## SigLIP AWQ, 27-Layer Preset (2026-07-27)
+
+Commit `dde9809` adds activation-aware requantization for the SigLIP FFN
+Up weights (see the commit message for the mechanism) and moves the
+SigLIP preset from 16 to all 27 layers. Formal strict-harness runs, all
+gates passed, both children fully regime-stable (FP4 sample spread under
+0.15 ms across 100 samples):
+
+| Views | Same-run FP8 p50 | FP4+FP4 p50 / p95 | Speedup |
+|---:|---:|---:|---:|
+| 2 | 38.633 ms | **29.587 / 29.655 ms** | 1.3057 |
+| 3 | 47.676 ms | **34.864 / 34.922 ms** | 1.3675 |
+
+Matched-noise fidelity versus the same-run FP8 reference (better than
+the 16-layer preset on every metric):
+
+| Views | Raw cosine / worst | Final action cosine / worst |
+|---:|---:|---:|
+| 2 | 0.999102 / 0.997126 | 0.999659 / 0.998810 |
+| 3 | 0.999061 / 0.998330 | 0.999631 / 0.998995 |
+
+Artifacts:
+
+- `flash_rt_fp4`: `3cded1e3d46f9e789686485c4081e61f185049079e252195c51293ff5469e41f`
+- `flash_rt_kernels`: `b9173596a459cec26fc9044ba796ab042e40ada89709eec6854dbdee8c486b37`
+- 2-view `result.json`: `d1f08fe8642cabd41b48990bfda1375c845a7f3cdac46b4c113bfd26da88c8cb`
+- 3-view `result.json`: `bf047a04b779e7c5270df849c90b2416c8a3a69b3910b354bf864d26e126e5a2`
+
 ## Decoder v10 Tiles (2026-07-27)
 
 Commit `d12fbfc` switches the decoder qkv/o/down GEMMs to the narrow-N
