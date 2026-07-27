@@ -29,6 +29,7 @@
 #include "quantize/quantize_e0m3_sfa.cuh"
 #include "gemm/fp4/cutlass_fp4_gemm_e0m3w_sm100.cuh"
 #include "fused_fp4/pi05_e0m3_act.cuh"
+#include "fused_fp4/siglip_ln_vec.cuh"
 #include "quantize/reshape_scales_sfa.cuh"
 #include "fused_fp16/rms_norm_noweight_fp16.cuh"
 #ifdef FLASHRT_HAVE_COSMOS3_EDGE
@@ -165,6 +166,41 @@ Phase 4 will add the layout conversion helper.
         py::arg("seq_len"), py::arg("dim"), py::arg("stream") = 0,
         "F2 + AWQ: weightless RMSNorm x per-channel inverse scale to "
         "NVFP4 + SFA.");
+
+  m.def("layer_norm_fp8_vec_fp16",
+        [](uintptr_t x, uintptr_t gamma, uintptr_t beta, uintptr_t out,
+           int S, int D, float eps, uintptr_t stream) -> int {
+          return flash_rt::fused_fp4::layer_norm_fp8_vec_fp16(
+              reinterpret_cast<const __half*>(x),
+              reinterpret_cast<const __half*>(gamma),
+              reinterpret_cast<const __half*>(beta),
+              reinterpret_cast<void*>(out),
+              S, D, eps, reinterpret_cast<cudaStream_t>(stream));
+        },
+        py::arg("x"), py::arg("gamma"), py::arg("beta"), py::arg("out"),
+        py::arg("S"), py::arg("D"), py::arg("eps") = 1e-5f,
+        py::arg("stream") = 0,
+        "Vectorized LayerNorm to FP8 (register-resident single pass; "
+        "reduction order differs from layer_norm_fp8 at ulp level).");
+
+  m.def("layer_norm_mul_fp4_sfa_vec_fp16",
+        [](uintptr_t x, uintptr_t gamma, uintptr_t beta, uintptr_t inv_s,
+           uintptr_t packed, uintptr_t sfa,
+           int S, int D, float eps, uintptr_t stream) -> int {
+          return flash_rt::fused_fp4::layer_norm_mul_fp4_sfa_vec_fp16(
+              reinterpret_cast<const __half*>(x),
+              reinterpret_cast<const __half*>(gamma),
+              reinterpret_cast<const __half*>(beta),
+              reinterpret_cast<const __half*>(inv_s),
+              reinterpret_cast<void*>(packed),
+              reinterpret_cast<void*>(sfa),
+              S, D, eps, reinterpret_cast<cudaStream_t>(stream));
+        },
+        py::arg("x"), py::arg("gamma"), py::arg("beta"), py::arg("inv_s"),
+        py::arg("packed"), py::arg("sfa"),
+        py::arg("S"), py::arg("D"), py::arg("eps") = 1e-5f,
+        py::arg("stream") = 0,
+        "Vectorized LayerNorm [x AWQ inv_s] to NVFP4+SFA (single pass).");
 
   m.def("layer_norm_mul_fp4_sfa_fp16",
         [](uintptr_t x, uintptr_t gamma, uintptr_t beta, uintptr_t inv_s,

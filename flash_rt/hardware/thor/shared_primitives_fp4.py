@@ -377,8 +377,14 @@ def siglip_forward_with_fp4_ffn(gemm, fvk, fvk_fp4, bufs, weights, dims,
         a_down = alpha[l * 4 + 3]
 
         # ── Attention half: identical to siglip_forward (FP8) ──
-        fvk.layer_norm_fp8(x, x_fp8, weights['ln_attn_w'][l],
-                           weights['ln_attn_b'][l], S, D, 1e-5, stream)
+        # Vectorized single-pass LayerNorm; falls back to the original
+        # kernel on unsupported dims.
+        rc = fvk_fp4.layer_norm_fp8_vec_fp16(
+            x, weights['ln_attn_w'][l], weights['ln_attn_b'][l], x_fp8,
+            S, D, 1e-5, stream)
+        if rc != 0:
+            fvk.layer_norm_fp8(x, x_fp8, weights['ln_attn_w'][l],
+                               weights['ln_attn_b'][l], S, D, 1e-5, stream)
         gemm.fp8_nn_bias(x_fp8, weights['qkv_w'][l], qkv,
                          weights['qkv_b'][l], S, 3 * D, D, a_qkv, stream)
         if attn is not None:
@@ -407,11 +413,17 @@ def siglip_forward_with_fp4_ffn(gemm, fvk, fvk_fp4, bufs, weights, dims,
                                  weights['down_b'][l], S, D, H, a_down,
                                  stream)
             continue
-        rc = fvk_fp4.layer_norm_mul_fp4_sfa_fp16(
+        rc = fvk_fp4.layer_norm_mul_fp4_sfa_vec_fp16(
             x, weights['ln_ffn_w'][l], weights['ln_ffn_b'][l],
             w.get('ln_inv_s', 0),
             sc_ln.packed.data_ptr(), sc_ln.sfa.data_ptr(),
             S, D, 1e-5, stream)
+        if rc != 0:
+            rc = fvk_fp4.layer_norm_mul_fp4_sfa_fp16(
+                x, weights['ln_ffn_w'][l], weights['ln_ffn_b'][l],
+                w.get('ln_inv_s', 0),
+                sc_ln.packed.data_ptr(), sc_ln.sfa.data_ptr(),
+                S, D, 1e-5, stream)
         if rc != 0:
             raise RuntimeError(
                 f"SigLIP FP4 FFN LayerNorm layer {l} failed rc={rc}")
