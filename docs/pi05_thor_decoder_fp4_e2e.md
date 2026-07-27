@@ -280,6 +280,46 @@ Implementation notes for future epilogue work of this kind:
   this volume (7.9M values per GEMM) cost 2.9x kernel time for
   bit-identical output.
 
+## Decoder Softmax Fold + Fused GeGLU FFN — New Defaults (2026-07-28)
+
+Commits `e8e3d87` + `e6ea2df` remove two kernels per decoder layer-step
+and default both changes on:
+
+- `attention_qkv_fp16_seqused_v2` folds the seqused `-inf` mask into
+  the softmax kernel: max/sum run over the valid prefix and positions
+  beyond it are written as exact zero probabilities, which is what the
+  reference mask + softmax chain produces. One fewer launch per
+  attention call (`--decoder-fused-attn 0` restores the old chain).
+- The decoder FFN reuses the compact GeGLU store epilogue on the
+  decoder GEMM tile (128x64x256): a pairwise-interleaved gate/up
+  weight (MSE-quantized like the other decoder projections) turns the
+  gate_up GEMM + GeGLU-quantize pair into one GEMM that writes the
+  down-projection input directly (`--decoder-fused-geglu 0` to
+  disable; nvfp4 weight tier only, the e0m3/rht tiers keep the
+  separate kernels).
+
+Formal same-batch A/B with matched FP8 references:
+
+| views | fusions off | fusions on | speedup | raw_min |
+|-------|-------------|------------|---------|---------|
+| 3v    | 32.26 ms    | **31.64 ms** | 1.4417 → **1.4726** | 0.99754 → 0.99766 |
+| 2v    | 27.70 ms    | **27.14 ms** | 1.3917 → **1.4169** | 0.99794 → 0.99803 |
+
+All gates pass and cosine floors are equal or better (the fused FFN
+applies GELU to the fp32 accumulator instead of the fp16-rounded GEMM
+output).
+
+A full replacement of the decoder attention chain (QK^T + softmax + AV
++ quantize in one SIMT kernel) was implemented, validated for
+numerics, and measured at 5-7x the chain's latency across three
+schedule designs: the skinny attention shape leaves the GEMM work
+tensor-core-bound (the two cuBLAS calls are ~1 us of tensor-core math
+that SIMT arithmetic cannot approach), and per-(head, row) grids
+multiply KV cache re-reads past the L2 budget. FlashAttention-4 at
+this shape measures 24.6 us (head_dim 256 has no KV-split path).
+Fusing the glue between GEMMs — not the GEMMs — is the viable pattern
+here.
+
 ## SigLIP FFN NVFP4, 16-Layer Preset (2026-07-27)
 
 Commit `1e07ea2` moves the SigLIP vision-tower FFN to NVFP4 on the first
