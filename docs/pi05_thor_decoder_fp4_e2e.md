@@ -1,5 +1,28 @@
 # Pi0.5 Thor NVFP4 End-to-End Results
 
+## Full-INT4 Decoder Activations + Hadamard Rotation (2026-07-27)
+
+`--decoder-act-format e0m3` extends the uniform-INT4 grid to all five
+decoder activation quantize exits (AdaRMS entry, both gated-residual
+AdaRMS sites, attention context, GeGLU), and `--decoder-rht 1` rotates
+every 16-value block by the orthonormal 16x16 Hadamard matrix on both
+operands before quantization (lane-parallel kernels use a 4-stage
+shfl_xor butterfly, vectorized kernels an in-register FWHT; the rotation
+is mathematically inert on the GEMM). Formal 3-view, all gates PASS,
+same-session NVFP4 baseline for reference:
+
+| decoder config | p50 (ms) | raw cos | raw min | act min |
+|---|---|---|---|---|
+| W4A4 INT4 + RHT | 35.061 | 0.99937 | 0.99904 | 0.99942 |
+| W4A4 INT4 | 34.902 | 0.99861 | 0.99795 | 0.99891 |
+| NVFP4 (default) | 34.707 | 0.99906 | 0.99833 | 0.99899 |
+
+The rotated full-INT4 configuration is the most accurate decoder
+quantization measured to date — the Hadamard rotation gaussianizes the
+per-block distributions, and the uniform grid then beats E2M1-with-MSE
+on every cosine metric — at ~0.35 ms from the software E0M3 encoders.
+The default remains `nvfp4`; the tiers exist for task-level evaluation
+and as precision headroom for further compression.
 ## E0M3 Uniform-INT4 Decoder Weights (2026-07-27)
 
 The SM110 tcgen05 block-scaled MMA reads its 3-bit element-format field
