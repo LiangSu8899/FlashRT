@@ -303,3 +303,113 @@ def encoder_forward_with_fp4_subset(gemm, fvk, fvk_fp4, bufs, weights, dims,
                 as_next = act_scales + ((l + 1) * 4 + 0) * 4
                 fvk.residual_add_rms_norm_fp8_noweight_fp16(x, fg, x_fp8,
                                                               Se, D, as_next, stream)
+
+
+def siglip_forward_with_fp4_ffn(gemm, fvk, fvk_fp4, bufs, weights, dims,
+                                stream=0, *, attn=None,
+                                fp4_weights: dict = None,
+                                fp4_scratch: dict = None):
+    """SigLIP vision encoder with the FFN in NVFP4.
+
+    The attention half of every layer is identical to
+    ``shared_primitives.siglip_forward`` (FP8 with static scales). The FFN
+    runs LayerNorm straight into NVFP4 activations, an Up GEMM with fused
+    bias + tanh-GELU + fp4/SFA output, and a Down GEMM with fused bias +
+    residual accumulate. The FFN hidden dimension is zero-padded to a
+    multiple of 32 (fp4 TMA alignment); pad rows/columns carry zero
+    weights and biases so the padding is mathematically inert.
+
+    Args:
+        fp4_weights: {layer: {'up': quantized, 'up_bias': ptr,
+                              'down': quantized}} where the quantized
+            entries are ``quant_weight_nvfp4`` dicts over the PADDED
+            hidden dimension and ``up_bias`` points to the padded fp16
+            bias. The Down bias reuses ``weights['down_b']``.
+        fp4_scratch: {'ln_act': FP4ActScratch(S, D),
+                      'hid_act': FP4ActScratch(S, H_pad), 'H_pad': int}
+    """
+    if fp4_weights is None or fp4_scratch is None:
+        raise ValueError(
+            "siglip_forward_with_fp4_ffn requires fp4_weights and "
+            "fp4_scratch")
+    S = dims['S']
+    D = dims['D']
+    H = dims['H']
+    NH = dims['NH']
+    HD = dims['HD']
+    L = dims['L']
+    nv = dims['num_views']
+    spv = dims['seq_per_view']
+
+    x = bufs['x']
+    x_fp8 = bufs['x_fp8']
+    qkv = bufs['qkv']
+    attn_out = bufs['attn_out']
+    hidden = bufs['hidden']
+    hid_fp8 = bufs['hid_fp8']
+
+    alpha = weights['alpha']
+    sc_ln = fp4_scratch['ln_act']
+    sc_hid = fp4_scratch['hid_act']
+    H_pad = int(fp4_scratch['H_pad'])
+
+    for l in range(L):
+        a_qkv = alpha[l * 4 + 0]
+        a_o = alpha[l * 4 + 1]
+        a_up = alpha[l * 4 + 2]
+        a_down = alpha[l * 4 + 3]
+
+        # ── Attention half: identical to siglip_forward (FP8) ──
+        fvk.layer_norm_fp8(x, x_fp8, weights['ln_attn_w'][l],
+                           weights['ln_attn_b'][l], S, D, 1e-5, stream)
+        gemm.fp8_nn_bias(x_fp8, weights['qkv_w'][l], qkv,
+                         weights['qkv_b'][l], S, 3 * D, D, a_qkv, stream)
+        if attn is not None:
+            attn.run("siglip", 0, q_seq=spv, stream=stream)
+        else:
+            stride = 3 * D
+            fvk.fmha_strided_full(qkv, qkv + D * 2, qkv + 2 * D * 2,
+                                  attn_out, nv, spv, spv, NH, NH, HD,
+                                  stride, stride, stream)
+        fvk.quantize_fp8_static_fp16(attn_out, x_fp8,
+                                     weights['unit_scale'], S * D, stream)
+        gemm.fp8_nn_bias_res(x_fp8, weights['o_w'][l], x,
+                             weights['o_b'][l], S, D, D, a_o, stream)
+
+        # ── FFN: NVFP4 when the layer is quantized, FP8 otherwise ──
+        w = fp4_weights.get(l)
+        if w is None:
+            fvk.layer_norm_fp8(x, x_fp8, weights['ln_ffn_w'][l],
+                               weights['ln_ffn_b'][l], S, D, 1e-5, stream)
+            gemm.fp8_nn_gelu_bias(x_fp8, weights['up_w'][l], hidden,
+                                  weights['up_b'][l], S, H, D, a_up, stream)
+            fvk.quantize_fp8_static_fp16(hidden, hid_fp8,
+                                         weights['unit_scale'], S * H,
+                                         stream)
+            gemm.fp8_nn_bias_res(hid_fp8, weights['down_w'][l], x,
+                                 weights['down_b'][l], S, D, H, a_down,
+                                 stream)
+            continue
+        rc = fvk_fp4.layer_norm_fp4_sfa_fp16(
+            x, weights['ln_ffn_w'][l], weights['ln_ffn_b'][l],
+            sc_ln.packed.data_ptr(), sc_ln.sfa.data_ptr(),
+            S, D, 1e-5, stream)
+        if rc != 0:
+            raise RuntimeError(
+                f"SigLIP FP4 FFN LayerNorm layer {l} failed rc={rc}")
+        rc = fvk_fp4.cutlass_fp4_gemm_bias_gelu_fp4out(
+            sc_ln.packed.data_ptr(), sc_ln.sfa.data_ptr(),
+            w['up']['packed'].data_ptr(), w['up']['sfb'].data_ptr(),
+            w['up_bias'],
+            sc_hid.packed.data_ptr(), sc_hid.sfa.data_ptr(),
+            S, H_pad, D, stream)
+        if rc != 0:
+            raise RuntimeError(
+                f"SigLIP FP4 FFN Up GEMM layer {l} failed rc={rc}")
+        rc = fvk_fp4.cutlass_fp4_gemm_bias_res_fp16(
+            sc_hid.packed.data_ptr(), sc_hid.sfa.data_ptr(),
+            w['down']['packed'].data_ptr(), w['down']['sfb'].data_ptr(),
+            weights['down_b'][l], x, x, S, D, H_pad, stream)
+        if rc != 0:
+            raise RuntimeError(
+                f"SigLIP FP4 FFN Down GEMM layer {l} failed rc={rc}")

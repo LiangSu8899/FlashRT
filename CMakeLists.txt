@@ -1727,6 +1727,8 @@ if(ENABLE_SM100_CUTLASS)
     csrc/fused_fp4/norm_silu_fp4_sfa.cu
     csrc/fused_fp4/silu_mul_fp4_sfa_v2.cu
     csrc/fused_fp4/silu_mul_fp4_sfa_vec.cu
+    csrc/fused_fp4/layer_norm_fp4_sfa.cu
+    csrc/gemm/fp4/cutlass_fp4_gemm_siglip_ffn_sm100.cu
     csrc/fused_fp4/res_rms_fp4_sfa_v2.cu
     csrc/fused_fp4/per_channel_mul_fp16.cu
     csrc/fused_fp4/res_rms_mul_fp4_sfa.cu

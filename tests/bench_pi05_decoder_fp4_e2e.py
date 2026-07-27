@@ -95,6 +95,9 @@ def main() -> int:
         "--encoder-attn-o-fp4", type=int, choices=(0, 1), default=1,
         help="NVFP4 encoder attention O projections (QKV stays FP8)")
     parser.add_argument(
+        "--siglip-ffn-fp4", type=int, choices=(0, 1), default=1,
+        help="NVFP4 SigLIP FFN on the validated 16-layer preset")
+    parser.add_argument(
         "--encoder-fp4-layer-count", type=int, choices=range(18),
         default=17, help="FP4-quantize this many leading live encoder FFNs")
     parser.add_argument(
@@ -157,7 +160,8 @@ def main() -> int:
                 decoder_gate_up_variant=args.decoder_gate_up_variant,
                 use_fp4_decoder=True,
                 use_fa4=True,
-                use_fp4_encoder_attn=bool(args.encoder_attn_o_fp4))
+                use_fp4_encoder_attn=bool(args.encoder_attn_o_fp4),
+                use_fp4_siglip_ffn=bool(args.siglip_ffn_fp4))
 
         data = np.load(args.fixture)
         count = int(data["n"])
@@ -238,6 +242,9 @@ def main() -> int:
                     "encoder_awq_alpha": args.awq_alpha,
                     "encoder_attn_o": (
                         "nvfp4" if args.encoder_attn_o_fp4 else "fp8"),
+                    "siglip_ffn": (
+                        "nvfp4_16_layers" if args.siglip_ffn_fp4
+                        else "fp8"),
                     "encoder_gu_mode": args.encoder_gu_mode,
                     "encoder_p1_combiner": args.encoder_p1_combiner,
                     "encoder_down_variant": args.encoder_down_variant,
@@ -304,6 +311,7 @@ def main() -> int:
             "--awq-alpha", str(args.awq_alpha),
             "--encoder-fp4-layer-count", str(args.encoder_fp4_layer_count),
             "--encoder-attn-o-fp4", str(args.encoder_attn_o_fp4),
+            "--siglip-ffn-fp4", str(args.siglip_ffn_fp4),
         ]
         child = subprocess.run(
             command, check=False, capture_output=True, text=True,

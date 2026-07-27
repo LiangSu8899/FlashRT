@@ -62,7 +62,9 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                  state_prompt_mode: str = "exact",
                  state_prompt_fixed_max_len=None,
                  use_fa4: bool = False,
-                 use_fp4_encoder_attn: bool = False):
+                 use_fp4_encoder_attn: bool = False,
+                 use_fp4_siglip_ffn: bool = False,
+                 fp4_siglip_layers: Iterable[int] = None):
         if use_fp4_decoder and not use_fp8:
             raise ValueError(
                 "use_fp4_decoder=True requires the FP8 Thor encoder path")
@@ -80,6 +82,13 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
         self.use_fp4_encoder_ffn = bool(use_fp4_encoder_ffn)
         self.use_fp4_decoder = bool(use_fp4_decoder)
         self.use_fp4_encoder_attn = bool(use_fp4_encoder_attn)
+        self.use_fp4_siglip_ffn = bool(use_fp4_siglip_ffn)
+        # Validated preset: the first 16 SigLIP layers. Deeper-layer FP4
+        # FFNs (tested at 20/23/27 of 27) push the worst-sample raw cosine
+        # below the 0.995 acceptance gate.
+        self._fp4_siglip_layers = (
+            frozenset(fp4_siglip_layers) if fp4_siglip_layers is not None
+            else frozenset(range(16)))
         self._fp4_layers = frozenset(fp4_layers) if self.use_fp4_encoder_ffn else frozenset()
         self.use_awq = bool(use_awq) and self.use_fp4_encoder_ffn
         self.awq_alpha = float(awq_alpha)
@@ -115,6 +124,10 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
             self._prepare_fp4_encoder()
             if self.use_fp4_encoder_attn:
                 self._prepare_fp4_encoder_attn()
+            if self.use_fp4_siglip_ffn:
+                # Graph capture happens later through the overridden
+                # _capture_siglip_graph once the attention backend exists.
+                self._prepare_fp4_siglip_ffn()
             logger.info(
                 "Pi05 FP4 enabled on encoder layers: %s  (AWQ=%s, attn=%s)",
                 sorted(self._fp4_layers), self.use_awq,
@@ -504,6 +517,131 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                 self._enc_attn_fp4_weights[l] = {'o': packed}
         logger.info("Pi05 FP4 encoder attention O projections quantized "
                     "(%d layers)", len(self._enc_attn_fp4_weights))
+
+    def _prepare_fp4_siglip_ffn(self):
+        """NVFP4-quantize the SigLIP FFN (fc1/fc2) with the hidden dim
+        zero-padded to a multiple of 32 (fp4 TMA alignment). Pad rows and
+        columns carry zero weights/biases, so padding is mathematically
+        inert. Also allocates the FFN activation scratch and re-captures
+        the SigLIP graph through siglip_forward_with_fp4_ffn.
+        """
+        from safetensors import safe_open
+        from flash_rt.executors.torch_weights import _autodetect_strip_prefix
+
+        D, H, L = self.sig_D, self.sig_H, self.sig_L
+        H_pad = ((H + 31) // 32) * 32
+        root = ("paligemma_with_expert.paligemma.model.vision_tower."
+                "vision_model.encoder.layers")
+        self._sig_fp4_weights = {}
+        self._sig_fp4_up_bias = []       # keep padded bias tensors alive
+        with safe_open(self._checkpoint_path, framework='pt',
+                       device='cuda') as sf:
+            _strip = _autodetect_strip_prefix(set(sf.keys()))
+
+            def get(k):
+                return sf.get_tensor((_strip + k) if _strip else k)
+
+            for l in sorted(self._fp4_siglip_layers):
+                p = f"{root}.{l}"
+                w_up = get(f"{p}.mlp.fc1.weight").to(fp16)
+                b_up = get(f"{p}.mlp.fc1.bias").to(fp16)
+                w_dn = get(f"{p}.mlp.fc2.weight").to(fp16)
+                if w_up.shape != (H, D) or w_dn.shape != (D, H):
+                    raise ValueError(
+                        f"SigLIP FFN layer {l} shapes {tuple(w_up.shape)}/"
+                        f"{tuple(w_dn.shape)} != {(H, D)}/{(D, H)}")
+                w_up_p = torch.zeros(H_pad, D, dtype=fp16, device='cuda')
+                w_up_p[:H] = w_up
+                b_up_p = torch.zeros(H_pad, dtype=fp16, device='cuda')
+                b_up_p[:H] = b_up
+                w_dn_p = torch.zeros(D, H_pad, dtype=fp16, device='cuda')
+                w_dn_p[:, :H] = w_dn
+                entry = {}
+                for name, w in (('up', w_up_p.contiguous()),
+                                ('down', w_dn_p.contiguous())):
+                    packed = quant_weight_nvfp4(w)
+                    rc = fvk_fp4.quantize_fp4_dynamic_sfa_mse_fp16(
+                        w.data_ptr(), packed['packed'].data_ptr(),
+                        packed['sfb'].data_ptr(), packed['N'], packed['K'],
+                        True, 0)
+                    if rc != 0:
+                        raise RuntimeError(
+                            f"SigLIP FFN {name} FP4 MSE quantization "
+                            f"failed at layer {l}: rc={rc}")
+                    entry[name] = packed
+                entry['up_bias'] = b_up_p.data_ptr()
+                self._sig_fp4_up_bias.append(b_up_p)
+                torch.cuda.synchronize()
+                self._sig_fp4_weights[l] = entry
+        self._sig_fp4_scratch = {
+            'ln_act': FP4ActScratch(self.sig_S, D, device='cuda'),
+            'hid_act': FP4ActScratch(self.sig_S, H_pad, device='cuda'),
+            'H_pad': H_pad,
+        }
+        logger.info("Pi05 SigLIP FFN NVFP4 quantized (%d layers, H_pad=%d)",
+                    len(self._sig_fp4_weights), H_pad)
+
+    def _capture_siglip_graph(self):
+        """Capture the SigLIP graphs; routes through the NVFP4 FFN when
+        use_fp4_siglip_ffn is enabled (base FP8 path otherwise, including
+        during base-class construction before the flag exists)."""
+        if not getattr(self, 'use_fp4_siglip_ffn', False) or \
+                not hasattr(self, '_sig_fp4_weights'):
+            return super()._capture_siglip_graph()
+        import numpy as np
+        from flash_rt.hardware.thor.shared_primitives_fp4 import (
+            siglip_forward_with_fp4_ffn)
+
+        def _sig_fwd(stream_int):
+            siglip_forward_with_fp4_ffn(
+                self._gemm, fvk, fvk_fp4, self._sig_bufs,
+                self._sig_weights, self._sig_dims, stream=stream_int,
+                attn=self._attn,
+                fp4_weights=self._sig_fp4_weights,
+                fp4_scratch=self._sig_fp4_scratch)
+
+        dummy_img = np.zeros((self.num_views, 224, 224, 3), dtype=np.float16)
+        self._img_buf.upload(dummy_img)
+        for _ in range(3):
+            self._patch_embed_ops(0)
+            self._sig_x.zero_()
+            _sig_fwd(0)
+            self._postln_project_ops(0)
+        torch.cuda.synchronize()
+
+        stream = torch.cuda.Stream()
+        self._siglip_graph = torch.cuda.CUDAGraph()
+        s_int = stream.cuda_stream
+        with torch.cuda.stream(stream):
+            self._siglip_graph.capture_begin()
+            self._patch_embed_ops(s_int)
+            _sig_fwd(s_int)
+            self._postln_project_ops(s_int)
+            self._siglip_graph.capture_end()
+        torch.cuda.synchronize()
+
+        dummy_u8 = np.full(
+            (self.num_views, 224, 224, 3), 128, dtype=np.uint8)
+        self._img_u8_buf.upload(dummy_u8)
+        for _ in range(3):
+            self._patch_embed_ops(0, uint8_input=True)
+            self._sig_x.zero_()
+            _sig_fwd(0)
+            self._postln_project_ops(0)
+        torch.cuda.synchronize()
+
+        uint8_stream = torch.cuda.Stream()
+        self._siglip_u8_graph = torch.cuda.CUDAGraph()
+        u8_int = uint8_stream.cuda_stream
+        with torch.cuda.stream(uint8_stream):
+            self._siglip_u8_graph.capture_begin()
+            self._patch_embed_ops(u8_int, uint8_input=True)
+            _sig_fwd(u8_int)
+            self._postln_project_ops(u8_int)
+            self._siglip_u8_graph.capture_end()
+        torch.cuda.synchronize()
+        logger.info("SigLIP CUDA graph captured with NVFP4 FFN (S=%d)",
+                    self.sig_S)
 
     def _awq_scale_weight(self, W: torch.Tensor,
                            activation_amax: torch.Tensor | None = None,

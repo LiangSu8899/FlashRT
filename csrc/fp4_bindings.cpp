@@ -36,6 +36,8 @@
 #include "gemm/fp4/cutlass_fp4_gemm_bias_bf16_sm100.cuh"
 #include "quantize/quantize_fp4_sfa_bf16.cuh"
 #include "fused_fp4/dit_norm_fp4_sfa.cuh"
+#include "fused_fp4/layer_norm_fp4_sfa.cuh"
+#include "gemm/fp4/cutlass_fp4_gemm_siglip_ffn_sm100.cuh"
 
 extern "C" int flash_rt_per_channel_mul_fp16(
     uintptr_t x, uintptr_t inv_s, int S, int D, uintptr_t stream);
@@ -105,6 +107,64 @@ NOTE: SFA/SFB must be in the CUTLASS Sm1xxBlkScaledConfig tile-interleaved
 layout, NOT the linear [N, D/16] layout produced by quantize_fp4_dynamic_fp16.
 Phase 4 will add the layout conversion helper.
 )pbdoc");
+
+  m.def("cutlass_fp4_gemm_bias_gelu_fp4out",
+        [](uintptr_t A, uintptr_t SFA, uintptr_t B, uintptr_t SFB,
+           uintptr_t bias, uintptr_t D, uintptr_t D_SFD,
+           int M, int N, int K, uintptr_t stream) -> int {
+          return flash_rt::fp4::cutlass_fp4_gemm_bias_gelu_fp4out(
+              reinterpret_cast<void const*>(A),
+              reinterpret_cast<void const*>(SFA),
+              reinterpret_cast<void const*>(B),
+              reinterpret_cast<void const*>(SFB),
+              reinterpret_cast<void const*>(bias),
+              reinterpret_cast<void*>(D),
+              reinterpret_cast<void*>(D_SFD),
+              M, N, K, reinterpret_cast<cudaStream_t>(stream));
+        },
+        py::arg("A"), py::arg("SFA"), py::arg("B"), py::arg("SFB"),
+        py::arg("bias"), py::arg("D"), py::arg("D_SFD"),
+        py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0,
+        "NVFP4 GEMM, epilogue tanh-GELU(acc + bias[N]) with fp4+SFA output.");
+
+  m.def("cutlass_fp4_gemm_bias_res_fp16",
+        [](uintptr_t A, uintptr_t SFA, uintptr_t B, uintptr_t SFB,
+           uintptr_t bias, uintptr_t C, uintptr_t D,
+           int M, int N, int K, uintptr_t stream) -> int {
+          return flash_rt::fp4::cutlass_fp4_gemm_bias_res_fp16(
+              reinterpret_cast<void const*>(A),
+              reinterpret_cast<void const*>(SFA),
+              reinterpret_cast<void const*>(B),
+              reinterpret_cast<void const*>(SFB),
+              reinterpret_cast<void const*>(bias),
+              reinterpret_cast<void const*>(C),
+              reinterpret_cast<void*>(D),
+              M, N, K, reinterpret_cast<cudaStream_t>(stream));
+        },
+        py::arg("A"), py::arg("SFA"), py::arg("B"), py::arg("SFB"),
+        py::arg("bias"), py::arg("C"), py::arg("D"),
+        py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0,
+        "NVFP4 GEMM, epilogue acc + bias[N] + C (residual), fp16 output; "
+        "C may alias D.");
+
+  m.def("layer_norm_fp4_sfa_fp16",
+        [](uintptr_t x, uintptr_t gamma, uintptr_t beta,
+           uintptr_t packed, uintptr_t sfa,
+           int seq_len, int dim, float eps, uintptr_t stream) -> int {
+          return flash_rt::fused_fp4::layer_norm_fp4_sfa_fp16(
+              reinterpret_cast<const __half*>(x),
+              reinterpret_cast<const __half*>(gamma),
+              reinterpret_cast<const __half*>(beta),
+              reinterpret_cast<void*>(packed),
+              reinterpret_cast<void*>(sfa),
+              seq_len, dim, eps,
+              reinterpret_cast<cudaStream_t>(stream));
+        },
+        py::arg("x"), py::arg("gamma"), py::arg("beta"),
+        py::arg("packed"), py::arg("sfa"),
+        py::arg("seq_len"), py::arg("dim"), py::arg("eps") = 1e-5f,
+        py::arg("stream") = 0,
+        "Fused LayerNorm (gamma/beta) + NVFP4 quantize + SFA write.");
 
   // ── Dynamic quantize ──
   m.def("quantize_fp4_dynamic_fp16",
