@@ -86,7 +86,7 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                  use_p1_split_gu: bool = False,
                  encoder_p1_combiner: str = "lut_native",
                  encoder_down_variant: int = 7,
-                 encoder_down_x_variant: int = 1,
+                 encoder_down_x_variant: int = 6,
                  decoder_qkv_variant: int = 10,
                  decoder_o_variant: int = 10,
                  decoder_gate_up_variant: int = 10,

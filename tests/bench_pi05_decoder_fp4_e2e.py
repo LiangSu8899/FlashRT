@@ -90,7 +90,7 @@ def main() -> int:
         choices=("direct", "lut", "lut_native", "epilogue"),
         default="lut_native")
     parser.add_argument("--encoder-down-variant", type=int, default=7)
-    parser.add_argument("--encoder-down-x-variant", type=int, default=1)
+    parser.add_argument("--encoder-down-x-variant", type=int, default=6)
     parser.add_argument("--decoder-gate-up-variant", type=int, default=10)
     parser.add_argument(
         "--decoder-weight-format", choices=("nvfp4", "e0m3"),
