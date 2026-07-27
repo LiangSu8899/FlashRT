@@ -1,5 +1,42 @@
 # Pi0.5 Thor NVFP4 End-to-End Results
 
+## SigLIP FFN NVFP4, 16-Layer Preset (2026-07-27)
+
+Commit `1e07ea2` moves the SigLIP vision-tower FFN to NVFP4 on the first
+16 of 27 layers: a fused LayerNorm + NVFP4/SFA quantize kernel, an Up
+GEMM with fused per-channel bias + tanh-GELU + fp4/SFA output, and a
+Down GEMM with fused bias + residual accumulate. The hidden dimension is
+zero-padded from 4304 to 4320 for the 32-element fp4 TMA alignment; the
+padding carries zero weights and biases. Quantizing deeper layers
+(20/23/27 of 27) pushes the worst-sample raw cosine below the 0.995
+gate, so the remaining layers keep the FP8 FFN.
+
+Formal strict-harness runs at `1e07ea2` (all gates passed):
+
+| Views | Same-run FP8 p50 | FP4+FP4 p50 / p95 | Speedup |
+|---:|---:|---:|---:|
+| 2 | 38.616 ms | **30.076 / 31.948 ms** | 1.2839 |
+| 3 | 49.401 ms | **37.442 / 37.530 ms** | 1.3194 |
+
+Matched-noise fidelity versus the same-run FP8 reference:
+
+| Views | Raw cosine / worst | Final action cosine / worst |
+|---:|---:|---:|
+| 2 | 0.999123 / 0.998523 | 0.999735 / 0.999427 |
+| 3 | 0.998744 / 0.996937 | 0.999672 / 0.999231 |
+
+The 3-view run executed in the slower sustained-load clock regime (FP8
+reference 49.4 ms; see the measurement note below) — the speedup ratio
+is the like-for-like metric, and it improves from 1.2925 to 1.3194 over
+the previous section's configuration.
+
+Artifacts:
+
+- `flash_rt_fp4`: `5ffd0736eb1e20497cb875a8135db60a113de800c69a1328f9b8ac50633ed9c8`
+- `flash_rt_kernels`: `b9173596a459cec26fc9044ba796ab042e40ada89709eec6854dbdee8c486b37`
+- 2-view `result.json`: `21df99f986635c6f1fca11aafd2a0d8a08328d672561cdde82e46236120be6db`
+- 3-view `result.json`: `dbb1370794f434e2d39254018b80a118c48f04ea7eaf67a48dfba4d4199541ef`
+
 ## Vectorized Kernels + Encoder Attention O NVFP4 (2026-07-26)
 
 Three follow-up optimizations on top of the merged FP4+FP4 path, at
