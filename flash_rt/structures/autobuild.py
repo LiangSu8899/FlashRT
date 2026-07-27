@@ -52,6 +52,21 @@ def register_attention_adapter(adapter) -> None:
     _ATTENTION_ADAPTERS.append(adapter)
 
 
+# Per-structure binders registered from impls, consulted before the
+# built-in routing in :func:`_bind_auto`. New structures land by
+# registering here from their own module instead of editing the routing
+# function — parallel additions then touch disjoint files. A binder is
+# ``f(model, seam, cap, *, points, fmt) -> module | None`` with the same
+# refusal contract as ``_bind_auto`` (raise ``ValueError`` with the
+# reason; return ``None`` for "host keeps its path").
+_STRUCTURE_BINDERS: dict[str, Any] = {}
+
+
+def register_structure_binder(structure: str, binder) -> None:
+    """Route ``structure`` seams to ``binder`` (last write wins)."""
+    _STRUCTURE_BINDERS[structure] = binder
+
+
 @dataclass
 class AutoPlan:
     """Discovered + calibrated swaps, ready to stage."""
@@ -691,6 +706,10 @@ def _bind_auto(model, seam, cap, plan, act_scales, negotiate_fp8,
     def scale(name, path=None):
         return None if points is None else points.scale(path or seam.path,
                                                         name)
+
+    custom = _STRUCTURE_BINDERS.get(seam.structure)
+    if custom is not None:
+        return custom(model, seam, cap, points=points, fmt=fmt)
 
     if fmt and seam.structure != "decoder_ffn":
         raise ValueError(f"scheme routed {seam.structure} to format "

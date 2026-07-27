@@ -433,8 +433,11 @@ def attach(
         say("outcome: whole-host refusal — model left untouched")
 
     receipt = {
+        "schema_version": 1,
+        "environment": _environment(),
         "model": type(model).__name__,
         "output_kind": kind,
+        "scheme": plan.notes.get("scheme"),
         "floors": band_floors,
         "min_speedup": min_speedup,
         "timing": {"method": "paired alternating", "rounds": rounds,
@@ -452,6 +455,33 @@ def attach(
         json.dumps(receipt, sort_keys=True, default=str).encode()
     ).hexdigest()
     return Plan(winners, stats, receipt, _handle=handle, _plan=plan)
+
+
+def _environment() -> dict[str, str]:
+    """Version fingerprint baked into every receipt.
+
+    A parity or latency figure without the environment it was measured
+    in is not comparable to anything. The concrete case: a host
+    modelling contract that moved between two library versions changed
+    every activation scale while both arms of an A/B stayed mutually
+    consistent — two receipts differing only in this block is exactly
+    how that shows up.
+    """
+    import platform
+
+    env = {"python": platform.python_version(),
+           "torch": torch.__version__}
+    if torch.cuda.is_available():
+        env["cuda"] = str(torch.version.cuda)
+        env["device"] = torch.cuda.get_device_name(0)
+        cap = torch.cuda.get_device_capability(0)
+        env["sm"] = f"sm{cap[0]}{cap[1]}"
+    try:
+        import transformers
+        env["transformers"] = transformers.__version__
+    except ImportError:
+        pass
+    return env
 
 
 def _say_band(where: str, band: str, note: str, say) -> None:
