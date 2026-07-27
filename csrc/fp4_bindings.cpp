@@ -147,6 +147,22 @@ Phase 4 will add the layout conversion helper.
         "NVFP4 GEMM, epilogue acc + bias[N] + C (residual), fp16 output; "
         "C may alias D.");
 
+  m.def("rms_norm_mul_fp4_sfa_fp16",
+        [](uintptr_t x, uintptr_t inv_s, uintptr_t packed, uintptr_t sfa,
+           int seq_len, int dim, uintptr_t stream) {
+          flash_rt::fused_fp4::rms_norm_mul_fp4_sfa_fp16(
+              reinterpret_cast<const __half*>(x),
+              reinterpret_cast<const __half*>(inv_s),
+              reinterpret_cast<uint8_t*>(packed),
+              reinterpret_cast<uint8_t*>(sfa),
+              seq_len, dim,
+              reinterpret_cast<cudaStream_t>(stream));
+        },
+        py::arg("x"), py::arg("inv_s"), py::arg("packed"), py::arg("sfa"),
+        py::arg("seq_len"), py::arg("dim"), py::arg("stream") = 0,
+        "F2 + AWQ: weightless RMSNorm x per-channel inverse scale to "
+        "NVFP4 + SFA.");
+
   m.def("layer_norm_mul_fp4_sfa_fp16",
         [](uintptr_t x, uintptr_t gamma, uintptr_t beta, uintptr_t inv_s,
            uintptr_t packed, uintptr_t sfa,

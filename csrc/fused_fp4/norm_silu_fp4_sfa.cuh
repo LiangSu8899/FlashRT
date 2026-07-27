@@ -18,6 +18,11 @@ namespace fused_fp4 {
 
 // F2: rms_norm → fp4 packed + SFA tile-interleaved.
 // x [S, D] fp16 → packed [S, D/2] uint8 + sfa (CUTLASS SFA layout, is_sfb=false)
+// F2 + AWQ: rms_norm(x) * inv_s[c] → fp4 + SFA.
+void rms_norm_mul_fp4_sfa_fp16(
+    const __half* x, const __half* inv_s, uint8_t* packed, uint8_t* sfa,
+    int seq_len, int dim, cudaStream_t stream);
+
 void rms_norm_fp4_sfa_fp16(
     const __half* x, uint8_t* packed, uint8_t* sfa,
     int seq_len, int dim, cudaStream_t stream);

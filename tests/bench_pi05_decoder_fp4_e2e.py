@@ -93,7 +93,10 @@ def main() -> int:
     parser.add_argument("--awq-alpha", type=float, default=0.8)
     parser.add_argument(
         "--encoder-attn-o-fp4", type=int, choices=(0, 1), default=1,
-        help="NVFP4 encoder attention O projections (QKV stays FP8)")
+        help="NVFP4 encoder attention O projections")
+    parser.add_argument(
+        "--encoder-attn-qkv-fp4", type=int, choices=(0, 1), default=1,
+        help="NVFP4 encoder attention QKV projections (AWQ-calibrated)")
     parser.add_argument(
         "--siglip-ffn-fp4", type=int, choices=(0, 1), default=1,
         help="NVFP4 SigLIP FFN on the validated 16-layer preset")
@@ -161,6 +164,7 @@ def main() -> int:
                 use_fp4_decoder=True,
                 use_fa4=True,
                 use_fp4_encoder_attn=bool(args.encoder_attn_o_fp4),
+                use_fp4_encoder_attn_qkv=bool(args.encoder_attn_qkv_fp4),
                 use_fp4_siglip_ffn=bool(args.siglip_ffn_fp4))
 
         data = np.load(args.fixture)
@@ -242,6 +246,9 @@ def main() -> int:
                     "encoder_awq_alpha": args.awq_alpha,
                     "encoder_attn_o": (
                         "nvfp4" if args.encoder_attn_o_fp4 else "fp8"),
+                    "encoder_attn_qkv": (
+                        "nvfp4_awq" if args.encoder_attn_qkv_fp4
+                        else "fp8"),
                     "siglip_ffn": (
                         "nvfp4_16_layers" if args.siglip_ffn_fp4
                         else "fp8"),
@@ -311,6 +318,7 @@ def main() -> int:
             "--awq-alpha", str(args.awq_alpha),
             "--encoder-fp4-layer-count", str(args.encoder_fp4_layer_count),
             "--encoder-attn-o-fp4", str(args.encoder_attn_o_fp4),
+            "--encoder-attn-qkv-fp4", str(args.encoder_attn_qkv_fp4),
             "--siglip-ffn-fp4", str(args.siglip_ffn_fp4),
         ]
         child = subprocess.run(

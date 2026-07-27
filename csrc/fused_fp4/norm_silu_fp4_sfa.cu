@@ -348,6 +348,78 @@ __global__ void f2_rms_norm_fp4_sfa_kernel(
 }
 
 // ──────────────────────────────────────────────────────────────────
+// F2 + AWQ: rms_norm(x) * inv_s → fp4 + SFA (per-channel inverse scale)
+// Same structure as F2; the normalized value is multiplied by inv_s[c]
+// before the fp16 staging round.
+// ──────────────────────────────────────────────────────────────────
+template <class LayoutSF>
+__global__ void f2_rms_norm_mul_fp4_sfa_kernel(
+    const __half* __restrict__ x,
+    const __half* __restrict__ inv_s,
+    uint8_t* __restrict__ packed,
+    uint8_t* __restrict__ dst_sfa,
+    LayoutSF layout,
+    int D) {
+    const int r = blockIdx.x;
+    const __half* row_ptr = x + r * D;
+    uint8_t* packed_row = packed + r * (D / 2);
+
+    const __half2* row2 = reinterpret_cast<const __half2*>(row_ptr);
+    const __half2* inv2 = reinterpret_cast<const __half2*>(inv_s);
+    const int D2 = D / 2;
+
+    extern __shared__ __half smem_normed[];
+
+    constexpr int ELEMS_PER_THREAD = 8;
+    float cache[ELEMS_PER_THREAD];
+    float ssq = 0;
+    int c2_base[ELEMS_PER_THREAD / 2];
+
+    #pragma unroll
+    for (int it = 0; it < ELEMS_PER_THREAD / 2; it++) {
+        int c2 = threadIdx.x + it * blockDim.x;
+        c2_base[it] = c2;
+        if (c2 < D2) {
+            __half2 v2 = row2[c2];
+            cache[it*2]   = __half2float(v2.x);
+            cache[it*2+1] = __half2float(v2.y);
+            ssq += cache[it*2]*cache[it*2] + cache[it*2+1]*cache[it*2+1];
+        } else {
+            cache[it*2] = 0; cache[it*2+1] = 0;
+        }
+    }
+
+    __shared__ float sh[16];
+    int lane = threadIdx.x % 32, wid = threadIdx.x / 32;
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) ssq += __shfl_xor_sync(0xffffffff, ssq, o);
+    if (!lane) sh[wid] = ssq; __syncthreads();
+    if (!wid) { ssq = (lane < (blockDim.x/32)) ? sh[lane] : 0;
+                for (int o = 16; o > 0; o >>= 1) ssq += __shfl_xor_sync(0xffffffff, ssq, o); }
+    __syncthreads(); if (!threadIdx.x) sh[0] = ssq; __syncthreads();
+
+    float rms = __frsqrt_rn(sh[0] / D + 1e-6f);
+
+    #pragma unroll
+    for (int it = 0; it < ELEMS_PER_THREAD / 2; it++) {
+        int c2 = c2_base[it];
+        if (c2 < D2) {
+            const float2 iv = __half22float2(inv2[c2]);
+            float v0 = cache[it*2]   * rms * iv.x;
+            float v1 = cache[it*2+1] * rms * iv.y;
+            __half2 h2 = __halves2half2(__float2half(v0), __float2half(v1));
+            reinterpret_cast<__half2*>(smem_normed)[c2] = h2;
+        }
+    }
+    __syncthreads();
+
+    const int n_blocks = D / 16;
+    for (int b = threadIdx.x; b < n_blocks; b += blockDim.x) {
+        quant_block_from_smem(smem_normed, packed_row, dst_sfa, layout, r, b);
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────
 // F3: residual += x; rms_norm(residual) → fp4 + SFA
 // ──────────────────────────────────────────────────────────────────
 template <class LayoutSF>
@@ -474,6 +546,21 @@ void rms_norm_fp4_sfa_fp16(
         x, packed, sfa, layout, dim);
 #else
     (void)x; (void)packed; (void)sfa; (void)seq_len; (void)dim; (void)stream;
+#endif
+}
+
+void rms_norm_mul_fp4_sfa_fp16(
+    const __half* x, const __half* inv_s, uint8_t* packed, uint8_t* sfa,
+    int seq_len, int dim, cudaStream_t stream) {
+#if FV_HAVE_CUTLASS
+    auto shape = cute::make_shape(seq_len, 1, dim, 1);
+    auto layout = Cfg::tile_atom_to_shape_SFA(shape);
+    const size_t smem_bytes = dim * sizeof(__half);
+    f2_rms_norm_mul_fp4_sfa_kernel<<<seq_len, 256, smem_bytes, stream>>>(
+        x, inv_s, packed, sfa, layout, dim);
+#else
+    (void)x; (void)inv_s; (void)packed; (void)sfa;
+    (void)seq_len; (void)dim; (void)stream;
 #endif
 }
 

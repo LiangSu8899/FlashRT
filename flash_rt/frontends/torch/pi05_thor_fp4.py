@@ -66,6 +66,7 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                  state_prompt_fixed_max_len=None,
                  use_fa4: bool = False,
                  use_fp4_encoder_attn: bool = False,
+                 use_fp4_encoder_attn_qkv: bool = False,
                  use_fp4_siglip_ffn: bool = False,
                  fp4_siglip_layers: Iterable[int] = None):
         if use_fp4_decoder and not use_fp8:
@@ -74,6 +75,10 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
         if use_fp4_encoder_attn and not use_fp4_encoder_ffn:
             raise ValueError(
                 "use_fp4_encoder_attn=True requires use_fp4_encoder_ffn=True")
+        if use_fp4_encoder_attn_qkv and not use_fp4_encoder_attn:
+            raise ValueError(
+                "use_fp4_encoder_attn_qkv=True requires "
+                "use_fp4_encoder_attn=True")
         # Base init (loads weights, allocates all FP8 buffers, etc.)
         super().__init__(checkpoint_dir, num_views=num_views,
                          use_cuda_graph=use_cuda_graph, autotune=autotune,
@@ -85,6 +90,7 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
         self.use_fp4_encoder_ffn = bool(use_fp4_encoder_ffn)
         self.use_fp4_decoder = bool(use_fp4_decoder)
         self.use_fp4_encoder_attn = bool(use_fp4_encoder_attn)
+        self.use_fp4_encoder_attn_qkv = bool(use_fp4_encoder_attn_qkv)
         self.use_fp4_siglip_ffn = bool(use_fp4_siglip_ffn)
         # Default: all 27 layers. Without AWQ, deep-layer FP4 FFNs push the
         # worst-sample raw cosine below the 0.995 gate (0.989 at 27 of 27);
@@ -325,6 +331,7 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
         sig_layers = (sorted(self._sig_fp4_weights)
                       if self.use_fp4_siglip_ffn else [])
         per_sample_sig: dict = {l: [] for l in sig_layers}
+        per_sample_qkv: dict = {}
         for i, obs in enumerate(obs_list):
             if 'images' in obs:
                 img_list = obs['images']
@@ -356,7 +363,14 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
             # written by the SigLIP replay above) and returns per-
             # channel activation amax at each FP4 layer's Gate+Up input
             # (shape [De]) and Down input (shape [He]).
-            act_gu, act_dn = self._collect_awq_activation_amax()
+            if self.use_fp4_encoder_attn_qkv:
+                act_gu, act_dn, act_qkv = self._collect_awq_activation_amax(
+                    collect_qkv=True)
+                for l in act_qkv:
+                    per_sample_qkv.setdefault(l, []).append(
+                        act_qkv[l].detach().cpu().numpy().astype(np.float32))
+            else:
+                act_gu, act_dn = self._collect_awq_activation_amax()
             for l in self._fp4_layers:
                 per_sample_gu[l].append(
                     act_gu[l].detach().cpu().numpy().astype(np.float32))
@@ -404,6 +418,12 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                 l: torch.as_tensor(final_sig[l], device='cuda')
                 for l in sig_layers})
             self._sig_awq_calibrated = True
+
+        if per_sample_qkv:
+            self._requant_enc_attn_qkv_with_awq({
+                l: torch.as_tensor(
+                    accumulate_amax(v, percentile=percentile), device='cuda')
+                for l, v in per_sample_qkv.items()})
 
         # Hand the reduced per-channel amax dicts to the existing single-
         # frame AWQ requant routine. It updates inv_s + NVFP4 packed/sfb
@@ -507,21 +527,26 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                     self._fp4_weights[l]['up']   = quant_weight_nvfp4(u_fp16)
 
     def _prepare_fp4_encoder_attn(self):
-        """NVFP4-quantize the encoder attention output (O) projections.
+        """NVFP4-quantize the encoder attention projections.
 
-        Covers the layers that run attention (all but the last), with the
-        per-block MSE scale search used by the decoder weights. The QKV
-        projections stay FP8: 4-bit Q/K weights shift the attention logits
-        enough to break the raw-output cosine gate (worst sample 0.97
-        versus the required 0.995), while O-only passes every gate.
+        O projections (all layers that run attention) use the per-block
+        MSE scale search. With ``use_fp4_encoder_attn_qkv`` the QKV
+        projections are quantized as well (input_layernorm folded, GQA
+        8/1 interleave, all layers); without AWQ their 4-bit Q/K weights
+        shift the attention logits enough to break the raw-cosine gate
+        (worst sample 0.97), so the QKV path relies on the
+        activation-aware requant during multi-sample calibration.
         """
         from safetensors import safe_open
-        from flash_rt.executors.torch_weights import _autodetect_strip_prefix
+        from flash_rt.executors.torch_weights import (
+            _autodetect_strip_prefix, _interleave_qk_core)
 
         De = self.De
         model_root = (
             "paligemma_with_expert.paligemma.model.language_model.layers")
         self._enc_attn_fp4_weights = {}
+        self._enc_attn_qkv_fp16 = {}
+        self._enc_attn_qkv_inv_s = {}
         with safe_open(self._checkpoint_path, framework='pt',
                        device='cuda') as sf:
             _strip = _autodetect_strip_prefix(set(sf.keys()))
@@ -529,27 +554,82 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
             def get(k):
                 return sf.get_tensor((_strip + k) if _strip else k)
 
-            for l in range(self.Le - 1):
+            for l in range(self.Le):
                 p = f"{model_root}.{l}"
-                o_fp16 = get(
-                    f"{p}.self_attn.o_proj.weight").to(fp16).contiguous()
-                if o_fp16.shape != (De, De):
-                    raise ValueError(
-                        f"encoder o shape {tuple(o_fp16.shape)} != "
-                        f"{(De, De)}")
-                packed = quant_weight_nvfp4(o_fp16)
-                rc = fvk_fp4.quantize_fp4_dynamic_sfa_mse_fp16(
-                    o_fp16.data_ptr(), packed['packed'].data_ptr(),
-                    packed['sfb'].data_ptr(), packed['N'], packed['K'],
-                    True, 0)
-                if rc != 0:
-                    raise RuntimeError(
-                        "encoder attn O FP4 MSE quantization failed at "
-                        f"layer {l}: rc={rc}")
-                torch.cuda.synchronize()
-                self._enc_attn_fp4_weights[l] = {'o': packed}
-        logger.info("Pi05 FP4 encoder attention O projections quantized "
-                    "(%d layers)", len(self._enc_attn_fp4_weights))
+                entry = {}
+                if l < self.Le - 1:
+                    o_fp16 = get(
+                        f"{p}.self_attn.o_proj.weight").to(fp16).contiguous()
+                    if o_fp16.shape != (De, De):
+                        raise ValueError(
+                            f"encoder o shape {tuple(o_fp16.shape)} != "
+                            f"{(De, De)}")
+                    packed = quant_weight_nvfp4(o_fp16)
+                    rc = fvk_fp4.quantize_fp4_dynamic_sfa_mse_fp16(
+                        o_fp16.data_ptr(), packed['packed'].data_ptr(),
+                        packed['sfb'].data_ptr(), packed['N'], packed['K'],
+                        True, 0)
+                    if rc != 0:
+                        raise RuntimeError(
+                            "encoder attn O FP4 MSE quantization failed at "
+                            f"layer {l}: rc={rc}")
+                    entry['o'] = packed
+                if self.use_fp4_encoder_attn_qkv:
+                    q = _interleave_qk_core(
+                        get(f"{p}.self_attn.q_proj.weight").float(), 8)
+                    k = _interleave_qk_core(
+                        get(f"{p}.self_attn.k_proj.weight").float(), 1)
+                    v = get(f"{p}.self_attn.v_proj.weight").float()
+                    fa = (1.0 + get(f"{p}.input_layernorm.weight").float()
+                          ).unsqueeze(0)
+                    qkv_fp16 = torch.cat(
+                        [q * fa, k * fa, v * fa],
+                        dim=0).to(fp16).contiguous()
+                    if qkv_fp16.shape != (2560, De):
+                        raise ValueError(
+                            f"encoder qkv shape {tuple(qkv_fp16.shape)} != "
+                            f"{(2560, De)}")
+                    packed_q = quant_weight_nvfp4(qkv_fp16)
+                    rc = fvk_fp4.quantize_fp4_dynamic_sfa_mse_fp16(
+                        qkv_fp16.data_ptr(), packed_q['packed'].data_ptr(),
+                        packed_q['sfb'].data_ptr(), packed_q['N'],
+                        packed_q['K'], True, 0)
+                    if rc != 0:
+                        raise RuntimeError(
+                            "encoder attn QKV FP4 MSE quantization failed "
+                            f"at layer {l}: rc={rc}")
+                    inv = torch.ones(De, dtype=fp16, device='cuda')
+                    entry['qkv'] = packed_q
+                    entry['qkv_inv_s'] = inv.data_ptr()
+                    self._enc_attn_qkv_fp16[l] = qkv_fp16
+                    self._enc_attn_qkv_inv_s[l] = inv
+                if entry:
+                    torch.cuda.synchronize()
+                    self._enc_attn_fp4_weights[l] = entry
+        logger.info("Pi05 FP4 encoder attention projections quantized "
+                    "(%d layers, qkv=%s)",
+                    len(self._enc_attn_fp4_weights),
+                    self.use_fp4_encoder_attn_qkv)
+
+    def _requant_enc_attn_qkv_with_awq(self, qkv_amax: dict):
+        """In-place AWQ requant of the encoder attention QKV weights."""
+        for l, a in qkv_amax.items():
+            if l not in self._enc_attn_qkv_fp16:
+                continue
+            w_scaled, inv_s = self._awq_scale_weight(
+                self._enc_attn_qkv_fp16[l], activation_amax=a)
+            packed = self._enc_attn_fp4_weights[l]['qkv']
+            rc = fvk_fp4.quantize_fp4_dynamic_sfa_mse_fp16(
+                w_scaled.data_ptr(), packed['packed'].data_ptr(),
+                packed['sfb'].data_ptr(), packed['N'], packed['K'], True, 0)
+            if rc != 0:
+                raise RuntimeError(
+                    f"encoder attn QKV AWQ requant failed at layer {l}: "
+                    f"rc={rc}")
+            self._enc_attn_qkv_inv_s[l].copy_(inv_s)
+        torch.cuda.synchronize()
+        logger.info("Encoder attn QKV AWQ requant complete (%d layers)",
+                    len(qkv_amax))
 
     def _prepare_fp4_siglip_ffn(self):
         """NVFP4-quantize the SigLIP FFN (fc1/fc2) with the hidden dim
@@ -750,7 +830,7 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                     quant_weight_nvfp4_inplace(
                         gu_scaled[He:, :].contiguous(), self._fp4_weights[l]['up'])
 
-    def _collect_awq_activation_amax(self):
+    def _collect_awq_activation_amax(self, collect_qkv=False):
         """Run calibration forward with hook that snapshots fp16 activations
         at FP4 layers' Gate+Up and Down inputs; return per-channel amax dicts."""
         Se = self.Se; De = self.De; He = self.He; NHe = self.NHe; HDe = self.HDe
@@ -759,6 +839,7 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
         act_dn = {l: torch.zeros(He, dtype=torch.float32, device='cuda') for l in self._fp4_layers}
         # Snapshot scratch buffers (one-per-FP4-layer to avoid re-alloc)
         x_snap = {l: torch.empty(Se, De, dtype=fp16, device='cuda') for l in self._fp4_layers}
+        qkv_snap = {}
         h_snap = {l: torch.empty(Se, He, dtype=fp16, device='cuda') for l in self._fp4_layers}
 
         # Run one encoder pass hand-rolled: use existing kernels step by step.
@@ -793,6 +874,9 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
 
             fvk.rms_norm_fp8_noweight_fp16(
                 x.data_ptr(), x_fp8.data_ptr(), Se, De, as_qkv, 0)
+            if collect_qkv:
+                torch.cuda.synchronize()
+                qkv_snap[l] = x.clone()
             fvk.cutlass_fp8_sq(
                 x_fp8.data_ptr(), self._enc_qkv_w[l].data_ptr(), qkv.data_ptr(),
                 Se, 2560, De, alpha_host[l*4+0], 0.0, 0)
@@ -856,9 +940,21 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
         for l in self._fp4_layers:
             act_gu[l] = x_snap[l].abs().float().amax(dim=0)
             act_dn[l] = h_snap[l].abs().float().amax(dim=0)
+        act_qkv = {}
+        if collect_qkv:
+            # QKV GEMM input = weightless RMSNorm of the layer-entry
+            # residual (the input_layernorm gamma is folded into the
+            # quantized weight).
+            for l, xs in qkv_snap.items():
+                xn = xs.float()
+                xn = xn * torch.rsqrt(
+                    xn.pow(2).mean(dim=1, keepdim=True) + 1e-6)
+                act_qkv[l] = xn.abs().amax(dim=0)
         # Free snapshots
-        del x_snap, h_snap
+        del x_snap, h_snap, qkv_snap
         torch.cuda.empty_cache()
+        if collect_qkv:
+            return act_gu, act_dn, act_qkv
         return act_gu, act_dn
 
     def _alloc_fp4_scratch_for_Se(self, Se: int):

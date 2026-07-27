@@ -117,24 +117,41 @@ def encoder_forward_with_fp4_subset(gemm, fvk, fvk_fp4, bufs, weights, dims,
 
         aw_attn = attn_fp4.get(l)
 
-        # 1. RMSNorm → FP8 (unchanged, QKV path always FP8: 4-bit Q/K
-        # weights break the raw-cosine gate, see Pi05TorchFrontendThorFP4.
-        # _prepare_fp4_encoder_attn)
+        # 1+2. RMSNorm + QKV GEMM. Default: FP8 with static scales. With
+        # an AWQ-calibrated NVFP4 QKV weight ('qkv' in the layer entry),
+        # the input runs weightless RMSNorm x per-channel AWQ inverse
+        # scale straight into NVFP4 (input_layernorm stays folded into
+        # the quantized weight).
         #
-        # NOTE: on paper, this step for layer l>=1 is redundant with the
-        # previous layer's step 11 (same scale, unchanged x). However, the
-        # FP8 calibration scales were collected by encoder_forward_calibrate
-        # WITH step 1 in place. Step 11 uses fp32 (r+x) intermediate; step 1
-        # re-reads the fp16-cast residual and recomputes rms from the
-        # rounded value. The resulting x_fp8 differs at the fp16 rounding
-        # level — calibration was tuned to step-1's output, so skipping it
-        # introduces a systematic scale-mismatch that compounds across 17
-        # layers. Empirically cos drops from 0.997 to 0.91. Keep the call.
-        fvk.rms_norm_fp8_noweight_fp16(x, x_fp8, Se, D, as_qkv, stream)
-
-        # 2. QKV GEMM FP8 (unchanged)
-        fvk.cutlass_fp8_sq(x_fp8, weights['qkv_w'][l], qkv,
-                           Se, 2560, D, alpha_host[l * 4 + 0], 0.0, stream)
+        # NOTE (FP8 path): on paper, step 1 for layer l>=1 is redundant
+        # with the previous layer's step 11 (same scale, unchanged x).
+        # However, the FP8 calibration scales were collected by
+        # encoder_forward_calibrate WITH step 1 in place. Step 11 uses
+        # fp32 (r+x) intermediate; step 1 re-reads the fp16-cast residual
+        # and recomputes rms from the rounded value. The resulting x_fp8
+        # differs at the fp16 rounding level — calibration was tuned to
+        # step-1's output, so skipping it introduces a systematic
+        # scale-mismatch that compounds across 17 layers. Empirically cos
+        # drops from 0.997 to 0.91. Keep the call.
+        if aw_attn is not None and 'qkv' in aw_attn:
+            fvk_fp4.rms_norm_mul_fp4_sfa_fp16(
+                x, aw_attn['qkv_inv_s'],
+                sc_at.packed.data_ptr(), sc_at.sfa.data_ptr(),
+                Se, D, stream)
+            rc = fvk_fp4.cutlass_fp4_gemm_variant(
+                attn_variant,
+                sc_at.packed.data_ptr(), sc_at.sfa.data_ptr(),
+                aw_attn['qkv']['packed'].data_ptr(),
+                aw_attn['qkv']['sfb'].data_ptr(),
+                qkv, Se, 2560, D, 1.0, 0.0, stream)
+            if rc != 0:
+                raise RuntimeError(
+                    f"encoder FP4 qkv GEMM layer {l} failed rc={rc}")
+        else:
+            fvk.rms_norm_fp8_noweight_fp16(x, x_fp8, Se, D, as_qkv, stream)
+            fvk.cutlass_fp8_sq(x_fp8, weights['qkv_w'][l], qkv,
+                               Se, 2560, D, alpha_host[l * 4 + 0], 0.0,
+                               stream)
 
         # 3+4. QKV split + RoPE + KV cache write (vectorized, bit-exact)
         kv_elem_off = l * total_keys * HD
