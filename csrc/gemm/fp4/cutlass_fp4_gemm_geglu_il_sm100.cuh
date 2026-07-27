@@ -43,5 +43,16 @@ int cutlass_fp4_gemm_geglu_il_hw(
     int M, int N_il, int K,
     cudaStream_t stream);
 
+// Skinny-M variant on the decoder GEMM tile (128x64x256): same contract
+// as cutlass_fp4_gemm_geglu_il_hw with CTA parallelism suited to tiny M.
+int cutlass_fp4_gemm_geglu_il_hw_v10(
+    void const* A_packed, void const* SFA,
+    void const* B_packed, void const* SFB,
+    void*       D_dummy,
+    void*       compact_packed,
+    void*       compact_sfa,
+    int M, int N_il, int K,
+    cudaStream_t stream);
+
 }  // namespace fp4
 }  // namespace flash_rt

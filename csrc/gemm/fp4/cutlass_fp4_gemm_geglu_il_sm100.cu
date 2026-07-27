@@ -140,6 +140,39 @@ using GemmKernelHw = cutlass::gemm::kernel::GemmUniversal<
 
 using GemmHw = cutlass::gemm::device::GemmUniversalAdapter<GemmKernelHw>;
 
+// ── Skinny-M compact-store instantiation (decoder FFN: tiny M, N=8192) ──
+// Same tile as the production decoder GEMMs (v10, 128x64x256): the small
+// N tile keeps enough CTAs in flight to stream the weight at DRAM rate.
+using MmaTileShapeV10 = Shape<_128, _64, _256>;
+
+using CollectiveEpilogueHwV10 = typename cutlass::epilogue::collective::CollectiveBuilder<
+    ArchTag, OperatorClass,
+    MmaTileShapeV10, ClusterShape,
+    cutlass::epilogue::collective::EpilogueTileAuto,
+    ElementAccumulator, ElementAccumulator,
+    ElementC, LayoutCTag, AlignmentC,
+    ElementD, LayoutDTag, AlignmentD,
+    cutlass::epilogue::collective::EpilogueScheduleAuto,
+    FusionOperationHw
+>::CollectiveOp;
+
+using CollectiveMainloopHwV10 = typename cutlass::gemm::collective::CollectiveBuilder<
+    ArchTag, OperatorClass,
+    ElementA, LayoutATag, AlignmentA,
+    ElementB, LayoutBTag, AlignmentB,
+    ElementAccumulator,
+    MmaTileShapeV10, ClusterShape,
+    cutlass::gemm::collective::StageCountAutoCarveout<
+        static_cast<int>(sizeof(typename CollectiveEpilogueHwV10::SharedStorage))>,
+    cutlass::gemm::collective::KernelScheduleAuto
+>::CollectiveOp;
+
+using GemmKernelHwV10 = cutlass::gemm::kernel::GemmUniversal<
+    Shape<int, int, int, int>,
+    CollectiveMainloopHwV10, CollectiveEpilogueHwV10, void>;
+
+using GemmHwV10 = cutlass::gemm::device::GemmUniversalAdapter<GemmKernelHwV10>;
+
 }  // namespace geglu_il
 
 int cutlass_fp4_gemm_geglu_il(
@@ -200,7 +233,10 @@ int cutlass_fp4_gemm_geglu_il(
   return (st == cutlass::Status::kSuccess) ? 0 : (static_cast<int>(st) | 0x30000);
 }
 
-int cutlass_fp4_gemm_geglu_il_hw(
+namespace geglu_il {
+
+template <class GemmT>
+static int run_geglu_il_hw(
     void const* A_packed, void const* SFA,
     void const* B_packed, void const* SFB,
     void*       D_dummy,
@@ -208,21 +244,25 @@ int cutlass_fp4_gemm_geglu_il_hw(
     void*       compact_sfa,
     int M, int N_il, int K,
     cudaStream_t stream) {
-  using namespace geglu_il;
+  using StrideAT = typename GemmT::GemmKernel::StrideA;
+  using StrideBT = typename GemmT::GemmKernel::StrideB;
+  using StrideCT = typename GemmT::GemmKernel::StrideC;
+  using StrideDT = typename GemmT::GemmKernel::StrideD;
+  using CfgT = typename GemmT::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
 
-  auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, {M, K, 1});
-  auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, {N_il, K, 1});
-  auto stride_C = cutlass::make_cute_packed_stride(StrideC{}, {M, N_il, 1});
-  auto stride_D = cutlass::make_cute_packed_stride(StrideD{}, {M, N_il, 1});
-  auto layout_SFA = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(make_shape(M, N_il, K, 1));
-  auto layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(M, N_il, K, 1));
+  auto stride_A = cutlass::make_cute_packed_stride(StrideAT{}, {M, K, 1});
+  auto stride_B = cutlass::make_cute_packed_stride(StrideBT{}, {N_il, K, 1});
+  auto stride_C = cutlass::make_cute_packed_stride(StrideCT{}, {M, N_il, 1});
+  auto stride_D = cutlass::make_cute_packed_stride(StrideDT{}, {M, N_il, 1});
+  auto layout_SFA = CfgT::tile_atom_to_shape_SFA(make_shape(M, N_il, K, 1));
+  auto layout_SFB = CfgT::tile_atom_to_shape_SFB(make_shape(M, N_il, K, 1));
 
   using EA = typename ElementA::DataType;
   using SA = typename ElementA::ScaleFactorType;
   using EB = typename ElementB::DataType;
   using SB = typename ElementB::ScaleFactorType;
 
-  typename GemmHw::Arguments args{
+  typename GemmT::Arguments args{
       cutlass::gemm::GemmUniversalMode::kGemm, {M, N_il, K, 1},
       { reinterpret_cast<EA const*>(A_packed), stride_A,
         reinterpret_cast<EB const*>(B_packed), stride_B,
@@ -235,10 +275,10 @@ int cutlass_fp4_gemm_geglu_il_hw(
   args.epilogue.thread.compact_ptr    = reinterpret_cast<uint8_t*>(compact_packed);
   args.epilogue.thread.compact_sf_ptr = reinterpret_cast<uint8_t*>(compact_sfa);
 
-  GemmHw gemm;
+  GemmT gemm;
   auto st = gemm.can_implement(args);
   if (st != cutlass::Status::kSuccess) return static_cast<int>(st) | 0x10000;
-  size_t ws_sz = GemmHw::get_workspace_size(args);
+  size_t ws_sz = GemmT::get_workspace_size(args);
   void* ws = nullptr;
   if (ws_sz > 0 && cudaMalloc(&ws, ws_sz) != cudaSuccess) return -1;
   st = gemm.initialize(args, ws, stream);
@@ -249,6 +289,34 @@ int cutlass_fp4_gemm_geglu_il_hw(
   st = gemm.run(stream);
   if (ws) cudaFree(ws);
   return (st == cutlass::Status::kSuccess) ? 0 : (static_cast<int>(st) | 0x30000);
+}
+
+}  // namespace geglu_il
+
+int cutlass_fp4_gemm_geglu_il_hw(
+    void const* A_packed, void const* SFA,
+    void const* B_packed, void const* SFB,
+    void*       D_dummy,
+    void*       compact_packed,
+    void*       compact_sfa,
+    int M, int N_il, int K,
+    cudaStream_t stream) {
+  return geglu_il::run_geglu_il_hw<geglu_il::GemmHw>(
+      A_packed, SFA, B_packed, SFB, D_dummy, compact_packed, compact_sfa,
+      M, N_il, K, stream);
+}
+
+int cutlass_fp4_gemm_geglu_il_hw_v10(
+    void const* A_packed, void const* SFA,
+    void const* B_packed, void const* SFB,
+    void*       D_dummy,
+    void*       compact_packed,
+    void*       compact_sfa,
+    int M, int N_il, int K,
+    cudaStream_t stream) {
+  return geglu_il::run_geglu_il_hw<geglu_il::GemmHwV10>(
+      A_packed, SFA, B_packed, SFB, D_dummy, compact_packed, compact_sfa,
+      M, N_il, K, stream);
 }
 
 }  // namespace fp4

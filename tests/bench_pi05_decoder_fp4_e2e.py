@@ -107,6 +107,14 @@ def main() -> int:
         "--decoder-rht", type=int, choices=(0, 1), default=0,
         help="Per-16 Hadamard rotation on decoder weights + activations "
              "(requires --decoder-act-format e0m3)")
+    parser.add_argument(
+        "--decoder-fused-attn", type=int, choices=(0, 1), default=0,
+        help="Fold the decoder attention seqused mask into the softmax "
+             "kernel (one fewer launch per layer-step)")
+    parser.add_argument(
+        "--decoder-fused-geglu", type=int, choices=(0, 1), default=0,
+        help="Fused-epilogue decoder FFN: one interleaved GeGLU GEMM "
+             "replaces the gate_up GEMM + GeGLU kernel (nvfp4 weights only)")
     parser.add_argument("--awq-alpha", type=float, default=0.8)
     parser.add_argument(
         "--encoder-attn-o-fp4", type=int, choices=(0, 1), default=1,
@@ -185,6 +193,8 @@ def main() -> int:
                 decoder_weight_format=args.decoder_weight_format,
                 decoder_act_format=args.decoder_act_format,
                 decoder_rht=bool(args.decoder_rht),
+                decoder_fused_attn=bool(args.decoder_fused_attn),
+                decoder_fused_geglu=bool(args.decoder_fused_geglu),
                 use_fp4_decoder=True,
                 use_fa4=True,
                 use_fp4_encoder_attn=bool(args.encoder_attn_o_fp4),
@@ -284,6 +294,8 @@ def main() -> int:
                     "decoder_weight_format": args.decoder_weight_format,
                     "decoder_act_format": args.decoder_act_format,
                     "decoder_rht": bool(args.decoder_rht),
+                    "decoder_fused_attn": bool(args.decoder_fused_attn),
+                    "decoder_fused_geglu": bool(args.decoder_fused_geglu),
                     "decoder_gate_up_variant": args.decoder_gate_up_variant,
                     "attention": "fa4_siglip_encoder",
                 }
@@ -347,6 +359,8 @@ def main() -> int:
             "--decoder-weight-format", args.decoder_weight_format,
             "--decoder-act-format", args.decoder_act_format,
             "--decoder-rht", str(args.decoder_rht),
+            "--decoder-fused-attn", str(args.decoder_fused_attn),
+            "--decoder-fused-geglu", str(args.decoder_fused_geglu),
             "--awq-alpha", str(args.awq_alpha),
             "--encoder-fp4-layer-count", str(args.encoder_fp4_layer_count),
             "--encoder-attn-o-fp4", str(args.encoder_attn_o_fp4),

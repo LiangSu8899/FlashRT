@@ -286,6 +286,7 @@ def decoder_forward_fp4(ctx, fvk, fvk_fp4, bufs, weights, dims, stream=0, *,
     weight_format = str(dims.get('weight_format', 'nvfp4'))
     act_format = str(dims.get('act_format', 'nvfp4'))
     rht = 1 if dims.get('rht') else 0
+    fused_geglu = bool(dims.get('fused_geglu')) and weight_format == 'nvfp4'
     act_e0m3 = act_format == 'e0m3'
     if act_format not in ('nvfp4', 'e0m3'):
         raise ValueError(
@@ -389,7 +390,8 @@ def decoder_forward_fp4(ctx, fvk, fvk_fp4, bufs, weights, dims, stream=0, *,
                         f"rc={rc}")
 
             if attn is not None:
-                attn.run("decoder", l, q_seq=S, kv_seq=total_keys, stream=stream)
+                attn.run("decoder", l, q_seq=S, kv_seq=total_keys,
+                         stream=stream)
             else:
                 K_ptr = Kc + l * total_keys * HD * 2
                 V_ptr = Vc + l * total_keys * HD * 2
@@ -422,23 +424,39 @@ def decoder_forward_fp4(ctx, fvk, fvk_fp4, bufs, weights, dims, stream=0, *,
             else:
                 fvk_fp4.pi05_gate_res_adarms_fp4_sfa_native_fp16(
                     fg, gate, x, sf_ptr, xn_fp4, xn_sfa, gate, S, D, stream)
-            rc = dec_gemm(
-                variant_gu, xn_fp4, xn_sfa,
-                weights['gw_fp4'][l], weights['gw_sfb'][l], fg,
-                S, H * 2, D, 1.0, 0.0, stream)
-            if rc != 0:
-                raise RuntimeError(
-                    f"Pi0.5 decoder FP4 gate_up layer {l} failed rc={rc}")
-
-            if act_e0m3:
-                rc = fvk_fp4.gate_geglu_e0m3_sfa_vec_fp16(
-                    fg, hid_fp4, hid_sfa, S, H, rht, stream)
+            if fused_geglu and not act_e0m3:
+                # One interleaved GeGLU GEMM: the epilogue computes
+                # gelu(gate)*up per column pair and writes the Down input
+                # (hid_fp4/hid_sfa) directly; the gate_up fp16 output and
+                # the GeGLU-quantize kernel disappear.
+                rc = fvk_fp4.cutlass_fp4_gemm_geglu_il_hw_v10(
+                    xn_fp4, xn_sfa,
+                    weights['gwil_fp4'][l], weights['gwil_sfb'][l],
+                    weights['gu_dummy'], hid_fp4, hid_sfa,
+                    S, H * 2, D, stream)
+                if rc != 0:
+                    raise RuntimeError(
+                        f"Pi0.5 decoder fused GeGLU layer {l} failed "
+                        f"rc={rc}")
             else:
-                rc = fvk_fp4.gate_geglu_fp4_sfa_vec_fp16(
-                    fg, hid_fp4, hid_sfa, S, H, stream)
-            if rc != 0:
-                raise RuntimeError(
-                    f"Pi0.5 decoder FP4 GeGLU layer {l} failed rc={rc}")
+                rc = dec_gemm(
+                    variant_gu, xn_fp4, xn_sfa,
+                    weights['gw_fp4'][l], weights['gw_sfb'][l], fg,
+                    S, H * 2, D, 1.0, 0.0, stream)
+                if rc != 0:
+                    raise RuntimeError(
+                        f"Pi0.5 decoder FP4 gate_up layer {l} failed "
+                        f"rc={rc}")
+
+                if act_e0m3:
+                    rc = fvk_fp4.gate_geglu_e0m3_sfa_vec_fp16(
+                        fg, hid_fp4, hid_sfa, S, H, rht, stream)
+                else:
+                    rc = fvk_fp4.gate_geglu_fp4_sfa_vec_fp16(
+                        fg, hid_fp4, hid_sfa, S, H, stream)
+                if rc != 0:
+                    raise RuntimeError(
+                        f"Pi0.5 decoder FP4 GeGLU layer {l} failed rc={rc}")
             rc = dec_gemm(
                 variant_down, hid_fp4, hid_sfa,
                 weights['dw_fp4'][l], weights['dw_sfb'][l], fg,

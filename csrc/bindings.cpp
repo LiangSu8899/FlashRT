@@ -147,6 +147,7 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #endif
 #include "kernels/kernels.h"
 #include "kernels/fusion.cuh"
+#include "kernels/attention_seqused_fused.cuh"
 #ifdef FLASHRT_HAVE_MELBAND_ROFORMER
 #include "kernels/mbr_kernels.cuh"
 #endif
@@ -1894,6 +1895,26 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
        py::arg("logits"), py::arg("out"),
        py::arg("S"), py::arg("S_kv_max"), py::arg("NH"), py::arg("HD"),
        py::arg("seqused_k"), py::arg("attn_scale") = 1.0f, py::arg("stream") = 0);
+
+    m.def("attention_qkv_fp16_seqused_v2", [](FvkContext& ctx, uintptr_t Q, uintptr_t K, uintptr_t V,
+                                    uintptr_t logits, uintptr_t out,
+                                    int S, int S_kv_max, int NH, int HD,
+                                    uintptr_t seqused_k, float attn_scale, uintptr_t stream) {
+        attention_qkv_fp16_seqused_v2(ctx.cublas_handle,
+                            reinterpret_cast<const __half*>(Q),
+                            reinterpret_cast<const __half*>(K),
+                            reinterpret_cast<const __half*>(V),
+                            reinterpret_cast<__half*>(logits),
+                            reinterpret_cast<__half*>(out),
+                            S, S_kv_max, NH, HD,
+                            reinterpret_cast<const int*>(seqused_k),
+                            attn_scale, to_stream(stream));
+    }, py::arg("ctx"), py::arg("Q"), py::arg("K"), py::arg("V"),
+       py::arg("logits"), py::arg("out"),
+       py::arg("S"), py::arg("S_kv_max"), py::arg("NH"), py::arg("HD"),
+       py::arg("seqused_k"), py::arg("attn_scale") = 1.0f, py::arg("stream") = 0,
+       "seqused attention with the -inf mask folded into softmax "
+       "(one fewer kernel; S_kv_max <= 1024)");
 
     // Padded attention: supports odd S_kv (pads logits lda to even).
     // logits buffer must have room for S*NH * (S_kv + S_kv%2) elements.

@@ -446,7 +446,13 @@ class ThorFlashAttnBackend(AttentionBackendBase):
             if self._fixed_shape and site in ("encoder", "decoder"):
                 seqused = (self._enc_seqused_ptr if site == "encoder"
                            else self._dec_seqused_ptr)
-                fvk.attention_qkv_fp16_seqused(
+                # v2 folds the seqused mask into the softmax kernel
+                # (one fewer launch per call); numerics identical.
+                attn_seqused = (
+                    fvk.attention_qkv_fp16_seqused_v2
+                    if getattr(self, "use_fused_softmax", False)
+                    else fvk.attention_qkv_fp16_seqused)
+                attn_seqused(
                     self._ctx_cpp,
                     int(s["Q_O"]), K_ptr, V_ptr,
                     int(s["logits"]), int(s["Q_O"]),

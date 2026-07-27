@@ -93,6 +93,8 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                  decoder_down_variant: int = 10,
                  decoder_weight_format: str = "nvfp4",
                  decoder_act_format: str = "nvfp4",
+                 decoder_fused_attn: bool = False,
+                 decoder_fused_geglu: bool = False,
                  decoder_rht: bool = False,
                  use_fp8: bool = True,
                  state_prompt_mode: str = "exact",
@@ -178,6 +180,13 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
         self.decoder_weight_format = decoder_weight_format
         self.decoder_act_format = decoder_act_format
         self.decoder_rht = bool(decoder_rht)
+        # Fold the decoder attention's seqused mask into the softmax
+        # kernel (one fewer launch per layer-step; numerics identical).
+        self.decoder_fused_attn = bool(decoder_fused_attn)
+        # Fused-epilogue decoder FFN: one interleaved GeGLU GEMM replaces
+        # the gate_up GEMM + GeGLU-quantize kernel (nvfp4 weights only).
+        self.decoder_fused_geglu = (bool(decoder_fused_geglu)
+                                    and decoder_weight_format == 'nvfp4')
 
         if self._fp4_layers:
             if not _HAS_FP4:
@@ -306,6 +315,22 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                                 f"quantization failed at layer {layer}: "
                                 f"rc={rc}")
                         quantized[name] = packed
+                    if self.decoder_fused_geglu:
+                        # Fused-epilogue FFN: pairwise-interleaved gate/up
+                        # rows, MSE-quantized like the other decoder weights.
+                        il = _interleave_gu_rows(
+                            gate_up[:self.Ha].contiguous(),
+                            gate_up[self.Ha:].contiguous())
+                        packed = quant_weight_nvfp4(il)
+                        rc = fvk_fp4.quantize_fp4_dynamic_sfa_mse_fp16(
+                            il.data_ptr(), packed['packed'].data_ptr(),
+                            packed['sfb'].data_ptr(), packed['N'],
+                            packed['K'], True, 0)
+                        if rc != 0:
+                            raise RuntimeError(
+                                "decoder gu_il quantization failed at "
+                                f"layer {layer}: rc={rc}")
+                        quantized['gu_il'] = packed
                     torch.cuda.synchronize()
                     self._decoder_fp4_weights.append(quantized)
 
@@ -315,6 +340,10 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                 self.Sa, 2048, device='cuda')
             self._decoder_fp4_hid = FP4ActScratch(
                 self.Sa, self.Ha, device='cuda')
+            if self.decoder_fused_geglu:
+                # Dummy landing zone for the fused GeGLU GEMM's D output.
+                self._decoder_fp4_gu_dummy = torch.zeros(
+                    self.Sa, self.Ha, dtype=torch.uint8, device='cuda')
             logger.info(
                 "Pi0.5 decoder NVFP4 enabled: variants=%s, layers=%d",
                 self._decoder_fp4_variants, self.La)
@@ -1351,6 +1380,14 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                 'dw_sfb': [w['down']['sfb'].data_ptr()
                            for w in self._decoder_fp4_weights],
             })
+            if self.decoder_fused_geglu:
+                ae_weights.update({
+                    'gwil_fp4': [w['gu_il']['packed'].data_ptr()
+                                 for w in self._decoder_fp4_weights],
+                    'gwil_sfb': [w['gu_il']['sfb'].data_ptr()
+                                 for w in self._decoder_fp4_weights],
+                    'gu_dummy': self._decoder_fp4_gu_dummy.data_ptr(),
+                })
         ae_dims = {
             'S': Sa, 'D': Da, 'H': Ha, 'NH': 8, 'HD': 256,
             'steps': 10, 'layers': La, 'enc_seq': Se,
@@ -1362,6 +1399,10 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
             ae_dims['weight_format'] = self.decoder_weight_format
             ae_dims['act_format'] = self.decoder_act_format
             ae_dims['rht'] = self.decoder_rht
+            ae_dims['fused_geglu'] = self.decoder_fused_geglu
+            if self._attn is not None:
+                # Fold the decoder seqused mask into the softmax kernel.
+                self._attn.use_fused_softmax = self.decoder_fused_attn
 
         fp4_layers = self._fp4_layers
         fp4_weights = self._fp4_weights if fp4_layers else None
