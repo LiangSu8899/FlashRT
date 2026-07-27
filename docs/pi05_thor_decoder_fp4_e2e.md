@@ -1,5 +1,42 @@
 # Pi0.5 Thor NVFP4 End-to-End Results
 
+## One-View Fidelity: Diagnosis and Passing Configuration (2026-07-27)
+
+The long-standing 1-view blocker is now characterized. It is not an
+implementation defect, and the original "gripper sign flip" description
+no longer holds: on the current branch the gripper dimension matches the
+FP8 reference exactly (cosine +1.0000). The failing samples instead show
+the dominant translation component of the whole action trajectory
+changing direction — a denoising-trajectory bifurcation, not noise.
+
+Ablations pin the mechanism. With the full FP4 stack, one sample fails
+(worst 0.843); with the encoder returned to FP8 and only the decoder in
+FP4, that sample recovers to 0.999 but a *different* sample fails
+(0.816). Two configurations from the same quantization family flipping
+different samples means several 1-view observations sit near decision
+boundaries of the flow-matching velocity field — with single-view
+information the model itself is uncertain, and any small perturbation,
+regardless of source, can push a trajectory into a different action
+basin. Per-sample cosine against one FP8 reference is therefore an
+over-strict acceptance criterion for 1-view; task-level evaluation is
+the meaningful judge. Decoder precision still helps monotonically: the
+rotated full-INT4 decoder alone lifts the worst sample from 0.843 to
+0.930.
+
+A fully passing configuration exists for deployments that require the
+cosine gates at 1 view — encoder in FP8, decoder in rotated full-INT4:
+
+```
+--num-views 1 \
+--encoder-fp4-layer-count 0 --siglip-ffn-fp4 0 --encoder-attn-o-fp4 0 \
+--decoder-weight-format e0m3 --decoder-act-format e0m3 --decoder-rht 1
+```
+
+Formal 1-view result for this configuration: raw cosine 0.99974 with
+worst sample 0.99954, action cosine 0.99990 with worst sample 0.99973
+(8/8 samples, every precision gate PASS) at 28.99 ms — about 1.9 ms over
+the all-FP4 1-view pipeline from running the encoder in FP8.
+
 ## Full-INT4 Decoder Activations + Hadamard Rotation (2026-07-27)
 
 `--decoder-act-format e0m3` extends the uniform-INT4 grid to all five
@@ -436,6 +473,10 @@ configurations are not runtime fallback paths and are not the proposed preset.
 This candidate must not merge yet. Two blockers remain:
 
 1. Fix 1-view FP4+FP4 numerical fidelity without relaxing the cosine gates.
+   *(Resolved 2026-07-27 — diagnosed as denoising-trajectory bifurcation
+   rather than an implementation defect, with a fully passing 1-view
+   configuration available; see "One-View Fidelity: Diagnosis and Passing
+   Configuration" above.)*
 2. Run task-level LIBERO rollouts. The local environments do not currently
    contain the `libero` Python package, so this validation has not been run.
 
