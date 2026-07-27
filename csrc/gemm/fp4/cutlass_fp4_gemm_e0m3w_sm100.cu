@@ -101,7 +101,7 @@ struct RunnerV10 {
 
   static int run(void const* A, void const* SFA, void const* B, void const* SFB,
                  void* D, int M, int N, int K, float alpha, float beta,
-                 cudaStream_t stream) {
+                 cudaStream_t stream, int a_format) {
     auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, {M, K, 1});
     auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, {N, K, 1});
     auto stride_C = cutlass::make_cute_packed_stride(StrideC{}, {M, N, 1});
@@ -119,7 +119,8 @@ struct RunnerV10 {
           reinterpret_cast<ElementC*>(D), stride_C,
           reinterpret_cast<ElementD*>(D), stride_D }
     };
-    args.mainloop.runtime_data_type_a = static_cast<RuntimeA>(kFormatE2M1);
+    args.mainloop.runtime_data_type_a =
+        static_cast<RuntimeA>(a_format & 0b111);
     args.mainloop.runtime_data_type_b = static_cast<RuntimeB>(kFormatE0M3);
 
     Gemm gemm;
@@ -141,9 +142,9 @@ struct RunnerV10 {
 int cutlass_fp4_gemm_e0m3w(
     void const* A, void const* SFA, void const* B, void const* SFB,
     void* D, int M, int N, int K, float alpha, float beta,
-    cudaStream_t stream) {
+    cudaStream_t stream, int a_format) {
   return e0m3w::RunnerV10::run(A, SFA, B, SFB, D, M, N, K, alpha, beta,
-                               stream);
+                               stream, a_format);
 }
 
 }  // namespace fp4

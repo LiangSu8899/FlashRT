@@ -20,8 +20,9 @@
 namespace flash_rt {
 namespace fp4 {
 
-// D[M,N] = alpha * (A_e2m1 x SFA) @ (B_e0m3 x SFB)^T + beta * D
-//   A: packed e2m1 [M, K/2] row-major + SFA tile-interleaved UE4M3
+// D[M,N] = alpha * (A x SFA) @ (B_e0m3 x SFB)^T + beta * D
+//   A: packed 4-bit [M, K/2] row-major + SFA tile-interleaved UE4M3;
+//      element format selected by a_format (1 = E2M1 default, 0 = E0M3)
 //   B: packed e0m3 [N, K/2] (column-major operand) + SFB tile-interleaved
 //   D: fp16 [M, N] row-major
 // Returns 0 on success; CUTLASS status codes are or-ed with 0x10000 /
@@ -29,7 +30,7 @@ namespace fp4 {
 int cutlass_fp4_gemm_e0m3w(
     void const* A, void const* SFA, void const* B, void const* SFB,
     void* D, int M, int N, int K, float alpha, float beta,
-    cudaStream_t stream);
+    cudaStream_t stream, int a_format = 1);
 
 }  // namespace fp4
 }  // namespace flash_rt

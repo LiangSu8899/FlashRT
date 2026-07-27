@@ -284,11 +284,22 @@ def decoder_forward_fp4(ctx, fvk, fvk_fp4, bufs, weights, dims, stream=0, *,
             "Pi0.5 Thor decoder FP4 requires four non-negative GEMM variants")
     variant_qkv, variant_o, variant_gu, variant_down = variants
     weight_format = str(dims.get('weight_format', 'nvfp4'))
+    act_format = str(dims.get('act_format', 'nvfp4'))
+    rht = 1 if dims.get('rht') else 0
+    act_e0m3 = act_format == 'e0m3'
+    if act_format not in ('nvfp4', 'e0m3'):
+        raise ValueError(
+            f"Pi0.5 Thor decoder FP4 unknown act_format {act_format!r}")
+    if (act_e0m3 or rht) and weight_format != 'e0m3':
+        raise ValueError(
+            "Pi0.5 Thor decoder FP4 E0M3 activations/RHT require "
+            "weight_format='e0m3'")
     if weight_format == 'e0m3':
         # Uniform-INT4 weights: route every projection through the
         # runtime-idesc GEMM (fixed v10 tile); the variant index is unused.
+        a_fmt = 0 if act_e0m3 else 1
         def dec_gemm(variant, *args):
-            return fvk_fp4.cutlass_fp4_gemm_e0m3w(*args)
+            return fvk_fp4.cutlass_fp4_gemm_e0m3w(*args, a_format=a_fmt)
     elif weight_format == 'nvfp4':
         dec_gemm = fvk_fp4.cutlass_fp4_gemm_variant
     else:
@@ -347,8 +358,12 @@ def decoder_forward_fp4(ctx, fvk, fvk_fp4, bufs, weights, dims, stream=0, *,
             sf_ptr = sf + si * 2
 
             if l == 0:
-                fvk_fp4.pi05_adarms_fp4_sfa_native_fp16(
-                    x, sa_ptr, xn_fp4, xn_sfa, gate, S, D, stream)
+                if act_e0m3:
+                    fvk_fp4.pi05_adarms_e0m3_sfa_fp16(
+                        x, sa_ptr, xn_fp4, xn_sfa, gate, S, D, rht, stream)
+                else:
+                    fvk_fp4.pi05_adarms_fp4_sfa_native_fp16(
+                        x, sa_ptr, xn_fp4, xn_sfa, gate, S, D, stream)
 
             rc = dec_gemm(
                 variant_qkv, xn_fp4, xn_sfa,
@@ -382,8 +397,13 @@ def decoder_forward_fp4(ctx, fvk, fvk_fp4, bufs, weights, dims, stream=0, *,
                     ctx, attn_out, K_ptr, V_ptr, logits, attn_out,
                     S, total_keys, NH, HD, attn_scale, stream)
 
-            rc = fvk_fp4.quantize_fp4_dynamic_sfa_fp16_vec(
-                attn_out, ctx_fp4, ctx_sfa, S, NH * HD, False, stream)
+            if act_e0m3:
+                rc = fvk_fp4.quantize_e0m3_dynamic_sfa_fp16_vec(
+                    attn_out, ctx_fp4, ctx_sfa, S, NH * HD, False, rht,
+                    stream)
+            else:
+                rc = fvk_fp4.quantize_fp4_dynamic_sfa_fp16_vec(
+                    attn_out, ctx_fp4, ctx_sfa, S, NH * HD, False, stream)
             if rc != 0:
                 raise RuntimeError(
                     f"Pi0.5 decoder FP4 O activation layer {l} failed rc={rc}")
@@ -395,8 +415,13 @@ def decoder_forward_fp4(ctx, fvk, fvk_fp4, bufs, weights, dims, stream=0, *,
                 raise RuntimeError(
                     f"Pi0.5 decoder FP4 O layer {l} failed rc={rc}")
 
-            fvk_fp4.pi05_gate_res_adarms_fp4_sfa_native_fp16(
-                fg, gate, x, sf_ptr, xn_fp4, xn_sfa, gate, S, D, stream)
+            if act_e0m3:
+                fvk_fp4.pi05_gate_res_adarms_e0m3_sfa_fp16(
+                    fg, gate, x, sf_ptr, xn_fp4, xn_sfa, gate, S, D, rht,
+                    stream)
+            else:
+                fvk_fp4.pi05_gate_res_adarms_fp4_sfa_native_fp16(
+                    fg, gate, x, sf_ptr, xn_fp4, xn_sfa, gate, S, D, stream)
             rc = dec_gemm(
                 variant_gu, xn_fp4, xn_sfa,
                 weights['gw_fp4'][l], weights['gw_sfb'][l], fg,
@@ -405,8 +430,12 @@ def decoder_forward_fp4(ctx, fvk, fvk_fp4, bufs, weights, dims, stream=0, *,
                 raise RuntimeError(
                     f"Pi0.5 decoder FP4 gate_up layer {l} failed rc={rc}")
 
-            rc = fvk_fp4.gate_geglu_fp4_sfa_vec_fp16(
-                fg, hid_fp4, hid_sfa, S, H, stream)
+            if act_e0m3:
+                rc = fvk_fp4.gate_geglu_e0m3_sfa_vec_fp16(
+                    fg, hid_fp4, hid_sfa, S, H, rht, stream)
+            else:
+                rc = fvk_fp4.gate_geglu_fp4_sfa_vec_fp16(
+                    fg, hid_fp4, hid_sfa, S, H, stream)
             if rc != 0:
                 raise RuntimeError(
                     f"Pi0.5 decoder FP4 GeGLU layer {l} failed rc={rc}")

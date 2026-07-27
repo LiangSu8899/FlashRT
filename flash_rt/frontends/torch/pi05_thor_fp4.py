@@ -62,6 +62,8 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                  decoder_gate_up_variant: int = 10,
                  decoder_down_variant: int = 10,
                  decoder_weight_format: str = "nvfp4",
+                 decoder_act_format: str = "nvfp4",
+                 decoder_rht: bool = False,
                  use_fp8: bool = True,
                  state_prompt_mode: str = "exact",
                  state_prompt_fixed_max_len=None,
@@ -127,7 +129,21 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
             raise ValueError(
                 "decoder_weight_format must be 'nvfp4' or 'e0m3', got "
                 f"{decoder_weight_format!r}")
+        if decoder_act_format not in ("nvfp4", "e0m3"):
+            raise ValueError(
+                "decoder_act_format must be 'nvfp4' or 'e0m3', got "
+                f"{decoder_act_format!r}")
+        if decoder_act_format == "e0m3" and decoder_weight_format != "e0m3":
+            raise ValueError(
+                "decoder_act_format='e0m3' requires "
+                "decoder_weight_format='e0m3'")
+        if decoder_rht and decoder_act_format != "e0m3":
+            raise ValueError(
+                "decoder_rht=True requires decoder_act_format='e0m3' "
+                "(the rotation must be applied to both operands)")
         self.decoder_weight_format = decoder_weight_format
+        self.decoder_act_format = decoder_act_format
+        self.decoder_rht = bool(decoder_rht)
 
         if self._fp4_layers:
             if not _HAS_FP4:
@@ -177,6 +193,12 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                         f"{name} must be in [0, {variant_count}), got {v}")
             self._decoder_fp4_variants = variants
             self._decoder_fp4_weights = []
+            if self.decoder_rht:
+                h = torch.ones(1, 1, dtype=torch.float32, device='cuda')
+                for _ in range(4):
+                    h = torch.cat([torch.cat([h, h], 1),
+                                   torch.cat([h, -h], 1)], 0)
+                self._rht_h16 = h / 4.0  # symmetric orthonormal [16, 16]
 
             from safetensors import safe_open
             from flash_rt.executors.torch_weights import (
@@ -221,7 +243,18 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                         packed = quant_weight_nvfp4(weight)
                         if self.decoder_weight_format == "e0m3":
                             # Uniform-INT4 weights for the runtime-idesc
-                            # GEMM; same packed/scale buffer layout.
+                            # GEMM; same packed/scale buffer layout. With
+                            # RHT, rotate each 16-wide K block by the
+                            # orthonormal Hadamard matrix before
+                            # quantization (the activation kernels apply
+                            # the same rotation at run time, so the GEMM
+                            # is mathematically unchanged).
+                            if self.decoder_rht:
+                                Nw, Kw = weight.shape
+                                weight = (
+                                    weight.float().view(Nw, Kw // 16, 16)
+                                    @ self._rht_h16
+                                ).to(fp16).view(Nw, Kw).contiguous()
                             rc = fvk_fp4.quantize_e0m3_dynamic_sfa_fp16(
                                 weight.data_ptr(),
                                 packed['packed'].data_ptr(),
@@ -1248,6 +1281,8 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
         if self.use_fp4_decoder:
             ae_dims['fp4_variants'] = self._decoder_fp4_variants
             ae_dims['weight_format'] = self.decoder_weight_format
+            ae_dims['act_format'] = self.decoder_act_format
+            ae_dims['rht'] = self.decoder_rht
 
         fp4_layers = self._fp4_layers
         fp4_weights = self._fp4_weights if fp4_layers else None

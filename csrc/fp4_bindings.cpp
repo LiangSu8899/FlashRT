@@ -28,6 +28,7 @@
 #include "quantize/quantize_fp4_sfa.cuh"
 #include "quantize/quantize_e0m3_sfa.cuh"
 #include "gemm/fp4/cutlass_fp4_gemm_e0m3w_sm100.cuh"
+#include "fused_fp4/pi05_e0m3_act.cuh"
 #include "quantize/reshape_scales_sfa.cuh"
 #include "fused_fp16/rms_norm_noweight_fp16.cuh"
 #ifdef FLASHRT_HAVE_COSMOS3_EDGE
@@ -349,20 +350,91 @@ callers fall back to the scalar kernel.
   m.def("cutlass_fp4_gemm_e0m3w",
         [](uintptr_t A, uintptr_t SFA, uintptr_t B, uintptr_t SFB,
            uintptr_t D, int M, int N, int K, float alpha, float beta,
-           uintptr_t stream) -> int {
+           uintptr_t stream, int a_format) -> int {
           return flash_rt::fp4::cutlass_fp4_gemm_e0m3w(
               reinterpret_cast<void const*>(A), reinterpret_cast<void const*>(SFA),
               reinterpret_cast<void const*>(B), reinterpret_cast<void const*>(SFB),
               reinterpret_cast<void*>(D), M, N, K, alpha, beta,
-              reinterpret_cast<cudaStream_t>(stream));
+              reinterpret_cast<cudaStream_t>(stream), a_format);
         },
         py::arg("A"), py::arg("SFA"),
         py::arg("B"), py::arg("SFB"), py::arg("D"),
         py::arg("M"), py::arg("N"), py::arg("K"),
         py::arg("alpha") = 1.0f, py::arg("beta") = 0.0f,
-        py::arg("stream") = 0,
-        "Block-scaled GEMM with E2M1 activations and E0M3 (uniform INT4) "
-        "weights via the SM110 runtime instruction descriptor (tile 128x64x256).");
+        py::arg("stream") = 0, py::arg("a_format") = 1,
+        "Block-scaled GEMM with E0M3 (uniform INT4) weights via the SM110 "
+        "runtime instruction descriptor (tile 128x64x256). a_format selects "
+        "the activation element format: 1 = E2M1 (default), 0 = E0M3.");
+
+  m.def("quantize_e0m3_dynamic_sfa_fp16_vec",
+        [](uintptr_t src, uintptr_t packed, uintptr_t sfa,
+           int N, int D, bool is_sfb, int use_rht, uintptr_t stream) -> int {
+          const auto shape = fp4_kernel_shape({{"N", N}, {"D", D}});
+          require_fp4_ptrs("quantize_e0m3_dynamic_sfa_fp16_vec",
+                           {{"src", src}, {"packed", packed}, {"sfa", sfa}}, shape);
+          require_fp4(N > 0 && D > 0 && (D % 16) == 0,
+                      "quantize_e0m3_dynamic_sfa_fp16_vec",
+                      "N must be positive and D must be a positive multiple of 16", shape);
+          return flash_rt::fp4::quantize_e0m3_dynamic_sfa_fp16_vec(
+              reinterpret_cast<void const*>(src),
+              reinterpret_cast<void*>(packed), reinterpret_cast<void*>(sfa),
+              N, D, is_sfb, use_rht, reinterpret_cast<cudaStream_t>(stream));
+        },
+        py::arg("src"), py::arg("packed"), py::arg("sfa"),
+        py::arg("N"), py::arg("D"), py::arg("is_sfb"),
+        py::arg("use_rht") = 0, py::arg("stream") = 0,
+        "Vectorized FP16 to E0M3 activation quantize with optional per-16 "
+        "Hadamard rotation.");
+
+  m.def("pi05_adarms_e0m3_sfa_fp16",
+        [](uintptr_t x, uintptr_t style, uintptr_t packed, uintptr_t sfa,
+           uintptr_t gate, int S, int D, int use_rht, uintptr_t stream) {
+          flash_rt::fused_fp4::pi05_adarms_e0m3_sfa_fp16(
+              reinterpret_cast<const __half*>(x),
+              reinterpret_cast<const __half*>(style),
+              reinterpret_cast<uint8_t*>(packed),
+              reinterpret_cast<uint8_t*>(sfa),
+              reinterpret_cast<__half*>(gate),
+              S, D, use_rht, reinterpret_cast<cudaStream_t>(stream));
+        },
+        py::arg("x"), py::arg("style"), py::arg("packed"), py::arg("sfa"),
+        py::arg("gate"), py::arg("S"), py::arg("D"),
+        py::arg("use_rht") = 0, py::arg("stream") = 0,
+        "AdaRMS to E0M3 packed + SFA with optional per-16 Hadamard rotation.");
+
+  m.def("pi05_gate_res_adarms_e0m3_sfa_fp16",
+        [](uintptr_t x, uintptr_t prev_gate, uintptr_t residual,
+           uintptr_t style, uintptr_t packed, uintptr_t sfa, uintptr_t gate,
+           int S, int D, int use_rht, uintptr_t stream) {
+          flash_rt::fused_fp4::pi05_gate_res_adarms_e0m3_sfa_fp16(
+              reinterpret_cast<const __half*>(x),
+              reinterpret_cast<const __half*>(prev_gate),
+              reinterpret_cast<__half*>(residual),
+              reinterpret_cast<const __half*>(style),
+              reinterpret_cast<uint8_t*>(packed),
+              reinterpret_cast<uint8_t*>(sfa),
+              reinterpret_cast<__half*>(gate),
+              S, D, use_rht, reinterpret_cast<cudaStream_t>(stream));
+        },
+        py::arg("x"), py::arg("prev_gate"), py::arg("residual"),
+        py::arg("style"), py::arg("packed"), py::arg("sfa"), py::arg("gate"),
+        py::arg("S"), py::arg("D"),
+        py::arg("use_rht") = 0, py::arg("stream") = 0,
+        "Gated residual + AdaRMS to E0M3 packed + SFA with optional RHT.");
+
+  m.def("gate_geglu_e0m3_sfa_vec_fp16",
+        [](uintptr_t merged, uintptr_t packed, uintptr_t sfa,
+           int S, int H, int use_rht, uintptr_t stream) -> int {
+          return flash_rt::fused_fp4::gate_geglu_e0m3_sfa_vec_fp16(
+              reinterpret_cast<const __half*>(merged),
+              reinterpret_cast<uint8_t*>(packed),
+              reinterpret_cast<uint8_t*>(sfa),
+              S, H, use_rht, reinterpret_cast<cudaStream_t>(stream));
+        },
+        py::arg("merged"), py::arg("packed"), py::arg("sfa"),
+        py::arg("S"), py::arg("H"),
+        py::arg("use_rht") = 0, py::arg("stream") = 0,
+        "GeGLU to E0M3 packed + SFA with optional per-16 Hadamard rotation.");
 
   m.def("cutlass_fp4_gemm_variant_name", &flash_rt::fp4::cutlass_fp4_gemm_variant_name,
         py::arg("idx"), "Human-readable name of variant at index.");

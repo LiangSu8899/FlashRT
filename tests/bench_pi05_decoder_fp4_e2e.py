@@ -96,6 +96,15 @@ def main() -> int:
         help="Decoder projection weight element format: nvfp4 (E2M1, "
              "default) or e0m3 (uniform INT4 via the runtime instruction "
              "descriptor)")
+    parser.add_argument(
+        "--decoder-act-format", choices=("nvfp4", "e0m3"),
+        default="nvfp4",
+        help="Decoder activation element format (e0m3 requires "
+             "--decoder-weight-format e0m3)")
+    parser.add_argument(
+        "--decoder-rht", type=int, choices=(0, 1), default=0,
+        help="Per-16 Hadamard rotation on decoder weights + activations "
+             "(requires --decoder-act-format e0m3)")
     parser.add_argument("--awq-alpha", type=float, default=0.8)
     parser.add_argument(
         "--encoder-attn-o-fp4", type=int, choices=(0, 1), default=1,
@@ -171,6 +180,8 @@ def main() -> int:
                 encoder_down_variant=args.encoder_down_variant,
                 decoder_gate_up_variant=args.decoder_gate_up_variant,
                 decoder_weight_format=args.decoder_weight_format,
+                decoder_act_format=args.decoder_act_format,
+                decoder_rht=bool(args.decoder_rht),
                 use_fp4_decoder=True,
                 use_fa4=True,
                 use_fp4_encoder_attn=bool(args.encoder_attn_o_fp4),
@@ -267,6 +278,8 @@ def main() -> int:
                     "encoder_down_variant": args.encoder_down_variant,
                     "decoder": "nvfp4_all_projections",
                     "decoder_weight_format": args.decoder_weight_format,
+                    "decoder_act_format": args.decoder_act_format,
+                    "decoder_rht": bool(args.decoder_rht),
                     "decoder_gate_up_variant": args.decoder_gate_up_variant,
                     "attention": "fa4_siglip_encoder",
                 }
@@ -327,6 +340,8 @@ def main() -> int:
             "--encoder-down-variant", str(args.encoder_down_variant),
             "--decoder-gate-up-variant", str(args.decoder_gate_up_variant),
             "--decoder-weight-format", args.decoder_weight_format,
+            "--decoder-act-format", args.decoder_act_format,
+            "--decoder-rht", str(args.decoder_rht),
             "--awq-alpha", str(args.awq_alpha),
             "--encoder-fp4-layer-count", str(args.encoder_fp4_layer_count),
             "--encoder-attn-o-fp4", str(args.encoder_attn_o_fp4),
