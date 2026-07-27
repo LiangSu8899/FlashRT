@@ -1,5 +1,34 @@
 # Pi0.5 Thor NVFP4 End-to-End Results
 
+## E0M3 Uniform-INT4 Decoder Weights (2026-07-27)
+
+The SM110 tcgen05 block-scaled MMA reads its 3-bit element-format field
+from the runtime instruction descriptor; value 0 decodes a sign-magnitude
+uniform INT4 grid (E0M3, magnitudes 0..7) alongside the documented E2M1
+at value 1. An element-level canary confirms the decode exactly,
+including negative and mixed-nibble payloads, with no binary patching.
+
+`--decoder-weight-format e0m3` quantizes all four decoder projection
+weights to E0M3 (per-16 UE4M3 scales, amax/7) and routes them through a
+runtime-datatype GEMM on the production 128x64x256 tile, with E2M1
+activations unchanged. The quantizer is bit-exact against a host
+reference; the GEMM matches an fp32 reference at 0.999998+ cosine on all
+four decoder shapes.
+
+Back-to-back formal 3-view runs, both all gates PASS:
+
+| decoder weights | p50 (ms) | FP8 ref | raw min | act min |
+|---|---|---|---|---|
+| E0M3 (amax/7) | 36.829 | 49.211 | 0.99834 | 0.99896 |
+| NVFP4 (MSE, default) | 36.796 | 49.370 | 0.99833 | 0.99899 |
+
+Speed and precision are equivalent at this operating point — decoder
+weight quantization is not the current end-to-end error bottleneck, and
+the runtime-datatype kernel carries no performance penalty. The default
+stays `nvfp4`; the E0M3 path is the foundation for more aggressive
+low-bit configurations (coarser scales, INT4 activations, Hadamard
+rotations) where the uniform grid's lower quantization error pays off.
+
 ## Encoder Attention QKV NVFP4 + Scale-Factor Zero-Init (2026-07-27)
 
 Two changes landed together in this round.
