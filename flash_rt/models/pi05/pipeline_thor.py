@@ -450,9 +450,14 @@ def decoder_forward_fp4(ctx, fvk, fvk_fp4, bufs, weights, dims, stream=0, *,
             if l < layers - 1:
                 si_next = (s * layers + l + 1) * S * D3
                 sa_next_ptr = sa + si_next * 2
-                fvk_fp4.pi05_gate_res_adarms_fp4_sfa_native_fp16(
-                    fg, gate, x, sa_next_ptr,
-                    xn_fp4, xn_sfa, gate, S, D, stream)
+                if act_e0m3:
+                    fvk_fp4.pi05_gate_res_adarms_e0m3_sfa_fp16(
+                        fg, gate, x, sa_next_ptr,
+                        xn_fp4, xn_sfa, gate, S, D, rht, stream)
+                else:
+                    fvk_fp4.pi05_gate_res_adarms_fp4_sfa_native_fp16(
+                        fg, gate, x, sa_next_ptr,
+                        xn_fp4, xn_sfa, gate, S, D, stream)
             else:
                 fvk.gate_res_fp16(fg, gate, x, S * D, stream)
 
