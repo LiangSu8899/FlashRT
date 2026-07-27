@@ -1,5 +1,26 @@
 # Pi0.5 Thor NVFP4 End-to-End Results
 
+## Decoder v10 Tiles (2026-07-27)
+
+Commit `d12fbfc` switches the decoder qkv/o/down GEMMs to the narrow-N
+v10 tile (gate_up already used it); per-kernel evidence is in the commit
+message. Formal strict-harness runs (all gates passed; fidelity is
+bit-identical to the previous section, as expected from a
+schedule-only change):
+
+| Views | Same-run FP8 p50 | FP4+FP4 p50 / p95 | Speedup |
+|---:|---:|---:|---:|
+| 2 | 38.576 ms | **29.782 / 29.855 ms** | 1.2953 |
+| 3 | 49.594 ms | **34.922 / 37.154 ms** | 1.4201 |
+
+The 2-view run held one clock regime throughout; its speedup gain over
+the previous section (1.2839 to 1.2953) matches the kernel-level
+prediction of roughly 0.3 ms. The 3-view FP4 child crossed from the
+slow into the fast sustained-load regime mid-run while its FP8
+reference stayed slow, which inflates that speedup ratio; read it as
+FP4 p50 34.9 ms in the fast regime with a 37.2 ms slow-regime tail
+(p95), not as a like-for-like 1.42x.
+
 ## SigLIP FFN NVFP4, 16-Layer Preset (2026-07-27)
 
 Commit `1e07ea2` moves the SigLIP vision-tower FFN to NVFP4 on the first
