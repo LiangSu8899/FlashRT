@@ -532,17 +532,6 @@ struct Sm100GeluMulCompactBlockScaleFactorRowStore {
 
       Tensor pred = tC_cD(_, _, _, epi_m, epi_n);
       auto c0 = pred(0);
-#ifdef FRT_GELU_IL_PROBE
-      if (epi_m == 0 && epi_n == 0 && threadIdx.x == 128 && epi_v == 0 &&
-          blockIdx.x < 3 && blockIdx.y < 2) {
-        printf("HWPROBE b(%d,%d) off(%d,%d) c0=(%d,%d) resid=(%d,%d) less=%d "
-               "FRAG=%d\n",
-               (int)blockIdx.x, (int)blockIdx.y, tile_row_off, tile_col_off,
-               (int)get<0>(c0), (int)get<1>(c0),
-               (int)get<0>(residue_tC_cD), (int)get<1>(residue_tC_cD),
-               (int)elem_less(c0, residue_tC_cD), FragmentSize);
-      }
-#endif
       if (elem_less(c0, residue_tC_cD)) {
         const int row = tile_row_off + get<0>(c0);
         const int n0  = tile_col_off + get<1>(c0);
