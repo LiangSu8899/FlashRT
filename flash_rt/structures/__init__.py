@@ -7,6 +7,12 @@ structure catalog and its registry. Implementations, host adapters, and
 the qualification harness build on top of these specifications.
 """
 
+from flash_rt.structures.binding import (
+    BindingSpec,
+    CoverageSegment,
+    list_bindings,
+    load_binding,
+)
 from flash_rt.structures.registry import StructureSpec, list_structures, load
 
 
@@ -68,5 +74,17 @@ def attach(model, forward, **kwargs):
 
 from . import schemes  # noqa: E402  (registry: quantisation schemes)
 
-__all__ = ["StructureSpec", "attach", "capture", "get", "list_structures",
-           "load", "run_recipe", "schemes"]
+__all__ = [
+    "BindingSpec",
+    "CoverageSegment",
+    "StructureSpec",
+    "attach",
+    "capture",
+    "get",
+    "list_bindings",
+    "list_structures",
+    "load",
+    "load_binding",
+    "run_recipe",
+    "schemes",
+]

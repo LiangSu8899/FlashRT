@@ -72,6 +72,31 @@ Put the position in the impl and the same dataflow knowledge gets written
 once per backend and drifts. Neither is recoverable later, so the split is
 load-bearing.
 
+### 2.1 Pipeline coverage bindings
+
+A native pipeline is bound at two levels. Region bindings map weight slots
+and calibration points as above. A pipeline binding maps the larger stage
+seams and classifies every declared hot-path segment as one of:
+
+| Classification | Owner |
+|---|---|
+| `structure` | one or more catalog regions own the composition |
+| `state_region` | an explicit buffer/cache/window owns state and cadence |
+| `host_stage` | host preprocessing, embedding, or other retained glue |
+| `control` | loop, branch, or scheduling logic rather than a kernel region |
+
+`structures.load_binding(name, require_pipeline_coverage=True)` validates
+the binding against the catalog: stage names must exist, every hot-path name
+must resolve to one segment, and every referenced region structure must
+exist. Unknown classifications and unclassified hot-path names fail at load
+time. The normalized `BindingSpec.manifest()` is JSON-serialisable for
+runtime exporters and native consumers.
+
+This is a composition contract, not a compiler IR. It does not encode a
+kernel, target architecture, launch policy, or tensor lowering. Those stay
+in each referenced structure's implementation and Hub package, so adding a
+hardware target does not fork the pipeline declaration.
+
 ## 3. Calibration: reuse, do not redefine
 
 **The standard is `docs/calibration.md`. This layer adds no second
