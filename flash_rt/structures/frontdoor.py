@@ -79,21 +79,22 @@ _CHAIN = "negotiated_fp8_chain"
 
 def _cuda_time_ms(fn: Callable[[], Any], warmup: int = 3,
                   iters: int = 10) -> float:
-    for _ in range(warmup):
-        fn()
-    if not torch.cuda.is_available():
-        t0 = time.perf_counter()
+    with torch.no_grad():
+        for _ in range(warmup):
+            fn()
+        if not torch.cuda.is_available():
+            t0 = time.perf_counter()
+            for _ in range(iters):
+                fn()
+            return (time.perf_counter() - t0) * 1e3 / iters
+        torch.cuda.synchronize()
+        start, end = torch.cuda.Event(True), torch.cuda.Event(True)
+        start.record()
         for _ in range(iters):
             fn()
-        return (time.perf_counter() - t0) * 1e3 / iters
-    torch.cuda.synchronize()
-    start, end = torch.cuda.Event(True), torch.cuda.Event(True)
-    start.record()
-    for _ in range(iters):
-        fn()
-    end.record()
-    torch.cuda.synchronize()
-    return start.elapsed_time(end) / iters
+        end.record()
+        torch.cuda.synchronize()
+        return start.elapsed_time(end) / iters
 
 
 def _paired_ab(thunk: Callable[[], Any], on: Callable[[], Any],
@@ -318,6 +319,11 @@ def attach(
     get_out = output or eval_thunk
     want = _score_tensor(base_out)
     want = None if want is None else want.detach().float().cpu()
+    # Some generation-style model outputs retain a full KV cache alongside
+    # logits. Only the scored CPU tensor is needed after this point; keeping
+    # the host output alive through candidate binding can consume the memory
+    # needed by a reversible FP8 arm on near-capacity models.
+    del base_out
     say(f"host output scored as {kind!r}"
         + ("" if want is not None else " (no tensor found — accuracy gate "
            "cannot run, latency gate only)"))
