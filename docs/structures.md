@@ -17,6 +17,10 @@
 > - Every swapped-in structure carries a **runtime contract and a ledger**.
 >   Falling back to the host is numerically exact, so a seam that quietly
 >   reverted is invisible to parity — the ledger is how you see it.
+> - Adaptation, hardware qualification, and distribution are separate.
+>   See [`structure_release_qualification.md`](structure_release_qualification.md):
+>   production consumes measured release cells; it does not benchmark or
+>   search configurations at runtime.
 
 ---
 
@@ -240,6 +244,13 @@ ships the archs it was built for in its own metadata; the shared loader
 reads that declaration and refuses a device outside it with the package
 name and both arch strings in the message. The structures layer keeps
 no second table — hardware support is maintained where the kernels are.
+
+The tested release matrix is also not a second capability table. It is a
+set of receipts saying which model/hardware/precision/shape cells passed
+correctness and net-win qualification. The adaptation and publication
+workflow, including what must never move into runtime distribution, is
+defined in
+[`structure_release_qualification.md`](structure_release_qualification.md).
 
 ## 5. Runtime contract and the ledger
 
