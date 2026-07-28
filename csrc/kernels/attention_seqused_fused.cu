@@ -23,9 +23,12 @@ namespace {
 #define SMV2_MAX_COLS 1024
 #define SMV2_ITERS (SMV2_MAX_COLS / SMV2_WARP_SIZE)
 
-// One warp per logits row; numerics match softmax_fp16_kernel
-// (fp32 max-subtract, __expf, sum + 1e-8) with the seqused bound
-// applied while loading.
+// One warp per logits row. The register-to-column mapping, the reduction
+// order, and the arithmetic are all identical to softmax_fp16_kernel; the
+// only difference is that out-of-range columns take -1e30 at load time
+// instead of being read back as the -65504 a separate mask kernel wrote.
+// Both exponentiate to exactly zero, so the stored probabilities are
+// bit-identical to the mask + softmax chain.
 __global__ void softmax_fp16_seqused_kernel(
     __half* data, int rows, int cols, const int* __restrict__ seqused_k) {
     int lane = threadIdx.x % SMV2_WARP_SIZE;
@@ -37,18 +40,28 @@ __global__ void softmax_fp16_seqused_kernel(
     if (valid > cols) valid = cols;
 
     __half* src = data + row * cols;
+    int cols2 = cols / 2;
+    __half2* src2 = reinterpret_cast<__half2*>(src);
 
     float reg[SMV2_ITERS];
     float mx = -1e30f;
     #pragma unroll
-    for (int it = 0; it < SMV2_ITERS; it++) {
-        int c = it * SMV2_WARP_SIZE + lane;
-        if (c < valid) {
-            reg[it] = __half2float(src[c]);
-            mx = fmaxf(mx, reg[it]);
+    for (int it = 0; it < SMV2_ITERS / 2; it++) {
+        int c2 = it * SMV2_WARP_SIZE + lane;
+        if (c2 < cols2) {
+            __half2 v2 = src2[c2];
+            reg[it*2]   = (2 * c2     < valid) ? __half2float(v2.x) : -1e30f;
+            reg[it*2+1] = (2 * c2 + 1 < valid) ? __half2float(v2.y) : -1e30f;
+            mx = fmaxf(mx, fmaxf(reg[it*2], reg[it*2+1]));
         } else {
-            reg[it] = -1e30f;
+            reg[it*2] = -1e30f;
+            reg[it*2+1] = -1e30f;
         }
+    }
+    if ((cols & 1) && lane == 0) {
+        float v = (cols - 1 < valid) ? __half2float(src[cols-1]) : -1e30f;
+        reg[SMV2_ITERS-1] = v;
+        mx = fmaxf(mx, v);
     }
 
     #pragma unroll
@@ -67,13 +80,17 @@ __global__ void softmax_fp16_seqused_kernel(
 
     float inv = 1.f / (sm + 1e-8f);
     #pragma unroll
-    for (int it = 0; it < SMV2_ITERS; it++) {
-        int c = it * SMV2_WARP_SIZE + lane;
-        if (c < cols) {
-            // Positions beyond valid get exp(-1e30 - mx) * inv == 0,
-            // matching the reference mask + softmax result.
-            src[c] = __float2half(c < valid ? reg[it] * inv : 0.f);
+    for (int it = 0; it < SMV2_ITERS / 2; it++) {
+        int c2 = it * SMV2_WARP_SIZE + lane;
+        if (c2 < cols2) {
+            __half2 v2;
+            v2.x = __float2half(reg[it*2] * inv);
+            v2.y = __float2half(reg[it*2+1] * inv);
+            src2[c2] = v2;
         }
+    }
+    if ((cols & 1) && lane == 0) {
+        src[cols-1] = __float2half(reg[SMV2_ITERS-1] * inv);
     }
 }
 
