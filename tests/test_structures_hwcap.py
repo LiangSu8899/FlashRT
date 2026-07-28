@@ -38,9 +38,12 @@ def test_missing_metadata_means_no_declaration(tmp_path):
 
 def test_matching_device_passes_including_arch_specific_builds(
         tmp_path, monkeypatch):
-    mod = _fake_module(tmp_path, {"backend": {"archs": ["12.0a", "12.1"]}})
+    mod = _fake_module(
+        tmp_path,
+        {"backend": {"archs": ["12.0+PTX", "12.1a+PTX"]}},
+    )
     monkeypatch.setattr(impls, "_device_cc", lambda: (12, 0))
-    impls._check_arch("flashrt/x", mod)          # "12.0a" serves sm 12.0
+    impls._check_arch("flashrt/x", mod)
     monkeypatch.setattr(impls, "_device_cc", lambda: (12, 1))
     impls._check_arch("flashrt/x", mod)
 

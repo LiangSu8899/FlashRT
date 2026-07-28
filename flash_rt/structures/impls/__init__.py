@@ -52,8 +52,15 @@ def _check_arch(repo: str, module) -> None:
         # the arch check has nothing truthful to say here
         return
     want = f"{cc[0]}.{cc[1]}"
-    # "12.0a" (arch-specific build) serves a 12.0 device
-    if any(a == want or a.rstrip("a") == want for a in archs):
+    # Package metadata follows the kernels schema: ``+PTX`` qualifies the
+    # listed target with a PTX fallback, while ``a`` marks an
+    # architecture-specific build. Both still name the same device compute
+    # capability for admission purposes.
+    def target(arch: str) -> str:
+        base = arch.split("+", 1)[0]
+        return base.removesuffix("a")
+
+    if any(target(a) == want for a in archs):
         return
     raise ValueError(
         f"refused: kernel package {repo!r} declares archs {archs}, "
