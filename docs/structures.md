@@ -244,6 +244,12 @@ ships the archs it was built for in its own metadata; the shared loader
 reads that declaration and refuses a device outside it with the package
 name and both arch strings in the message. The structures layer keeps
 no second table — hardware support is maintained where the kernels are.
+The loader interprets the CUDA arch notation rather than comparing it
+as an opaque string: a plain cubin serves the same major compute family
+at or above its minor capability, generic ``+PTX`` serves equal or
+higher compute capabilities, and architecture-specific ``a`` targets
+serve only the exact capability. Missing declarations retain the legacy
+load path; an incompatible declaration refuses before binding.
 
 The tested release matrix is also not a second capability table. It is a
 set of receipts saying which model/hardware/precision/shape cells passed

@@ -26,7 +26,10 @@ def _fake_module(tmp_path, meta=None):
 
 
 def test_declared_archs_read_from_package_metadata(tmp_path):
-    mod = _fake_module(tmp_path, {"backend": {"archs": ["12.0a", "12.1"]}})
+    mod = _fake_module(
+        tmp_path,
+        {"backend": {"type": "cuda", "archs": ["12.0a", "12.1"]}},
+    )
     assert impls._declared_archs(mod) == ["12.0a", "12.1"]
 
 
@@ -36,29 +39,56 @@ def test_missing_metadata_means_no_declaration(tmp_path):
     assert impls._declared_archs(mod) is None
 
 
-def test_matching_device_passes_including_arch_specific_builds(
-        tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("archs", "device_cc"),
+    [
+        (["12.0"], (12, 0)),          # exact cubin
+        (["12.0"], (12, 1)),          # same-major cubin compatibility
+        (["12.0+PTX"], (12, 0)),      # exact target with PTX
+        (["9.0+PTX"], (12, 0)),       # PTX forward compatibility
+        (["12.0a"], (12, 0)),         # exact architecture-specific target
+        (["12.0a+PTX"], (12, 0)),     # specific PTX is exact-only
+    ],
+)
+def test_compatible_cuda_arch_declarations_pass(
+        tmp_path, monkeypatch, archs, device_cc):
     mod = _fake_module(
         tmp_path,
-        {"backend": {"archs": ["12.0+PTX", "12.1a+PTX"]}},
+        {"backend": {"type": "cuda", "archs": archs}},
     )
-    monkeypatch.setattr(impls, "_device_cc", lambda: (12, 0))
-    impls._check_arch("flashrt/x", mod)
-    monkeypatch.setattr(impls, "_device_cc", lambda: (12, 1))
+    monkeypatch.setattr(impls, "_device_cc", lambda: device_cc)
     impls._check_arch("flashrt/x", mod)
 
 
-def test_wrong_device_gets_a_clean_refusal(tmp_path, monkeypatch):
-    mod = _fake_module(tmp_path, {"backend": {"archs": ["12.0a"]}})
-    monkeypatch.setattr(impls, "_device_cc", lambda: (8, 9))
-    with pytest.raises(ValueError, match="refused.*8.9"):
+@pytest.mark.parametrize(
+    ("archs", "device_cc"),
+    [
+        (["12.0"], (11, 0)),          # device below the target
+        (["9.0"], (12, 0)),           # cubin cannot cross major families
+        (["12.1"], (12, 0)),          # cubin cannot run backward
+        (["12.0+PTX"], (11, 0)),      # PTX cannot run backward
+        (["9.0a+PTX"], (12, 0)),      # specific PTX is not forward-compatible
+        (["not-an-arch"], (12, 0)),   # malformed declaration is not admitted
+    ],
+)
+def test_incompatible_cuda_arch_gets_a_clean_refusal(
+        tmp_path, monkeypatch, archs, device_cc):
+    mod = _fake_module(
+        tmp_path,
+        {"backend": {"type": "cuda", "archs": archs}},
+    )
+    monkeypatch.setattr(impls, "_device_cc", lambda: device_cc)
+    with pytest.raises(ValueError, match="refused"):
         impls._check_arch("flashrt/x", mod)
 
 
 def test_no_cuda_device_defers_to_the_bind_path(tmp_path, monkeypatch):
     # without a device the check has nothing truthful to say; binding
     # refuses later at weight transfer, with its own reason
-    mod = _fake_module(tmp_path, {"backend": {"archs": ["12.0a"]}})
+    mod = _fake_module(
+        tmp_path,
+        {"backend": {"type": "cuda", "archs": ["12.0a"]}},
+    )
     monkeypatch.setattr(impls, "_device_cc", lambda: None)
     impls._check_arch("flashrt/x", mod)
 
@@ -73,7 +103,10 @@ def test_refusal_does_not_reload_the_package(monkeypatch, tmp_path):
     # refuses: a second load re-registers fake ops and torch.library
     # raises an error that has nothing to do with the real problem
     calls = {"n": 0}
-    mod = _fake_module(tmp_path, {"backend": {"archs": ["12.0a"]}})
+    mod = _fake_module(
+        tmp_path,
+        {"backend": {"type": "cuda", "archs": ["12.0a"]}},
+    )
 
     def fake_get_kernel(repo, version=None):
         calls["n"] += 1

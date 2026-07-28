@@ -18,6 +18,7 @@ absence of a declaration is not evidence of incompatibility.
 
 import json
 import pathlib
+import re
 from functools import lru_cache
 
 
@@ -42,6 +43,31 @@ def _declared_archs(module) -> list[str] | None:
         return None
 
 
+_CUDA_ARCH = re.compile(
+    r"^(?P<major>[0-9]+)\.(?P<minor>[0-9]+)"
+    r"(?P<specific>a)?(?P<ptx>\+PTX)?$")
+
+
+def _cuda_arch_supports_device(
+        arch: str, device_cc: tuple[int, int]) -> bool:
+    """Whether one Hub CUDA arch declaration can execute on ``device_cc``.
+
+    Plain cubins are binary-compatible with later minor capabilities in
+    the same major family. Generic PTX is forward-compatible with any
+    greater compute capability. Architecture-specific ``a`` targets are
+    exact-only, including when they also carry PTX.
+    """
+    match = _CUDA_ARCH.fullmatch(arch)
+    if match is None:
+        return False
+    target = (int(match["major"]), int(match["minor"]))
+    if match["specific"]:
+        return device_cc == target
+    if match["ptx"]:
+        return device_cc >= target
+    return device_cc[0] == target[0] and device_cc[1] >= target[1]
+
+
 def _check_arch(repo: str, module) -> None:
     archs = _declared_archs(module)
     if archs is None:
@@ -52,15 +78,7 @@ def _check_arch(repo: str, module) -> None:
         # the arch check has nothing truthful to say here
         return
     want = f"{cc[0]}.{cc[1]}"
-    # Package metadata follows the kernels schema: ``+PTX`` qualifies the
-    # listed target with a PTX fallback, while ``a`` marks an
-    # architecture-specific build. Both still name the same device compute
-    # capability for admission purposes.
-    def target(arch: str) -> str:
-        base = arch.split("+", 1)[0]
-        return base.removesuffix("a")
-
-    if any(target(a) == want for a in archs):
+    if any(_cuda_arch_supports_device(a, cc) for a in archs):
         return
     raise ValueError(
         f"refused: kernel package {repo!r} declares archs {archs}, "
