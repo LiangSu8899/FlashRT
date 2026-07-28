@@ -52,6 +52,68 @@ def test_binding_listing_can_filter_pipeline_family():
     assert "pi05" not in list_bindings("vla_tick_pipeline")
 
 
+@pytest.mark.parametrize(
+    ("name", "structure", "stages"),
+    [
+        (
+            "qwen3_8b_pipeline",
+            "autoregressive_decode_pipeline",
+            {"input_prepare", "prefill", "decode", "token_select"},
+        ),
+        (
+            "qwen3_vl_8b_pipeline",
+            "autoregressive_decode_pipeline",
+            {
+                "input_prepare",
+                "modality_encode",
+                "prefill",
+                "decode",
+                "token_select",
+            },
+        ),
+        (
+            "motus_tick",
+            "vla_tick_pipeline",
+            {"obs_encode", "action_denoise", "readout"},
+        ),
+    ],
+)
+def test_extended_pipeline_bindings_have_complete_coverage(
+    name,
+    structure,
+    stages,
+):
+    binding = load_binding(name, require_pipeline_coverage=True)
+
+    assert binding.structure.name == structure
+    assert set(binding.stages) == stages
+    assert set(binding.hot_path) == {
+        segment.name for segment in binding.segments if segment.hot
+    }
+    assert all(segment.classification != "unclassified"
+               for segment in binding.segments)
+
+
+def test_qwen_text_and_vl_share_pipeline_family_not_modality_stage():
+    text = load_binding("qwen3_8b_pipeline", require_pipeline_coverage=True)
+    vl = load_binding("qwen3_vl_8b_pipeline", require_pipeline_coverage=True)
+
+    assert text.structure.name == vl.structure.name
+    assert "modality_encode" not in text.stages
+    assert "modality_encode" in vl.stages
+
+
+def test_native_pipeline_gaps_remain_explicit_host_stages():
+    qwen = load_binding("qwen3_8b_pipeline",
+                        require_pipeline_coverage=True)
+    motus = load_binding("motus_tick", require_pipeline_coverage=True)
+    qwen_by_name = {segment.name: segment for segment in qwen.segments}
+    motus_by_name = {segment.name: segment for segment in motus.segments}
+
+    assert qwen_by_name["decode_norm_rope"].classification == "host_stage"
+    assert motus_by_name["video_decode"].classification == "host_stage"
+
+
 def test_legacy_pipeline_binding_is_visible_but_not_complete():
     binding = load_binding("smolvla_tick")
     assert binding.is_pipeline

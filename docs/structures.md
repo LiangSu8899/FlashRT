@@ -97,6 +97,20 @@ kernel, target architecture, launch policy, or tensor lowering. Those stay
 in each referenced structure's implementation and Hub package, so adding a
 hardware target does not fork the pipeline declaration.
 
+The catalog currently uses two schedule families:
+
+- `autoregressive_decode_pipeline`: optional modality encoding, causal
+  prefill/KV materialization, token decode, and token selection. Qwen3 and
+  Qwen3-VL share this family; the latter binds the optional modality stage.
+- `vla_tick_pipeline`: observation-cadence condition preparation, a
+  fixed-step iterative update, and an optional output readout. Pi0.5 and
+  Motus bind this family with different state and readout regions.
+
+A `host_stage` entry is an explicit coverage result, not a claim that the
+region is finished. For example, a fused Q/K norm plus RoPE path remains a
+host stage until a catalog structure owns that boundary; landing the
+structure changes the classification without changing the pipeline family.
+
 ## 3. Calibration: reuse, do not redefine
 
 **The standard is `docs/calibration.md`. This layer adds no second

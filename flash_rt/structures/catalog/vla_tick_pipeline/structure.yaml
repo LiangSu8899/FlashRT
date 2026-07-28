@@ -1,14 +1,16 @@
 structure: vla_tick_pipeline
 kind: stage_pipeline
 family: cond_iter_pipeline
-version: 1
+version: 2
 description: >
   Schedule-layer structure for tick-driven VLA inference: a condition
   encoding stage (vision tower + LLM + adapters) that runs at observation
   cadence, feeding a fixed-shape iterative denoise hot loop (diffusion or
   flow action head, K steps) that runs at tick cadence and is captured as
-  a single graph. Noise is an explicit SWAP window; condition features are
-  static read-only buffers across the loop.
+  a single graph. An optional readout stage covers deployments whose
+  iterative state needs a VAE or other output decoder. Noise is an explicit
+  SWAP window; condition features are static read-only buffers across the
+  loop.
 
 family_note: >
   cond_iter_pipeline family = cond_encode once + fixed-shape iterative hot
@@ -41,8 +43,17 @@ stages:
     outputs:
       - {name: action_chunk, window: swap, readback: true}
     capture: required_for_yield
+  - name: readout
+    optional: true
+    cadence: tick
+    inputs:
+      - {name: iterative_state, window: swap}
+    outputs:
+      - {name: deployment_output, window: readback}
+    capture: host_dependent
 
-embedded_regions: [decoder_ffn, vision_ffn]
+embedded_regions: [decoder_ffn, vision_ffn, qkv_pack, attention_core,
+                   adaln_producer, linear_proj]
 
 cadence_substructures:
   - {name: cross_kv_precompute, cadence: prompt}
@@ -56,6 +67,7 @@ conformance:
   - noise_single_hoistable_site
   - condition_read_only_in_loop
   - action_chunk_cadence
+  - readout_cost_reported_when_present
   - capture_blockers_enumerated
 
 gates:
