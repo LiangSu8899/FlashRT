@@ -68,8 +68,9 @@ coverage:
       seam: "reference per-step timestep embedding"
     - name: qk_norm_rope
       stage: denoise
-      classification: host_stage
+      classification: structure
       seam: "model-local fused_qk_norm_rope"
+      structures: [qk_norm_rope]
     - name: generation_tower
       stage: denoise
       classification: structure
@@ -89,4 +90,3 @@ hosts:
     module_path: "flash_rt.models.cosmos3_video.pipeline_rtx.CosmosVideo"
   torch:
     module_path: "flash_rt.frontends.torch.cosmos3_video_rtx.Cosmos3VideoTorchFrontendRtx"
-

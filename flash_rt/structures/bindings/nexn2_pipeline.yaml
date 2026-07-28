@@ -55,7 +55,7 @@ coverage:
       stage: prefill
       classification: structure
       seam: "_full_attn_layer"
-      structures: [qkv_pack, attention_core, linear_proj]
+      structures: [qkv_pack, qk_norm_rope, attention_core, linear_proj]
     - name: prefill_moe
       stage: prefill
       classification: host_stage
@@ -85,7 +85,7 @@ coverage:
       stage: decode
       classification: structure
       seam: "_decode_full"
-      structures: [qkv_pack, attention_core, linear_proj]
+      structures: [qkv_pack, qk_norm_rope, attention_core, linear_proj]
     - name: decode_moe
       stage: decode
       classification: host_stage

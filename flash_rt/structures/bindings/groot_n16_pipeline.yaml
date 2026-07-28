@@ -57,8 +57,8 @@ coverage:
       stage: obs_encode
       classification: structure
       seam: "GrootQwen3.forward"
-      structures: [decoder_ffn, qkv_pack, attention_core, linear_proj,
-                   norm_fused]
+      structures: [decoder_ffn, qkv_pack, qk_norm_rope, attention_core,
+                   linear_proj, norm_fused]
     - name: backbone_features
       stage: obs_encode
       classification: state_region
@@ -87,8 +87,8 @@ coverage:
       stage: action_denoise
       classification: structure
       seam: "GrootDiT._run_step alternating self/cross blocks"
-      structures: [decoder_ffn, qkv_pack, attention_core, adaln_producer,
-                   linear_proj, norm_fused]
+      structures: [decoder_ffn, qkv_pack, qk_norm_rope, attention_core,
+                   adaln_producer, linear_proj, norm_fused]
     - name: euler_update
       stage: action_denoise
       classification: state_region
@@ -104,4 +104,3 @@ hosts:
     module_path: "flash_rt.models.groot.pipeline_rtx"
   torch:
     module_path: "flash_rt.frontends.torch.groot_rtx"
-

@@ -54,8 +54,8 @@ stages:
       - {name: media, window: readback}
     capture: host_dependent
 
-embedded_regions: [decoder_ffn, vision_ffn, qkv_pack, attention_core,
-                   adaln_producer, linear_proj, norm_fused]
+embedded_regions: [decoder_ffn, vision_ffn, qkv_pack, qk_norm_rope,
+                   attention_core, adaln_producer, linear_proj, norm_fused]
 
 state_regions:
   - {name: condition_cache, cadence: request, reader: denoise}
@@ -79,4 +79,3 @@ gates:
   net_win:
     rule: same_request_e2e_and_per_stage_vs_host
     report: [condition_latency, denoise_latency, decode_latency]
-

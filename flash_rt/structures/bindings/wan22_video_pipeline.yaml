@@ -74,8 +74,9 @@ coverage:
       seam: "WanAttentionBlock.modulation plus timestep embedding chunk(6)"
     - name: qk_norm_rope
       stage: denoise
-      classification: host_stage
+      classification: structure
       seam: "WanSelfAttention q_norm, k_norm, and 3D RoPE"
+      structures: [qk_norm_rope]
     - name: self_attention
       stage: denoise
       classification: structure
@@ -113,4 +114,3 @@ hosts:
     module_path: "flash_rt.models.wan22.pipeline_rtx"
   torch:
     module_path: "flash_rt.frontends.torch.wan22_rtx.Wan22TorchFrontendRtx"
-

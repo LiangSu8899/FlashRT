@@ -55,7 +55,7 @@ def test_cosmos_and_wan_bind_the_same_complete_generation_schedule():
         json.dumps(binding.manifest())
 
 
-def test_unlanded_video_regions_remain_explicit_host_gaps():
+def test_landed_qk_region_and_remaining_video_gaps_are_explicit():
     cosmos = load_binding("cosmos3_video_pipeline",
                           require_pipeline_coverage=True)
     wan = load_binding("wan22_video_pipeline",
@@ -63,8 +63,8 @@ def test_unlanded_video_regions_remain_explicit_host_gaps():
     cosmos_segments = {segment.name: segment for segment in cosmos.segments}
     wan_segments = {segment.name: segment for segment in wan.segments}
 
-    assert cosmos_segments["qk_norm_rope"].classification == "host_stage"
-    assert wan_segments["qk_norm_rope"].classification == "host_stage"
+    assert cosmos_segments["qk_norm_rope"].structures == ("qk_norm_rope",)
+    assert wan_segments["qk_norm_rope"].structures == ("qk_norm_rope",)
     assert wan_segments["six_chunk_modulation"].classification == "host_stage"
     assert wan_segments["modulated_ffn"].classification == "host_stage"
     assert wan_segments["vae_decode"].classification == "host_stage"
