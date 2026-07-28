@@ -109,6 +109,10 @@ The catalog currently uses two schedule families:
 - `vla_tick_pipeline`: observation-cadence condition preparation, a
   fixed-step iterative update, and an optional output readout. Pi0.5 and
   Motus bind this family with different state and readout regions.
+- `video_generation_pipeline`: request-level condition preparation, explicit
+  latent initialization, a fixed-step generation loop, and optional VAE
+  decode. Cosmos3 and Wan2.2 share this family without inheriting VLA
+  action-chunk or observation-cadence semantics.
 
 A `host_stage` entry is an explicit coverage result, not a claim that the
 region is finished. For example, a fused Q/K norm plus RoPE path remains a
