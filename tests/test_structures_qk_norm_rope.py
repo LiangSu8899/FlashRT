@@ -78,6 +78,40 @@ def test_interleaved_partial_rope_keeps_unrotated_suffix_and_gqa_shape():
     assert q_out.shape[-2] != k_out.shape[-2]
 
 
+def test_projection_scope_matches_wan_pre_reshape_rmsnorm():
+    q, k, v, _, _, cos, sin = _inputs()
+    gen = torch.Generator().manual_seed(11)
+    qw = torch.randn(q.shape[-2] * q.shape[-1], generator=gen)
+    kw = torch.randn(k.shape[-2] * k.shape[-1], generator=gen)
+    ref = load("qk_norm_rope").reference()
+    q_out, k_out, _ = ref(
+        q,
+        k,
+        v,
+        qw,
+        kw,
+        cos,
+        sin,
+        variant={"normalization_scope": "projection"},
+    )
+
+    def wan_norm(x, weight):
+        flat = x.flatten(-2)
+        flat = flat * torch.rsqrt(
+            flat.square().mean(-1, keepdim=True) + 1e-6)
+        return (flat * weight).view_as(x)
+
+    qn = wan_norm(q, qw)
+    kn = wan_norm(k, kw)
+    half = q.shape[-1] // 2
+    qrot = torch.cat((-qn[..., half:], qn[..., :half]), dim=-1)
+    krot = torch.cat((-kn[..., half:], kn[..., :half]), dim=-1)
+    cf = torch.cat((cos, cos), dim=-1).unsqueeze(-2)
+    sf = torch.cat((sin, sin), dim=-1).unsqueeze(-2)
+    torch.testing.assert_close(q_out, qn * cf + qrot * sf)
+    torch.testing.assert_close(k_out, kn * cf + krot * sf)
+
+
 def test_preexpanded_position_table_makes_geometry_source_irrelevant():
     q, k, v, qw, kw, cos, sin = _inputs()
     ref = load("qk_norm_rope").reference()
