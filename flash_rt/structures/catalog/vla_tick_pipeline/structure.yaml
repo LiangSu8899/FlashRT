@@ -53,7 +53,7 @@ stages:
     capture: host_dependent
 
 embedded_regions: [decoder_ffn, vision_ffn, qkv_pack, attention_core,
-                   adaln_producer, linear_proj]
+                   adaln_producer, linear_proj, norm_fused]
 
 cadence_substructures:
   - {name: cross_kv_precompute, cadence: prompt}

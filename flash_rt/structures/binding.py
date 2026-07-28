@@ -192,6 +192,7 @@ def validate_binding(
         name,
         coverage,
         stages,
+        structure.embedded_regions,
     )
     return BindingSpec(
         name=name,
@@ -250,6 +251,7 @@ def _validate_coverage(
     binding_name: str,
     coverage: Any,
     stages: Mapping[str, Mapping[str, Any]],
+    embedded_regions: Sequence[str],
 ) -> tuple[str, tuple[str, ...], tuple[CoverageSegment, ...]]:
     if not isinstance(coverage, Mapping):
         raise ValueError(
@@ -317,6 +319,7 @@ def _validate_coverage(
             name,
             classification,
             item.get("structures"),
+            embedded_regions,
         )
         parsed.append((name, stage, classification, seam, structures))
 
@@ -345,6 +348,7 @@ def _validate_segment_structures(
     segment_name: str,
     classification: str,
     value: Any,
+    embedded_regions: Sequence[str],
 ) -> tuple[str, ...]:
     if value is None:
         structures: tuple[str, ...] = ()
@@ -373,6 +377,7 @@ def _validate_segment_structures(
         raise ValueError(
             f"pipeline segment {segment_name!r} repeats catalog structures"
         )
+    allowed = set(embedded_regions)
     for structure_name in structures:
         try:
             spec = load(structure_name)
@@ -385,6 +390,12 @@ def _validate_segment_structures(
             raise ValueError(
                 f"pipeline segment {segment_name!r} cannot embed pipeline "
                 f"structure {structure_name!r}"
+            )
+        if classification == "structure" and structure_name not in allowed:
+            raise ValueError(
+                f"pipeline segment {segment_name!r} references structure "
+                f"{structure_name!r}, which is not embedded by its pipeline "
+                "family"
             )
     return structures
 

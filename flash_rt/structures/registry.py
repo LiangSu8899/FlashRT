@@ -26,7 +26,8 @@ class StructureSpec:
     weight slots and a torch reference. ``stage_pipeline`` structures
     declare a stage graph with cadence attributes; their parity reference
     is the host's own eager path, so ``boundary``/``weights``/``reference``
-    are empty for them and ``stages`` is populated instead.
+    are empty for them, while ``stages`` and the allowed
+    ``embedded_regions`` are populated instead.
     """
 
     name: str
@@ -41,6 +42,7 @@ class StructureSpec:
     kind: str = "region"
     family: str = ""
     stages: Sequence[Mapping[str, Any]] = ()
+    embedded_regions: Sequence[str] = ()
     conformance: Sequence[str] = ()
 
     @property
@@ -96,6 +98,7 @@ def load(name: str) -> StructureSpec:
         kind=kind,
         family=str(data.get("family", "")),
         stages=data.get("stages", ()),
+        embedded_regions=data.get("embedded_regions", ()),
         conformance=data.get("conformance", ()),
     )
     if spec.name != name:

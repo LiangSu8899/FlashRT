@@ -131,6 +131,14 @@ def test_pipeline_binding_rejects_unknown_stage():
         validate_binding(data)
 
 
+def test_pipeline_binding_rejects_missing_required_stage():
+    data = _minimal_pipeline()
+    del data["stages"]["action_denoise"]
+
+    with pytest.raises(ValueError, match="missing required stages"):
+        validate_binding(data)
+
+
 def test_pipeline_binding_rejects_unclassified_hot_path():
     data = _minimal_pipeline()
     data["coverage"]["hot_path"].append("missing")
@@ -149,6 +157,38 @@ def test_pipeline_binding_rejects_duplicate_segments():
         validate_binding(data)
 
 
+def test_pipeline_binding_rejects_duplicate_hot_path_entries():
+    data = _minimal_pipeline()
+    data["coverage"]["hot_path"].append("loop")
+
+    with pytest.raises(ValueError, match="hot_path contains duplicates"):
+        validate_binding(data)
+
+
+def test_pipeline_binding_rejects_unknown_coverage_field():
+    data = _minimal_pipeline()
+    data["coverage"]["runtime_benchmark"] = True
+
+    with pytest.raises(ValueError, match="coverage has unknown keys"):
+        validate_binding(data)
+
+
+def test_pipeline_binding_rejects_unknown_classification():
+    data = _minimal_pipeline()
+    data["coverage"]["segments"][0]["classification"] = "kernel"
+
+    with pytest.raises(ValueError, match="unsupported classification"):
+        validate_binding(data)
+
+
+def test_structure_segment_requires_catalog_references():
+    data = _minimal_pipeline()
+    data["coverage"]["segments"][0]["classification"] = "structure"
+
+    with pytest.raises(ValueError, match="must reference catalog structures"):
+        validate_binding(data)
+
+
 def test_structure_segment_requires_known_catalog_structures():
     data = _minimal_pipeline()
     segment = data["coverage"]["segments"][0]
@@ -159,6 +199,27 @@ def test_structure_segment_requires_known_catalog_structures():
         validate_binding(data)
 
 
+def test_structure_segment_must_belong_to_pipeline_family():
+    data = _minimal_pipeline()
+    segment = data["coverage"]["segments"][0]
+    segment["classification"] = "structure"
+    segment["structures"] = ["cadence_static"]
+
+    with pytest.raises(ValueError, match="not embedded by its pipeline"):
+        validate_binding(data)
+
+
+def test_host_and_control_segments_cannot_claim_structures():
+    for classification in ("host_stage", "control"):
+        data = _minimal_pipeline()
+        segment = data["coverage"]["segments"][0]
+        segment["classification"] = classification
+        segment["structures"] = ["linear_proj"]
+
+        with pytest.raises(ValueError, match="cannot reference"):
+            validate_binding(data)
+
+
 def test_pipeline_structure_cannot_be_nested_as_region():
     data = _minimal_pipeline()
     segment = data["coverage"]["segments"][0]
@@ -167,6 +228,32 @@ def test_pipeline_structure_cannot_be_nested_as_region():
 
     with pytest.raises(ValueError, match="cannot embed pipeline"):
         validate_binding(data)
+
+
+def test_region_binding_cannot_declare_pipeline_coverage():
+    data = {
+        "binding": "region_fixture",
+        "structure": "decoder_ffn",
+        "coverage": {
+            "contract": "complete_hot_path",
+            "hot_path": ["ffn"],
+            "segments": [],
+        },
+    }
+
+    with pytest.raises(ValueError, match="cannot declare pipeline coverage"):
+        validate_binding(data)
+
+
+def test_binding_filename_identity_and_name_safety_are_enforced():
+    data = {
+        "binding": "declared_name",
+        "structure": "decoder_ffn",
+    }
+    with pytest.raises(ValueError, match="declares binding"):
+        validate_binding(data, expected_name="file_name")
+    with pytest.raises(KeyError, match="invalid binding name"):
+        load_binding("../pi05")
 
 
 def _minimal_pipeline():
