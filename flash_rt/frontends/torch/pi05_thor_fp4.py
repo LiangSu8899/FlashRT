@@ -93,7 +93,7 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
                  decoder_down_variant: int = 10,
                  decoder_weight_format: str = "nvfp4",
                  decoder_act_format: str = "nvfp4",
-                 decoder_fused_attn: bool = True,
+                 decoder_fused_attn: bool = False,
                  decoder_fused_geglu: bool = True,
                  decoder_rht: bool = False,
                  use_fp8: bool = True,
@@ -181,7 +181,9 @@ class Pi05TorchFrontendThorFP4(Pi05TorchFrontendThor):
         self.decoder_act_format = decoder_act_format
         self.decoder_rht = bool(decoder_rht)
         # Fold the decoder attention's seqused mask into the softmax
-        # kernel (one fewer launch per layer-step; numerics identical).
+        # kernel: bit-identical output, one fewer launch. Only the
+        # fixed-shape state-prompt path takes the seqused kernels, so this
+        # is off by default and unmeasured by the FP4 E2E suite.
         self.decoder_fused_attn = bool(decoder_fused_attn)
         # Fused-epilogue decoder FFN: one interleaved GeGLU GEMM replaces
         # the gate_up GEMM + GeGLU-quantize kernel (nvfp4 weights only).

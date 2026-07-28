@@ -280,34 +280,39 @@ Implementation notes for future epilogue work of this kind:
   this volume (7.9M values per GEMM) cost 2.9x kernel time for
   bit-identical output.
 
-## Decoder Softmax Fold + Fused GeGLU FFN — New Defaults (2026-07-28)
+## Fused GeGLU FFN in the Decoder — New Default (2026-07-28)
 
-Commits `e8e3d87` + `e6ea2df` remove two kernels per decoder layer-step
-and default both changes on:
-
-- `attention_qkv_fp16_seqused_v2` folds the seqused `-inf` mask into
-  the softmax kernel: max/sum run over the valid prefix and positions
-  beyond it are written as exact zero probabilities, which is what the
-  reference mask + softmax chain produces. One fewer launch per
-  attention call (`--decoder-fused-attn 0` restores the old chain).
-- The decoder FFN reuses the compact GeGLU store epilogue on the
-  decoder GEMM tile (128x64x256): a pairwise-interleaved gate/up
-  weight (MSE-quantized like the other decoder projections) turns the
-  gate_up GEMM + GeGLU-quantize pair into one GEMM that writes the
-  down-projection input directly (`--decoder-fused-geglu 0` to
-  disable; nvfp4 weight tier only, the e0m3/rht tiers keep the
-  separate kernels).
+The decoder FFN reuses the compact GeGLU store epilogue on the decoder
+GEMM tile (128x64x256): a pairwise-interleaved gate/up weight
+(MSE-quantized like the other decoder projections) turns the gate_up
+GEMM + GeGLU-quantize pair into one GEMM that writes the
+down-projection input directly. NVFP4 weight tier only — the e0m3 and
+e0m3+RHT tiers keep the separate kernels. `--decoder-fused-geglu 0`
+restores the pair.
 
 Formal same-batch A/B with matched FP8 references:
 
-| views | fusions off | fusions on | speedup | raw_min |
-|-------|-------------|------------|---------|---------|
-| 3v    | 32.26 ms    | **31.64 ms** | 1.4417 → **1.4726** | 0.99754 → 0.99766 |
-| 2v    | 27.70 ms    | **27.14 ms** | 1.3917 → **1.4169** | 0.99794 → 0.99803 |
+| views | off | on | speedup | raw_min |
+|-------|-----|-----|---------|---------|
+| 3v    | 32.26 ms | **31.64 ms** | 1.4417 → **1.4726** | 0.99754 → 0.99766 |
+| 2v    | 27.70 ms | **27.14 ms** | 1.3917 → **1.4169** | 0.99794 → 0.99803 |
 
 All gates pass and cosine floors are equal or better (the fused FFN
 applies GELU to the fp32 accumulator instead of the fp16-rounded GEMM
-output).
+output). A single-frame kernel trace confirms the attribution: the
+standalone GeGLU-quantize kernel disappears from the decoder's 180
+layer-steps and the gate_up GEMM carries the fused epilogue.
+
+`attention_qkv_fp16_seqused_v2` folds the seqused `-inf` mask into the
+softmax kernel — the register-to-column mapping and reduction order are
+copied from the reference kernel and out-of-range columns take -1e30
+instead of the -65504 a separate kernel would have written, so both
+exponentiate to zero and the stored probabilities are bit-identical
+(`tests/test_pi05_fp4_fusion_kernels.py` asserts exact equality of the
+attention output). It saves one launch per attention call, but only the
+fixed-shape state-prompt path routes through the seqused kernels, and
+this suite does not exercise that path, so the flag ships off
+(`--decoder-fused-attn 1` to enable).
 
 A full replacement of the decoder attention chain (QK^T + softmax + AV
 + quantize in one SIMT kernel) was implemented, validated for
