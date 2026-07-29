@@ -194,7 +194,10 @@ def discover(
             continue
         parent_path = path.rsplit(".", 1)[0] if "." in path else ""
         if "decoder_ffn" in structures and all(
+            # The catalog exposes only gate/up/down weights. Accepting a
+            # biased host here would silently drop parameters at the seam.
             isinstance(getattr(module, a, None), nn.Linear)
+            and getattr(module, a).bias is None
             for a in _DECODER_PROJ
         ):
             gate = module.gate_proj
