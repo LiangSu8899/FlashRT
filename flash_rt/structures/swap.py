@@ -175,8 +175,8 @@ def attach(
     installed. ``revert`` collects undo callables for host mutations made
     before this call, so ``detach`` restores those too.
     """
-    if not swaps:
-        raise ValueError("no swaps staged")
+    if not swaps and not observe:
+        raise ValueError("no swaps or routed seams staged")
     if on_guard_fail not in ("fallback", "raise"):
         raise ValueError(
             f"on_guard_fail must be 'fallback' or 'raise', "

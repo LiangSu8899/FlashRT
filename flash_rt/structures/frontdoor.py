@@ -50,6 +50,7 @@ import torch
 from .autobuild import AutoPlan, _layer_of, auto_swaps
 from .gates import (DEFAULT_FLOORS, band_note, band_of, infer_output_kind,
                     metrics_for, passes)
+from .guard import GuardRefused
 from .swap import AttachHandle as _AttachHandle, attach as _swap_attach
 
 #: the full catalog, which is what "one call" has to mean
@@ -75,6 +76,7 @@ _STRUCTURE_BY_IMPL = {
 #: hands the consumer a dtype it refuses — which the ledger would report
 #: as a family that fell back, from a split this gate created itself.
 _CHAIN = "negotiated_fp8_chain"
+_ROUTED = "attention_core_routed"
 
 
 def _cuda_time_ms(fn: Callable[[], Any], warmup: int = 3,
@@ -184,26 +186,31 @@ class _Arm:
 
     def __init__(self, model: torch.nn.Module,
                  swaps: Mapping[str, torch.nn.Module], plan: AutoPlan,
-                 mode: str, *, revert: Any = None) -> None:
+                 mode: str, *, routed: bool = False,
+                 revert: Any = None) -> None:
         self.model = model
         self.swaps = dict(swaps)
         self.plan = plan
         self.mode = mode
+        self.routed = routed
         self.revert = revert
         self.handle: _AttachHandle | None = None
 
     def on(self) -> None:
         if self.handle is None:
             self.handle = _swap_attach(
-                self.model, self.swaps, observe=self.plan.observed,
+                self.model, self.swaps,
+                observe=self.plan.observed if self.routed else None,
                 on_guard_fail=self.mode, revert=self.revert)
-        self.plan.enable_routed()
+        if self.routed:
+            self.plan.enable_routed()
 
     def off(self) -> None:
         if self.handle is not None:
             self.handle.detach()
             self.handle = None
-        self.plan.disable_routed()
+        if self.routed:
+            self.plan.disable_routed()
 
 
 @dataclass
@@ -334,15 +341,24 @@ def attach(
                       observations=observations, percentile=percentile,
                       max_samples=max_samples, prefix_cadence=prefix_cadence,
                       scheme=scheme, verbose=verbose)
-    if not plan.swaps:
+    if not plan.swaps and not plan.toggles:
         plan.revert_all()
         return Plan({}, {}, {"digest": "none", "seams": 0,
                              "output_kind": kind}, _plan=plan)
 
     calibration = plan.notes.get("calibration") or {}
+    # Adapters build their routed seam enabled so plain ``auto_swaps`` can
+    # be consumed directly. The front door must start its A/B gate from the
+    # untouched host and judge that routed seam as its own unit.
+    plan.disable_routed()
     groups = _gate_groups(plan)
-    say(f"{len(plan.swaps)} bound seam(s) in {len(groups)} gate unit(s): "
-        + ", ".join(f"{k}×{len(v)}" for k, v in sorted(groups.items())))
+    if plan.toggles:
+        groups[_ROUTED] = {}
+    bound_count = len(plan.swaps) + len(plan.observed)
+    say(f"{bound_count} bound seam(s) in {len(groups)} gate unit(s): "
+        + ", ".join(
+            f"{k}×{len(plan.observed) if k == _ROUTED else len(v)}"
+            for k, v in sorted(groups.items())))
 
     def scored() -> torch.Tensor | None:
         with torch.no_grad():
@@ -352,12 +368,15 @@ def attach(
     # ---- per unit: accuracy, then that it ran, then net win -----------
     stats: dict[str, dict[str, Any]] = {}
     winners: dict[str, torch.nn.Module] = {}
+    routed_winner = False
     for name, swaps in sorted(groups.items()):
-        stat: dict[str, Any] = {"seams": len(swaps),
-                                "paths": sorted(swaps)[:4],
+        routed = name == _ROUTED
+        paths = plan.observed if routed else swaps
+        stat: dict[str, Any] = {"seams": len(paths),
+                                "paths": sorted(paths)[:4],
                                 "outcome": "pending"}
         stats[name] = stat
-        arm = _Arm(model, swaps, plan, on_guard_fail)
+        arm = _Arm(model, swaps, plan, on_guard_fail, routed=routed)
         try:
             arm.on()
             if want is not None:
@@ -393,7 +412,13 @@ def attach(
                     f"{timing['spread']:.3f}) at {_shape_note(plan)}")
                 continue
             stat["outcome"] = "activated"
-            winners.update(swaps)
+            if routed:
+                routed_winner = True
+            else:
+                winners.update(swaps)
+        except GuardRefused as refusal:
+            stat["outcome"] = "refused"
+            stat["reason"] = f"runtime form refused: {refusal}"
         finally:
             arm.off()
         say(f"{name}: {stat['outcome']}"
@@ -404,24 +429,31 @@ def attach(
     e2e_final: dict[str, Any] | None = None
     ledger_final: dict[str, Any] | None = None
     handle = None
-    if winners:
-        arm = _Arm(model, winners, plan, on_guard_fail, revert=plan.revert)
-        arm.on()
-        metrics = (metrics_for(kind, scored(), want)
-                   if want is not None else {})
-        ok, why = (passes(metrics, band_floors) if metrics else (True, ""))
-        ledger_final = arm.handle.summary()
-        timing = _paired_ab(eval_thunk, arm.on, arm.off,
-                            rounds=rounds, iters=iters)
-        arm.on()                     # the loop ends on the off arm
-        handle = arm.handle
-        if not ok or not ledger_final["clean"] \
-                or timing["speedup"] < min_speedup:
+    if winners or routed_winner:
+        arm = _Arm(model, winners, plan, on_guard_fail,
+                   routed=routed_winner, revert=plan.revert)
+        reason = ""
+        try:
+            arm.on()
+            metrics = (metrics_for(kind, scored(), want)
+                       if want is not None else {})
+            ok, why = (
+                passes(metrics, band_floors) if metrics else (True, ""))
+            ledger_final = arm.handle.summary()
+            timing = _paired_ab(eval_thunk, arm.on, arm.off,
+                                rounds=rounds, iters=iters)
+            arm.on()                 # the loop ends on the off arm
+            handle = arm.handle
+            if not ok or not ledger_final["clean"] \
+                    or timing["speedup"] < min_speedup:
+                reason = (why if not ok
+                          else "seams fell back" if not ledger_final["clean"]
+                          else f"no net win ({timing['speedup']:.3f}x)")
+        except GuardRefused as refusal:
+            reason = f"runtime form refused: {refusal}"
+        if reason:
             arm.off()                # also reverts the routed seams
-            handle, winners = None, {}
-            reason = (why if not ok
-                      else "seams fell back" if not ledger_final["clean"]
-                      else f"no net win ({timing['speedup']:.3f}x)")
+            handle, winners, routed_winner = None, {}, False
             for stat in stats.values():
                 if stat["outcome"] == "activated":
                     stat["outcome"] = "refused"
@@ -440,10 +472,13 @@ def attach(
                 f"{timing['base_ms']:.2f} -> {timing['ms']:.2f} ms "
                 f"({timing['speedup']:.3f}x, spread {timing['spread']:.3f})"
                 f", band {e2e_final['band']}")
-    if not winners:
+    if not winners and not routed_winner:
         plan.revert_all()
         say("outcome: whole-host refusal — model left untouched")
 
+    activated = dict(winners)
+    if routed_winner:
+        activated.update(plan.observed)
     receipt = {
         "schema_version": 1,
         "environment": _environment(),
@@ -461,12 +496,12 @@ def attach(
         "units": stats,
         "e2e": e2e_final,
         "ledger": ledger_final,
-        "seams_active": sorted(winners),
+        "seams_active": sorted(activated),
     }
     receipt["digest"] = hashlib.sha256(
         json.dumps(receipt, sort_keys=True, default=str).encode()
     ).hexdigest()
-    return Plan(winners, stats, receipt, _handle=handle, _plan=plan)
+    return Plan(activated, stats, receipt, _handle=handle, _plan=plan)
 
 
 def _environment() -> dict[str, str]:
