@@ -56,6 +56,27 @@ class FakeFused(GuardedSeam, nn.Module):
                           device=x.device, dtype=x.dtype)
 
 
+class CapacityFused(GuardedSeam, nn.Module):
+    """A preallocated seam that admits every logical row count it covers."""
+
+    _frt_host_attr = "host_linear"
+    _frt_can_fallback = True
+
+    def __init__(self, original: nn.Module, capacity: int):
+        super().__init__()
+        self.host_linear = original
+        self._frt_arm(
+            dtypes=CAST_OK, device=original.weight.device,
+            k=int(original.weight.shape[1]), row_capacity=capacity)
+
+    def forward(self, x):
+        admitted = self._frt_admit(x)
+        if admitted is not PROCEED:
+            return admitted
+        return torch.ones(*x.shape[:-1], self.host_linear.out_features,
+                          device=x.device, dtype=x.dtype)
+
+
 class Composed(GuardedSeam, nn.Module):
     """A structure with no equivalent host module to revert to."""
 
@@ -104,6 +125,33 @@ def test_admitted_call_runs_the_structure(host):
     assert (entry["calls"], entry["fallbacks"]) == (1, 0)
     assert handle.summary()["clean"]
     handle.raise_on_fallback()
+
+
+def test_row_capacity_admits_smaller_shapes_and_reports_capacity(host):
+    handle = attach(
+        host, {"proj": CapacityFused(host.proj, capacity=8)})
+    for rows in (8, 3, 6):
+        out = host.proj(_rows(rows))
+        assert out.shape[0] == rows
+        assert torch.equal(out, torch.ones_like(out))
+    entry = handle.report()["proj"]
+    assert (entry["calls"], entry["fallbacks"]) == (3, 0)
+    assert entry["form"]["rows"] is None
+    assert entry["form"]["row_capacity"] == 8
+
+
+def test_row_capacity_falls_back_only_above_capacity(host):
+    original = host.proj
+    handle = attach(
+        host, {"proj": CapacityFused(host.proj, capacity=8)})
+    x = _rows(9)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        got = host.proj(x)
+    assert torch.equal(got, original(x))
+    entry = handle.report()["proj"]
+    assert entry["fallbacks"] == 1
+    assert "capacity 8" in entry["last_reason"]
 
 
 def test_refused_call_reproduces_the_host_exactly(host):

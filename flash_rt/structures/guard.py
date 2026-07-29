@@ -83,14 +83,14 @@ class SeamGuard:
     which knows where in the model it ended up.
     """
 
-    __slots__ = ("dtypes", "device", "k", "rows", "kind", "can_fallback",
-                 "calls", "fallbacks", "consecutive", "last_reason",
-                 "detached", "site", "mode", "notes", "thread",
-                 "_restore", "_warned")
+    __slots__ = ("dtypes", "device", "k", "rows", "row_capacity", "kind",
+                 "can_fallback", "calls", "fallbacks", "consecutive",
+                 "last_reason", "detached", "site", "mode", "notes",
+                 "thread", "_restore", "_warned")
 
     def __init__(self, *, kind: str, dtypes: Iterable[torch.dtype] | None,
                  device: torch.device, k: int | None, rows: int | None,
-                 can_fallback: bool) -> None:
+                 row_capacity: int | None, can_fallback: bool) -> None:
         self.kind = kind
         #: structure-specific counters an implementation keeps about
         #: itself, reported alongside the contract ones
@@ -99,6 +99,7 @@ class SeamGuard:
         self.device = _concrete(device)
         self.k = k
         self.rows = rows
+        self.row_capacity = row_capacity
         self.can_fallback = can_fallback
         self.calls = 0
         self.fallbacks = 0
@@ -150,6 +151,11 @@ class SeamGuard:
             rows = x.numel() // x.shape[-1]
             if rows != self.rows:
                 return f"{rows} row(s) (bound for {self.rows})"
+        if self.row_capacity is not None:
+            rows = x.numel() // x.shape[-1]
+            if rows > self.row_capacity:
+                return (f"{rows} row(s) (buffer capacity "
+                        f"{self.row_capacity})")
         tid = threading.get_ident()
         if self.thread is None:
             self.thread = tid
@@ -216,7 +222,9 @@ class SeamGuard:
                  "fallbacks": self.fallbacks, "detached": self.detached,
                  "last_reason": self.last_reason,
                  "form": {"dtype": self._dtype_note(), "k": self.k,
-                          "rows": self.rows, "device": str(self.device)}}
+                          "rows": self.rows,
+                          "row_capacity": self.row_capacity,
+                          "device": str(self.device)}}
         if self.notes:
             entry["notes"] = dict(self.notes)
         return entry
@@ -244,11 +252,15 @@ class GuardedSeam:
 
     def _frt_arm(self, *, dtypes: Iterable[torch.dtype] | None,
                  device: torch.device, k: int | None = None,
-                 rows: int | None = None) -> SeamGuard:
+                 rows: int | None = None,
+                 row_capacity: int | None = None) -> SeamGuard:
         """Declare the form this instance was calibrated for."""
+        if rows is not None and row_capacity is not None:
+            raise ValueError("rows and row_capacity are mutually exclusive")
         guard = SeamGuard(
             kind=type(self).__name__, dtypes=dtypes, device=device, k=k,
-            rows=rows, can_fallback=self._frt_can_fallback)
+            rows=rows, row_capacity=row_capacity,
+            can_fallback=self._frt_can_fallback)
         object.__setattr__(self, GUARD_ATTR, guard)
         return guard
 

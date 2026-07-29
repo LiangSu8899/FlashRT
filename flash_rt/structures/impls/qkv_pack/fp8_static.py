@@ -62,10 +62,11 @@ def _pack_weights(mods: Sequence[torch.nn.Module]):
 class PackedLinear(GuardedSeam, torch.nn.Module):
     """Leaf-form head: one packed GEMM, later siblings stashed.
 
-    The stash and quantize buffers are allocated once for the calibrated
-    row count, so the row count is part of this seam's contract rather
-    than a free dimension: a call with a different one would hand the
-    kernel an output buffer of the wrong length.
+    The stash and quantize buffers are allocated once at the largest row
+    count observed during calibration. The Hub entry accepts a logical M
+    no larger than those buffers and returns only the logical rows, so the
+    contract is a row *capacity*, not one exact row count. Calls above the
+    capacity fall back before they can hand the kernel a short buffer.
     """
 
     _frt_host_attr = "host_linear"
@@ -116,7 +117,8 @@ class PackedLinear(GuardedSeam, torch.nn.Module):
                 rows, sum(splits), device=dev, dtype=torch.bfloat16))
         self._frt_arm(
             dtypes=FP8_ONLY if in_dtype == "fp8_static" else CAST_OK,
-            device=dev, k=int(mods[0].weight.shape[1]), rows=rows)
+            device=dev, k=int(mods[0].weight.shape[1]),
+            row_capacity=rows)
 
     def alias_stash(self, index: int, region: torch.Tensor) -> None:
         """Write sibling ``index`` straight into a buffer someone else owns.
@@ -182,12 +184,16 @@ class PackedLinear(GuardedSeam, torch.nn.Module):
         """
         if not self.joint_slots:
             raise ValueError("qkv_pack: this pack has no joint slots")
-        self._run(x.reshape(-1, x.shape[-1]))
+        flat = x.reshape(-1, x.shape[-1])
+        self._run(flat)
         width = sum(self.splits[:self.joint_slots])
-        return self.packed[:, :width]
+        return self.packed[:flat.shape[0], :width]
 
     def _run(self, flat):
-        out = self.packed if self.joint_slots else None
+        logical_rows = flat.shape[0]
+        out = (self.packed[:logical_rows]
+               if self.joint_slots and self.in_dtype == "fp8_static"
+               else self.packed if self.joint_slots else None)
         if self.in_dtype == "fp8_static":
             y = (self._fn(flat, self.w8, self.act_scale, self.w_scale,
                           out=out)
@@ -205,7 +211,8 @@ class PackedLinear(GuardedSeam, torch.nn.Module):
         for i, n in enumerate(self.splits[1:], 1):
             if i < self.joint_slots:
                 continue
-            getattr(self, f"stash{i}").copy_(y[:, off:off + n])
+            getattr(self, f"stash{i}")[:logical_rows].copy_(
+                y[:, off:off + n])
             off += n
         return y
 
@@ -250,13 +257,14 @@ class StashReader(GuardedSeam, torch.nn.Module):
         self.index = index
         head = packed._frt_guard
         self._frt_arm(dtypes=head.dtypes, device=head.device, k=head.k,
-                      rows=head.rows)
+                      row_capacity=head.row_capacity)
 
     def forward(self, x):
         admitted = self._frt_admit(x)
         if admitted is not PROCEED:
             return admitted
-        buf = getattr(self._packed[0], f"stash{self.index}")
+        logical_rows = x.numel() // x.shape[-1]
+        buf = getattr(self._packed[0], f"stash{self.index}")[:logical_rows]
         out = buf.reshape(*x.shape[:-1], buf.shape[-1])
         return out if x.dtype is _FP8 else out.to(x.dtype)
 
@@ -270,7 +278,12 @@ class StashReader(GuardedSeam, torch.nn.Module):
 def bind_qkv_pack(mods: Sequence[torch.nn.Module],
                   act_scale: torch.Tensor, rows: int,
                   in_dtype: str = "fp8_static"):
-    """Bind a sibling group; returns replacements in sibling order."""
+    """Bind a sibling group; returns replacements in sibling order.
+
+    Each host weight is checkpoint-native ``[out_features, in_features]``;
+    the binder concatenates along the output axis and packs once. ``rows``
+    is the preallocated row capacity, not an exact runtime M.
+    """
     if len(mods) < 2:
         raise ValueError("qkv_pack: need at least two siblings")
     kdims = {m.weight.shape[1] for m in mods}
@@ -316,7 +329,8 @@ class AttnBlockPacked(GuardedSeam, torch.nn.Module):
         self.register_buffer("y_buf", torch.empty(
             rows, 3 * self.e, device=dev, dtype=torch.bfloat16))
         self.sdpa_dtype = sdpa_dtype
-        self._frt_arm(dtypes=CAST_OK, device=dev, k=int(k), rows=rows)
+        self._frt_arm(dtypes=CAST_OK, device=dev, k=int(k),
+                      row_capacity=rows)
 
     def forward(self, hidden_states, attention_mask=None, **kw):
         admitted = self._frt_admit(hidden_states, attention_mask, **kw)
@@ -356,6 +370,12 @@ def bind_attn_block(orig: torch.nn.Module, act_scale: torch.Tensor,
                     rows: int,
                     sdpa_dtype: torch.dtype = torch.bfloat16
                     ) -> AttnBlockPacked:
+    """Bind the module form with checkpoint-native Q/K/V weights.
+
+    ``orig.{q,k,v}_proj.weight`` are ``[out_features, in_features]`` and
+    ``rows`` is the maximum logical row count covered by the preallocated
+    quantize/output buffers.
+    """
     for attr in ("q_proj", "k_proj", "v_proj", "out_proj", "head_dim",
                  "scale"):
         if not hasattr(orig, attr):

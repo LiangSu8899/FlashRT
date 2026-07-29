@@ -810,7 +810,12 @@ def _bind_auto(model, seam, cap, plan, act_scales, negotiate_fp8,
             return None
         block = _resolve(model, seam.path)
         rows = points.row_profile(seam.path + "." + first, "x")
-        cap = dict(cap or {}, rows=rows[len(rows) // 2] if rows else 1)
+        # The packed implementation preallocates scratch/stash storage but
+        # the Hub entry accepts any logical M covered by that storage. Use
+        # the largest calibrated observation as capacity; choosing the
+        # median here turns a valid variable-row call into a guard fallback
+        # and can also under-allocate when calibration itself has buckets.
+        cap = dict(cap or {}, rows=max(rows) if rows else 1)
         act_scale = torch.tensor(
             [max(amax / 448.0, 1e-8)],
             device=getattr(block, first).weight.device)

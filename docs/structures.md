@@ -265,9 +265,9 @@ defined in
 ## 5. Runtime contract and the ledger
 
 Every swapped-in structure declares the form it was calibrated for
-(device, input dtype, width, and a row count where buffers were
-preallocated). Called outside it, a seam runs the retained host module and
-records that it did.
+(device, input dtype, width, and either an exact row count or a maximum
+row capacity where buffers were preallocated). Called outside it, a seam
+runs the retained host module and records that it did.
 
 ```python
 handle.report()             # per seam: calls, fallbacks, last_reason, form
