@@ -358,5 +358,11 @@ to measure along it.
 - **Report the increment, not the peak.** A resource number that includes
   the model weights and the bound plan is not the cost of the thing being
   measured.
+- **The final execution form owns the decision.** An eager per-family gate is
+  preflight evidence, not permission to prune a plan that will be captured or
+  compiled. Assemble structures, cadence/static regions, host lowerings, and
+  backend routes first; then capture both host and treated arms in the
+  deployment form and make one paired end-to-end decision. Reporting the
+  eager survivors as the pipeline result measures a different program.
 - **Refusals record the form and the shape.** "refused" must never read as
   "this cannot be bound", only as "not in that form, at that size".

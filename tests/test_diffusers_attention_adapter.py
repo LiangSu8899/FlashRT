@@ -69,6 +69,19 @@ class Core(torch.nn.Module):
         return F.scaled_dot_product_attention(query, key, value)
 
 
+class BF16Core(Core):
+    def __init__(self):
+        super().__init__()
+        self._frt_guard = type(
+            "Guard", (), {"dtypes": frozenset({torch.bfloat16})}
+        )()
+        self.seen_dtype = None
+
+    def forward(self, query, key, value):
+        self.seen_dtype = query.dtype
+        return super().forward(query, key, value)
+
+
 def test_diffusers_adapter_routes_and_restores(monkeypatch):
     monkeypatch.setattr(
         "flash_rt.structures.adapters.diffusers_attention."
@@ -90,3 +103,20 @@ def test_diffusers_adapter_routes_and_restores(monkeypatch):
     torch.testing.assert_close(root(), reference)
     extras["revert"][0]()
     assert root.attention.processor is original
+
+
+def test_diffusers_adapter_adapts_projection_dtype_to_backend(monkeypatch):
+    core = BF16Core()
+    monkeypatch.setattr(
+        "flash_rt.structures.adapters.diffusers_attention."
+        "bind_dense_attention",
+        lambda captures: core,
+    )
+    root = Root()
+    reference = root()
+    result = DiffusersAttentionAdapter()(root, root.forward)
+    assert result is not None
+    actual = root()
+    assert core.seen_dtype == torch.bfloat16
+    assert actual.dtype == reference.dtype
+    torch.testing.assert_close(actual, reference, rtol=2e-2, atol=2e-2)

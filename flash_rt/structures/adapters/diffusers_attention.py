@@ -88,10 +88,22 @@ class _FlashRTAttnProcessor2_0:
             batch_size, channel, height, width = hidden_states.shape
         query, key, value, mask = _qkv(
             attn, hidden_states, encoder_hidden_states, attention_mask, temb)
+        projection_dtype = query.dtype
+        guard = getattr(self.core, "_frt_guard", None)
+        accepted_dtypes = tuple(getattr(guard, "dtypes", ()) or ())
+        if accepted_dtypes and projection_dtype not in accepted_dtypes:
+            # A module swap upstream may change the projection output dtype
+            # after this routed seam was observed. FA2 does not consume fp32;
+            # adapt at the backend boundary and restore the host dtype before
+            # the output projection.
+            target_dtype = accepted_dtypes[0]
+            query = query.to(target_dtype)
+            key = key.to(target_dtype)
+            value = value.to(target_dtype)
         hidden_states = self.core(query, key, value)
         hidden_states = hidden_states.transpose(1, 2).reshape(
             query.shape[0], -1, attn.heads * query.shape[-1])
-        hidden_states = hidden_states.to(query.dtype)
+        hidden_states = hidden_states.to(projection_dtype)
         hidden_states = attn.to_out[0](hidden_states)
         hidden_states = attn.to_out[1](hidden_states)
         if input_ndim == 4:

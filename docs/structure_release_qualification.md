@@ -107,18 +107,29 @@ Before publishing a fast route:
 
 1. use real inference-distribution inputs through the host preprocessing
    chain;
-2. compare the final configured pipeline with the unmodified host in the
-   same process;
-3. use paired alternating timing and report the measurement spread;
-4. verify parity at the deployment output boundary with identical
+2. assemble every selected structure, cadence/static region, host lowering,
+   and backend route before making the release decision;
+3. capture or compile both arms in the same final execution form used by
+   deployment, then compare that configured pipeline with the unmodified
+   host in the same process;
+4. use paired alternating timing and report the measurement spread;
+5. verify parity at the deployment output boundary with identical
    stochastic windows;
-5. require target-path calls greater than zero and fallback count zero;
-6. verify detach/rollback restores the host;
-7. report stage costs when cadence changes where work is paid.
+6. require target-path calls greater than zero and fallback count zero;
+7. verify detach/rollback restores the host;
+8. report stage costs when cadence changes where work is paid.
 
 The final configured pipeline, not a sum of kernel microbenchmarks, owns the
 release performance claim. Kernel timings explain a result but do not replace
 the end-to-end gate.
+
+An eager per-family gate is a preflight only. It must not prune the plan that
+will later run under CUDA Graph or compilation, and its surviving seams must
+not be reported as the final pipeline result. Launch overhead, upstream dtype
+changes, cadence materialization, and backend composition can reverse the
+decision after assembly. The release decision therefore belongs to the final
+captured/compiled form as one unit; if that unit loses or fails parity, use
+ablation to diagnose it and rebuild, then repeat the final-form gate.
 
 Optional ablation is a debugging tool when the final integration regresses
 or the source of a loss is unclear. It is not required runtime machinery and
@@ -193,6 +204,10 @@ separate when their capture, buffer, or layout contracts genuinely differ.
 
 - [ ] Real-distribution input and host preprocessing are documented.
 - [ ] The unmodified-host empty control and stochastic-window parity pass.
+- [ ] All structures, cadence regions, host lowerings, and backend routes are
+      assembled before the performance decision.
+- [ ] Both arms use the deployment's final capture/compile form; no eager
+      per-family result is presented as the pipeline result.
 - [ ] Paired end-to-end timing clears the release gate.
 - [ ] Detach/rollback restores the host.
 - [ ] Receipt contains no local paths, private data, or transient logs.
