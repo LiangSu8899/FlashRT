@@ -141,6 +141,18 @@ def _consumer_point(seam) -> tuple[str, str]:
     return (seam.path, "x")
 
 
+def _seam_key(seam: Seam) -> str:
+    """Unique receipt/decision key for a discovered structure instance.
+
+    Most structures own one module path. A dual-path attention module may
+    expose two independent sibling QKV groups under the same parent; the
+    first projection is the stable, real host path that distinguishes them.
+    """
+    if seam.structure == "qkv_pack" and seam.pack_attrs:
+        return seam.path + "." + seam.pack_attrs[0]
+    return seam.path
+
+
 def auto_swaps(
     model: torch.nn.Module,
     forward: Callable[..., Any] | Sequence[Callable[[], Any]],
@@ -242,7 +254,7 @@ def auto_swaps(
         except ValueError as refusal:
             plan_refusals.append((seam.path, str(refusal)[:120]))
             continue
-        seam_points[seam.path] = pts
+        seam_points[_seam_key(seam)] = pts
         all_points.extend(pts)
 
     from . import schemes as _schemes
@@ -289,14 +301,15 @@ def auto_swaps(
     # is a statistic: a step table is memoised host output, a return
     # convention is one boolean
     for seam in seams:
-        caps[seam.path] = {}
+        key = _seam_key(seam)
+        caps[key] = {}
         target = _resolve(model, seam.path)
         if seam.structure == "decoder_block":
             hooks.append(target.register_forward_hook(
-                cap_shape(seam.path), with_kwargs=True))
+                cap_shape(key), with_kwargs=True))
         elif seam.structure == "adaln_producer":
             hooks.append(getattr(target, seam.cond_attr)
-                         .register_forward_hook(cap_cond(seam.path)))
+                         .register_forward_hook(cap_cond(key)))
     hooks.extend(collector.hooks(lambda path: _resolve(model, path)))
 
     if hooks:
@@ -339,7 +352,7 @@ def auto_swaps(
         scheme_note["auto"] = True
     if decision.keep_host:
         kept = set(decision.keep_host)
-        seams = [s for s in seams if s.path not in kept]
+        seams = [s for s in seams if _seam_key(s) not in kept]
         scheme_note["keep_host"] = {
             p: decision.reasons.get(p, "") for p in sorted(kept)}
         say(f"scheme {scheme_note['name']}: {len(kept)} seam(s) kept at "
@@ -367,7 +380,7 @@ def auto_swaps(
     if negotiate_fp8:
         by_parent: dict[str, dict[str, Seam]] = {}
         for seam in seams:
-            if formats.get(seam.path):
+            if formats.get(_seam_key(seam)):
                 # a chain shares one scale and one wire dtype; a member
                 # routed to another format has neither, so it binds
                 # standalone through its own impl instead
@@ -447,7 +460,7 @@ def auto_swaps(
             if p_slot not in g or c_slot not in g:
                 continue
             p_seam, c_seam = g[p_slot], g[c_slot]
-            p_cap = caps.get(p_seam.path, {})
+            p_cap = caps.get(_seam_key(p_seam), {})
             if not p_cap.get("pairs"):
                 continue
             try:
@@ -460,25 +473,26 @@ def auto_swaps(
                     (f"{lay} [{c_slot} chain]", str(refusal)[:80]))
                 continue
             plan.swaps.update(pair)
-            handled.update({p_seam.path, c_seam.path})
+            handled.update({_seam_key(p_seam), _seam_key(c_seam)})
     plan.notes["negotiated_layers"] = sorted(
         lay for lay, g in negotiated.items()
-        if any(sm.path in handled for sm in g.values()))
+        if any(_seam_key(sm) in handled for sm in g.values()))
 
     # ---- bind the remaining seams individually ----
     for name, members in group_families(seams).items():
         for seam in members:
-            if seam.path in handled:
+            key = _seam_key(seam)
+            if key in handled:
                 continue
-            cap = caps.get(seam.path, {})
+            cap = caps.get(key, {})
             try:
                 bound = _bind_auto(model, seam, cap, plan, act_scales,
                                    negotiate_fp8, points=collector,
-                                   fmt=formats.get(seam.path),
-                                   fmt_params=fmt_params.get(seam.path))
+                                   fmt=formats.get(key),
+                                   fmt_params=fmt_params.get(key))
             except (ValueError, RuntimeError) as refusal:
                 plan.notes.setdefault("refused", []).append(
-                    (seam.path, str(refusal)[:80]))
+                    (key, str(refusal)[:80]))
                 continue
             if bound is None:
                 continue
@@ -537,7 +551,8 @@ def auto_swaps(
     # the host child would leave two live copies of the same seam.
     for seam in (s for s in seams if s.structure == "decoder_block"):
         try:
-            block = _bind_block(model, seam, caps.get(seam.path, {}), plan)
+            block = _bind_block(
+                model, seam, caps.get(_seam_key(seam), {}), plan)
         except (ValueError, RuntimeError) as refusal:
             plan.notes.setdefault("refused", []).append(
                 (seam.path + " [block]", str(refusal)[:80]))

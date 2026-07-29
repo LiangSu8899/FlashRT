@@ -20,7 +20,9 @@ _DECODER_PROJ = ("gate_proj", "up_proj", "down_proj")
 _VISION_PROJ = (("fc1", "fc2"), ("linear_fc1", "linear_fc2"))
 _NORM_ATTRS = ("post_attention_layernorm", "layer_norm2", "norm2")
 _ATTN_PROJ = (("q_proj", "k_proj", "v_proj", "o_proj"),
-              ("q_proj", "k_proj", "v_proj", "out_proj"))
+              ("q_proj", "k_proj", "v_proj", "out_proj"),
+              ("to_q", "to_k", "to_v", "to_out"),
+              ("add_q_proj", "add_k_proj", "add_v_proj", "to_add_out"))
 # the HF decoder-layer shape: two sublayers, each a norm feeding a
 # compute region. Matched by slots, not by class name, so every host
 # built on that layout is the same seam.
@@ -30,7 +32,8 @@ _BLOCK_SLOTS = ("self_attn", "mlp", "input_layernorm",
 # consumption order. The trailing o_proj/out_proj is not part of the
 # pack (it consumes the attention output, not the shared input).
 _QKV_PACK = (("q_proj", "k_proj", "v_proj"),
-             ("to_q", "to_k", "to_v"))
+             ("to_q", "to_k", "to_v"),
+             ("add_q_proj", "add_k_proj", "add_v_proj"))
 # adaptive-norm modules: a norm that also projects a conditioning
 # vector. The child that produces the modulation is the tell.
 _COND_PROJ_ATTRS = ("dense", "linear", "adaLN_modulation", "modulation")
@@ -251,7 +254,6 @@ def discover(
                     variant={"bind": bind,
                              "in_dtype": "bf16_fused_quant"},
                     family=family, layer_index=idx))
-                break
         if "adaln_producer" in structures:
             cond_attr = next(
                 (a for a in _COND_PROJ_ATTRS
@@ -303,7 +305,6 @@ def discover(
                                           else "none"),
                                  "epilogue": "none", "in_dtype": "bf16"},
                         family=family + "." + attr, layer_index=idx))
-                break
         if "vision_ffn" in structures:
             for fc1_attr, fc2_attr in _VISION_PROJ:
                 fc1 = getattr(module, fc1_attr, None)
