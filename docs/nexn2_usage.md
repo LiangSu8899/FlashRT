@@ -99,7 +99,10 @@ Nexn2TorchFrontendRtx(
 
 Methods: `set_prompt(text)`, `infer() -> (1, S, vocab)`, `generate(max_new_tokens) -> list[int]`, `tokenizer`, `latency_records` (list[float], per `infer()`).
 
-Env knobs: `FLASHRT_NEXN2_PREFILL_CHUNK` (chunked-prefill block size, default 8192; 0 disables), `FLASHRT_NEXN2_GRAPH_CACHE_MAX` (decode CUDA-graph LRU cap, default 256).
+Env knobs: `FLASHRT_QWEN35MOE_PREFILL_CHUNK` (chunked-prefill block size,
+default 8192; 0 disables) and `FLASHRT_QWEN35MOE_GRAPH_CACHE_MAX` (decode
+CUDA-graph LRU cap, default 256). The older `FLASHRT_NEXN2_PREFILL_CHUNK` and
+`FLASHRT_NEXN2_GRAPH_CACHE_MAX` names remain compatible aliases.
 
 ## 5. Performance
 
@@ -185,8 +188,8 @@ logits that seed decode are stable:
   activations no longer bound it; the residual limit on a 32 GB card is the
   bf16 KV cache (~5.4 GB at 256k over the 10 full-attn layers) alongside the
   ~22 GB of weights. `generate()` auto-chunks; tune the block via
-  `FLASHRT_NEXN2_PREFILL_CHUNK` (default 8192; lower trades a little throughput
-  for headroom). The raw `infer()` path returns all-position logits and is a
-  separate single-pass validation tool, capped at ~4k by the `(S, 248320)`
-  logit tensor — use `generate()` for long context.
+  `FLASHRT_QWEN35MOE_PREFILL_CHUNK` (default 8192; lower trades a little
+  throughput for headroom). The raw `infer()` path returns all-position logits
+  and is a separate single-pass validation tool, capped at ~4k by the
+  `(S, 248320)` logit tensor — use `generate()` for long context.
 * Text LLM only — not wired into the `load_model` / VLA `predict()` API.

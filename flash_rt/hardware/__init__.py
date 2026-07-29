@@ -156,10 +156,13 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
     # (-DFLASHRT_ENABLE_QWEN35MOE=ON). Registered here for discoverability /
     # resolve_pipeline_class, but the frontend exposes an LLM surface
     # (infer()->logits, generate_greedy) rather than the VLA predict(images)
-    # API, so it is used via direct instantiation of Nexn2TorchFrontendRtx
-    # (see docs/nexn2_usage.md) rather than load_model's VLAModel wrapper.
+    # API, so these are used via direct frontend construction rather than
+    # load_model's VLAModel wrapper.
     ("nexn2", "torch", "rtx_sm120"):
         ("flash_rt.frontends.torch.nexn2_rtx", "Nexn2TorchFrontendRtx"),
+    ("qwen36_moe", "torch", "rtx_sm120"):
+        ("flash_rt.frontends.torch.qwen36_moe_rtx",
+         "Qwen36MoeTextFrontendRtx"),
 
     # ── Pi0-FAST ── (SM120 runtime fork inside pipeline, no AttentionBackend protocol.)
     ("pi0fast", "torch", "thor"):

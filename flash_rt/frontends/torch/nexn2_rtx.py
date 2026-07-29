@@ -34,22 +34,25 @@ _REQUIRED_FVK = (
 )
 
 
-def _require_kernels(fvk) -> None:
+def _require_kernels(
+        fvk, *, model_label: str = "Nex-N2",
+        usage_doc: str = "docs/nexn2_usage.md") -> None:
     """Raise a clear RuntimeError if the gated qwen3_5_moe kernels or the FA2
     module are missing (build was not configured with
     -DFLASHRT_ENABLE_QWEN35MOE=ON, or flash_rt_fa2 is absent)."""
     missing = [s for s in _REQUIRED_FVK if not hasattr(fvk, s)]
     if missing:
         raise RuntimeError(
-            "Nex-N2 kernelized path needs the qwen3_5_moe SM120 kernels, which "
+            f"{model_label} kernelized path needs the qwen3_5_moe SM120 "
+            "kernels, which "
             "are absent from flash_rt_kernels (missing: "
             f"{', '.join(missing)}). Rebuild on an SM120 toolchain with "
-            "-DFLASHRT_ENABLE_QWEN35MOE=ON. See docs/nexn2_usage.md.")
+            f"-DFLASHRT_ENABLE_QWEN35MOE=ON. See {usage_doc}.")
     try:
         from flash_rt import flash_rt_fa2 as _fa2
     except Exception as e:                                  # pragma: no cover
         raise RuntimeError(
-            "Nex-N2 full attention needs the vendored FA2 module "
+            f"{model_label} full attention needs the vendored FA2 module "
             "(flash_rt_fa2), which failed to import. Build with FA2 enabled "
             "(ENABLE_FA2, auto-on for SM120).") from e
     fa2_missing = [s for s in ('fwd_bf16', 'fwd_bf16_causal')
@@ -63,6 +66,9 @@ def _require_kernels(fvk) -> None:
 
 class Nexn2TorchFrontendRtx:
     """Nex-N2-mini inference frontend (PyTorch + RTX SM120)."""
+
+    _MODEL_LABEL = "Nex-N2"
+    _USAGE_DOC = "docs/nexn2_usage.md"
 
     def __init__(self, checkpoint_path: str, *,
                  device: str = 'cuda:0',
@@ -148,7 +154,12 @@ class Nexn2TorchFrontendRtx:
             extract_weights_nexn2_nvfp4,
         )
 
-        _require_kernels(fvk)            # fail fast before loading the 35B ckpt
+        # Fail before loading the 35B checkpoint.
+        _require_kernels(
+            fvk,
+            model_label=self._MODEL_LABEL,
+            usage_doc=self._USAGE_DOC,
+        )
 
         self._tokenizer = AutoTokenizer.from_pretrained(self.checkpoint_path)
         self._fvk = fvk

@@ -34,6 +34,13 @@ from flash_rt.frontends.torch._nexn2_rtx_forward import (
 from flash_rt.frontends.torch._nexn2_rtx_nvfp4_weights import _sf_swz_bytes
 from flash_rt.hardware.rtx.attn_backend_nexn2 import RtxFlashAttnBackendNexn2
 
+
+def _qwen35moe_env(name: str, default: str) -> str:
+    generic = f"FLASHRT_QWEN35MOE_{name}"
+    legacy = f"FLASHRT_NEXN2_{name}"
+    return os.environ.get(generic, os.environ.get(legacy, default))
+
+
 # Prompt length at/above which the batched prefill wins over the per-token loop
 # (batched has a fixed forward overhead; below this the loop's lower latency
 # wins). See Nexn2DecodeState.batched_prefill.
@@ -222,7 +229,7 @@ class Nexn2DecodeState:
         # used pos once over the cap; 0/negative disables the bound (legacy).
         self._graphs = collections.OrderedDict()
         self.graph_cache_max = int(
-            os.environ.get('FLASHRT_NEXN2_GRAPH_CACHE_MAX', '256'))
+            _qwen35moe_env("GRAPH_CACHE_MAX", "256"))
         self._snap_lin = [torch.empty_like(t) for t in self.lin_state]
         self._snap_conv = [torch.empty_like(t) for t in self.lin_conv_state]
         # Pre-allocated KV snapshot rows (one [.,1,.] slice each) reused every
@@ -265,7 +272,7 @@ class Nexn2DecodeState:
         # the ~16k single-pass ceiling on a 32 GB card. A multiple of the WY
         # chunk (64). 0 disables (always single-pass).
         self.prefill_chunk = int(
-            os.environ.get('FLASHRT_NEXN2_PREFILL_CHUNK', '8192'))
+            _qwen35moe_env("PREFILL_CHUNK", "8192"))
 
     def reset(self):
         for s in self.lin_state:
@@ -465,7 +472,18 @@ def _moe_layer_decode(h, ld, state, fvk, device):
         inter.data_ptr(), dn_p.data_ptr(), dn_s.data_ptr(), dn_a.data_ptr(),
         idx.data_ptr(), d_dn.data_ptr(), TOPK, n_dn, INTER,
         INTER, dn_p[0].numel(), dn_s[0].numel(), s)
-    out = (tw_row.float() @ d_dn.float()).unsqueeze(0)   # (1, n_dn) weighted sum
+    # Fixed-order weighted sum. The generic torch matmul may choose a
+    # reduction whose accumulation order changes between launches, which can
+    # flip a later greedy decision when two logits are nearly tied.
+    if 'decode_topk_rows' not in ld:
+        ld['decode_topk_rows'] = torch.arange(
+            TOPK, dtype=torch.int32, device=device)
+    out = torch.empty(n_dn, dtype=torch.float32, device=device)
+    fvk.moe_weighted_sum_sm120_bf16(
+        d_dn.data_ptr(), ld['decode_topk_rows'].data_ptr(),
+        tw_row.data_ptr(), out.data_ptr(),
+        1, TOPK, n_dn, n_dn, s)
+    out = out.unsqueeze(0)
 
     if fused_rs:                                      # already projected above
         sg, su = sg_f, su_f

@@ -57,7 +57,8 @@ def _open_shards(ckpt_dir: str):
     idx_path = os.path.join(ckpt_dir, 'model.safetensors.index.json')
     if not os.path.isfile(idx_path):
         raise RuntimeError(
-            f'Nex-N2 ckpt missing model.safetensors.index.json: {ckpt_dir!r}')
+            'qwen3_5_moe checkpoint missing '
+            f'model.safetensors.index.json: {ckpt_dir!r}')
     wmap = json.load(open(idx_path))['weight_map']
     handles_d = {}
     for shard in set(wmap.values()):

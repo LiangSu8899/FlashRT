@@ -456,11 +456,12 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                 "Supported: pi0, pi05, llm, mllm")
     elif config not in ("pi05", "groot", "groot_n17", "pi0", "pi0fast",
                       "motus", "wan22_ti2v_5b", "cosmos3_video",
-                      "cosmos3_edge", "nexn2"):
+                      "cosmos3_edge", "nexn2", "qwen36_moe"):
         raise ValueError(
             f"Unknown config: {config}. "
             f"Supported: pi05, groot, groot_n17, pi0, pi0fast, motus, "
-            f"wan22_ti2v_5b, cosmos3_video, cosmos3_edge, nexn2")
+            f"wan22_ti2v_5b, cosmos3_video, cosmos3_edge, nexn2, "
+            f"qwen36_moe")
     if framework not in ("torch", "jax", "jetson_pi"):
         raise ValueError(
             f"Unknown framework: {framework}. Supported: torch, jax, jetson_pi")
@@ -538,6 +539,13 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             "    from flash_rt.frontends.torch.nexn2_rtx import "
             "Nexn2TorchFrontendRtx\n"
             "See docs/nexn2_usage.md.")
+    if config == "qwen36_moe":
+        raise NotImplementedError(
+            "config='qwen36_moe' is a text LLM and is not served through "
+            "load_model's VLA wrapper. Construct it directly:\n"
+            "    from flash_rt.frontends.torch.qwen36_moe_rtx import "
+            "Qwen36MoeTextFrontendRtx\n"
+            "See docs/qwen36_moe_usage.md.")
 
     from flash_rt.hardware import detect_arch, resolve_pipeline_class
     arch = detect_arch() if hardware == "auto" else hardware
