@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+from contextlib import ExitStack
 from typing import Any
 
 from flash_rt.frontends.torch.nexn2_rtx import Nexn2TorchFrontendRtx
@@ -29,85 +30,133 @@ _EXPECTED_TEXT_CONFIG = {
     "num_attention_heads": 16,
     "num_key_value_heads": 2,
     "head_dim": 256,
+    "attention_bias": False,
+    "attn_output_gate": True,
+    "hidden_act": "silu",
     "num_experts": 256,
     "num_experts_per_tok": 8,
+    "moe_intermediate_size": 512,
+    "shared_expert_intermediate_size": 512,
     "linear_num_key_heads": 16,
     "linear_num_value_heads": 32,
     "linear_key_head_dim": 128,
     "linear_value_head_dim": 128,
+    "linear_conv_kernel_dim": 4,
+    "mamba_ssm_dtype": "float32",
     "full_attention_interval": 4,
+    "partial_rotary_factor": 0.25,
+    "rms_norm_eps": 1e-6,
     "mtp_num_hidden_layers": 1,
+    "mtp_use_dedicated_embeddings": False,
+    "tie_word_embeddings": False,
 }
 
-_MTP_KEYS = {
-    "mtp.fc.weight",
-    "mtp.norm.weight",
-    "mtp.pre_fc_norm_embedding.weight",
-    "mtp.pre_fc_norm_hidden.weight",
-    "mtp.layers.0.input_layernorm.weight",
-    "mtp.layers.0.post_attention_layernorm.weight",
-    "mtp.layers.0.self_attn.q_proj.weight",
-    "mtp.layers.0.self_attn.k_proj.weight",
-    "mtp.layers.0.self_attn.v_proj.weight",
-    "mtp.layers.0.self_attn.o_proj.weight",
-    "mtp.layers.0.self_attn.q_norm.weight",
-    "mtp.layers.0.self_attn.k_norm.weight",
-    "mtp.layers.0.mlp.gate.weight",
-    "mtp.layers.0.mlp.experts.gate_up_proj",
-    "mtp.layers.0.mlp.experts.down_proj",
-    "mtp.layers.0.mlp.shared_expert.gate_proj.weight",
-    "mtp.layers.0.mlp.shared_expert.up_proj.weight",
-    "mtp.layers.0.mlp.shared_expert.down_proj.weight",
-    "mtp.layers.0.mlp.shared_expert_gate.weight",
+_EXPECTED_ROPE_PARAMETERS = {
+    "rope_type": "default",
+    "rope_theta": 10000000,
+    "partial_rotary_factor": 0.25,
+    "mrope_interleaved": True,
+    "mrope_section": [11, 11, 10],
 }
+
+
+def _expected_mlp_shapes(prefix: str) -> dict[str, tuple[int, ...]]:
+    return {
+        prefix + "mlp.gate.weight": (256, 2048),
+        prefix + "mlp.experts.gate_up_proj": (256, 1024, 2048),
+        prefix + "mlp.experts.down_proj": (256, 2048, 512),
+        prefix + "mlp.shared_expert.gate_proj.weight": (512, 2048),
+        prefix + "mlp.shared_expert.up_proj.weight": (512, 2048),
+        prefix + "mlp.shared_expert.down_proj.weight": (2048, 512),
+        prefix + "mlp.shared_expert_gate.weight": (1, 2048),
+    }
+
+
+def _expected_attention_shapes(
+        prefix: str, layer_type: str) -> dict[str, tuple[int, ...]]:
+    if layer_type == "full_attention":
+        return {
+            prefix + "self_attn.q_proj.weight": (8192, 2048),
+            prefix + "self_attn.k_proj.weight": (512, 2048),
+            prefix + "self_attn.v_proj.weight": (512, 2048),
+            prefix + "self_attn.o_proj.weight": (2048, 4096),
+            prefix + "self_attn.q_norm.weight": (256,),
+            prefix + "self_attn.k_norm.weight": (256,),
+        }
+    return {
+        prefix + "linear_attn.in_proj_qkv.weight": (8192, 2048),
+        prefix + "linear_attn.in_proj_z.weight": (4096, 2048),
+        prefix + "linear_attn.in_proj_a.weight": (32, 2048),
+        prefix + "linear_attn.in_proj_b.weight": (32, 2048),
+        prefix + "linear_attn.conv1d.weight": (8192, 1, 4),
+        prefix + "linear_attn.A_log": (32,),
+        prefix + "linear_attn.dt_bias": (32,),
+        prefix + "linear_attn.norm.weight": (128,),
+        prefix + "linear_attn.out_proj.weight": (2048, 4096),
+    }
+
+
+def _expected_text_shapes(
+        layer_types: tuple[str, ...]) -> dict[str, tuple[int, ...]]:
+    shapes = {
+        "lm_head.weight": (248320, 2048),
+        "model.language_model.embed_tokens.weight": (248320, 2048),
+        "model.language_model.norm.weight": (2048,),
+    }
+    for i, layer_type in enumerate(layer_types):
+        prefix = f"model.language_model.layers.{i}."
+        shapes[prefix + "input_layernorm.weight"] = (2048,)
+        shapes[prefix + "post_attention_layernorm.weight"] = (2048,)
+        shapes.update(_expected_mlp_shapes(prefix))
+        shapes.update(_expected_attention_shapes(prefix, layer_type))
+    return shapes
+
+
+def _expected_mtp_shapes() -> dict[str, tuple[int, ...]]:
+    prefix = "mtp.layers.0."
+    shapes = {
+        "mtp.fc.weight": (2048, 4096),
+        "mtp.norm.weight": (2048,),
+        "mtp.pre_fc_norm_embedding.weight": (2048,),
+        "mtp.pre_fc_norm_hidden.weight": (2048,),
+        prefix + "input_layernorm.weight": (2048,),
+        prefix + "post_attention_layernorm.weight": (2048,),
+    }
+    shapes.update(_expected_attention_shapes(prefix, "full_attention"))
+    shapes.update(_expected_mlp_shapes(prefix))
+    return shapes
+
+
+_MTP_KEYS = set(_expected_mtp_shapes())
 
 
 def _required_text_keys(layer_types: tuple[str, ...]) -> set[str]:
-    keys = {
-        "lm_head.weight",
-        "model.language_model.embed_tokens.weight",
-        "model.language_model.norm.weight",
-    }
-    mlp_suffixes = (
-        "mlp.gate.weight",
-        "mlp.experts.gate_up_proj",
-        "mlp.experts.down_proj",
-        "mlp.shared_expert.gate_proj.weight",
-        "mlp.shared_expert.up_proj.weight",
-        "mlp.shared_expert.down_proj.weight",
-        "mlp.shared_expert_gate.weight",
-    )
-    linear_suffixes = (
-        "linear_attn.in_proj_qkv.weight",
-        "linear_attn.in_proj_z.weight",
-        "linear_attn.in_proj_a.weight",
-        "linear_attn.in_proj_b.weight",
-        "linear_attn.conv1d.weight",
-        "linear_attn.A_log",
-        "linear_attn.dt_bias",
-        "linear_attn.norm.weight",
-        "linear_attn.out_proj.weight",
-    )
-    full_suffixes = (
-        "self_attn.q_proj.weight",
-        "self_attn.k_proj.weight",
-        "self_attn.v_proj.weight",
-        "self_attn.o_proj.weight",
-        "self_attn.q_norm.weight",
-        "self_attn.k_norm.weight",
-    )
-    for i, layer_type in enumerate(layer_types):
-        prefix = f"model.language_model.layers.{i}."
-        keys.add(prefix + "input_layernorm.weight")
-        keys.add(prefix + "post_attention_layernorm.weight")
-        keys.update(prefix + suffix for suffix in mlp_suffixes)
-        suffixes = (
-            full_suffixes
-            if layer_type == "full_attention"
-            else linear_suffixes
-        )
-        keys.update(prefix + suffix for suffix in suffixes)
-    return keys
+    return set(_expected_text_shapes(layer_types))
+
+
+def _read_tensor_shapes(
+        checkpoint_path: str,
+        weight_map: dict[str, str],
+        tensor_names: set[str],
+) -> dict[str, tuple[int, ...]]:
+    from safetensors import safe_open
+
+    shapes = {}
+    with ExitStack() as stack:
+        readers = {
+            shard: stack.enter_context(
+                safe_open(
+                    os.path.join(checkpoint_path, shard),
+                    framework="pt",
+                    device="cpu",
+                )
+            )
+            for shard in set(weight_map[name] for name in tensor_names)
+        }
+        for name in tensor_names:
+            shapes[name] = tuple(
+                readers[weight_map[name]].get_slice(name).get_shape())
+    return shapes
 
 
 def validate_qwen36_moe_checkpoint(checkpoint_path: str) -> dict[str, Any]:
@@ -139,6 +188,17 @@ def validate_qwen36_moe_checkpoint(checkpoint_path: str) -> dict[str, Any]:
         actual = text_config.get(name)
         if actual != expected:
             mismatches.append(f"{name}={actual!r} (expected {expected!r})")
+    rope_parameters = text_config.get("rope_parameters")
+    if not isinstance(rope_parameters, dict):
+        mismatches.append(
+            "rope_parameters is missing or is not an object")
+    else:
+        for name, expected in _EXPECTED_ROPE_PARAMETERS.items():
+            actual = rope_parameters.get(name)
+            if actual != expected:
+                mismatches.append(
+                    f"rope_parameters.{name}={actual!r} "
+                    f"(expected {expected!r})")
     layer_types = tuple(text_config.get("layer_types") or ())
     if layer_types != _EXPECTED_LAYER_TYPES:
         mismatches.append(
@@ -188,6 +248,23 @@ def validate_qwen36_moe_checkpoint(checkpoint_path: str) -> dict[str, Any]:
             "Qwen3.6-35B-A3B checkpoint has missing or empty shards: "
             + preview)
 
+    expected_shapes = _expected_text_shapes(layer_types)
+    expected_shapes.update(_expected_mtp_shapes())
+    actual_shapes = _read_tensor_shapes(
+        checkpoint_path, weight_map, set(expected_shapes))
+    shape_mismatches = [
+        f"{name}={actual_shapes[name]!r} (expected {expected!r})"
+        for name, expected in sorted(expected_shapes.items())
+        if actual_shapes[name] != expected
+    ]
+    if shape_mismatches:
+        preview = "; ".join(shape_mismatches[:8])
+        if len(shape_mismatches) > 8:
+            preview += f"; ... ({len(shape_mismatches)} mismatched)"
+        raise ValueError(
+            "Qwen3.6-35B-A3B checkpoint tensor shape mismatches: "
+            + preview)
+
     return {
         "checkpoint_path": checkpoint_path,
         "text_tensor_count": len(required_text),
@@ -209,12 +286,16 @@ class Qwen36MoeTextFrontendRtx(Nexn2TorchFrontendRtx):
                  device: str = "cuda:0",
                  max_seq: int = 2048,
                  quant: str = "nvfp4",
-                 kernelized: bool = False,
+                 kernelized: bool = True,
                  quant_scope: str = "experts") -> None:
         if quant != "nvfp4":
             raise NotImplementedError(
                 f"quant={quant!r} is not implemented; only 'nvfp4' is "
                 "supported")
+        if not kernelized:
+            raise NotImplementedError(
+                "Qwen3.6-35B-A3B text only supports kernelized=True with "
+                "runtime NVFP4 conversion")
         contract = validate_qwen36_moe_checkpoint(checkpoint_path)
         super().__init__(
             checkpoint_path,
@@ -228,9 +309,6 @@ class Qwen36MoeTextFrontendRtx(Nexn2TorchFrontendRtx):
 
     def generate(self, max_new_tokens: int, *, do_sample: bool = False):
         """Generate tokens with the shared qwen3_5_moe CUDA Graph path."""
-        if not self._kernelized:
-            return super().generate(
-                max_new_tokens=max_new_tokens, do_sample=do_sample)
         if self._prompt_ids is None:
             raise ValueError("call set_prompt(...) before generate()")
         if do_sample:

@@ -19,12 +19,14 @@ decode are not part of this interface.
 | GPU memory | 32 GB |
 | Framework | PyTorch |
 | Runtime quantization | NVFP4 |
-| Build flag | `-DFLASHRT_ENABLE_QWEN35MOE=ON` |
+| Build flags | `-DGPU_ARCH=120 -DFLASHRT_ENABLE_QWEN35MOE=ON` |
 
 Configure and build the gated `qwen3_5_moe` kernels:
 
 ```bash
-cmake -S . -B build -DFLASHRT_ENABLE_QWEN35MOE=ON
+cmake -S . -B build \
+  -DGPU_ARCH=120 \
+  -DFLASHRT_ENABLE_QWEN35MOE=ON
 cmake --build build -j
 pip install -e ".[torch]"
 ```
@@ -40,7 +42,6 @@ frontend = Qwen36MoeTextFrontendRtx(
     "/models/Qwen3.6-35B-A3B",
     device="cuda:0",
     max_seq=4096,
-    kernelized=True,
     quant_scope="experts",
 )
 frontend.set_prompt("Explain why deterministic reductions matter.")
@@ -65,14 +66,22 @@ The direct frontend is intentional. `flash_rt.load_model()` wraps VLA models
 with a `predict(images, ...)` API and therefore redirects
 `config="qwen36_moe"` to the class above.
 
+The frontend defaults to `kernelized=True`. Setting `kernelized=False` is
+rejected because it would select the parent Transformers reference path, which
+loads the complete multimodal BF16 model rather than this text-only NVFP4
+runtime.
+
 ## Checkpoint contract
 
 Before allocating GPU memory, the frontend checks:
 
-- the exact 40-layer `qwen3_5_moe` text geometry;
+- the exact 40-layer `qwen3_5_moe` text geometry, including MoE widths,
+  convolution width, gated attention, normalization epsilon, and RoPE
+  parameters;
 - the 30 linear-attention / 10 full-attention schedule;
-- all 693 text-backbone tensors consumed by the shared pipeline;
-- all 19 official MTP tensors;
+- the exact shapes of all 693 text-backbone tensors consumed by the shared
+  pipeline;
+- the exact shapes of all 19 official MTP tensors;
 - every safetensors shard referenced by the index.
 
 Extra vision tensors are allowed and ignored by this text-only entry. The
@@ -113,9 +122,10 @@ test. Performance and precision numbers must be measured on Qwen3.6 weights;
 Nex-N2-mini measurements are not interchangeable even though the compute
 pipeline is shared.
 
-The optional real-model test loads the checkpoint, checks finite logits, and
-compares cold and warm CUDA Graph generation with an official Transformers
-BF16 greedy-token fixture:
+The optional GPU suite checks the shared weighted-sum reducer against the
+former Torch reduction, repeats it eagerly and through CUDA Graph replay, then
+loads the checkpoint, checks finite logits, and compares cold and warm CUDA
+Graph generation with an official Transformers BF16 greedy-token fixture:
 
 ```bash
 FLASHRT_QWEN36_MOE_CKPT_DIR=/models/Qwen3.6-35B-A3B \
@@ -155,7 +165,8 @@ greedy sequences were token-exact for 16 generated tokens on all four prompts.
 ## Limitations
 
 - Text only; the vision tower is not loaded.
-- Greedy decode only on the kernelized path.
+- The kernelized runtime NVFP4 path is required.
+- Greedy decode only.
 - The MTP tensors are validated but not loaded, so speculative decode is not
   enabled.
 - Only the BF16 source checkpoint with runtime NVFP4 conversion is supported.
