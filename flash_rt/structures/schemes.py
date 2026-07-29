@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 from typing import Mapping, Sequence
 
 __all__ = ["PointStat", "Decision", "QuantScheme", "Fp8Static",
-           "NoQuant", "W8A16Decode", "W4A16Decode",
+           "NoQuant", "W8A16Decode", "W4A16Decode", "Nvfp4Awq",
            "register", "get", "names", "resolve_auto", "validate_request"]
 
 #: statistics the collector can currently execute. Granularities other
@@ -79,11 +79,19 @@ class Decision:
     is excluded from FP8 seam negotiation — a chain shares one scale and
     one wire dtype, and a member in another format has neither. An
     unknown format fails loudly at bind time.
+
+    ``params`` carries per-seam recipe parameters for the routed format
+    (an algorithm's ``alpha``, clamp bounds, recipe name). They are
+    *values of the decision*, handed to the impl at bind and recorded in
+    the receipt — never read from environment variables, and never the
+    bytes: how a parameterised algorithm is executed stays with the
+    impl.
     """
 
     keep_host: tuple[str, ...] = ()
     reasons: Mapping[str, str] = field(default_factory=dict)
     formats: Mapping[str, str] = field(default_factory=dict)
+    params: Mapping[str, Mapping[str, object]] = field(default_factory=dict)
 
 
 class QuantScheme:
@@ -187,6 +195,59 @@ class W4A16Decode(W8A16Decode):
     _format = "w4a16_static"
 
 
+class Nvfp4Awq(QuantScheme):
+    """NVFP4 with activation-aware per-input-channel balance.
+
+    Requests per-channel amax at every calibration point (the collector
+    measures it; :func:`validate_request` admits it), and routes
+    ``decoder_ffn`` seams to the ``nvfp4_awq`` impl variant with the
+    recipe parameters as the decision's payload. The impl consumes the
+    channel statistics and calls the one shared algorithm
+    (``flash_rt.core.quantization.fit_input_channel_balance``) at bind;
+    this scheme owns the *decision*, not the fold and not the bytes.
+
+    ``recipe="balance"`` is the production formula validated on Pi0.5
+    (Thor FP4) and Motus video FFN — activation-only channel balance.
+    ``"smoothquant"`` names the legacy activation/weight ratio and is
+    accepted for experiments; there is no environment-variable fork.
+    Other structures stay at host precision until their NVFP4 variants
+    land — extending the routing is a change to this method, in one
+    place.
+    """
+
+    name = "nvfp4_awq"
+
+    def __init__(self, alpha: float = 0.5,
+                 clamp: tuple[float, float] = (0.25, 4.0),
+                 recipe: str = "balance") -> None:
+        if recipe not in ("balance", "smoothquant"):
+            raise ValueError(f"unknown recipe {recipe!r}; "
+                             f"known: balance, smoothquant")
+        self.alpha = float(alpha)
+        self.clamp = (float(clamp[0]), float(clamp[1]))
+        self.recipe = recipe
+
+    def statistics(self, points: Sequence) -> dict[str, PointStat]:
+        return {f"{p.path}|{p.name}": PointStat("amax", "channel")
+                for p in points}
+
+    def decide(self, report: Mapping[str, Mapping[str, float]]) -> Decision:
+        formats, params, keep = {}, {}, []
+        payload = {"alpha": self.alpha, "clamp": list(self.clamp),
+                   "recipe": self.recipe}
+        for seam_path, pts in report.items():
+            if any(k.endswith("|act_after_mul") for k in pts):
+                formats[seam_path] = "nvfp4_awq"
+                params[seam_path] = dict(payload)
+            else:
+                keep.append(seam_path)
+        return Decision(keep_host=tuple(keep),
+                        reasons={p: "nvfp4_awq routes decoder_ffn only "
+                                    "in this version"
+                                 for p in keep},
+                        formats=formats, params=params)
+
+
 class NoQuant(QuantScheme):
     """Quantisation off: every quantised seam stays at host precision.
 
@@ -272,3 +333,4 @@ register("fp8_static_keep_outliers", Fp8Static(keep_outliers=20.0))
 register("w8a16_decode", W8A16Decode())
 register("w4a16_decode", W4A16Decode())
 register("none", NoQuant())
+register("nvfp4_awq", Nvfp4Awq())

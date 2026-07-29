@@ -24,17 +24,20 @@ class _Seam:
 def test_registered_binder_is_consulted_first():
     calls = {}
 
-    def binder(model, seam, cap, *, points, fmt):
+    def binder(model, seam, cap, *, points, fmt, fmt_params):
         calls["seam"] = seam.path
         calls["fmt"] = fmt
+        calls["fmt_params"] = fmt_params
         return "bound-sentinel"
 
     autobuild.register_structure_binder("test_structure", binder)
     try:
         out = autobuild._bind_auto(None, _Seam(), {}, None, {}, False,
-                                   points=None, fmt="some_format")
+                                   points=None, fmt="some_format",
+                                   fmt_params={"alpha": 0.5})
         assert out == "bound-sentinel"
-        assert calls == {"seam": "layers.0.thing", "fmt": "some_format"}
+        assert calls == {"seam": "layers.0.thing", "fmt": "some_format",
+                         "fmt_params": {"alpha": 0.5}}
     finally:
         autobuild._STRUCTURE_BINDERS.pop("test_structure", None)
 

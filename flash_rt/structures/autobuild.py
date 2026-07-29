@@ -63,7 +63,14 @@ _STRUCTURE_BINDERS: dict[str, Any] = {}
 
 
 def register_structure_binder(structure: str, binder) -> None:
-    """Route ``structure`` seams to ``binder`` (last write wins)."""
+    """Route ``structure`` seams to ``binder`` (last write wins).
+
+    A binder is called as ``binder(model, seam, cap, *, points, fmt,
+    fmt_params)`` — ``points`` is the reduced collector, ``fmt`` the
+    scheme's format routing for this seam (or ``None`` for the default),
+    ``fmt_params`` the decision's recipe payload for that format (or
+    ``None``).
+    """
     _STRUCTURE_BINDERS[structure] = binder
 
 
@@ -338,8 +345,12 @@ def auto_swaps(
         say(f"scheme {scheme_note['name']}: {len(kept)} seam(s) kept at "
             f"host precision")
     formats: dict[str, str] = dict(decision.formats or {})
+    fmt_params: dict[str, Any] = dict(getattr(decision, "params", None) or {})
     if formats:
         scheme_note["formats"] = dict(sorted(formats.items()))
+        if fmt_params:
+            scheme_note["params"] = {p: dict(v) for p, v
+                                     in sorted(fmt_params.items())}
         say(f"scheme {scheme_note['name']}: {len(formats)} seam(s) "
             f"routed to a non-default format")
 
@@ -463,7 +474,8 @@ def auto_swaps(
             try:
                 bound = _bind_auto(model, seam, cap, plan, act_scales,
                                    negotiate_fp8, points=collector,
-                                   fmt=formats.get(seam.path))
+                                   fmt=formats.get(seam.path),
+                                   fmt_params=fmt_params.get(seam.path))
             except (ValueError, RuntimeError) as refusal:
                 plan.notes.setdefault("refused", []).append(
                     (seam.path, str(refusal)[:80]))
@@ -697,7 +709,7 @@ def _alias_kv_region(plan, path: str, sublayer) -> None:
 
 
 def _bind_auto(model, seam, cap, plan, act_scales, negotiate_fp8,
-               points=None, fmt=None):
+               points=None, fmt=None, fmt_params=None):
     """Route one seam to its impl with the calibrated scales.
 
     ``points`` is the reduced collector: every scale an impl needs is one
@@ -710,6 +722,8 @@ def _bind_auto(model, seam, cap, plan, act_scales, negotiate_fp8,
     structure's default impl; a named format binds that variant instead,
     and a name with no variant for this structure fails loudly — the
     scheme author's error surfaces at bind time, not as accuracy.
+    ``fmt_params`` is the decision's recipe payload for that format
+    (algorithm parameters, never bytes), handed to the variant's binder.
     """
     from .impls.decoder_ffn import fp8_static as ffn_impl
     from .impls.vision_ffn import fp8_static as vis_impl
@@ -720,7 +734,8 @@ def _bind_auto(model, seam, cap, plan, act_scales, negotiate_fp8,
 
     custom = _STRUCTURE_BINDERS.get(seam.structure)
     if custom is not None:
-        return custom(model, seam, cap, points=points, fmt=fmt)
+        return custom(model, seam, cap, points=points, fmt=fmt,
+                      fmt_params=fmt_params)
 
     if fmt and seam.structure != "decoder_ffn":
         raise ValueError(f"scheme routed {seam.structure} to format "
