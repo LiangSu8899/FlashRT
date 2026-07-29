@@ -37,7 +37,11 @@ import torch
 from .. import hub_kernel
 from ...guard import PROCEED, GuardedSeam
 
-SUPPORTED_HEAD_DIMS = (64, 96, 128, 256)
+# Hub FA2 keeps logical D and dispatches into native 64/96/128/256
+# instantiations. The structure must admit the same vector-aligned envelope;
+# otherwise valid GROOT D48/D72 and VL vision D80 captures are rejected before
+# the package can apply its internal bucket mapping.
+SUPPORTED_HEAD_DIMS = tuple(range(8, 257, 8))
 
 
 @dataclass
