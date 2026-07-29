@@ -1,12 +1,10 @@
 """attention_core — run attention on the FlashRT FA2 kernel.
 
-A fused attention kernel wants contiguous keys and values; hosts hand
-it an additive mask instead, and a mask that blocks a run of positions
-in the middle of the sequence has no equivalent the kernel accepts. The
-structure resolves that at bind time rather than per call: it reads the
-host's own mask, and when the blocked positions form one contiguous run
-it packs the surviving keys and values into a compact buffer. What is
-left is a dense attention the kernel runs directly.
+A fused attention kernel wants contiguous keys and values. This module
+provides two executable forms: a cadence-aware packed-KV form for decoder
+loops, and a stateless dense form for hosts that supply complete Q/K/V on
+every call. Both reduce supported masks to contiguous allowed key ranges
+before dispatching one dense attention call.
 
 The packed prefix (everything before the blocked run) belongs to a
 slower cadence — it is the encoder's output for the current
@@ -229,6 +227,161 @@ class PackedKVAttention(GuardedSeam, torch.nn.Module):
             q, self.packed_k, self.packed_v, out=sc.out,
             softmax_lse=sc.lse, workspace=sc.workspace,
             softmax_scale=scale)
+
+
+class DenseAttention(GuardedSeam, torch.nn.Module):
+    """FA2 replacement for an ordinary dense SDPA call.
+
+    Unlike :class:`PackedKVAttention`, this form owns no observation-cadence
+    state.  Every call receives the complete Q/K/V tensors, so it is suitable
+    for Diffusers self- and cross-attention and remains correct when the
+    conditioning changes between graph replays.
+
+    Inputs and outputs use the host SDPA layout ``[B, H, S, D]``.  The package
+    consumes ``[B, S, H, D]``; reversing the host's projection view is normally
+    already contiguous and therefore does not materialise a transpose.
+    """
+
+    def __init__(
+        self, q_shape, kv_shape, dtype: torch.dtype, device,
+        allowed_ranges=None,
+    ):
+        super().__init__()
+        b, heads, seq_q, head_dim = q_shape
+        kb, kv_heads, seq_kv, kv_dim = kv_shape
+        if kb != b or kv_dim != head_dim:
+            raise ValueError(
+                "attention_core dense: Q and KV batch/head dimensions differ")
+        if heads % kv_heads:
+            raise ValueError(
+                "attention_core dense: query heads must be divisible by "
+                "KV heads")
+        self.q_shape = tuple(q_shape)
+        self.kv_shape = tuple(kv_shape)
+        self.allowed_ranges = tuple(allowed_ranges or ())
+        self._kfa = hub_kernel("flashrt/fa2-seqused-runtime", ">=1")
+        q_sample = torch.empty(
+            b, seq_q, heads, head_dim, device=device, dtype=dtype)
+        packed_seq = (
+            sum(hi - lo for lo, hi in self.allowed_ranges)
+            if self.allowed_ranges else seq_kv)
+        kv_sample = torch.empty(
+            b, packed_seq, kv_heads, head_dim, device=device, dtype=dtype)
+        if self.allowed_ranges:
+            self.register_buffer("packed_k", torch.empty_like(kv_sample))
+            self.register_buffer("packed_v", torch.empty_like(kv_sample))
+        out, lse = self._kfa.allocate_outputs(q_sample)
+        self._scratch = _Scratch(
+            out, lse, self._kfa.allocate_workspace(q_sample, kv_sample))
+        self._frt_arm(
+            dtypes=(dtype,), device=q_sample.device, k=int(head_dim),
+            rows=int(b * heads * seq_q))
+
+    def forward(self, query, key, value, *, scale=None):
+        admitted = self._frt_admit(query)
+        if admitted is not PROCEED:
+            return admitted
+        if tuple(query.shape) != self.q_shape:
+            raise ValueError(
+                "attention_core dense: query shape moved from "
+                f"{self.q_shape} to {tuple(query.shape)}")
+        if tuple(key.shape) != self.kv_shape or value.shape != key.shape:
+            raise ValueError(
+                "attention_core dense: key/value shape moved from "
+                f"{self.kv_shape} to {tuple(key.shape)}/{tuple(value.shape)}")
+        q = query.transpose(1, 2)
+        k = key.transpose(1, 2)
+        v = value.transpose(1, 2)
+        if not q.is_contiguous():
+            q = q.contiguous()
+        if self.allowed_ranges:
+            offset = 0
+            for lo, hi in self.allowed_ranges:
+                length = hi - lo
+                self.packed_k[:, offset:offset + length].copy_(k[:, lo:hi])
+                self.packed_v[:, offset:offset + length].copy_(v[:, lo:hi])
+                offset += length
+            k, v = self.packed_k, self.packed_v
+        else:
+            if not k.is_contiguous():
+                k = k.contiguous()
+            if not v.is_contiguous():
+                v = v.contiguous()
+        sc = self._scratch
+        out = self._kfa.forward_static(
+            q, k, v, out=sc.out, softmax_lse=sc.lse,
+            workspace=sc.workspace, softmax_scale=scale)
+        return out.transpose(1, 2)
+
+
+def _allowed_ranges(mask):
+    if mask is None:
+        return ()
+    rows = mask.reshape(-1, mask.shape[-1])
+    first = rows[0]
+    if mask.dtype == torch.bool:
+        allowed = first
+        if not bool((rows == first).all()):
+            raise ValueError(
+                "attention_core dense: mask differs per query row")
+    else:
+        allowed = ~((first.float() < -1e5) | first.float().isneginf())
+        other = ~((rows.float() < -1e5) | rows.float().isneginf())
+        if not bool((other == allowed).all()):
+            raise ValueError(
+                "attention_core dense: mask differs per query row")
+    indices = allowed.nonzero().flatten().tolist()
+    if not indices:
+        raise ValueError("attention_core dense: mask permits no keys")
+    ranges = []
+    for index in indices:
+        if not ranges or index != ranges[-1][1]:
+            ranges.append([index, index + 1])
+        else:
+            ranges[-1][1] += 1
+    if len(ranges) > 2:
+        return None
+    if len(ranges) == 1 and ranges[0] == [0, mask.shape[-1]]:
+        return ()
+    return tuple((lo, hi) for lo, hi in ranges)
+
+
+def bind_dense_attention(captures):
+    """Bind one stateless dense FA2 core from repeated host captures."""
+    if not captures:
+        raise ValueError("attention_core dense: no captures")
+    first = captures[0]
+    query, key, value = first["q"], first["key"], first["value"]
+    head_dim = query.shape[-1]
+    if head_dim not in SUPPORTED_HEAD_DIMS:
+        return None
+    allowed_ranges = _allowed_ranges(first.get("mask"))
+    if allowed_ranges is None:
+        return None
+    expected = (tuple(query.shape), tuple(key.shape), tuple(value.shape),
+                query.dtype, key.dtype, value.dtype)
+    for capture in captures[1:]:
+        got = (
+            tuple(capture["q"].shape),
+            tuple(capture["key"].shape),
+            tuple(capture["value"].shape),
+            capture["q"].dtype,
+            capture["key"].dtype,
+            capture["value"].dtype,
+        )
+        if got != expected:
+            raise ValueError(
+                "attention_core dense: shape, dtype, or mask moved within "
+                f"one calibration call: {expected} -> {got}")
+        if _allowed_ranges(capture.get("mask")) != allowed_ranges:
+            raise ValueError(
+                "attention_core dense: mask pattern moved within one "
+                "calibration call")
+    if not (query.dtype == key.dtype == value.dtype):
+        raise ValueError("attention_core dense: Q/K/V dtypes differ")
+    return DenseAttention(
+        query.shape, key.shape, query.dtype, query.device,
+        allowed_ranges=allowed_ranges)
 
 
 def bind_attention_core(captures, *, prefix_static_rtol: float = 1e-3):

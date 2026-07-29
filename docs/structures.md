@@ -229,6 +229,12 @@ because K/V consume encoder features on another cadence. An intervening
 positional module refuses the chain. Diffusers-style `to_out[0]` projections
 are discovered as ordinary `linear_proj` seams, but retain the host path when
 their measured small-M bias form is outside the profitable work band.
+Diffusers `AttnProcessor2_0` sites use the same `attention_core` structure:
+the family adapter preserves the host projections and output contract, while
+the stateless core consumes complete Q/K/V on every call. An unmasked dense
+call is passed directly; a mask with one or two contiguous allowed key ranges
+is packed explicitly. More fragmented masks are refused instead of being
+approximated.
 
 `auto_swaps` builds and does not judge. If you use it, you own the gate —
 and read the ledger, or you have not checked that what you measured was on.
