@@ -106,7 +106,7 @@ def resolve(seam: Any, spec_points: Sequence[str]) -> list[Point]:
         # ``cond`` is not an amax point: the step table is captured content,
         # not a statistic, and is collected by the conditioning hook
         put("x")
-    elif structure == "decoder_block":
+    elif structure in ("decoder_block", "modnorm_qkv_chain"):
         pass                      # composed; its sublayers carry the points
 
     unplaced = [p for p in spec_points if p not in placed

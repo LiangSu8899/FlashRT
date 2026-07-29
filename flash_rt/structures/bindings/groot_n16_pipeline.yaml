@@ -88,7 +88,8 @@ coverage:
       classification: structure
       seam: "GrootDiT._run_step alternating self/cross blocks"
       structures: [decoder_ffn, qkv_pack, qk_norm_rope, attention_core,
-                   adaln_producer, linear_proj, norm_fused]
+                   adaln_producer, modnorm_qkv_chain, linear_proj,
+                   norm_fused]
     - name: euler_update
       stage: action_denoise
       classification: state_region

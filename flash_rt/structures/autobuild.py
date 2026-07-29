@@ -160,7 +160,8 @@ def auto_swaps(
     structures: tuple[str, ...] = ("decoder_ffn", "vision_ffn",
                                    "qkv_pack", "adaln_producer",
                                    "linear_proj", "norm_fused",
-                                   "attention_core", "decoder_block"),
+                                   "attention_core", "decoder_block",
+                                   "modnorm_qkv_chain"),
     negotiate_fp8: bool = True,
     prefix_cadence: bool = False,
     observations: Iterable[Any] | None = None,
@@ -395,6 +396,10 @@ def auto_swaps(
                 by_parent.setdefault(layer, {})[slot] = seam
             elif seam.structure == "qkv_pack":
                 by_parent.setdefault(layer, {})["pack"] = seam
+            elif (seam.structure == "linear_proj"
+                  and seam.proj_attr in ("q_proj", "to_q",
+                                         "add_q_proj")):
+                by_parent.setdefault(layer, {})["query"] = seam
             elif seam.structure == "decoder_ffn":
                 by_parent.setdefault(layer, {})["ffn"] = seam
         # the chain wins at small M (denoise): fp8 is bandwidth-bound and
@@ -403,7 +408,8 @@ def auto_swaps(
         # prefill region is where the triton fp8 codegen chokes. Qualify
         # on the calibrated row count, not on host names.
         dev = next(model.parameters()).device
-        blocks = {s.path for s in seams if s.structure == "decoder_block"}
+        blocks = {s.path for s in seams if s.structure in (
+            "decoder_block", "modnorm_qkv_chain")}
         for lay, g in by_parent.items():
             # the attention pack is always negotiated. The FFN chain is
             # negotiated only where a decoder_block owns the boundary,
@@ -426,7 +432,8 @@ def auto_swaps(
             # was already gated this way; the attention chain was not.
             if lay not in blocks:
                 continue
-            pairs = [("producer", "pack"), ("producer_ffn", "ffn")]
+            pairs = [("producer", "pack"), ("producer", "query"),
+                     ("producer_ffn", "ffn")]
             keep = {}
             for p_slot, c_slot in pairs:
                 if p_slot not in g or c_slot not in g:
@@ -456,6 +463,7 @@ def auto_swaps(
     handled: set[str] = set()
     for lay, g in negotiated.items():
         for p_slot, c_slot in (("producer", "pack"),
+                               ("producer", "query"),
                                ("producer_ffn", "ffn")):
             if p_slot not in g or c_slot not in g:
                 continue
@@ -935,6 +943,16 @@ def _bind_negotiated(model, p_seam, k_seam, p_cap, points, scale, rows,
             original=consumer)
         swaps[k_seam.path] = bound
         return swaps
+    if k_seam.structure == "linear_proj":
+        from .impls.linear_proj import fp8_static as proj_impl
+        swaps[k_seam.path] = proj_impl.bind_proj_seam(
+            seam_weights(model, k_seam),
+            input_scale=float(scale.item()),
+            row_profile=points.row_profile(k_seam.path, "x"),
+            original=consumer,
+            in_dtype="fp8_static",
+        )
+        return swaps
     mods = [getattr(consumer, a) for a in k_seam.pack_attrs]
     parts = bind_qkv_pack(mods, scale, rows=rows,
                           in_dtype="fp8_static")
@@ -1028,7 +1046,8 @@ def _stream_key(pairs) -> str:
 def _layer_of(path: str) -> str:
     """The parent layer key: a.layers.7.self_attn -> a.layers.7."""
     import re
-    m = re.search(r"(.*\.layers\.\d+)\.", path)
+    m = re.search(
+        r"((?:.*\.)?(?:layers|transformer_blocks)\.\d+)\.", path)
     return m.group(1) if m else path.rsplit(".", 1)[0]
 
 

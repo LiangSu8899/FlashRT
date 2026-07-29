@@ -221,6 +221,15 @@ the consumer was bound for. It judges accuracy with the metric the host's
 output type deserves, checks the ledger, and settles latency by timing
 both arms in every round.
 
+`modnorm_qkv_chain` is the data-flow qualification for the common DiT/VLA
+case behind that negotiation. It admits a conditional LayerNorm only when
+its output feeds attention projections directly: self-attention binds the
+shared Q/K/V pack, while cross-attention binds only the query projection
+because K/V consume encoder features on another cadence. An intervening
+positional module refuses the chain. Diffusers-style `to_out[0]` projections
+are discovered as ordinary `linear_proj` seams, but retain the host path when
+their measured small-M bias form is outside the profitable work band.
+
 `auto_swaps` builds and does not judge. If you use it, you own the gate —
 and read the ledger, or you have not checked that what you measured was on.
 

@@ -17,8 +17,9 @@ import torch
 from torch import nn
 
 _DECODER_PROJ = ("gate_proj", "up_proj", "down_proj")
-_VISION_PROJ = (("fc1", "fc2"), ("linear_fc1", "linear_fc2"))
-_NORM_ATTRS = ("post_attention_layernorm", "layer_norm2", "norm2")
+_VISION_PROJ = (("fc1", "fc2"), ("linear_fc1", "linear_fc2"),
+                ("net.0.proj", "net.2"))
+_NORM_ATTRS = ("post_attention_layernorm", "layer_norm2", "norm2", "norm3")
 _ATTN_PROJ = (("q_proj", "k_proj", "v_proj", "o_proj"),
               ("q_proj", "k_proj", "v_proj", "out_proj"),
               ("to_q", "to_k", "to_v", "to_out"),
@@ -71,6 +72,65 @@ def _has_cond_forward(module: nn.Module) -> bool:
     # (self is bound out of module.forward already) x + one more positional
     positional = [p for p in params if p not in ("args", "kwargs")]
     return len(positional) >= 2
+
+
+def _nested_module(module: nn.Module, path: str) -> nn.Module | None:
+    """Resolve a relative child path, including Sequential indices."""
+    node = module
+    try:
+        for part in path.split("."):
+            node = node[int(part)] if part.isdigit() else getattr(node, part)
+    except (AttributeError, IndexError, KeyError, TypeError):
+        return None
+    return node if isinstance(node, nn.Module) else None
+
+
+def _is_modnorm_qkv_chain(
+    module: nn.Module,
+) -> tuple[int, int, str] | None:
+    """Recognise a direct conditional-norm -> sibling-QKV data flow.
+
+    The block is admitted only when no positional module sits between the
+    modulated norm and the projections.  That is the property required by
+    the shared FP8 wire; class and model names are deliberately irrelevant.
+    """
+    norm = getattr(module, "norm1", None)
+    attn = getattr(module, "attn1", None)
+    if not (isinstance(norm, nn.Module) and _has_cond_forward(norm)
+            and isinstance(attn, nn.Module)):
+        return None
+    if getattr(module, "pos_embed", None) is not None:
+        return None
+    q_proj = getattr(attn, "to_q", None)
+    if not isinstance(q_proj, nn.Linear):
+        return None
+    dim = q_proj.in_features
+    k_proj, v_proj = getattr(attn, "to_k", None), getattr(attn, "to_v", None)
+    fanout = "q_only"
+    if (isinstance(k_proj, nn.Linear) and isinstance(v_proj, nn.Linear)
+            and k_proj.in_features == dim and v_proj.in_features == dim):
+        fanout = "qkv"
+    cond = next((getattr(norm, attr, None) for attr in _COND_PROJ_ATTRS
+                 if isinstance(getattr(norm, attr, None), nn.Linear)), None)
+    if cond is None or cond.out_features != 2 * dim:
+        return None
+    return dim, cond.in_features, fanout
+
+
+def _projection_child(
+    module: nn.Module, attr: str,
+) -> tuple[str, nn.Linear] | None:
+    """One attention projection, including Diffusers' ``to_out[0]``."""
+    direct = getattr(module, attr, None)
+    if isinstance(direct, nn.Linear):
+        return attr, direct
+    if attr not in ("to_out", "to_add_out"):
+        return None
+    try:
+        first = direct[0]
+    except (IndexError, KeyError, TypeError):
+        return None
+    return (attr + ".0", first) if isinstance(first, nn.Linear) else None
 
 
 @dataclass
@@ -235,6 +295,18 @@ def discover(
                          "norm": "adaln_rms" if gated else "rms",
                          "ffn_entry": "fp8_static"},
                 family=family, layer_index=idx))
+        if "modnorm_qkv_chain" in structures:
+            chain_dims = _is_modnorm_qkv_chain(module)
+            if chain_dims is not None:
+                dim, cond_dim, fanout = chain_dims
+                family, idx = _family_key(path)
+                seams.append(Seam(
+                    structure="modnorm_qkv_chain", path=path,
+                    parent_path=parent_path, norm_attr="norm1",
+                    dims={"D": dim, "C": cond_dim},
+                    variant={"wire_dtype": "fp8_static",
+                             "fanout": fanout},
+                    family=family, layer_index=idx))
         if "qkv_pack" in structures:
             for group in _QKV_PACK:
                 projs = [getattr(module, a, None) for a in group]
@@ -288,10 +360,11 @@ def discover(
                     family=family, layer_index=idx))
         if "linear_proj" in structures:
             for group in _ATTN_PROJ:
-                projs = [getattr(module, a, None) for a in group]
-                if not all(isinstance(p, nn.Linear) for p in projs):
+                resolved = [_projection_child(module, attr)
+                            for attr in group]
+                if not all(item is not None for item in resolved):
                     continue
-                for attr, proj in zip(group, projs):
+                for attr, proj in resolved:
                     if proj.weight.numel() < _PROJ_WEIGHT_FLOOR:
                         continue
                     family, idx = _family_key(path)
@@ -307,8 +380,8 @@ def discover(
                         family=family + "." + attr, layer_index=idx))
         if "vision_ffn" in structures:
             for fc1_attr, fc2_attr in _VISION_PROJ:
-                fc1 = getattr(module, fc1_attr, None)
-                fc2 = getattr(module, fc2_attr, None)
+                fc1 = _nested_module(module, fc1_attr)
+                fc2 = _nested_module(module, fc2_attr)
                 if not (isinstance(fc1, nn.Linear)
                         and isinstance(fc2, nn.Linear)):
                     continue
@@ -363,10 +436,21 @@ def seam_weights(model: nn.Module, seam: Seam) -> dict[str, torch.Tensor]:
             "w_down": module.down_proj.weight.detach().t().contiguous(),
         }
     fc1_attr, fc2_attr = seam.fc_attrs
-    fc1, fc2 = getattr(module, fc1_attr), getattr(module, fc2_attr)
+    fc1, fc2 = _nested_module(module, fc1_attr), _nested_module(
+        module, fc2_attr)
+    norm_weight = getattr(norm, "weight", None)
+    norm_bias = getattr(norm, "bias", None)
+    if norm_weight is None:
+        norm_weight = torch.ones(
+            fc1.in_features, device=fc1.weight.device,
+            dtype=fc1.weight.dtype)
+    if norm_bias is None:
+        norm_bias = torch.zeros(
+            fc1.in_features, device=fc1.weight.device,
+            dtype=fc1.weight.dtype)
     return {
-        "w_norm": norm.weight.detach(),
-        "b_norm": norm.bias.detach(),
+        "w_norm": norm_weight.detach(),
+        "b_norm": norm_bias.detach(),
         "w_fc1": fc1.weight.detach(),
         "b_fc1": fc1.bias.detach(),
         "w_fc2": fc2.weight.detach(),

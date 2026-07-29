@@ -1,8 +1,8 @@
 import torch
 from torch import nn
 
-from flash_rt.structures.autobuild import _seam_key
-from flash_rt.structures.discover import discover
+from flash_rt.structures.autobuild import _layer_of, _seam_key
+from flash_rt.structures.discover import discover, seam_weights
 
 
 class _GatedMlp(nn.Module):
@@ -35,6 +35,40 @@ class _DualPathAttention(nn.Module):
         self.add_k_proj = nn.Linear(512, 128, bias=False)
         self.add_v_proj = nn.Linear(512, 128, bias=False)
         self.to_add_out = nn.Linear(512, 512, bias=False)
+
+
+class _ConditionalNorm(nn.Module):
+    def __init__(self, dim=512):
+        super().__init__()
+        self.linear = nn.Linear(dim, 2 * dim)
+        self.norm = nn.LayerNorm(dim, elementwise_affine=False)
+
+    def forward(self, x, temb=None):
+        scale, shift = self.linear(temb).chunk(2, dim=-1)
+        return self.norm(x) * (1 + scale[:, None]) + shift[:, None]
+
+
+class _DenseGelu(nn.Module):
+    def __init__(self, dim=512):
+        super().__init__()
+        first = nn.Module()
+        first.proj = nn.Linear(dim, 4 * dim)
+        self.net = nn.ModuleList([first, nn.GELU(), nn.Linear(4 * dim, dim)])
+
+
+class _DiffusionBlock(nn.Module):
+    def __init__(self, *, positional=False, cross=False):
+        super().__init__()
+        self.norm1 = _ConditionalNorm()
+        self.norm3 = nn.LayerNorm(512, elementwise_affine=False)
+        self.attn1 = nn.Module()
+        self.attn1.to_q = nn.Linear(512, 512)
+        kv_dim = 768 if cross else 512
+        self.attn1.to_k = nn.Linear(kv_dim, 512)
+        self.attn1.to_v = nn.Linear(kv_dim, 512)
+        self.attn1.to_out = nn.ModuleList([nn.Linear(512, 512)])
+        self.ff = _DenseGelu()
+        self.pos_embed = nn.Identity() if positional else None
 
 
 def test_decoder_ffn_discovery_accepts_its_bias_free_weight_contract():
@@ -77,3 +111,56 @@ def test_dual_path_attention_discovers_profitable_projections_on_both_paths():
         "add_q_proj",
         "to_add_out",
     ]
+
+
+def test_modnorm_qkv_chain_discovers_by_direct_dataflow_slots():
+    host = nn.ModuleDict({"block": _DiffusionBlock()})
+
+    seams = discover(host, structures=("modnorm_qkv_chain",))
+
+    assert [seam.path for seam in seams] == ["block"]
+    assert seams[0].dims == {"D": 512, "C": 512}
+    assert seams[0].variant["fanout"] == "qkv"
+
+
+def test_modnorm_qkv_chain_refuses_an_intervening_positional_module():
+    host = nn.ModuleDict({"block": _DiffusionBlock(positional=True)})
+
+    assert discover(host, structures=("modnorm_qkv_chain",)) == []
+
+
+def test_nested_diffusers_feedforward_is_a_vision_ffn_slice():
+    host = nn.ModuleDict({"block": _DiffusionBlock()})
+
+    seams = discover(host, structures=("vision_ffn",))
+
+    assert [seam.path for seam in seams] == ["block.ff"]
+    assert seams[0].fc_attrs == ("net.0.proj", "net.2")
+    assert seams[0].norm_attr == "norm3"
+    weights = seam_weights(host, seams[0])
+    assert torch.equal(weights["w_norm"], torch.ones(512))
+    assert torch.equal(weights["b_norm"], torch.zeros(512))
+
+
+def test_cross_attention_chain_owns_only_the_query_wire():
+    host = nn.ModuleDict({"block": _DiffusionBlock(cross=True)})
+
+    chain = discover(host, structures=("modnorm_qkv_chain",))
+    packs = discover(host, structures=("qkv_pack",))
+    projections = discover(host, structures=("linear_proj",))
+
+    assert chain[0].variant["fanout"] == "q_only"
+    assert packs == []
+    assert [seam.path for seam in projections] == [
+        "block.attn1.to_q",
+        "block.attn1.to_k",
+        "block.attn1.to_v",
+        "block.attn1.to_out.0",
+    ]
+
+
+def test_transformer_block_layer_key_works_at_root_and_nested_paths():
+    assert _layer_of("transformer_blocks.1.attn1.to_q") == (
+        "transformer_blocks.1")
+    assert _layer_of("head.model.transformer_blocks.1.norm1") == (
+        "head.model.transformer_blocks.1")
