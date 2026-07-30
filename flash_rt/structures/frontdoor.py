@@ -56,7 +56,8 @@ from .swap import AttachHandle as _AttachHandle, attach as _swap_attach
 #: the full catalog, which is what "one call" has to mean
 ALL_STRUCTURES = ("decoder_ffn", "vision_ffn", "qkv_pack", "adaln_producer",
                   "linear_proj", "norm_fused", "attention_core",
-                  "decoder_block", "modnorm_qkv_chain", "cadence_static")
+                  "decoder_block", "modnorm_qkv_chain", "qk_norm_rope",
+                  "cadence_static")
 
 #: structure name per implementation class, for swaps whose path is not
 #: itself a discovered seam (a pack's sibling readers, a composed block's

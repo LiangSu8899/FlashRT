@@ -236,6 +236,16 @@ call is passed directly; a mask with one or two contiguous allowed key ranges
 is packed explicitly. More fragmented masks are refused instead of being
 approximated.
 
+Qwen-style sequence attention composes `qkv_pack` with the per-head GQA
+variant of `qk_norm_rope` when the host exposes compatible Q/K/V projections,
+128-wide per-head Q/K RMSNorm, a valid Q-to-KV head ratio, and pre-expanded
+BF16 rotate-half tables. The adapter consumes the pack's joint output and
+writes contiguous Q/K/V workspaces through
+`flashrt-qkv-cache-rope`; cache mutation remains on the host after this
+stateless boundary. Qualification is capability-based, so Qwen3 and Qwen3-VL
+hosts share the same structure implementation while retaining their own
+attention dispatch function and cache object.
+
 `auto_swaps` builds and does not judge. If you use it, you own the gate —
 and read the ledger, or you have not checked that what you measured was on.
 

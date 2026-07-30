@@ -34,7 +34,7 @@ from typing import Sequence
 import torch
 
 from .. import hub_kernel
-from ...guard import CAST_OK, FP8_ONLY, PROCEED, GuardedSeam
+from ...guard import CAST_OK, FP8_ONLY, PROCEED, GuardRefused, GuardedSeam
 
 _FP8 = torch.float8_e4m3fn
 
@@ -170,9 +170,14 @@ class PackedLinear(GuardedSeam, torch.nn.Module):
         if not 2 <= slots <= len(self.splits):
             raise ValueError(f"qkv_pack: cannot join {slots} sibling(s)")
         self.joint_slots = slots
-        self.packed = torch.empty(
-            self.rows, sum(self.splits), device=self.w8.device,
-            dtype=torch.bfloat16)
+        if not hasattr(self, "packed"):
+            self.register_buffer("packed", torch.empty(
+                self.rows, sum(self.splits), device=self.w8.device,
+                dtype=torch.bfloat16))
+
+    def disable_joint(self) -> None:
+        """Restore the sibling-by-sibling stash contract."""
+        self.joint_slots = 0
 
     def joint(self, x):
         """Run the pack and return the first ``joint_slots`` siblings whole.
@@ -185,6 +190,11 @@ class PackedLinear(GuardedSeam, torch.nn.Module):
         if not self.joint_slots:
             raise ValueError("qkv_pack: this pack has no joint slots")
         flat = x.reshape(-1, x.shape[-1])
+        if flat.shape[0] > self.rows:
+            raise GuardRefused(
+                f"qkv_pack: joint rows {flat.shape[0]} exceed capacity "
+                f"{self.rows}"
+            )
         self._run(flat)
         width = sum(self.splits[:self.joint_slots])
         return self.packed[:flat.shape[0], :width]

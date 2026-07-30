@@ -119,6 +119,14 @@ Before publishing a fast route:
 7. verify detach/rollback restores the host;
 8. report stage costs when cadence changes where work is paid.
 
+A cadence region may be hoisted only when captures from every invocation in
+the fast loop agree under its declared tolerance. Do not prove a cadence by
+calling the candidate module once on a guessed upstream tensor: that can
+freeze a changing self/cross-attention projection, improve the reported
+latency, and silently change the model. If the observed outputs vary, leave
+the region in the host loop until the actual slower-cadence producer boundary
+is represented.
+
 The final configured pipeline, not a sum of kernel microbenchmarks, owns the
 release performance claim. Kernel timings explain a result but do not replace
 the end-to-end gate.

@@ -45,11 +45,17 @@ _FP8_CHAIN_MAX_ROWS = 256  # fp8 producer chain qualifies at denoise
 # registered adapters. Each adapter, given the model and a way to run
 # it, returns (swaps, update) or None (this host is not its family).
 _ATTENTION_ADAPTERS: list = []
+_QK_NORM_ROPE_ADAPTERS: list = []
 
 
 def register_attention_adapter(adapter) -> None:
     """Register a host-family attention adapter (callable)."""
     _ATTENTION_ADAPTERS.append(adapter)
+
+
+def register_qk_norm_rope_adapter(adapter) -> None:
+    """Register a host-family adapter for a Q/K norm + RoPE boundary."""
+    _QK_NORM_ROPE_ADAPTERS.append(adapter)
 
 
 # Per-structure binders registered from impls, consulted before the
@@ -161,7 +167,7 @@ def auto_swaps(
                                    "qkv_pack", "adaln_producer",
                                    "linear_proj", "norm_fused",
                                    "attention_core", "decoder_block",
-                                   "modnorm_qkv_chain"),
+                                   "modnorm_qkv_chain", "qk_norm_rope"),
     negotiate_fp8: bool = True,
     prefix_cadence: bool = False,
     observations: Iterable[Any] | None = None,
@@ -508,6 +514,30 @@ def auto_swaps(
                 plan.swaps.update(bound)
             else:
                 plan.swaps[seam.path] = bound
+    # ---- qk_norm_rope: compose a packed QKV seam with host attention ----
+    if "qk_norm_rope" in structures:
+        from . import adapters as _adapters  # noqa: F401 (registers)
+        for adapter in _QK_NORM_ROPE_ADAPTERS:
+            try:
+                result = adapter(model, plan)
+            except (ValueError, RuntimeError) as refusal:
+                plan.notes.setdefault("refused", []).append(
+                    ("qk_norm_rope", str(refusal)[:80]))
+                continue
+            if result is None:
+                continue
+            extras = result
+            plan.observed.update(extras.get("observed", {}))
+            plan.revert.extend(extras.get("revert", ()))
+            if extras.get("toggle") is not None:
+                plan.notes["qk_norm_rope_toggle_index"] = len(plan.toggles)
+                plan.toggles.append(extras["toggle"])
+            plan.notes["qk_norm_rope_adapter"] = (
+                type(adapter).__name__
+                if hasattr(adapter, "__name__")
+                else str(adapter)
+            )
+            break
     # ---- attention_core: host-family adapters (fa2 seam) ----
     if "attention_core" in structures:
         from . import adapters as _adapters  # noqa: F401 (registers)
