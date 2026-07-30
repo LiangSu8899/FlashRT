@@ -123,6 +123,20 @@ The final configured pipeline, not a sum of kernel microbenchmarks, owns the
 release performance claim. Kernel timings explain a result but do not replace
 the end-to-end gate.
 
+Cross-version or cross-model comparisons add one more constraint: both cells
+must use the same upstream host family, the official model implementation and
+processor for each checkpoint, the same timed boundary, and the same execution
+assembly. A port in another repository qualifies that port only; its latency
+must not be compared directly with a sibling version measured in the upstream
+host.
+
+“CUDA Graph” alone does not identify an execution assembly. Direct eager graph
+capture, compile-then-capture, segmented graphs, and one complete compiled graph
+are different programs for performance purposes. Receipts must record the
+sequence explicitly. When an existing sibling result uses compile-then-capture
+plus cadence-static refreshes, a comparison cell must include the same sequence
+and cadence ownership before attributing a gap to structures or kernels.
+
 An eager per-family gate is a preflight only. It must not prune the plan that
 will later run under CUDA Graph or compilation, and its surviving seams must
 not be reported as the final pipeline result. Launch overhead, upstream dtype
@@ -208,6 +222,8 @@ separate when their capture, buffer, or layout contracts genuinely differ.
       assembled before the performance decision.
 - [ ] Both arms use the deployment's final capture/compile form; no eager
       per-family result is presented as the pipeline result.
+- [ ] Cross-version comparisons use the same official host family, timed
+      boundary, compile/capture sequence, and cadence ownership.
 - [ ] Paired end-to-end timing clears the release gate.
 - [ ] Detach/rollback restores the host.
 - [ ] Receipt contains no local paths, private data, or transient logs.
