@@ -157,14 +157,20 @@ def test_two_way_adapter_routes_and_restores(monkeypatch):
                 "full_only_seq": query["full_only_seq"] + 3,
             }
 
-    monkeypatch.setattr(
-        "flash_rt.structures.adapters.factored_two_way_attention."
-        "bind_two_way_attention",
-        lambda capture: Core(),
-    )
+    # resolve module and class at run time from sys.modules: a
+    # neighbouring test (test_install_smoke) purges and re-imports the
+    # flash_rt tree between collection and this test, so the names bound
+    # at this file's import can be a different module object than the
+    # one a dotted-path monkeypatch would patch
+    import importlib
+
+    mod = importlib.import_module(
+        "flash_rt.structures.adapters.factored_two_way_attention")
+    monkeypatch.setattr(mod, "bind_two_way_attention",
+                        lambda capture: Core())
     root = Root()
     original = root.attention.dispatch_attention_fn
-    result = FactoredTwoWayAttentionAdapter()(root, root.forward)
+    result = mod.FactoredTwoWayAttentionAdapter()(root, root.forward)
     assert result is not None
     _, _, extras = result
     assert root.forward()["causal_seq"].item() == 5
