@@ -26,6 +26,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--device', default='cuda:0')
     p.add_argument('--precision', default='bf16',
                    help='runtime precision path; currently implemented: bf16')
+    p.add_argument('--weight-mode', default='bf16',
+                   choices=('bf16', 'int8', 'int4', 'w8', 'w4'),
+                   help=('decode weight-only quantization tier; int8/int4 are '
+                         'the Ampere-friendly ones and need the 2B dimensions'))
+    p.add_argument('--kv-mode', default='bf16', choices=('bf16', 'int8'),
+                   help='KV cache precision for q=1 decode attention')
     p.add_argument('--reps', type=int, default=1,
                    help=('repeat generation in one process; useful for '
                          'graph warm replay timing'))
@@ -62,7 +68,8 @@ def main() -> None:
 
     model = Qwen3VlTorchFrontendRtxBF16(
         args.checkpoint, device=args.device, max_seq=args.max_seq,
-        max_pixels=args.max_pixels)
+        max_pixels=args.max_pixels, weight_mode=args.weight_mode,
+        kv_mode=args.kv_mode)
     text = ''
     lat_ms = []
     for _ in range(max(1, args.reps)):
