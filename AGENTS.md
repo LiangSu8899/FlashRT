@@ -25,6 +25,101 @@ reference), `bindings/` (per-host addressing receipts), `impls/`
 `guard.py` + `swap.py` (runtime contract, ledger, attach/detach),
 `frontdoor.py` (the gated one-call door).
 
+### 0.1 One-model closure is the only allowed execution order
+
+Work on **one target model at a time**. Before changing code, lock the
+target model, its official host repository or repositories, the
+corresponding FlashRT native pipeline, and the exact end-to-end
+boundary. Do not move to another model because a local seam is easier
+to test. A model may be left only when it is closed or explicitly
+blocked on a missing Hub artifact.
+
+The following stages are mandatory and may not be reordered:
+
+1. **Build the native coverage map.** Read the native `pipeline_*`,
+   frontend, kernel catalog, and model configuration. List every
+   performance-relevant native region and classify it as:
+   `configured`, `existing_structure_not_configured`,
+   `missing_structure`, `host_stage_or_state`, or
+   `intentionally_retained`. The map must name the native file and
+   symbol, boundary, relevant shapes/dtypes/phases, and intended
+   structure. No implementation or performance claim starts before
+   this table exists.
+2. **Prove generality.** For every uncovered native region, locate the
+   same dataflow in at least one unrelated model or host family. If the
+   catalog already describes it, add only the missing addressing or
+   executable form. If a genuinely recurring region is absent, add a
+   catalog spec and reference. Model-only behaviour remains in a
+   binding or host stage; it never becomes a model-special structure.
+   Record the cross-model evidence before implementation.
+3. **Audit kernel readiness.** Audit only formally delivered,
+   published Hub artifacts. If the required Tensor API, executable
+   form, shape/dtype/layout/phase envelope, architecture build, or
+   capture behaviour is absent, mark the region
+   `blocked_on_kernel`, report it immediately, and stop work on that
+   region. The report must contain:
+   - native file and symbol;
+   - structure boundary and real shape/dtype/layout/phase/hardware;
+   - nearest Hub API and exactly why it is insufficient;
+   - the generic API or artifact capability required;
+   - all known consuming structures, models, and hosts;
+   - standalone correctness, compile, capture, and E2E acceptance
+     gates.
+
+   The structures worker must not patch `FlashRT-HF-kernels`, native
+   kernel sources, bindings, build files, package metadata, fake
+   registrations, or kernel-package documentation. It must not inject
+   a source checkout into a host to manufacture an artifact. Kernel
+   packaging and validation belong to the kernel owner. Resume only
+   after that owner supplies a commit, built artifact, and its
+   correctness/compile/capture evidence.
+4. **Integrate the structure.** Using the verified artifact, land the
+   catalog/reference if needed, generic discovery or host binding, the
+   executable form, configuration, and public contract tests. No
+   model-ID branch, one-off model wrapper, private source injection,
+   or undeclared fallback is allowed.
+5. **Validate in this order, without skipping a rung:**
+   1. reference and public CPU contract;
+   2. local boundary correctness, target call count, and zero
+      unexpected fallback;
+   3. cross-model correctness and benefit on the second family used
+      to prove generality;
+   4. official target-host E2E on real inputs, comparing the
+      unmodified strong host baseline with identical inputs/noise and
+      the same compile/capture policy used for deployment;
+   5. aligned comparison with the FlashRT native pipeline at the same
+      E2E boundary and assembly policy;
+   6. cross-host and cross-hardware cells when available;
+   7. detach/null/negative controls.
+
+   A native result at a different boundary is a ceiling or diagnostic,
+   not a direct speedup comparison. A seam benchmark is not model E2E.
+6. **Close the model.** Every native hot-path region must end as
+   `e2e_verified`, `blocked_on_kernel`, or
+   `intentionally_retained` with evidence. Run the final all-enabled
+   configuration E2E and record the native, cross-host, and
+   cross-model comparisons. Only then may work move to the next model.
+
+Use these progress states literally:
+`mapped` → `generality_proven` → `configured` →
+`local_verified` → `cross_model_verified` → `e2e_verified` →
+`native_compared` → `cross_hardware_verified`. A region may branch
+from `generality_proven` to `blocked_on_kernel` until the formal
+artifact arrives.
+
+“E2E ran once” does not mean “configuration complete”. If a planned
+attention form, cache path, cadence/state path, host stage, or other
+native region remains uncovered, report the model as **incomplete**.
+Every progress update uses one coverage table:
+
+| Native region | Structure | Cross-model evidence | Hub artifact | Config | Local | Cross-model | Official E2E | Native comparison | Blocker |
+|---|---|---|---|---|---|---|---|---|---|
+
+Keep work in progress bounded to one model and one uncovered region.
+When a region is blocked, report it immediately; continue only with
+already-ready regions of the same model unless the user explicitly
+changes scope.
+
 ---
 
 ## 1. Finding a structure abstraction in the native implementations
@@ -192,16 +287,22 @@ A structure must *not* be discovered on hosts it does not describe;
    side effects in the hot path, no loader calls, one custom-op call.
 7. Every API mentioned in docs or a PR description is checked against
    the source signature before it is written down.
+8. **Kernel ownership is strict.** Structures work may inspect and
+   report a kernel-package gap, but it may not implement, repair,
+   package, publish, or validate that package on the kernel owner's
+   behalf. A local kernel edit is not a delivered dependency.
 
 ---
 
 ## 5. Deliverables and acceptance
 
 **You deliver**:
-1. the repository diff — additions under `catalog/`, `bindings/`,
+1. the completed native coverage table, including every blocked or
+   intentionally retained region;
+2. the repository diff — additions under `catalog/`, `bindings/`,
    `impls/`, `tests/`, `docs/` only;
-2. the public CPU contract tests, green;
-3. a one-page report: the results table (host / baseline stating eager
+3. the public CPU contract tests, green;
+4. a one-page report: the results table (host / baseline stating eager
    or compiled / result / speedup / output match with worst case),
    the data-source statement, and the null-check / negative-control /
    ledger / detach results.
