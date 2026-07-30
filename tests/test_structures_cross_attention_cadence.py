@@ -96,3 +96,23 @@ def test_cross_kv_cadence_refuses_a_moving_encoder_source():
     captures = capture_cross_attention_kv(candidates, moving_loop)
     with pytest.raises(ValueError, match="varies within the hot loop"):
         bind_cross_attention_kv(candidates, captures)
+
+
+def test_cross_kv_refresh_does_not_mutate_ledger_while_compiling(monkeypatch):
+    host = FamilyOne()
+    candidates = discover_cross_attention_kv(host)
+    encoder = torch.randn(1, 5, 12)
+
+    def one_loop():
+        host.blocks[0].to_k(encoder)
+        host.blocks[0].to_v(encoder)
+
+    captures = capture_cross_attention_kv(candidates, one_loop)
+    _, statics = bind_cross_attention_kv(candidates, captures)
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+
+    refresh_cross_attention_kv(statics, encoder)
+
+    assert all(
+        static._frt_guard.notes["refreshes"] == 0 for static in statics
+    )

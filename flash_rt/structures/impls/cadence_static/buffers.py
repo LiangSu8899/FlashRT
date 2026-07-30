@@ -53,7 +53,7 @@ class StaticOutput(GuardedSeam, torch.nn.Module):
     def refreshed(self) -> None:
         """Record that the slower cadence ran. Called by the updater."""
         guard = self._frt_guard
-        if guard is not None:
+        if guard is not None and not torch.compiler.is_compiling():
             guard.notes["refreshes"] += 1
 
     def forward(self, *args, **kwargs):
