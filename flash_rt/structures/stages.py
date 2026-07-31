@@ -30,6 +30,27 @@ class CaptureRefused(RuntimeError):
     """The captured stage failed its parity or net-win gate."""
 
 
+def _first_tensor(value: Any) -> torch.Tensor | None:
+    """Pick one tensor deterministically for schedule-equivalence preflight."""
+    if torch.is_tensor(value):
+        return value
+    logits = getattr(value, "logits", None)
+    if torch.is_tensor(logits):
+        return logits
+    if isinstance(value, Mapping):
+        for key in sorted(value):
+            found = _first_tensor(value[key])
+            if found is not None:
+                return found
+        return None
+    if isinstance(value, (tuple, list)):
+        for item in value:
+            found = _first_tensor(item)
+            if found is not None:
+                return found
+    return None
+
+
 def _time_ms(fn: Callable[[], Any], warmup: int = 5, iters: int = 20) -> float:
     for _ in range(warmup):
         fn()
@@ -94,6 +115,7 @@ class CapturedStage:
 def capture(
     fn: Callable[[], Any],
     *,
+    model: torch.nn.Module | None = None,
     windows: Mapping[str, torch.Tensor] | None = None,
     reference: Callable[[], torch.Tensor] | None = None,
     output_of: Callable[[Any], torch.Tensor] | None = None,
@@ -106,7 +128,10 @@ def capture(
 
     ``fn`` must be graph-safe: fixed shapes, no host-side branching on
     tensor values, all varying inputs read from the declared ``windows``
-    buffers. ``reference`` runs the host's own eager path under the same
+    buffers. When ``model`` is supplied, a registered fixed-iteration
+    schedule adapter may normalize a recognized graph-unsafe host loop; the
+    original and normalized callables must pass an exact preflight before
+    capture. ``reference`` runs the host's own eager path under the same
     window contents; parity is judged between its output and the
     replayed stage output. Pass ``gate_cos=0`` / ``min_speedup=0`` to
     skip a gate explicitly (recorded in the certification).
@@ -116,7 +141,48 @@ def capture(
         if verbose:
             print(f"[structures] {msg}", flush=True)
 
-    windows = dict(windows or {})
+    from .impls.fixed_iter import (
+        FixedIterationRefused,
+        normalize_fixed_iteration,
+    )
+
+    schedule = None
+    try:
+        schedule = normalize_fixed_iteration(fn, model)
+    except FixedIterationRefused as exc:
+        raise CaptureRefused(str(exc)) from exc
+    if schedule is not None:
+        want_schedule = _first_tensor(schedule.reference_output)
+        with torch.no_grad():
+            got_schedule = _first_tensor(schedule.forward())
+        if want_schedule is None or got_schedule is None:
+            raise CaptureRefused(
+                f"{schedule.family}: schedule parity needs one tensor output")
+        metrics = parity_metrics(
+            got_schedule.detach().float().cpu(),
+            want_schedule.detach().float().cpu(),
+        )
+        exact = torch.equal(got_schedule, want_schedule)
+        if schedule.exact and not exact:
+            raise CaptureRefused(
+                f"{schedule.family}: fixed-iteration lowering is not exact "
+                f"(cos={metrics['cosine']:.7f}, "
+                f"max_abs={metrics['max_abs']:.7g})")
+        fn = schedule.forward
+        if schedule.compile_before_capture:
+            fn = torch.compile(fn)
+        say(f"schedule normalized: {schedule.family}, "
+            f"{schedule.steps} fixed step(s), exact={exact}")
+
+    declared_windows = dict(schedule.windows) if schedule is not None else {}
+    for name, tensor in dict(windows or {}).items():
+        if name in declared_windows \
+                and declared_windows[name] is not tensor:
+            raise CaptureRefused(
+                f"window {name!r} conflicts with the tensor discovered by "
+                "the fixed-iteration schedule")
+        declared_windows[name] = tensor
+    windows = declared_windows
     stream = torch.cuda.Stream()
     with torch.no_grad(), torch.cuda.stream(stream):
         for _ in range(max(1, warmup)):
@@ -135,6 +201,16 @@ def capture(
     cert: dict[str, Any] = {"windows": sorted(windows),
                             "gate_cos": gate_cos,
                             "min_speedup": min_speedup}
+    if schedule is not None:
+        cert["schedule"] = {
+            "family": schedule.family,
+            "steps": schedule.steps,
+            "exact": exact,
+            "parity_cos": round(metrics["cosine"], 7),
+            "max_abs": metrics["max_abs"],
+            "compiled": schedule.compile_before_capture,
+            **dict(schedule.details),
+        }
     if reference is not None and gate_cos:
         with torch.no_grad():
             want = reference().detach().float().cpu()

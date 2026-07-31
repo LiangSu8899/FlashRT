@@ -234,6 +234,34 @@ def auto_swaps(
     plan_notes_calibration: dict[str, Any] = {}
     plan_refusals: list[tuple[str, str]] = []
 
+    # A schedule adapter changes only the Python spelling of a qualified
+    # fixed loop.  Calibration must observe that same canonical execution:
+    # otherwise a tensor-controlled host ``while`` re-enters a compiled
+    # graph break on every denoise step before the region hooks even run.
+    from .impls.fixed_iter import (
+        FixedIterationRefused,
+        normalize_fixed_iteration,
+    )
+
+    schedule_notes: list[dict[str, Any]] = []
+    normalized_thunks = []
+    for thunk in thunks:
+        try:
+            schedule = normalize_fixed_iteration(thunk, model)
+        except FixedIterationRefused as exc:
+            raise ValueError(str(exc)) from exc
+        if schedule is None:
+            normalized_thunks.append(thunk)
+            continue
+        normalized_thunks.append(schedule.forward)
+        schedule_notes.append({
+            "family": schedule.family,
+            "steps": schedule.steps,
+            "exact": schedule.exact,
+            **dict(schedule.details),
+        })
+    thunks = normalized_thunks
+
     seams = discover(model, structures, refused=plan_refusals)
     # a packed group owns its q/k/v; linear_proj keeps only what the
     # pack does not take (the output projection), so the two structures
@@ -470,6 +498,8 @@ def auto_swaps(
     # produced it. Bind the pair together, or leave both on BF16.
     plan = AutoPlan(seams=seams)
     plan.notes["scheme"] = scheme_note
+    if schedule_notes:
+        plan.notes["schedules"] = schedule_notes
     handled: set[str] = set()
     for lay, g in negotiated.items():
         for p_slot, c_slot in (("producer", "pack"),

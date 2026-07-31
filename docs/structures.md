@@ -215,6 +215,27 @@ mod  = structures.get("decoder_ffn").bind(module, calibration=[x])
 stage = structures.capture(hot, windows={...})
 ```
 
+Fixed-iteration hosts use the same doors. A graph-safe fixed ``for`` follows
+the ordinary capture path. A registered host-family adapter may normalize a
+recognized tensor-controlled ``while`` to the catalog's canonical
+``init -> K * step -> readout`` schedule when ``model=`` is supplied:
+
+```python
+from flash_rt.structures import swap
+
+plan = structures.auto_swaps(model, [calibration_0, calibration_1])
+handle = swap.attach(model, plan.swaps, on_guard_fail="raise")
+stage = structures.capture(forward, model=model)
+```
+
+Normalization is not source rewriting. The adapter matches semantic host
+capabilities, records one real invocation, requires an explicit noise/init
+tensor, and runs the original and canonical schedules before calibration or
+capture. A fixed schedule must be bit-exact or it is refused. Its observation
+and noise tensors become declared replay windows automatically. Data-dependent
+or unbounded loops remain on the existing per-step/bucketed host path; they are
+never silently forced into a fixed graph.
+
 `attach` gates unit by unit — a unit is a structure, except that a
 negotiated FP8 chain is one unit, because the producer emits under a scale
 the consumer was bound for. It judges accuracy with the metric the host's
