@@ -138,20 +138,20 @@ def test_every_layer_gets_the_sites_its_type_needs(tmp_path):
     weights = load_text_weights(str(tmp_path), contract, device=DEVICE)
 
     for index, entry in enumerate(weights.layers):
-        assert {"gate_packed", "up_packed", "down_packed"} <= set(entry)
+        assert {"gate_up_packed", "down_packed"} <= set(entry)
         if dims.layer_types[index] == "linear_attention":
             assert {"in_qkv_packed", "in_z_packed", "out_packed",
                     "a_log", "dt_bias", "conv"} <= set(entry)
-            assert "q_packed" not in entry
+            assert "qkv_packed" not in entry
         else:
-            assert {"q_packed", "k_packed", "v_packed", "o_packed",
+            assert {"qkv_packed", "o_packed",
                     "q_norm", "k_norm"} <= set(entry)
             assert "in_qkv_packed" not in entry
     weights.close()
 
 
 def test_a_packed_shape_the_geometry_does_not_make_is_refused(tmp_path):
-    site = "model.language_model.layers.0.mlp.gate_proj"
+    site = "model.language_model.layers.0.mlp.down_proj"
     _write_checkpoint(tmp_path, mangle=site)
     contract = validate_checkpoint(str(tmp_path))
 
@@ -168,8 +168,11 @@ def test_the_recorded_widths_are_the_logical_ones(tmp_path):
     weights = load_text_weights(str(tmp_path), contract, device=DEVICE)
 
     entry = weights.layers[0]
-    assert entry["gate_n"] == dims.intermediate
-    assert entry["gate_k"] == dims.hidden
+    # gate and up are one weight now; the fused N is their sum.
+    assert entry["gate_up_n"] == 2 * dims.intermediate
+    assert entry["gate_up_k"] == dims.hidden
+    assert entry["gate_up_gate_offset"] == 0
+    assert entry["gate_up_up_offset"] == dims.intermediate
     assert entry["down_n"] == dims.hidden
     assert entry["down_k"] == dims.intermediate
     weights.close()

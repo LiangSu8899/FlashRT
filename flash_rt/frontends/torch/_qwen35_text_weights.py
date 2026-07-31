@@ -122,6 +122,54 @@ def _load_compressed(weights: TextWeights, reader: _Reader, site: str,
     into[prefix + "_k"] = columns
 
 
+
+def _load_fused(weights: TextWeights, reader: _Reader, sites: dict,
+                parts: list[tuple[str, str]], into: dict[str, int],
+                prefix: str, device: str) -> None:
+    """Several packed weights that share an activation, as one weight.
+
+    Rows are independent in this layout, so projections over the same input
+    concatenate along N by concatenating their bytes -- no repacking, and the
+    scales follow the same rows. Done once at load, it is one launch per layer
+    instead of two or three, and a wider N for the kernel to fill.
+
+    The concatenation happens on the host so the device never holds the parts
+    and the whole at the same time.
+    """
+    rows = 0
+    columns = None
+    packed_parts = []
+    scale_parts = []
+    for short, site in parts:
+        site_rows, site_columns = sites[site]
+        if columns is None:
+            columns = site_columns
+        elif site_columns != columns:
+            raise ValueError(
+                f"{site} has K={site_columns}, but {parts[0][1]} has "
+                f"K={columns}; only projections over the same activation fuse")
+        packed = reader.get(site + PACKED_SUFFIX)
+        scale = reader.get(site + SCALE_SUFFIX)
+        if tuple(packed.shape) != (site_rows, site_columns // 8):
+            raise ValueError(
+                f"{site}: packed is {tuple(packed.shape)}, but the geometry "
+                f"makes it {(site_rows, site_columns // 8)}")
+        packed_parts.append(packed)
+        scale_parts.append(scale)
+        # Where this part starts in the fused output, so a consumer slices by
+        # arithmetic rather than by re-deriving the geometry.
+        into[prefix + "_" + short + "_offset"] = rows
+        into[prefix + "_" + short + "_rows"] = site_rows
+        rows += site_rows
+
+    into[prefix + "_packed"] = _place(
+        weights, torch.cat(packed_parts, dim=0), device, torch.int32)
+    into[prefix + "_scale"] = _place(
+        weights, torch.cat(scale_parts, dim=0), device, torch.bfloat16)
+    into[prefix + "_n"] = rows
+    into[prefix + "_k"] = columns
+
+
 def load_text_weights(path: str, contract: dict[str, Any],
                       device: str = "cuda:0") -> TextWeights:
     """Load the text backbone, packed weights kept packed.
@@ -168,11 +216,12 @@ def load_text_weights(path: str, contract: dict[str, Any],
             weights, reader.get(prefix + "post_attention_layernorm.weight"),
             device, torch.bfloat16)
 
-        for short, site in (("gate", "mlp.gate_proj"),
-                            ("up", "mlp.up_proj"),
-                            ("down", "mlp.down_proj")):
-            _load_compressed(weights, reader, prefix + site, entry, short,
-                             sites[prefix + site], device)
+        _load_fused(weights, reader, sites,
+                    [("gate", prefix + "mlp.gate_proj"),
+                     ("up", prefix + "mlp.up_proj")],
+                    entry, "gate_up", device)
+        _load_compressed(weights, reader, prefix + "mlp.down_proj", entry,
+                         "down", sites[prefix + "mlp.down_proj"], device)
 
         if linear:
             for short, site in (("in_qkv", "linear_attn.in_proj_qkv"),
@@ -190,12 +239,14 @@ def load_text_weights(path: str, contract: dict[str, Any],
                     weights, reader.get(prefix + name), device,
                     torch.bfloat16)
         else:
-            for short, site in (("q", "self_attn.q_proj"),
-                                ("k", "self_attn.k_proj"),
-                                ("v", "self_attn.v_proj"),
-                                ("o", "self_attn.o_proj")):
-                _load_compressed(weights, reader, prefix + site, entry, short,
-                                 sites[prefix + site], device)
+            _load_fused(weights, reader, sites,
+                        [("q", prefix + "self_attn.q_proj"),
+                         ("k", prefix + "self_attn.k_proj"),
+                         ("v", prefix + "self_attn.v_proj")],
+                        entry, "qkv", device)
+            _load_compressed(weights, reader, prefix + "self_attn.o_proj",
+                             entry, "o", sites[prefix + "self_attn.o_proj"],
+                             device)
             for short, name in (("q_norm", "self_attn.q_norm.weight"),
                                 ("k_norm", "self_attn.k_norm.weight")):
                 entry[short] = _place(
