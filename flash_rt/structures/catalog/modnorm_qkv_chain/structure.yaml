@@ -1,5 +1,5 @@
 structure: modnorm_qkv_chain
-version: 1
+version: 2
 description: >
   A conditional LayerNorm whose output directly feeds sibling Q, K and V
   projections. The producer writes the shared static FP8 wire once and all
@@ -16,17 +16,17 @@ boundary:
     - {name: cond, dims: [B, C], dtype: "@binding"}
   outputs:
     - {name: q, dims: [B, M, Nq], dtype: "@binding"}
-    - {name: k, dims: [B, M, Nk], dtype: "@binding"}
-    - {name: v, dims: [B, M, Nv], dtype: "@binding"}
+    - {name: k, dims: [B, M, Nk], dtype: "@binding", optional: true}
+    - {name: v, dims: [B, M, Nv], dtype: "@binding", optional: true}
 
 weights:
   - {slot: w_cond, dims: [2D, C]}
   - {slot: b_cond, dims: [2D]}
   - {slot: w_q, dims: [Nq, D]}
   - {slot: b_q, dims: [Nq], optional: true}
-  - {slot: w_k, dims: [Nk, D]}
+  - {slot: w_k, dims: [Nk, D], optional: true}
   - {slot: b_k, dims: [Nk], optional: true}
-  - {slot: w_v, dims: [Nv, D]}
+  - {slot: w_v, dims: [Nv, D], optional: true}
   - {slot: b_v, dims: [Nv], optional: true}
 
 variants:

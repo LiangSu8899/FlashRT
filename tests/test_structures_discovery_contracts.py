@@ -137,9 +137,22 @@ def test_nested_diffusers_feedforward_is_a_vision_ffn_slice():
     assert [seam.path for seam in seams] == ["block.ff"]
     assert seams[0].fc_attrs == ("net.0.proj", "net.2")
     assert seams[0].norm_attr == "norm3"
+    assert seams[0].variant["norm_affine"] == "identity"
     weights = seam_weights(host, seams[0])
-    assert torch.equal(weights["w_norm"], torch.ones(512))
-    assert torch.equal(weights["b_norm"], torch.zeros(512))
+    assert weights["w_norm"] is None
+    assert weights["b_norm"] is None
+
+
+def test_vision_ffn_refuses_rms_like_one_sided_affine_norm():
+    host = nn.ModuleDict({"block": _DiffusionBlock()})
+    host.block.norm3.weight = nn.Parameter(torch.ones(512))
+    host.block.norm3.bias = None
+    refused = []
+
+    seams = discover(host, structures=("vision_ffn",), refused=refused)
+
+    assert seams == []
+    assert refused and "one-sided affine" in refused[0][1]
 
 
 def test_cross_attention_chain_owns_only_the_query_wire():

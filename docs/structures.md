@@ -229,7 +229,17 @@ because K/V consume encoder features on another cadence. An intervening
 positional module refuses the chain. Diffusers-style `to_out[0]` projections
 are discovered as ordinary `linear_proj` seams, but retain the host path when
 their measured small-M bias form is outside the profitable work band.
-Diffusers `AttnProcessor2_0` sites use the same `attention_core` structure:
+
+`cadence_static` remains an explicit host-stage structure rather than part of
+the automatic front door. Its updater needs the host's observation boundary:
+the host must capture the repeated-loop outputs, bind the static K/V buffers,
+and call `refresh_cross_attention_kv` when encoder inputs change. Replacement
+projections may be reused for refresh only when they are independently
+callable; sibling-ordered readers such as a packed QKV stash are rejected as
+refresh producers so stale data cannot be copied into the cadence buffer.
+
+Capability-compatible Diffusers attention-processor sites use the same
+`attention_core` structure:
 the family adapter preserves the host projections and output contract, while
 the stateless core consumes complete Q/K/V on every call. An unmasked dense
 call is passed directly; a mask with one or two contiguous allowed key ranges

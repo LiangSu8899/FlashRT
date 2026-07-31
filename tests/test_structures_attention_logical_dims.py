@@ -25,6 +25,8 @@ class _FakePackedKVAttention:
 
 
 class _FakeFa2:
+    SUPPORTED_HEAD_DIMS = tuple(range(8, 257, 8))
+
     @staticmethod
     def allocate_outputs(q):
         return torch.empty_like(q), torch.empty(
@@ -58,6 +60,14 @@ def _capture(head_dim: int):
         "values": [value, value.clone()],
         "mask": None,
     }
+
+
+@pytest.fixture(autouse=True)
+def _artifact_capabilities(monkeypatch):
+    monkeypatch.setattr(
+        fa2_seqused, "supported_head_dims",
+        lambda: _FakeFa2.SUPPORTED_HEAD_DIMS,
+    )
 
 
 @pytest.mark.parametrize("head_dim", [48, 64, 72, 80, 128, 256])

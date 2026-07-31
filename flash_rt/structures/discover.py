@@ -246,9 +246,37 @@ def _norm_attr_of(root: nn.Module, parent_path: str) -> str | None:
     return None
 
 
+def _vision_norm_variant(
+    norm: nn.Module, dim: int,
+) -> tuple[str | None, str]:
+    """Classify the exact LayerNorm affine contract at a vision-FFN seam."""
+    shape = getattr(norm, "normalized_shape", None)
+    if isinstance(shape, int):
+        shape = (shape,)
+    try:
+        shape = tuple(shape)
+    except TypeError:
+        return None, "norm has no LayerNorm normalized_shape contract"
+    if shape != (dim,) or not hasattr(norm, "eps"):
+        return None, (
+            f"norm shape/epsilon is not LayerNorm({dim}); got shape={shape}")
+    weight, bias = getattr(norm, "weight", None), getattr(norm, "bias", None)
+    if weight is None and bias is None:
+        return "identity", ""
+    if weight is None or bias is None:
+        return None, (
+            "norm exposes a one-sided affine contract (for example RMSNorm); "
+            "vision_ffn requires LayerNorm with both affine tensors or neither")
+    if tuple(weight.shape) != (dim,) or tuple(bias.shape) != (dim,):
+        return None, "norm affine tensors do not match the vision width"
+    return "learned", ""
+
+
 def discover(
     model: nn.Module,
     structures: tuple[str, ...] = ("decoder_ffn", "vision_ffn"),
+    *,
+    refused: list[tuple[str, str]] | None = None,
 ) -> list[Seam]:
     """Find every region-structure seam in ``model``."""
     seams: list[Seam] = []
@@ -304,7 +332,8 @@ def discover(
                     structure="modnorm_qkv_chain", path=path,
                     parent_path=parent_path, norm_attr="norm1",
                     dims={"D": dim, "C": cond_dim},
-                    variant={"wire_dtype": "fp8_static",
+                    variant={"modulation": "scale_shift",
+                             "wire_dtype": "fp8_static",
                              "fanout": fanout},
                     family=family, layer_index=idx))
         if "qkv_pack" in structures:
@@ -392,6 +421,19 @@ def discover(
                 norm_attr = _norm_attr_of(model, parent_path)
                 if norm_attr is None:
                     continue  # vision_ffn boundary includes a LayerNorm
+                norm = _resolve(
+                    model,
+                    (parent_path + "." + norm_attr).lstrip("."),
+                )
+                norm_affine, reason = _vision_norm_variant(
+                    norm, fc1.in_features)
+                if norm_affine is None:
+                    if refused is not None:
+                        refused.append((
+                            path,
+                            f"vision_ffn refused: {reason}",
+                        ))
+                    continue
                 act, assumed = _activation_or_default(module, "gelu")
                 if act is None:
                     break
@@ -400,7 +442,9 @@ def discover(
                     structure="vision_ffn", path=path,
                     parent_path=parent_path, norm_attr=norm_attr,
                     dims={"D": fc1.in_features, "F": fc1.out_features},
-                    variant={"activation": act}, fc_attrs=(fc1_attr, fc2_attr),
+                    variant={"activation": act,
+                             "norm_affine": norm_affine},
+                    fc_attrs=(fc1_attr, fc2_attr),
                     family=family, layer_index=idx, assumptions=assumed))
                 break
     return seams
@@ -440,17 +484,11 @@ def seam_weights(model: nn.Module, seam: Seam) -> dict[str, torch.Tensor]:
         module, fc2_attr)
     norm_weight = getattr(norm, "weight", None)
     norm_bias = getattr(norm, "bias", None)
-    if norm_weight is None:
-        norm_weight = torch.ones(
-            fc1.in_features, device=fc1.weight.device,
-            dtype=fc1.weight.dtype)
-    if norm_bias is None:
-        norm_bias = torch.zeros(
-            fc1.in_features, device=fc1.weight.device,
-            dtype=fc1.weight.dtype)
     return {
-        "w_norm": norm_weight.detach(),
-        "b_norm": norm_bias.detach(),
+        "w_norm": (norm_weight.detach()
+                   if norm_weight is not None else None),
+        "b_norm": (norm_bias.detach()
+                   if norm_bias is not None else None),
         "w_fc1": fc1.weight.detach(),
         "b_fc1": fc1.bias.detach(),
         "w_fc2": fc2.weight.detach(),

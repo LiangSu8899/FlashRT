@@ -161,7 +161,14 @@ def bind_per_head_gqa_qk_norm_rope(
     head_dim: int,
     eps: float = 1e-6,
 ) -> PerHeadGqaQkNormRope:
-    """Bind the capacity-guarded per-head GQA implementation."""
+    """Bind the capacity-guarded per-head GQA implementation.
+
+    ``q_norm_weight`` and ``k_norm_weight`` are checkpoint-native vectors
+    with layout ``[head_dim]``.  The packed activation is laid out
+    ``[Q heads..., K heads..., V heads...]``, each head contiguous at
+    ``head_dim`` elements; no transposition or interleaving of the norm
+    weights is performed.
+    """
     return PerHeadGqaQkNormRope(
         q_norm_weight,
         k_norm_weight,

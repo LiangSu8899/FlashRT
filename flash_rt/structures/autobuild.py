@@ -156,6 +156,10 @@ def _seam_key(seam: Seam) -> str:
     """
     if seam.structure == "qkv_pack" and seam.pack_attrs:
         return seam.path + "." + seam.pack_attrs[0]
+    if seam.structure == "modnorm_qkv_chain":
+        # This catalog structure describes the composition at the same host
+        # path as a possible block seam; keep both receipt identities.
+        return seam.path + "::modnorm_qkv_chain"
     return seam.path
 
 
@@ -230,7 +234,7 @@ def auto_swaps(
     plan_notes_calibration: dict[str, Any] = {}
     plan_refusals: list[tuple[str, str]] = []
 
-    seams = discover(model, structures)
+    seams = discover(model, structures, refused=plan_refusals)
     # a packed group owns its q/k/v; linear_proj keeps only what the
     # pack does not take (the output projection), so the two structures
     # compose instead of fighting over the same module
@@ -488,6 +492,14 @@ def auto_swaps(
                 continue
             plan.swaps.update(pair)
             handled.update({_seam_key(p_seam), _seam_key(c_seam)})
+            for chain in (
+                seam for seam in seams
+                if seam.structure == "modnorm_qkv_chain"
+                and seam.path == lay
+            ):
+                handled.add(_seam_key(chain))
+                plan.notes.setdefault("composed_structures", []).append(
+                    _seam_key(chain))
     plan.notes["negotiated_layers"] = sorted(
         lay for lay, g in negotiated.items()
         if any(_seam_key(sm) in handled for sm in g.values()))
@@ -527,6 +539,16 @@ def auto_swaps(
             if result is None:
                 continue
             extras = result
+            if extras.get("refused"):
+                plan.notes.setdefault("refused", []).extend(
+                    extras["refused"])
+            engaged = bool(
+                extras.get("observed")
+                or extras.get("revert")
+                or extras.get("toggle")
+            )
+            if not engaged:
+                continue
             plan.observed.update(extras.get("observed", {}))
             plan.revert.extend(extras.get("revert", ()))
             if extras.get("toggle") is not None:
@@ -561,6 +583,17 @@ def auto_swaps(
             # and what to report
             att_swaps, update = result[0], result[1]
             extras = result[2] if len(result) > 2 else {}
+            if extras.get("refused"):
+                plan.notes.setdefault("refused", []).extend(
+                    extras["refused"])
+            engaged = bool(
+                att_swaps or update
+                or extras.get("observed")
+                or extras.get("revert")
+                or extras.get("toggle")
+            )
+            if not engaged:
+                continue
             plan.swaps.update(att_swaps)
             plan.observed.update(extras.get("observed", {}))
             plan.revert.extend(extras.get("revert", ()))

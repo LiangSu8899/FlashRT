@@ -53,8 +53,8 @@ class BoundVisionFfnFp8:
     """Bound callable for the full structure boundary."""
 
     fused_mlp: Callable[..., torch.Tensor]
-    w_norm: torch.Tensor
-    b_norm: torch.Tensor
+    w_norm: torch.Tensor | None
+    b_norm: torch.Tensor | None
     fc1_fp8: torch.Tensor
     b_fc1: torch.Tensor
     fc2_fp8: torch.Tensor
@@ -96,7 +96,9 @@ class BoundVisionFfnFp8:
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         h = torch.nn.functional.layer_norm(
             x.float(), (x.shape[-1],),
-            self.w_norm.float(), self.b_norm.float(), self.eps).to(x.dtype)
+            (self.w_norm.float() if self.w_norm is not None else None),
+            (self.b_norm.float() if self.b_norm is not None else None),
+            self.eps).to(x.dtype)
         return x + self.ffn(h).to(x.dtype)
 
 
@@ -215,7 +217,11 @@ def bind(
     normed = [
         torch.nn.functional.layer_norm(
             s["x"].float(), (s["x"].shape[-1],),
-            weights["w_norm"].float(), weights["b_norm"].float(), eps)
+            (weights["w_norm"].float()
+             if weights["w_norm"] is not None else None),
+            (weights["b_norm"].float()
+             if weights["b_norm"] is not None else None),
+            eps)
         for s in calibration_inputs
     ]
     input_scale, hidden_scale = _calibrate(

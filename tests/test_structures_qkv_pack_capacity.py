@@ -3,10 +3,12 @@ from __future__ import annotations
 import warnings
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch import nn
 
 from flash_rt.structures.impls.qkv_pack import fp8_static
+from flash_rt.structures.guard import GuardRefused
 from flash_rt.structures.swap import attach
 
 
@@ -105,6 +107,25 @@ def test_qkv_joint_view_and_remaining_stash_follow_logical_rows(monkeypatch):
     v = host.v(x)
     assert qk.shape == (3, 5)
     assert v.shape == (3, 1)
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        torch.randn(9, 4, dtype=torch.bfloat16),
+        torch.randn(3, 5, dtype=torch.bfloat16),
+        torch.randn(3, 4, dtype=torch.float64),
+    ),
+)
+def test_qkv_joint_refuses_every_bound_form_mismatch(monkeypatch, value):
+    host, _, handle = _bind(monkeypatch, capacity=8)
+    host.q.enable_joint(3)
+
+    with warnings.catch_warnings(), pytest.raises(GuardRefused):
+        warnings.simplefilter("ignore")
+        host.q.joint(value)
+
+    assert handle.report()["q"]["fallbacks"] == 1
 
 
 class _Attention(nn.Module):

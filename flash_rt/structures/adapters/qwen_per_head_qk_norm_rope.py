@@ -9,15 +9,16 @@ from ..impls.qk_norm_rope import bind_per_head_gqa_qk_norm_rope
 from ..impls.qkv_pack.fp8_static import PackedLinear, StashReader
 
 
-class QwenPerHeadQkNormRopeAdapter:
-    """Route capability-compatible Qwen attention modules through one seam."""
+class PerHeadGqaQkNormRopeAdapter:
+    """Route capability-compatible per-head GQA attention through one seam."""
 
-    __name__ = "qwen_per_head_qk_norm_rope"
+    __name__ = "per_head_gqa_qk_norm_rope"
 
     def __call__(self, model, plan):
         modules = dict(model.named_modules())
         routes = []
         observed = {}
+        refused = []
 
         for path, module in modules.items():
             pack = plan.swaps.get(f"{path}.q_proj")
@@ -31,6 +32,11 @@ class QwenPerHeadQkNormRopeAdapter:
                 and v_reader._packed[0] is pack
             ):
                 continue
+            site = f"{path}::per_head_qk_norm_rope"
+
+            def refuse(reason):
+                refused.append((site, f"qk_norm_rope refused: {reason}"))
+
             if not all(
                 hasattr(module, attr)
                 for attr in (
@@ -43,8 +49,13 @@ class QwenPerHeadQkNormRopeAdapter:
                     "scaling",
                 )
             ):
+                refuse("host lacks the complete per-head GQA attention slots")
+                continue
+            if module.training:
+                refuse("training/dropout form is outside the inference seam")
                 continue
             if int(module.head_dim) != 128 or len(pack.splits) < 3:
+                refuse("kernel requires head_dim=128 and three packed slots")
                 continue
             q_heads, q_rem = divmod(int(pack.splits[0]), 128)
             kv_heads, k_rem = divmod(int(pack.splits[1]), 128)
@@ -54,10 +65,12 @@ class QwenPerHeadQkNormRopeAdapter:
                 or int(pack.splits[2]) != int(pack.splits[1])
                 or q_heads != kv_heads * int(module.num_key_value_groups)
             ):
+                refuse("packed Q/K/V widths do not form the declared GQA")
                 continue
             q_weight = getattr(module.q_norm, "weight", None)
             k_weight = getattr(module.k_norm, "weight", None)
             if q_weight is None or k_weight is None:
+                refuse("Q/K norm weights are absent")
                 continue
             eps = getattr(
                 module.q_norm,
@@ -65,23 +78,52 @@ class QwenPerHeadQkNormRopeAdapter:
                 getattr(module.q_norm, "eps", None),
             )
             if eps is None:
+                refuse("Q/K norm epsilon is absent")
                 continue
 
-            source = importlib.import_module(type(module).__module__)
+            try:
+                source = importlib.import_module(type(module).__module__)
+            except (ImportError, ValueError) as exc:
+                refuse(f"cannot resolve host attention functions: {exc}")
+                continue
             eager_attention = getattr(source, "eager_attention_forward", None)
             attention_functions = getattr(source, "ALL_ATTENTION_FUNCTIONS", None)
             if eager_attention is None or attention_functions is None:
+                refuse("host module does not expose its attention dispatcher")
                 continue
-
-            impl = bind_per_head_gqa_qk_norm_rope(
-                q_weight,
-                k_weight,
-                row_capacity=pack.rows,
-                q_heads=q_heads,
-                kv_heads=kv_heads,
-                head_dim=128,
-                eps=float(eps),
+            implementation = getattr(
+                getattr(module, "config", None),
+                "_attn_implementation",
+                None,
             )
+            if implementation == "eager":
+                attention = eager_attention
+            else:
+                try:
+                    attention = attention_functions[implementation]
+                except (KeyError, TypeError):
+                    refuse(
+                        f"attention implementation {implementation!r} is "
+                        "not available at bind time")
+                    continue
+            sliding_window = getattr(module, "sliding_window", None)
+            scaling = module.scaling
+            output_projection = module.o_proj
+            layer_index = getattr(module, "layer_idx", None)
+
+            try:
+                impl = bind_per_head_gqa_qk_norm_rope(
+                    q_weight,
+                    k_weight,
+                    row_capacity=pack.rows,
+                    q_heads=q_heads,
+                    kv_heads=kv_heads,
+                    head_dim=128,
+                    eps=float(eps),
+                )
+            except (ValueError, RuntimeError) as exc:
+                refuse(str(exc))
+                continue
             original = module.forward
             had_instance_forward = "forward" in module.__dict__
 
@@ -95,8 +137,11 @@ class QwenPerHeadQkNormRopeAdapter:
                 *,
                 bound=impl,
                 packed=pack,
-                eager_fn=eager_attention,
-                interfaces=attention_functions,
+                attention_fn=attention,
+                attention_scale=scaling,
+                output_proj=output_projection,
+                cache_layer=layer_index,
+                window=sliding_window,
                 **kwargs,
             ):
                 batch, tokens, _ = hidden_states.shape
@@ -117,24 +162,18 @@ class QwenPerHeadQkNormRopeAdapter:
                     key, value = past_key_values.update(
                         key,
                         value,
-                        self.layer_idx,
+                        cache_layer,
                         cache_kwargs,
                     )
 
-                attention = eager_fn
-                implementation = self.config._attn_implementation
-                if implementation != "eager":
-                    attention = interfaces[implementation]
                 attention_kwargs = dict(
-                    dropout=(
-                        0.0 if not self.training else self.attention_dropout
-                    ),
-                    scaling=self.scaling,
+                    dropout=0.0,
+                    scaling=attention_scale,
                     **kwargs,
                 )
-                if hasattr(self, "sliding_window"):
-                    attention_kwargs["sliding_window"] = self.sliding_window
-                output, weights = attention(
+                if window is not None:
+                    attention_kwargs["sliding_window"] = window
+                output, weights = attention_fn(
                     self,
                     query,
                     key,
@@ -143,7 +182,7 @@ class QwenPerHeadQkNormRopeAdapter:
                     **attention_kwargs,
                 )
                 output = output.reshape(batch, tokens, -1).contiguous()
-                return self.o_proj(output), weights
+                return output_proj(output), weights
 
             routed_method = types.MethodType(routed, module)
             routes.append(
@@ -155,10 +194,10 @@ class QwenPerHeadQkNormRopeAdapter:
                     had_instance_forward,
                 )
             )
-            observed[f"{path}::per_head_qk_norm_rope"] = impl
+            observed[site] = impl
 
         if not routes:
-            return None
+            return {"refused": refused} if refused else None
 
         def enable() -> None:
             for module, pack, routed, _, _ in routes:
@@ -183,4 +222,10 @@ class QwenPerHeadQkNormRopeAdapter:
             "observed": observed,
             "revert": [revert],
             "toggle": (enable, disable),
+            "refused": refused,
         }
+
+
+# Import compatibility for callers that used the original family-labelled
+# name. Registration and receipts use the capability name above.
+QwenPerHeadQkNormRopeAdapter = PerHeadGqaQkNormRopeAdapter

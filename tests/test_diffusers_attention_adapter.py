@@ -9,10 +9,14 @@ from flash_rt.structures.adapters.diffusers_attention import (
 
 
 class AttnProcessor2_0:
+    def __init__(self):
+        self.calls = 0
+
     def __call__(
         self, attn, hidden_states, encoder_hidden_states=None,
         attention_mask=None, temb=None, *args, **kwargs,
     ):
+        self.calls += 1
         del attention_mask, temb, args, kwargs
         source = (
             hidden_states
@@ -105,7 +109,7 @@ def test_diffusers_adapter_routes_and_restores(monkeypatch):
     assert root.attention.processor is original
 
 
-def test_diffusers_adapter_adapts_projection_dtype_to_backend(monkeypatch):
+def test_diffusers_adapter_uses_host_instead_of_hidden_dtype_cast(monkeypatch):
     core = BF16Core()
     monkeypatch.setattr(
         "flash_rt.structures.adapters.diffusers_attention."
@@ -114,9 +118,53 @@ def test_diffusers_adapter_adapts_projection_dtype_to_backend(monkeypatch):
     )
     root = Root()
     reference = root()
+    original = root.attention.processor
     result = DiffusersAttentionAdapter()(root, root.forward)
     assert result is not None
     actual = root()
-    assert core.seen_dtype == torch.bfloat16
+    assert core.seen_dtype is None
+    assert original.calls == 3  # reference, calibration, routed fallback
     assert actual.dtype == reference.dtype
-    torch.testing.assert_close(actual, reference, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(actual, reference)
+
+
+def test_diffusers_adapter_matches_capability_not_processor_class_name(
+        monkeypatch):
+    class RenamedCompatibleProcessor(AttnProcessor2_0):
+        pass
+
+    monkeypatch.setattr(
+        "flash_rt.structures.adapters.diffusers_attention."
+        "bind_dense_attention",
+        lambda captures: Core(),
+    )
+    root = Root()
+    root.attention.processor = RenamedCompatibleProcessor()
+
+    result = DiffusersAttentionAdapter()(root, root.forward)
+
+    assert result is not None
+    assert result[2]["observed"]
+
+
+def test_diffusers_adapter_refuses_a_live_mask(monkeypatch):
+    monkeypatch.setattr(
+        "flash_rt.structures.adapters.diffusers_attention."
+        "bind_dense_attention",
+        lambda captures: Core(),
+    )
+    root = Root()
+    original = root.attention.processor
+
+    result = DiffusersAttentionAdapter()(
+        root,
+        lambda: root.attention.processor(
+            root.attention, root.hidden, root.encoder,
+            torch.zeros(1, 1, 7, 13)),
+    )
+
+    assert result is not None
+    swaps, update, extras = result
+    assert swaps == {} and update is None
+    assert "live attention masks" in extras["refused"][0][1]
+    assert root.attention.processor is original

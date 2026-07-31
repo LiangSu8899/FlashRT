@@ -1,4 +1,4 @@
-"""Attention adapter for Diffusers ``AttnProcessor2_0`` hosts."""
+"""Attention adapter for capability-compatible Diffusers attention hosts."""
 
 from __future__ import annotations
 
@@ -7,8 +7,45 @@ import torch
 from ..impls.attention_core import bind_dense_attention
 
 
+def _compatible_site(module, processor) -> tuple[bool, str]:
+    """Whether ``module`` exposes the processor contract reproduced below.
+
+    Processor class names are deliberately irrelevant.  The adapter owns the
+    projection/output dataflow, so it admits only sites exposing every slot it
+    reads and a callable processor that accepts the ordinary Diffusers
+    ``(attention, hidden_states, ...)`` boundary.
+    """
+    if not callable(processor):
+        return False, "processor is not callable"
+    for attr in ("to_q", "to_k", "to_v"):
+        if not isinstance(getattr(module, attr, None), torch.nn.Module):
+            return False, f"attention lacks callable projection slot {attr!r}"
+    try:
+        out_proj, out_drop = module.to_out[0], module.to_out[1]
+    except (AttributeError, IndexError, KeyError, TypeError):
+        return False, "attention lacks the to_out[projection, dropout] slots"
+    if not all(isinstance(part, torch.nn.Module)
+               for part in (out_proj, out_drop)):
+        return False, "attention output slots are not modules"
+    heads = getattr(module, "heads", None)
+    if not isinstance(heads, int) or heads <= 0:
+        return False, "attention lacks a positive integer head count"
+    required_state = (
+        "spatial_norm", "group_norm", "norm_cross", "norm_q", "norm_k",
+        "residual_connection", "rescale_output_factor",
+    )
+    missing = [name for name in required_state if not hasattr(module, name)]
+    if missing:
+        return False, f"attention lacks processor state {missing}"
+    if (getattr(module, "norm_cross", False)
+            and not callable(getattr(module, "norm_encoder_hidden_states",
+                                     None))):
+        return False, "cross normalization is enabled but has no callable"
+    return True, ""
+
+
 def _qkv(attn, hidden_states, encoder_hidden_states, attention_mask, temb):
-    """Reproduce the projection half of Diffusers ``AttnProcessor2_0``."""
+    """Reproduce the capability-compatible Diffusers projection half."""
     if attn.spatial_norm is not None:
         hidden_states = attn.spatial_norm(hidden_states, temb)
     if hidden_states.ndim == 4:
@@ -58,6 +95,11 @@ class _Recorder:
         self, attn, hidden_states, encoder_hidden_states=None,
         attention_mask=None, temb=None, *args, **kwargs,
     ):
+        if attention_mask is not None:
+            self.rows.append({"mask": attention_mask.detach()})
+            return self.original(
+                attn, hidden_states, encoder_hidden_states, attention_mask,
+                temb, *args, **kwargs)
         query, key, value, mask = _qkv(
             attn, hidden_states, encoder_hidden_states, attention_mask, temb)
         self.rows.append({
@@ -71,17 +113,24 @@ class _Recorder:
             *args, **kwargs)
 
 
-class _FlashRTAttnProcessor2_0:
+class _FlashRTDenseAttnProcessor:
     """Diffusers processor with only the SDPA body replaced by FA2."""
 
-    def __init__(self, core):
+    def __init__(self, core, original):
         self.core = core
+        self.original = original
 
     def __call__(
         self, attn, hidden_states, encoder_hidden_states=None,
         attention_mask=None, temb=None, *args, **kwargs,
     ):
-        del args, kwargs
+        # The dense Hub form has no live mask input.  Binding therefore
+        # accepts only unmasked captures, and a later masked call returns to
+        # the host instead of reusing a frozen calibration mask.
+        if attention_mask is not None:
+            return self.original(
+                attn, hidden_states, encoder_hidden_states, attention_mask,
+                temb, *args, **kwargs)
         residual = hidden_states
         input_ndim = hidden_states.ndim
         if input_ndim == 4:
@@ -92,14 +141,14 @@ class _FlashRTAttnProcessor2_0:
         guard = getattr(self.core, "_frt_guard", None)
         accepted_dtypes = tuple(getattr(guard, "dtypes", ()) or ())
         if accepted_dtypes and projection_dtype not in accepted_dtypes:
-            # A module swap upstream may change the projection output dtype
-            # after this routed seam was observed. FA2 does not consume fp32;
-            # adapt at the backend boundary and restore the host dtype before
-            # the output projection.
-            target_dtype = accepted_dtypes[0]
-            query = query.to(target_dtype)
-            key = key.to(target_dtype)
-            value = value.to(target_dtype)
+            # An upstream composition can change the effective projection
+            # dtype after this adapter calibrated.  A hidden cast here would
+            # silently change the declared boundary and add hot-path work.
+            # Keep the host path; the core's zero call count makes the missed
+            # route visible to the final-form gate.
+            return self.original(
+                attn, hidden_states, encoder_hidden_states, attention_mask,
+                temb, *args, **kwargs)
         hidden_states = self.core(query, key, value)
         hidden_states = hidden_states.transpose(1, 2).reshape(
             query.shape[0], -1, attn.heads * query.shape[-1])
@@ -124,11 +173,13 @@ class DiffusersAttentionAdapter:
         sites = []
         for path, module in model.named_modules():
             processor = getattr(module, "processor", None)
-            if type(processor).__name__ == "AttnProcessor2_0":
+            compatible, _ = _compatible_site(module, processor)
+            if compatible:
                 sites.append((path, module, processor))
         if not sites:
             return None
 
+        refused = []
         captures = [[] for _ in sites]
         for (_, module, original), rows in zip(sites, captures):
             module.processor = _Recorder(original, rows)
@@ -143,15 +194,32 @@ class DiffusersAttentionAdapter:
         observed = {}
         for (path, module, original), rows in zip(sites, captures):
             if not rows:
+                refused.append((
+                    f"{path}.processor",
+                    "attention_core dense: compatible processor was not "
+                    "called during calibration",
+                ))
+                continue
+            if any(row["mask"] is not None for row in rows):
+                refused.append((
+                    f"{path}.processor",
+                    "attention_core dense: live attention masks are outside "
+                    "the unmasked dense executable form",
+                ))
                 continue
             core = bind_dense_attention(rows)
             if core is None:
+                refused.append((
+                    f"{path}.processor",
+                    "attention_core dense: published Hub artifact does not "
+                    "cover the captured head dimension or mask form",
+                ))
                 continue
-            routed = _FlashRTAttnProcessor2_0(core)
+            routed = _FlashRTDenseAttnProcessor(core, original)
             routes.append((module, original, routed))
             observed[f"{path}.processor::fa2_core"] = core
         if not routes:
-            return None
+            return {}, None, {"refused": refused}
 
         def enable() -> None:
             for module, _, routed in routes:
@@ -169,4 +237,5 @@ class DiffusersAttentionAdapter:
             "revert": [revert],
             "observed": observed,
             "toggle": (enable, disable),
+            "refused": refused,
         }

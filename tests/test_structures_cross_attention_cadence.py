@@ -116,3 +116,36 @@ def test_cross_kv_refresh_does_not_mutate_ledger_while_compiling(monkeypatch):
     assert all(
         static._frt_guard.notes["refreshes"] == 0 for static in statics
     )
+
+
+def test_cross_kv_refresh_never_uses_a_sibling_ordered_replacement():
+    host = FamilyOne()
+    candidates = discover_cross_attention_kv(host)
+    encoder = torch.randn(1, 5, 12)
+    captures = capture_cross_attention_kv(
+        candidates,
+        lambda: [
+            (host.blocks[0].to_k(encoder), host.blocks[0].to_v(encoder))
+            for _ in range(2)
+        ],
+    )
+
+    class StaleSiblingReader(nn.Module):
+        _frt_requires_sibling_order = True
+
+        def forward(self, value):
+            return torch.full(
+                (*value.shape[:-1], 8), -999.0, dtype=value.dtype)
+
+    replacements = {
+        candidate.path: StaleSiblingReader() for candidate in candidates
+    }
+    _, statics = bind_cross_attention_kv(
+        candidates, captures, replacements=replacements)
+    fresh = torch.randn_like(encoder)
+    refresh_cross_attention_kv(statics, fresh)
+
+    for candidate, static in zip(candidates, statics):
+        torch.testing.assert_close(
+            static.buffer, candidate.module(fresh))
+        assert not bool((static.buffer == -999).all())

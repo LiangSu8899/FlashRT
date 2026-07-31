@@ -190,11 +190,14 @@ class PackedLinear(GuardedSeam, torch.nn.Module):
         if not self.joint_slots:
             raise ValueError("qkv_pack: this pack has no joint slots")
         flat = x.reshape(-1, x.shape[-1])
-        if flat.shape[0] > self.rows:
-            raise GuardRefused(
-                f"qkv_pack: joint rows {flat.shape[0]} exceed capacity "
-                f"{self.rows}"
-            )
+        if not torch.compiler.is_compiling():
+            reason = self._frt_guard.admit(flat)
+            if reason is not None:
+                # Joint consumption has no q-only host fallback: all sibling
+                # projections have already been claimed by the composition.
+                # Still write the refusal into the ordinary seam ledger.
+                self._frt_guard.refuse(reason)
+                raise GuardRefused(f"qkv_pack: joint refused — {reason}")
         self._run(flat)
         width = sum(self.splits[:self.joint_slots])
         return self.packed[:flat.shape[0], :width]
@@ -258,6 +261,10 @@ class StashReader(GuardedSeam, torch.nn.Module):
 
     _frt_host_attr = "host_linear"
     _frt_can_fallback = True
+    # Its value is valid only after the packed head ran on the same input.
+    # A slower-cadence updater calls one projection independently, so using
+    # this replacement there would refresh from a previous sibling call.
+    _frt_requires_sibling_order = True
 
     def __init__(self, orig: torch.nn.Module, packed: PackedLinear,
                  index: int):

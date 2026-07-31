@@ -14,8 +14,8 @@ import torch.nn.functional as F
 
 def vision_ffn_ref(
     x: torch.Tensor,
-    w_norm: torch.Tensor,
-    b_norm: torch.Tensor,
+    w_norm: torch.Tensor | None,
+    b_norm: torch.Tensor | None,
     w_fc1: torch.Tensor,
     b_fc1: torch.Tensor,
     w_fc2: torch.Tensor,
@@ -28,6 +28,8 @@ def vision_ffn_ref(
     if activation != "gelu":
         raise ValueError(f"unsupported activation: {activation!r}")
     h = F.layer_norm(x.float(), (x.shape[-1],),
-                     w_norm.float(), b_norm.float(), eps).to(x.dtype)
+                     (w_norm.float() if w_norm is not None else None),
+                     (b_norm.float() if b_norm is not None else None),
+                     eps).to(x.dtype)
     hidden = F.gelu(h @ w_fc1.t() + b_fc1, approximate="tanh")
     return x + (hidden @ w_fc2.t() + b_fc2)

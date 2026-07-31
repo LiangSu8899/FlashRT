@@ -29,17 +29,28 @@ Three qualifications, all decided from real captures:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 
 import torch
 
 from .. import hub_kernel
 from ...guard import PROCEED, GuardedSeam
 
-# Hub FA2 keeps logical D and dispatches into native 64/96/128/256
-# instantiations. The structure must admit the same vector-aligned envelope;
-# otherwise valid GROOT D48/D72 and VL vision D80 captures are rejected before
-# the package can apply its internal bucket mapping.
-SUPPORTED_HEAD_DIMS = tuple(range(8, 257, 8))
+@lru_cache(maxsize=1)
+def supported_head_dims() -> tuple[int, ...]:
+    """Read the executable envelope from the installed Hub artifact."""
+    package = hub_kernel("flashrt/fa2-seqused-runtime", ">=1")
+    advertised = getattr(package, "SUPPORTED_HEAD_DIMS", None)
+    if advertised is None:
+        raise ValueError(
+            "attention_core: FA2 Hub artifact does not advertise "
+            "SUPPORTED_HEAD_DIMS; refusing to duplicate backend capability "
+            "inside the structure layer")
+    dims = tuple(sorted({int(dim) for dim in advertised}))
+    if not dims or any(dim <= 0 for dim in dims):
+        raise ValueError(
+            "attention_core: FA2 Hub artifact advertised invalid head dims")
+    return dims
 
 
 @dataclass
@@ -353,7 +364,7 @@ def bind_dense_attention(captures):
     first = captures[0]
     query, key, value = first["q"], first["key"], first["value"]
     head_dim = query.shape[-1]
-    if head_dim not in SUPPORTED_HEAD_DIMS:
+    if head_dim not in supported_head_dims():
         return None
     allowed_ranges = _allowed_ranges(first.get("mask"))
     if allowed_ranges is None:
@@ -396,7 +407,7 @@ def bind_attention_core(captures, *, prefix_static_rtol: float = 1e-3):
     if not captures:
         raise ValueError("attention_core: no captures")
     head_dim = captures[0]["q"].shape[-1]
-    if head_dim not in SUPPORTED_HEAD_DIMS:
+    if head_dim not in supported_head_dims():
         return None
 
     modules, scratch = [], None

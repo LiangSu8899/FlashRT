@@ -216,3 +216,34 @@ def test_qwen_adapter_composes_pack_and_is_reversible(monkeypatch):
     assert cache.seen[1]["cos"] is position[0]
     extras["revert"][0]()
     assert parts[0].joint_slots == 0
+
+
+def test_qwen_adapter_reports_a_recognised_but_incompatible_site(monkeypatch):
+    monkeypatch.setattr(
+        fp8_static,
+        "hub_kernel",
+        lambda *args, **kwargs: SimpleNamespace(
+            bf16_fp8_linear_bias_bf16=_FakeGemm.bf16_fp8_linear_bias_bf16
+        ),
+    )
+    host = _Host().eval()
+    parts = fp8_static.bind_qkv_pack(
+        (host.attn.q_proj, host.attn.k_proj, host.attn.v_proj),
+        torch.ones(1),
+        rows=7,
+        in_dtype="bf16_fused_quant",
+    )
+    del host.attn.config
+    plan = SimpleNamespace(
+        swaps={
+            "attn.q_proj": parts[0],
+            "attn.k_proj": parts[1],
+            "attn.v_proj": parts[2],
+        }
+    )
+
+    extras = adapter_mod.PerHeadGqaQkNormRopeAdapter()(host, plan)
+
+    assert extras is not None
+    assert not extras.get("observed")
+    assert "host lacks the complete" in extras["refused"][0][1]

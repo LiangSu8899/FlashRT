@@ -84,10 +84,17 @@ def bind_cross_attention_kv(
 ) -> tuple[dict[str, StaticOutput], tuple[StaticOutput, ...]]:
     """Bind K/V buffers, optionally consuming already-bound projections."""
     replacements = replacements or {}
-    modules = [
-        replacements.get(candidate.path, candidate.module)
-        for candidate in candidates
-    ]
+    modules = []
+    for candidate in candidates:
+        replacement = replacements.get(candidate.path, candidate.module)
+        if getattr(replacement, "_frt_requires_sibling_order", False):
+            # A StashReader (and any equivalent composed tail) is not a
+            # projection in isolation: it reads data produced by a sibling.
+            # Refresh happens outside that sibling call order, so recompute
+            # from the candidate's real projection instead of copying stale
+            # stash contents into the cadence buffer.
+            replacement = candidate.module
+        modules.append(replacement)
     statics, _ = bind_cadence_static(modules, captures)
     return (
         {
