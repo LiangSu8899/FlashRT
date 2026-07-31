@@ -1472,6 +1472,7 @@ endif()
 if(FLASHRT_ENABLE_QWEN35MOE AND ENABLE_NVFP4)
   target_sources(flash_rt_kernels PRIVATE
     csrc/kernels/qwen35moe_layout.cu
+    csrc/kernels/w4a16_packed_sm80.cu
     csrc/kernels/moe_grouped_gemv_sm120.cu
     csrc/kernels/bf16_matvec_sm120.cu
     csrc/kernels/w4a16_matvec_sm120.cu
