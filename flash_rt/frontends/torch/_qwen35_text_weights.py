@@ -170,6 +170,43 @@ def _load_fused(weights: TextWeights, reader: _Reader, sites: dict,
     into[prefix + "_k"] = columns
 
 
+
+def _load_fused_plain(weights: TextWeights, reader: _Reader,
+                      parts: list[tuple[str, str, int]], into: dict[str, int],
+                      prefix: str, device: str) -> None:
+    """Uncompressed projections over one activation, joined the same way.
+
+    The recurrence's two small projections are left uncompressed by the
+    producer, so they cannot join the packed set -- but they read the same
+    activation as each other, and joining them is still one launch instead of
+    two.
+    """
+    rows = 0
+    tensors = []
+    columns = None
+    for short, name, part_rows in parts:
+        tensor = reader.get(name)
+        if tensor.ndim != 2:
+            raise ValueError(f"{name} is {tuple(tensor.shape)}, not a matrix")
+        if columns is None:
+            columns = int(tensor.shape[1])
+        elif int(tensor.shape[1]) != columns:
+            raise ValueError(
+                f"{name} has K={int(tensor.shape[1])}, but {parts[0][1]} has "
+                f"K={columns}; only projections over the same activation fuse")
+        if int(tensor.shape[0]) != part_rows:
+            raise ValueError(
+                f"{name} has {int(tensor.shape[0])} rows, but the geometry "
+                f"makes it {part_rows}")
+        tensors.append(tensor)
+        into[prefix + "_" + short + "_offset"] = rows
+        rows += part_rows
+    into[prefix] = _place(
+        weights, torch.cat(tensors, dim=0), device, torch.bfloat16)
+    into[prefix + "_n"] = rows
+    into[prefix + "_k"] = columns
+
+
 def load_text_weights(path: str, contract: dict[str, Any],
                       device: str = "cuda:0") -> TextWeights:
     """Load the text backbone, packed weights kept packed.
@@ -224,15 +261,24 @@ def load_text_weights(path: str, contract: dict[str, Any],
                          "down", sites[prefix + "mlp.down_proj"], device)
 
         if linear:
-            for short, site in (("in_qkv", "linear_attn.in_proj_qkv"),
-                                ("in_z", "linear_attn.in_proj_z"),
-                                ("out", "linear_attn.out_proj")):
-                _load_compressed(weights, reader, prefix + site, entry, short,
-                                 sites[prefix + site], device)
+            # qkv and z are packed and read the same activation.
+            _load_fused(weights, reader, sites,
+                        [("qkv", prefix + "linear_attn.in_proj_qkv"),
+                         ("z", prefix + "linear_attn.in_proj_z")],
+                        entry, "in_proj", device)
+            _load_compressed(weights, reader, prefix + "linear_attn.out_proj",
+                             entry, "out",
+                             sites[prefix + "linear_attn.out_proj"], device)
+            # a and b read it too, but the producer leaves them uncompressed.
+            _load_fused_plain(
+                weights, reader,
+                [("a", prefix + "linear_attn.in_proj_a.weight",
+                  dims.lin_value_heads),
+                 ("b", prefix + "linear_attn.in_proj_b.weight",
+                  dims.lin_value_heads)],
+                entry, "in_ab", device)
             for short, name in (("a_log", "linear_attn.A_log"),
                                 ("dt_bias", "linear_attn.dt_bias"),
-                                ("in_a", "linear_attn.in_proj_a.weight"),
-                                ("in_b", "linear_attn.in_proj_b.weight"),
                                 ("conv", "linear_attn.conv1d.weight"),
                                 ("gdn_norm", "linear_attn.norm.weight")):
                 entry[short] = _place(

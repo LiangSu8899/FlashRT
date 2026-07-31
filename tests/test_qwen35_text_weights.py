@@ -140,7 +140,7 @@ def test_every_layer_gets_the_sites_its_type_needs(tmp_path):
     for index, entry in enumerate(weights.layers):
         assert {"gate_up_packed", "down_packed"} <= set(entry)
         if dims.layer_types[index] == "linear_attention":
-            assert {"in_qkv_packed", "in_z_packed", "out_packed",
+            assert {"in_proj_packed", "out_packed", "in_ab",
                     "a_log", "dt_bias", "conv"} <= set(entry)
             assert "qkv_packed" not in entry
         else:
