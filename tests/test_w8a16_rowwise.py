@@ -36,11 +36,32 @@ def quantize_rowwise(weight: torch.Tensor):
     return values, scale.to(torch.float16)
 
 
+# Rows per reference chunk. The vocabulary-sized case is 248320 x 2560: a
+# reference that materialises the decoded weight wants 2.5 GiB of fp32 beside
+# the int8 it decoded from, which does not fit the part this targets. The
+# kernel still runs over every row -- only the comparison is chunked.
+CHUNK_ROWS = 8192
+
+
+def _quantized_rows(rows: int, k: int, generator: torch.Generator):
+    """One chunk of weight, and its INT8 form, without keeping the fp32."""
+    weight = torch.randn(rows, k, device=DEVICE, generator=generator) * 0.02
+    values, scale = quantize_rowwise(weight)
+    del weight
+    return values, scale
+
+
 @pytest.mark.parametrize("n,k", SHAPES)
 def test_matvec_matches_the_decoded_weight(n, k):
-    torch.manual_seed(0)
-    weight = torch.randn(n, k, device=DEVICE) * 0.02
-    values, scale = quantize_rowwise(weight)
+    generator = torch.Generator(device=DEVICE).manual_seed(0)
+    values = torch.empty(n, k, dtype=torch.int8, device=DEVICE)
+    scale = torch.empty(n, dtype=torch.float16, device=DEVICE)
+    for start in range(0, n, CHUNK_ROWS):
+        stop = min(start + CHUNK_ROWS, n)
+        chunk_values, chunk_scale = _quantized_rows(stop - start, k, generator)
+        values[start:stop] = chunk_values
+        scale[start:stop] = chunk_scale
+        del chunk_values, chunk_scale
     x = torch.randn(1, k, dtype=torch.bfloat16, device=DEVICE)
 
     out = torch.empty(1, n, dtype=torch.bfloat16, device=DEVICE)
@@ -50,9 +71,19 @@ def test_matvec_matches_the_decoded_weight(n, k):
     assert rc == 0
     torch.cuda.synchronize(DEVICE)
 
-    decoded = values.float() * scale.float()[:, None]
-    want = x.float() @ decoded.T
-    error = (out.float() - want).abs().max() / want.abs().max()
+    # Compare a chunk at a time against the same rows decoded, so the largest
+    # fp32 alive is one chunk rather than the whole weight.
+    xf = x.float()
+    worst = 0.0
+    scale_of = 0.0
+    for start in range(0, n, CHUNK_ROWS):
+        stop = min(start + CHUNK_ROWS, n)
+        decoded = values[start:stop].float() * scale[start:stop].float()[:, None]
+        want = xf @ decoded.T
+        worst = max(worst, float((out[:, start:stop].float() - want).abs().max()))
+        scale_of = max(scale_of, float(want.abs().max()))
+        del decoded, want
+    error = worst / max(scale_of, 1e-6)
     assert error < 5e-3, f"relative error {error:.3g} at N={n}, K={k}"
 
 
