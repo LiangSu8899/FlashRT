@@ -43,7 +43,7 @@ class Workspace:
     """
 
     def __init__(self, weights: TextWeights, device: str = "cuda:0",
-                 max_batch: int = 1):
+                 max_batch: int = 1, max_seq: int = 4096):
         dims = weights.dims
         self.device = device
         self.max_batch = max_batch
@@ -67,10 +67,70 @@ class Workspace:
         # come back to the host between tokens.
         self.token = _Buffer.make(max_batch, dtype=torch.int64, device=device)
 
+        # Per-layer state, allocated with the workspace because it is the
+        # same kind of thing: an address the step writes into that has to
+        # outlive the call and never move.
+        #
+        # The two regimes carry state of different shapes, and the difference
+        # is the reason this model suits a device like this. A recurrence
+        # holds a fixed amount however long the context gets; only the full
+        # attention layers grow with it, and there are a quarter as many of
+        # those. A prompt twice as long costs twice the KV of eight layers,
+        # not of thirty-two.
+        self.recurrent = [
+            _Buffer.make(dims.lin_value_heads, dims.lin_key_head_dim,
+                         dims.lin_value_head_dim, dtype=torch.float32,
+                         device=device)
+            for _ in dims.linear_attention_layers
+        ]
+        self.conv = [
+            _Buffer.make(max_batch, dims.lin_qkv_width,
+                         dims.lin_conv_kernel - 1, device=device)
+            for _ in dims.linear_attention_layers
+        ]
+        self.keys = [
+            _Buffer.make(max_seq, dims.kv_heads, dims.head_dim, device=device)
+            for _ in dims.full_attention_layers
+        ]
+        self.values = [
+            _Buffer.make(max_seq, dims.kv_heads, dims.head_dim, device=device)
+            for _ in dims.full_attention_layers
+        ]
+        # Which slot of the two lists above a layer index belongs to, resolved
+        # once so the step does not count layer types while it runs.
+        self.state_slot = {
+            layer: rank
+            for rank, layer in enumerate(dims.linear_attention_layers)
+        }
+        self.state_slot.update({
+            layer: rank
+            for rank, layer in enumerate(dims.full_attention_layers)
+        })
+        self.max_seq = max_seq
+        self.state_bytes = sum(
+            buffer.tensor.numel() * buffer.tensor.element_size()
+            for group in (self.recurrent, self.conv, self.keys, self.values)
+            for buffer in group)
+
+    def reset(self) -> None:
+        """Forget the sequence, keep the addresses.
+
+        A control loop starts a new sequence often, and re-allocating would
+        move every address a captured graph was built around. Zeroing is what
+        starting over means here.
+        """
+        for group in (self.recurrent, self.conv):
+            for buffer in group:
+                buffer.tensor.zero_()
+
     def close(self) -> None:
         for name in ("hidden", "normed", "residual", "fused", "gated",
                      "attn_out", "logits", "token"):
             setattr(self, name, None)
+        self.recurrent = []
+        self.conv = []
+        self.keys = []
+        self.values = []
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
