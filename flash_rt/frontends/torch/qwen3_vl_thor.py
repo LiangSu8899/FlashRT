@@ -23,13 +23,16 @@ See docs/qwen3_vl_thor.md.
 """
 from __future__ import annotations
 
+import collections
 import json
 import os
 from typing import Any
 
 
 # flash_rt_kernels (fvk) language ops required on Thor. embedding_lookup_bf16
-# and bf16_matmul_bf16 are model-neutral and built for every arch.
+# and bf16_matmul_bf16 are model-neutral and built for every arch;
+# bf16_matmul_bf16 is uncalled here (GEMMs go through the vlk cuBLASLt/GEMV
+# path) and is required purely as a build-inventory health check.
 _THOR_CORE_FNS = (
     'rms_norm',
     'residual_add',
@@ -101,7 +104,16 @@ def _validate_wq_overrides(overrides: dict | None) -> dict:
             raise ValueError(
                 f'wq_overrides key {key!r} must be one of {_WQ_PROJ_KEYS} '
                 f"(optionally 'L<layer>.' prefixed)")
+        if base == 'lm_head' and base != key:
+            raise ValueError(
+                f"wq_overrides key {key!r}: lm_head is not per-layer; "
+                "use 'lm_head'")
     return ov
+
+
+def _wq_active(mode: str, overrides: dict) -> bool:
+    """True when the global mode or any override requests quantization."""
+    return mode != 'bf16' or any(v != 'bf16' for v in overrides.values())
 
 
 class Qwen3VlTorchFrontendThor:
@@ -116,10 +128,10 @@ class Qwen3VlTorchFrontendThor:
                              f"{weight_mode!r}")
         self._wq_overrides = _validate_wq_overrides(wq_overrides)
         self._wq_mode = weight_mode          # 'bf16' | 'w8' | 'w4'
-        self._use_wq = weight_mode in ('w8', 'w4')
+        self._use_wq = _wq_active(weight_mode, self._wq_overrides)
 
         import torch
-        from transformers import AutoProcessor, AutoTokenizer
+        from transformers import AutoProcessor
 
         from flash_rt.frontends.torch._qwen3_vl_bf16_weights import (
             assert_extraction_invariants_qwen3_vl_bf16,
@@ -202,7 +214,7 @@ class Qwen3VlTorchFrontendThor:
             head_dim=self._cfg['head_dim'], device=self.device)
 
         self.processor = AutoProcessor.from_pretrained(self.checkpoint_path)
-        self._tokenizer = AutoTokenizer.from_pretrained(self.checkpoint_path)
+        self._tokenizer = self.processor.tokenizer
         self._processor_kwargs: dict[str, Any] = {'device': self.device}
         if max_pixels is not None:
             size = getattr(getattr(self.processor, 'image_processor', None),
@@ -248,7 +260,6 @@ class Qwen3VlTorchFrontendThor:
         # CUDA-graph decode state (all Thor decode primitives are capturable).
         self._static_token_id = torch.zeros(1, 1, device=d, dtype=torch.long)
         self._graph_stream = torch.cuda.Stream(device=d)
-        import collections
         self._decode_graphs: "collections.OrderedDict[tuple[int, int], Any]" = (
             collections.OrderedDict())
         self._graph_warmed = False
@@ -308,7 +319,6 @@ class Qwen3VlTorchFrontendThor:
                 return m
         return ov.get(key, self._wq_mode)
 
-
     def _load_wq_weights(self) -> None:
         """Quantize the language linears (+ tied lm_head) to the decode weight
         format (W8A16 / W4A16, per-projection overridable) for the
@@ -318,7 +328,7 @@ class Qwen3VlTorchFrontendThor:
         for fn in ('qwen3_vl_w8_gemv_m1', 'qwen3_vl_w4_gemv_m1'):
             if not hasattr(self._vlk, fn):
                 raise RuntimeError(
-                    f'weight_mode={self._wq_mode!r} requires {fn} in '
+                    f'W8/W4 decode requires {fn} in '
                     'flash_rt_qwen3_vl_kernels (rebuild with -DGPU_ARCH=110 '
                     '-DFLASHRT_BUILD_QWEN3_VL=ON)')
         gemv = {'w8': self._vlk.qwen3_vl_w8_gemv_m1,
@@ -387,8 +397,6 @@ class Qwen3VlTorchFrontendThor:
                 self.checkpoint_path, device=self.device,
                 config=self._vision_cfg, fp8=False)
         return self._vision
-
-
 
     def reset_state(self) -> None:
         self._attn.reset_cache()
@@ -486,16 +494,13 @@ class Qwen3VlTorchFrontendThor:
         # M=1 decode: the dedicated warp-per-row GEMV is bandwidth-bound and
         # beats cuBLASLt's poor M=1 tactics (covers K in {2048, 6144}, which is
         # every 2B decode GEMM including lm_head). Larger M (prefill) and other
-        # K go through cuBLASLt; the deterministic warp GEMM is the last resort.
+        # K go through cuBLASLt.
         if (M == 1 and K in (2048, 6144)
                 and hasattr(self._vlk, 'qwen3_vl_bf16_gemv_m1')):
             self._vlk.qwen3_vl_bf16_gemv_m1(
                 x.data_ptr(), int(weight_ptr), out.data_ptr(), N, K, stream)
-        elif hasattr(self._vlk, 'bf16_matmul_cublaslt_bf16'):
-            self._vlk.bf16_matmul_cublaslt_bf16(
-                x.data_ptr(), int(weight_ptr), out.data_ptr(), M, N, K, stream)
         else:
-            self._fvk.bf16_matmul_bf16(
+            self._vlk.bf16_matmul_cublaslt_bf16(
                 x.data_ptr(), int(weight_ptr), out.data_ptr(), M, N, K, stream)
 
     # ── one decoder layer (prefill loops rows; decode is S=1) ──
@@ -682,9 +687,8 @@ class Qwen3VlTorchFrontendThor:
 
         deepstack = None
         if p['has_image']:
-            import torch as _torch
             a, b = p['span']
-            with _torch.no_grad():
+            with torch.no_grad():
                 emb, deepstack = self._ensure_native_vision().forward(
                     p['pixel_values'], p['pos_embeds'],
                     p['vcos'], p['vsin'])
@@ -693,7 +697,8 @@ class Qwen3VlTorchFrontendThor:
         cur = h
         # Batched QK norm-rope kernel (_layer_forward) hardcodes a 64-elem
         # cos/sin row stride; enforce that coupling once (silent-wrong guard).
-        assert p['mcos'].is_contiguous() and p['mcos'].shape[-1] == 64, (
+        assert all(t.is_contiguous() and t.shape[-1] == 64
+                   for t in (p['mcos'], p['msin'])), (
             'batched prefill requires (S,64) row-contiguous mcos/msin')
         for L in range(cfg['num_hidden_layers']):
             cur = self._layer_forward(L, cur, p['mcos'], p['msin'], 0, S)
@@ -715,31 +720,12 @@ class Qwen3VlTorchFrontendThor:
     # ── decode ──
 
     def decode_step(self, token_id: int, *, cache_pos: int, rope_pos: int):
+        """Eager single-token decode (correctness reference for graph replay).
+        Same body as the captured path, run directly with a sync."""
         import torch
 
-        cfg = self._cfg
-        fvk = self._fvk
-        H = cfg['hidden_size']
-        eps = cfg['rms_norm_eps']
-        n = cfg['num_hidden_layers']
-        stream = torch.cuda.current_stream().cuda_stream
-        tok = torch.tensor([[int(token_id)]], dtype=torch.long,
-                           device=self.device)
-        h = self._h_a[:, :1]
-        fvk.embedding_lookup_bf16(
-            tok.view(-1).data_ptr(), int(self._weights.ptrs['embed_w']),
-            h.data_ptr(), 1, H, stream)
-        cos = self._mrope_cos_cache[rope_pos:rope_pos + 1]
-        sin = self._mrope_sin_cache[rope_pos:rope_pos + 1]
-        layers = self._weights.ptrs['layers']
-        final_w = int(self._weights.ptrs['final_norm_w'])
-        xn = self._norm_buf[:1]
-        fvk.rms_norm(h.view(1, H).data_ptr(), int(layers[0]['input_norm_w']),
-                     xn.data_ptr(), 1, H, eps, stream)
-        for L in range(n):
-            nw = int(layers[L + 1]['input_norm_w']) if L + 1 < n else final_w
-            xn = self._decode_layer(L, h, xn, cos, sin, cache_pos, nw)
-        self._lm_head(xn, self._logits, stream, decode=True)
+        self._static_token_id.fill_(int(token_id))
+        self._decode_body(cache_pos, rope_pos)
         torch.cuda.synchronize()
         return self._logits
 
@@ -812,21 +798,24 @@ class Qwen3VlTorchFrontendThor:
             raise RuntimeError('call set_prompt() before warmup_decode_graphs')
         base_slot = int(self._prompt['S'])
         base_rope = int(self._prompt['mrope_max']) + 1
+        if base_slot + int(n_tokens) > self.max_seq:
+            raise ValueError(
+                f'warmup of {n_tokens} positions from slot {base_slot} '
+                f'exceeds max_seq={self.max_seq}')
         for i in range(int(n_tokens)):
             self._ensure_decode_graph(base_slot + i, base_rope + i)
 
     def set_wq_overrides(self, overrides: dict | None) -> None:
         """Set per-projection quant-mode overrides and requantize the decode
-        weights in place (validated). No-op re-quant if ``weight_mode='bf16'``
-        (nothing is W-quantized)."""
+        weights in place (validated)."""
+        was = self._use_wq
         self._wq_overrides = _validate_wq_overrides(overrides)
-        if self._use_wq:
+        self._use_wq = _wq_active(self._wq_mode, self._wq_overrides)
+        if was or self._use_wq:
             self._load_wq_weights()
 
-    def _finish_greedy(self, out_ids: list, max_new_tokens: int) -> str:
-        """Shared greedy tail: clip to the token budget, then cut at the
-        first EOS within it, then decode."""
-        out_ids = out_ids[:max_new_tokens]
+    def _finish_greedy(self, out_ids: list) -> str:
+        """Greedy tail: cut at the first EOS, then decode."""
         eos = next((i for i, t in enumerate(out_ids)
                     if t in self._eos_token_ids), None)
         if eos is not None:
@@ -838,12 +827,21 @@ class Qwen3VlTorchFrontendThor:
         """Greedy generation. Decode runs via captured CUDA-Graph replay by
         default (graph output is bit-identical to eager); ``use_graph=False``
         forces the eager per-step path (correctness reference)."""
+        if max_new_tokens < 1:
+            raise ValueError(
+                f'max_new_tokens must be >= 1, got {max_new_tokens}')
         self.set_prompt(messages)
-        logits = self.prefill()
         p = self._prompt
         assert p is not None
         base_slot = int(p['S'])
         base_rope = int(p['mrope_max']) + 1
+        if base_slot + max_new_tokens - 1 > self.max_seq:
+            raise ValueError(
+                f'prompt ({base_slot} tokens) + max_new_tokens='
+                f'{max_new_tokens} needs '
+                f'{base_slot + max_new_tokens - 1} KV slots, but '
+                f'max_seq={self.max_seq}')
+        logits = self.prefill()
         step = self.decode_step_graph if use_graph else self.decode_step
         tok = int(logits[0].argmax())
         out_ids = [tok]
@@ -854,4 +852,4 @@ class Qwen3VlTorchFrontendThor:
                 tok, cache_pos=base_slot + i, rope_pos=base_rope + i)
             tok = int(logits[0].argmax())
             out_ids.append(tok)
-        return self._finish_greedy(out_ids, max_new_tokens)
+        return self._finish_greedy(out_ids)

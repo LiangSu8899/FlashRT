@@ -152,6 +152,7 @@ def test_valid_wq_overrides_accepted(ov):
     {'nonsense': 'w4'},           # unknown projection
     {'Lx.gate_up': 'w4'},         # malformed layer prefix
     {'L1.nonsense': 'w4'},
+    {'L3.lm_head': 'w8'},         # lm_head is not per-layer
 ])
 def test_invalid_wq_overrides_rejected(ov):
     m = importlib.import_module(FRONTEND_MOD)
@@ -166,6 +167,17 @@ def test_wq_overrides_returns_a_copy():
     out = m._validate_wq_overrides(src)
     out['mlp_down'] = 'w4'
     assert src == {'gate_up': 'w8'}
+
+
+def test_wq_active_covers_global_mode_and_overrides():
+    """A non-bf16 override must activate quantization even when the global
+    weight_mode is bf16 (otherwise the override is silently dropped)."""
+    m = importlib.import_module(FRONTEND_MOD)
+    assert m._wq_active('w8', {})
+    assert m._wq_active('w4', {})
+    assert not m._wq_active('bf16', {})
+    assert m._wq_active('bf16', {'gate_up': 'w8'})
+    assert not m._wq_active('bf16', {'gate_up': 'bf16'})
 
 
 # ── routing ──

@@ -132,13 +132,17 @@ Constructor arguments:
 
 `max_seq` sizes the KV cache and must cover prompt plus generated tokens; a
 full-resolution image prompt already costs ~1.6 K tokens, so the `4096` default
-leaves modest headroom. `set_prompt_text()` takes a pre-templated string instead
-of a `messages` list, for text-only harnesses that build their own prompt.
+leaves modest headroom. `set_prompt_text()` takes a plain string (plus optional
+`system=`) instead of a `messages` list; it wraps the string in a user message
+and applies the chat template, for text-only harnesses.
 
 Decode graphs are cached per `(cache_pos, rope_pos)` and the cache is capped at
-`max_seq` entries — one per reachable position, so a graph is never evicted while
-still reachable. Thor therefore has no graph-cache environment variables; the
-`FLASHRT_QWEN3_VL_*_GRAPH_CACHE_MAX` knobs belong to the other Qwen3-VL
+`max_seq` entries, so a graph is never evicted within a single generation.
+Prompts with different image geometries key different `(cache_pos, rope_pos)`
+pairs and may evict older entries across a session. Each cached graph holds a
+private CUDA memory pool, so very long generations trade GPU memory for
+capture-free decode. Thor therefore has no graph-cache environment variables;
+the `FLASHRT_QWEN3_VL_*_GRAPH_CACHE_MAX` knobs belong to the other Qwen3-VL
 frontends (Orin/SM89/SM120) and are not read here.
 
 The frontend is registered for `('qwen3_vl', 'torch', 'thor')`, so
@@ -177,7 +181,9 @@ fe = Qwen3VlTorchFrontendThor(ckpt, weight_mode='w4',
 ```
 
 Unknown keys are rejected rather than ignored, because a silently dropped
-override reads as "this projection does not matter" in a sweep.
+override reads as "this projection does not matter" in a sweep. Overrides
+apply independently of the global mode: `weight_mode='bf16'` with a single
+non-bf16 override quantizes just that projection.
 `set_wq_overrides()` requantizes in place and drops the captured decode graphs,
 which bake in the quant-buffer pointers.
 
@@ -204,7 +210,7 @@ Environment:
   → 6256 vision patches, 1581 prompt tokens
 
 Build and symbol checks passed as described in [Local checks](#local-checks);
-`tests/test_qwen3_vl_thor.py` reports 40 passed, 3 skipped on device.
+`tests/test_qwen3_vl_thor.py` reports 42 passed on device.
 
 **Correctness.** Text-only and single-image greedy prompts both produce coherent
 answers. The eager decode path (`--no-graph`) and CUDA-Graph replay returned
@@ -212,8 +218,8 @@ character-identical text on the same prompt, which is the intended property:
 graph replay changes launch overhead, not math.
 
 Full-resolution BF16 result, `generate(max_new_tokens=64)` (greedy hits EOS
-after ~33 generated tokens on this prompt; cold includes ViT graph capture and
-cuDNN/cuBLASLt plan building in a fresh process):
+after ~33 generated tokens on this prompt; cold includes decode-graph capture
+and cuDNN/cuBLASLt plan building in a fresh process):
 
 ```text
 vision patches: 6256

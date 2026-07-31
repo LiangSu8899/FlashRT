@@ -107,11 +107,12 @@ class ThorAttnBackendQwen3:
 
     @property
     def kv_layer_stride_bytes(self) -> int:
-        return self._max_seq * self.NUM_KV_HEADS * self.HEAD_DIM * 2
+        return self._max_seq * self.kv_row_stride_bytes
 
     @property
     def kv_row_stride_bytes(self) -> int:
-        return self.NUM_KV_HEADS * self.HEAD_DIM * 2
+        return (self.NUM_KV_HEADS * self.HEAD_DIM
+                * self.K_cache.element_size())
 
     # ── AttentionBackend protocol ──
 
