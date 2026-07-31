@@ -178,9 +178,11 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #ifdef FLASHRT_HAVE_QWEN36_KERNELS
 #include "kernels/qwen36_misc.cuh"
 #endif
-#ifdef FLASHRT_HAVE_QWEN35MOE
+#ifdef FLASHRT_HAVE_W4A16_PACKED
 #include "kernels/w4a16_packed_sm80.cuh"
 #include "kernels/w8a16_rowwise_sm80.cuh"
+#endif
+#ifdef FLASHRT_HAVE_QWEN35MOE
 #include "kernels/qwen35moe_layout.cuh"
 #include "kernels/moe_grouped_gemv_sm120.cuh"
 #include "kernels/bf16_matvec_sm120.cuh"
@@ -5387,49 +5389,6 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
 #endif  // FLASHRT_HAVE_QWEN36_KERNELS (gated_deltanet_qwen36 part 1)
 
 #ifdef FLASHRT_HAVE_QWEN35MOE
-    m.def("w8a16_rowwise_matvec_bf16",
-        [](uintptr_t x, uintptr_t weight, uintptr_t scale, uintptr_t out,
-           int N, int K, uintptr_t stream) -> int {
-            return flash_rt::kernels::w8a16_rowwise_matvec_bf16(
-                to_ptr(x), to_ptr(weight), to_ptr(scale), to_ptr(out),
-                N, K, to_stream(stream));
-        },
-        py::arg("x"), py::arg("weight"), py::arg("scale"), py::arg("out"),
-        py::arg("N"), py::arg("K"), py::arg("stream") = 0);
-
-    m.def("int8_rowwise_gather_bf16",
-        [](uintptr_t ids, uintptr_t weight, uintptr_t scale, uintptr_t out,
-           int rows, int table_rows, int K, uintptr_t stream) -> int {
-            return flash_rt::kernels::int8_rowwise_gather_bf16(
-                to_ptr(ids), to_ptr(weight), to_ptr(scale), to_ptr(out),
-                rows, table_rows, K, to_stream(stream));
-        },
-        py::arg("ids"), py::arg("weight"), py::arg("scale"), py::arg("out"),
-        py::arg("rows"), py::arg("table_rows"), py::arg("K"),
-        py::arg("stream") = 0);
-
-    m.def("w4a16_packed_matvec_bf16",
-        [](uintptr_t x, uintptr_t packed, uintptr_t scale, uintptr_t out,
-           int N, int K, int group, uintptr_t stream) -> int {
-            return flash_rt::kernels::w4a16_packed_matvec_bf16(
-                to_ptr(x), to_ptr(packed), to_ptr(scale), to_ptr(out),
-                N, K, group, to_stream(stream));
-        },
-        py::arg("x"), py::arg("packed"), py::arg("scale"), py::arg("out"),
-        py::arg("N"), py::arg("K"), py::arg("group") = 32,
-        py::arg("stream") = 0);
-
-    m.def("w4a16_packed_gemm_bf16",
-        [](uintptr_t x, uintptr_t packed, uintptr_t scale, uintptr_t out,
-           int M, int N, int K, int group, uintptr_t stream) -> int {
-            return flash_rt::kernels::w4a16_packed_gemm_bf16(
-                to_ptr(x), to_ptr(packed), to_ptr(scale), to_ptr(out),
-                M, N, K, group, to_stream(stream));
-        },
-        py::arg("x"), py::arg("packed"), py::arg("scale"), py::arg("out"),
-        py::arg("M"), py::arg("N"), py::arg("K"), py::arg("group") = 32,
-        py::arg("stream") = 0);
-
     m.def("qwen35moe_lin_split_qkv_broadcast_bf16",
         [](uintptr_t conv_out, uintptr_t q32,
            uintptr_t k32, uintptr_t v32,
@@ -5629,6 +5588,52 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("w_stride"), py::arg("sfb_stride"),
         py::arg("stream") = 0);
 #endif  // FLASHRT_HAVE_QWEN35MOE
+
+#ifdef FLASHRT_HAVE_W4A16_PACKED
+    m.def("w8a16_rowwise_matvec_bf16",
+        [](uintptr_t x, uintptr_t weight, uintptr_t scale, uintptr_t out,
+           int N, int K, uintptr_t stream) -> int {
+            return flash_rt::kernels::w8a16_rowwise_matvec_bf16(
+                to_ptr(x), to_ptr(weight), to_ptr(scale), to_ptr(out),
+                N, K, to_stream(stream));
+        },
+        py::arg("x"), py::arg("weight"), py::arg("scale"), py::arg("out"),
+        py::arg("N"), py::arg("K"), py::arg("stream") = 0);
+
+    m.def("int8_rowwise_gather_bf16",
+        [](uintptr_t ids, uintptr_t weight, uintptr_t scale, uintptr_t out,
+           int rows, int table_rows, int K, uintptr_t stream) -> int {
+            return flash_rt::kernels::int8_rowwise_gather_bf16(
+                to_ptr(ids), to_ptr(weight), to_ptr(scale), to_ptr(out),
+                rows, table_rows, K, to_stream(stream));
+        },
+        py::arg("ids"), py::arg("weight"), py::arg("scale"), py::arg("out"),
+        py::arg("rows"), py::arg("table_rows"), py::arg("K"),
+        py::arg("stream") = 0);
+
+    m.def("w4a16_packed_matvec_bf16",
+        [](uintptr_t x, uintptr_t packed, uintptr_t scale, uintptr_t out,
+           int N, int K, int group, uintptr_t stream) -> int {
+            return flash_rt::kernels::w4a16_packed_matvec_bf16(
+                to_ptr(x), to_ptr(packed), to_ptr(scale), to_ptr(out),
+                N, K, group, to_stream(stream));
+        },
+        py::arg("x"), py::arg("packed"), py::arg("scale"), py::arg("out"),
+        py::arg("N"), py::arg("K"), py::arg("group") = 32,
+        py::arg("stream") = 0);
+
+    m.def("w4a16_packed_gemm_bf16",
+        [](uintptr_t x, uintptr_t packed, uintptr_t scale, uintptr_t out,
+           int M, int N, int K, int group, uintptr_t stream) -> int {
+            return flash_rt::kernels::w4a16_packed_gemm_bf16(
+                to_ptr(x), to_ptr(packed), to_ptr(scale), to_ptr(out),
+                M, N, K, group, to_stream(stream));
+        },
+        py::arg("x"), py::arg("packed"), py::arg("scale"), py::arg("out"),
+        py::arg("M"), py::arg("N"), py::arg("K"), py::arg("group") = 32,
+        py::arg("stream") = 0);
+
+#endif  // FLASHRT_HAVE_W4A16_PACKED
 
 #ifdef FLASHRT_HAVE_QWEN36_KERNELS
     m.def("qwen36_gdn_gating_bf16",

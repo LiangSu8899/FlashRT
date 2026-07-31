@@ -1465,6 +1465,25 @@ else()
   message(STATUS "NVFP4 swizzle/quantize kernels: SKIPPED (slim build)")
 endif()
 
+# ── Portable weight-only quantized GEMV/GEMM ──
+# These decode published weight formats and use SM80-family facilities only,
+# so they are not part of any model's tier and not gated on Blackwell. They
+# were briefly inside the NVFP4 block, where they silently did not build on a
+# target that has no NVFP4 -- the tests then reported "built without kernels"
+# rather than failing, which is the wrong way round for a missing kernel.
+option(FLASHRT_ENABLE_W4A16_PACKED
+  "Build the packed-4-bit and rowwise-INT8 weight-only kernels" ON)
+if(FLASHRT_ENABLE_W4A16_PACKED)
+  target_sources(flash_rt_kernels PRIVATE
+    csrc/kernels/w4a16_packed_sm80.cu
+    csrc/kernels/w8a16_rowwise_sm80.cu)
+  target_compile_definitions(flash_rt_kernels PRIVATE
+    FLASHRT_HAVE_W4A16_PACKED=1)
+  message(STATUS "packed weight-only kernels: ENABLED (sm_${GPU_ARCH})")
+else()
+  message(STATUS "packed weight-only kernels: SKIPPED")
+endif()
+
 # ── qwen3_5_moe family (Nex-N2 / Qwen3.6-35B-A3B) SM120 kernels ──
 # Gated: only compiled when explicitly enabled AND on a Blackwell (NVFP4)
 # build. The bindings are #ifdef FLASHRT_HAVE_QWEN35MOE in bindings.cpp, so
@@ -1472,8 +1491,6 @@ endif()
 if(FLASHRT_ENABLE_QWEN35MOE AND ENABLE_NVFP4)
   target_sources(flash_rt_kernels PRIVATE
     csrc/kernels/qwen35moe_layout.cu
-    csrc/kernels/w4a16_packed_sm80.cu
-    csrc/kernels/w8a16_rowwise_sm80.cu
     csrc/kernels/moe_grouped_gemv_sm120.cu
     csrc/kernels/bf16_matvec_sm120.cu
     csrc/kernels/w4a16_matvec_sm120.cu
