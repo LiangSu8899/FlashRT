@@ -100,7 +100,12 @@ __device__ __forceinline__ int staged_slot(int index) {
   return word * kValuesPerWord + (within % 4) * 2 + within / 4;
 }
 
-template <int R, int G>
+// silu(g) * u, in fp32 where the accumulation already is.
+__device__ __forceinline__ float gated(float g, float u) {
+  return (g / (1.0f + __expf(-g))) * u;
+}
+
+template <int R, int G, bool kGated>
 __global__ void packed_matvec_kernel(
     const __nv_bfloat16* __restrict__ x,
     const uint32_t* __restrict__ packed,
@@ -130,12 +135,21 @@ __global__ void packed_matvec_kernel(
 
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
+  // When gated, a warp owns a row of the first half and its partner in the
+  // second, so the rows it covers are half the output it produces.
+  const int rows_out = kGated ? N / 2 : N;
   const int row_base = (blockIdx.x * kWarps + warp) * R;
-  if (row_base >= N) return;
+  if (row_base >= rows_out) return;
+  const int partner = kGated ? N / 2 : 0;
 
   float acc[R];
+  float acc_up[kGated ? R : 1];
 #pragma unroll
   for (int r = 0; r < R; ++r) acc[r] = 0.0f;
+  if (kGated) {
+#pragma unroll
+    for (int r = 0; r < R; ++r) acc_up[r] = 0.0f;
+  }
 
   for (int group = lane; group < groups; group += 32) {
     const __nv_bfloat16* activation = x_sh + group * kStride;
@@ -146,7 +160,7 @@ __global__ void packed_matvec_kernel(
 #pragma unroll
     for (int r = 0; r < R; ++r) {
       const int row = row_base + r;
-      const bool live = row < N;
+      const bool live = row < rows_out;
       const size_t base =
           (static_cast<size_t>(row) * groups + group) * kWords;
 #pragma unroll
@@ -162,6 +176,28 @@ __global__ void packed_matvec_kernel(
       acc[r] = fmaf(group_dot<G>(words[r], activation, group_sum[group]),
                     __bfloat162float(scales[r]), acc[r]);
     }
+    if (kGated) {
+      // The partner row's weight, read the same way. It is a second stream of
+      // loads over the same activation, which is why the pairing costs one
+      // register set and no extra traffic.
+#pragma unroll
+      for (int r = 0; r < R; ++r) {
+        const int row = row_base + r + partner;
+        const bool live = row_base + r < rows_out;
+        const size_t base =
+            (static_cast<size_t>(row) * groups + group) * kWords;
+        uint32_t up_words[kWords];
+#pragma unroll
+        for (int w = 0; w < kWords; ++w) {
+          up_words[w] = live ? packed[base + w] : 0u;
+        }
+        const __nv_bfloat16 up_scale = live
+            ? scale[static_cast<size_t>(row) * groups + group]
+            : __float2bfloat16(0.0f);
+        acc_up[r] = fmaf(group_dot<G>(up_words, activation, group_sum[group]),
+                         __bfloat162float(up_scale), acc_up[r]);
+      }
+    }
   }
 
 #pragma unroll
@@ -169,13 +205,16 @@ __global__ void packed_matvec_kernel(
 #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
       acc[r] += __shfl_xor_sync(0xffffffffu, acc[r], offset);
+      if (kGated) acc_up[r] += __shfl_xor_sync(0xffffffffu, acc_up[r], offset);
     }
   }
   if (lane == 0) {
 #pragma unroll
     for (int r = 0; r < R; ++r) {
       const int row = row_base + r;
-      if (row < N) out[row] = __float2bfloat16_rn(acc[r]);
+      if (row >= rows_out) continue;
+      out[row] = __float2bfloat16_rn(
+          kGated ? gated(acc[r], acc_up[r]) : acc[r]);
     }
   }
 }
@@ -257,11 +296,16 @@ int rows_per_warp(int K, int group) {
 
 }  // namespace
 
-int w4a16_packed_matvec_bf16(
+namespace {
+
+template <bool kGated>
+int launch_matvec(
     const void* x, const void* packed, const void* scale, void* out,
     int N, int K, int group, cudaStream_t stream) {
   const int bad = validate(x, packed, scale, out, N, K, group);
   if (bad) return bad;
+  if (kGated && (N & 1)) return 7;
+  const int rows_out = kGated ? N / 2 : N;
 
   const auto* x_ptr = reinterpret_cast<const __nv_bfloat16*>(x);
   const auto* packed_ptr = reinterpret_cast<const uint32_t*>(packed);
@@ -271,9 +315,9 @@ int w4a16_packed_matvec_bf16(
   const int rows = rows_per_warp(K, group);
 
 #define FLASHRT_DISPATCH(ROWS, GROUP)                                         \
-  packed_matvec_kernel<ROWS, GROUP>                                           \
-      <<<(N + kWarps * (ROWS) - 1) / (kWarps * (ROWS)), kThreads, shared,     \
-         stream>>>(x_ptr, packed_ptr, scale_ptr, out_ptr, N, K)
+  packed_matvec_kernel<ROWS, GROUP, kGated>                                   \
+      <<<(rows_out + kWarps * (ROWS) - 1) / (kWarps * (ROWS)), kThreads,      \
+         shared, stream>>>(x_ptr, packed_ptr, scale_ptr, out_ptr, N, K)
 #define FLASHRT_DISPATCH_ROWS(GROUP)                                          \
   switch (rows) {                                                             \
     case 1: FLASHRT_DISPATCH(1, GROUP); break;                                \
@@ -290,6 +334,20 @@ int w4a16_packed_matvec_bf16(
 #undef FLASHRT_DISPATCH_ROWS
 #undef FLASHRT_DISPATCH
   return 0;
+}
+
+}  // namespace
+
+int w4a16_packed_matvec_bf16(
+    const void* x, const void* packed, const void* scale, void* out,
+    int N, int K, int group, cudaStream_t stream) {
+  return launch_matvec<false>(x, packed, scale, out, N, K, group, stream);
+}
+
+int w4a16_packed_matvec_gated_bf16(
+    const void* x, const void* packed, const void* scale, void* out,
+    int N, int K, int group, cudaStream_t stream) {
+  return launch_matvec<true>(x, packed, scale, out, N, K, group, stream);
 }
 
 int w4a16_packed_gemm_bf16(

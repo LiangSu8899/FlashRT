@@ -140,7 +140,7 @@ def test_mlp_block_matches_the_block_written_out(tmp_path):
     weights.close()
 
 
-def test_the_step_issues_three_launches_and_allocates_nothing(tmp_path):
+def test_the_step_issues_two_launches_and_allocates_nothing(tmp_path):
     # The point of the workspace is that a step is launches and nothing else.
     # Anything allocated per call is both a dispatch and an address a captured
     # graph could not replay.
@@ -153,7 +153,8 @@ def test_the_step_issues_three_launches_and_allocates_nothing(tmp_path):
                     device=DEVICE)
     out = torch.empty_like(x)
 
-    watched = ("w4a16_packed_matvec_bf16", "silu_mul_sm120_bf16")
+    watched = ("w4a16_packed_matvec_gated_bf16",
+               "w4a16_packed_matvec_bf16")
     originals = {name: getattr(fvk, name) for name in watched}
     calls = []
     for name in watched:
@@ -173,7 +174,7 @@ def test_the_step_issues_three_launches_and_allocates_nothing(tmp_path):
         for name, original in originals.items():
             setattr(fvk, name, original)
 
-    assert calls == ["w4a16_packed_matvec_bf16", "silu_mul_sm120_bf16",
+    assert calls == ["w4a16_packed_matvec_gated_bf16",
                      "w4a16_packed_matvec_bf16"]
     assert after == before, f"the step allocated {after - before} bytes"
     work.close()

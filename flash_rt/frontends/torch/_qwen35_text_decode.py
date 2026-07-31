@@ -144,32 +144,49 @@ def mlp_block(layer: dict[str, int], work: Workspace, fvk, x: int, out: int,
               rows: int, stream: int) -> None:
     """out = W_down * (silu(gate) * up), with gate and up one weight.
 
-    Three launches: the fused projection, the gated product, and the
-    contraction. ``x`` and ``out`` are addresses, and may be the same buffer
-    only if the caller means them to be.
+    At one row this is two launches: the projection applies its own gate, and
+    the contraction follows. The prompt pass keeps the three-launch form,
+    which needs the elementwise kernel -- at many rows the intermediate is
+    large enough that a separate pass is not obviously worse, and the batched
+    projection has no gated variant yet.
+
+    ``x`` and ``out`` are addresses, and may be the same buffer only if the
+    caller means them to be.
     """
     intermediate = layer["gate_up_up_offset"]
-    call = (fvk.w4a16_packed_matvec_bf16 if rows == 1
-            else fvk.w4a16_packed_gemm_bf16)
-    extra = () if rows == 1 else (rows,)
 
-    rc = call(x, layer["gate_up_packed"], layer["gate_up_scale"],
-              work.fused.address, *extra, layer["gate_up_n"],
-              layer["gate_up_k"], work.group_size, stream)
+    if rows == 1:
+        # The gate is applied inside the projection: a warp owns a row and its
+        # partner half a weight away and combines them in registers. One
+        # launch rather than two, and no dependence on an elementwise kernel
+        # that lives in a model-specific build tier.
+        rc = fvk.w4a16_packed_matvec_gated_bf16(
+            x, layer["gate_up_packed"], layer["gate_up_scale"],
+            work.gated.address, layer["gate_up_n"], layer["gate_up_k"],
+            work.group_size, stream)
+        if rc:
+            raise RuntimeError(f"gated gate/up projection failed with {rc}")
+        rc = fvk.w4a16_packed_matvec_bf16(
+            work.gated.address, layer["down_packed"], layer["down_scale"],
+            out, layer["down_n"], layer["down_k"], work.group_size, stream)
+        if rc:
+            raise RuntimeError(f"down projection failed with {rc}")
+        return
+
+    rc = fvk.w4a16_packed_gemm_bf16(
+        x, layer["gate_up_packed"], layer["gate_up_scale"],
+        work.fused.address, rows, layer["gate_up_n"], layer["gate_up_k"],
+        work.group_size, stream)
     if rc:
         raise RuntimeError(f"gate/up projection failed with {rc}")
-
-    # silu(gate) * up over the fused output: the two halves are contiguous and
-    # a row apart, which is arithmetic on the address rather than a slice.
     rc = fvk.silu_mul_sm120_bf16(
         work.fused.address,
         work.fused.address + _element_size(intermediate),
         work.gated.address, rows * intermediate, stream)
     if rc:
         raise RuntimeError(f"gated product failed with {rc}")
-
-    rc = call(work.gated.address, layer["down_packed"], layer["down_scale"],
-              out, *extra, layer["down_n"], layer["down_k"], work.group_size,
-              stream)
+    rc = fvk.w4a16_packed_gemm_bf16(
+        work.gated.address, layer["down_packed"], layer["down_scale"],
+        out, rows, layer["down_n"], layer["down_k"], work.group_size, stream)
     if rc:
         raise RuntimeError(f"down projection failed with {rc}")

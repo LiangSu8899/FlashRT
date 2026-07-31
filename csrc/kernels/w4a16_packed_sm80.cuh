@@ -35,6 +35,21 @@ int w4a16_packed_matvec_bf16(
     const void* x, const void* packed, const void* scale, void* out,
     int N, int K, int group, cudaStream_t stream);
 
+// The gate-and-up projection with its gate applied, in one pass.
+//
+// A pair of projections over one activation, concatenated along N, is followed
+// by silu(first) * second. Split as a projection and an elementwise kernel,
+// the whole 2*I-wide result goes out to memory and comes back to be reduced to
+// I. Here a warp owns row r and row r + N/2 together and applies the gate in
+// registers, so what reaches memory is the I values that are wanted -- and the
+// elementwise kernel, which lives in a model-specific build tier, is not
+// needed at all.
+//
+// ``N`` is the fused width and must be even; ``out`` holds N/2 values.
+int w4a16_packed_matvec_gated_bf16(
+    const void* x, const void* packed, const void* scale, void* out,
+    int N, int K, int group, cudaStream_t stream);
+
 // The same weight against M rows of activation. Delegates to the matvec at
 // M=1 so the two cannot drift apart at the shape a decode step uses.
 int w4a16_packed_gemm_bf16(
