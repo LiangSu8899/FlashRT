@@ -120,8 +120,23 @@ of the true continuation moved from 334 to 337.
 ## Where the time goes
 
 At batch one the weight read is the whole cost and the fraction of bandwidth
-reached is the whole result; `benchmarks/w4a16_packed_roofline.py` reports it
-per shape against a bandwidth measured on the same part.
+reached is the whole result. Two tools report it:
+
+```
+python benchmarks/w4a16_packed_roofline.py          # per weight shape
+python benchmarks/qwen35_text_profile.py --checkpoint <path> --verify
+```
+
+The first times each projection shape on its own against a bandwidth measured
+on the same part. The second attributes a whole step: the bytes each piece
+accounts for beside the time it takes, so a piece whose share of the time is
+larger than its share of the bytes is where the work is, and the ratio says
+whether the answer is a better kernel or fewer bytes.
+
+`--verify` is the check to run after changing a kernel: it reports how far
+down the distribution the true continuation of a passage sits. A model that is
+subtly wrong still emits fluent tokens and every timing still looks right, so
+this is the measurement that does not.
 
 The prompt pass does not yet get the benefit batching should give it: the
 batched projection reads the weight once per activation row, so a prompt read
