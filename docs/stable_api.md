@@ -158,8 +158,12 @@ class VLAModel:
 
 - `infer(*args, **kwargs)` — delegate inference to the selected frontend.
   GROOT N1.7 currently uses
-  `infer(state_normalized, initial_noise=..., use_dit_graph=...)` and
-  returns normalized actions.
+  `infer(state_normalized, aux=..., initial_noise=..., use_dit_graph=...)` and
+  returns normalized actions. For the RTX FP8 frontend, optional `aux` supplies
+  fresh observation/model inputs and lazily captures, then runs, the backbone
+  graph before the action graph. Fresh inputs must retain the `grid_thw`, visual
+  mask, RoPE tables, and tensor shapes established by `set_prompt()`. Omitting
+  `aux` reuses the eager backbone features without capturing the optional graph.
 
 - `predict(images, prompt, state)` — run one inference step.
   `images`: list of `(224,224,3)` uint8 numpy arrays, or a dict with
