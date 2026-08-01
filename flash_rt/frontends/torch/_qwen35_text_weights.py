@@ -100,6 +100,25 @@ def _place(weights: TextWeights, tensor: torch.Tensor, device: str,
     return int(resident.data_ptr())
 
 
+def _place_norm(weights: TextWeights, tensor: torch.Tensor,
+                device: str) -> int:
+    """A normalization weight, centred where the kernels expect it.
+
+    This family's plain RMSNorm scales by ``1 + weight`` rather than by
+    ``weight``, and stores the parameter centred on zero -- some entries are
+    negative, which a scale never is. The one is added here, once, so the
+    kernels stay the ordinary normalization they are used everywhere else.
+
+    Getting this wrong does not fail: it scales the hidden state towards
+    nothing at every layer, and the model still emits fluent-looking tokens
+    that have no relation to the input.
+
+    The gated normalization inside the recurrence is *not* of this kind --
+    its parameter is a scale in the usual sense, and is placed as it is.
+    """
+    return _place(weights, tensor.float() + 1.0, device, torch.bfloat16)
+
+
 def _load_compressed(weights: TextWeights, reader: _Reader, site: str,
                      into: dict[str, int], prefix: str, shape: tuple[int, int],
                      device: str) -> None:
@@ -222,9 +241,8 @@ def load_text_weights(path: str, contract: dict[str, Any],
     embed_name = "model.language_model.embed_tokens.weight"
     weights.top["embed"] = _place(
         weights, reader.get(embed_name), device, torch.bfloat16)
-    weights.top["final_norm"] = _place(
-        weights, reader.get("model.language_model.norm.weight"), device,
-        torch.bfloat16)
+    weights.top["final_norm"] = _place_norm(
+        weights, reader.get("model.language_model.norm.weight"), device)
     weights.top["vocab_size"] = dims.vocab_size
     weights.top["hidden"] = dims.hidden
 
@@ -246,12 +264,11 @@ def load_text_weights(path: str, contract: dict[str, Any],
         linear = dims.layer_types[layer] == "linear_attention"
         entry["linear_attention"] = int(linear)
 
-        entry["input_norm"] = _place(
-            weights, reader.get(prefix + "input_layernorm.weight"), device,
-            torch.bfloat16)
-        entry["post_norm"] = _place(
+        entry["input_norm"] = _place_norm(
+            weights, reader.get(prefix + "input_layernorm.weight"), device)
+        entry["post_norm"] = _place_norm(
             weights, reader.get(prefix + "post_attention_layernorm.weight"),
-            device, torch.bfloat16)
+            device)
 
         _load_fused(weights, reader, sites,
                     [("gate", prefix + "mlp.gate_proj"),
@@ -277,13 +294,28 @@ def load_text_weights(path: str, contract: dict[str, Any],
                  ("b", prefix + "linear_attn.in_proj_b.weight",
                   dims.lin_value_heads)],
                 entry, "in_ab", device)
-            for short, name in (("a_log", "linear_attn.A_log"),
-                                ("dt_bias", "linear_attn.dt_bias"),
-                                ("conv", "linear_attn.conv1d.weight"),
-                                ("gdn_norm", "linear_attn.norm.weight")):
-                entry[short] = _place(
-                    weights, reader.get(prefix + name), device,
-                    torch.bfloat16)
+            # The decay constant is used as -exp(A_log) and never as A_log,
+            # so the exponential happens once here rather than per step. In
+            # float32 because that is the width the recurrence decays in:
+            # rounded to bfloat16 the slowest-forgetting heads lose the
+            # distinction between a long memory and a permanent one.
+            a_log = reader.get(prefix + "linear_attn.A_log").float()
+            entry["neg_exp_a_log"] = _place(
+                weights, -a_log.exp(), device, torch.float32)
+            entry["dt_bias"] = _place(
+                weights, reader.get(prefix + "linear_attn.dt_bias"), device,
+                torch.float32)
+            # The convolution is depthwise, so its weight is one row of taps
+            # per channel; the middle axis is the input channel it never has.
+            conv = reader.get(prefix + "linear_attn.conv1d.weight")
+            entry["conv"] = _place(
+                weights, conv.reshape(conv.shape[0], -1), device,
+                torch.bfloat16)
+            entry["conv_dim"] = int(conv.shape[0])
+            entry["conv_k"] = int(conv.shape[-1])
+            entry["gdn_norm"] = _place(
+                weights, reader.get(prefix + "linear_attn.norm.weight"),
+                device, torch.bfloat16)
         else:
             _load_fused(weights, reader, sites,
                         [("q", prefix + "self_attn.q_proj"),
@@ -295,9 +327,8 @@ def load_text_weights(path: str, contract: dict[str, Any],
                              device)
             for short, name in (("q_norm", "self_attn.q_norm.weight"),
                                 ("k_norm", "self_attn.k_norm.weight")):
-                entry[short] = _place(
-                    weights, reader.get(prefix + name), device,
-                    torch.bfloat16)
+                entry[short] = _place_norm(
+                    weights, reader.get(prefix + name), device)
 
         weights.layers.append(entry)
 

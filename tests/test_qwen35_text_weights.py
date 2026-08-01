@@ -141,7 +141,7 @@ def test_every_layer_gets_the_sites_its_type_needs(tmp_path):
         assert {"gate_up_packed", "down_packed"} <= set(entry)
         if dims.layer_types[index] == "linear_attention":
             assert {"in_proj_packed", "out_packed", "in_ab",
-                    "a_log", "dt_bias", "conv"} <= set(entry)
+                    "neg_exp_a_log", "dt_bias", "conv"} <= set(entry)
             assert "qkv_packed" not in entry
         else:
             assert {"qkv_packed", "o_packed",
@@ -176,3 +176,48 @@ def test_the_recorded_widths_are_the_logical_ones(tmp_path):
     assert entry["down_n"] == dims.hidden
     assert entry["down_k"] == dims.intermediate
     weights.close()
+
+
+def test_the_plain_norms_are_offset_and_the_gated_one_is_not(tmp_path):
+    # This family's plain RMSNorm scales by 1 + weight, and stores the
+    # parameter centred on zero. Placing it unchanged is not an error anything
+    # reports: it scales the hidden state down at every layer and the model
+    # still emits fluent tokens unrelated to the input, which is expensive to
+    # attribute later. The gated norm inside the recurrence is an ordinary
+    # scale and must not be offset -- so both halves are checked here.
+    _write_checkpoint(tmp_path)
+    contract = validate_checkpoint(str(tmp_path))
+    weights = load_text_weights(str(tmp_path), contract, device=DEVICE)
+    dims = weights.dims
+
+    by_address = {int(t.data_ptr()): t for t in weights.anchors}
+    for key in ("input_norm", "post_norm"):
+        for entry in weights.layers:
+            assert torch.all(by_address[entry[key]] == 1.0), key
+    assert torch.all(by_address[weights.top["final_norm"]] == 1.0)
+
+    for index, entry in enumerate(weights.layers):
+        if dims.layer_types[index] == "full_attention":
+            for key in ("q_norm", "k_norm"):
+                assert torch.all(by_address[entry[key]] == 1.0), key
+        else:
+            assert torch.all(by_address[entry["gdn_norm"]] == 0.0)
+
+
+def test_the_decay_constant_is_exponentiated_once_at_load(tmp_path):
+    # The recurrence wants -exp(A_log), never A_log, and wants it in float32:
+    # it multiplies the state every step and never re-derives it, so a
+    # bfloat16 decay makes a long memory and a permanent one the same number.
+    _write_checkpoint(tmp_path)
+    contract = validate_checkpoint(str(tmp_path))
+    weights = load_text_weights(str(tmp_path), contract, device=DEVICE)
+
+    by_address = {int(t.data_ptr()): t for t in weights.anchors}
+    for index, entry in enumerate(weights.layers):
+        if weights.dims.layer_types[index] != "linear_attention":
+            continue
+        decay = by_address[entry["neg_exp_a_log"]]
+        assert decay.dtype is torch.float32
+        # the synthetic checkpoint stores A_log = 0, so -exp(0) = -1
+        assert torch.all(decay == -1.0)
+        assert by_address[entry["dt_bias"]].dtype is torch.float32
