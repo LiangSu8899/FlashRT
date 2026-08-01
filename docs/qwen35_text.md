@@ -138,9 +138,29 @@ down the distribution the true continuation of a passage sits. A model that is
 subtly wrong still emits fluent tokens and every timing still looks right, so
 this is the measurement that does not.
 
-The prompt pass does not yet get the benefit batching should give it: the
-batched projection reads the weight once per activation row, so a prompt read
-sixteen positions at a time costs nearly what sixteen separate positions
-would. Time to the first token is close to linear in the prompt length for
-that reason, and tiling the activation rows inside that kernel is the change
-that would fix it.
+### The ceiling
+
+A token reads 2528 MiB with the tied table in INT8, and cannot read much less:
+the backbone is already four bits and the table is already one byte. So the
+rate is decided by the part:
+
+    tokens per second = bandwidth / 2.651 GB
+
+That puts a hard ceiling on single-token decoding at whatever the part reads
+at, and the only way past it is to make one read of the weights produce more
+than one token. The checkpoint carries the means to do that: a 76 MiB
+one-layer next-token head under `mtp.`, which drafts and lets the main model
+verify several positions per pass. Its cost is dominated not by its own layer
+but by the vocabulary projection each draft position needs, so a draft head
+restricted to the frequent part of the vocabulary is most of what makes it
+worth doing.
+
+### The prompt pass
+
+It does not yet get the benefit batching should give it: the batched
+projection reads the weight once per activation row, so a prompt read sixteen
+positions at a time costs nearly what sixteen separate positions would. Time
+to the first token is close to linear in the prompt length for that reason,
+and tiling the activation rows inside that kernel is the change that would fix
+it. On a part with a large last-level cache this is partly hidden; on a small
+one it is not.
