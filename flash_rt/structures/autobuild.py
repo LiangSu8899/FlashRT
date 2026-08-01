@@ -263,13 +263,6 @@ def auto_swaps(
     thunks = normalized_thunks
 
     seams = discover(model, structures, refused=plan_refusals)
-    # a packed group owns its q/k/v; linear_proj keeps only what the
-    # pack does not take (the output projection), so the two structures
-    # compose instead of fighting over the same module
-    packed = {s.path + "." + a for s in seams
-              if s.structure == "qkv_pack" for a in (s.pack_attrs or ())}
-    seams = [s for s in seams
-             if not (s.structure == "linear_proj" and s.path in packed)]
     say(f"discovered {len(seams)} seam(s)")
     adapter_only = not seams and "attention_core" in structures
     if not seams and not adapter_only:
@@ -335,6 +328,32 @@ def auto_swaps(
             return None
         return hook
 
+    def cap_pack_input(path, attr):
+        """Record the executable shared-input property of a pack sibling.
+
+        Equal K dimensions only prove that projections *could* share an
+        input.  Cross attention is the counterexample: Q consumes the live
+        latent while K/V consume encoder state.  The leaf implementation
+        runs the first projection and turns later siblings into stash reads,
+        so exact storage identity and call order are part of its contract.
+        """
+        def hook(module, args):
+            x = args[0] if args else None
+            cap = caps[path]
+            cap.setdefault("pack_events", []).append(attr)
+            if not torch.is_tensor(x):
+                cap.setdefault("pack_inputs", {}).setdefault(attr, []).append(
+                    None)
+                return None
+            signature = (
+                int(x.data_ptr()), int(x.storage_offset()), tuple(x.shape),
+                tuple(x.stride()), x.dtype, x.device,
+            )
+            cap.setdefault("pack_inputs", {}).setdefault(attr, []).append(
+                signature)
+            return None
+        return hook
+
     # the amax points are hooked by the collector; only the two
     # content/observation captures need their own hooks here, and neither
     # is a statistic: a step table is memoised host output, a return
@@ -349,6 +368,10 @@ def auto_swaps(
         elif seam.structure == "adaln_producer":
             hooks.append(getattr(target, seam.cond_attr)
                          .register_forward_hook(cap_cond(key)))
+        elif seam.structure == "qkv_pack":
+            for attr in seam.pack_attrs or ():
+                hooks.append(getattr(target, attr).register_forward_pre_hook(
+                    cap_pack_input(key, attr)))
     hooks.extend(collector.hooks(lambda path: _resolve(model, path)))
 
     if hooks:
@@ -376,6 +399,43 @@ def auto_swaps(
             f"{source}, {plan_notes_calibration['points']} point(s), "
             f"{plan_notes_calibration['method']}"
             + (f" p={percentile}" if len(thunks) > 1 else "") + ")")
+
+    # A pack owns its sibling projections only after the calibration pass
+    # proves the property its execution relies on: identical input storage
+    # and q/k/v call order for every invocation.  If it does not, retain the
+    # independent linear projections; they are valid structures at the
+    # narrower boundary.  This is deliberately a data-flow check rather than
+    # a class/path allow-list, so self- and cross-attention implementations
+    # using the same module type are classified by what they actually do.
+    qualified_packs = []
+    for seam in (s for s in seams if s.structure == "qkv_pack"):
+        attrs = tuple(seam.pack_attrs or ())
+        cap = caps.get(_seam_key(seam), {})
+        inputs = cap.get("pack_inputs", {})
+        columns = [inputs.get(attr, []) for attr in attrs]
+        count_ok = bool(columns) and len({len(col) for col in columns}) == 1
+        calls = len(columns[0]) if count_ok else 0
+        shared = count_ok and calls > 0 and all(
+            all(col[i] is not None and col[i] == columns[0][i]
+                for col in columns[1:])
+            for i in range(calls)
+        )
+        ordered = cap.get("pack_events", []) == list(attrs) * calls
+        if shared and ordered:
+            qualified_packs.append(seam)
+            continue
+        plan_refusals.append((
+            _seam_key(seam),
+            "qkv_pack refused: sibling projections did not consume the "
+            "same tensor in fixed order during calibration",
+        ))
+    qualified_ids = {id(seam) for seam in qualified_packs}
+    seams = [s for s in seams
+             if s.structure != "qkv_pack" or id(s) in qualified_ids]
+    packed = {s.path + "." + a for s in qualified_packs
+              for a in (s.pack_attrs or ())}
+    seams = [s for s in seams
+             if not (s.structure == "linear_proj" and s.path in packed)]
 
     # ---- the scheme turns statistics into decisions. Keep-host is a
     # first-class outcome recorded in the receipt, not a refusal: the

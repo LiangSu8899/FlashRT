@@ -1,7 +1,7 @@
 import torch
 from torch import nn
 
-from flash_rt.structures.autobuild import _layer_of, _seam_key
+from flash_rt.structures.autobuild import auto_swaps, _layer_of, _seam_key
 from flash_rt.structures.discover import discover, seam_weights
 
 
@@ -69,6 +69,42 @@ class _DiffusionBlock(nn.Module):
         self.attn1.to_out = nn.ModuleList([nn.Linear(512, 512)])
         self.ff = _DenseGelu()
         self.pos_embed = nn.Identity() if positional else None
+
+
+class _ProjectionNamedAttention(nn.Module):
+    """Attention slots used by hosts that expose q/k/v/o directly."""
+
+    def __init__(self, dim=512):
+        super().__init__()
+        self.q = nn.Linear(dim, dim)
+        self.k = nn.Linear(dim, dim)
+        self.v = nn.Linear(dim, dim)
+        self.o = nn.Linear(dim, dim)
+
+    def forward(self, x, context=None):
+        source = x if context is None else context
+        q, k, v = self.q(x), self.k(source), self.v(source)
+        if context is not None:
+            k = k.mean(dim=1, keepdim=True)
+            v = v.mean(dim=1, keepdim=True)
+        return self.o(q + k + v)
+
+
+class _SequentialVideoBlock(nn.Module):
+    def __init__(self, dim=512):
+        super().__init__()
+        self.norm2 = nn.LayerNorm(dim)
+        self.self_attn = _ProjectionNamedAttention(dim)
+        self.cross_attn = _ProjectionNamedAttention(dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, 4 * dim), nn.GELU(approximate="tanh"),
+            nn.Linear(4 * dim, dim),
+        )
+
+    def forward(self, x, context):
+        x = self.self_attn(x)
+        x = self.cross_attn(x, context)
+        return self.ffn(self.norm2(x))
 
 
 def test_decoder_ffn_discovery_accepts_its_bias_free_weight_contract():
@@ -141,6 +177,44 @@ def test_nested_diffusers_feedforward_is_a_vision_ffn_slice():
     weights = seam_weights(host, seams[0])
     assert weights["w_norm"] is None
     assert weights["b_norm"] is None
+
+
+def test_projection_named_attention_and_sequential_ffn_are_structural_slots():
+    host = nn.ModuleDict({"block": _SequentialVideoBlock()})
+
+    packs = discover(host, structures=("qkv_pack",))
+    projections = discover(host, structures=("linear_proj",))
+    ffns = discover(host, structures=("vision_ffn",))
+
+    assert [seam.path for seam in packs] == [
+        "block.self_attn", "block.cross_attn"]
+    assert all(seam.pack_attrs == ("q", "k", "v") for seam in packs)
+    assert [seam.proj_attr for seam in projections] == [
+        "q", "k", "v", "o", "q", "k", "v", "o"]
+    assert [seam.path for seam in ffns] == ["block.ffn"]
+    assert ffns[0].fc_attrs == ("0", "2")
+    assert ffns[0].norm_attr == "norm2"
+
+
+def test_qkv_pack_qualification_uses_observed_dataflow_not_equal_dimensions():
+    torch.manual_seed(4)
+    host = nn.ModuleDict({"attention": _ProjectionNamedAttention()}).eval()
+    x = torch.randn(1, 3, 512)
+    context = torch.randn(1, 5, 512)
+
+    self_plan = auto_swaps(
+        host, lambda: host.attention(x),
+        structures=("qkv_pack", "linear_proj"), scheme="none")
+    cross_plan = auto_swaps(
+        host, lambda: host.attention(x, context),
+        structures=("qkv_pack", "linear_proj"), scheme="none")
+
+    self_refusals = self_plan.notes.get("refused", [])
+    cross_refusals = cross_plan.notes.get("refused", [])
+    assert not any("sibling projections did not consume" in reason
+                   for _, reason in self_refusals)
+    assert any("sibling projections did not consume" in reason
+               for _, reason in cross_refusals)
 
 
 def test_vision_ffn_refuses_rms_like_one_sided_affine_norm():
