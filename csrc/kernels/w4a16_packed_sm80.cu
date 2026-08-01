@@ -334,19 +334,24 @@ __global__ void packed_gemm_kernel(
 
     // Stage this chunk of every row in the tile. Read in order, written to
     // the slots the decode will want them in.
-    for (int index = threadIdx.x; index < rows_here * here * G;
-         index += kThreads) {
+    // Every row of the tile is staged, the last one repeated where the tile
+    // runs past the end. The loops that consume it are then bounded at
+    // compile time -- with a runtime bound the accumulators are indexed by a
+    // variable and land in local memory, and every multiply-add becomes a
+    // load and a store. Measured that way the batched form was slower than
+    // doing the rows one at a time.
+    for (int index = threadIdx.x; index < TM * here * G; index += kThreads) {
       const int within = index % G;
       const int group = (index / G) % here;
       const int m = index / (G * here);
+      const int source = min(base_row + m, M - 1);
       tile_sh[(m * kChunkGroups + group) * kStride + within] =
           __bfloat162float(
-              x[(static_cast<size_t>(base_row + m) * K) + (first + group) * G
+              x[(static_cast<size_t>(source) * K) + (first + group) * G
                 + within]);
     }
     __syncthreads();
-    for (int index = threadIdx.x; index < rows_here * here;
-         index += kThreads) {
+    for (int index = threadIdx.x; index < TM * here; index += kThreads) {
       const int group = index % here;
       const int m = index / here;
       const float* values = tile_sh + (m * kChunkGroups + group) * kStride;
@@ -375,7 +380,8 @@ __global__ void packed_gemm_kernel(
       for (int w = 0; w < kWords; ++w) {
         float decoded[kValuesPerWord];
         decode_word(words[w], decoded);
-        for (int m = 0; m < rows_here; ++m) {
+#pragma unroll
+        for (int m = 0; m < TM; ++m) {
           const float* staged =
               tile_sh + (m * kChunkGroups + lane) * kStride + w * kValuesPerWord;
           // Summed within the word and then added, which is the association
@@ -391,7 +397,8 @@ __global__ void packed_gemm_kernel(
           partial[m] += dot;
         }
       }
-      for (int m = 0; m < rows_here; ++m) {
+#pragma unroll
+      for (int m = 0; m < TM; ++m) {
         acc[m] = fmaf(
             partial[m] - kFoldedOffset * group_sum[m * kChunkGroups + lane],
             step, acc[m]);
@@ -409,9 +416,12 @@ __global__ void packed_gemm_kernel(
     }
   }
   if (lane) return;
-  for (int m = 0; m < rows_here; ++m) {
-    out[static_cast<size_t>(base_row + m) * N + row] =
-        __float2bfloat16_rn(acc[m]);
+#pragma unroll
+  for (int m = 0; m < TM; ++m) {
+    if (m < rows_here) {
+      out[static_cast<size_t>(base_row + m) * N + row] =
+          __float2bfloat16_rn(acc[m]);
+    }
   }
 }
 
