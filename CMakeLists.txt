@@ -1494,6 +1494,7 @@ option(FLASHRT_ENABLE_DECODE_ATTENTION
 if(FLASHRT_ENABLE_DECODE_ATTENTION)
   target_sources(flash_rt_kernels PRIVATE
     csrc/kernels/linear_attn_decode_prep_sm80.cu
+    csrc/kernels/linear_attn_recurrent_chunk_sm80.cu
     csrc/kernels/attn_qkv_norm_rope_write_sm80.cu
     csrc/kernels/gqa_decode_attention_sm80.cu)
   target_compile_definitions(flash_rt_kernels PRIVATE

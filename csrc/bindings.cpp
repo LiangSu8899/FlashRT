@@ -186,6 +186,7 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #include "kernels/attn_qkv_norm_rope_write_sm80.cuh"
 #include "kernels/gqa_decode_attention_sm80.cuh"
 #include "kernels/linear_attn_decode_prep_sm80.cuh"
+#include "kernels/linear_attn_recurrent_chunk_sm80.cuh"
 #endif
 #ifdef FLASHRT_HAVE_QWEN35MOE
 #include "kernels/qwen35moe_layout.cuh"
@@ -5674,6 +5675,22 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("S"), py::arg("k_heads"), py::arg("v_heads"),
         py::arg("head_k"), py::arg("head_v"),
         py::arg("a_stride"), py::arg("b_stride"), py::arg("stream") = 0);
+
+    m.def("linear_attn_recurrent_chunk_f32state_bf16",
+        [](uintptr_t q, uintptr_t k, uintptr_t v, uintptr_t g,
+           uintptr_t beta, uintptr_t state, uintptr_t out,
+           int S, int heads, int head_k, int head_v, bool use_qk_l2norm,
+           uintptr_t stream) -> int {
+            return flash_rt::kernels::
+                linear_attn_recurrent_chunk_f32state_bf16(
+                    to_ptr(q), to_ptr(k), to_ptr(v), to_ptr(g), to_ptr(beta),
+                    to_ptr(state), to_ptr(out), S, heads, head_k, head_v,
+                    use_qk_l2norm, to_stream(stream));
+        },
+        py::arg("q"), py::arg("k"), py::arg("v"), py::arg("g"),
+        py::arg("beta"), py::arg("state"), py::arg("out"),
+        py::arg("S"), py::arg("heads"), py::arg("head_k"), py::arg("head_v"),
+        py::arg("use_qk_l2norm") = true, py::arg("stream") = 0);
 
     m.def("attn_qkv_norm_rope_write_bf16",
         [](uintptr_t qkv, uintptr_t q_norm_w, uintptr_t k_norm_w,

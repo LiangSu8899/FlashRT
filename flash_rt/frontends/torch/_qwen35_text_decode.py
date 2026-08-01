@@ -388,19 +388,24 @@ def linear_attention_block(layer: dict[str, int], work: Workspace, fvk,
     # to see the same state, which is why a prompt is stepped through this
     # kernel rather than handed to the chunked one, whose state is bfloat16.
     state = work.recurrent[slot].address
-    key_row = _element_size(dims.lin_value_heads * dims.lin_key_head_dim)
-    value_row = _element_size(dims.lin_value_heads * dims.lin_value_head_dim)
-    gate_row = _element_size(dims.lin_value_heads)
-    for row in range(rows):
+    if rows == 1:
         fvk.gated_deltanet_recurrent_qwen36_f32state_bf16io(
-            work.lin_q.address + row * key_row,
-            work.lin_k.address + row * key_row,
-            work.lin_v.address + row * value_row,
-            work.lin_g.address + row * gate_row,
-            work.lin_beta.address + row * gate_row, state,
-            work.mixer_out.address + row * value_row, 1,
-            dims.lin_value_heads, dims.lin_key_head_dim,
-            dims.lin_value_head_dim, True, stream)
+            work.lin_q.address, work.lin_k.address, work.lin_v.address,
+            work.lin_g.address, work.lin_beta.address, state,
+            work.mixer_out.address, 1, dims.lin_value_heads,
+            dims.lin_key_head_dim, dims.lin_value_head_dim, True, stream)
+    else:
+        # The recurrence is sequential and cannot be widened, but it does not
+        # have to be re-entered: a thread keeps its column of the state in
+        # registers across the whole chunk. A prompt otherwise costs a launch
+        # per position per layer, which for a few hundred positions outweighs
+        # the arithmetic and is most of the time to the first token.
+        _check(fvk.linear_attn_recurrent_chunk_f32state_bf16(
+            work.lin_q.address, work.lin_k.address, work.lin_v.address,
+            work.lin_g.address, work.lin_beta.address, state,
+            work.mixer_out.address, rows, dims.lin_value_heads,
+            dims.lin_key_head_dim, dims.lin_value_head_dim, True, stream),
+            "gated-delta recurrence")
 
     # The output gate is the other half of the input projection, so it is read
     # where it already is rather than copied out first.
