@@ -189,7 +189,8 @@ def test_the_workspace_addresses_do_not_move(tmp_path):
     weights = load_text_weights(str(tmp_path), contract, device=DEVICE)
     work = Workspace(weights, device=DEVICE)
 
-    before = (work.fused.address, work.gated.address, work.normed.address)
+    before = (work.attn_fused.address, work.gated.address,
+              work.normed.address)
     stream = torch.cuda.current_stream(DEVICE).cuda_stream
     x = torch.randn(1, weights.dims.hidden, dtype=torch.bfloat16,
                     device=DEVICE)
@@ -199,7 +200,7 @@ def test_the_workspace_addresses_do_not_move(tmp_path):
                   rows=1, stream=stream)
     torch.cuda.synchronize(DEVICE)
 
-    assert (work.fused.address, work.gated.address,
+    assert (work.attn_fused.address, work.gated.address,
             work.normed.address) == before
     work.close()
     weights.close()
