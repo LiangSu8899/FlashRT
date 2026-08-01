@@ -352,7 +352,10 @@ def linear_attention_block(layer: dict[str, int], work: Workspace, fvk,
     # The two decay projections are left uncompressed by the producer and are
     # narrow enough that reading them is the whole cost either way.
     if rows == 1:
-        _check(fvk.bf16_matvec_qwen36_bf16(
+        # A block per output row rather than a warp: sixty-four rows is
+        # sixty-four warps, and this projection then costs more than the one
+        # beside it that reads fifty times as much.
+        _check(fvk.bf16_matvec_narrow_bf16(
             x, layer["in_ab"], work.decay.address, layer["in_ab_n"],
             layer["in_ab_k"], stream), "decay projection")
     else:

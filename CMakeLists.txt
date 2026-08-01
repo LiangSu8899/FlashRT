@@ -1493,6 +1493,7 @@ option(FLASHRT_ENABLE_DECODE_ATTENTION
   "Build the portable single-token attention and linear-attention kernels" ON)
 if(FLASHRT_ENABLE_DECODE_ATTENTION)
   target_sources(flash_rt_kernels PRIVATE
+    csrc/kernels/bf16_matvec_narrow_sm80.cu
     csrc/kernels/linear_attn_decode_prep_sm80.cu
     csrc/kernels/linear_attn_recurrent_chunk_sm80.cu
     csrc/kernels/attn_qkv_norm_rope_write_sm80.cu

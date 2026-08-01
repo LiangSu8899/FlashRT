@@ -184,6 +184,7 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #endif
 #ifdef FLASHRT_HAVE_DECODE_ATTENTION
 #include "kernels/attn_qkv_norm_rope_write_sm80.cuh"
+#include "kernels/bf16_matvec_narrow_sm80.cuh"
 #include "kernels/gqa_decode_attention_sm80.cuh"
 #include "kernels/linear_attn_decode_prep_sm80.cuh"
 #include "kernels/linear_attn_recurrent_chunk_sm80.cuh"
@@ -5653,6 +5654,16 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
 #endif  // FLASHRT_HAVE_W4A16_PACKED
 
 #ifdef FLASHRT_HAVE_DECODE_ATTENTION
+    m.def("bf16_matvec_narrow_bf16",
+        [](uintptr_t x, uintptr_t weight, uintptr_t out, int N, int K,
+           uintptr_t stream) -> int {
+            return flash_rt::kernels::bf16_matvec_narrow_bf16(
+                to_ptr(x), to_ptr(weight), to_ptr(out), N, K,
+                to_stream(stream));
+        },
+        py::arg("x"), py::arg("weight"), py::arg("out"), py::arg("N"),
+        py::arg("K"), py::arg("stream") = 0);
+
     m.def("linear_attn_split_broadcast_gate_bf16",
         [](uintptr_t conv_out, uintptr_t a, uintptr_t b,
            uintptr_t neg_exp_a_log, uintptr_t dt_bias,
