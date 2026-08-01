@@ -183,6 +183,8 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #include "kernels/w8a16_rowwise_sm80.cuh"
 #endif
 #ifdef FLASHRT_HAVE_DECODE_ATTENTION
+#include "kernels/attn_qkv_norm_rope_write_sm80.cuh"
+#include "kernels/gqa_decode_attention_sm80.cuh"
 #include "kernels/linear_attn_decode_prep_sm80.cuh"
 #endif
 #ifdef FLASHRT_HAVE_QWEN35MOE
@@ -5673,6 +5675,49 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("head_k"), py::arg("head_v"),
         py::arg("a_stride"), py::arg("b_stride"), py::arg("stream") = 0);
 
+    m.def("attn_qkv_norm_rope_write_bf16",
+        [](uintptr_t qkv, uintptr_t q_norm_w, uintptr_t k_norm_w,
+           uintptr_t cos, uintptr_t sin,
+           uintptr_t q_out, uintptr_t gate_out,
+           uintptr_t k_cache, uintptr_t v_cache,
+           int S, int pos, uintptr_t pos_device,
+           int q_heads, int kv_heads, int head_dim, int rope_dim,
+           bool has_gate, float eps, uintptr_t stream) -> int {
+            return flash_rt::kernels::attn_qkv_norm_rope_write_bf16(
+                to_ptr(qkv), to_ptr(q_norm_w), to_ptr(k_norm_w),
+                to_ptr(cos), to_ptr(sin), to_ptr(q_out), to_ptr(gate_out),
+                to_ptr(k_cache), to_ptr(v_cache),
+                S, pos, reinterpret_cast<const int*>(pos_device),
+                q_heads, kv_heads, head_dim, rope_dim, has_gate, eps,
+                to_stream(stream));
+        },
+        py::arg("qkv"), py::arg("q_norm_w"), py::arg("k_norm_w"),
+        py::arg("cos"), py::arg("sin"),
+        py::arg("q_out"), py::arg("gate_out"),
+        py::arg("k_cache"), py::arg("v_cache"),
+        py::arg("S"), py::arg("pos") = 0, py::arg("pos_device") = 0,
+        py::arg("q_heads") = 0, py::arg("kv_heads") = 0,
+        py::arg("head_dim") = 0, py::arg("rope_dim") = 0,
+        py::arg("has_gate") = true, py::arg("eps") = 1e-6f,
+        py::arg("stream") = 0);
+
+    m.def("gqa_decode_attention_bf16",
+        [](uintptr_t q, uintptr_t k_cache, uintptr_t v_cache, uintptr_t gate,
+           uintptr_t out, int seq_len, uintptr_t seq_len_device,
+           int q_heads, int kv_heads, int head_dim, float scale,
+           uintptr_t stream) -> int {
+            return flash_rt::kernels::gqa_decode_attention_bf16(
+                to_ptr(q), to_ptr(k_cache), to_ptr(v_cache), to_ptr(gate),
+                to_ptr(out), seq_len,
+                reinterpret_cast<const int*>(seq_len_device),
+                q_heads, kv_heads, head_dim, scale, to_stream(stream));
+        },
+        py::arg("q"), py::arg("k_cache"), py::arg("v_cache"), py::arg("gate"),
+        py::arg("out"), py::arg("seq_len") = 0,
+        py::arg("seq_len_device") = 0,
+        py::arg("q_heads") = 0, py::arg("kv_heads") = 0,
+        py::arg("head_dim") = 0, py::arg("scale") = 1.0f,
+        py::arg("stream") = 0);
 #endif  // FLASHRT_HAVE_DECODE_ATTENTION
 
 #ifdef FLASHRT_HAVE_QWEN36_KERNELS

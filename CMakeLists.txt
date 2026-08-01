@@ -1485,15 +1485,17 @@ else()
 endif()
 
 # ── Portable single-token decode kernels ──
-# What a decode step needs between its projections, parameterised by head
+# The staging and attention that a decode step needs, parameterised by head
 # counts rather than named for a model's, and using SM80-family facilities
 # only. Same reasoning as the block above: not part of any model's tier, so
 # not gated on one.
 option(FLASHRT_ENABLE_DECODE_ATTENTION
-  "Build the portable single-token decode kernels" ON)
+  "Build the portable single-token attention and linear-attention kernels" ON)
 if(FLASHRT_ENABLE_DECODE_ATTENTION)
   target_sources(flash_rt_kernels PRIVATE
-    csrc/kernels/linear_attn_decode_prep_sm80.cu)
+    csrc/kernels/linear_attn_decode_prep_sm80.cu
+    csrc/kernels/attn_qkv_norm_rope_write_sm80.cu
+    csrc/kernels/gqa_decode_attention_sm80.cu)
   target_compile_definitions(flash_rt_kernels PRIVATE
     FLASHRT_HAVE_DECODE_ATTENTION=1)
   message(STATUS "portable decode kernels: ENABLED (sm_${GPU_ARCH})")
