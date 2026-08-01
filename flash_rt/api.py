@@ -447,7 +447,12 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             "import Qwen3VlFp8Sm89Frontend\n"
             "    from flash_rt.frontends.torch.qwen3_vl_rtx import "
             "Qwen3VlTorchFrontendRtx\n"
-            "See docs/qwen3_vl_fp8_sm89.md and docs/qwen3_vl_nvfp4.md.")
+            "    from flash_rt.frontends.torch.qwen3_vl_thor import "
+            "Qwen3VlTorchFrontendThor\n"
+            "    from flash_rt.frontends.torch.qwen3_vl_rtx_bf16 import "
+            "Qwen3VlTorchFrontendRtxBF16\n"
+            "See docs/qwen3_vl_fp8_sm89.md, docs/qwen3_vl_nvfp4.md, "
+            "docs/qwen3_vl_thor.md and docs/qwen3_vl_rtx_bf16.md.")
 
     if framework == "jetson_pi":
         if config not in ("pi0", "pi05", "llm", "mllm"):

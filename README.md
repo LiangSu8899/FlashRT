@@ -170,6 +170,22 @@ RTX 5090, NVFP4 language stack + FP8 ViT, image + text:
 | Full resolution | 1581 | **~100 ms** | **~150 tok/s** | [Qwen3-VL RTX 5090](docs/qwen3_vl_nvfp4.md#1-headline-performance) |
 | 0.5 MP cap | 473 | **~32 ms** | **~150 tok/s** | [Qwen3-VL resolution sweep](docs/qwen3_vl_nvfp4.md#ttft-vs-resolution-the-dominant-knob) |
 
+#### Qwen3-VL-2B on Jetson
+
+Official BF16 checkpoint, full-resolution image + text (1581 prompt tokens,
+6256 vision patches), with opt-in weight-only decode quantization:
+
+| Hardware | Decode tier | Prefill | Decode | Source |
+|---|---|---:|---:|---|
+| Jetson AGX Thor | BF16 | **230 ms** (eager) | **66.4 tok/s** | [Qwen3-VL Jetson Thor](docs/qwen3_vl_thor.md#jetson-thor-validation) |
+| Jetson AGX Thor | `w8` (FP8 e4m3) | 230 ms (eager) | **106.6 tok/s** | [Measured tiers](docs/qwen3_vl_thor.md#measured-tiers) |
+| Jetson AGX Thor | `w4` (NVFP4 e2m1) | 230 ms (eager) | **158.1 tok/s** | [Measured tiers](docs/qwen3_vl_thor.md#measured-tiers) |
+| Jetson AGX Orin | BF16 | 927 ms (graph) | 36.8 tok/s | [Qwen3-VL Jetson Orin](docs/qwen3_vl_rtx_bf16.md#jetson-orin-validation) |
+
+Thor prefill is eager by measurement, not omission: a prefill CUDA Graph
+prototype bought 0.3% there (GPU-bound), so it was not shipped; see
+[Where prefill time goes](docs/qwen3_vl_thor.md#where-prefill-time-goes).
+
 #### Higgs Audio v3
 
 | Hardware | Mode | Latency | TTFA | Throughput | Source |
@@ -1051,7 +1067,7 @@ examples/
 - **Wan2.2 TI2V-5B** (`config="wan22_ti2v_5b"`) — [Wan2.2 usage](docs/wan22_usage.md)
 - **Cosmos3-Nano text-to-video** (`config="cosmos3_video"`) — RTX 5090 BF16/FP8 denoise and complete benchmark workflow; [usage and performance](docs/cosmos3_video_usage.md)
 - **Cosmos3-Edge AV inverse dynamics and Reasoner** (`config="cosmos3_edge"`) — Jetson AGX Thor official baseline, 6.60x no-cache AV denoise, and NVFP4 multimodal chat decode; [complete usage and performance](docs/cosmos3_edge_thor.md)
-- **Qwen3-VL-8B** — RTX 5090 NVFP4/FP8 multimodal path and RTX 4090 official-FP8 path; [RTX 5090 usage](docs/qwen3_vl_nvfp4.md), [RTX 4090 usage](docs/qwen3_vl_fp8_sm89.md)
+- **Qwen3-VL-8B** — RTX 5090 NVFP4/FP8 multimodal path, RTX 4090 official-FP8 path, and Jetson BF16 paths for Thor and Orin; [RTX 5090 usage](docs/qwen3_vl_nvfp4.md), [RTX 4090 usage](docs/qwen3_vl_fp8_sm89.md), [Jetson Thor usage](docs/qwen3_vl_thor.md), [Jetson Orin usage](docs/qwen3_vl_rtx_bf16.md)
 - **MiniMax-Remover** — FP8 transformer + NVFP4 VAE video inpainting; [usage and performance](docs/minimax_remover_usage.md)
 - **MelBandRoformer** — kernelized FP8 audio source separation; [usage and performance](docs/melband_roformer_usage.md)
 - **OmniVoice TTS** — BF16/FP4 acceleration and HTTP serving; [serving quickstart](serving/omnivoice_agent/README.md)
@@ -1071,13 +1087,13 @@ artifacts and dispatch map are.
 
 | Hardware | SM | Status | Validated paths / notes |
 |---|---:|---|---|
-| Jetson AGX Thor | SM110 | Production target | Pi0, Pi0.5, GROOT N1.6, Pi0-FAST, Qwen3.6 Thor path, Lingbot, and Cosmos3-Edge AV/Reasoner; CUTLASS FMHA / Thor attention paths; Pi0.5 FP8 and NVFP4 validation live in [examples/thor](examples/thor/README.md#thor-vla-performance). |
+| Jetson AGX Thor | SM110 | Production target | Pi0, Pi0.5, GROOT N1.6, Pi0-FAST, Qwen3.6 Thor path, Lingbot, Cosmos3-Edge AV/Reasoner, and Qwen3-VL BF16 with opt-in W8/W4 decode ([docs](docs/qwen3_vl_thor.md)); CUTLASS FMHA / Thor attention paths; Pi0.5 FP8 and NVFP4 validation live in [examples/thor](examples/thor/README.md#thor-vla-performance). |
 | RTX 5090 | SM120 | Production target | Pi0/Pi0.5/GROOT/Pi0-FAST RTX paths, Qwen3.6, Qwen3-8B, Qwen3-VL, Higgs Audio v3 FP8, Motus, Wan2.2, Cosmos3-Nano, and HF Kernel Hub package validation; see [RTX 5090 latency](examples/blackwell/README.md#vla-latency-rtx-5090). |
 | RTX 4090 | SM89 | Validated / supported target | RTX VLA build path and deployment recipe; Higgs BF16 path compiles/configures. See [deployment_rtx4090.md](docs/deployment_rtx4090.md). |
 | RTX 5060 Ti | SM120 | Community validated | Pi0.5 FP8 and LIBERO Spatial submission; see [Community benchmarks](#community-benchmarks). |
 | RTX 4060 Ti | SM89 | Validated build/run target | Included in current tested hardware list; run local benchmarks before making model-specific latency claims. |
 | NVIDIA L40 | SM89 | Community validated | Pi0.5 FP8 submission; see [Community benchmarks](#community-benchmarks). |
-| Jetson AGX Orin | SM87 | Community port | Pi0.5 INT8/BF16 paths, Orin tile dispatch, frame-cache inference; see [deployment_orin.md](docs/deployment_orin.md). |
+| Jetson AGX Orin | SM87 | Community port | Pi0.5 INT8/BF16 paths, Orin tile dispatch, frame-cache inference, and Qwen3-VL BF16 with opt-in INT8/INT4 decode ([docs](docs/qwen3_vl_rtx_bf16.md)); see [deployment_orin.md](docs/deployment_orin.md). |
 | A100 / A10 / RTX 3090 / RTX 3080 / A5000 / A6000 and other SM80/86/89 GPUs | SM80/86/89 | Build target | CMake and FA2 gates cover Ampere/Ada shapes. Treat unlisted cards as expected to build until a benchmark or regression row is submitted. |
 
 Feature notes:
