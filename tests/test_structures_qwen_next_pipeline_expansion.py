@@ -30,12 +30,13 @@ def test_hybrid_qwen_bindings_cover_the_complete_language_schedule(name):
 
 
 @pytest.mark.parametrize("name", _BINDINGS)
-def test_unlanded_gdn_regions_remain_explicit_host_gaps(name):
+def test_gdn_decode_is_owned_while_prefill_stays_an_explicit_gap(name):
     binding = load_binding(name, require_pipeline_coverage=True)
     segments = {segment.name: segment for segment in binding.segments}
 
     assert segments["prefill_gdn"].classification == "host_stage"
-    assert segments["decode_gdn"].classification == "host_stage"
+    assert segments["decode_gdn"].classification == "structure"
+    assert segments["decode_gdn"].structures == ("gated_delta_core",)
 
 
 def test_nexn2_moe_remains_a_gap_until_moe_ffn_lands():
@@ -76,4 +77,3 @@ def test_qwen36_and_nexn2_source_seams_are_real():
         source = (_ROOT / relative).read_text(encoding="utf-8")
         for needle in needles:
             assert needle in source
-

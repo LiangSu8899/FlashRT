@@ -82,8 +82,9 @@ coverage:
       seam: "single-token embedding lookup"
     - name: decode_gdn
       stage: decode
-      classification: host_stage
+      classification: structure
       seam: "_layer_forward_lin_nvfp4 Gated DeltaNet state update"
+      structures: [gated_delta_core]
     - name: decode_full_attention
       stage: decode
       classification: structure

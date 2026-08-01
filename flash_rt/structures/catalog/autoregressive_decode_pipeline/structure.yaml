@@ -1,7 +1,7 @@
 structure: autoregressive_decode_pipeline
 kind: stage_pipeline
 family: autoregressive_decode
-version: 1
+version: 2
 description: >
   Schedule-layer structure for autoregressive generation: optional host
   input preparation and modality encoding feed a causal prefill that
@@ -58,7 +58,7 @@ stages:
     capture: host_dependent
 
 embedded_regions: [decoder_ffn, vision_ffn, qkv_pack, qk_norm_rope,
-                   attention_core, linear_proj]
+                   attention_core, gated_delta_core, linear_proj]
 
 state_regions:
   - {name: kv_state, writers: [prefill, decode], reader: decode}

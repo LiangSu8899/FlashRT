@@ -7,12 +7,14 @@ them, so each family gets a small adapter.
 """
 from ..autobuild import (
     register_attention_adapter,
+    register_gated_delta_adapter,
     register_qk_norm_rope_adapter,
 )
 from .diffusers_attention import DiffusersAttentionAdapter
 from .diffusers_rotary_attention import DiffusersRotaryAttentionAdapter
 from .factored_two_way_attention import FactoredTwoWayAttentionAdapter
 from .gemma_attention import GemmaAttentionAdapter
+from .transformers_gated_delta import TransformersGatedDeltaAdapter
 from .qwen_per_head_qk_norm_rope import (
     PerHeadGqaQkNormRopeAdapter,
     QwenPerHeadQkNormRopeAdapter,
@@ -23,11 +25,13 @@ register_attention_adapter(GemmaAttentionAdapter())
 register_attention_adapter(FactoredTwoWayAttentionAdapter())
 register_attention_adapter(DiffusersRotaryAttentionAdapter())
 register_attention_adapter(DiffusersAttentionAdapter())
+register_gated_delta_adapter(TransformersGatedDeltaAdapter())
 
 __all__ = [
     "DiffusersAttentionAdapter",
     "DiffusersRotaryAttentionAdapter",
     "GemmaAttentionAdapter",
+    "TransformersGatedDeltaAdapter",
     "FactoredTwoWayAttentionAdapter",
     "PerHeadGqaQkNormRopeAdapter",
     "QwenPerHeadQkNormRopeAdapter",

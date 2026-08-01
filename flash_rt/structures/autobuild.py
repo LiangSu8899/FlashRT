@@ -46,6 +46,7 @@ _FP8_CHAIN_MAX_ROWS = 256  # fp8 producer chain qualifies at denoise
 # it, returns (swaps, update) or None (this host is not its family).
 _ATTENTION_ADAPTERS: list = []
 _QK_NORM_ROPE_ADAPTERS: list = []
+_GATED_DELTA_ADAPTERS: list = []
 
 
 def register_attention_adapter(adapter) -> None:
@@ -56,6 +57,11 @@ def register_attention_adapter(adapter) -> None:
 def register_qk_norm_rope_adapter(adapter) -> None:
     """Register a host-family adapter for a Q/K norm + RoPE boundary."""
     _QK_NORM_ROPE_ADAPTERS.append(adapter)
+
+
+def register_gated_delta_adapter(adapter) -> None:
+    """Register a host-family Gated Delta callable adapter."""
+    _GATED_DELTA_ADAPTERS.append(adapter)
 
 
 # Per-structure binders registered from impls, consulted before the
@@ -171,7 +177,8 @@ def auto_swaps(
                                    "qkv_pack", "adaln_producer",
                                    "linear_proj", "norm_fused",
                                    "attention_core", "decoder_block",
-                                   "modnorm_qkv_chain", "qk_norm_rope"),
+                                   "modnorm_qkv_chain", "qk_norm_rope",
+                                   "gated_delta_core"),
     negotiate_fp8: bool = True,
     prefix_cadence: bool = False,
     observations: Iterable[Any] | None = None,
@@ -264,7 +271,8 @@ def auto_swaps(
 
     seams = discover(model, structures, refused=plan_refusals)
     say(f"discovered {len(seams)} seam(s)")
-    adapter_only = not seams and "attention_core" in structures
+    adapter_only = not seams and bool(
+        {"attention_core", "gated_delta_core"}.intersection(structures))
     if not seams and not adapter_only:
         return AutoPlan()
 
@@ -699,6 +707,26 @@ def auto_swaps(
             if update is not None:
                 plan.updates.append(update)
             plan.notes["attention_adapter"] = type(adapter).__name__ \
+                if hasattr(adapter, "__name__") else str(adapter)
+            break
+
+    # ---- gated_delta_core: stateful host callable adapters ----
+    if "gated_delta_core" in structures:
+        from . import adapters as _adapters  # noqa: F401 (registers)
+        for adapter in _GATED_DELTA_ADAPTERS:
+            try:
+                result = adapter(model, thunks[0])
+            except (ValueError, RuntimeError) as refusal:
+                plan.notes.setdefault("refused", []).append(
+                    ("gated_delta_core", str(refusal)[:120]))
+                continue
+            if result is None:
+                continue
+            plan.observed.update(result.get("observed", {}))
+            plan.revert.extend(result.get("revert", ()))
+            if result.get("toggle") is not None:
+                plan.toggles.append(result["toggle"])
+            plan.notes["gated_delta_adapter"] = type(adapter).__name__ \
                 if hasattr(adapter, "__name__") else str(adapter)
             break
 

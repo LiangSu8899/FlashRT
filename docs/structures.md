@@ -277,6 +277,18 @@ stateless boundary. Qualification is capability-based, so Qwen3 and Qwen3-VL
 hosts share the same structure implementation while retaining their own
 attention dispatch function and cache object.
 
+Transformers-style hybrid decoders expose their Gated Delta recurrence through
+callable recurrent and chunk slots. `gated_delta_core` owns that stateful
+Q/K/V, decay, update-strength and explicit-final-state boundary; projections,
+causal convolution and gated output normalization remain neighbouring
+structures. The Hub v3 decode implementation qualifies the D=128, H=32/H=48
+BF16 profiles used by two independent hybrid-decoder families. Sequence
+prefill is retained by the host until the formal artifact exposes a
+non-mutating explicit state output. A host that exposes non-contiguous split
+views is likewise refused until the recurrence artifact can consume their
+strides; the adapter never inserts hidden `.contiguous()` or state-copy
+kernels into the hot path.
+
 `auto_swaps` builds and does not judge. If you use it, you own the gate —
 and read the ledger, or you have not checked that what you measured was on.
 
