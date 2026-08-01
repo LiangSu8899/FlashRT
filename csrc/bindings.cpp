@@ -5704,20 +5704,21 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     m.def("gqa_decode_attention_bf16",
         [](uintptr_t q, uintptr_t k_cache, uintptr_t v_cache, uintptr_t gate,
            uintptr_t out, int seq_len, uintptr_t seq_len_device,
-           int q_heads, int kv_heads, int head_dim, float scale,
+           int q_heads, int kv_heads, int head_dim, float scale, int q_rows,
            uintptr_t stream) -> int {
             return flash_rt::kernels::gqa_decode_attention_bf16(
                 to_ptr(q), to_ptr(k_cache), to_ptr(v_cache), to_ptr(gate),
                 to_ptr(out), seq_len,
                 reinterpret_cast<const int*>(seq_len_device),
-                q_heads, kv_heads, head_dim, scale, to_stream(stream));
+                q_heads, kv_heads, head_dim, scale, q_rows,
+                to_stream(stream));
         },
         py::arg("q"), py::arg("k_cache"), py::arg("v_cache"), py::arg("gate"),
         py::arg("out"), py::arg("seq_len") = 0,
         py::arg("seq_len_device") = 0,
         py::arg("q_heads") = 0, py::arg("kv_heads") = 0,
         py::arg("head_dim") = 0, py::arg("scale") = 1.0f,
-        py::arg("stream") = 0);
+        py::arg("q_rows") = 1, py::arg("stream") = 0);
 #endif  // FLASHRT_HAVE_DECODE_ATTENTION
 
 #ifdef FLASHRT_HAVE_QWEN36_KERNELS

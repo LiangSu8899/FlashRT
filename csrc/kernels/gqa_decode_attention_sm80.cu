@@ -36,7 +36,8 @@ __global__ void gqa_decode_attention_kernel(
     const __nv_bfloat16* __restrict__ gate,
     __nv_bfloat16* __restrict__ out,
     int seq_len, const int* __restrict__ seq_len_device,
-    int q_heads, int kv_heads, int head_dim, int group, float scale) {
+    int q_heads, int kv_heads, int head_dim, int group, float scale,
+    int q_rows) {
   extern __shared__ float shared[];
   float* query = shared;                        // head_dim
   float* partial = query + head_dim;            // kWarps * head_dim
@@ -44,10 +45,15 @@ __global__ void gqa_decode_attention_kernel(
   float* warp_weight = warp_max + kWarps;          // kWarps
 
   const int head = blockIdx.x;
+  const int row = blockIdx.y;
   const int key_head = head / group;
-  const int length = seq_len_device ? *seq_len_device : seq_len;
+  // Row r is at cache position seq_len - q_rows + r, and attends to
+  // everything up to and including itself.
+  const int length =
+      (seq_len_device ? *seq_len_device : seq_len) - q_rows + row + 1;
 
-  const __nv_bfloat16* q_row = q + static_cast<size_t>(head) * head_dim;
+  const __nv_bfloat16* q_row =
+      q + (static_cast<size_t>(row) * q_heads + head) * head_dim;
   for (int i = threadIdx.x; i < head_dim; i += kThreads) {
     query[i] = __bfloat162float(q_row[i]);
   }
@@ -113,9 +119,10 @@ __global__ void gqa_decode_attention_kernel(
   }
   const float inverse = 1.0f / total_weight;
 
-  __nv_bfloat16* out_row = out + static_cast<size_t>(head) * head_dim;
-  const __nv_bfloat16* gate_row =
-      gate ? gate + static_cast<size_t>(head) * head_dim : nullptr;
+  const size_t row_offset =
+      (static_cast<size_t>(row) * q_heads + head) * head_dim;
+  __nv_bfloat16* out_row = out + row_offset;
+  const __nv_bfloat16* gate_row = gate ? gate + row_offset : nullptr;
   for (int i = threadIdx.x; i < head_dim; i += kThreads) {
     float value = 0.0f;
     for (int w = 0; w < kWarps; ++w) {
@@ -140,24 +147,26 @@ int gqa_decode_attention_bf16(
     void* out,
     int seq_len, const int* seq_len_device,
     int q_heads, int kv_heads, int head_dim,
-    float scale,
+    float scale, int q_rows,
     cudaStream_t stream) {
   if (q_heads <= 0 || kv_heads <= 0 || q_heads % kv_heads) return -1;
   if (head_dim <= 0 || (head_dim & 31)) return -1;
-  if (!seq_len_device && seq_len <= 0) return -1;
+  if (q_rows <= 0) return -1;
+  if (!seq_len_device && seq_len < q_rows) return -1;
 
   const size_t shared =
       (static_cast<size_t>(head_dim) * (kWarps + 1) + 2 * kWarps) *
       sizeof(float);
+  const dim3 grid(q_heads, q_rows);
   const auto launch = [&](auto kernel) {
-    kernel<<<q_heads, kThreads, shared, stream>>>(
+    kernel<<<grid, kThreads, shared, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(q),
         reinterpret_cast<const __nv_bfloat16*>(k_cache),
         reinterpret_cast<const __nv_bfloat16*>(v_cache),
         reinterpret_cast<const __nv_bfloat16*>(gate),
         reinterpret_cast<__nv_bfloat16*>(out),
         seq_len, seq_len_device, q_heads, kv_heads, head_dim,
-        q_heads / kv_heads, scale);
+        q_heads / kv_heads, scale, q_rows);
   };
   switch (head_dim >> 5) {
     case 2:  launch(gqa_decode_attention_kernel<2>);  break;

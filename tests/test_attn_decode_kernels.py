@@ -189,7 +189,7 @@ def test_attention_matches_an_explicit_softmax(q_heads, kv_heads, head_dim,
     rc = fvk.gqa_decode_attention_bf16(
         q.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(), 0,
         out.data_ptr(), seq_len, 0, q_heads, kv_heads, head_dim, scale,
-        torch.cuda.current_stream(DEVICE).cuda_stream)
+        1, torch.cuda.current_stream(DEVICE).cuda_stream)
     assert rc == 0
     torch.cuda.synchronize(DEVICE)
 
@@ -222,11 +222,11 @@ def test_the_gate_is_applied_where_the_result_is_produced():
     fvk.gqa_decode_attention_bf16(
         q.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(), 0,
         plain.data_ptr(), seq_len, 0, q_heads, kv_heads, head_dim, scale,
-        stream)
+        1, stream)
     fvk.gqa_decode_attention_bf16(
         q.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(), gate.data_ptr(),
         gated.data_ptr(), seq_len, 0, q_heads, kv_heads, head_dim, scale,
-        stream)
+        1, stream)
     torch.cuda.synchronize(DEVICE)
 
     want = plain.float() * torch.sigmoid(gate.float())
@@ -251,11 +251,11 @@ def test_a_length_can_come_from_the_device():
     fvk.gqa_decode_attention_bf16(
         q.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(), 0,
         from_host.data_ptr(), 21, 0, q_heads, kv_heads, head_dim, scale,
-        stream)
+        1, stream)
     fvk.gqa_decode_attention_bf16(
         q.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(), 0,
         from_device.data_ptr(), 0, length.data_ptr(), q_heads, kv_heads,
-        head_dim, scale, stream)
+        head_dim, scale, 1, stream)
     torch.cuda.synchronize(DEVICE)
 
     assert torch.equal(from_host, from_device)
@@ -267,7 +267,7 @@ def test_query_heads_that_do_not_divide_are_refused():
     buffer = torch.zeros(4096, dtype=torch.bfloat16, device=DEVICE)
     rc = fvk.gqa_decode_attention_bf16(
         buffer.data_ptr(), buffer.data_ptr(), buffer.data_ptr(), 0,
-        buffer.data_ptr(), 4, 0, 6, 4, 64, 1.0,
+        buffer.data_ptr(), 4, 0, 6, 4, 64, 1.0, 1,
         torch.cuda.current_stream(DEVICE).cuda_stream)
     assert rc == -1
 
@@ -301,7 +301,7 @@ def test_staging_and_attention_agree_on_where_a_head_lives():
     fvk.gqa_decode_attention_bf16(
         q_out.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(),
         gate_out.data_ptr(), out.data_ptr(), length, 0, q_heads, kv_heads,
-        head_dim, scale, torch.cuda.current_stream(DEVICE).cuda_stream)
+        head_dim, scale, 1, torch.cuda.current_stream(DEVICE).cuda_stream)
     torch.cuda.synchronize(DEVICE)
 
     group = q_heads // kv_heads
@@ -313,3 +313,72 @@ def test_staging_and_attention_agree_on_where_a_head_lives():
 
     error = (out.float() - want).abs().max() / want.abs().max()
     assert error < 3e-2, f"relative error {error:.3g}"
+
+
+@pytest.mark.parametrize("chunk", [2, 5, 64])
+def test_a_chunk_of_queries_attends_causally(chunk):
+    # A prompt is read as a chunk, and the rows of it are the last rows of
+    # the cache: row r must see itself and nothing after it. Without that the
+    # prompt would be read bidirectionally, which is a model that predicts
+    # well on its own prompt and badly on anything else.
+    torch.manual_seed(7)
+    q_heads, kv_heads, head_dim = 8, 2, 128
+    prior = 3
+    seq_len = prior + chunk
+    scale = 1.0 / math.sqrt(head_dim)
+    q = torch.randn(chunk, q_heads, head_dim, dtype=torch.bfloat16,
+                    device=DEVICE)
+    k_cache = torch.randn(seq_len, kv_heads, head_dim, dtype=torch.bfloat16,
+                          device=DEVICE)
+    v_cache = torch.randn(seq_len, kv_heads, head_dim, dtype=torch.bfloat16,
+                          device=DEVICE)
+    out = torch.empty(chunk, q_heads, head_dim, dtype=torch.bfloat16,
+                      device=DEVICE)
+
+    rc = fvk.gqa_decode_attention_bf16(
+        q.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(), 0,
+        out.data_ptr(), seq_len, 0, q_heads, kv_heads, head_dim, scale, chunk,
+        torch.cuda.current_stream(DEVICE).cuda_stream)
+    assert rc == 0
+    torch.cuda.synchronize(DEVICE)
+
+    group = q_heads // kv_heads
+    keys = k_cache.float().repeat_interleave(group, dim=1)
+    values = v_cache.float().repeat_interleave(group, dim=1)
+    for row in range(chunk):
+        visible = prior + row + 1
+        scores = torch.einsum("hd,shd->hs", q[row].float(),
+                              keys[:visible]) * scale
+        want = torch.einsum("hs,shd->hd", scores.softmax(-1),
+                            values[:visible])
+        error = (out[row].float() - want).abs().max() / want.abs().max()
+        assert error < 2e-2, f"row {row}: relative error {error:.3g}"
+
+
+def test_one_row_of_a_chunk_is_the_decode_case():
+    # The decode path is the chunk path at one row, so the two must not be
+    # separate code paths that agree by accident.
+    torch.manual_seed(8)
+    q_heads, kv_heads, head_dim, seq_len = 8, 2, 128, 40
+    scale = 1.0 / math.sqrt(head_dim)
+    q = torch.randn(1, q_heads, head_dim, dtype=torch.bfloat16, device=DEVICE)
+    k_cache = torch.randn(seq_len, kv_heads, head_dim, dtype=torch.bfloat16,
+                          device=DEVICE)
+    v_cache = torch.randn(seq_len, kv_heads, head_dim, dtype=torch.bfloat16,
+                          device=DEVICE)
+
+    single = torch.empty(1, q_heads, head_dim, dtype=torch.bfloat16,
+                         device=DEVICE)
+    chunked = torch.empty_like(single)
+    stream = torch.cuda.current_stream(DEVICE).cuda_stream
+    fvk.gqa_decode_attention_bf16(
+        q.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(), 0,
+        single.data_ptr(), seq_len, 0, q_heads, kv_heads, head_dim, scale, 1,
+        stream)
+    fvk.gqa_decode_attention_bf16(
+        q.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(), 0,
+        chunked.data_ptr(), seq_len, 0, q_heads, kv_heads, head_dim, scale, 1,
+        stream)
+    torch.cuda.synchronize(DEVICE)
+
+    assert torch.equal(single, chunked)

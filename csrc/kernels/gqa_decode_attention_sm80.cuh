@@ -10,13 +10,18 @@
 namespace flash_rt {
 namespace kernels {
 
-// out = softmax(q . K^T * scale) V, for a single query row.
+// out = softmax(q . K^T * scale) V, causally, for ``q_rows`` query rows.
 //
-//   q        (q_heads, head_dim)
+//   q        (q_rows, q_heads, head_dim)
 //   k_cache  (capacity, kv_heads, head_dim)
 //   v_cache  (capacity, kv_heads, head_dim)
-//   gate     (q_heads * head_dim), or null
-//   out      (q_heads * head_dim)
+//   gate     (q_rows, q_heads * head_dim), or null
+//   out      (q_rows, q_heads, head_dim)
+//
+// The query rows are the last ``q_rows`` of the cache, so row r attends to
+// everything up to and including position ``seq_len - q_rows + r``. At one
+// row that is the whole cache, which is what a decode step wants; at many it
+// is the causal mask a prompt wants, without a mask being built.
 //
 // Query heads are grouped onto key heads: head h reads key head
 // ``h / (q_heads / kv_heads)``. Nothing is expanded to make that happen -- at
@@ -40,7 +45,7 @@ int gqa_decode_attention_bf16(
     void* out,
     int seq_len, const int* seq_len_device,
     int q_heads, int kv_heads, int head_dim,
-    float scale,
+    float scale, int q_rows,
     cudaStream_t stream);
 
 }  // namespace kernels
