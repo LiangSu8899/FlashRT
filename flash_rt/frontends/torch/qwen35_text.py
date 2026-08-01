@@ -164,6 +164,95 @@ class TextRuntime:
             self.weights.top["vocab_size"], stream)
         work.seek(position, 1)
 
+    # ── a prefix, kept ──
+
+    def snapshot(self) -> dict:
+        """What the sequence so far leaves behind, kept for reuse.
+
+        An agent's prompt is mostly the same every turn -- a system prompt,
+        tool definitions, documents -- and only its tail changes. Reading the
+        unchanged part again costs the same as reading it the first time,
+        which for a long prefix is most of the time to the first token.
+
+        What a prefix leaves behind is small and, for three quarters of the
+        layers, a fixed size however long the prefix is: a recurrence carries
+        the same state for ten tokens as for ten thousand. Only the eight
+        full-attention layers keep something proportional, and only up to the
+        prefix's length.
+
+        The snapshot is taken on the device and stays there.
+        """
+        length = int(self.work.cursor.tensor[0].item())
+        if length <= 0:
+            raise ValueError("nothing has been read yet")
+        return {
+            "length": length,
+            "recurrent": [b.tensor.clone() for b in self.work.recurrent],
+            "conv": [b.tensor.clone() for b in self.work.conv],
+            "keys": [b.tensor[:length].clone() for b in self.work.keys],
+            "values": [b.tensor[:length].clone() for b in self.work.values],
+            "token": self.work.token.tensor[0].clone(),
+        }
+
+    def restore(self, snapshot: dict) -> None:
+        """Start again from a prefix that was already read.
+
+        The addresses do not move, so a captured graph stays valid across
+        this: what changes is what the buffers hold, not where they are.
+        """
+        length = snapshot["length"]
+        if length >= self.work.max_seq:
+            raise ValueError(
+                f"a prefix of {length} does not fit a workspace built for "
+                f"{self.work.max_seq} positions")
+        for buffer, saved in zip(self.work.recurrent, snapshot["recurrent"]):
+            buffer.tensor.copy_(saved)
+        for buffer, saved in zip(self.work.conv, snapshot["conv"]):
+            buffer.tensor.copy_(saved)
+        for buffer, saved in zip(self.work.keys, snapshot["keys"]):
+            buffer.tensor[:length].copy_(saved)
+        for buffer, saved in zip(self.work.values, snapshot["values"]):
+            buffer.tensor[:length].copy_(saved)
+        self.work.token.tensor[0].copy_(snapshot["token"])
+        self.work.seek(length, 1)
+
+    def read_suffix(self, token_ids: list[int]) -> None:
+        """Read more positions onto whatever the cursor is already past.
+
+        Together with a snapshot this is what makes a turn cost its own
+        tokens rather than the whole prompt.
+        """
+        if not token_ids:
+            raise ValueError("the suffix is empty")
+        work = self.work
+        stream = self._stream()
+        position = int(work.cursor.tensor[0].item())
+        if position + len(token_ids) >= work.max_seq:
+            raise ValueError(
+                f"{position} + {len(token_ids)} does not fit a workspace "
+                f"built for {work.max_seq} positions")
+
+        for start in range(0, len(token_ids), work.max_chunk):
+            chunk = token_ids[start:start + work.max_chunk]
+            work.token.tensor[:len(chunk)] = torch.tensor(
+                chunk, dtype=torch.int64, device=self.device)
+            work.seek(position, len(chunk))
+            decode.forward(self.weights, work, self.fvk, len(chunk), stream)
+            position += len(chunk)
+
+        last_row = (len(token_ids) - 1) % work.max_chunk
+        decode.project_to_vocabulary(self.weights, work, self.fvk, stream,
+                                     row=last_row)
+        self.fvk.qwen36_argmax_bf16(
+            work.logits.address, work.token.address, 1,
+            self.weights.top["vocab_size"], stream)
+        work.seek(position, 1)
+
+    def snapshot_bytes(self, snapshot: dict) -> int:
+        return sum(t.numel() * t.element_size()
+                   for group in ("recurrent", "conv", "keys", "values")
+                   for t in snapshot[group])
+
     def step(self) -> None:
         """One token, through the graph if there is one."""
         if self._graph is not None:

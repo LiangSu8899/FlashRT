@@ -190,3 +190,74 @@ def test_a_recurrence_width_the_kernel_does_not_implement_is_refused(tmp_path):
 
     with pytest.raises(RuntimeError, match="head width"):
         TextRuntime.from_checkpoint(str(tmp_path))
+
+
+def test_a_prefix_can_be_kept_and_started_from_again(checkpoint):
+    # An agent's prompt is mostly the same every turn and only its tail
+    # changes. What a prefix leaves behind is a fixed size for three quarters
+    # of the layers, so it can be kept -- and starting from it has to give the
+    # same answer as reading the whole prompt, or the saving is not a saving.
+    prefix, suffix = PROMPT, [7, 99, 4, 250]
+
+    whole = _runtime(checkpoint, 4)
+    whole.reset()
+    whole.read_prompt(prefix + suffix)
+    torch.cuda.synchronize()
+    expected = whole.token()
+    whole.close()
+
+    runtime = _runtime(checkpoint, 4)
+    runtime.reset()
+    runtime.read_prompt(prefix)
+    kept = runtime.snapshot()
+    assert kept["length"] == len(prefix)
+    assert runtime.snapshot_bytes(kept) > 0
+
+    # a different sequence in between, to prove the restore is what carries
+    runtime.reset()
+    runtime.read_prompt([11, 12, 13])
+    runtime.restore(kept)
+    runtime.read_suffix(suffix)
+    torch.cuda.synchronize()
+
+    assert runtime.token() == expected
+    assert runtime.work.cursor.tensor[0].item() == len(prefix) + len(suffix)
+    runtime.close()
+
+
+def test_a_kept_prefix_survives_a_captured_step(checkpoint):
+    # The addresses do not move across a restore, so a graph captured before
+    # one stays valid after it: what changes is what the buffers hold.
+    runtime = _runtime(checkpoint, 4)
+    runtime.reset()
+    runtime.read_prompt(PROMPT)
+    kept = runtime.snapshot()
+    runtime.capture()
+
+    runtime.restore(kept)
+    runtime.read_suffix([5, 6])
+    first = [runtime.token()]
+    for _ in range(3):
+        runtime.step()
+        torch.cuda.synchronize()
+        first.append(runtime.token())
+
+    runtime.restore(kept)
+    runtime.read_suffix([5, 6])
+    second = [runtime.token()]
+    for _ in range(3):
+        runtime.step()
+        torch.cuda.synchronize()
+        second.append(runtime.token())
+
+    assert first == second
+    runtime.close()
+
+
+def test_a_suffix_that_does_not_fit_is_refused(checkpoint):
+    runtime = TextRuntime.from_checkpoint(checkpoint, max_seq=16, max_chunk=4)
+    runtime.reset()
+    runtime.read_prompt(PROMPT)
+    with pytest.raises(ValueError):
+        runtime.read_suffix(list(range(10)))
+    runtime.close()

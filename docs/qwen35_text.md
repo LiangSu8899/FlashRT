@@ -207,6 +207,32 @@ but by the vocabulary projection each draft position needs, so a draft head
 restricted to the frequent part of the vocabulary is most of what makes it
 worth doing.
 
+### A prompt that is mostly the same every turn
+
+An agent's prompt is a system prompt, a set of tool definitions and some
+documents, followed by a short tail that changes. Reading the unchanged part
+again costs what it cost the first time, and for a long prefix that is most of
+the time to the first token.
+
+What a prefix leaves behind can be kept. For three quarters of the layers it
+is a fixed size however long the prefix is -- a recurrence carries the same
+state for ten tokens as for ten thousand -- and only the eight full-attention
+layers keep something proportional:
+
+```python
+runtime.read_prompt(system_prompt_and_tools)
+prefix = runtime.snapshot()
+...
+runtime.restore(prefix)          # addresses do not move; a graph stays valid
+runtime.read_suffix(this_turn)
+```
+
+Measured with a 1024-token prefix and a 48-token turn: 1014 ms to read the
+whole prompt each time against 47.6 ms to restore and read the tail, for the
+same first token. The snapshot was 81 MiB.
+
+The restore itself is 0.2 ms, so what a turn costs is its own tokens.
+
 ### The prompt pass
 
 It does not yet get the benefit batching should give it: the batched
