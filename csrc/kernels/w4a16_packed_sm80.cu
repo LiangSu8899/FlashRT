@@ -469,9 +469,11 @@ int rows_per_warp(int K, int group, bool gated) {
     return count;
   }();
   // A gated warp carries two streams of weight against one activation, so it
-  // reaches the same amount of work at half the rows -- and measured that way
-  // on both parts.
-  if (processors > 0 && processors <= 24) return gated ? 4 : 8;
+  // reaches the same amount of work at fewer rows. Two, measured on two
+  // eight-multiprocessor parts that disagree about almost everything else:
+  // on one it was the best of the four tried and on the other within two per
+  // cent of the best. Every other shape wanted eight on both.
+  if (processors > 0 && processors <= 24) return gated ? 2 : 8;
   const int steps = (K / group) / 32;
   const int rows = steps >= 8 ? 1 : (steps >= 4 ? 2 : (steps >= 2 ? 4 : 8));
   return gated ? 1 : rows;
