@@ -22,6 +22,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 
 namespace flash_rt {
@@ -58,7 +59,7 @@ constexpr int kPad = 2;                // keeps the per-group word stride odd
 // the result is their difference from 136 sum x -- eight mantissa bits do not
 // survive that cancellation.
 __device__ __forceinline__ float word_dot(
-    uint32_t word, const __nv_bfloat162* __restrict__ pairs) {
+    uint32_t word, const float* __restrict__ activation) {
   float dot = 0.0f;
 #pragma unroll
   for (int p = 0; p < 4; ++p) {
@@ -67,11 +68,28 @@ __device__ __forceinline__ float word_dot(
     __nv_bfloat162 decoded;
     memcpy(&decoded, &bits, sizeof(decoded));
     const float2 value = __bfloat1622float2(decoded);
-    const float2 activation = __bfloat1622float2(pairs[p]);
-    dot = fmaf(value.x, activation.x, dot);
-    dot = fmaf(value.y, activation.y, dot);
+    dot = fmaf(value.x, activation[2 * p], dot);
+    dot = fmaf(value.y, activation[2 * p + 1], dot);
   }
   return dot;
+}
+
+// One word of activation, converted once and left in registers.
+//
+// The rows a warp owns all contract against the same activation, so
+// converting it inside the row loop converts it once per row: at four rows
+// paired with their gate partners, the same eight values were converted eight
+// times. Hoisting it here costs eight registers and removes the rest.
+__device__ __forceinline__ void stage_word(
+    const __nv_bfloat16* __restrict__ activation, int word, float* out) {
+  const __nv_bfloat162* pairs =
+      reinterpret_cast<const __nv_bfloat162*>(activation) + word * 4;
+#pragma unroll
+  for (int p = 0; p < 4; ++p) {
+    const float2 value = __bfloat1622float2(pairs[p]);
+    out[2 * p] = value.x;
+    out[2 * p + 1] = value.y;
+  }
 }
 
 // What the folded offsets cost the group: 136 for the 128 the pattern carries
@@ -82,12 +100,12 @@ template <int G>
 __device__ __forceinline__ float group_dot(
     const uint32_t* __restrict__ words,
     const __nv_bfloat16* __restrict__ activation, float activation_sum) {
-  const __nv_bfloat162* pairs =
-      reinterpret_cast<const __nv_bfloat162*>(activation);
   float dot = 0.0f;
 #pragma unroll
   for (int w = 0; w < G / kValuesPerWord; ++w) {
-    dot += word_dot(words[w], pairs + w * 4);
+    float staged[kValuesPerWord];
+    stage_word(activation, w, staged);
+    dot += word_dot(words[w], staged);
   }
   return dot - kFoldedOffset * activation_sum;
 }
@@ -171,31 +189,58 @@ __global__ void packed_matvec_kernel(
           ? scale[static_cast<size_t>(row) * groups + group]
           : __float2bfloat16(0.0f);
     }
-#pragma unroll
-    for (int r = 0; r < R; ++r) {
-      acc[r] = fmaf(group_dot<G>(words[r], activation, group_sum[group]),
-                    __bfloat162float(scales[r]), acc[r]);
-    }
+    // The partner rows a gate needs, read the same way. Loading them here
+    // rather than in a second pass lets both streams contract against one
+    // conversion of the activation.
+    uint32_t up_words[kGated ? R : 1][kWords];
+    __nv_bfloat16 up_scales[kGated ? R : 1];
     if (kGated) {
-      // The partner row's weight, read the same way. It is a second stream of
-      // loads over the same activation, which is why the pairing costs one
-      // register set and no extra traffic.
 #pragma unroll
       for (int r = 0; r < R; ++r) {
         const int row = row_base + r + partner;
         const bool live = row_base + r < rows_out;
         const size_t base =
             (static_cast<size_t>(row) * groups + group) * kWords;
-        uint32_t up_words[kWords];
 #pragma unroll
         for (int w = 0; w < kWords; ++w) {
-          up_words[w] = live ? packed[base + w] : 0u;
+          up_words[r][w] = live ? packed[base + w] : 0u;
         }
-        const __nv_bfloat16 up_scale = live
+        up_scales[r] = live
             ? scale[static_cast<size_t>(row) * groups + group]
             : __float2bfloat16(0.0f);
-        acc_up[r] = fmaf(group_dot<G>(up_words, activation, group_sum[group]),
-                         __bfloat162float(up_scale), acc_up[r]);
+      }
+    }
+
+    // One conversion of the activation, every row of the tile against it.
+    float part[R];
+    float part_up[kGated ? R : 1];
+#pragma unroll
+    for (int r = 0; r < R; ++r) part[r] = 0.0f;
+    if (kGated) {
+#pragma unroll
+      for (int r = 0; r < R; ++r) part_up[r] = 0.0f;
+    }
+#pragma unroll
+    for (int w = 0; w < kWords; ++w) {
+      float staged[kValuesPerWord];
+      stage_word(activation, w, staged);
+#pragma unroll
+      for (int r = 0; r < R; ++r) part[r] += word_dot(words[r][w], staged);
+      if (kGated) {
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+          part_up[r] += word_dot(up_words[r][w], staged);
+        }
+      }
+    }
+
+    const float folded = kFoldedOffset * group_sum[group];
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+      acc[r] = fmaf(part[r] - folded, __bfloat162float(scales[r]), acc[r]);
+      if (kGated) {
+        acc_up[r] = fmaf(part_up[r] - folded,
+                         __bfloat162float(up_scales[r]), acc_up[r]);
       }
     }
   }
@@ -289,9 +334,39 @@ size_t shared_bytes(int K, int group) {
 
 // Rows per warp so that rows x (groups / 32) lands near eight loads in
 // flight: a shape that already pipelines eight deep wants one row.
-int rows_per_warp(int K, int group) {
+// Rows per warp, chosen from how many multiprocessors there are and
+// overridable so it can be swept on a part without rebuilding.
+//
+// Every block stages the whole activation before it reads any weight, so that
+// work is paid once per block and the redundancy is proportional to how many
+// blocks there are -- which is inversely proportional to the rows a warp
+// takes. On a part with few multiprocessors the redundancy decides: measured
+// on an eight-multiprocessor part, the widest contraction went from 47 to 72
+// GB/s between one row and eight, because its activation was being staged by
+// three hundred and twenty blocks instead of forty.
+//
+// On a part with many, the opposite decides: taking more rows leaves too few
+// blocks to fill it, and on a hundred-and-seventy-multiprocessor part one row
+// measured fastest for most shapes. So this is not a property of the shape,
+// which is what it used to be keyed on.
+int rows_per_warp(int K, int group, bool gated) {
+  static const int forced = [] {
+    const char* value = getenv("FLASHRT_W4A16_ROWS");
+    return value ? atoi(value) : 0;
+  }();
+  if (forced == 1 || forced == 2 || forced == 4 || forced == 8) return forced;
+  static const int processors = [] {
+    int count = 0;
+    cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, 0);
+    return count;
+  }();
+  // A gated warp carries two streams of weight against one activation, so it
+  // reaches the same amount of work at half the rows -- and measured that way
+  // on both parts.
+  if (processors > 0 && processors <= 24) return gated ? 4 : 8;
   const int steps = (K / group) / 32;
-  return steps >= 8 ? 1 : (steps >= 4 ? 2 : (steps >= 2 ? 4 : 8));
+  const int rows = steps >= 8 ? 1 : (steps >= 4 ? 2 : (steps >= 2 ? 4 : 8));
+  return gated ? 1 : rows;
 }
 
 }  // namespace
@@ -312,7 +387,7 @@ int launch_matvec(
   const auto* scale_ptr = reinterpret_cast<const __nv_bfloat16*>(scale);
   auto* out_ptr = reinterpret_cast<__nv_bfloat16*>(out);
   const size_t shared = shared_bytes(K, group);
-  const int rows = rows_per_warp(K, group);
+  const int rows = rows_per_warp(K, group, kGated);
 
 #define FLASHRT_DISPATCH(ROWS, GROUP)                                         \
   packed_matvec_kernel<ROWS, GROUP, kGated>                                   \
