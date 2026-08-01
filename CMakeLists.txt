@@ -1484,6 +1484,23 @@ else()
   message(STATUS "packed weight-only kernels: SKIPPED")
 endif()
 
+# ── Portable single-token decode kernels ──
+# What a decode step needs between its projections, parameterised by head
+# counts rather than named for a model's, and using SM80-family facilities
+# only. Same reasoning as the block above: not part of any model's tier, so
+# not gated on one.
+option(FLASHRT_ENABLE_DECODE_ATTENTION
+  "Build the portable single-token decode kernels" ON)
+if(FLASHRT_ENABLE_DECODE_ATTENTION)
+  target_sources(flash_rt_kernels PRIVATE
+    csrc/kernels/linear_attn_decode_prep_sm80.cu)
+  target_compile_definitions(flash_rt_kernels PRIVATE
+    FLASHRT_HAVE_DECODE_ATTENTION=1)
+  message(STATUS "portable decode kernels: ENABLED (sm_${GPU_ARCH})")
+else()
+  message(STATUS "portable decode kernels: SKIPPED")
+endif()
+
 # ── qwen3_5_moe family (Nex-N2 / Qwen3.6-35B-A3B) SM120 kernels ──
 # Gated: only compiled when explicitly enabled AND on a Blackwell (NVFP4)
 # build. The bindings are #ifdef FLASHRT_HAVE_QWEN35MOE in bindings.cpp, so

@@ -182,6 +182,9 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #include "kernels/w4a16_packed_sm80.cuh"
 #include "kernels/w8a16_rowwise_sm80.cuh"
 #endif
+#ifdef FLASHRT_HAVE_DECODE_ATTENTION
+#include "kernels/linear_attn_decode_prep_sm80.cuh"
+#endif
 #ifdef FLASHRT_HAVE_QWEN35MOE
 #include "kernels/qwen35moe_layout.cuh"
 #include "kernels/moe_grouped_gemv_sm120.cuh"
@@ -5645,6 +5648,32 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("stream") = 0);
 
 #endif  // FLASHRT_HAVE_W4A16_PACKED
+
+#ifdef FLASHRT_HAVE_DECODE_ATTENTION
+    m.def("linear_attn_split_broadcast_gate_bf16",
+        [](uintptr_t conv_out, uintptr_t a, uintptr_t b,
+           uintptr_t neg_exp_a_log, uintptr_t dt_bias,
+           uintptr_t q, uintptr_t k, uintptr_t v,
+           uintptr_t g, uintptr_t beta,
+           int S, int k_heads, int v_heads, int head_k, int head_v,
+           int a_stride, int b_stride, uintptr_t stream) -> int {
+            return flash_rt::kernels::linear_attn_split_broadcast_gate_bf16(
+                to_ptr(conv_out), to_ptr(a), to_ptr(b),
+                reinterpret_cast<const float*>(neg_exp_a_log),
+                reinterpret_cast<const float*>(dt_bias),
+                to_ptr(q), to_ptr(k), to_ptr(v), to_ptr(g), to_ptr(beta),
+                S, k_heads, v_heads, head_k, head_v, a_stride, b_stride,
+                to_stream(stream));
+        },
+        py::arg("conv_out"), py::arg("a"), py::arg("b"),
+        py::arg("neg_exp_a_log"), py::arg("dt_bias"),
+        py::arg("q"), py::arg("k"), py::arg("v"),
+        py::arg("g"), py::arg("beta"),
+        py::arg("S"), py::arg("k_heads"), py::arg("v_heads"),
+        py::arg("head_k"), py::arg("head_v"),
+        py::arg("a_stride"), py::arg("b_stride"), py::arg("stream") = 0);
+
+#endif  // FLASHRT_HAVE_DECODE_ATTENTION
 
 #ifdef FLASHRT_HAVE_QWEN36_KERNELS
     m.def("qwen36_gdn_gating_bf16",
