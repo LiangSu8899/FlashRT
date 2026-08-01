@@ -3,7 +3,7 @@
 
 Example:
   python examples/thor/qwen3_vl_quickstart.py \
-    --checkpoint /root/models/Qwen3-VL-2B-Instruct \
+    --checkpoint /path/to/Qwen3-VL-2B-Instruct \
     --image FlashRT.png \
     --prompt "Describe this image in one sentence." \
     --max-new-tokens 32
@@ -21,7 +21,7 @@ import time
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
-    p.add_argument('--checkpoint', default='/root/models/Qwen3-VL-2B-Instruct')
+    p.add_argument('--checkpoint', required=True)
     p.add_argument('--image', default=None,
                    help='omit for a text-only prompt')
     p.add_argument('--prompt', default='Describe this image in one sentence.')

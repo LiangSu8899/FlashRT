@@ -42,7 +42,7 @@ __device__ __forceinline__ float dot_block(const uint8_t* wb, int4 xa, int4 xb) 
 // flight at once. Nibble unpack: shift+sign-extend+I2F; per-16 bf16 scale; fp32
 // accumulation. NG is a multiple of 32*kUnroll for K in {2048,6144} (no tail).
 template<int K_FIXED>
-__global__ __launch_bounds__(kThreads, 8) void qwen3_vl_int4_gemv_m1_kernel(
+__global__ __launch_bounds__(kThreads) void qwen3_vl_int4_gemv_m1_kernel(
     const __nv_bfloat16* __restrict__ x,
     const uint8_t* __restrict__ Wp,
     const __nv_bfloat16* __restrict__ Ws,

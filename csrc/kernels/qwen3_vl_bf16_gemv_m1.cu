@@ -11,7 +11,7 @@ constexpr int kWarpsPerBlock = 8;
 constexpr int kThreads = kWarpsPerBlock * 32;
 
 template<int K_FIXED>
-__global__ __launch_bounds__(kThreads, 8) void qwen3_vl_bf16_gemv_m1_kernel(
+__global__ __launch_bounds__(kThreads) void qwen3_vl_bf16_gemv_m1_kernel(
     const __nv_bfloat16* __restrict__ x,
     const __nv_bfloat16* __restrict__ W,
     __nv_bfloat16* __restrict__ out,

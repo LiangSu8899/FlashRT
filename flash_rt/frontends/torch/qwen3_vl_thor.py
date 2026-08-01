@@ -395,7 +395,8 @@ class Qwen3VlTorchFrontendThor:
             )
             self._vision = Qwen3VlVisionRtx(
                 self.checkpoint_path, device=self.device,
-                config=self._vision_cfg, fp8=False)
+                config=self._vision_cfg, fp8=False,
+                attention_backend='sdpa')
         return self._vision
 
     def reset_state(self) -> None:

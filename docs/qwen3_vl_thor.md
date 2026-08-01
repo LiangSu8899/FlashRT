@@ -92,14 +92,16 @@ roughly 2·S kernel launches per layer.
 **Vision.** The BF16 `Qwen3VlVisionRtx` tower is reused with its FP8 path
 explicitly disabled. Autodetecting on compute capability is not sufficient here:
 Thor reports sm_110, which satisfies the `>= 89` FP8 test, but its Qwen3-VL
-module deliberately omits the FP8 block-128 ViT kernels. Patch attention falls
-back to non-causal SDPA because `flash_rt_fa2` is absent; patch attention is
-bidirectional, so that is equivalent rather than an approximation. On the SDPA
-path the tower prefers the **cuDNN backend**, probed once at kernel init (never
-inside a capture): at the ViT shape (head_dim 64, non-causal, 6256 patches) it
-measures 1.6 ms per block vs 3.8 ms for torch's default flash backend — 2.3×,
-worth ~52 ms of full-resolution prefill across the 24 blocks. When the probe
-fails the code falls back to the default SDPA dispatcher.
+module deliberately omits the FP8 block-128 ViT kernels. The Thor frontend
+therefore explicitly selects non-causal SDPA for patch attention; existing RTX
+frontends retain the required FA2 backend and still fail fast if
+`flash_rt_fa2` is missing. Patch attention is bidirectional, so SDPA is
+equivalent rather than an approximation. On Thor the tower prefers the
+**cuDNN backend**, probed once at kernel init (never inside a capture): at the
+ViT shape (head_dim 64, non-causal, 6256 patches) it measures 1.6 ms per block
+vs 3.8 ms for torch's default flash backend — 2.3×, worth ~52 ms of
+full-resolution prefill across the 24 blocks. When the probe fails the code
+falls back to the default SDPA dispatcher.
 
 **Linears.** M=1 decode uses the dedicated warp-per-row BF16 GEMV, which beats
 cuBLASLt's weak M=1 tactics. Larger M (prefill) goes through the Thor cuBLASLt
@@ -109,7 +111,7 @@ BF16 matmul.
 
 ```bash
 python examples/thor/qwen3_vl_quickstart.py \
-  --checkpoint /root/models/Qwen3-VL-2B-Instruct \
+  --checkpoint /path/to/Qwen3-VL-2B-Instruct \
   --image FlashRT.png \
   --prompt "Describe this image in one sentence." \
   --max-new-tokens 32

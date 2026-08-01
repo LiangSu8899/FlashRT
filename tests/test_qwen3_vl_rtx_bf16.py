@@ -163,6 +163,67 @@ def test_decode_quant_knobs_default_to_bf16():
     assert sig.parameters['kv_mode'].default == 'bf16'
 
 
+def _decode_capacity_stub(*, prompt_len=5, max_seq=8):
+    m = importlib.import_module('flash_rt.frontends.torch.qwen3_vl_rtx_bf16')
+    frontend = object.__new__(m.Qwen3VlTorchFrontendRtxBF16)
+    frontend._prompt = {'S': prompt_len, 'mrope_max': prompt_len - 1}
+    frontend.max_seq = max_seq
+    frontend.max_decode_graphs = max_seq
+    return frontend
+
+
+def test_warmup_decode_graphs_checks_prompt_plus_decode_capacity():
+    frontend = _decode_capacity_stub()
+    positions = []
+    frontend._ensure_decode_graph = (
+        lambda cache_pos, rope_pos: positions.append((cache_pos, rope_pos)))
+
+    frontend.warmup_decode_graphs(3)
+    assert positions == [(5, 5), (6, 6), (7, 7)]
+    with pytest.raises(ValueError, match='KV slots'):
+        frontend.warmup_decode_graphs(4)
+    with pytest.raises(ValueError, match='n_tokens must be >= 1'):
+        frontend.warmup_decode_graphs(0)
+
+
+def test_warmup_decode_da_graphs_checks_generation_capacity():
+    frontend = _decode_capacity_stub()
+    positions = []
+    frontend._ensure_decode_graph_da = (
+        lambda cache_pos, rope_pos, out_idx: positions.append(
+            (cache_pos, rope_pos, out_idx)))
+
+    frontend.warmup_decode_da_graphs(4)
+    assert positions == [(5, 5, 1), (6, 6, 2), (7, 7, 3)]
+    with pytest.raises(ValueError, match='KV slots'):
+        frontend.warmup_decode_da_graphs(5)
+    with pytest.raises(ValueError, match='n_tokens must be >= 1'):
+        frontend.warmup_decode_da_graphs(0)
+
+
+@pytest.mark.parametrize('use_graph', [False, True])
+def test_generate_rejects_prompt_plus_generation_overflow(use_graph):
+    frontend = _decode_capacity_stub(prompt_len=7, max_seq=8)
+    frontend.set_prompt = lambda messages: None
+    with pytest.raises(ValueError, match='prompt .* max_new_tokens'):
+        frontend.generate([], max_new_tokens=3, use_graph=use_graph)
+
+
+@pytest.mark.parametrize('max_new_tokens', [0, -1])
+def test_generate_rejects_non_positive_token_count(max_new_tokens):
+    frontend = _decode_capacity_stub()
+    frontend.set_prompt = lambda messages: (_ for _ in ()).throw(
+        AssertionError('set_prompt must not run for an invalid token count'))
+    with pytest.raises(ValueError, match='max_new_tokens must be >= 1'):
+        frontend.generate([], max_new_tokens=max_new_tokens)
+
+
+def test_orin_quickstart_requires_checkpoint_argument():
+    src = (pathlib.Path(__file__).parents[1]
+           / 'examples/orin/qwen3_vl_quickstart.py').read_text()
+    assert "add_argument('--checkpoint', required=True)" in src
+
+
 # ── decode weight quantization ──
 
 @pytest.mark.parametrize('mode', ['bogus', 'fp8', 'int2', ''])

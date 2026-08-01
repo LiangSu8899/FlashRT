@@ -360,7 +360,8 @@ def test_uneven_gqa_ratio_rejected():
 VISION_MOD = 'flash_rt.frontends.torch._qwen3_vl_vision_rtx'
 
 
-def _vision_stub(monkeypatch, *, with_fa2: bool):
+def _vision_stub(monkeypatch, *, with_fa2: bool,
+                 attention_backend: str | None = None):
     """Bare Qwen3VlVisionRtx whose lazy _kernels() sees fake kernel modules."""
     import sys
     import types
@@ -388,9 +389,30 @@ def _vision_stub(monkeypatch, *, with_fa2: bool):
     v.device = 'cpu'
     v._fvk = v._fa2 = v._vlk = None
     v._vit_sdpa_ctx = None
+    v._attention_backend = attention_backend or ('fa2' if with_fa2 else 'sdpa')
     v.num_heads = 16
     v.head_dim = 64
     return v
+
+
+def test_vit_default_fa2_backend_fails_fast_when_module_missing(monkeypatch):
+    v = _vision_stub(
+        monkeypatch, with_fa2=False, attention_backend='fa2')
+    with pytest.raises(ImportError):
+        v._kernels()
+
+
+def test_thor_explicitly_selects_sdpa_and_requires_checkpoint():
+    import inspect
+    import pathlib
+
+    m = importlib.import_module('flash_rt.frontends.torch.qwen3_vl_thor')
+    source = inspect.getsource(m.Qwen3VlTorchFrontendThor._ensure_native_vision)
+    assert "attention_backend='sdpa'" in source
+
+    quickstart = (pathlib.Path(__file__).parents[1]
+                  / 'examples/thor/qwen3_vl_quickstart.py').read_text()
+    assert "add_argument('--checkpoint', required=True)" in quickstart
 
 
 def _record_sdpa_kernel(monkeypatch):

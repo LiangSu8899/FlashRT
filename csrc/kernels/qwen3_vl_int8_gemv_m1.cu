@@ -20,10 +20,8 @@ constexpr int kRows = 1;                             // output rows per warp
 // Measured non-wins (do not re-add): smem-staging x (occupancy loss on 16 SMs);
 // half2/__hfma2 accumulation (int8 per-16 partial can overflow half on outlier
 // activations — fp32 is the safe choice).
-// The minBlocks hint mainly acts as a register clamp here: 8 x 256 threads
-// exceeds the 1536 threads/SM these arches allow.
 template<int K_FIXED, int R>
-__global__ __launch_bounds__(kThreads, 8) void qwen3_vl_int8_gemv_m1_kernel(
+__global__ __launch_bounds__(kThreads) void qwen3_vl_int8_gemv_m1_kernel(
     const __nv_bfloat16* __restrict__ x,
     const uint8_t* __restrict__ Wp,
     const __nv_bfloat16* __restrict__ Ws,

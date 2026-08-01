@@ -86,7 +86,7 @@ decode graphs per `(cache_pos, rope_pos)` bucket.
 
 ```bash
 python examples/orin/qwen3_vl_quickstart.py \
-  --checkpoint /root/models/Qwen3-VL-2B-Instruct \
+  --checkpoint /path/to/Qwen3-VL-2B-Instruct \
   --image FlashRT.png \
   --prompt "Describe this image in one sentence." \
   --max-new-tokens 32
@@ -109,7 +109,7 @@ FP8/NVFP4 reports:
 
 ```bash
 python examples/orin/qwen3_vl_quickstart.py \
-  --checkpoint /root/models/Qwen3-VL-2B-Instruct \
+  --checkpoint /path/to/Qwen3-VL-2B-Instruct \
   --image FlashRT.png \
   --prompt "Describe this image in one sentence." \
   --max-new-tokens 4 \
@@ -129,7 +129,7 @@ Environment:
 - L4T: R36.4.7
 - CUDA Toolkit: 12.6.68
 - PyTorch: 2.8.0 + CUDA 12.6
-- Checkpoint: `/root/models/Qwen3-VL-2B-Instruct`
+- Checkpoint: `/path/to/Qwen3-VL-2B-Instruct`
 - Workload: `FlashRT.png`, prompt `Describe this image in one sentence.`
 
 Local checks:
@@ -306,7 +306,7 @@ after graph capture and warmup:
 nsys profile --trace=cuda \
   --capture-range=cudaProfilerApi --capture-range-end=stop \
   --cuda-graph-trace=node \
-  -o /root/qwen3_vl_bf16_prefill_replay \
+  -o /path/to/qwen3_vl_bf16_prefill_replay \
   python ...
 ```
 

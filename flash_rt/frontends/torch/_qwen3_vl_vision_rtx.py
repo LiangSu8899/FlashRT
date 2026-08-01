@@ -31,13 +31,14 @@ class Qwen3VlVisionRtx:
     early-layer paths can stay BF16 via explicit config overrides.
 
     Public surface:
-      __init__(checkpoint_path, *, device='cuda:0')
+      __init__(checkpoint_path, *, device='cuda:0', attention_backend='fa2')
       forward(pixel_values, pos_embeds, rope_cos, rope_sin)
         -> (image_embeds, deepstack_features)
     """
 
     def __init__(self, checkpoint_path: str, *, device: str = 'cuda:0',
-                 config: dict | None = None, fp8: bool | None = None) -> None:
+                 config: dict | None = None, fp8: bool | None = None,
+                 attention_backend: str = 'fa2') -> None:
         import torch
 
         from safetensors import safe_open
@@ -46,11 +47,16 @@ class Qwen3VlVisionRtx:
         self._fvk = None
         self._fa2 = None
         self._vlk = None
-        self._vit_sdpa_ctx = None  # set by _kernels() on the SDPA fallback
+        self._vit_sdpa_ctx = None  # set by _kernels() for explicit SDPA
         # patch-count -> (graph, static_inputs, captured_outputs)
         self._graphs: dict = {}
         self._graph_stream = None
         self._use_fp8_gemm = False
+        if attention_backend not in ('fa2', 'sdpa'):
+            raise ValueError(
+                f'attention_backend must be "fa2" or "sdpa", got '
+                f'{attention_backend!r}')
+        self._attention_backend = attention_backend
 
         cfg = config if config is not None else _read_vision_config(
             checkpoint_path)
@@ -187,10 +193,9 @@ class Qwen3VlVisionRtx:
 
     def _kernels(self):
         if self._fvk is None:
-            try:
+            if self._attention_backend == 'fa2':
                 from flash_rt import flash_rt_fa2 as fa2
-            except ImportError:
-                # Not built on Thor (sm_110); _attn falls back to SDPA.
+            else:
                 fa2 = None
             from flash_rt import flash_rt_kernels as fvk
             from flash_rt import flash_rt_qwen3_vl_kernels as vlk
@@ -202,8 +207,11 @@ class Qwen3VlVisionRtx:
             # on head_dim: FA2 does instantiate the ViT's head_dim 64 (see
             # FA2_HDIMS), and excluding it would silently reroute the working
             # SM89/SM120 ViT attention to SDPA.
-            self._vit_use_fa2 = fa2 is not None and hasattr(fa2, 'fwd_bf16')
-            # On the SDPA fallback (Thor sm_110), prefer the cuDNN backend:
+            self._vit_use_fa2 = self._attention_backend == 'fa2'
+            if self._vit_use_fa2 and not hasattr(fa2, 'fwd_bf16'):
+                raise RuntimeError(
+                    'attention_backend="fa2" requires flash_rt_fa2.fwd_bf16')
+            # On Thor's explicit SDPA path, prefer the cuDNN backend:
             # at the ViT shape (head_dim 64, non-causal) it measures ~2.3x
             # faster than torch's flash backend there. Probe once here, not on
             # the first forward — the probe launches an SDPA, which must not

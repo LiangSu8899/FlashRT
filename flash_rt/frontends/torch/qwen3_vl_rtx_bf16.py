@@ -859,9 +859,18 @@ class Qwen3VlTorchFrontendRtxBF16:
     def warmup_decode_graphs(self, n_tokens: int) -> None:
         if self._prompt is None:
             raise RuntimeError('call set_prompt() before warmup_decode_graphs()')
+        n_tokens = int(n_tokens)
+        if n_tokens < 1:
+            raise ValueError(f'n_tokens must be >= 1, got {n_tokens}')
         base_slot = int(self._prompt['S'])
         base_rope = int(self._prompt['mrope_max']) + 1
-        for i in range(int(n_tokens)):
+        required_slots = base_slot + n_tokens
+        if required_slots > self.max_seq:
+            raise ValueError(
+                f'prompt ({base_slot} tokens) + {n_tokens} decode warmup '
+                f'steps needs {required_slots} KV slots, but max_seq='
+                f'{self.max_seq}')
+        for i in range(n_tokens):
             self._ensure_decode_graph(base_slot + i, base_rope + i)
 
     # ── device-argmax decode ──
@@ -917,9 +926,17 @@ class Qwen3VlTorchFrontendRtxBF16:
         if self._prompt is None:
             raise RuntimeError(
                 'call set_prompt() before warmup_decode_da_graphs()')
+        n_tokens = int(n_tokens)
+        if n_tokens < 1:
+            raise ValueError(f'n_tokens must be >= 1, got {n_tokens}')
         base_slot = int(self._prompt['S'])
         base_rope = int(self._prompt['mrope_max']) + 1
-        for i in range(int(n_tokens) - 1):
+        required_slots = base_slot + n_tokens - 1
+        if required_slots > self.max_seq:
+            raise ValueError(
+                f'prompt ({base_slot} tokens) + n_tokens={n_tokens} needs '
+                f'{required_slots} KV slots, but max_seq={self.max_seq}')
+        for i in range(n_tokens - 1):
             self._ensure_decode_graph_da(base_slot + i, base_rope + i, i + 1)
 
     def generate(self, messages: list, *, max_new_tokens: int = 64,
@@ -933,6 +950,10 @@ class Qwen3VlTorchFrontendRtxBF16:
         """
         import torch
 
+        max_new_tokens = int(max_new_tokens)
+        if max_new_tokens < 1:
+            raise ValueError(
+                f'max_new_tokens must be >= 1, got {max_new_tokens}')
         if use_graph:
             if max_new_tokens - 1 > self.max_decode_graphs:
                 raise ValueError(
@@ -940,17 +961,18 @@ class Qwen3VlTorchFrontendRtxBF16:
                     f'cache cap ({self.max_decode_graphs}); raise '
                     'FLASHRT_QWEN3_VL_DECODE_GRAPH_CACHE_MAX or lower '
                     'max_new_tokens')
-            if max_new_tokens > self.max_seq:
-                raise ValueError(
-                    f'max_new_tokens={max_new_tokens} exceeds max_seq='
-                    f'{self.max_seq} (the generated-token ring size)')
-
         self.set_prompt(messages)
-        logits = self.prefill_graph() if use_graph else self.prefill()
         p = self._prompt
         assert p is not None
         base_slot = int(p['S'])
         base_rope = int(p['mrope_max']) + 1
+        required_slots = base_slot + max_new_tokens - 1
+        if required_slots > self.max_seq:
+            raise ValueError(
+                f'prompt ({base_slot} tokens) + max_new_tokens='
+                f'{max_new_tokens} needs {required_slots} KV slots, but '
+                f'max_seq={self.max_seq}')
+        logits = self.prefill_graph() if use_graph else self.prefill()
 
         if not use_graph:
             tok = int(logits[0].float().argmax())
