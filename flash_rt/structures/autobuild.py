@@ -440,10 +440,17 @@ def auto_swaps(
     # ---- the scheme turns statistics into decisions. Keep-host is a
     # first-class outcome recorded in the receipt, not a refusal: the
     # seam is healthy, the scheme chose host precision for it. ----
+    class _SeamStats(dict):
+        def __init__(self, *args, structure: str, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.structure = structure
+
+    seam_by_key = {_seam_key(seam): seam for seam in seams}
     scheme_report = {
-        path: {f"{pt.path}|{pt.name}": collector.amax(pt.path, pt.name)
-               for pt in pts}
-        for path, pts in seam_points.items()}
+        path: _SeamStats(
+            {f"{pt.path}|{pt.name}": collector.amax(pt.path, pt.name)
+             for pt in pts}, structure=seam_by_key[path].structure)
+        for path, pts in seam_points.items() if path in seam_by_key}
     decision = scheme_obj.decide(scheme_report)
     scheme_note: dict[str, Any] = {
         "name": getattr(scheme_obj, "name", type(scheme_obj).__name__)}
@@ -913,7 +920,8 @@ def _bind_auto(model, seam, cap, plan, act_scales, negotiate_fp8,
         return custom(model, seam, cap, points=points, fmt=fmt,
                       fmt_params=fmt_params)
 
-    if fmt and seam.structure != "decoder_ffn":
+    if fmt and not (seam.structure == "qkv_pack" and fmt == "bf16_pack") \
+            and seam.structure != "decoder_ffn":
         raise ValueError(f"scheme routed {seam.structure} to format "
                          f"{fmt!r}, which has no impl variant here")
 
@@ -978,6 +986,21 @@ def _bind_auto(model, seam, cap, plan, act_scales, negotiate_fp8,
             original=_resolve(model, seam.path))
 
     if seam.structure == "qkv_pack":
+        if fmt == "bf16_pack":
+            if seam.variant.get("bind") == "module":
+                raise ValueError(
+                    "qkv_pack bf16_pack v1 supports leaf binding only")
+            first = (seam.pack_attrs or ("q_proj",))[0]
+            rows_seen = points.row_profile(
+                seam.path + "." + first, "x")
+            if not rows_seen:
+                return None
+            from .impls.qkv_pack import bf16 as pack_impl
+            block = _resolve(model, seam.path)
+            mods = [getattr(block, attr) for attr in seam.pack_attrs]
+            parts = pack_impl.bind_qkv_pack(mods, rows=max(rows_seen))
+            return {seam.path + "." + attr: mod
+                    for attr, mod in zip(seam.pack_attrs, parts)}
         from .impls.qkv_pack import bind_attn_block, bind_qkv_pack
         first = (seam.pack_attrs or ("q_proj",))[0]
         amax = None if points is None else points.amax(

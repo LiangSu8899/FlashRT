@@ -289,6 +289,7 @@ registered quantisation scheme (§6) selected by name:
 |---|---|
 | `"auto"` (default) | resolves to the fastest profile this device can execute: `fp8_static` on FP8-capable hardware (bit-identical to the pre-profile default), `"none"` elsewhere. The resolution table is one function, so a profile that measures faster is promoted by editing one line |
 | `"fp8_static"` | static per-tensor FP8, the shipped behaviour; `"fp8_static_keep_outliers"` keeps outlier seams at host precision by the house scale-ceiling criterion |
+| `"bf16_structural"` | no quantisation; binds only numerically conservative structural forms (currently shared-input QKV packing) and keeps dense FFNs/projections at host precision |
 | `"w8a16_decode"` / `"w4a16_decode"` | weight-only INT8 / NVFP4 on `decoder_ffn`, decode band only, everything else at host precision |
 | `"none"` | quantisation off. An explicit choice, not a degraded mode: fusion structures never consult a scheme decision and attach as usual, so a BF16/FP16 host under `"none"` still gets every fusion structure |
 

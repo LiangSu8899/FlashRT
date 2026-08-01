@@ -3,6 +3,7 @@ from torch import nn
 
 from flash_rt.structures.autobuild import auto_swaps, _layer_of, _seam_key
 from flash_rt.structures.discover import discover, seam_weights
+from flash_rt.structures.swap import attach
 
 
 class _GatedMlp(nn.Module):
@@ -215,6 +216,32 @@ def test_qkv_pack_qualification_uses_observed_dataflow_not_equal_dimensions():
                    for _, reason in self_refusals)
     assert any("sibling projections did not consume" in reason
                for _, reason in cross_refusals)
+
+
+def test_bf16_structural_pack_preserves_self_attention_and_refuses_cross():
+    torch.manual_seed(7)
+    host = nn.ModuleDict({"attention": _ProjectionNamedAttention()}).eval()
+    x = torch.randn(1, 3, 512)
+    context = torch.randn(1, 5, 512)
+    expected = host.attention(x)
+
+    plan = auto_swaps(
+        host, lambda: host.attention(x), structures=("qkv_pack",),
+        scheme="bf16_structural")
+    handle = attach(host, plan.swaps, on_guard_fail="raise")
+    got = host.attention(x)
+    handle.raise_on_fallback()
+    handle.detach()
+
+    torch.testing.assert_close(got, expected, rtol=1e-5, atol=1e-5)
+    assert len(plan.swaps) == 3
+
+    cross = auto_swaps(
+        host, lambda: host.attention(x, context), structures=("qkv_pack",),
+        scheme="bf16_structural")
+    assert not cross.swaps
+    assert any("same tensor in fixed order" in reason
+               for _, reason in cross.notes.get("refused", []))
 
 
 def test_vision_ffn_refuses_rms_like_one_sided_affine_norm():

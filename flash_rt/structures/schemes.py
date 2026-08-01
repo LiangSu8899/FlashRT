@@ -38,7 +38,8 @@ from dataclasses import dataclass, field
 from typing import Mapping, Sequence
 
 __all__ = ["PointStat", "Decision", "QuantScheme", "Fp8Static",
-           "NoQuant", "W8A16Decode", "W4A16Decode", "Nvfp4Awq",
+           "NoQuant", "Bf16Structural", "W8A16Decode", "W4A16Decode",
+           "Nvfp4Awq",
            "register", "get", "names", "resolve_auto", "validate_request"]
 
 #: statistics the collector can currently execute. Granularities other
@@ -270,6 +271,27 @@ class NoQuant(QuantScheme):
                                  for p in keep})
 
 
+class Bf16Structural(QuantScheme):
+    """No quantisation; retain only BF16 structural fusions."""
+
+    name = "bf16_structural"
+
+    def statistics(self, points: Sequence) -> dict[str, PointStat]:
+        return {f"{p.path}|{p.name}": PointStat(None) for p in points}
+
+    def decide(self, report: Mapping[str, Mapping[str, float]]) -> Decision:
+        formats, keep, reasons = {}, [], {}
+        for seam_path, pts in report.items():
+            structure = getattr(pts, "structure", None)
+            if structure == "qkv_pack":
+                formats[seam_path] = "bf16_pack"
+            elif structure in ("decoder_ffn", "vision_ffn", "linear_proj"):
+                keep.append(seam_path)
+                reasons[seam_path] = "bf16_structural introduces no quantisation"
+        return Decision(keep_host=tuple(keep), reasons=reasons,
+                        formats=formats)
+
+
 _REGISTRY: dict[str, QuantScheme] = {}
 
 
@@ -333,4 +355,5 @@ register("fp8_static_keep_outliers", Fp8Static(keep_outliers=20.0))
 register("w8a16_decode", W8A16Decode())
 register("w4a16_decode", W4A16Decode())
 register("none", NoQuant())
+register("bf16_structural", Bf16Structural())
 register("nvfp4_awq", Nvfp4Awq())

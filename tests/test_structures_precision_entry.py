@@ -12,7 +12,7 @@ contract surface that is checkable without a GPU.
 import pytest
 
 from flash_rt.structures import schemes
-from flash_rt.structures.schemes import (Decision, NoQuant, PointStat,
+from flash_rt.structures.schemes import (Bf16Structural, Decision, NoQuant, PointStat,
                                          W4A16Decode, W8A16Decode,
                                          resolve_auto, validate_request)
 
@@ -24,8 +24,25 @@ class _Pt:
 
 def test_new_profiles_are_registered():
     assert isinstance(schemes.get("none"), NoQuant)
+    assert isinstance(schemes.get("bf16_structural"), Bf16Structural)
     assert isinstance(schemes.get("w4a16_decode"), W4A16Decode)
-    assert {"none", "w4a16_decode"} <= set(schemes.names())
+    assert {"none", "bf16_structural", "w4a16_decode"} <= set(schemes.names())
+
+
+def test_bf16_structural_routes_only_qkv_pack():
+    class Stats(dict):
+        def __init__(self, structure, values):
+            super().__init__(values)
+            self.structure = structure
+
+    report = {
+        "block.attn.q": Stats("qkv_pack", {"block.attn.q|x": None}),
+        "block.attn.o": Stats("linear_proj", {"block.attn.o|x": None}),
+        "block.norm": Stats("norm_fused", {"block.norm|x": None}),
+    }
+    decision = Bf16Structural().decide(report)
+    assert decision.formats == {"block.attn.q": "bf16_pack"}
+    assert decision.keep_host == ("block.attn.o",)
 
 
 def test_auto_resolves_by_fp8_capability(monkeypatch):
