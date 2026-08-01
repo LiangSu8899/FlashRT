@@ -113,15 +113,27 @@ __device__ __forceinline__ void stage_word(
 // and the 8 the format does.
 constexpr float kFoldedOffset = 136.0f;
 
+// One group, for the form that has a single activation row. Nothing is
+// hoisted here: with one row the conversion happens once either way, and
+// staging it into registers first only costs the registers -- measured as a
+// fifth off the prompt pass, which is where this form is used.
 template <int G>
 __device__ __forceinline__ float group_dot(
     const uint32_t* __restrict__ words,
     const __nv_bfloat16* __restrict__ activation, float activation_sum) {
+  const __nv_bfloat162* pairs =
+      reinterpret_cast<const __nv_bfloat162*>(activation);
   float dot = 0.0f;
 #pragma unroll
   for (int w = 0; w < G / kValuesPerWord; ++w) {
+    const __nv_bfloat162* group = pairs + w * 4;
     float staged[kValuesPerWord];
-    stage_word(activation, w, staged);
+#pragma unroll
+    for (int p = 0; p < 4; ++p) {
+      const float2 value = __bfloat1622float2(group[p]);
+      staged[2 * p] = value.x;
+      staged[2 * p + 1] = value.y;
+    }
     dot += word_dot(words[w], staged);
   }
   return dot - kFoldedOffset * activation_sum;
@@ -281,147 +293,56 @@ __global__ void packed_matvec_kernel(
   }
 }
 
-// The batched form.
-//
-// A weight is read once per activation row when a block owns one row, which is
-// what this used to do: a prompt of two hundred and fifty-six positions then
-// cost two hundred and fifty-six reads of the model, and time to the first
-// token was linear in the prompt with the slope of a decode step. Batching
-// bought nothing.
-//
-// So a block owns a tile of activation rows and the contraction is walked in
-// chunks: the chunk of every row in the tile is staged in shared memory, and
-// the weight for that chunk is read once and used against all of them. The
-// weight is then read once per tile rather than once per row, and the decode
-// -- which is a fifth of the kernel's time, measured by removing it -- is paid
-// once per tile as well.
-//
-// The chunk is thirty-two groups so that every lane of a warp has a group to
-// take, and the tile is as many rows as that leaves shared memory for.
-template <int TM, int G>
+// The batched form. One block per (row tile, activation row): the weight read
+// dominates and blockIdx.y walks the activations.
+template <int G>
 __global__ void packed_gemm_kernel(
     const __nv_bfloat16* __restrict__ x,
     const uint32_t* __restrict__ packed,
     const __nv_bfloat16* __restrict__ scale,
     __nv_bfloat16* __restrict__ out,
     int M, int N, int K) {
+  extern __shared__ __nv_bfloat16 x_sh[];
+  constexpr int kStride = G + kPad;
   constexpr int kWords = G / kValuesPerWord;
-  constexpr int kChunkGroups = 32;            // one group per lane
-  constexpr int kStride = G + 1;              // odd, so lanes miss each other
   const int groups = K / G;
+  const int row_of_x = blockIdx.y;
+  // The folded offsets need one sum per group, computed here and read by
+  // every row -- the whole point of folding them out of the row loop.
+  float* group_sum = reinterpret_cast<float*>(x_sh + groups * kStride);
 
-  // Staged as float, not bfloat16. In the single-row form the conversion is
-  // paid once and bfloat16 halves the shared memory; here every row of the
-  // tile contracts against the same values, so bfloat16 would pay the
-  // conversion once per row -- sixteen times the decode it was hoisted to
-  // save. Measured that way round it was twice as slow.
-  extern __shared__ float tile_sh[];             // TM * kChunkGroups * kStride
-  float* group_sum =                          // TM * kChunkGroups
-      tile_sh + TM * kChunkGroups * kStride;
+  for (int index = threadIdx.x; index < K; index += kThreads) {
+    x_sh[(index / G) * kStride + staged_slot(index % G)] = x[static_cast<size_t>(row_of_x) * K + index];
+  }
+  __syncthreads();
+  for (int g = threadIdx.x; g < groups; g += kThreads) {
+    float total = 0.0f;
+    const __nv_bfloat16* values = x_sh + g * kStride;
+#pragma unroll 8
+    for (int i = 0; i < G; ++i) total += __bfloat162float(values[i]);
+    group_sum[g] = total;
+  }
+  __syncthreads();
 
   const int lane = threadIdx.x & 31;
-  const int warp = threadIdx.x >> 5;
-  const int base_row = blockIdx.y * TM;
-  const int rows_here = min(TM, M - base_row);
-  const int row = blockIdx.x * kWarps + warp;
-
-  float acc[TM];
-#pragma unroll
-  for (int m = 0; m < TM; ++m) acc[m] = 0.0f;
-
-  for (int first = 0; first < groups; first += kChunkGroups) {
-    const int here = min(kChunkGroups, groups - first);
-
-    // Stage this chunk of every row in the tile. Read in order, written to
-    // the slots the decode will want them in.
-    // Every row of the tile is staged, the last one repeated where the tile
-    // runs past the end. The loops that consume it are then bounded at
-    // compile time -- with a runtime bound the accumulators are indexed by a
-    // variable and land in local memory, and every multiply-add becomes a
-    // load and a store. Measured that way the batched form was slower than
-    // doing the rows one at a time.
-    for (int index = threadIdx.x; index < TM * here * G; index += kThreads) {
-      const int within = index % G;
-      const int group = (index / G) % here;
-      const int m = index / (G * here);
-      const int source = min(base_row + m, M - 1);
-      tile_sh[(m * kChunkGroups + group) * kStride + within] =
-          __bfloat162float(
-              x[(static_cast<size_t>(source) * K) + (first + group) * G
-                + within]);
-    }
-    __syncthreads();
-    for (int index = threadIdx.x; index < TM * here; index += kThreads) {
-      const int group = index % here;
-      const int m = index / here;
-      const float* values = tile_sh + (m * kChunkGroups + group) * kStride;
-      float total = 0.0f;
-#pragma unroll 8
-      for (int i = 0; i < G; ++i) total += values[i];
-      group_sum[m * kChunkGroups + group] = total;
-    }
-    __syncthreads();
-
-    if (row < N && lane < here) {
-      const int group = first + lane;
-      uint32_t words[kWords];
-#pragma unroll
-      for (int w = 0; w < kWords; ++w) {
-        words[w] = packed[(static_cast<size_t>(row) * groups + group) * kWords
-                          + w];
-      }
-      const float step = __bfloat162float(
-          scale[static_cast<size_t>(row) * groups + group]);
-      // One decode of the weight, every row of the tile against it.
-      float partial[TM];
-#pragma unroll
-      for (int m = 0; m < TM; ++m) partial[m] = 0.0f;
-#pragma unroll
-      for (int w = 0; w < kWords; ++w) {
-        float decoded[kValuesPerWord];
-        decode_word(words[w], decoded);
-#pragma unroll
-        for (int m = 0; m < TM; ++m) {
-          const float* staged =
-              tile_sh + (m * kChunkGroups + lane) * kStride + w * kValuesPerWord;
-          // Summed within the word and then added, which is the association
-          // the single-row form uses. A prompt and the tokens after it go
-          // through different kernels, and it is worth their agreeing to the
-          // bit rather than to a tolerance.
-          float dot = 0.0f;
-#pragma unroll
-          for (int i = 0; i < 4; ++i) {
-            dot = fmaf(decoded[2 * i], staged[i], dot);
-            dot = fmaf(decoded[2 * i + 1], staged[i + 4], dot);
-          }
-          partial[m] += dot;
-        }
-      }
-#pragma unroll
-      for (int m = 0; m < TM; ++m) {
-        acc[m] = fmaf(
-            partial[m] - kFoldedOffset * group_sum[m * kChunkGroups + lane],
-            step, acc[m]);
-      }
-    }
-    __syncthreads();
-  }
-
+  const int row = blockIdx.x * kWarps + (threadIdx.x >> 5);
   if (row >= N) return;
-#pragma unroll
-  for (int m = 0; m < TM; ++m) {
-#pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-      acc[m] += __shfl_xor_sync(0xffffffffu, acc[m], offset);
-    }
+
+  float acc = 0.0f;
+  for (int group = lane; group < groups; group += 32) {
+    acc = fmaf(
+        group_dot<G>(
+            packed + (static_cast<size_t>(row) * groups + group) * kWords,
+            x_sh + group * kStride, group_sum[group]),
+        __bfloat162float(scale[static_cast<size_t>(row) * groups + group]),
+        acc);
   }
-  if (lane) return;
 #pragma unroll
-  for (int m = 0; m < TM; ++m) {
-    if (m < rows_here) {
-      out[static_cast<size_t>(base_row + m) * N + row] =
-          __float2bfloat16_rn(acc[m]);
-    }
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    acc += __shfl_xor_sync(0xffffffffu, acc, offset);
+  }
+  if (lane == 0) {
+    out[static_cast<size_t>(row_of_x) * N + row] = __float2bfloat16_rn(acc);
   }
 }
 
@@ -541,47 +462,33 @@ int w4a16_packed_gemm_bf16(
   const int bad = validate(x, packed, scale, out, N, K, group);
   if (bad) return bad;
   if (M <= 0) return 5;
+  if (M > 65535) return 6;
   if (M == 1) {
     return w4a16_packed_matvec_bf16(x, packed, scale, out, N, K, group,
                                     stream);
   }
 
-  // As many activation rows per block as shared memory holds a chunk of.
-  constexpr int kChunkGroups = 32;
-  const size_t per_row =
-      static_cast<size_t>(kChunkGroups) * (group + 1) * sizeof(float)
-      + static_cast<size_t>(kChunkGroups) * sizeof(float);
-  const size_t budget = 40u << 10;
-  int tile = 16;
-  while (tile > 1 && per_row * tile > budget) tile >>= 1;
-
+  const dim3 grid((N + kWarps - 1) / kWarps, M);
   const auto* x_ptr = reinterpret_cast<const __nv_bfloat16*>(x);
   const auto* packed_ptr = reinterpret_cast<const uint32_t*>(packed);
   const auto* scale_ptr = reinterpret_cast<const __nv_bfloat16*>(scale);
   auto* out_ptr = reinterpret_cast<__nv_bfloat16*>(out);
-
-#define FLASHRT_GEMM_DISPATCH(TILE, GROUP)                                    \
-  packed_gemm_kernel<TILE, GROUP>                                             \
-      <<<dim3((N + kWarps - 1) / kWarps, (M + (TILE)-1) / (TILE)), kThreads,  \
-         per_row * (TILE), stream>>>(x_ptr, packed_ptr, scale_ptr, out_ptr,   \
-                                     M, N, K)
-
-#define FLASHRT_GEMM_TILE(GROUP)                                              \
-  switch (tile) {                                                             \
-    case 1: FLASHRT_GEMM_DISPATCH(1, GROUP); break;                           \
-    case 2: FLASHRT_GEMM_DISPATCH(2, GROUP); break;                           \
-    case 4: FLASHRT_GEMM_DISPATCH(4, GROUP); break;                           \
-    case 8: FLASHRT_GEMM_DISPATCH(8, GROUP); break;                           \
-    default: FLASHRT_GEMM_DISPATCH(16, GROUP); break;                         \
-  }
+  const size_t shared = shared_bytes(K, group);
 
   switch (group) {
-    case 32: FLASHRT_GEMM_TILE(32); break;
-    case 64: FLASHRT_GEMM_TILE(64); break;
-    default: FLASHRT_GEMM_TILE(128); break;
+    case 32:
+      packed_gemm_kernel<32><<<grid, kThreads, shared, stream>>>(
+          x_ptr, packed_ptr, scale_ptr, out_ptr, M, N, K);
+      break;
+    case 64:
+      packed_gemm_kernel<64><<<grid, kThreads, shared, stream>>>(
+          x_ptr, packed_ptr, scale_ptr, out_ptr, M, N, K);
+      break;
+    default:
+      packed_gemm_kernel<128><<<grid, kThreads, shared, stream>>>(
+          x_ptr, packed_ptr, scale_ptr, out_ptr, M, N, K);
+      break;
   }
-#undef FLASHRT_GEMM_TILE
-#undef FLASHRT_GEMM_DISPATCH
   return 0;
 }
 
