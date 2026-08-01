@@ -138,6 +138,58 @@ down the distribution the true continuation of a passage sits. A model that is
 subtly wrong still emits fluent tokens and every timing still looks right, so
 this is the measurement that does not.
 
+### Before measuring anything on an embedded part
+
+Check what power mode it is in. A Jetson defaults to a mode well below its
+capability, and every number taken in it is a number about the mode:
+
+```
+sudo nvpmodel -q            # which mode
+sudo nvpmodel -m <max>      # MAXN, or MAXN_SUPER where it exists
+sudo jetson_clocks          # hold the clocks there
+```
+
+Measured on an eight-multiprocessor Orin: a device-to-device copy went from
+51.2 to 85.9 GB/s and the projections a token issues from 39.9 to 35.1 ms,
+with the part 3 degrees warmer. It also changes what the limit *is* -- in the
+lower mode the projections ran at 105% of the copy bandwidth and were bound by
+memory, in the higher one at 72% and were bound by everything else. A kernel
+tuned in the wrong mode is tuned for the wrong problem.
+
+### What the tile size is really keyed on
+
+Every block stages the whole activation before it reads any weight, so that
+work is proportional to the number of blocks -- which is inversely
+proportional to the rows a warp takes. Which of those dominates depends on the
+part and not on the shape:
+
+* On eight multiprocessors, the widest contraction went from 47 to 72 GB/s
+  between one row per warp and eight, its activation being staged by forty
+  blocks instead of three hundred and twenty.
+* On a hundred and seventy, one row measured fastest for most shapes: eight
+  leaves too few blocks to fill the part.
+
+`benchmarks/w4a16_packed_sweep.py` measures it; `FLASHRT_W4A16_ROWS` overrides
+it without a rebuild.
+
+### An integer dot product does not pay here
+
+The bfloat16 path spends about seven arithmetic instructions per byte of
+weight. Quantizing the activation to int8 lets a word of weight become two
+`dp4a` instructions -- five per four bytes rather than twenty-eight -- and on
+a part whose arithmetic pipeline is the limit that should be most of the gap.
+
+Measured on the eight-multiprocessor part in its full power mode, it is
+slower: 38.2 ms against 31.0 for the projections, at every tile size tried,
+and worst on the longest contraction. The saving in the inner loop is smaller
+than the cost of the staging it needs -- a maximum over each group, a rounding
+and a repacking, where the bfloat16 path only copies. The arithmetic was the
+limit in the *lower* power mode; in the higher one it is not, and the change
+that follows from the first measurement is the wrong change for the second.
+
+Relative error against the bfloat16 path was 0.005 across the shapes, so this
+is a statement about speed and not about accuracy.
+
 ### The ceiling
 
 A token reads 2528 MiB with the tied table in INT8, and cannot read much less:
