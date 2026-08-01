@@ -98,6 +98,25 @@ handled at load and the fourth is refused:
   before. That width is checked at load and a checkpoint with another one is
   refused.
 
+## The tied table
+
+At a 248k vocabulary the embedding table is 1.2 GiB of bfloat16 and, being
+tied, it is read twice per token -- once as a lookup and once as the output
+projection. It is 39% of everything a token reads, more than the whole
+gated-delta stack, and unlike the backbone it arrives unquantized.
+
+`quantize_tied_table=True` (or `--int8-head`) stores it as per-row INT8 with
+one scale per row. Both readings quantize together, because one tensor read
+two ways with a scale applied to only one direction embeds plausibly and
+predicts badly.
+
+Measured on a 4B checkpoint: 3.061 -> 2.469 GiB resident, and a decode step
+from 4.49 to 3.74 ms on an RTX 5090 -- a 20% saving against a 19% reduction in
+bytes, which is what a step limited by its weight read should give. It is
+opt-in because it is not free: over a passage of ordinary text the greedy
+token agreed with the bfloat16 table at 43 of 44 positions, and the mean rank
+of the true continuation moved from 334 to 337.
+
 ## Where the time goes
 
 At batch one the weight read is the whole cost and the fraction of bandwidth

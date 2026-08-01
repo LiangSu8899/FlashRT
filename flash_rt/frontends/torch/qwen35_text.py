@@ -85,8 +85,8 @@ class TextRuntime:
 
     @classmethod
     def from_checkpoint(cls, path: str, device: str = "cuda:0",
-                        max_seq: int = 4096, max_chunk: int = 64
-                        ) -> "TextRuntime":
+                        max_seq: int = 4096, max_chunk: int = 64,
+                        quantize_tied_table: bool = False) -> "TextRuntime":
         from flash_rt import flash_rt_kernels as fvk
 
         for name in ("w4a16_packed_matvec_bf16",
@@ -110,7 +110,9 @@ class TextRuntime:
                 f"{RECURRENCE_HEAD_DIM}, and this checkpoint uses "
                 f"{dims.lin_key_head_dim} for keys and "
                 f"{dims.lin_value_head_dim} for values")
-        weights = load_text_weights(path, contract, device=device)
+        weights = load_text_weights(
+            path, contract, device=device,
+            quantize_tied_table=quantize_tied_table)
         work = decode.Workspace(weights, device=device, max_chunk=max_chunk,
                                 max_seq=max_seq)
         return cls(weights, work, fvk)

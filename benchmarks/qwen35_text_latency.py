@@ -50,6 +50,8 @@ def main() -> None:
     parser.add_argument("--max-chunk", type=int, default=64)
     parser.add_argument("--no-graph", action="store_true",
                         help="do not capture the decode step")
+    parser.add_argument("--int8-head", action="store_true",
+                        help="quantize the tied embedding and output table")
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--output")
     args = parser.parse_args()
@@ -57,7 +59,7 @@ def main() -> None:
     started = time.perf_counter()
     runtime = TextRuntime.from_checkpoint(
         args.checkpoint, device=args.device, max_seq=args.max_seq,
-        max_chunk=args.max_chunk)
+        max_chunk=args.max_chunk, quantize_tied_table=args.int8_head)
     load_seconds = time.perf_counter() - started
 
     footprint = runtime.footprint()
@@ -97,6 +99,7 @@ def main() -> None:
         with open(args.output, "w", encoding="utf-8") as f:
             json.dump({"device": torch.cuda.get_device_name(args.device),
                        "graph": not args.no_graph,
+                       "int8_head": args.int8_head,
                        "footprint": footprint,
                        "rows": results}, f, indent=2)
             f.write("\n")

@@ -223,3 +223,36 @@ def test_the_decay_constant_is_exponentiated_once_at_load(tmp_path):
         # the synthetic checkpoint stores A_log = 0, so -exp(0) = -1
         assert torch.all(decay == -1.0)
         assert by_address[entry["dt_bias"]].dtype is torch.float32
+
+
+def test_the_tied_table_quantizes_for_both_readings_or_neither(tmp_path):
+    # The table is the embedding and the output projection, and at a large
+    # vocabulary it is the largest single read a token makes. Quantizing one
+    # reading and not the other would embed plausibly and predict badly, so
+    # the two addresses and their scale come from one placement.
+    _write_checkpoint(tmp_path)
+    contract = validate_checkpoint(str(tmp_path))
+
+    plain = load_text_weights(str(tmp_path), contract, device=DEVICE)
+    assert plain.top["lm_head"] == plain.top["embed"]
+    assert "embed_scale" not in plain.top
+
+    quantized = load_text_weights(str(tmp_path), contract, device=DEVICE,
+                                  quantize_tied_table=True)
+    assert quantized.top["lm_head"] == quantized.top["embed"]
+    assert quantized.top["lm_head_scale"] == quantized.top["embed_scale"]
+    assert quantized.resident_bytes < plain.resident_bytes
+
+
+def test_quantizing_the_table_halves_what_a_token_reads_of_it(tmp_path):
+    _write_checkpoint(tmp_path)
+    contract = validate_checkpoint(str(tmp_path))
+    dims = contract["dims"]
+
+    plain = load_text_weights(str(tmp_path), contract, device=DEVICE)
+    quantized = load_text_weights(str(tmp_path), contract, device=DEVICE,
+                                  quantize_tied_table=True)
+    # one byte per value and one scale per row, against two bytes per value
+    saved = plain.resident_bytes - quantized.resident_bytes
+    expected = dims.vocab_size * dims.hidden - dims.vocab_size * 2
+    assert saved == expected

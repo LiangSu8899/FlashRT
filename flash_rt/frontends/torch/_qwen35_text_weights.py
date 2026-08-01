@@ -119,6 +119,48 @@ def _place_norm(weights: TextWeights, tensor: torch.Tensor,
     return _place(weights, tensor.float() + 1.0, device, torch.bfloat16)
 
 
+def _rowwise_int8(table: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Symmetric INT8 with the scale a property of the row.
+
+    Done a slice at a time so the float32 the rounding needs is one slice
+    rather than the whole table -- at a 248k vocabulary the table is the
+    largest tensor in the checkpoint and materializing it twice is most of
+    what a small part has.
+    """
+    rows = table.shape[0]
+    values = torch.empty_like(table, dtype=torch.int8)
+    scale = torch.empty(rows, dtype=torch.float16)
+    for start in range(0, rows, 8192):
+        stop = min(start + 8192, rows)
+        chunk = table[start:stop].float()
+        step = chunk.abs().amax(dim=1).clamp_min(1e-8) / 127.0
+        values[start:stop] = (chunk / step[:, None]).round().clamp(
+            -127, 127).to(torch.int8)
+        scale[start:stop] = step.to(torch.float16)
+    return values, scale
+
+
+def _place_tied_table(weights: TextWeights, table: torch.Tensor, device: str,
+                      quantized: bool) -> None:
+    """The embedding table, which is also the output projection.
+
+    Tied, so it is read twice per token in different directions, and at this
+    vocabulary it is the largest single read a step makes -- more than the
+    whole gated-delta stack. Halving it is worth more than anything left in
+    the backbone, and it is one tensor, so both readings quantize together or
+    neither does.
+    """
+    if not quantized:
+        weights.top["embed"] = _place(weights, table, device, torch.bfloat16)
+        weights.top["lm_head"] = weights.top["embed"]
+        return
+    values, scale = _rowwise_int8(table)
+    weights.top["embed"] = _place(weights, values, device)
+    weights.top["embed_scale"] = _place(weights, scale, device)
+    weights.top["lm_head"] = weights.top["embed"]
+    weights.top["lm_head_scale"] = weights.top["embed_scale"]
+
+
 def _load_compressed(weights: TextWeights, reader: _Reader, site: str,
                      into: dict[str, int], prefix: str, shape: tuple[int, int],
                      device: str) -> None:
@@ -227,7 +269,8 @@ def _load_fused_plain(weights: TextWeights, reader: _Reader,
 
 
 def load_text_weights(path: str, contract: dict[str, Any],
-                      device: str = "cuda:0") -> TextWeights:
+                      device: str = "cuda:0",
+                      quantize_tied_table: bool = False) -> TextWeights:
     """Load the text backbone, packed weights kept packed.
 
     ``contract`` is what ``validate_checkpoint`` returned, so the geometry has
@@ -239,8 +282,9 @@ def load_text_weights(path: str, contract: dict[str, Any],
     sites = compressed_sites(dims)
 
     embed_name = "model.language_model.embed_tokens.weight"
-    weights.top["embed"] = _place(
-        weights, reader.get(embed_name), device, torch.bfloat16)
+    tied = bool(dims.tie_word_embeddings)
+    _place_tied_table(weights, reader.get(embed_name), device,
+                      quantized=tied and quantize_tied_table)
     weights.top["final_norm"] = _place_norm(
         weights, reader.get("model.language_model.norm.weight"), device)
     weights.top["vocab_size"] = dims.vocab_size
@@ -248,9 +292,9 @@ def load_text_weights(path: str, contract: dict[str, Any],
 
     # Tied embeddings mean the output projection is the embedding table read
     # the other way; there is no second copy to load and none to allocate.
-    weights.top["lm_head_tied"] = int(dims.tie_word_embeddings)
-    if dims.tie_word_embeddings:
-        weights.top["lm_head"] = weights.top["embed"]
+    weights.top["lm_head_tied"] = int(tied)
+    if tied:
+        pass                              # both readings placed together
     elif reader.has("lm_head" + PACKED_SUFFIX):
         _load_compressed(weights, reader, "lm_head", weights.top, "lm_head",
                          (dims.vocab_size, dims.hidden), device)

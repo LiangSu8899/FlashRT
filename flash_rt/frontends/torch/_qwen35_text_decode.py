@@ -468,9 +468,19 @@ def forward(weights: TextWeights, work: Workspace, fvk, rows: int,
     eps = dims.rms_norm_eps
     hidden = dims.hidden
 
-    fvk.embedding_lookup_bf16(
-        work.token.address, weights.top["embed"], work.residual.address,
-        rows, hidden, stream)
+    # One table, two readings. If it was quantized it was quantized for both,
+    # so the lookup decodes the same rows the output projection contracts
+    # against -- a scale that applied to one and not the other would embed
+    # plausibly and predict badly.
+    if weights.top.get("embed_scale"):
+        _check(fvk.int8_rowwise_gather_bf16(
+            work.token.address, weights.top["embed"],
+            weights.top["embed_scale"], work.residual.address, rows,
+            dims.vocab_size, hidden, stream), "embedding")
+    else:
+        fvk.embedding_lookup_bf16(
+            work.token.address, weights.top["embed"], work.residual.address,
+            rows, hidden, stream)
     fvk.rms_norm(work.residual.address, weights.layers[0]["input_norm"],
                  work.normed.address, rows, hidden, eps, stream)
 
