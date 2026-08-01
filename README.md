@@ -525,9 +525,11 @@ production frontend when `use_fp16=False`; `rtx_sm89` is registered
 directly to its dedicated FP8 frontend. `use_fp16=True, use_fp8=False`
 selects the explicit RTX reference frontend for the selected hardware. It
 uses the N1.7 `set_prompt(aux=...)` / normalized-state `infer(...)`
-contract. On the RTX FP8 path, passing fresh `aux` to `infer()` replays the
-captured backbone graph before the existing action graph, covering the complete
-backbone-to-action execution without rebuilding per-call scratch buffers. See
+contract. On the RTX FP8 path, the first `infer(aux=...)` lazily captures the
+backbone graph; later compatible calls replay it before the existing action
+graph, covering the complete backbone-to-action execution without rebuilding
+per-call scratch buffers. Omitting `aux` keeps the original eager backbone from
+`set_prompt()` and does not capture the optional graph. See
 [USAGE.md](USAGE.md#groot-n17-rtx).
 
 ### Autotune

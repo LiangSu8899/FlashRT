@@ -147,14 +147,13 @@ class _GrootN17FP8BackboneMixin:
         self._num_vit_views = len(grid_thw)
         self._S_vit = sum(int(t * h * w) for t, h, w in grid_thw)
         self._visual_pos_masks = aux["visual_pos_masks"][0].to(device)
+        self._backbone_graph_contract = self._snapshot_backbone_graph_contract(aux)
 
         # ── Activation scales: warm cache load (no torch) or one-time shadow ──
         self._ensure_act_scales(aux)
 
         # ── FP8 KERNEL backbone (no torch matmul on the feature path) ──
-        self._run_kernel_backbone_fp8(aux)
-        self._capture_backbone_graph()
-        self._backbone_features = self.run_backbone_graph(aux).clone().half()
+        self._backbone_features = self._run_kernel_backbone_fp8(aux).half()
 
         try:
             self._warmup_infer()
@@ -173,8 +172,15 @@ class _GrootN17FP8BackboneMixin:
         num_timestep_buckets: int = 1000,
         use_dit_graph: bool = True,
     ) -> torch.Tensor:
-        """Run the backbone graph for fresh inputs, then the action graph."""
+        """Run the backbone graph for fresh inputs, then the action graph.
+
+        Omitting ``aux`` preserves the original set-prompt backbone path and
+        does not capture or replay the optional backbone CUDA Graph.
+        """
         if aux is not None:
+            self._validate_backbone_graph_contract(aux)
+            if not hasattr(self, "_kbb_graph"):
+                self._capture_backbone_graph()
             self._backbone_features = self.run_backbone_graph(aux)
         return super().infer(
             state_normalized,
@@ -184,6 +190,56 @@ class _GrootN17FP8BackboneMixin:
             num_timestep_buckets=num_timestep_buckets,
             use_dit_graph=use_dit_graph,
         )
+
+    @staticmethod
+    def _snapshot_backbone_graph_contract(aux: dict) -> dict:
+        """Record metadata baked into the fixed-shape backbone graph."""
+        required = (
+            "pixel_features", "llm_input_embeds", "grid_thw",
+            "visual_pos_masks", "rope_cos", "rope_sin",
+        )
+        missing = [name for name in required if name not in aux]
+        if missing:
+            raise ValueError(
+                "backbone aux is missing required keys: " + ", ".join(missing))
+
+        def snapshot(name):
+            value = torch.as_tensor(aux[name]).detach().cpu()
+            return value.clone()
+
+        return {
+            "pixel_features_shape": tuple(aux["pixel_features"].shape),
+            "llm_input_embeds_shape": tuple(aux["llm_input_embeds"].shape),
+            "grid_thw": snapshot("grid_thw"),
+            "visual_pos_masks": snapshot("visual_pos_masks"),
+            "rope_cos": snapshot("rope_cos"),
+            "rope_sin": snapshot("rope_sin"),
+        }
+
+    def _validate_backbone_graph_contract(self, aux: dict) -> None:
+        """Reject fresh inputs whose graph-owned metadata changed."""
+        expected = self._backbone_graph_contract
+        shape_fields = {
+            "pixel_features": expected["pixel_features_shape"],
+            "llm_input_embeds": expected["llm_input_embeds_shape"],
+        }
+        for name, shape in shape_fields.items():
+            if name not in aux:
+                raise ValueError(f"backbone aux is missing required key: {name}")
+            actual = tuple(aux[name].shape)
+            if actual != shape:
+                raise ValueError(
+                    f"backbone graph requires {name} shape {shape}, got {actual}")
+
+        for name in ("grid_thw", "visual_pos_masks", "rope_cos", "rope_sin"):
+            if name not in aux:
+                raise ValueError(f"backbone aux is missing required key: {name}")
+            actual = torch.as_tensor(aux[name]).detach().cpu()
+            reference = expected[name]
+            if actual.dtype != reference.dtype or not torch.equal(actual, reference):
+                raise ValueError(
+                    f"backbone graph requires {name} to match the set_prompt() "
+                    "metadata; construct a new frontend for a changed structure")
 
     # ── FP8 kernel backbone: ViT → DeepStack → LLM → vlln → VL-self-attn ──
     def _run_kernel_backbone_fp8(self, aux: dict) -> "torch.Tensor":
@@ -486,6 +542,7 @@ class _GrootN17FP8BackboneMixin:
 
     def run_backbone_graph(self, aux: dict) -> "torch.Tensor":
         """Replay the captured backbone graph with a fresh observation."""
+        self._validate_backbone_graph_contract(aux)
         self._kbb_vit_h.copy_(
             aux["pixel_features"].to(self.device).half().reshape(
                 self._S_vit, 1024))
