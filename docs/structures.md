@@ -277,6 +277,17 @@ stateless boundary. Qualification is capability-based, so Qwen3 and Qwen3-VL
 hosts share the same structure implementation while retaining their own
 attention dispatch function and cache object.
 
+Factored two-way attention uses the same region without introducing a
+model-labelled form.  A compatible host exposes two complete sibling-QKV
+groups over causal and full-only sequence packs, one pair of 128-wide
+per-head Q/K RMSNorm weights for each group, and one shared factored
+attention dispatcher.  The adapter requires both groups and composes two
+`qk_norm_rope` entries with the existing factored `attention_core`; an
+incomplete pair, context-parallel layout, neighborhood-attention metadata,
+or mutating KV-cache call is refused.  The output projections remain dynamic
+module calls so independently qualified `linear_proj` swaps still compose
+with this region.
+
 Packed vision attention without Q/K normalization uses the separate
 `qkv_rope` boundary: one already-packed projection result plus its bias and
 pre-expanded FP32 rotate-half table become attention-ready Q/K/V through one

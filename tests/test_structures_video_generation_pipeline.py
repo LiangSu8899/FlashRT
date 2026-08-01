@@ -70,6 +70,19 @@ def test_landed_qk_region_and_remaining_video_gaps_are_explicit():
     assert wan_segments["vae_decode"].classification == "host_stage"
 
 
+def test_cosmos_binding_names_the_official_host_and_factored_qk_boundary():
+    cosmos = load_binding("cosmos3_video_pipeline",
+                          require_pipeline_coverage=True)
+
+    assert cosmos.data["hosts"]["official"]["module_path"] == (
+        "diffusers_cosmos3.transformer.Cosmos3OmniTransformer"
+    )
+    qk = {segment.name: segment for segment in cosmos.segments}[
+        "qk_norm_rope"
+    ]
+    assert "factored causal/full QKV" in qk.seam
+
+
 def test_video_pipeline_source_seams_are_real():
     expected = {
         "flash_rt/models/cosmos3_video/pipeline_rtx.py": (
