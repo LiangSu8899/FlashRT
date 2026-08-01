@@ -204,8 +204,14 @@ class _GrootN17FP8BackboneMixin:
                 "backbone aux is missing required keys: " + ", ".join(missing))
 
         def snapshot(name):
-            value = torch.as_tensor(aux[name]).detach().cpu()
-            return value.clone()
+            source = torch.as_tensor(aux[name])
+            return {
+                "value": source.detach().cpu().clone(),
+                "source": source,
+                "version": getattr(source, "_version", None),
+                "validated_source": None,
+                "validated_version": None,
+            }
 
         return {
             "pixel_features_shape": tuple(aux["pixel_features"].shape),
@@ -234,12 +240,24 @@ class _GrootN17FP8BackboneMixin:
         for name in ("grid_thw", "visual_pos_masks", "rope_cos", "rope_sin"):
             if name not in aux:
                 raise ValueError(f"backbone aux is missing required key: {name}")
-            actual = torch.as_tensor(aux[name]).detach().cpu()
-            reference = expected[name]
+            source = torch.as_tensor(aux[name])
+            version = getattr(source, "_version", None)
+            entry = expected[name]
+            if ((source is entry["source"] and version == entry["version"])
+                    or (source is entry["validated_source"]
+                        and version == entry["validated_version"])):
+                continue
+            actual = source.detach().cpu()
+            reference = entry["value"]
             if actual.dtype != reference.dtype or not torch.equal(actual, reference):
                 raise ValueError(
                     f"backbone graph requires {name} to match the set_prompt() "
                     "metadata; construct a new frontend for a changed structure")
+            # Keep the most recently validated metadata tensors alive. Repeated
+            # observations normally reuse them, so identity + PyTorch's mutation
+            # version avoids a host tensor comparison on the steady-state path.
+            entry["validated_source"] = source
+            entry["validated_version"] = version
 
     # ── FP8 kernel backbone: ViT → DeepStack → LLM → vlln → VL-self-attn ──
     def _run_kernel_backbone_fp8(self, aux: dict) -> "torch.Tensor":

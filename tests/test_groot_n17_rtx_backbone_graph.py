@@ -147,6 +147,16 @@ def test_backbone_graph_contract_allows_fresh_feature_values():
     frontend._validate_backbone_graph_contract(fresh)
 
 
+def test_backbone_graph_contract_detects_in_place_metadata_mutation():
+    frontend = object.__new__(GrootN17TorchFrontendRtxFP8)
+    aux = _contract_aux()
+    frontend._backbone_graph_contract = frontend._snapshot_backbone_graph_contract(aux)
+    aux["rope_cos"].add_(1)
+
+    with pytest.raises(ValueError, match="rope_cos"):
+        frontend._validate_backbone_graph_contract(aux)
+
+
 @pytest.mark.skipif(
     os.environ.get("FLASH_RT_RUN_GROOT_N17_GRAPH_GPU_TEST") != "1",
     reason="set FLASH_RT_RUN_GROOT_N17_GRAPH_GPU_TEST=1 for the fixture GPU test",
