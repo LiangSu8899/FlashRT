@@ -9,6 +9,7 @@ from ..autobuild import (
     register_attention_adapter,
     register_gated_delta_adapter,
     register_qk_norm_rope_adapter,
+    register_qkv_rope_adapter,
 )
 from .diffusers_attention import DiffusersAttentionAdapter
 from .diffusers_rotary_attention import DiffusersRotaryAttentionAdapter
@@ -19,8 +20,10 @@ from .qwen_per_head_qk_norm_rope import (
     PerHeadGqaQkNormRopeAdapter,
     QwenPerHeadQkNormRopeAdapter,
 )
+from .packed_qkv_rope import PackedQkvRopeAdapter
 
 register_qk_norm_rope_adapter(PerHeadGqaQkNormRopeAdapter())
+register_qkv_rope_adapter(PackedQkvRopeAdapter())
 register_attention_adapter(GemmaAttentionAdapter())
 register_attention_adapter(FactoredTwoWayAttentionAdapter())
 register_attention_adapter(DiffusersRotaryAttentionAdapter())
@@ -35,4 +38,5 @@ __all__ = [
     "FactoredTwoWayAttentionAdapter",
     "PerHeadGqaQkNormRopeAdapter",
     "QwenPerHeadQkNormRopeAdapter",
+    "PackedQkvRopeAdapter",
 ]

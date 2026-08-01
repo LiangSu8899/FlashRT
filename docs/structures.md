@@ -277,6 +277,15 @@ stateless boundary. Qualification is capability-based, so Qwen3 and Qwen3-VL
 hosts share the same structure implementation while retaining their own
 attention dispatch function and cache object.
 
+Packed vision attention without Q/K normalization uses the separate
+`qkv_rope` boundary: one already-packed projection result plus its bias and
+pre-expanded FP32 rotate-half table become attention-ready Q/K/V through one
+Hub custom op. Keeping this distinct from `qk_norm_rope` prevents a vision
+tower from acquiring normalization it does not have. The capability adapter
+qualifies packed equal-head QKV, an observed fixed token capacity, an even
+head dimension no larger than 256, and the host's own attention dispatcher;
+Qwen3-VL's D=72 vision form is one consumer, not a model-special branch.
+
 Transformers-style hybrid decoders expose their Gated Delta recurrence through
 callable recurrent and chunk slots. `gated_delta_core` owns that stateful
 Q/K/V, decay, update-strength and explicit-final-state boundary; projections,

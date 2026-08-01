@@ -46,6 +46,7 @@ _FP8_CHAIN_MAX_ROWS = 256  # fp8 producer chain qualifies at denoise
 # it, returns (swaps, update) or None (this host is not its family).
 _ATTENTION_ADAPTERS: list = []
 _QK_NORM_ROPE_ADAPTERS: list = []
+_QKV_ROPE_ADAPTERS: list = []
 _GATED_DELTA_ADAPTERS: list = []
 
 
@@ -57,6 +58,11 @@ def register_attention_adapter(adapter) -> None:
 def register_qk_norm_rope_adapter(adapter) -> None:
     """Register a host-family adapter for a Q/K norm + RoPE boundary."""
     _QK_NORM_ROPE_ADAPTERS.append(adapter)
+
+
+def register_qkv_rope_adapter(adapter) -> None:
+    """Register a host-family adapter for packed QKV + bias + RoPE."""
+    _QKV_ROPE_ADAPTERS.append(adapter)
 
 
 def register_gated_delta_adapter(adapter) -> None:
@@ -178,6 +184,7 @@ def auto_swaps(
                                    "linear_proj", "norm_fused",
                                    "attention_core", "decoder_block",
                                    "modnorm_qkv_chain", "qk_norm_rope",
+                                   "qkv_rope",
                                    "gated_delta_core"),
     negotiate_fp8: bool = True,
     prefix_cadence: bool = False,
@@ -407,6 +414,20 @@ def auto_swaps(
             f"{source}, {plan_notes_calibration['points']} point(s), "
             f"{plan_notes_calibration['method']}"
             + (f" p={percentile}" if len(thunks) > 1 else "") + ")")
+
+    # Adapters bind after the precision scheme may remove host-precision
+    # seams from ``plan.seams``. Preserve only the observed row capacity in
+    # the transient cap map so a structural adapter can preallocate without
+    # retaining activations or depending on a quantized sibling being bound.
+    for seam in seams:
+        key = _seam_key(seam)
+        rows = [
+            row
+            for point in seam_points.get(key, ())
+            for row in collector.row_profile(point.path, point.name)
+        ]
+        if rows:
+            caps[key]["rows"] = max(rows)
 
     # A pack owns its sibling projections only after the calibration pass
     # proves the property its execution relies on: identical input storage
@@ -664,6 +685,33 @@ def auto_swaps(
                 if hasattr(adapter, "__name__")
                 else str(adapter)
             )
+            break
+    # ---- qkv_rope: packed biased QKV plus rotate-half RoPE ----
+    if "qkv_rope" in structures:
+        from . import adapters as _adapters  # noqa: F401 (registers)
+        for adapter in _QKV_ROPE_ADAPTERS:
+            try:
+                result = adapter(model, plan, caps)
+            except (ValueError, RuntimeError) as refusal:
+                plan.notes.setdefault("refused", []).append(
+                    ("qkv_rope", str(refusal)[:100]))
+                continue
+            if result is None:
+                continue
+            if result.get("refused"):
+                plan.notes.setdefault("refused", []).extend(result["refused"])
+            engaged = bool(
+                result.get("observed")
+                or result.get("revert")
+                or result.get("toggle")
+            )
+            if not engaged:
+                continue
+            plan.observed.update(result.get("observed", {}))
+            plan.revert.extend(result.get("revert", ()))
+            if result.get("toggle") is not None:
+                plan.toggles.append(result["toggle"])
+            plan.notes["qkv_rope_adapter"] = type(adapter).__name__
             break
     # ---- attention_core: host-family adapters (fa2 seam) ----
     if "attention_core" in structures:

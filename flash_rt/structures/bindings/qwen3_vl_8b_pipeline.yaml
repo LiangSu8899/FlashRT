@@ -24,7 +24,7 @@ coverage:
   hot_path:
     - message_preprocess
     - vision_patch_embed
-    - vision_norm_rope
+    - vision_qkv_rope
     - vision_transformer
     - vision_merge
     - multimodal_scatter
@@ -47,18 +47,18 @@ coverage:
       seam: "processor + multimodal geometry construction"
     - name: vision_patch_embed
       stage: modality_encode
-      classification: structure
-      seam: "Qwen3VlVisionRtx patch embedding projection"
-      structures: [linear_proj]
-    - name: vision_norm_rope
-      stage: modality_encode
       classification: host_stage
-      seam: "vision LayerNorm + 2D RoPE"
+      seam: "Conv3D patchify/projection; linear lowering requires exact flatten qualification"
+    - name: vision_qkv_rope
+      stage: modality_encode
+      classification: structure
+      seam: "packed vision QKV bias/split + pre-expanded 2D rotate-half RoPE"
+      structures: [qkv_rope]
     - name: vision_transformer
       stage: modality_encode
       classification: structure
       seam: "Qwen3VlVisionRtx.forward block loop"
-      structures: [vision_ffn, qkv_pack, attention_core, linear_proj]
+      structures: [vision_ffn, qkv_rope, attention_core, linear_proj]
     - name: vision_merge
       stage: modality_encode
       classification: structure
@@ -74,8 +74,9 @@ coverage:
       seam: "vision merger features added to early LLM hidden states"
     - name: prefill_mrope
       stage: prefill
-      classification: host_stage
+      classification: structure
       seam: "interleaved MRoPE q/k post-processing"
+      structures: [qk_norm_rope]
     - name: prefill_transformer
       stage: prefill
       classification: structure
@@ -100,8 +101,9 @@ coverage:
       seam: "single-token language embedding lookup"
     - name: decode_mrope
       stage: decode
-      classification: host_stage
+      classification: structure
       seam: "cache-position and MRoPE-position keyed q/k post-processing"
+      structures: [qk_norm_rope]
     - name: decode_transformer
       stage: decode
       classification: structure

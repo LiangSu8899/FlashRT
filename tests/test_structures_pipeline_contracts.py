@@ -53,18 +53,16 @@ _COMPLETE_PIPELINES = {
         },
         "counts": {
             "control": 2,
-            "host_stage": 7,
+            "host_stage": 5,
             "state_region": 2,
-            "structure": 7,
+            "structure": 9,
         },
         "host_gaps": {
             "message_preprocess",
-            "vision_norm_rope",
+            "vision_patch_embed",
             "multimodal_scatter",
             "deepstack_injection",
-            "prefill_mrope",
             "decode_embedding",
-            "decode_mrope",
         },
     },
     "motus_tick": {
