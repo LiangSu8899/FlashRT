@@ -169,6 +169,7 @@ int gqa_decode_attention_bf16(
         q_heads / kv_heads, scale, q_rows);
   };
   switch (head_dim >> 5) {
+    case 1:  launch(gqa_decode_attention_kernel<1>);  break;
     case 2:  launch(gqa_decode_attention_kernel<2>);  break;
     case 4:  launch(gqa_decode_attention_kernel<4>);  break;
     case 8:  launch(gqa_decode_attention_kernel<8>);  break;

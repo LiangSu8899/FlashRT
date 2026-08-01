@@ -47,8 +47,8 @@ def _config():
             "attn_output_gate": True,
             "linear_num_key_heads": 2,
             "linear_num_value_heads": 4,
-            "linear_key_head_dim": 32,
-            "linear_value_head_dim": 32,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128,
             "linear_conv_kernel_dim": 4,
             "rope_parameters": {"rope_theta": 1e6,
                                 "partial_rotary_factor": 0.25},
@@ -64,10 +64,12 @@ def _config():
     }
 
 
-def _write_checkpoint(directory, mangle=None):
+def _write_checkpoint(directory, mangle=None, overrides=None):
     from flash_rt.frontends.torch._qwen35_text_spec import TextDims
 
     config = _config()
+    if overrides:
+        config["text_config"].update(overrides)
     (directory / "config.json").write_text(json.dumps(config))
     dims = TextDims.from_config(config)
 

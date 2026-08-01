@@ -37,6 +37,10 @@ namespace kernels {
 // ``seq_len_device``, when not null, supplies the length instead of
 // ``seq_len``, so a captured graph can be replayed as the sequence grows.
 //
+// ``head_dim`` is a power of two from 32 to 1024: a lane holds the dimensions
+// congruent to it modulo the warp width, and that count is a compile-time
+// bound because it sizes the accumulator.
+//
 // Returns 0, or -1 if the geometry is not one this decodes.
 int gqa_decode_attention_bf16(
     const void* q,
