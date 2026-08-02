@@ -186,3 +186,57 @@ def test_hub_v3_refuses_builds_without_the_fp32_entry(monkeypatch):
     q = torch.zeros(1, 1, 32, 128, dtype=torch.bfloat16)
     with _pytest.raises(ValueError, match="predates the .*gf32"):
         hub_v3.HubV3GatedDeltaCore(q, g_dtype=torch.float32)
+
+
+def test_fused_adapter_recognises_by_shape_and_ladders_cleanly(monkeypatch):
+    # the fused-layer adapter is shape-recognised (no class names) and
+    # steps aside — for the callable-slot ladder — when the installed
+    # packages predate the chain entries
+    import torch
+    import pytest as _pytest
+    from torch import nn
+
+    from flash_rt.structures.adapters.transformers_gated_delta_fused import (
+        TransformersGatedDeltaFusedAdapter, _fusable, _layer_index)
+    from flash_rt.structures.impls.gated_delta_core import fused_layer
+
+    class _Gdn(nn.Module):
+        def __init__(self, profile=True):
+            super().__init__()
+            d = 5120
+            self.in_proj_qkv = nn.Linear(d, 10240, bias=False)
+            self.in_proj_z = nn.Linear(d, 6144, bias=False)
+            self.in_proj_b = nn.Linear(d, 48, bias=False)
+            self.in_proj_a = nn.Linear(d, 48, bias=False)
+            self.out_proj = nn.Linear(6144, d, bias=False)
+            self.conv1d = nn.Conv1d(10240, 10240, 4, groups=10240)
+            self.A_log = nn.Parameter(torch.zeros(48))
+            self.dt_bias = nn.Parameter(torch.zeros(48))
+            self.norm = nn.RMSNorm(128)
+            self.num_v_heads = 48 if profile else 32
+            self.num_k_heads = 16
+            self.head_k_dim = 128
+            self.head_v_dim = 128
+
+    assert _fusable(_Gdn())
+    assert not _fusable(_Gdn(profile=False))   # out of the fused profile
+    assert not _fusable(nn.Linear(8, 8))
+    assert _layer_index("model.layers.7.linear_attn") == 7
+    assert _layer_index("model.embed") is None
+
+    class _Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = nn.ModuleList([nn.Module()])
+            self.layers[0].linear_attn = _Gdn()
+
+    class _OldPkg:
+        pass
+
+    fused_layer._packages.cache_clear()
+    monkeypatch.setattr(
+        "flash_rt.structures.impls.hub_kernel",
+        lambda repo, ver: _OldPkg())
+    with _pytest.raises(ValueError, match="lacks"):
+        TransformersGatedDeltaFusedAdapter()(_Model(), lambda: None)
+    fused_layer._packages.cache_clear()

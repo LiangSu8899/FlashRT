@@ -17,6 +17,9 @@ from .factored_two_way_attention import FactoredTwoWayAttentionAdapter
 from .factored_qk_norm_rope import FactoredQkNormRopeAdapter
 from .gemma_attention import GemmaAttentionAdapter
 from .transformers_gated_delta import TransformersGatedDeltaAdapter
+from .transformers_gated_delta_fused import (
+    TransformersGatedDeltaFusedAdapter,
+)
 from .qwen_per_head_qk_norm_rope import (
     PerHeadGqaQkNormRopeAdapter,
     QwenPerHeadQkNormRopeAdapter,
@@ -30,6 +33,10 @@ register_attention_adapter(GemmaAttentionAdapter())
 register_attention_adapter(FactoredTwoWayAttentionAdapter())
 register_attention_adapter(DiffusersRotaryAttentionAdapter())
 register_attention_adapter(DiffusersAttentionAdapter())
+# the fused-layer form is tried first; it refuses cleanly (missing
+# package entries, out-of-profile layers) and the ladder falls
+# through to the callable-slot form
+register_gated_delta_adapter(TransformersGatedDeltaFusedAdapter())
 register_gated_delta_adapter(TransformersGatedDeltaAdapter())
 
 __all__ = [
