@@ -291,18 +291,36 @@ class NoQuant(QuantScheme):
 
 
 class W4A4Decode(NoQuant):
-    """NVFP4 W4A4 band on the gated-delta packed projections only.
+    """Mixed decode band for hosts built around gated-delta layers.
 
-    Everything the ``none`` scheme keeps at host precision stays there;
-    the one decision this scheme adds is routing the fused gated-delta
-    layer's packed input projection and output projection through the
-    dynamic NVFP4 path (weights packed at bind time, activations
-    quantised per call). Decode-band only — the retained host layer
-    still serves prefill at its own precision.
+    Two decisions on top of the ``none`` scheme, both decode-band only.
+    The fused gated-delta layer's packed input projection and output
+    projection — the bandwidth-dominant GEMVs — go through the dynamic
+    NVFP4 path (weights packed at bind time, activations quantised per
+    call). The attention/head ``linear_proj`` seams go to the INT8
+    weight-only band instead: their output feeds attention scores and
+    logits, where the denser grid is the right conservatism. Prefill
+    dispatches back to the host either way, and everything else stays
+    at host precision.
     """
 
     name = "w4a4_decode"
     gdn_projection_format = "nvfp4_dynamic"
+    _linear_format: str | None = "w8a16_static"
+
+    def decide(self, report: Mapping[str, Mapping[str, float]]) -> Decision:
+        formats, keep = {}, []
+        for seam_path, pts in report.items():
+            if (self._linear_format is not None
+                    and getattr(pts, "structure", None) == "linear_proj"):
+                formats[seam_path] = self._linear_format
+            else:
+                keep.append(seam_path)
+        return Decision(keep_host=tuple(keep),
+                        reasons={p: f"{self.name} binds decode-band "
+                                    f"GEMM seams only"
+                                 for p in keep},
+                        formats=formats)
 
 
 class Bf16Structural(QuantScheme):

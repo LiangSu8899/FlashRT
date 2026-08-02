@@ -136,9 +136,17 @@ def bind_proj_seam(
     kern = _kernel()
     w = weights["w"].to("cuda", torch.float16).contiguous()
     w_packed, w_sfb = kern.quantize_fp4_sfa_fp16(w, is_sfb=True)
-    deq = kern.dequantize_fp4_sfa_fp16(w_packed, w_sfb).float()
-    rel = float(torch.linalg.vector_norm(deq - w.float())
-                / torch.linalg.vector_norm(w.float()).clamp_min(1e-12))
+    # the conversion check accumulates in row slabs: a whole-tensor
+    # FP32 dequant doubles the bind's transient footprint, and on
+    # head-class weights that spike is what fails under a tight budget
+    deq = kern.dequantize_fp4_sfa_fp16(w_packed, w_sfb)
+    num_sq = den_sq = 0.0
+    for i in range(0, n, 4096):
+        diff = deq[i:i + 4096].float() - w[i:i + 4096].float()
+        num_sq += float(diff.square().sum())
+        den_sq += float(w[i:i + 4096].float().square().sum())
+    del deq
+    rel = (num_sq ** 0.5) / max(den_sq ** 0.5, 1e-12)
     bias = weights.get("b")
     if bias is not None:
         bias = bias.detach().to("cuda", torch.bfloat16)
