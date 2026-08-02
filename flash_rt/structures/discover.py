@@ -410,6 +410,46 @@ def discover(
                                           else "none"),
                                  "epilogue": "none", "in_dtype": "bf16"},
                         family=family + "." + attr, layer_index=idx))
+        if "patch_projection" in structures:
+            # Some vision processors already emit one flattened, complete
+            # spatio-temporal patch per row. Their host module spells the
+            # following projection as Conv3d, even though kernel=stride is
+            # exactly that one patch and the convolution has no overlap,
+            # padding, dilation or groups. Match this complete semantic
+            # contract; an ordinary Conv3d must never be lowered here.
+            proj = getattr(module, "proj", None)
+            if isinstance(proj, nn.Conv3d):
+                try:
+                    temporal = int(module.temporal_patch_size)
+                    spatial = int(module.patch_size)
+                    in_channels = int(module.in_channels)
+                    embed_dim = int(module.embed_dim)
+                except (AttributeError, TypeError, ValueError):
+                    pass
+                else:
+                    kernel = (temporal, spatial, spatial)
+                    if (
+                        tuple(proj.kernel_size) == kernel
+                        and tuple(proj.stride) == kernel
+                        and tuple(proj.padding) == (0, 0, 0)
+                        and tuple(proj.dilation) == (1, 1, 1)
+                        and proj.groups == 1
+                        and proj.in_channels == in_channels
+                        and proj.out_channels == embed_dim
+                        and proj.weight.numel() >= _PROJ_WEIGHT_FLOOR
+                    ):
+                        family, idx = _family_key(path)
+                        seams.append(Seam(
+                            structure="patch_projection", path=path,
+                            parent_path=parent_path, norm_attr=None,
+                            dims={"K": in_channels * temporal * spatial * spatial,
+                                  "N": embed_dim},
+                            variant={"layout": "preflattened_full_patch",
+                                     "bias": ("add" if proj.bias is not None
+                                              else "none")},
+                            family=family + ".patch_projection",
+                            layer_index=idx,
+                        ))
         if "vision_ffn" in structures:
             for fc1_attr, fc2_attr in _VISION_PROJ:
                 fc1 = _nested_module(module, fc1_attr)
@@ -472,6 +512,12 @@ def seam_weights(model: nn.Module, seam: Seam) -> dict[str, torch.Tensor]:
         return {"w": module.weight.detach(),
                 "b": (module.bias.detach()
                       if module.bias is not None else None)}
+    if seam.structure == "patch_projection":
+        proj = module.proj
+        return {
+            "w": proj.weight.detach().reshape(seam.dims["N"], -1),
+            "b": (proj.bias.detach() if proj.bias is not None else None),
+        }
     if seam.structure == "decoder_ffn":
         w_norm = (norm.weight.detach() if norm is not None
                   and getattr(norm, "weight", None) is not None

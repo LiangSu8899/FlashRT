@@ -55,7 +55,8 @@ from .swap import AttachHandle as _AttachHandle, attach as _swap_attach
 
 #: the full catalog, which is what "one call" has to mean
 ALL_STRUCTURES = ("decoder_ffn", "vision_ffn", "qkv_pack", "adaln_producer",
-                  "linear_proj", "norm_fused", "attention_core",
+                  "linear_proj", "patch_projection", "norm_fused",
+                  "attention_core",
                   "decoder_block", "modnorm_qkv_chain", "qk_norm_rope",
                   "qkv_rope", "gated_delta_core")
 
@@ -66,6 +67,7 @@ ALL_STRUCTURES = ("decoder_ffn", "vision_ffn", "qkv_pack", "adaln_producer",
 _STRUCTURE_BY_IMPL = {
     "FusedGeGluMlp": "decoder_ffn", "FusedGluMlpW8A16": "decoder_ffn",
     "FusedGeluMlp": "vision_ffn", "FusedLinearProj": "linear_proj",
+    "FlatPatchProjection": "patch_projection",
     "PackedLinear": "qkv_pack", "StashReader": "qkv_pack",
     "AttnBlockPacked": "qkv_pack", "AdaLNProducer": "adaln_producer",
     "StyleTable": "adaln_producer", "FusedNorm": "norm_fused",

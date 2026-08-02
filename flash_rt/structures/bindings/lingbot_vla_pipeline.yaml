@@ -42,8 +42,8 @@ coverage:
     - name: vision_patch_embed
       stage: obs_encode
       classification: structure
-      seam: "vit_patch_embed"
-      structures: [linear_proj]
+      seam: "preflattened full-patch Conv3D lowered to one BF16 projection"
+      structures: [patch_projection]
     - name: vision_transformer
       stage: obs_encode
       classification: structure

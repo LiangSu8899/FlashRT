@@ -58,7 +58,8 @@ stages:
     capture: host_dependent
 
 embedded_regions: [decoder_ffn, vision_ffn, qkv_pack, qk_norm_rope, qkv_rope,
-                   attention_core, gated_delta_core, linear_proj]
+                   attention_core, gated_delta_core, linear_proj,
+                   patch_projection]
 
 state_regions:
   - {name: kv_state, writers: [prefill, decode], reader: decode}

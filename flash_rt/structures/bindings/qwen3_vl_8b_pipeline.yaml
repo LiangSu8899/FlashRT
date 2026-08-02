@@ -47,8 +47,9 @@ coverage:
       seam: "processor + multimodal geometry construction"
     - name: vision_patch_embed
       stage: modality_encode
-      classification: host_stage
-      seam: "Conv3D patchify/projection; linear lowering requires exact flatten qualification"
+      classification: structure
+      seam: "preflattened full-patch Conv3D lowered to one BF16 projection"
+      structures: [patch_projection]
     - name: vision_qkv_rope
       stage: modality_encode
       classification: structure

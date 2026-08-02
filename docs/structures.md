@@ -251,6 +251,17 @@ positional module refuses the chain. Diffusers-style `to_out[0]` projections
 are discovered as ordinary `linear_proj` seams, but retain the host path when
 their measured small-M bias form is outside the profitable work band.
 
+Processor-preflattened vision patches use the narrower `patch_projection`
+structure. It admits a Conv3D wrapper only when the module declares one
+complete temporal/spatial patch, `kernel == stride`, zero padding, unit
+dilation and one group, and calibration proves the host actually supplies
+that full patch as the input's final dimension. The executable form reshapes
+the checkpoint Conv3D weight once and calls the BF16 Hub projection API.
+Ordinary image/video volumes, overlapping patches and grouped convolutions
+remain on the host. This BF16 lowering is independent of `scheme=`; the final
+accuracy/latency gate may still refuse it when its sub-millisecond model-level
+gain is lost inside a larger request boundary.
+
 `cadence_static` remains an explicit host-stage structure rather than part of
 the automatic front door. Its updater needs the host's observation boundary:
 the host must capture the repeated-loop outputs, bind the static K/V buffers,
@@ -321,7 +332,7 @@ registered quantisation scheme (§6) selected by name:
 |---|---|
 | `"auto"` (default) | resolves to the fastest profile this device can execute: `fp8_static` on FP8-capable hardware (bit-identical to the pre-profile default), `"none"` elsewhere. The resolution table is one function, so a profile that measures faster is promoted by editing one line |
 | `"fp8_static"` | static per-tensor FP8, the shipped behaviour; `"fp8_static_keep_outliers"` keeps outlier seams at host precision by the house scale-ceiling criterion |
-| `"bf16_structural"` | no quantisation; binds only numerically conservative structural forms (currently shared-input QKV packing) and keeps dense FFNs/projections at host precision |
+| `"bf16_structural"` | no quantisation; binds numerically conservative structural forms (shared-input QKV packing and qualified full-patch projection) and keeps dense FFNs/projections at host precision |
 | `"w8a16_decode"` / `"w4a16_decode"` | weight-only INT8 / NVFP4 on `decoder_ffn`, decode band only, everything else at host precision |
 | `"none"` | quantisation off. An explicit choice, not a degraded mode: fusion structures never consult a scheme decision and attach as usual, so a BF16/FP16 host under `"none"` still gets every fusion structure |
 

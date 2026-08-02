@@ -181,7 +181,8 @@ def auto_swaps(
     *,
     structures: tuple[str, ...] = ("decoder_ffn", "vision_ffn",
                                    "qkv_pack", "adaln_producer",
-                                   "linear_proj", "norm_fused",
+                                   "linear_proj", "patch_projection",
+                                   "norm_fused",
                                    "attention_core", "decoder_block",
                                    "modnorm_qkv_chain", "qk_norm_rope",
                                    "qkv_rope",
@@ -369,6 +370,23 @@ def auto_swaps(
             return None
         return hook
 
+    def cap_patch_input(path, width):
+        """Record that the host really supplies complete flattened patches.
+
+        Matching Conv3d slots is not enough: a module with the same kernel
+        may consume an ordinary 5-D volume. The lowering is legal only when
+        the calibrated host input exposes K as its final dimension, exactly
+        as the processor-preflattened dataflow declares.
+        """
+        def hook(module, args):
+            x = args[0] if args else None
+            form = None
+            if torch.is_tensor(x) and x.numel() % width == 0:
+                form = (int(x.shape[-1]), int(x.numel() // width))
+            caps[path].setdefault("patch_inputs", []).append(form)
+            return None
+        return hook
+
     # the amax points are hooked by the collector; only the two
     # content/observation captures need their own hooks here, and neither
     # is a statistic: a step table is memoised host output, a return
@@ -387,6 +405,9 @@ def auto_swaps(
             for attr in seam.pack_attrs or ():
                 hooks.append(getattr(target, attr).register_forward_pre_hook(
                     cap_pack_input(key, attr)))
+        elif seam.structure == "patch_projection":
+            hooks.append(target.register_forward_pre_hook(
+                cap_patch_input(key, seam.dims["K"])))
     hooks.extend(collector.hooks(lambda path: _resolve(model, path)))
 
     if hooks:
@@ -475,11 +496,17 @@ def auto_swaps(
             self.structure = structure
 
     seam_by_key = {_seam_key(seam): seam for seam in seams}
+    # Host-precision structural lowerings do not belong to a quantisation
+    # scheme decision. They still use the collector for real row/dtype
+    # qualification, but scheme="none" must not remove them.
+    scheme_independent = {"patch_projection"}
     scheme_report = {
         path: _SeamStats(
             {f"{pt.path}|{pt.name}": collector.amax(pt.path, pt.name)
              for pt in pts}, structure=seam_by_key[path].structure)
-        for path, pts in seam_points.items() if path in seam_by_key}
+        for path, pts in seam_points.items()
+        if path in seam_by_key
+        and seam_by_key[path].structure not in scheme_independent}
     decision = scheme_obj.decide(scheme_report)
     scheme_note: dict[str, Any] = {
         "name": getattr(scheme_obj, "name", type(scheme_obj).__name__)}
@@ -1061,6 +1088,26 @@ def _bind_auto(model, seam, cap, plan, act_scales, negotiate_fp8,
             seam_weights(model, seam), input_scale=in_s,
             row_profile=points.row_profile(seam.path, "x"),
             original=_resolve(model, seam.path))
+
+    if seam.structure == "patch_projection":
+        from .impls.patch_projection import bind_flat_patch_projection
+
+        forms = tuple(cap.get("patch_inputs", ()))
+        if not forms or any(
+            form is None or form[0] != seam.dims["K"] for form in forms
+        ):
+            raise ValueError(
+                "patch_projection: calibrated host input is not "
+                f"preflattened full-patch rows with K={seam.dims['K']}"
+            )
+        rows = points.row_profile(seam.path, "x") if points else ()
+        dtypes = points.seen_dtypes(seam.path, "x") if points else ()
+        return bind_flat_patch_projection(
+            seam_weights(model, seam),
+            row_profile=rows,
+            host_dtypes=dtypes,
+            original=_resolve(model, seam.path),
+        )
 
     if seam.structure == "qkv_pack":
         if fmt == "bf16_pack":

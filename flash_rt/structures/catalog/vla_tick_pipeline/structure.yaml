@@ -54,7 +54,7 @@ stages:
 
 embedded_regions: [decoder_ffn, vision_ffn, qkv_pack, qk_norm_rope,
                    attention_core, adaln_producer, modnorm_qkv_chain,
-                   linear_proj, norm_fused]
+                   linear_proj, patch_projection, norm_fused]
 
 cadence_substructures:
   - {name: cross_kv_precompute, cadence: prompt}

@@ -100,7 +100,7 @@ def resolve(seam: Any, spec_points: Sequence[str]) -> list[Point]:
     elif structure == "qkv_pack":
         # siblings share one input; the first one the host calls sees it
         put("x", (seam.pack_attrs or ("q_proj",))[0])
-    elif structure in ("linear_proj", "norm_fused"):
+    elif structure in ("linear_proj", "patch_projection", "norm_fused"):
         put("x")
     elif structure == "adaln_producer":
         # ``cond`` is not an amax point: the step table is captured content,

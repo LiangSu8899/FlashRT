@@ -53,13 +53,12 @@ _COMPLETE_PIPELINES = {
         },
         "counts": {
             "control": 2,
-            "host_stage": 5,
+            "host_stage": 4,
             "state_region": 2,
-            "structure": 9,
+            "structure": 10,
         },
         "host_gaps": {
             "message_preprocess",
-            "vision_patch_embed",
             "multimodal_scatter",
             "deepstack_injection",
             "decode_embedding",
