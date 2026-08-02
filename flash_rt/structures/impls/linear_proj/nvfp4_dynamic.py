@@ -1,0 +1,144 @@
+"""NVFP4 (W4A4, dynamic activation scales) ``linear_proj`` implementation.
+
+Weights are packed to NVFP4 (E2M1 data plus per-16-element-block scale
+factors) at bind time; activations are quantized to the same format at
+runtime, per call, with dynamically computed block scales — no
+calibration data at either end. This is the execution form behind the
+27B enablement line: checkpoints whose upstream loader decompresses
+4-bit weights to BF16 inside ``forward`` (and therefore cannot fit the
+card) run on the same card once their projections consume the packed
+layout directly.
+
+The ``flashrt/fp4-gemm`` entry point ``fp4_w4a16_linear_bf16`` takes the
+pre-quantized activation tensor plus its scale factors — despite the
+``a16`` in its historical name, the GEMM it runs is W4A4. ``variant=2``
+is the qualified dispatch across the decode and short-prefill shapes
+this impl serves (same-token 1.0000 against an exact reference on the
+27B host, decode and prefill both through this path).
+
+There is no host fallback: the module this replaces holds packed
+weights the host cannot execute. The guard therefore refuses instead of
+falling back, and adoption of a whole checkpoint is a load-time
+transform, not a reversible attachment.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from functools import lru_cache
+
+import torch
+
+from ...guard import CAST_OK, PROCEED, GuardedSeam
+
+KERNEL_DEP = {
+    "provider": "huggingface_kernels",
+    "repo": "flashrt/fp4-gemm",
+    "version": ">=1",
+}
+
+#: mirrors the kernel's own shape checks (``torch_binding.cpp``: K
+#: divisible by 16 for the per-block scale factors, positive dims) —
+#: no invented size walls: the adoption path serves whatever the
+#: checkpoint author packed, and the 27B host's 17408-wide FFN is a
+#: qualified shape, not an edge case
+SUPPORT = {
+    "K": {"min": 16, "multiple_of": 16},
+    "N": {"min": 1},
+}
+
+
+@lru_cache(maxsize=1)
+def _kernel():
+    from flash_rt.structures.impls import hub_kernel
+
+    return hub_kernel(KERNEL_DEP["repo"], KERNEL_DEP["version"])
+
+
+def _check(weights: Mapping[str, torch.Tensor]) -> tuple[int, int]:
+    w = weights["w"]
+    if w.dim() != 2:
+        raise ValueError(f"w must be [N, K], got {tuple(w.shape)}")
+    n, k = w.shape
+    for name, dim in (("K", k), ("N", n)):
+        bounds = SUPPORT[name]
+        if dim < bounds["min"]:
+            raise ValueError(
+                f"{name}={dim} outside support envelope "
+                f"(min {bounds['min']})")
+        if bounds.get("multiple_of") and dim % bounds["multiple_of"]:
+            raise ValueError(
+                f"{name}={dim} must be a multiple of "
+                f"{bounds['multiple_of']}")
+    b = weights.get("b")
+    if b is not None and tuple(b.shape) != (n,):
+        raise ValueError(
+            f"bias shape {tuple(b.shape)} does not match N={n}")
+    return n, k
+
+
+class LinearProjNvfp4Dynamic(GuardedSeam, torch.nn.Module):
+    """Packed-weight projection: FP4 GEMM with runtime activation scales."""
+
+    _frt_can_fallback = False
+
+    def __init__(self, w_packed, w_sfb, bias, n, k):
+        super().__init__()
+        self.register_buffer("_w_packed", w_packed)
+        self.register_buffer("_w_sfb", w_sfb)
+        self._bias = bias
+        self._n = n
+        self._k = k
+        kern = _kernel()
+        self._quantize = kern.quantize_fp4_sfa_fp16
+        self._gemm = kern.fp4_w4a16_linear_bf16
+        self._frt_arm(dtypes=CAST_OK, device=w_packed.device, k=int(k))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        admitted = self._frt_admit(x)
+        if admitted is not PROCEED:
+            return admitted
+        shape = x.shape
+        flat = x.reshape(-1, shape[-1])
+        a_packed, a_sfa = self._quantize(
+            flat.to(torch.float16).contiguous())
+        y = self._gemm(a_packed, self._w_packed, a_sfa, self._w_sfb,
+                       variant=2)
+        if self._bias is not None:
+            y = y + self._bias
+        return y.reshape(*shape[:-1], self._n).type_as(x)
+
+
+@torch.no_grad()
+def bind_proj_seam(
+    weights: Mapping[str, torch.Tensor],
+) -> tuple[LinearProjNvfp4Dynamic, float]:
+    """Bind one projection from a dense ``[N, K]`` weight.
+
+    The weight is packed to the Hub kernel's NVFP4 layout on the GPU;
+    the returned float is the pack-and-unpack relative L2 against the
+    input weight — the *conversion* cost of regridding into this layout,
+    reported so a caller adopting a whole checkpoint can put it in the
+    receipt instead of losing it.
+    """
+    n, k = _check(weights)
+    kern = _kernel()
+    w = weights["w"].to("cuda", torch.float16).contiguous()
+    w_packed, w_sfb = kern.quantize_fp4_sfa_fp16(w, is_sfb=True)
+    deq = kern.dequantize_fp4_sfa_fp16(w_packed, w_sfb).float()
+    rel = float(torch.linalg.vector_norm(deq - w.float())
+                / torch.linalg.vector_norm(w.float()).clamp_min(1e-12))
+    bias = weights.get("b")
+    if bias is not None:
+        bias = bias.detach().to("cuda", torch.bfloat16)
+    bound = LinearProjNvfp4Dynamic(w_packed, w_sfb, bias, n, k)
+    # bind-time smoke: one M=1 launch through the real entry point before
+    # the seam is handed out — a stale build or missing symbol surfaces
+    # as a clean bind refusal, not later inside the host's forward
+    probe = bound(torch.zeros(1, k, device=w_packed.device,
+                              dtype=torch.bfloat16))
+    if probe.shape != (1, n) or not torch.isfinite(probe).all():
+        raise ValueError(
+            f"refused: nvfp4 bind smoke produced shape "
+            f"{tuple(probe.shape)}, finite={bool(torch.isfinite(probe).all())}")
+    return bound, rel

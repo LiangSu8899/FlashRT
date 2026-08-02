@@ -72,12 +72,25 @@ def attach(model, forward, **kwargs):
     return _attach(model, forward, **kwargs)
 
 
+def adopt_prequantized(model, fmt="ct_nvfp4", **kwargs):
+    """Checkpoint door: adopt an already-quantized checkpoint by
+    converting its packed projections into structure impls.
+
+    See :func:`flash_rt.structures.prequantized.adopt_prequantized`.
+    """
+    from flash_rt.structures.prequantized import (
+        adopt_prequantized as _adopt)
+
+    return _adopt(model, fmt, **kwargs)
+
+
 from . import schemes  # noqa: E402  (registry: quantisation schemes)
 
 __all__ = [
     "BindingSpec",
     "CoverageSegment",
     "StructureSpec",
+    "adopt_prequantized",
     "attach",
     "capture",
     "get",

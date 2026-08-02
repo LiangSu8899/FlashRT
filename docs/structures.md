@@ -333,7 +333,8 @@ registered quantisation scheme (§6) selected by name:
 | `"auto"` (default) | resolves to the fastest profile this device can execute: `fp8_static` on FP8-capable hardware (bit-identical to the pre-profile default), `"none"` elsewhere. The resolution table is one function, so a profile that measures faster is promoted by editing one line |
 | `"fp8_static"` | static per-tensor FP8, the shipped behaviour; `"fp8_static_keep_outliers"` keeps outlier seams at host precision by the house scale-ceiling criterion |
 | `"bf16_structural"` | no quantisation; binds numerically conservative structural forms (shared-input QKV packing and qualified full-patch projection) and keeps dense FFNs/projections at host precision |
-| `"w8a16_decode"` / `"w4a16_decode"` | weight-only INT8 / NVFP4 on `decoder_ffn`, decode band only, everything else at host precision |
+| `"w8a16_decode"` | weight-only INT8 on `decoder_ffn` and on `linear_proj` (the attention Q/K/V/O family), decode band only, everything else at host precision. Each impl mirrors its kernel's own auto-dispatch qualification; prefill dispatches to the retained host module and is counted |
+| `"w4a16_decode"` | the NVFP4 twin, `decoder_ffn` only — its linear auto band is too narrow to route projections blind, so they stay at host precision until a measured table says otherwise |
 | `"none"` | quantisation off. An explicit choice, not a degraded mode: fusion structures never consult a scheme decision and attach as usual, so a BF16/FP16 host under `"none"` still gets every fusion structure |
 
 Quantisation happens **at attach time, from the host's own weights** —
@@ -342,6 +343,16 @@ loaded at host precision; weight scales and packed formats are derived
 from the floating weights at bind, activation statistics come from
 running the host's own forward. Nothing is destroyed: the original
 module is retained, and detach restores it bit-exactly.
+
+A checkpoint that arrives *already* quantized in a packed layout goes
+through the other door, `structures.adopt_prequantized(model, fmt)`
+(first supported: compressed-tensors NVFP4 in its `run_compressed`
+form). Each packed projection is unpacked by the compressor registered
+for the checkpoint's own format and converted once, at load time, into
+the `linear_proj/nvfp4_dynamic` impl; the per-layer conversion error is
+recorded in the returned report. Unlike a scheme attachment this is a
+load-time transform with no detach — the packed source cannot execute,
+and undoing an adoption is reloading the checkpoint.
 
 Hardware support is not declared here at all. A Hub kernel package
 ships the archs it was built for in its own metadata; the shared loader
