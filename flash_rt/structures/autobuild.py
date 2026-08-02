@@ -141,7 +141,14 @@ def _spec_points(seam) -> tuple[str, ...]:
     from .registry import load
 
     try:
-        return tuple(load(seam.structure).calibration.get("points", ()))
+        calibration = load(seam.structure).calibration
+        if (seam.structure == "modnorm_qkv_chain"
+                and seam.variant.get("modulation") == "per_token_table"):
+            # the table form owns its sublayers' seams, so it carries
+            # their static scales itself; the spec names them separately
+            # because the scale_shift form keeps no points at all
+            return tuple(calibration.get("per_token_table_points", ()))
+        return tuple(calibration.get("points", ()))
     except Exception:                                   # noqa: BLE001
         return ()
 
@@ -486,6 +493,34 @@ def auto_swaps(
               for a in (s.pack_attrs or ())}
     seams = [s for s in seams
              if not (s.structure == "linear_proj" and s.path in packed)]
+
+    # ---- per-token-table chains own their block's producer-fed members:
+    # the self-attention pack (the chain quantizes once for all three)
+    # and the FFN (the chain's second producer site feeds it fused).
+    # Everything else under the block — the output projection, the whole
+    # cross-attention — stays individually bindable, and the chain's
+    # forward calls whatever is attached there. ----
+    chain_blocks = {
+        s.path for s in seams
+        if s.structure == "modnorm_qkv_chain"
+        and s.variant.get("modulation") == "per_token_table"}
+    if chain_blocks:
+        def _chain_owns(seam):
+            for block in chain_blocks:
+                if (seam.structure == "qkv_pack"
+                        and seam.path == block + ".attn1"):
+                    return True
+                if (seam.structure == "vision_ffn"
+                        and seam.path == block + ".ffn"):
+                    return True
+                if (seam.structure == "linear_proj"
+                        and seam.path.startswith(block + ".attn1.")
+                        and seam.path.rsplit(".", 1)[1] in
+                        ("to_q", "to_k", "to_v")):
+                    return True
+            return False
+
+        seams = [s for s in seams if not _chain_owns(s)]
 
     # ---- the scheme turns statistics into decisions. Keep-host is a
     # first-class outcome recorded in the receipt, not a refusal: the
@@ -1071,6 +1106,13 @@ def _bind_auto(model, seam, cap, plan, act_scales, negotiate_fp8,
         return vis_impl.bind_mlp_seam(
             seam_weights(model, seam), input_scale=in_s,
             hidden_scale=hid_s, original=_resolve(model, seam.path))
+
+    if seam.structure == "modnorm_qkv_chain":
+        if seam.variant.get("modulation") == "per_token_table":
+            from .impls.modnorm_qkv_chain import fp8_ptok_table as chain
+            return chain.bind_block_seam(model, seam, points=points)
+        # the scale_shift form composes through producer negotiation
+        return None
 
     if seam.structure == "norm_fused":
         from .impls.norm_fused import bind_norm_fused

@@ -66,7 +66,10 @@ def test_landed_qk_region_and_remaining_video_gaps_are_explicit():
     assert cosmos_segments["qk_norm_rope"].structures == ("qk_norm_rope",)
     assert wan_segments["qk_norm_rope"].structures == ("qk_norm_rope",)
     assert wan_segments["six_chunk_modulation"].classification == "host_stage"
-    assert wan_segments["modulated_ffn"].classification == "host_stage"
+    # covered since vision_ffn learned the diffusers FeedForward shape;
+    # the segment's modulation and gated residual stay host
+    assert wan_segments["modulated_ffn"].classification == "structure"
+    assert wan_segments["modulated_ffn"].structures == ("vision_ffn",)
     assert wan_segments["vae_decode"].classification == "host_stage"
 
 

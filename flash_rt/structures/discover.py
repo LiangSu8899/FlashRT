@@ -120,6 +120,42 @@ def _is_modnorm_qkv_chain(
     return dim, cond.in_features, fanout
 
 
+def _is_table_modnorm_chain(module: nn.Module) -> tuple[int, int] | None:
+    """Recognise the per-token-table modulated block (video-DiT family).
+
+    Shape, not class names: the block carries its own ``[1, chunks, D]``
+    modulation parameter, a no-affine ``norm1`` and ``norm3`` pair, and
+    sibling self/cross attentions plus an FFN whose modulation happens
+    inline in the block's forward from a per-token timestep table. Only a
+    block owner can reroute that inline math, which is why this seam is
+    the whole block rather than a norm module.
+    """
+    table = getattr(module, "scale_shift_table", None)
+    if not (isinstance(table, torch.nn.Parameter) and table.dim() == 3
+            and table.shape[0] == 1 and table.shape[1] in (4, 6, 9)):
+        return None
+    attn = getattr(module, "attn1", None)
+    q_proj = getattr(attn, "to_q", None) if attn is not None else None
+    if not isinstance(q_proj, nn.Linear):
+        return None
+    dim = q_proj.in_features
+    if table.shape[2] != dim:
+        return None
+    for attr in ("to_k", "to_v"):
+        proj = getattr(attn, attr, None)
+        if not (isinstance(proj, nn.Linear) and proj.in_features == dim):
+            return None
+    for norm_attr in ("norm1", "norm3"):
+        norm = getattr(module, norm_attr, None)
+        if norm is None or getattr(norm, "weight", None) is not None:
+            return None
+    if getattr(module, "attn2", None) is None:
+        return None
+    if getattr(module, "ffn", None) is None:
+        return None
+    return dim, int(table.shape[1])
+
+
 def _projection_child(
     module: nn.Module, attr: str,
 ) -> tuple[str, nn.Linear] | None:
@@ -339,6 +375,19 @@ def discover(
                              "wire_dtype": "fp8_static",
                              "fanout": fanout},
                     family=family, layer_index=idx))
+            else:
+                table_dims = _is_table_modnorm_chain(module)
+                if table_dims is not None:
+                    dim, chunks = table_dims
+                    family, idx = _family_key(path)
+                    seams.append(Seam(
+                        structure="modnorm_qkv_chain", path=path,
+                        parent_path=parent_path, norm_attr="norm1",
+                        dims={"D": dim, "C": chunks},
+                        variant={"modulation": "per_token_table",
+                                 "wire_dtype": "fp8_static",
+                                 "fanout": "qkv"},
+                        family=family, layer_index=idx))
         if "qkv_pack" in structures:
             for group in _QKV_PACK:
                 projs = [getattr(module, a, None) for a in group]

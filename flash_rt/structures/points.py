@@ -106,6 +106,16 @@ def resolve(seam: Any, spec_points: Sequence[str]) -> list[Point]:
         # ``cond`` is not an amax point: the step table is captured content,
         # not a statistic, and is collected by the conditioning hook
         put("x")
+    elif (structure == "modnorm_qkv_chain"
+            and seam.variant.get("modulation") == "per_token_table"):
+        # the table form owns the whole block, so the four static scales
+        # its composition needs are measured at the block's own sublayer
+        # inputs — the same real-distribution sites the sublayers would
+        # calibrate at if bound individually
+        put("attn_in", "attn1.to_q")
+        put("o_in", "attn1.to_out.0")
+        put("ffn_in", "ffn")
+        put("ffn_hid", "ffn.net.2")
     elif structure in ("decoder_block", "modnorm_qkv_chain"):
         pass                      # composed; its sublayers carry the points
 
