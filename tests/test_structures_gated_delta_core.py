@@ -128,3 +128,61 @@ def test_transformers_gated_delta_adapter_accepts_second_head_profile(
     out, state = host.linear_attn(q, k, v, g, beta, initial_state)
     assert out.shape == q.shape
     assert state.shape == (1, 32, 128, 128)
+
+
+def test_hub_v3_binds_the_log_decay_dtype_the_host_exposes(monkeypatch):
+    # the 27B-class cached-decode hosts keep g in FP32; the impl must
+    # bind the entry matching the observed dtype, refuse builds that
+    # predate the FP32 entry, and hold the bound dtype at call time
+    import torch
+
+    from flash_rt.structures.impls.gated_delta_core import hub_v3
+
+    calls = {}
+
+    class _Ops:
+        def gated_delta_recurrent_inout_bf16(self, *a, **kw):
+            calls["entry"] = "bf16"
+            return kw["out"], kw["state_out"]
+
+        def gated_delta_recurrent_inout_gf32_bf16(self, *a, **kw):
+            calls["entry"] = "gf32"
+            return kw["out"], kw["state_out"]
+
+    monkeypatch.setattr(hub_v3, "hub_kernel", lambda repo, ver: _Ops())
+    q = torch.zeros(1, 1, 32, 128, dtype=torch.bfloat16)
+    sample = {"query": q, "key": q.clone(), "value": q.clone(),
+              "g": torch.zeros(1, 1, 32, dtype=torch.float32),
+              "beta": torch.zeros(1, 1, 32, dtype=torch.bfloat16),
+              "state": torch.zeros(1, 32, 128, 128, dtype=torch.bfloat16),
+              "output_final_state": True, "use_qk_l2norm": True}
+    core = hub_v3.bind_gated_delta_core(sample)
+    assert calls["entry"] == "gf32"
+
+    # a bf16-g host still binds the original entry
+    sample_bf = dict(sample, g=sample["g"].to(torch.bfloat16))
+    hub_v3.bind_gated_delta_core(sample_bf)
+    assert calls["entry"] == "bf16"
+
+    # the bound dtype is a contract: a host that changes g dtype after
+    # binding is refused, not silently served
+    import pytest as _pytest
+    with _pytest.raises(ValueError, match="dtypes moved"):
+        core(q, q, q, sample["g"].to(torch.bfloat16), sample["beta"],
+             sample["state"], output_final_state=True, use_qk_l2norm=True)
+
+
+def test_hub_v3_refuses_builds_without_the_fp32_entry(monkeypatch):
+    import torch
+    import pytest as _pytest
+
+    from flash_rt.structures.impls.gated_delta_core import hub_v3
+
+    class _OldOps:
+        def gated_delta_recurrent_inout_bf16(self, *a, **kw):
+            return kw["out"], kw["state_out"]
+
+    monkeypatch.setattr(hub_v3, "hub_kernel", lambda repo, ver: _OldOps())
+    q = torch.zeros(1, 1, 32, 128, dtype=torch.bfloat16)
+    with _pytest.raises(ValueError, match="predates the FP32"):
+        hub_v3.HubV3GatedDeltaCore(q, g_dtype=torch.float32)
