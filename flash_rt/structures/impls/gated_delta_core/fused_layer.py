@@ -77,6 +77,27 @@ class FusedGatedDeltaDecodeLayer(GuardedSeam, torch.nn.Module):
                 "fused decode chain serves the 48/16-head, D=128 "
                 "profile; other profiles keep the host layer")
         dev = host.in_proj_qkv.weight.device
+        # the four input projections read the same activation; packing
+        # them row-wise turns four GEMV launches into one, bit-identical
+        # per output row. The host projections are rebound onto views of
+        # the packed rows so the layer still carries one copy of these
+        # weights — prefill and detach see the exact same values.
+        self._packed_w = torch.cat(
+            [host.in_proj_qkv.weight.detach(),
+             host.in_proj_z.weight.detach(),
+             host.in_proj_b.weight.detach(),
+             host.in_proj_a.weight.detach()], dim=0)
+        self._splits = []
+        off = 0
+        for name in ("in_proj_qkv", "in_proj_z", "in_proj_b",
+                     "in_proj_a"):
+            lin = getattr(host, name)
+            n = int(lin.weight.shape[0])
+            lin.weight = torch.nn.Parameter(
+                self._packed_w[off:off + n],
+                requires_grad=lin.weight.requires_grad)
+            self._splits.append((off, off + n))
+            off += n
         self._conv_w = host.conv1d.weight.detach().squeeze(1).contiguous()
         self._conv_b = (host.conv1d.bias.detach().contiguous()
                         if host.conv1d.bias is not None else None)
@@ -125,19 +146,23 @@ class FusedGatedDeltaDecodeLayer(GuardedSeam, torch.nn.Module):
 
         host = self.host_layer
         x = hidden_states.view(1, -1)
-        mixed = torch.nn.functional.linear(x, host.in_proj_qkv.weight)
-        z = torch.nn.functional.linear(x, host.in_proj_z.weight)
-        b = torch.nn.functional.linear(x, host.in_proj_b.weight)
-        a = torch.nn.functional.linear(x, host.in_proj_a.weight)
+        allp = torch.nn.functional.linear(x, self._packed_w)
+        # column slices of a single-row output stay contiguous
+        (q0, q1), (z0, z1), (b0, b1), (a0, a1) = self._splits
+        mixed = allp[:, q0:q1]
+        z = allp[:, z0:z1]
+        b = allp[:, b0:b1]
+        a = allp[:, a0:a1]
 
         conv_host = cache_params.conv_states[self._idx]
         hub_state = conv_host[:, :, 1:].contiguous()
         conv_out = self._conv.causal_conv1d_update_bf16(
             mixed, self._conv_w, hub_state, self._conv_b,
             apply_silu=True)
-        # the host slot keeps the last K raw inputs; roll it forward
-        conv_host.copy_(torch.cat(
-            [conv_host[:, :, 1:], mixed.view(1, -1, 1)], dim=-1))
+        # the host slot keeps the last K raw inputs; roll it forward.
+        # hub_state is a snapshot, so the two writes never overlap reads.
+        conv_host[:, :, :-1].copy_(hub_state)
+        conv_host[:, :, -1:].copy_(mixed.view(1, -1, 1))
 
         q, k, v = self._gda.lin_split_qkv_broadcast_bf16(conv_out)
         g, beta = self._gda.gdn_gating_bf16(
