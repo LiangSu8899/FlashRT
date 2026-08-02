@@ -126,6 +126,7 @@ def test_dense_attention_uses_complete_per_call_kv(monkeypatch):
 def test_dense_attention_packs_one_or_two_allowed_runs(
     monkeypatch, allowed
 ):
+    torch.manual_seed(0)
     monkeypatch.setattr(
         fa2_seqused, "hub_kernel", lambda *args: _FakeFa2())
     query = torch.randn(1, 4, 7, 48, dtype=torch.bfloat16)

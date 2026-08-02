@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 
 from ..impls.qkv_rope import bind_packed_bias_qkv_rope
+from ..impls.attention_core.fa2_seqused import DenseAttention
 from ..guard import GuardRefused
 from ..discover import discover
 
@@ -18,10 +19,16 @@ class PackedQkvRopeAdapter:
 
     __name__ = "packed_qkv_rope"
 
-    def __call__(self, model, plan, caps):
+    def __call__(self, model, plan, caps, *, compose_attention=None):
+        if compose_attention is None:
+            compose_attention = "attention_core" in getattr(
+                plan, "_requested_structures", ()
+            )
         routes = []
         observed = {}
         refused = []
+        attention_scratch = {}
+        smoke_inputs = {}
 
         capacities = {}
         for seam in discover(model, ("vision_ffn",)):
@@ -111,6 +118,44 @@ class PackedQkvRopeAdapter:
                 refuse(str(exc))
                 continue
 
+            dense_attention = None
+            if compose_attention:
+                shape = (1, heads, row_capacity, head_dim)
+                scratch_key = (
+                    shape, qkv.weight.dtype, qkv.weight.device,
+                )
+                try:
+                    dense_attention = DenseAttention(
+                        shape,
+                        shape,
+                        qkv.weight.dtype,
+                        qkv.weight.device,
+                        scratch=attention_scratch.get(scratch_key),
+                    )
+                    attention_scratch.setdefault(
+                        scratch_key, dense_attention._scratch
+                    )
+                    samples = smoke_inputs.get(scratch_key)
+                    if samples is None:
+                        samples = tuple(
+                            torch.empty(
+                                shape,
+                                device=qkv.weight.device,
+                                dtype=qkv.weight.dtype,
+                            )
+                            for _ in range(3)
+                        )
+                        smoke_inputs[scratch_key] = samples
+                    with torch.no_grad():
+                        dense_attention(
+                            *samples, scale=float(module.scaling)
+                        )
+                    if dense_attention._frt_guard is not None:
+                        dense_attention._frt_guard.calls = 0
+                except (ValueError, RuntimeError) as exc:
+                    refuse(f"single-segment attention unavailable: {exc}")
+                    dense_attention = None
+
             original = module.forward
             had_instance_forward = "forward" in module.__dict__
 
@@ -126,6 +171,7 @@ class PackedQkvRopeAdapter:
                 attention_fn=attention,
                 attention_scale=float(module.scaling),
                 implementation_name=implementation,
+                attention_core=dense_attention,
                 **kwargs,
             ):
                 tokens = hidden_states.shape[0]
@@ -157,7 +203,14 @@ class PackedQkvRopeAdapter:
                 key = key.transpose(1, 2)
                 value = value.transpose(1, 2)
 
-                if implementation_name == "flash_attention_2":
+                if attention_core is not None and cu_seqlens.numel() == 2:
+                    output = attention_core(
+                        query,
+                        key,
+                        value,
+                        scale=attention_scale,
+                    ).transpose(1, 2)
+                elif implementation_name == "flash_attention_2":
                     max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
                     output, _ = attention_fn(
                         self,
@@ -203,6 +256,8 @@ class PackedQkvRopeAdapter:
                 (module, routed_method, original, had_instance_forward)
             )
             observed[site] = bound
+            if dense_attention is not None:
+                observed[f"{path}::attention_core"] = dense_attention
 
         if not routes:
             return {"refused": refused} if refused else None
@@ -223,6 +278,15 @@ class PackedQkvRopeAdapter:
                     del module.forward
 
         enable()
+        if compose_attention and any(
+            name.endswith("::attention_core") for name in observed
+        ):
+            plan.notes["attention_adapter"] = (
+                "PackedQkvRopeAdapter.single_segment_dense"
+            )
+            plan.notes.setdefault("composed_structures", []).append(
+                "qkv_rope->attention_core"
+            )
         return {
             "observed": observed,
             "revert": [revert],

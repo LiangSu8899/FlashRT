@@ -593,6 +593,7 @@ def auto_swaps(
     # and the host would silently grow a quantize fused into whatever
     # produced it. Bind the pair together, or leave both on BF16.
     plan = AutoPlan(seams=seams)
+    plan._requested_structures = frozenset(structures)
     plan.notes["scheme"] = scheme_note
     if schedule_notes:
         plan.notes["schedules"] = schedule_notes

@@ -27,8 +27,9 @@ boundary:
 weights: []
 
 variants:
-  kernel: [fa2_seqused, host_fallback]
+  kernel: [fa2_seqused, fa2_dense, host_fallback]
   kv_cadence: [static_prefix, per_call]
+  segment_layout: [single_dense, packed_varlen_host]
 
 calibration:
   points: [q, k, v, mask]
@@ -56,6 +57,9 @@ qualification:
      prefix means the cadence split is wrong, and it is rejected here
      where the reason is still legible rather than downstream as a
      parity failure"
+  - "a cu-seqlens host with exactly one segment is the ordinary dense
+     per-call form; multiple packed segments remain on the host unless
+     a compile- and capture-qualified varlen artifact is available"
 
 evidence:
   - "standalone at pi05 denoise shapes — cos 0.9999979 vs eager+mask,
@@ -63,3 +67,6 @@ evidence:
   - "pi05 structures stack — round13, 2.246 -> 2.308x"
   - "pi05 hub-kernel demo e2e — own FA2 21.42ms vs community 21.61ms,
      action cosine 0.99987 against the native FlashRT pipeline"
+  - "Qwen3-VL single-image vision attention — one 6256-token segment,
+     27/27 sites, full forward 1.026x for qkv_rope+attention_core,
+     complete structure stack E2E 1.195x, exact generated token IDs"

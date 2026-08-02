@@ -255,7 +255,7 @@ class DenseAttention(GuardedSeam, torch.nn.Module):
 
     def __init__(
         self, q_shape, kv_shape, dtype: torch.dtype, device,
-        allowed_ranges=None,
+        allowed_ranges=None, scratch: "_Scratch | None" = None,
     ):
         super().__init__()
         b, heads, seq_q, head_dim = q_shape
@@ -281,9 +281,22 @@ class DenseAttention(GuardedSeam, torch.nn.Module):
         if self.allowed_ranges:
             self.register_buffer("packed_k", torch.empty_like(kv_sample))
             self.register_buffer("packed_v", torch.empty_like(kv_sample))
-        out, lse = self._kfa.allocate_outputs(q_sample)
-        self._scratch = _Scratch(
-            out, lse, self._kfa.allocate_workspace(q_sample, kv_sample))
+        if scratch is None:
+            out, lse = self._kfa.allocate_outputs(q_sample)
+            scratch = _Scratch(
+                out, lse, self._kfa.allocate_workspace(q_sample, kv_sample))
+        elif (
+            scratch.out.shape != q_sample.shape
+            or scratch.out.dtype != dtype
+            or scratch.out.device != q_sample.device
+            or scratch.lse.shape != (b, heads, seq_q)
+            or scratch.lse.device != q_sample.device
+        ):
+            raise ValueError(
+                "attention_core dense: shared scratch does not match "
+                "the bound attention form"
+            )
+        self._scratch = scratch
         self._frt_arm(
             dtypes=(dtype,), device=q_sample.device, k=int(head_dim),
             rows=int(b * heads * seq_q))

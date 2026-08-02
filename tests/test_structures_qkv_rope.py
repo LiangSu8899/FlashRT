@@ -117,6 +117,24 @@ class _FakeRope(nn.Module):
         )
 
 
+class _FakeDenseAttention(nn.Module):
+    instances = []
+
+    def __init__(self, q_shape, kv_shape, dtype, device, *, scratch=None):
+        super().__init__()
+        del q_shape, kv_shape, dtype, device
+        self._scratch = object() if scratch is None else scratch
+        self._frt_guard = None
+        self.calls = 0
+        self.__class__.instances.append(self)
+
+    def forward(self, query, key, value, *, scale=None):
+        self.calls += 1
+        return torch.nn.functional.scaled_dot_product_attention(
+            query, key, value, scale=scale
+        )
+
+
 def test_qkv_rope_catalog_excludes_norm_and_cache_state():
     spec = load("qkv_rope")
     assert spec.version == 1
@@ -164,6 +182,57 @@ def test_packed_vision_adapter_is_capability_based_and_reversible(monkeypatch):
     enable()
     host.block.attn(hidden, cu, (cos, sin))
     assert fake.calls == 2
+    extras["revert"][0]()
+
+
+def test_packed_vision_adapter_composes_single_segment_attention(monkeypatch):
+    host = _Host().eval()
+    fake_rope = _FakeRope(host.block.attn.qkv.bias)
+    _FakeDenseAttention.instances = []
+    monkeypatch.setattr(
+        adapter_mod,
+        "bind_packed_bias_qkv_rope",
+        lambda *args, **kwargs: fake_rope,
+    )
+    monkeypatch.setattr(
+        adapter_mod, "DenseAttention", _FakeDenseAttention
+    )
+    tokens = 7
+    hidden = torch.randn(tokens, 32, dtype=torch.bfloat16)
+    angle = torch.randn(tokens, 4, dtype=torch.float32)
+    cos = torch.cat((angle.cos(), angle.cos()), dim=-1).contiguous()
+    sin = torch.cat((angle.sin(), angle.sin()), dim=-1).contiguous()
+    cu = torch.tensor([0, tokens], dtype=torch.int32)
+    expected = host.block.attn(hidden, cu, (cos, sin))
+
+    plan = SimpleNamespace(seams=[], notes={})
+    extras = adapter_mod.PackedQkvRopeAdapter()(
+        host,
+        plan,
+        {"block.mlp": {"rows": tokens}},
+        compose_attention=True,
+    )
+    assert extras is not None
+    actual = host.block.attn(hidden, cu, (cos, sin))
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+    assert len(_FakeDenseAttention.instances) == 1
+    assert _FakeDenseAttention.instances[0].calls == 2  # bind smoke + route
+    assert "block.attn::attention_core" in extras["observed"]
+    assert plan.notes["composed_structures"] == [
+        "qkv_rope->attention_core"
+    ]
+
+    multi_segment = torch.tensor([0, 3, tokens], dtype=torch.int32)
+    multi_expected = _PackedVisionAttention.forward(
+        host.block.attn, hidden, multi_segment, (cos, sin)
+    )
+    multi_actual = host.block.attn(
+        hidden, multi_segment, (cos, sin)
+    )
+    torch.testing.assert_close(
+        multi_actual, multi_expected, atol=2e-2, rtol=2e-2
+    )
+    assert _FakeDenseAttention.instances[0].calls == 2
     extras["revert"][0]()
 
 
