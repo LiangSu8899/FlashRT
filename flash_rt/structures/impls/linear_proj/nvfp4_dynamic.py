@@ -92,6 +92,14 @@ class LinearProjNvfp4Dynamic(GuardedSeam, torch.nn.Module):
         kern = _kernel()
         self._quantize = kern.quantize_fp4_sfa_fp16
         self._gemm = kern.fp4_w4a16_linear_bf16
+        # M=1 decode rows route to the warp-split GEMV where the build
+        # carries it and the shape qualifies (its own contract: N%8,
+        # K a multiple of 64*warps). Absence is not a refusal - the
+        # tiled GEMM serves every shape correctly, the GEMV just fills
+        # the SMs it underfills at long-K decode shapes.
+        gemv = getattr(kern, "fp4_w4a4_gemv_warpsplit_bf16", None)
+        self._gemv = (gemv if gemv is not None
+                      and n % 8 == 0 and k % (64 * 4) == 0 else None)
         self._frt_arm(dtypes=CAST_OK, device=w_packed.device, k=int(k))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -102,8 +110,11 @@ class LinearProjNvfp4Dynamic(GuardedSeam, torch.nn.Module):
         flat = x.reshape(-1, shape[-1])
         a_packed, a_sfa = self._quantize(
             flat.to(torch.float16).contiguous())
-        y = self._gemm(a_packed, self._w_packed, a_sfa, self._w_sfb,
-                       variant=2)
+        if flat.shape[0] == 1 and self._gemv is not None:
+            y = self._gemv(a_packed, self._w_packed, a_sfa, self._w_sfb)
+        else:
+            y = self._gemm(a_packed, self._w_packed, a_sfa, self._w_sfb,
+                           variant=2)
         if self._bias is not None:
             y = y + self._bias
         return y.reshape(*shape[:-1], self._n).type_as(x)
