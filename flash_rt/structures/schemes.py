@@ -157,16 +157,24 @@ class W8A16Decode(QuantScheme):
     on weights, done at bind time), so every point declares ``None``.
     Routes ``decoder_ffn`` seams to the ``w8a16_static`` impl, whose own
     M-dispatch sends decode shapes to the kernel and prefill back to the
-    host. Other structures stay at host precision: this scheme is the
-    decode recipe, not a whole-host FP8 replacement.
+    host, and ``linear_proj`` seams (the attention Q/K/V/O family) to
+    its projection twin under the same band contract. Other structures
+    stay at host precision: this scheme is the decode recipe, not a
+    whole-host FP8 replacement.
 
     A ``decoder_ffn`` seam is recognised by the point its spec declares
     (``act_after_mul`` — the gated activation), which is
-    backend-independent by construction.
+    backend-independent by construction; a ``linear_proj`` seam by the
+    structure name the report entry carries.
     """
 
     name = "w8a16_decode"
     _format = "w8a16_static"
+    #: format for linear_proj seams, or None to keep them at host
+    #: precision (the 4-bit twin: its linear auto band is too narrow to
+    #: route blind — M in [1, 2] with strict N/K limits — so it stays
+    #: host until a measured table says otherwise)
+    _linear_format: str | None = "w8a16_static"
 
     def statistics(self, points: Sequence) -> dict[str, PointStat]:
         return {f"{p.path}|{p.name}": PointStat(None) for p in points}
@@ -176,10 +184,14 @@ class W8A16Decode(QuantScheme):
         for seam_path, pts in report.items():
             if any(k.endswith("|act_after_mul") for k in pts):
                 formats[seam_path] = self._format
+            elif (self._linear_format is not None
+                    and getattr(pts, "structure", None) == "linear_proj"):
+                formats[seam_path] = self._linear_format
             else:
                 keep.append(seam_path)
         return Decision(keep_host=tuple(keep),
-                        reasons={p: f"{self.name} binds decoder_ffn only"
+                        reasons={p: f"{self.name} binds decode-band "
+                                    f"GEMM seams only"
                                  for p in keep},
                         formats=formats)
 
@@ -194,6 +206,7 @@ class W4A16Decode(W8A16Decode):
 
     name = "w4a16_decode"
     _format = "w4a16_static"
+    _linear_format = None
 
 
 class Nvfp4Awq(QuantScheme):

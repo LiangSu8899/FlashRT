@@ -97,6 +97,81 @@ def test_w8a16_routing_is_unchanged_by_the_subclass():
         "layers.0.mlp": "w8a16_static"}
 
 
+class _Stats(dict):
+    def __init__(self, structure, values):
+        super().__init__(values)
+        self.structure = structure
+
+
+def test_w8a16_scheme_routes_linear_proj_seams():
+    # the decode recipe covers the attention projection family too: a
+    # report entry carrying the linear_proj structure name is routed to
+    # the projection twin, everything unrecognised stays at host
+    report = {
+        "layers.0.mlp": _Stats("decoder_ffn", {
+            "layers.0.mlp.down_proj|act_after_mul": None}),
+        "layers.0.self_attn.q_proj": _Stats("linear_proj", {
+            "layers.0.self_attn.q_proj|x": None}),
+        "layers.0.norm": _Stats("norm_fused", {"layers.0.norm|x": None}),
+    }
+    d = W8A16Decode().decide(report)
+    assert d.formats == {"layers.0.mlp": "w8a16_static",
+                         "layers.0.self_attn.q_proj": "w8a16_static"}
+    assert d.keep_host == ("layers.0.norm",)
+
+
+def test_w4a16_scheme_keeps_linear_proj_at_host():
+    # the 4-bit twin's linear auto band is too narrow to route blind;
+    # its projections stay at host precision until a measured table
+    # says otherwise
+    report = {"layers.0.self_attn.q_proj": _Stats("linear_proj", {
+        "layers.0.self_attn.q_proj|x": None})}
+    d = W4A16Decode().decide(report)
+    assert not d.formats
+    assert d.keep_host == ("layers.0.self_attn.q_proj",)
+
+
+def test_w8a16_linear_band_mirrors_the_kernel_qualification():
+    # the kernel's auto dispatch accepts M in [1,4] with an N/K shape
+    # table (w8_auto_linear_supported in the package's binding); the
+    # impl's predicate must agree with it, not rediscover it as
+    # runtime errors
+    from flash_rt.structures.impls.linear_proj.w8a16_static import _qualified
+
+    assert _qualified(1, 512, 1024)          # K <= 1024 always
+    assert _qualified(4, 128, 1024)
+    assert _qualified(1, 1024, 4096)         # K <= 4096 needs N >= 1024
+    assert not _qualified(1, 960, 4096)
+    assert _qualified(2, 1024, 8192)         # K > 4096, M <= 2: N >= 1024
+    assert not _qualified(3, 1024, 8192)     # K > 4096, M in {3,4}: N >= 2048
+    assert _qualified(3, 2048, 8192)
+    assert not _qualified(5, 16384, 4096)    # M=5 never qualifies
+    assert not _qualified(0, 16384, 4096)
+
+
+def test_w8a16_linear_impl_contract_surface():
+    import torch
+
+    from flash_rt.structures.impls.linear_proj import w8a16_static
+
+    assert w8a16_static.KERNEL_DEP["repo"] == "flashrt/weight-only-ffn"
+    assert w8a16_static._check({"w": torch.zeros(1024, 4096)}) == (1024, 4096)
+    with pytest.raises(ValueError, match="outside support envelope"):
+        w8a16_static._check({"w": torch.zeros(1024, 96)})
+    with pytest.raises(ValueError, match="bias shape"):
+        w8a16_static._check({"w": torch.zeros(1024, 4096),
+                             "b": torch.zeros(960)})
+
+
+def test_bind_router_accepts_w8a16_linear_format():
+    import inspect
+
+    from flash_rt.structures import autobuild
+
+    src = inspect.getsource(autobuild._bind_auto)
+    assert 'fmt == "w8a16_static"' in src
+
+
 def test_w4a16_impl_contract_surface():
     import torch
 

@@ -1025,7 +1025,7 @@ def _bind_auto(model, seam, cap, plan, act_scales, negotiate_fp8,
                       fmt_params=fmt_params)
 
     if fmt and not (seam.structure == "qkv_pack" and fmt == "bf16_pack") \
-            and seam.structure != "decoder_ffn":
+            and seam.structure not in ("decoder_ffn", "linear_proj"):
         raise ValueError(f"scheme routed {seam.structure} to format "
                          f"{fmt!r}, which has no impl variant here")
 
@@ -1080,6 +1080,16 @@ def _bind_auto(model, seam, cap, plan, act_scales, negotiate_fp8,
                          else points.seen_dtypes(seam.path, "x")))
 
     if seam.structure == "linear_proj":
+        if fmt == "w8a16_static":
+            # weight-only decode band: no calibration scale to look up,
+            # and the weight dict is already the kernel's [N, K] layout
+            from .impls.linear_proj import w8a16_static as proj_w8
+            return proj_w8.bind_proj_seam(
+                seam_weights(model, seam),
+                original=_resolve(model, seam.path))
+        if fmt not in (None, "fp8_static"):
+            raise ValueError(f"scheme routed linear_proj to format "
+                             f"{fmt!r}, which has no impl variant here")
         in_s = scale("x")
         if in_s is None:
             return None
