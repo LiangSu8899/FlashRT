@@ -19,14 +19,23 @@ class HubV3GatedDeltaCore(GuardedSeam, torch.nn.Module):
     """
 
     def __init__(self, sample: torch.Tensor,
-                 g_dtype: torch.dtype = torch.bfloat16):
+                 g_dtype: torch.dtype = torch.bfloat16,
+                 state_dtype: torch.dtype = torch.bfloat16):
         super().__init__()
         if sample.dtype != torch.bfloat16:
             raise ValueError("gated_delta_core v3 requires BF16 Q/K/V")
         if g_dtype not in (torch.bfloat16, torch.float32):
             raise ValueError(
                 "gated_delta_core v3 serves BF16 or FP32 log-decay only")
+        if state_dtype not in (torch.bfloat16, torch.float32):
+            raise ValueError(
+                "gated_delta_core v3 serves BF16 or FP32 state only")
+        if state_dtype is torch.float32 and g_dtype is not torch.float32:
+            raise ValueError(
+                "gated_delta_core v3 has no BF16-g/FP32-state entry; no "
+                "host has exposed that combination")
         self._g_dtype = g_dtype
+        self._state_dtype = state_dtype
         if sample.ndim != 4 or sample.shape[0] != 1 \
                 or sample.shape[1] != 1 \
                 or sample.shape[2] not in (32, 48) \
@@ -40,13 +49,15 @@ class HubV3GatedDeltaCore(GuardedSeam, torch.nn.Module):
         self.heads = int(sample.shape[2])
         self._ops = hub_kernel("flashrt/gated-delta-attention", ">=3")
         if g_dtype is torch.float32:
-            step = getattr(self._ops,
-                           "gated_delta_recurrent_inout_gf32_bf16", None)
+            name = ("gated_delta_recurrent_inout_gf32_sf32_bf16"
+                    if state_dtype is torch.float32
+                    else "gated_delta_recurrent_inout_gf32_bf16")
+            step = getattr(self._ops, name, None)
             if step is None:
                 raise ValueError(
                     "refused: the installed gated-delta-attention build "
-                    "predates the FP32-log-decay entry; a release with "
-                    "gated_delta_recurrent_inout_gf32_bf16 is required")
+                    f"predates the {name} entry; a release carrying it "
+                    "is required")
         else:
             step = self._ops.gated_delta_recurrent_inout_bf16
         self._step = step
@@ -54,7 +65,7 @@ class HubV3GatedDeltaCore(GuardedSeam, torch.nn.Module):
             "_state_out",
             torch.empty(
                 1, self.heads, 128, 128,
-                device=sample.device, dtype=torch.bfloat16),
+                device=sample.device, dtype=self._state_dtype),
             persistent=False,
         )
         self.register_buffer(
@@ -102,9 +113,10 @@ class HubV3GatedDeltaCore(GuardedSeam, torch.nn.Module):
                 "and BF16 beta; the host's dtypes moved after binding")
         if state is None or state.shape != (1, self.heads, 128, 128):
             raise ValueError("gated_delta_core v3 state shape differs")
-        if state.dtype != torch.bfloat16 or not state.is_contiguous():
+        if state.dtype != self._state_dtype or not state.is_contiguous():
             raise ValueError(
-                "gated_delta_core v3 requires contiguous BF16 state")
+                f"gated_delta_core v3 bound contiguous {self._state_dtype} "
+                "state; the host's state moved after binding")
         # One custom op. The caller's state is read-only and the final state is
         # written into graph-stable storage for snapshot and rollback.
         out, state_out = self._step(
@@ -122,8 +134,11 @@ def bind_gated_delta_core(sample: dict[str, torch.Tensor]):
 
     The entry is chosen by the observed sample's log-decay dtype — the
     form the host actually calls with, not a preference."""
-    core = HubV3GatedDeltaCore(sample["query"],
-                               g_dtype=sample["g"].dtype)
+    state = sample.get("state")
+    core = HubV3GatedDeltaCore(
+        sample["query"], g_dtype=sample["g"].dtype,
+        state_dtype=(state.dtype if state is not None
+                     else torch.bfloat16))
     with torch.no_grad():
         core(
             sample["query"], sample["key"], sample["value"],

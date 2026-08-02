@@ -184,5 +184,5 @@ def test_hub_v3_refuses_builds_without_the_fp32_entry(monkeypatch):
 
     monkeypatch.setattr(hub_v3, "hub_kernel", lambda repo, ver: _OldOps())
     q = torch.zeros(1, 1, 32, 128, dtype=torch.bfloat16)
-    with _pytest.raises(ValueError, match="predates the FP32"):
+    with _pytest.raises(ValueError, match="predates the .*gf32"):
         hub_v3.HubV3GatedDeltaCore(q, g_dtype=torch.float32)
