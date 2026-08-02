@@ -20,10 +20,11 @@ Cache contract (the host's, followed not replaced): the layer reads and
 writes ``cache_params.conv_states[idx]`` and ``recurrent_states[idx]``.
 The host keeps the last K raw inputs in the conv state; the Hub update
 kernel keeps the previous K-1, so the impl feeds ``state[..., 1:]`` and
-rolls the host slot forward itself. The recurrent state is written
-back in BF16 through ping-pong buffers — the core reads the previous
-state while writing the next, and one buffer serving both sides of the
-same step would race.
+rolls the host slot forward itself. The recurrent state slot is
+normalised to a stable BF16 tensor on the first decode step and never
+re-pointed after that: the core writes a scratch buffer (it cannot
+write the slot it is reading within the same step) and the result is
+copied back into the slot, which is what graph replay requires.
 """
 
 from __future__ import annotations
@@ -134,8 +135,6 @@ class FusedGatedDeltaDecodeLayer(GuardedSeam, torch.nn.Module):
                 f"{projection_format!r}")
         self._state_a = torch.empty(1, self._hv, self._d, self._d,
                                     device=dev, dtype=torch.bfloat16)
-        self._state_b = torch.empty_like(self._state_a)
-        self._flip = False
         self._core_out = torch.empty(1, self._hv, self._d, device=dev,
                                      dtype=torch.bfloat16)
         guard = self._frt_arm(dtypes=CAST_OK, device=dev, k=d_model)
@@ -198,16 +197,20 @@ class FusedGatedDeltaDecodeLayer(GuardedSeam, torch.nn.Module):
             a.view(1, self._hv), b.view(1, self._hv),
             self._neg_exp_a, self._dt_bias)
         state_in = cache_params.recurrent_states[self._idx]
-        if state_in.dtype != torch.bfloat16:
-            state_in = state_in.to(torch.bfloat16)
-        state_out = self._state_b if self._flip else self._state_a
-        self._flip = not self._flip
+        if state_in.dtype != torch.bfloat16 or not state_in.is_contiguous():
+            # normalise the cache slot to a contiguous BF16 tensor once
+            # (first decode after prefill); after this the slot pointer
+            # never changes, which is what graph replay requires
+            state_in = state_in.to(torch.bfloat16).contiguous()
+            cache_params.recurrent_states[self._idx] = state_in
         core_out, new_state = self._gda.gated_delta_recurrent_inout_bf16(
             q.view(1, self._hv, self._d), k.view(1, self._hv, self._d),
             v.view(1, self._hv, self._d), g, beta,
-            state_in.contiguous(), use_qk_l2norm=True,
-            state_out=state_out, out=self._core_out)
-        cache_params.recurrent_states[self._idx] = new_state
+            state_in, use_qk_l2norm=True,
+            state_out=self._state_a, out=self._core_out)
+        # scratch -> slot copy keeps the slot pointer stable; the core
+        # cannot write the slot it is reading within the same step
+        state_in.copy_(new_state)
 
         normed = self._fused.rms_norm_gated_silu_bf16(
             core_out.view(self._hv, self._d), z.view(self._hv, self._d),
