@@ -89,8 +89,11 @@ coverage:
       structures: [qkv_pack, attention_core, linear_proj]
     - name: modulated_ffn
       stage: denoise
-      classification: host_stage
+      classification: structure
       seam: "WanAttentionBlock modulated GELU FFN and gated residual"
+      structures: [vision_ffn]   # diffusers FeedForward (net.0.proj/net.2)
+                                 # binds as the MLP slice; modulation and
+                                 # gated residual stay host
     - name: denoise_head
       stage: denoise
       classification: structure
