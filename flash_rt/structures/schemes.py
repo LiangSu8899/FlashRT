@@ -103,6 +103,12 @@ class QuantScheme:
 
     name = "base"
 
+    #: Optional format for the gated-delta layer's packed projections.
+    #: The fused-layer adapter consults this; ``None`` keeps them at
+    #: host precision. This is a scheme attribute, not an impl default —
+    #: quantising those projections is a precision decision.
+    gdn_projection_format: str | None = None
+
     def statistics(self, points: Sequence) -> dict[str, PointStat]:
         """Per point key (``"path|name"``): what to measure there."""
         return {f"{p.path}|{p.name}": PointStat() for p in points}
@@ -284,6 +290,21 @@ class NoQuant(QuantScheme):
                                  for p in keep})
 
 
+class W4A4Decode(NoQuant):
+    """NVFP4 W4A4 band on the gated-delta packed projections only.
+
+    Everything the ``none`` scheme keeps at host precision stays there;
+    the one decision this scheme adds is routing the fused gated-delta
+    layer's packed input projection and output projection through the
+    dynamic NVFP4 path (weights packed at bind time, activations
+    quantised per call). Decode-band only — the retained host layer
+    still serves prefill at its own precision.
+    """
+
+    name = "w4a4_decode"
+    gdn_projection_format = "nvfp4_dynamic"
+
+
 class Bf16Structural(QuantScheme):
     """No quantisation; retain only BF16 structural fusions."""
 
@@ -367,6 +388,7 @@ register("fp8_static", Fp8Static())
 register("fp8_static_keep_outliers", Fp8Static(keep_outliers=20.0))
 register("w8a16_decode", W8A16Decode())
 register("w4a16_decode", W4A16Decode())
+register("w4a4_decode", W4A4Decode())
 register("none", NoQuant())
 register("bf16_structural", Bf16Structural())
 register("nvfp4_awq", Nvfp4Awq())

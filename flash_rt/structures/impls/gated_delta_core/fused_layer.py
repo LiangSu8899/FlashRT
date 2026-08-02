@@ -6,8 +6,12 @@ on a launch-bound host (a quantized projection swap *lost* throughput
 here — the receipts are on the record). This impl owns the layer's
 cached-decode step as one short chain of Hub kernels:
 
-    in_proj GEMVs -> causal_conv1d_update -> broadcast QKV split
+    packed in_proj GEMV -> causal_conv1d_update -> broadcast QKV split
     -> gating -> gated-delta recurrent core -> gated RMSNorm -> out_proj
+
+A scheme may route the two projection GEMVs through the dynamic NVFP4
+band (``gdn_projection_format="nvfp4_dynamic"``); the BF16 weights are
+retained for prefill and detach either way.
 
 Everything else — prefill, uncached calls, masked batches — dispatches
 to the retained host layer and is counted.
@@ -63,7 +67,8 @@ class FusedGatedDeltaDecodeLayer(GuardedSeam, torch.nn.Module):
     _frt_host_attr = "host_layer"
     _frt_can_fallback = True
 
-    def __init__(self, host, layer_idx: int):
+    def __init__(self, host, layer_idx: int,
+                 projection_format: str | None = None):
         super().__init__()
         gda, conv, fused = _packages()
         self._gda, self._conv, self._fused = gda, conv, fused
@@ -106,6 +111,27 @@ class FusedGatedDeltaDecodeLayer(GuardedSeam, torch.nn.Module):
         self._eps = float(getattr(host.norm, "variance_epsilon",
                                   getattr(host.norm, "eps", 1e-6)))
         d_model = int(host.in_proj_qkv.weight.shape[1])
+        # optional W4A4 decode band on the two projection GEMVs — a
+        # scheme decision, never a default. The BF16 weights (and the
+        # host views into them) are retained: prefill and detach stay
+        # exact, only the decode band changes representation. A refusal
+        # (missing package, unqualified shape) degrades to the BF16
+        # band for this layer and is counted, not raised.
+        self._proj_in = self._proj_out = None
+        if projection_format == "nvfp4_dynamic":
+            from ..linear_proj import nvfp4_dynamic
+            try:
+                self._proj_in, rel_in = nvfp4_dynamic.bind_proj_seam(
+                    {"w": self._packed_w})
+                self._proj_out, rel_out = nvfp4_dynamic.bind_proj_seam(
+                    {"w": host.out_proj.weight.detach()})
+                self._proj_rel = (rel_in, rel_out)
+            except ValueError:
+                self._proj_in = self._proj_out = None
+        elif projection_format is not None:
+            raise ValueError(
+                f"refused: unknown gdn projection format "
+                f"{projection_format!r}")
         self._state_a = torch.empty(1, self._hv, self._d, self._d,
                                     device=dev, dtype=torch.bfloat16)
         self._state_b = torch.empty_like(self._state_a)
@@ -114,6 +140,8 @@ class FusedGatedDeltaDecodeLayer(GuardedSeam, torch.nn.Module):
                                      dtype=torch.bfloat16)
         guard = self._frt_arm(dtypes=CAST_OK, device=dev, k=d_model)
         guard.notes["host_form_calls"] = 0
+        guard.notes["proj_band"] = ("nvfp4" if self._proj_in is not None
+                                    else "bf16")
 
     def __getattr__(self, name):
         try:
@@ -146,7 +174,8 @@ class FusedGatedDeltaDecodeLayer(GuardedSeam, torch.nn.Module):
 
         host = self.host_layer
         x = hidden_states.view(1, -1)
-        allp = torch.nn.functional.linear(x, self._packed_w)
+        allp = (self._proj_in(x) if self._proj_in is not None
+                else torch.nn.functional.linear(x, self._packed_w))
         # column slices of a single-row output stay contiguous
         (q0, q1), (z0, z1), (b0, b1), (a0, a1) = self._splits
         mixed = allp[:, q0:q1]
@@ -183,15 +212,19 @@ class FusedGatedDeltaDecodeLayer(GuardedSeam, torch.nn.Module):
         normed = self._fused.rms_norm_gated_silu_bf16(
             core_out.view(self._hv, self._d), z.view(self._hv, self._d),
             host.norm.weight, eps=self._eps)
-        out = torch.nn.functional.linear(normed.view(1, -1),
-                                         host.out_proj.weight)
+        flat_norm = normed.view(1, -1)
+        out = (self._proj_out(flat_norm) if self._proj_out is not None
+               else torch.nn.functional.linear(flat_norm,
+                                               host.out_proj.weight))
         return out.view(1, 1, -1).to(hidden_states.dtype)
 
 
 @torch.no_grad()
-def bind_fused_decode_layer(host, layer_idx: int):
+def bind_fused_decode_layer(host, layer_idx: int,
+                            projection_format: str | None = None):
     """Bind one layer; a smoke step runs on zeros before handing out."""
-    bound = FusedGatedDeltaDecodeLayer(host, layer_idx)
+    bound = FusedGatedDeltaDecodeLayer(host, layer_idx,
+                                       projection_format)
 
     class _Cache:
         pass

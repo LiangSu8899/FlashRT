@@ -240,3 +240,17 @@ def test_fused_adapter_recognises_by_shape_and_ladders_cleanly(monkeypatch):
     with _pytest.raises(ValueError, match="lacks"):
         TransformersGatedDeltaFusedAdapter()(_Model(), lambda: None)
     fused_layer._packages.cache_clear()
+
+
+def test_w4a4_scheme_routes_the_gdn_projection_band():
+    from flash_rt.structures import schemes
+    from flash_rt.structures.adapters.transformers_gated_delta_fused \
+        import TransformersGatedDeltaFusedAdapter
+
+    assert schemes.QuantScheme.gdn_projection_format is None
+    assert schemes.get("none").gdn_projection_format is None
+    assert (schemes.get("w4a4_decode").gdn_projection_format
+            == "nvfp4_dynamic")
+    # the fused adapter declares scheme awareness so autobuild hands
+    # the active scheme through; older adapters keep the two-arg call
+    assert TransformersGatedDeltaFusedAdapter.scheme_aware is True

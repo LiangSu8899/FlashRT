@@ -826,7 +826,12 @@ def auto_swaps(
         from . import adapters as _adapters  # noqa: F401 (registers)
         for adapter in _GATED_DELTA_ADAPTERS:
             try:
-                result = adapter(model, thunks[0])
+                # adapters that declare scheme awareness receive the
+                # active scheme; the rest keep the two-argument call
+                if getattr(adapter, "scheme_aware", False):
+                    result = adapter(model, thunks[0], scheme=scheme_obj)
+                else:
+                    result = adapter(model, thunks[0])
             except (ValueError, RuntimeError) as refusal:
                 plan.notes.setdefault("refused", []).append(
                     ("gated_delta_core", str(refusal)[:120]))

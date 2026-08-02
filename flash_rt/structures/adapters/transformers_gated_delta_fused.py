@@ -44,8 +44,10 @@ class TransformersGatedDeltaFusedAdapter:
     """Bind every fusable gated-delta layer module as one fused seam."""
 
     __name__ = "transformers_gated_delta_fused"
+    scheme_aware = True
 
-    def __call__(self, model, forward):
+    def __call__(self, model, forward, scheme=None):
+        fmt = getattr(scheme, "gdn_projection_format", None)
         sites = []
         for path, module in model.named_modules():
             for child_name, child in module.named_children():
@@ -64,7 +66,8 @@ class TransformersGatedDeltaFusedAdapter:
         for parent, child_name, child, idx in sites:
             # a package predating the chain raises here once, and the
             # whole adapter steps aside for the callable-slot ladder
-            bound = fused_layer.bind_fused_decode_layer(child, idx)
+            bound = fused_layer.bind_fused_decode_layer(
+                child, idx, projection_format=fmt)
             routes.append((parent, child_name, child, bound))
             observed[f"{child_name}@{idx}.gated_delta_fused"] = bound
 
