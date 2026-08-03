@@ -215,6 +215,24 @@ mod  = structures.get("decoder_ffn").bind(module, calibration=[x])
 stage = structures.capture(hot, windows={...})
 ```
 
+The serving door builds the whole-loop decode form over whatever swaps
+are attached — a duck-typed static hybrid cache, the decoder stack
+found by its slots, argmax and the position increment in-graph, the
+step optionally compiled before capture:
+
+```python
+loop = structures.decode_loop(model, max_len=4096)
+out = loop.generate(input_ids, max_new_tokens=256)     # greedy, exact
+
+loop.enable_mtp(ckpt_dir, default_k=6)                 # draft head
+out = loop.generate_speculative(input_ids, 256)        # bit-identical
+```
+
+Speculative decode is exact by construction (the verify pass recomputes
+every draft token), so its gate is token identity; draft precision is a
+scheme decision (``mtp_projection_format``) judged by acceptance
+length, and BF16 is the arm until a measured table says otherwise.
+
 Fixed-iteration hosts use the same doors. A graph-safe fixed ``for`` follows
 the ordinary capture path. A registered host-family adapter may normalize a
 recognized tensor-controlled ``while`` to the catalog's canonical
