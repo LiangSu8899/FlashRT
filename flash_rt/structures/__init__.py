@@ -92,7 +92,8 @@ def explain(plan):
     return _explain(plan)
 
 
-def decode_loop(model, *, max_len, compile_step=True):
+def decode_loop(model, *, max_len, compile_step=True,
+                compile_prefill=True):
     """Serving door: the whole-loop decode form (static cache + compiled
     step + whole-step CUDA graph) over whatever structures are attached.
 
@@ -102,7 +103,8 @@ def decode_loop(model, *, max_len, compile_step=True):
         build_decode_loop)
 
     return build_decode_loop(model, max_len=max_len,
-                             compile_step=compile_step)
+                             compile_step=compile_step,
+                             compile_prefill=compile_prefill)
 
 
 from . import schemes  # noqa: E402  (registry: quantisation schemes)

@@ -89,10 +89,12 @@ def _find_stack(model):
 class WholeStepDecodeLoop:
     """Compiled, graph-captured greedy decode over the attached model."""
 
-    def __init__(self, model, *, max_len, compile_step=True):
+    def __init__(self, model, *, max_len, compile_step=True,
+                 compile_prefill=True):
         lm = _find_stack(model)
         self._model = model
         self._lm = lm
+        self._compile_prefill = bool(compile_prefill)
         head = getattr(model, "lm_head", None)
         if head is None:
             raise ValueError("refused: host carries no lm_head")
@@ -168,8 +170,9 @@ class WholeStepDecodeLoop:
                 f"window {self._max}")
         self.cache.frt_continue = False
         self._rope_delta.zero_()
-        logits = self._step(input_ids,
-                            torch.arange(L, device=input_ids.device))
+        pf = self._step if self._compile_prefill else self._fwd
+        logits = pf(input_ids,
+                    torch.arange(L, device=input_ids.device))
         self._cur.copy_(logits.float().argmax(-1))
         self._pos.fill_(L)
         toks = [self._cur.clone()]
@@ -482,7 +485,9 @@ class WholeStepDecodeLoop:
         return out[:, :L + max_new_tokens]
 
 
-def build_decode_loop(model, *, max_len, compile_step=True):
+def build_decode_loop(model, *, max_len, compile_step=True,
+                      compile_prefill=True):
     """Build the whole-loop form over whatever is attached to ``model``."""
     return WholeStepDecodeLoop(model, max_len=max_len,
-                               compile_step=compile_step)
+                               compile_step=compile_step,
+                               compile_prefill=compile_prefill)

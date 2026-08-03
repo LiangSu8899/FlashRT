@@ -187,9 +187,15 @@ class FusedGatedDeltaDecodeLayer(GuardedSeam, torch.nn.Module):
         # slots; a fresh prompt starts from zero. The signal is an
         # explicit attribute only loop-owned caches carry — host caches
         # lack it and always get prompt semantics.
-        cont = bool(getattr(cache_params, "frt_continue", False))
-        old_slot = cache_params.conv_states[self._idx] if cont else None
-        cont = cont and torch.is_tensor(old_slot)
+        # three continuation sources, one rule: a filled conv slot means
+        # mid-stream unless the cache explicitly says fresh. Hosts that
+        # chunk long prompts re-enter this branch per chunk with their
+        # own cache carrying state (the 2K receipts caught the zero-
+        # reset); loop-owned caches say False around a fresh prompt and
+        # True around a verify batch.
+        flag = getattr(cache_params, "frt_continue", None)
+        old_slot = cache_params.conv_states[self._idx]
+        cont = torch.is_tensor(old_slot) and flag is not False
         if cont:
             conv_state = old_slot[:, :, 1:].contiguous().clone()
             state = cache_params.recurrent_states[self._idx] \
