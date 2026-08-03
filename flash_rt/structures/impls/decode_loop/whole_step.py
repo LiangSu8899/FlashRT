@@ -252,11 +252,12 @@ class WholeStepDecodeLoop:
             input_ids, torch.arange(L, device=dev))
         self.cache.frt_continue = True
         tok = logits[:, -1:].float().argmax(-1)
-        # draft KV over the prompt: position p keys on (h_{p-1}, y_p)
-        for p in range(1, L):
-            pt = torch.tensor([p], device=dev)
-            self._mtp(hn[:, p - 1:p], input_ids[:, p:p + 1], pt,
-                      self.cache, self._row(pt))
+        # draft KV over the prompt: position p keys on (h_{p-1}, y_p) —
+        # one multi-position pass over the whole prompt
+        if L > 1:
+            pr = torch.arange(1, L, device=dev)
+            self._mtp(hn[:, :L - 1], input_ids[:, 1:L], pr,
+                      self.cache, self._row(pr))
         produced = [tok]
         pos = L
         h_last = hn[:, -1:]
@@ -273,7 +274,6 @@ class WholeStepDecodeLoop:
                                    self._row(pt))
                 dtok = lg[:, -1:].float().argmax(-1)
                 dtoks.append(dtok)
-            seq = torch.cat([produced[-1]] + dtoks[:-1], dim=1)                 if k_eff > 1 else produced[-1]
             seq = torch.cat([produced[-1]] + dtoks, dim=1)[:, :k_eff + 1]
             pos_v = torch.arange(pos, pos + k_eff + 1, device=dev)
             lg_v, hn_v = self._fwd_full(seq[:, :k_eff + 1], pos_v)
@@ -282,29 +282,33 @@ class WholeStepDecodeLoop:
             while j < k_eff and int(dtoks[j][0, 0]) == int(
                     targets[0, j]):
                 j += 1
-            # roll the gated-delta states back and re-advance exactly
-            # the accepted prefix — linear states cannot unwind
-            for i, cs, rs in snaps:
-                self.cache.conv_states[i].copy_(cs)
-                self.cache.recurrent_states[i].copy_(rs)
-            pos_a = torch.arange(pos, pos + j + 1, device=dev)
-            lg_a, hn_a = self._fwd_full(seq[:, :j + 1], pos_a)
-            bonus = lg_a[:, -1:].float().argmax(-1)
-            # draft KV for the accepted region keys on main hiddens
-            prev_h = h_last
-            row_toks = torch.cat([seq[:, 1:j + 1], bonus], dim=1)                 if j > 0 else bonus
-            for r in range(j + 1):
-                pt = torch.tensor([pos + r], device=dev)
-                self._mtp(prev_h if r == 0 else hn_a[:, r - 1:r],
-                          seq[:, r:r + 1], pt, self.cache,
-                          self._row(pt))
-            del row_toks
+            if j == k_eff:
+                # full acceptance: the verify pass committed exactly
+                # the accepted stream — no rollback, no second pass
+                bonus = targets[:, -1:].contiguous()
+                hn_x = hn_v
+            else:
+                # roll the gated-delta states back and re-advance the
+                # accepted prefix — linear states cannot unwind
+                for i, cs, rs in snaps:
+                    self.cache.conv_states[i].copy_(cs)
+                    self.cache.recurrent_states[i].copy_(rs)
+                pos_a = torch.arange(pos, pos + j + 1, device=dev)
+                lg_a, hn_x = self._fwd_full(seq[:, :j + 1], pos_a)
+                bonus = lg_a[:, -1:].float().argmax(-1)
+            # draft KV for the accepted region keys on main hiddens —
+            # one multi-position pass, not j+1 single steps
+            prev_rows = (torch.cat([h_last, hn_x[:, :j]], dim=1)
+                         if j > 0 else h_last)
+            pos_rows = torch.arange(pos, pos + j + 1, device=dev)
+            self._mtp(prev_rows, seq[:, :j + 1], pos_rows, self.cache,
+                      self._row(pos_rows))
             for r in range(j):
                 produced.append(dtoks[r])
             produced.append(bonus)
             accepted_hist.append(j + 1)
             pos += j + 1
-            h_last = hn_a[:, -1:]
+            h_last = hn_x[:, j:j + 1]
         self.cache.frt_continue = False
         out = torch.cat([input_ids] + produced, dim=1)
         self.last_acceptance = (sum(accepted_hist) / len(accepted_hist)
