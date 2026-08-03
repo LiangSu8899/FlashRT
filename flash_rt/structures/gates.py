@@ -417,6 +417,56 @@ def env_lock() -> dict[str, Any]:
     return lock
 
 
+def verify_record(record: Mapping[str, Any]) -> bool:
+    """Recompute a record's digest; ``False`` means tampered or torn.
+
+    Two digest recipes exist in the wild: qualification records digest
+    a fixed key subset, probe records digest the whole record as it
+    stood before the digest (and before the env lock) was added. A
+    record verifying under either recipe is intact."""
+    stated = str(record.get("plan_digest", ""))
+    if not stated.startswith("sha256:"):
+        return False
+    body = {k: v for k, v in record.items()
+            if k not in ("plan_digest", "env_lock")}
+    whole = "sha256:" + hashlib.sha256(
+        json.dumps(body, sort_keys=True).encode("utf-8")).hexdigest()
+    if whole == stated:
+        return True
+    subset_keys = ("structure", "spec_digest", "impl", "variant",
+                   "workload", "env", "thresholds")
+    if all(k in record for k in subset_keys):
+        subset = "sha256:" + hashlib.sha256(
+            json.dumps({k: record[k] for k in subset_keys},
+                       sort_keys=True).encode("utf-8")).hexdigest()
+        if subset == stated:
+            return True
+    return False
+
+
+def check_env(record: Mapping[str, Any]) -> list[str]:
+    """Name every way the current environment drifts from a receipt's.
+
+    Empty list = re-runnable as-is. A receipt without a lock is itself
+    a finding."""
+    lock = record.get("env_lock")
+    if not lock:
+        return ["record carries no env_lock"]
+    now = env_lock()
+    drift = []
+    for pkg, ver in (lock.get("packages") or {}).items():
+        cur = now["packages"].get(pkg)
+        if cur != ver:
+            drift.append(f"{pkg}: receipt {ver}, current {cur}")
+    if lock.get("python") != now["python"]:
+        drift.append(f"python: receipt {lock.get('python')}, "
+                     f"current {now['python']}")
+    if (lock.get("pip_freeze_sha256") != now["pip_freeze_sha256"]
+            and not drift):
+        drift.append("installed set differs (freeze digest mismatch)")
+    return drift
+
+
 def save_record(record: Mapping[str, Any], directory: str | pathlib.Path) -> pathlib.Path:
     """Write one qualification record as JSON, named by its plan digest.
 
