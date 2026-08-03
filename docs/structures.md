@@ -119,6 +119,39 @@ region is finished. For example, a fused Q/K norm plus RoPE path remains a
 host stage until a catalog structure owns that boundary; landing the
 structure changes the classification without changing the pipeline family.
 
+### 2.2 Catalog evolution: what a version bump means for your binding
+
+Three facts anchor the process. A spec's ``version`` is an integer in
+``structure.yaml``; every qualification record carries a
+``spec_digest`` — the sha256 of that file's bytes — so any edit to a
+spec, compatible or not, is visible in receipts; and bindings resolve
+specs by name through the registry, never by digest.
+
+The rules:
+
+1. **Byte changes without meaning changes do not exist.** Reordering
+   keys or rewording a comment changes the digest, and a changed
+   digest orphans every receipt that cites the old one. Treat the yaml
+   as frozen bytes between versions; editorial changes ride along with
+   the next real bump.
+2. **A version bump is a new contract, not a patch.** ``v1 -> v2``
+   means at least one of: a point moved, a dimension constraint
+   changed, the reference changed. Old receipts stay valid *for v1*;
+   nothing re-validates automatically.
+3. **Coexistence window.** When v2 lands, v1 stays in the catalog
+   until every in-tree impl and binding has re-qualified against v2 —
+   receipts named with the new digest — and the release notes say so.
+   Third-party bindings pin the version they qualified against; the
+   registry loads what the yaml says, so an unmigrated binding keeps
+   working against v1 until v1 is retired in a *major* release.
+4. **Retirement is loud.** Removing a spec version is a release-notes
+   event with the migration note inline; the registry failing to find
+   a name is a refusal with the reason, not a KeyError.
+
+If you write bindings out of tree: record the ``spec_digest`` your
+qualification ran against (the receipt already does), and re-run your
+own gate when the digest you depend on disappears from the catalog.
+
 ## 3. Calibration: reuse, do not redefine
 
 **The standard is `docs/calibration.md`. This layer adds no second
