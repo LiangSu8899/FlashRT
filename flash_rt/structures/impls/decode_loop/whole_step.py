@@ -190,7 +190,7 @@ class WholeStepDecodeLoop:
 
     @torch.no_grad()
     def enable_mtp(self, ckpt_dir=None, head=None,
-                   projection_format=None):
+                   projection_format=None, default_k=6):
         """Attach the checkpoint's draft head; BF16 unless a scheme
         routes the draft projections elsewhere (judged by acceptance
         length). Pass a prebuilt ``head`` to load it early, while the
@@ -214,6 +214,7 @@ class WholeStepDecodeLoop:
                 f"refused: draft head was built for slot {head.slot}, "
                 f"this loop's slot is {slot}")
         self._mtp = head
+        self._default_k = int(default_k)
         return self._mtp
 
     def _fwd_full(self, tok_ids, pos_t):
@@ -315,10 +316,22 @@ class WholeStepDecodeLoop:
         self._dgraph.replay()
 
     @torch.no_grad()
-    def generate_speculative(self, input_ids, max_new_tokens, K=6):
-        """Greedy MTP spec decode; exact vs plain greedy by verify."""
+    def generate_speculative(self, input_ids, max_new_tokens, K=None):
+        """Greedy MTP spec decode; exact vs plain greedy by verify.
+
+        ``K`` (draft chain length) defaults to the value set at
+        ``enable_mtp``; passing a different K rebuilds the captured
+        passes for the new shape."""
         if getattr(self, "_mtp", None) is None:
             raise ValueError("refused: enable_mtp first")
+        K = int(K) if K is not None else self._default_k
+        if getattr(self, "_spec_k", None) not in (None, K):
+            # the captured passes are shaped by K — rebuild, never
+            # replay a mismatched shape
+            self._dgraph = None
+            self._vgraph = None
+            self._rwgraph = None
+        self._spec_k = K
         dev = input_ids.device
         L = int(input_ids.shape[1])
         if L + max_new_tokens + K + 1 > self._max:
@@ -377,10 +390,11 @@ class WholeStepDecodeLoop:
                 pos_v = torch.arange(pos, pos + k_eff + 1, device=dev)
                 lg_v, hn_v = self._fwd_full(seq[:, :k_eff + 1], pos_v)
             targets = lg_v.float().argmax(-1)          # (1, k_eff+1)
-            j = 0
-            while j < k_eff and int(dtoks[j][0, 0]) == int(
-                    targets[0, j]):
-                j += 1
+            # device-side prefix match: one sync per round, not one
+            # per accepted token
+            dstack = torch.cat([d.view(1) for d in dtoks])
+            j = int((dstack == targets[0, :k_eff]).cumprod(0)
+                    .sum().item())
             if j == k_eff:
                 # full acceptance: the verify pass committed exactly
                 # the accepted stream — no rollback, no second pass
