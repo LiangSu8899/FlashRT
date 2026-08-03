@@ -154,6 +154,24 @@ class WholeStepDecodeLoop:
             self._full_cache = s
         return s
 
+    def _prefill_callable(self):
+        """The prompt pass gets its own compile, pinned deterministic.
+
+        The fast step's inductor artifacts use non-deterministic
+        reductions that are harmless inside a captured replay but flip
+        long-prompt logits between runs — the 2K-context receipts
+        caught exactly that. Prefill therefore compiles separately with
+        the backend's deterministic mode, keeping the eager arm's
+        repeatability at compiled speed. Shapes specialise per prompt
+        length, same as the step.
+        """
+        if not self._compile_prefill:
+            return self._fwd
+        if getattr(self, "_pf", None) is None:
+            self._pf = torch.compile(self._fwd, dynamic=False,
+                                     options={"deterministic": True})
+        return self._pf
+
     def _gstep(self):
         logits = self._step(self._cur, self._pos)
         # hosts sample from FP32 logits; argmax there too, or BF16
@@ -171,7 +189,7 @@ class WholeStepDecodeLoop:
                 f"window {self._max}")
         self.cache.frt_continue = False
         self._rope_delta.zero_()
-        pf = self._step if self._compile_prefill else self._fwd
+        pf = self._prefill_callable()
         logits = pf(input_ids,
                     torch.arange(L, device=input_ids.device))
         self._cur.copy_(logits.float().argmax(-1))

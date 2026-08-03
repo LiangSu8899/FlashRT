@@ -202,8 +202,12 @@ class FusedGatedDeltaDecodeLayer(GuardedSeam, torch.nn.Module):
 
         Chunks of 64 carry the conv state and the recurrent state
         forward in place, so any prompt length runs through the same
-        two kernels per chunk. Both host cache slots are written with
-        the host's own semantics (last-K raw inputs; final state).
+        two kernels per chunk. Larger slabs are on the record as a
+        negative: at S>64 the chunk kernel's internal combine is not
+        run-to-run stable (the repeat gate caught it) and the latency
+        win measured under three percent — the fixed-order 64 chunk is
+        the contract. Both host cache slots are written with the
+        host's own semantics (last-K raw inputs; final state).
         """
         host = self.host_layer
         S = hidden_states.shape[1]
