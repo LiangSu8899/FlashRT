@@ -45,6 +45,10 @@ class _StaticHybridCache:
         self.value_cache = [None] * n_layers
         self._max = int(max_len)
         self._cp = None
+        # true prompt-progress counter for HOST-side forwards: host glue
+        # branches on "is there history" (rope deltas, prefill vs
+        # continue); the loop's own fwd never consults it
+        self._seen = 0
         for i in attn_layers:
             self.key_cache[i] = torch.zeros(
                 1, kv_heads, self._max, head_dim, device=device,
@@ -57,7 +61,7 @@ class _StaticHybridCache:
         return self.key_cache[layer_idx], self.value_cache[layer_idx]
 
     def get_seq_length(self, layer_idx=0):
-        return self._max
+        return self._seen
 
     def get_mask_sizes(self, query_length, layer_idx):
         return self._max, 0
@@ -112,6 +116,7 @@ class WholeStepDecodeLoop:
             dtype=torch.bfloat16).triu_(1)
         self._cur = torch.empty(1, 1, dtype=torch.long, device=dev)
         self._pos = torch.empty(1, dtype=torch.long, device=dev)
+        self._rope_delta = torch.zeros(1, dtype=torch.long, device=dev)
         if compile_step:
             # the layer loop specialises per layer index; the default
             # recompile budget is smaller than a deep stack
@@ -125,7 +130,9 @@ class WholeStepDecodeLoop:
 
     def _fwd(self, tok_ids, pos_t):
         h = self._embed(tok_ids)
-        pe = self._rotary(h, pos_t.view(1, -1))
+        # KV slot index and rotary position are different things on
+        # multimodal hosts: the host's rope delta shifts the latter
+        pe = self._rotary(h, (pos_t + self._rope_delta).view(1, -1))
         self.cache._cp = pos_t
         m4 = self._causal.index_select(0, pos_t).view(
             1, 1, -1, self._max)
@@ -160,11 +167,16 @@ class WholeStepDecodeLoop:
                 f"refused: {L}+{max_new_tokens} exceeds the static "
                 f"window {self._max}")
         self.cache.frt_continue = False
+        self._rope_delta.zero_()
         logits = self._step(input_ids,
                             torch.arange(L, device=input_ids.device))
         self._cur.copy_(logits.float().argmax(-1))
         self._pos.fill_(L)
         toks = [self._cur.clone()]
+        self._decode_tail(max_new_tokens, toks)
+        return torch.cat([input_ids] + toks, dim=1)
+
+    def _decode_tail(self, max_new_tokens, toks):
         warm = min(3, max_new_tokens - 1)
         if self._graph is None:
             side = torch.cuda.Stream()
@@ -185,7 +197,41 @@ class WholeStepDecodeLoop:
             for _ in range(max_new_tokens - 1):
                 self._graph.replay()
                 toks.append(self._cur.clone())
-        return torch.cat([input_ids] + toks, dim=1)
+
+    @torch.no_grad()
+    def generate_from(self, inputs, max_new_tokens):
+        """Host-side prefill, loop-side decode.
+
+        The host forward runs the whole multimodal front (vision tower,
+        embed merge, mrope) and writes its KV into the loop's cache;
+        the captured step takes over from the first generated token.
+        ``inputs`` is the processor's dict; batch of one, no padding.
+        """
+        inputs = {k: v for k, v in inputs.items()
+                  if k != "attention_mask"}
+        ids = inputs["input_ids"]
+        L = int(ids.shape[1])
+        if L + max_new_tokens > self._max:
+            raise ValueError(
+                f"refused: {L}+{max_new_tokens} exceeds the static "
+                f"window {self._max}")
+        self.cache.frt_continue = False
+        self.cache._seen = 0        # host must take its prefill branch
+        cp = torch.arange(L, device=ids.device)
+        self.cache._cp = cp
+        out = self._model(**inputs, past_key_values=self.cache,
+                          use_cache=True, cache_position=cp)
+        self.cache._seen = L
+        delta = getattr(
+            getattr(self._model, "model", self._model),
+            "rope_deltas", None)
+        self._rope_delta.fill_(
+            int(delta.reshape(-1)[0]) if torch.is_tensor(delta) else 0)
+        self._cur.copy_(out.logits[:, -1:].float().argmax(-1))
+        self._pos.fill_(L)
+        toks = [self._cur.clone()]
+        self._decode_tail(max_new_tokens, toks)
+        return torch.cat([ids] + toks, dim=1)
 
 
     @torch.no_grad()
