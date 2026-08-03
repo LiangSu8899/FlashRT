@@ -315,6 +315,16 @@ class W4A4Decode(NoQuant):
     name = "w4a4_decode"
     gdn_projection_format = "nvfp4_dynamic"
     _linear_format: str | None = "w8a16_static"
+    #: one-way arm: after the FP4 band binds (and only then), the
+    #: layer's BF16 projection weights are released — ~11GB on the 27B
+    #: host, trading exact detach for the headroom a draft head and a
+    #: W8 lm_head need to coexist. Never a default; the receipt says so.
+    gdn_release_host_weights = False
+
+    def __init__(self, release_host_weights: bool = False) -> None:
+        if release_host_weights:
+            self.gdn_release_host_weights = True
+            self.name = "w4a4_decode_release"
 
     def decide(self, report: Mapping[str, Mapping[str, float]]) -> Decision:
         formats, keep = {}, []
@@ -415,6 +425,7 @@ register("fp8_static_keep_outliers", Fp8Static(keep_outliers=20.0))
 register("w8a16_decode", W8A16Decode())
 register("w4a16_decode", W4A16Decode())
 register("w4a4_decode", W4A4Decode())
+register("w4a4_decode_release", W4A4Decode(release_host_weights=True))
 register("none", NoQuant())
 register("bf16_structural", Bf16Structural())
 register("nvfp4_awq", Nvfp4Awq())

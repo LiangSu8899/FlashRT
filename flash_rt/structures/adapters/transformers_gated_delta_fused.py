@@ -48,6 +48,8 @@ class TransformersGatedDeltaFusedAdapter:
 
     def __call__(self, model, forward, scheme=None):
         fmt = getattr(scheme, "gdn_projection_format", None)
+        release = bool(getattr(scheme, "gdn_release_host_weights",
+                               False))
         sites = []
         for path, module in model.named_modules():
             for child_name, child in module.named_children():
@@ -67,7 +69,8 @@ class TransformersGatedDeltaFusedAdapter:
             # a package predating the chain raises here once, and the
             # whole adapter steps aside for the callable-slot ladder
             bound = fused_layer.bind_fused_decode_layer(
-                child, idx, projection_format=fmt)
+                child, idx, projection_format=fmt,
+                release_host_weights=release)
             routes.append((parent, child_name, child, bound))
             observed[f"{child_name}@{idx}.gated_delta_fused"] = bound
 

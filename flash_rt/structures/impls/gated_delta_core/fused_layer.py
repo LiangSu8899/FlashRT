@@ -156,6 +156,10 @@ class FusedGatedDeltaDecodeLayer(GuardedSeam, torch.nn.Module):
             return getattr(super().__getattr__("host_layer"), name)
 
     def _host_form(self, *args, **kwargs):
+        if getattr(self, "_released", False):
+            raise ValueError(
+                "refused: host projection weights were released "
+                "(one-way band); this call shape has no host fallback")
         guard = self._frt_guard
         if guard is not None and not torch.compiler.is_compiling():
             guard.notes["host_form_calls"] += 1
@@ -317,7 +321,8 @@ class FusedGatedDeltaDecodeLayer(GuardedSeam, torch.nn.Module):
 
 @torch.no_grad()
 def bind_fused_decode_layer(host, layer_idx: int,
-                            projection_format: str | None = None):
+                            projection_format: str | None = None,
+                            release_host_weights: bool = False):
     """Bind one layer; a smoke step runs on zeros before handing out."""
     bound = FusedGatedDeltaDecodeLayer(host, layer_idx,
                                        projection_format)
@@ -344,4 +349,18 @@ def bind_fused_decode_layer(host, layer_idx: int,
     guard = bound._frt_guard
     if guard is not None:
         guard.calls = 0
+    if release_host_weights and bound._proj_in is not None \
+            and bound._proj_out is not None:
+        # one-way: the FP4 band passed its smoke, the BF16 projection
+        # weights go. From here the host form refuses instead of
+        # falling back, and detach restores structure, not bytes.
+        empty = torch.nn.Parameter(
+            host.in_proj_qkv.weight.new_empty(0), requires_grad=False)
+        for name in ("in_proj_qkv", "in_proj_z", "in_proj_b",
+                     "in_proj_a", "out_proj"):
+            getattr(host, name).weight = empty
+        bound._packed_w = None
+        bound._released = True
+        if guard is not None:
+            guard.notes["host_weights"] = "released (one-way)"
     return bound
