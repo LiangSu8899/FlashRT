@@ -305,6 +305,18 @@ class FusedGatedDeltaDecodeLayer(GuardedSeam, torch.nn.Module):
                   and (attention_mask is None
                        or bool(attention_mask.all())))
         if not decode:
+            if (cache_params is not None
+                    and hidden_states.shape[0] == 1
+                    and 1 < hidden_states.shape[1] <= 16
+                    and getattr(cache_params, "frt_continue", None)
+                    is True
+                    and getattr(cache_params, "has_previous_state",
+                                False)
+                    and attention_mask is None):
+                # an explicitly-continuing short batch (spec verify /
+                # re-advance): step it, don't chunk it — same numeric
+                # family as the plain decode step
+                return self._stepwise_chain(hidden_states, cache_params)
             if (self._chunk_ok and cache_params is not None
                     and hidden_states.shape[0] == 1
                     and hidden_states.shape[1] > 1
@@ -314,6 +326,24 @@ class FusedGatedDeltaDecodeLayer(GuardedSeam, torch.nn.Module):
             return self._host_form(hidden_states, cache_params,
                                    attention_mask)
 
+        return self._decode_one(hidden_states, cache_params)
+
+    def _stepwise_chain(self, hidden_states, cache_params):
+        """Short continuation rows, one decode step per token.
+
+        A verify or re-advance pass must land on the *same* numeric
+        family as the plain step it is judged against — the chunk
+        prefill kernels are a different reduction order, and FP4-noise
+        tie tokens flip between the two. Looping the decode chain keeps
+        the family identical; the count is small and fixed, so the pass
+        stays capturable.
+        """
+        S = hidden_states.shape[1]
+        rows = [self._decode_one(hidden_states[:, s:s + 1], cache_params)
+                for s in range(S)]
+        return torch.cat(rows, dim=1)
+
+    def _decode_one(self, hidden_states, cache_params):
         host = self.host_layer
         x = hidden_states.view(1, -1)
         allp = (self._proj_in(x) if self._proj_in is not None
