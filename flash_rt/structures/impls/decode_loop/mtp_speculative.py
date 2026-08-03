@@ -68,6 +68,37 @@ def _dequant_block_fp8(w, scale_inv):
     return wf.view(n, k).to(torch.bfloat16)
 
 
+class _GatherExpertsBf16(torch.nn.Module):
+    """BF16 expert bank behind the host contract, sync-free.
+
+    Routed slots gather device-side and run as one batched matmul per
+    projection — the same fixed-shape, host-silent step the packed form
+    takes, at the bank's own precision. Sized for a draft layer: one
+    layer's bank, a few MB per routed slot.
+    """
+
+    def __init__(self, gate_up, down, act_fn):
+        super().__init__()
+        self.register_buffer("_gu", gate_up.contiguous())
+        self.register_buffer("_dn", down.contiguous())
+        self._act = act_fn
+
+    def forward(self, hidden_states, top_k_index, top_k_weights):
+        t, h = hidden_states.shape
+        k = top_k_index.shape[1]
+        flat = top_k_index.reshape(-1)
+        gu = self._gu.index_select(0, flat)          # [T*k, 2I, H]
+        dn = self._dn.index_select(0, flat)          # [T*k, H, I]
+        x = hidden_states.unsqueeze(1).expand(t, k, h).reshape(t * k, 1, h)
+        y = torch.bmm(x, gu.transpose(1, 2))         # [T*k, 1, 2I]
+        gate, up = y.chunk(2, dim=-1)
+        inter = self._act(gate) * up
+        d = torch.bmm(inter, dn.transpose(1, 2))     # [T*k, 1, H]
+        out = (d.view(t, k, h).float()
+               * top_k_weights[..., None].float()).sum(dim=1)
+        return out.to(hidden_states.dtype)
+
+
 class MtpDraftHead(torch.nn.Module):
     """fc + one host-class decoder layer + norms; embed/head shared."""
 
@@ -98,22 +129,21 @@ class MtpDraftHead(torch.nn.Module):
                      else w.to(torch.bfloat16))
                 p.copy_(w)
             self.layer = self.layer.to(dev)
-            # a draft layer whose MLP is an expert bank must run the
+            # a draft layer whose MLP is an expert bank must run a
             # gather-then-fixed-shape form: the draft chain is captured,
             # and the host bank's routed loop syncs the host. The bank
-            # binds in the same packed representation the adopted main
-            # model runs; draft precision is judged by acceptance length.
+            # stays BF16 — the scheme's draft default — because the
+            # draft's whole value is its acceptance length, and BF16
+            # gathers capture just as well as packed ones (the draft is
+            # one layer; a routed slot is a handful of MB).
             mlp = getattr(self.layer, "mlp", None)
             bank = getattr(mlp, "experts", None) if mlp is not None else None
             if bank is not None and hasattr(bank, "gate_up_proj") \
                     and torch.is_tensor(bank.gate_up_proj) \
                     and bank.gate_up_proj.dim() == 3:
-                from ..moe_experts.nvfp4_dynamic import bind_experts_seam
-                bound, rels = bind_experts_seam(
-                    {"gate_up_proj": bank.gate_up_proj.detach(),
-                     "down_proj": bank.down_proj.detach()}, bank.act_fn)
-                mlp.experts = bound
-                self.experts_conversion = rels
+                mlp.experts = _GatherExpertsBf16(
+                    bank.gate_up_proj.detach().to(dev),
+                    bank.down_proj.detach().to(dev), bank.act_fn)
             self.fc = torch.nn.Linear(2 * hidden, hidden, bias=False,
                                       device=dev, dtype=torch.bfloat16)
             self.fc.weight.copy_(t["fc.weight"].to(torch.bfloat16))
@@ -128,7 +158,21 @@ class MtpDraftHead(torch.nn.Module):
         self.slot = int(layer_slot)
         self._embed = lm.embed_tokens
         self._rotary = lm.rotary_emb
+        # the draft carries its own W8 view of the shared head: a draft
+        # step pays the full-vocab projection every token, its precision
+        # is judged by acceptance length alone, and the model's own head
+        # must NOT change — the step and the verify pass share that one,
+        # and splitting their numeric family at the logits is what a
+        # W8-swapped model head was measured to do
         self._head = model.lm_head
+        if isinstance(model.lm_head, torch.nn.Linear):
+            try:
+                from ..linear_proj import w8a16_static
+                self._head = w8a16_static.bind_proj_seam(
+                    {"w": model.lm_head.weight.detach()},
+                    original=model.lm_head)
+            except (ValueError, RuntimeError):
+                self._head = model.lm_head
         self.eval()
 
     @torch.no_grad()

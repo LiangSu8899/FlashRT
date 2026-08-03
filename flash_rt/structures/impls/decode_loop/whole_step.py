@@ -119,6 +119,7 @@ class WholeStepDecodeLoop:
         self._cur = torch.empty(1, 1, dtype=torch.long, device=dev)
         self._pos = torch.empty(1, dtype=torch.long, device=dev)
         self._rope_delta = torch.zeros(1, dtype=torch.long, device=dev)
+        self._use_compile = bool(compile_step)
         if compile_step:
             # the layer loop specialises per layer index; the default
             # recompile budget is smaller than a deep stack
@@ -329,8 +330,17 @@ class WholeStepDecodeLoop:
                 self._dtok_buf.copy_(nxt.view(1, 1))
                 self._dpos_buf.add_(1)
 
+        # the verify pass runs every round: when the step is compiled,
+        # verify takes the same compile-then-capture recipe — inductor's
+        # elementwise fusion is the same third it buys the plain step
+        if self._use_compile and getattr(self, "_fwd_full_c", None) is None:
+            self._fwd_full_c = torch.compile(self._fwd_full,
+                                             dynamic=False)
+        fwd_v = (self._fwd_full_c if self._use_compile
+                 else self._fwd_full)
+
         def verify():
-            lg, hn = self._fwd_full(self._vseq_buf, self._vpos_buf)
+            lg, hn = fwd_v(self._vseq_buf, self._vpos_buf)
             return lg, hn
 
         side = torch.cuda.Stream()
@@ -344,9 +354,73 @@ class WholeStepDecodeLoop:
         for i, cs, rs in snaps:
             self.cache.conv_states[i].copy_(cs)
             self.cache.recurrent_states[i].copy_(rs)
+        def snap_states():
+            # the pre-round state snapshot rides inside the draft graph:
+            # sixty host-launched little copies a round otherwise sit
+            # squarely inside the per-round sync window
+            for i, (cb, rb) in self._snap_bufs.items():
+                cb.copy_(self.cache.conv_states[i])
+                rb.copy_(self.cache.recurrent_states[i])
+
         self._dgraph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self._dgraph):
+            snap_states()
             draft_chain()
+        # rejected rounds re-advance the accepted prefix; each of the K
+        # possible prefix lengths is a fixed shape, so each gets its own
+        # captured pass — the reject path replays instead of paying an
+        # eager whole-model forward
+        self._ra_seq, self._ra_pos = {}, {}
+        self._ra_lg, self._ra_hn = {}, {}
+        self._ra_graphs = {}
+        for m in range(1, K + 1):
+            self._ra_seq[m] = torch.empty(1, m, dtype=torch.long,
+                                          device=dev)
+            self._ra_pos[m] = torch.empty(m, dtype=torch.long, device=dev)
+            self._ra_seq[m].copy_(self._vseq_buf[:, :m])
+            self._ra_pos[m].copy_(self._vpos_buf[:m])
+        side_ra = torch.cuda.Stream()
+        side_ra.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side_ra):
+            for m in range(1, K + 1):
+                self._fwd_full(self._ra_seq[m], self._ra_pos[m])
+        torch.cuda.current_stream().wait_stream(side_ra)
+        for i, cs, rs in snaps:
+            self.cache.conv_states[i].copy_(cs)
+            self.cache.recurrent_states[i].copy_(rs)
+        for m in range(1, K + 1):
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                # the rollback restore rides in-graph too: the draft
+                # graph snapshotted these buffers before the round
+                for i, (cb, rb) in self._snap_bufs.items():
+                    self.cache.conv_states[i].copy_(cb)
+                    self.cache.recurrent_states[i].copy_(rb)
+                self._ra_lg[m], self._ra_hn[m] = self._fwd_full(
+                    self._ra_seq[m], self._ra_pos[m])
+            self._ra_graphs[m] = g
+        # the draft-KV rewrite over a cut-short accepted region is the
+        # same story: K possible shapes, each captured once. The draft
+        # layer carries no gated-delta state, so no snapshot dance.
+        hdim = self._dh_buf.shape[-1]
+        self._rwm_h, self._rwm_graphs = {}, {}
+        side_rw = torch.cuda.Stream()
+        side_rw.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side_rw):
+            for m in range(1, K + 1):
+                self._rwm_h[m] = torch.zeros(1, m, hdim, device=dev,
+                                             dtype=torch.bfloat16)
+                self._mtp(self._rwm_h[m], self._ra_seq[m],
+                          self._ra_pos[m], self.cache,
+                          self._row(self._ra_pos[m]))
+        torch.cuda.current_stream().wait_stream(side_rw)
+        for m in range(1, K + 1):
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                self._mtp(self._rwm_h[m], self._ra_seq[m],
+                          self._ra_pos[m], self.cache,
+                          self._row(self._ra_pos[m]))
+            self._rwm_graphs[m] = g
         if not getattr(self, "_verify_capture", True):
             # multi-token passes stay eager (MoE hosts: the T>1 expert
             # path routes on the host); the draft chain above is the
@@ -395,6 +469,8 @@ class WholeStepDecodeLoop:
             self._dgraph = None
             self._vgraph = None
             self._rwgraph = None
+            self._ra_graphs = None
+            self._rwm_graphs = None
         self._spec_k = K
         dev = input_ids.device
         L = int(input_ids.shape[1])
@@ -416,11 +492,25 @@ class WholeStepDecodeLoop:
         h_last = hn[:, -1:]
         accepted_hist = []
         self._dgraph = getattr(self, "_dgraph", None)
+        # snapshot buffers live across rounds: per-round clones would
+        # allocate sixty tensors a round for nothing
+        if getattr(self, "_snap_bufs", None) is None:
+            self._snap_bufs = {
+                i: (torch.empty_like(self.cache.conv_states[i]),
+                    torch.empty_like(self.cache.recurrent_states[i]))
+                for i in self._gdn_slots()}
         while len(produced) < max_new_tokens:
             k_eff = min(K, max_new_tokens - len(produced))
-            snaps = [(i, self.cache.conv_states[i].clone(),
-                      self.cache.recurrent_states[i].clone())
-                     for i in self._gdn_slots()]
+            if k_eff == K and getattr(self, "_dgraph", None) is not None:
+                # the draft graph snapshots in-graph on replay
+                snaps = [(i, cb, rb)
+                         for i, (cb, rb) in self._snap_bufs.items()]
+            else:
+                snaps = []
+                for i, (cb, rb) in self._snap_bufs.items():
+                    cb.copy_(self.cache.conv_states[i])
+                    rb.copy_(self.cache.recurrent_states[i])
+                    snaps.append((i, cb, rb))
             if k_eff == K:
                 # captured fast path: draft chain replay + verify replay
                 if self._dgraph is None:
@@ -471,11 +561,22 @@ class WholeStepDecodeLoop:
             else:
                 # roll the gated-delta states back and re-advance the
                 # accepted prefix — linear states cannot unwind
-                for i, cs, rs in snaps:
-                    self.cache.conv_states[i].copy_(cs)
-                    self.cache.recurrent_states[i].copy_(rs)
-                pos_a = torch.arange(pos, pos + j + 1, device=dev)
-                lg_a, hn_x = self._fwd_full(seq[:, :j + 1], pos_a)
+                m = j + 1
+                ra = getattr(self, "_ra_graphs", None)
+                if ra and m in ra:
+                    # the rollback restore is captured at the head of
+                    # the re-advance graph
+                    self._ra_seq[m].copy_(seq[:, :m])
+                    self._ra_pos[m].copy_(torch.arange(
+                        pos, pos + m, device=dev))
+                    ra[m].replay()
+                    lg_a, hn_x = self._ra_lg[m], self._ra_hn[m]
+                else:
+                    for i, cs, rs in snaps:
+                        self.cache.conv_states[i].copy_(cs)
+                        self.cache.recurrent_states[i].copy_(rs)
+                    pos_a = torch.arange(pos, pos + m, device=dev)
+                    lg_a, hn_x = self._fwd_full(seq[:, :m], pos_a)
                 bonus = lg_a[:, -1:].float().argmax(-1)
             # draft KV for the accepted region keys on main hiddens —
             # one multi-position pass; captured when the shape is the
@@ -486,11 +587,22 @@ class WholeStepDecodeLoop:
                 self._rwh_buf[:, 1:].copy_(hn_x[:, :K])
                 self._rwgraph.replay()
             else:
-                prev_rows = (torch.cat([h_last, hn_x[:, :j]], dim=1)
-                             if j > 0 else h_last)
-                pos_rows = torch.arange(pos, pos + j + 1, device=dev)
-                self._mtp(prev_rows, seq[:, :j + 1], pos_rows,
-                          self.cache, self._row(pos_rows))
+                m = j + 1
+                rw = getattr(self, "_rwm_graphs", None)
+                if rw and m in rw:
+                    self._rwm_h[m][:, :1].copy_(h_last)
+                    if j > 0:
+                        self._rwm_h[m][:, 1:].copy_(hn_x[:, :j])
+                    self._ra_seq[m].copy_(seq[:, :m])
+                    self._ra_pos[m].copy_(torch.arange(
+                        pos, pos + m, device=dev))
+                    rw[m].replay()
+                else:
+                    prev_rows = (torch.cat([h_last, hn_x[:, :j]], dim=1)
+                                 if j > 0 else h_last)
+                    pos_rows = torch.arange(pos, pos + m, device=dev)
+                    self._mtp(prev_rows, seq[:, :m], pos_rows,
+                              self.cache, self._row(pos_rows))
             for r in range(j):
                 produced.append(dtoks[r].clone())
             produced.append(bonus.clone())
