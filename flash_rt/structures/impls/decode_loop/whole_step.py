@@ -238,6 +238,82 @@ class WholeStepDecodeLoop:
         return [i for i, sl in enumerate(self.cache.conv_states)
                 if torch.is_tensor(sl)]
 
+    def _ensure_spec_graphs(self, K, dev, snaps, h_last, tok, pos):
+        """Capture the K-step draft chain and the M=K+1 verify pass.
+
+        The warmup executions commit real state; the caller's snapshot
+        is restored before capture so the first replay starts clean.
+        """
+        self._dh_buf = torch.empty(1, 1, self._causal.shape[0] and
+                                   self._embed.weight.shape[1],
+                                   device=dev, dtype=torch.bfloat16)
+        self._dtok_buf = torch.empty(1, 1, dtype=torch.long, device=dev)
+        self._dpos_buf = torch.empty(1, dtype=torch.long, device=dev)
+        self._dtoks_out = torch.empty(K, dtype=torch.long, device=dev)
+        self._vseq_buf = torch.empty(1, K + 1, dtype=torch.long,
+                                     device=dev)
+        self._vpos_buf = torch.empty(K + 1, dtype=torch.long, device=dev)
+        # warmup must run on live values — an uninitialised token
+        # buffer is an out-of-bounds embedding lookup
+        self._dh_buf.copy_(h_last)
+        self._dtok_buf.copy_(tok)
+        self._dpos_buf.fill_(pos)
+        self._vpos_buf.copy_(torch.arange(pos, pos + K + 1, device=dev))
+
+        def draft_chain():
+            for k in range(K):
+                lg, dh = self._mtp(self._dh_buf, self._dtok_buf,
+                                   self._dpos_buf, self.cache,
+                                   self._row(self._dpos_buf))
+                self._dh_buf.copy_(dh)
+                nxt = lg[:, -1].float().argmax(-1)
+                self._dtoks_out[k].copy_(nxt[0])
+                self._dtok_buf.copy_(nxt.view(1, 1))
+                self._dpos_buf.add_(1)
+
+        def verify():
+            lg, hn = self._fwd_full(self._vseq_buf, self._vpos_buf)
+            return lg, hn
+
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            draft_chain()
+            self._vseq_buf[:, 0].copy_(tok[0])
+            self._vseq_buf[:, 1:].copy_(self._dtoks_out)
+            verify()
+        torch.cuda.current_stream().wait_stream(side)
+        for i, cs, rs in snaps:
+            self.cache.conv_states[i].copy_(cs)
+            self.cache.recurrent_states[i].copy_(rs)
+        self._dgraph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self._dgraph):
+            draft_chain()
+        self._vgraph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self._vgraph):
+            self._vlg, self._vhn = verify()
+        # full-accept rewrite pass is also fixed-shape (K+1 rows)
+        self._rwh_buf = torch.empty(1, K + 1, self._dh_buf.shape[-1],
+                                    device=dev, dtype=torch.bfloat16)
+        side2 = torch.cuda.Stream()
+        side2.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side2):
+            self._mtp(self._rwh_buf.zero_(), self._vseq_buf,
+                      self._vpos_buf, self.cache,
+                      self._row(self._vpos_buf))
+        torch.cuda.current_stream().wait_stream(side2)
+        self._rwgraph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self._rwgraph):
+            self._mtp(self._rwh_buf, self._vseq_buf, self._vpos_buf,
+                      self.cache, self._row(self._vpos_buf))
+
+    def _seed_spec(self, h_last, tok, pos, K, dev, snaps):
+        self._ensure_spec_graphs(K, dev, snaps, h_last, tok, pos)
+        self._dh_buf.copy_(h_last)
+        self._dtok_buf.copy_(tok)
+        self._dpos_buf.fill_(pos)
+        self._dgraph.replay()
+
     @torch.no_grad()
     def generate_speculative(self, input_ids, max_new_tokens, K=6):
         """Greedy MTP spec decode; exact vs plain greedy by verify."""
@@ -262,21 +338,44 @@ class WholeStepDecodeLoop:
         pos = L
         h_last = hn[:, -1:]
         accepted_hist = []
+        self._dgraph = getattr(self, "_dgraph", None)
         while len(produced) < max_new_tokens:
             k_eff = min(K, max_new_tokens - len(produced))
             snaps = [(i, self.cache.conv_states[i].clone(),
                       self.cache.recurrent_states[i].clone())
                      for i in self._gdn_slots()]
-            dtoks, dh, dtok = [], h_last, produced[-1]
-            for k in range(k_eff):
-                pt = torch.tensor([pos + k], device=dev)
-                lg, dh = self._mtp(dh, dtok, pt, self.cache,
-                                   self._row(pt))
-                dtok = lg[:, -1:].float().argmax(-1)
-                dtoks.append(dtok)
-            seq = torch.cat([produced[-1]] + dtoks, dim=1)[:, :k_eff + 1]
-            pos_v = torch.arange(pos, pos + k_eff + 1, device=dev)
-            lg_v, hn_v = self._fwd_full(seq[:, :k_eff + 1], pos_v)
+            if k_eff == K:
+                # captured fast path: draft chain replay + verify replay
+                if self._dgraph is None:
+                    self._dh_buf_init = True
+                    self._seed_spec(h_last, produced[-1], pos, K, dev,
+                                    snaps)
+                else:
+                    self._dh_buf.copy_(h_last)
+                    self._dtok_buf.copy_(produced[-1])
+                    self._dpos_buf.fill_(pos)
+                    self._dgraph.replay()
+                self._vseq_buf[:, 0].copy_(produced[-1][0])
+                self._vseq_buf[:, 1:].copy_(self._dtoks_out)
+                self._vpos_buf.copy_(torch.arange(
+                    pos, pos + K + 1, device=dev))
+                self._vgraph.replay()
+                dtoks = [self._dtoks_out[k].view(1, 1)
+                         for k in range(K)]
+                seq = self._vseq_buf
+                lg_v, hn_v = self._vlg, self._vhn
+            else:
+                dtoks, dh, dtok = [], h_last, produced[-1]
+                for k in range(k_eff):
+                    pt = torch.tensor([pos + k], device=dev)
+                    lg, dh = self._mtp(dh, dtok, pt, self.cache,
+                                       self._row(pt))
+                    dtok = lg[:, -1:].float().argmax(-1)
+                    dtoks.append(dtok)
+                seq = torch.cat([produced[-1]] + dtoks,
+                                dim=1)[:, :k_eff + 1]
+                pos_v = torch.arange(pos, pos + k_eff + 1, device=dev)
+                lg_v, hn_v = self._fwd_full(seq[:, :k_eff + 1], pos_v)
             targets = lg_v.float().argmax(-1)          # (1, k_eff+1)
             j = 0
             while j < k_eff and int(dtoks[j][0, 0]) == int(
@@ -297,15 +396,22 @@ class WholeStepDecodeLoop:
                 lg_a, hn_x = self._fwd_full(seq[:, :j + 1], pos_a)
                 bonus = lg_a[:, -1:].float().argmax(-1)
             # draft KV for the accepted region keys on main hiddens —
-            # one multi-position pass, not j+1 single steps
-            prev_rows = (torch.cat([h_last, hn_x[:, :j]], dim=1)
-                         if j > 0 else h_last)
-            pos_rows = torch.arange(pos, pos + j + 1, device=dev)
-            self._mtp(prev_rows, seq[:, :j + 1], pos_rows, self.cache,
-                      self._row(pos_rows))
+            # one multi-position pass; captured when the shape is the
+            # full-accept one
+            if (j == k_eff and k_eff == K
+                    and getattr(self, "_rwgraph", None) is not None):
+                self._rwh_buf[:, 0].copy_(h_last[:, 0])
+                self._rwh_buf[:, 1:].copy_(hn_x[:, :K])
+                self._rwgraph.replay()
+            else:
+                prev_rows = (torch.cat([h_last, hn_x[:, :j]], dim=1)
+                             if j > 0 else h_last)
+                pos_rows = torch.arange(pos, pos + j + 1, device=dev)
+                self._mtp(prev_rows, seq[:, :j + 1], pos_rows,
+                          self.cache, self._row(pos_rows))
             for r in range(j):
-                produced.append(dtoks[r])
-            produced.append(bonus)
+                produced.append(dtoks[r].clone())
+            produced.append(bonus.clone())
             accepted_hist.append(j + 1)
             pos += j + 1
             h_last = hn_x[:, j:j + 1]
