@@ -70,3 +70,28 @@ def test_unknown_format_is_refused_by_name():
 def test_bankless_model_is_a_named_refusal():
     with pytest.raises(ValueError, match="no expert banks"):
         quantize_on_adopt(torch.nn.Sequential(torch.nn.Linear(8, 8)))
+
+
+def test_matrix_counts_only_passing_digest_receipts(tmp_path):
+    import json
+
+    from flash_rt.structures.matrix import generate
+
+    def rec(name, host, chain, verdict="PASS", digest=True):
+        d = {"gate": name, "host": host, "chain": chain,
+             "verdict": verdict}
+        if digest:
+            d["plan_digest"] = "sha256:x"
+        (tmp_path / f"{name}.json").write_text(json.dumps(d))
+
+    rec("a1", "transformers HostA", "auto_swaps gated_delta_core x")
+    rec("b1", "transformers HostB", "gated_delta_core + decode_loop")
+    rec("c1", "transformers HostC", "decode_loop only",
+        verdict="FAIL")                      # fails: not counted
+    rec("d1", "transformers HostD", "decode_loop only", digest=False)
+
+    text = generate(tmp_path)
+    assert "| gated_delta_core |" in text and "HostA" in text
+    assert "gated_delta_core: 2 host(s) — meets" in text
+    assert "decode_loop: 1 host(s) — single-host" in text
+    assert "HostC" not in text and "HostD" not in text
