@@ -202,13 +202,25 @@ class FusedGatedDeltaDecodeLayer(GuardedSeam, torch.nn.Module):
         out = (self._proj_out(flat_norm) if self._proj_out is not None
                else torch.nn.functional.linear(flat_norm,
                                                host.out_proj.weight))
-        cache_params.recurrent_states[self._idx] = \
-            state.view(1, self._hv, self._d, self._d)
+        # write INTO existing slots when they match — a repoint here
+        # would strand a captured graph on the old tensors
+        state4 = state.view(1, self._hv, self._d, self._d)
+        rec = cache_params.recurrent_states[self._idx]
+        if (torch.is_tensor(rec) and rec.shape == state4.shape
+                and rec.dtype == state4.dtype):
+            rec.copy_(state4)
+        else:
+            cache_params.recurrent_states[self._idx] = state4
         # the host slot keeps the last K *raw* projected inputs
-        slot = mixed.new_zeros(1, mixed.shape[1], kk)
         take = min(kk, S)
-        slot[0, :, kk - take:] = mixed[S - take:].t()
-        cache_params.conv_states[self._idx] = slot
+        cslot = cache_params.conv_states[self._idx]
+        if not (torch.is_tensor(cslot)
+                and cslot.shape == (1, mixed.shape[1], kk)
+                and cslot.dtype == mixed.dtype):
+            cslot = mixed.new_zeros(1, mixed.shape[1], kk)
+            cache_params.conv_states[self._idx] = cslot
+        cslot.zero_()
+        cslot[0, :, kk - take:] = mixed[S - take:].t()
         return out.view(1, S, -1).to(hidden_states.dtype)
 
     def forward(self, hidden_states, cache_params=None,

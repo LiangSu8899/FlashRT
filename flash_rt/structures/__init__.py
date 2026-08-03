@@ -84,6 +84,19 @@ def adopt_prequantized(model, fmt="ct_nvfp4", **kwargs):
     return _adopt(model, fmt, **kwargs)
 
 
+def decode_loop(model, *, max_len, compile_step=True):
+    """Serving door: the whole-loop decode form (static cache + compiled
+    step + whole-step CUDA graph) over whatever structures are attached.
+
+    See :mod:`flash_rt.structures.impls.decode_loop.whole_step`.
+    """
+    from flash_rt.structures.impls.decode_loop.whole_step import (
+        build_decode_loop)
+
+    return build_decode_loop(model, max_len=max_len,
+                             compile_step=compile_step)
+
+
 from . import schemes  # noqa: E402  (registry: quantisation schemes)
 
 __all__ = [
@@ -91,6 +104,7 @@ __all__ = [
     "CoverageSegment",
     "StructureSpec",
     "adopt_prequantized",
+    "decode_loop",
     "attach",
     "capture",
     "get",
