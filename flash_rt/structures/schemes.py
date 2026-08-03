@@ -103,12 +103,16 @@ class QuantScheme:
 
     name = "base"
 
-    #: Optional format for an MTP draft head's projections. ``None``
-    #: keeps the draft in BF16 — the conservative arm: greedy spec
-    #: decode is exact regardless of draft precision (verify recomputes
-    #: with the main model), but the acceptance length is what a sloppy
-    #: draft destroys, so quantising the draft is a measured decision
-    #: judged by AL, never a default.
+    #: Optional format for an MTP draft head's expert bank / projections
+    #: (``decode_loop.enable_mtp`` consumes this vocabulary). ``None``
+    #: keeps the draft weights BF16 — the conservative arm. The draft
+    #: answers to acceptance length alone: the verify pass anchors the
+    #: output stream, so both measured arms (``"bf16"``,
+    #: ``"nvfp4_dynamic"`` — AL-equal on the record) are quality-safe,
+    #: and the choice trades memory for nothing else. The draft's
+    #: private W8 head view is part of the member's fixed form, not a
+    #: scheme decision: the model's own head stays on the step/verify
+    #: numeric family in every scheme.
     mtp_projection_format: str | None = None
 
     #: Optional format for the gated-delta layer's packed projections.

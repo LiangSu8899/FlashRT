@@ -242,22 +242,33 @@ class WholeStepDecodeLoop:
     def enable_mtp(self, ckpt_dir=None, head=None,
                    projection_format=None, default_k=6,
                    verify_capture=True):
-        """Attach the checkpoint's draft head; BF16 unless a scheme
-        routes the draft projections elsewhere (judged by acceptance
-        length). Pass a prebuilt ``head`` to load it early, while the
-        device still has assembly headroom.
+        """Attach the checkpoint's draft head.
+
+        The draft's precision axes are explicit and answer to acceptance
+        length alone (the verify pass anchors the output either way):
+        ``projection_format`` picks the draft expert-bank arm —
+        ``"bf16"`` (default, conservative) or ``"nvfp4_dynamic"``
+        (measured AL-equal, smaller) — and the draft always carries a
+        private W8 view of the shared head, because the model's own
+        head must stay on the step/verify numeric family. Pass a
+        prebuilt ``head`` to load it early, while the device still has
+        assembly headroom; a prebuilt head already carries its formats
+        and a conflicting ``projection_format`` here is refused, not
+        silently ignored.
 
         ``verify_capture=False`` keeps the M=K+1 verify and rewrite
-        passes eager: on MoE hosts the multi-token expert path routes
-        on the host and cannot be captured until a grouped expert GEMM
-        ships — the draft chain (single-token steps) is captured either
-        way, and greedy identity holds on both arms."""
-        from .mtp_speculative import MtpDraftHead
+        passes eager — the diagnostic arm; the captured passes are the
+        production form."""
+        from .mtp_speculative import MtpDraftHead, check_draft_formats
 
         if projection_format is not None:
-            raise ValueError(
-                f"refused: draft projection format {projection_format!r}"
-                " has no measured acceptance table yet; BF16 is the arm")
+            check_draft_formats("w8a16_static", projection_format)
+            if head is not None and getattr(head, "formats", {}).get(
+                    "experts") not in (None, projection_format):
+                raise ValueError(
+                    f"refused: prebuilt draft head carries experts "
+                    f"format {head.formats['experts']!r}, caller asked "
+                    f"for {projection_format!r}")
         slot = len(self._layers)
         ref = self.cache.key_cache[self._full[0]]
         self.cache.key_cache.append(torch.zeros_like(ref))
@@ -265,12 +276,15 @@ class WholeStepDecodeLoop:
         self.cache.conv_states.append(None)
         self.cache.recurrent_states.append(None)
         if head is None:
-            head = MtpDraftHead(self._model, self._lm, ckpt_dir, slot)
+            head = MtpDraftHead(
+                self._model, self._lm, ckpt_dir, slot,
+                experts_format=(projection_format or "bf16"))
         if head.slot != slot:
             raise ValueError(
                 f"refused: draft head was built for slot {head.slot}, "
                 f"this loop's slot is {slot}")
         self._mtp = head
+        self._mtp_formats = dict(getattr(head, "formats", {}))
         self._default_k = int(default_k)
         self._verify_capture = bool(verify_capture)
         return self._mtp

@@ -68,6 +68,30 @@ def _dequant_block_fp8(w, scale_inv):
     return wf.view(n, k).to(torch.bfloat16)
 
 
+#: the draft's precision axes and their measured arms. The draft answers
+#: to acceptance length alone — greedy spec output is anchored by the
+#: verify pass either way — so both axes may trade precision for cost,
+#: and the defaults are the measured sweet spot on the record: a private
+#: W8 view of the shared head (the model's own head must not change —
+#: step and verify share its numeric family) and the BF16 expert bank
+#: (the FP4 bank measured AL-equal; BF16 is the conservative default).
+DRAFT_FORMATS = {
+    "head": ("w8a16_static", "host"),
+    "experts": ("bf16", "nvfp4_dynamic"),
+}
+
+
+def check_draft_formats(head_format: str, experts_format: str) -> None:
+    if head_format not in DRAFT_FORMATS["head"]:
+        raise ValueError(
+            f"refused: unknown draft head format {head_format!r}; "
+            f"measured arms: {', '.join(DRAFT_FORMATS['head'])}")
+    if experts_format not in DRAFT_FORMATS["experts"]:
+        raise ValueError(
+            f"refused: unknown draft experts format {experts_format!r}; "
+            f"measured arms: {', '.join(DRAFT_FORMATS['experts'])}")
+
+
 class _GatherExpertsBf16(torch.nn.Module):
     """BF16 expert bank behind the host contract, sync-free.
 
@@ -102,8 +126,11 @@ class _GatherExpertsBf16(torch.nn.Module):
 class MtpDraftHead(torch.nn.Module):
     """fc + one host-class decoder layer + norms; embed/head shared."""
 
-    def __init__(self, model, lm, ckpt_dir, layer_slot: int):
+    def __init__(self, model, lm, ckpt_dir, layer_slot: int, *,
+                 head_format: str = "w8a16_static",
+                 experts_format: str = "bf16"):
         super().__init__()
+        check_draft_formats(head_format, experts_format)
 
         cfg = getattr(model.config, "text_config", model.config)
         full_idx = next(i for i, t in enumerate(cfg.layer_types)
@@ -138,12 +165,23 @@ class MtpDraftHead(torch.nn.Module):
             # one layer; a routed slot is a handful of MB).
             mlp = getattr(self.layer, "mlp", None)
             bank = getattr(mlp, "experts", None) if mlp is not None else None
+            self.formats = {"head": "host", "experts": None}
             if bank is not None and hasattr(bank, "gate_up_proj") \
                     and torch.is_tensor(bank.gate_up_proj) \
                     and bank.gate_up_proj.dim() == 3:
-                mlp.experts = _GatherExpertsBf16(
-                    bank.gate_up_proj.detach().to(dev),
-                    bank.down_proj.detach().to(dev), bank.act_fn)
+                if experts_format == "nvfp4_dynamic":
+                    from ..moe_experts.nvfp4_dynamic import (
+                        bind_experts_seam)
+                    mlp.experts, self.experts_conversion = \
+                        bind_experts_seam(
+                            {"gate_up_proj": bank.gate_up_proj.detach(),
+                             "down_proj": bank.down_proj.detach()},
+                            bank.act_fn)
+                else:
+                    mlp.experts = _GatherExpertsBf16(
+                        bank.gate_up_proj.detach().to(dev),
+                        bank.down_proj.detach().to(dev), bank.act_fn)
+                self.formats["experts"] = experts_format
             self.fc = torch.nn.Linear(2 * hidden, hidden, bias=False,
                                       device=dev, dtype=torch.bfloat16)
             self.fc.weight.copy_(t["fc.weight"].to(torch.bfloat16))
@@ -165,12 +203,14 @@ class MtpDraftHead(torch.nn.Module):
         # and splitting their numeric family at the logits is what a
         # W8-swapped model head was measured to do
         self._head = model.lm_head
-        if isinstance(model.lm_head, torch.nn.Linear):
+        if head_format == "w8a16_static" \
+                and isinstance(model.lm_head, torch.nn.Linear):
             try:
                 from ..linear_proj import w8a16_static
                 self._head = w8a16_static.bind_proj_seam(
                     {"w": model.lm_head.weight.detach()},
                     original=model.lm_head)
+                self.formats["head"] = "w8a16_static"
             except (ValueError, RuntimeError):
                 self._head = model.lm_head
         self.eval()

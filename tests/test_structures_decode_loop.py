@@ -128,3 +128,20 @@ def test_mtp_tensor_loader_names_its_refusals(tmp_path):
         json.dumps({"weight_map": {"model.embed.weight": "s1"}}))
     with pytest.raises(ValueError, match="no mtp"):
         _load_mtp_tensors(tmp_path)
+
+
+def test_draft_precision_axes_are_explicit_and_refuse_by_name():
+    import pytest
+
+    from flash_rt.structures.impls.decode_loop.mtp_speculative import (
+        DRAFT_FORMATS, check_draft_formats)
+
+    # the measured arms are the whole vocabulary
+    assert DRAFT_FORMATS == {"head": ("w8a16_static", "host"),
+                             "experts": ("bf16", "nvfp4_dynamic")}
+    check_draft_formats("w8a16_static", "bf16")
+    check_draft_formats("host", "nvfp4_dynamic")
+    with pytest.raises(ValueError, match="unknown draft head"):
+        check_draft_formats("w4", "bf16")
+    with pytest.raises(ValueError, match="unknown draft experts"):
+        check_draft_formats("host", "int4")
