@@ -77,6 +77,16 @@ def _check(weights: Mapping[str, torch.Tensor]) -> tuple[int, int]:
     return n, k
 
 
+def _quantize_activation(kern, flat: torch.Tensor):
+    """Use the direct BF16 producer when the installed artifact carries it."""
+    if flat.dtype is torch.bfloat16:
+        direct = getattr(kern, "quantize_fp4_sfa_bf16", None)
+        if direct is not None:
+            return direct(flat.contiguous())
+    return kern.quantize_fp4_sfa_fp16(
+        flat.to(torch.float16).contiguous())
+
+
 class LinearProjNvfp4Dynamic(GuardedSeam, torch.nn.Module):
     """Packed-weight projection: FP4 GEMM with runtime activation scales."""
 
@@ -90,7 +100,7 @@ class LinearProjNvfp4Dynamic(GuardedSeam, torch.nn.Module):
         self._n = n
         self._k = k
         kern = _kernel()
-        self._quantize = kern.quantize_fp4_sfa_fp16
+        self._kern = kern
         self._gemm = kern.fp4_w4a16_linear_bf16
         # M=1 decode rows route to the warp-split GEMV where the build
         # carries it and the shape qualifies (its own contract: N%8,
@@ -108,8 +118,7 @@ class LinearProjNvfp4Dynamic(GuardedSeam, torch.nn.Module):
             return admitted
         shape = x.shape
         flat = x.reshape(-1, shape[-1])
-        a_packed, a_sfa = self._quantize(
-            flat.to(torch.float16).contiguous())
+        a_packed, a_sfa = _quantize_activation(self._kern, flat)
         if flat.shape[0] == 1 and self._gemv is not None:
             y = self._gemv(a_packed, self._w_packed, a_sfa, self._w_sfb)
         else:

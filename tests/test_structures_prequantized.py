@@ -61,6 +61,45 @@ def test_nvfp4_impl_contract_surface():
                               "b": torch.zeros(960)})
 
 
+def test_nvfp4_activation_quantizer_prefers_direct_bf16_entry():
+    from flash_rt.structures.impls.linear_proj import nvfp4_dynamic
+
+    calls = []
+
+    class Kern:
+        @staticmethod
+        def quantize_fp4_sfa_bf16(x):
+            calls.append(("bf16", x.dtype, x.is_contiguous()))
+            return "bf16-packed"
+
+        @staticmethod
+        def quantize_fp4_sfa_fp16(x):
+            calls.append(("fp16", x.dtype, x.is_contiguous()))
+            return "fp16-packed"
+
+    got = nvfp4_dynamic._quantize_activation(
+        Kern(), torch.zeros((1, 32), dtype=torch.bfloat16))
+    assert got == "bf16-packed"
+    assert calls == [("bf16", torch.bfloat16, True)]
+
+
+def test_nvfp4_activation_quantizer_retains_legacy_fallback():
+    from flash_rt.structures.impls.linear_proj import nvfp4_dynamic
+
+    calls = []
+
+    class LegacyKern:
+        @staticmethod
+        def quantize_fp4_sfa_fp16(x):
+            calls.append((x.dtype, x.is_contiguous()))
+            return "fp16-packed"
+
+    got = nvfp4_dynamic._quantize_activation(
+        LegacyKern(), torch.zeros((1, 32), dtype=torch.bfloat16))
+    assert got == "fp16-packed"
+    assert calls == [(torch.float16, True)]
+
+
 def test_adoption_is_exported_from_the_package_door():
     from flash_rt import structures
 
