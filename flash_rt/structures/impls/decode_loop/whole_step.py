@@ -144,7 +144,9 @@ class WholeStepDecodeLoop:
 
     def _gstep(self):
         logits = self._step(self._cur, self._pos)
-        self._cur.copy_(logits.argmax(-1))
+        # hosts sample from FP32 logits; argmax there too, or BF16
+        # ties break differently and free runs diverge
+        self._cur.copy_(logits.float().argmax(-1))
         self._pos.add_(1)
 
     @torch.no_grad()
@@ -157,7 +159,7 @@ class WholeStepDecodeLoop:
                 f"window {self._max}")
         logits = self._step(input_ids,
                             torch.arange(L, device=input_ids.device))
-        self._cur.copy_(logits.argmax(-1))
+        self._cur.copy_(logits.float().argmax(-1))
         self._pos.fill_(L)
         toks = [self._cur.clone()]
         warm = min(3, max_new_tokens - 1)
