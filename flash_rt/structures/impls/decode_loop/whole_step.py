@@ -87,6 +87,8 @@ class WholeStepDecodeLoop:
 
     def __init__(self, model, *, max_len, compile_step=True):
         lm = _find_stack(model)
+        self._model = model
+        self._lm = lm
         head = getattr(model, "lm_head", None)
         if head is None:
             raise ValueError("refused: host carries no lm_head")
@@ -157,6 +159,7 @@ class WholeStepDecodeLoop:
             raise ValueError(
                 f"refused: {L}+{max_new_tokens} exceeds the static "
                 f"window {self._max}")
+        self.cache.frt_continue = False
         logits = self._step(input_ids,
                             torch.arange(L, device=input_ids.device))
         self._cur.copy_(logits.float().argmax(-1))
@@ -183,6 +186,130 @@ class WholeStepDecodeLoop:
                 self._graph.replay()
                 toks.append(self._cur.clone())
         return torch.cat([input_ids] + toks, dim=1)
+
+
+    @torch.no_grad()
+    def enable_mtp(self, ckpt_dir=None, head=None,
+                   projection_format=None):
+        """Attach the checkpoint's draft head; BF16 unless a scheme
+        routes the draft projections elsewhere (judged by acceptance
+        length). Pass a prebuilt ``head`` to load it early, while the
+        device still has assembly headroom."""
+        from .mtp_speculative import MtpDraftHead
+
+        if projection_format is not None:
+            raise ValueError(
+                f"refused: draft projection format {projection_format!r}"
+                " has no measured acceptance table yet; BF16 is the arm")
+        slot = len(self._layers)
+        ref = self.cache.key_cache[self._full[0]]
+        self.cache.key_cache.append(torch.zeros_like(ref))
+        self.cache.value_cache.append(torch.zeros_like(ref))
+        self.cache.conv_states.append(None)
+        self.cache.recurrent_states.append(None)
+        if head is None:
+            head = MtpDraftHead(self._model, self._lm, ckpt_dir, slot)
+        if head.slot != slot:
+            raise ValueError(
+                f"refused: draft head was built for slot {head.slot}, "
+                f"this loop's slot is {slot}")
+        self._mtp = head
+        return self._mtp
+
+    def _fwd_full(self, tok_ids, pos_t):
+        h = self._embed(tok_ids)
+        pe = self._rotary(h, pos_t.view(1, -1))
+        self.cache._cp = pos_t
+        m4 = self._causal.index_select(0, pos_t).view(
+            1, 1, -1, self._max)
+        for i, lyr in enumerate(self._layers):
+            h = lyr(h, position_embeddings=pe,
+                    attention_mask=(m4 if i in self._full_set else None),
+                    past_key_values=self.cache, use_cache=True,
+                    cache_position=pos_t)
+        hn = self._norm(h)
+        return self._head(hn), hn
+
+    def _row(self, pos_t):
+        return self._causal.index_select(0, pos_t).view(
+            1, 1, -1, self._max)
+
+    def _gdn_slots(self):
+        return [i for i, sl in enumerate(self.cache.conv_states)
+                if torch.is_tensor(sl)]
+
+    @torch.no_grad()
+    def generate_speculative(self, input_ids, max_new_tokens, K=6):
+        """Greedy MTP spec decode; exact vs plain greedy by verify."""
+        if getattr(self, "_mtp", None) is None:
+            raise ValueError("refused: enable_mtp first")
+        dev = input_ids.device
+        L = int(input_ids.shape[1])
+        if L + max_new_tokens + K + 1 > self._max:
+            raise ValueError("refused: window too small for spec tail")
+        self.cache.frt_continue = False
+        logits, hn = self._fwd_full(
+            input_ids, torch.arange(L, device=dev))
+        self.cache.frt_continue = True
+        tok = logits[:, -1:].float().argmax(-1)
+        # draft KV over the prompt: position p keys on (h_{p-1}, y_p)
+        for p in range(1, L):
+            pt = torch.tensor([p], device=dev)
+            self._mtp(hn[:, p - 1:p], input_ids[:, p:p + 1], pt,
+                      self.cache, self._row(pt))
+        produced = [tok]
+        pos = L
+        h_last = hn[:, -1:]
+        accepted_hist = []
+        while len(produced) < max_new_tokens:
+            k_eff = min(K, max_new_tokens - len(produced))
+            snaps = [(i, self.cache.conv_states[i].clone(),
+                      self.cache.recurrent_states[i].clone())
+                     for i in self._gdn_slots()]
+            dtoks, dh, dtok = [], h_last, produced[-1]
+            for k in range(k_eff):
+                pt = torch.tensor([pos + k], device=dev)
+                lg, dh = self._mtp(dh, dtok, pt, self.cache,
+                                   self._row(pt))
+                dtok = lg[:, -1:].float().argmax(-1)
+                dtoks.append(dtok)
+            seq = torch.cat([produced[-1]] + dtoks[:-1], dim=1)                 if k_eff > 1 else produced[-1]
+            seq = torch.cat([produced[-1]] + dtoks, dim=1)[:, :k_eff + 1]
+            pos_v = torch.arange(pos, pos + k_eff + 1, device=dev)
+            lg_v, hn_v = self._fwd_full(seq[:, :k_eff + 1], pos_v)
+            targets = lg_v.float().argmax(-1)          # (1, k_eff+1)
+            j = 0
+            while j < k_eff and int(dtoks[j][0, 0]) == int(
+                    targets[0, j]):
+                j += 1
+            # roll the gated-delta states back and re-advance exactly
+            # the accepted prefix — linear states cannot unwind
+            for i, cs, rs in snaps:
+                self.cache.conv_states[i].copy_(cs)
+                self.cache.recurrent_states[i].copy_(rs)
+            pos_a = torch.arange(pos, pos + j + 1, device=dev)
+            lg_a, hn_a = self._fwd_full(seq[:, :j + 1], pos_a)
+            bonus = lg_a[:, -1:].float().argmax(-1)
+            # draft KV for the accepted region keys on main hiddens
+            prev_h = h_last
+            row_toks = torch.cat([seq[:, 1:j + 1], bonus], dim=1)                 if j > 0 else bonus
+            for r in range(j + 1):
+                pt = torch.tensor([pos + r], device=dev)
+                self._mtp(prev_h if r == 0 else hn_a[:, r - 1:r],
+                          seq[:, r:r + 1], pt, self.cache,
+                          self._row(pt))
+            del row_toks
+            for r in range(j):
+                produced.append(dtoks[r])
+            produced.append(bonus)
+            accepted_hist.append(j + 1)
+            pos += j + 1
+            h_last = hn_a[:, -1:]
+        self.cache.frt_continue = False
+        out = torch.cat([input_ids] + produced, dim=1)
+        self.last_acceptance = (sum(accepted_hist) / len(accepted_hist)
+                                if accepted_hist else 0.0)
+        return out[:, :L + max_new_tokens]
 
 
 def build_decode_loop(model, *, max_len, compile_step=True):

@@ -179,10 +179,24 @@ class FusedGatedDeltaDecodeLayer(GuardedSeam, torch.nn.Module):
         a_all = allp[:, a0:a1].contiguous()
         b_all = allp[:, b0:b1].contiguous()
         kk = self._conv_w.shape[-1]
-        conv_state = torch.zeros(1, mixed.shape[1], kk - 1,
-                                 device=mixed.device, dtype=mixed.dtype)
-        state = torch.zeros(self._hv, self._d, self._d,
-                            device=mixed.device, dtype=torch.bfloat16)
+        # continuation (a verify batch mid-stream) seeds from the live
+        # slots; a fresh prompt starts from zero. The signal is an
+        # explicit attribute only loop-owned caches carry — host caches
+        # lack it and always get prompt semantics.
+        cont = bool(getattr(cache_params, "frt_continue", False))
+        old_slot = cache_params.conv_states[self._idx] if cont else None
+        cont = cont and torch.is_tensor(old_slot)
+        if cont:
+            conv_state = old_slot[:, :, 1:].contiguous().clone()
+            state = cache_params.recurrent_states[self._idx] \
+                .view(self._hv, self._d, self._d) \
+                .to(torch.bfloat16).contiguous().clone()
+        else:
+            conv_state = torch.zeros(1, mixed.shape[1], kk - 1,
+                                     device=mixed.device,
+                                     dtype=mixed.dtype)
+            state = torch.zeros(self._hv, self._d, self._d,
+                                device=mixed.device, dtype=torch.bfloat16)
         core_out = torch.empty(S, self._hv, self._d,
                                device=mixed.device, dtype=torch.bfloat16)
         for s0 in range(0, S, 64):
@@ -219,7 +233,13 @@ class FusedGatedDeltaDecodeLayer(GuardedSeam, torch.nn.Module):
                 and cslot.dtype == mixed.dtype):
             cslot = mixed.new_zeros(1, mixed.shape[1], kk)
             cache_params.conv_states[self._idx] = cslot
-        cslot.zero_()
+        if cont and S < kk:
+            # short continuation: the slot keeps the last kk raw inputs
+            # across the old tail and the new tokens
+            head = old_slot[:, :, S:].clone()
+            cslot[:, :, :kk - S].copy_(head)
+        else:
+            cslot.zero_()
         cslot[0, :, kk - take:] = mixed[S - take:].t()
         return out.view(1, S, -1).to(hidden_states.dtype)
 

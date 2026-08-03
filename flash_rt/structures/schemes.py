@@ -103,6 +103,14 @@ class QuantScheme:
 
     name = "base"
 
+    #: Optional format for an MTP draft head's projections. ``None``
+    #: keeps the draft in BF16 — the conservative arm: greedy spec
+    #: decode is exact regardless of draft precision (verify recomputes
+    #: with the main model), but the acceptance length is what a sloppy
+    #: draft destroys, so quantising the draft is a measured decision
+    #: judged by AL, never a default.
+    mtp_projection_format: str | None = None
+
     #: Optional format for the gated-delta layer's packed projections.
     #: The fused-layer adapter consults this; ``None`` keeps them at
     #: host precision. This is a scheme attribute, not an impl default —
