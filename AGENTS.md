@@ -167,6 +167,46 @@ and record the results as evidence — and verify the negative case too.
 A structure must *not* be discovered on hosts it does not describe;
 "correctly not found" is an acceptance item with test precedent.
 
+### 1.1 The adapter contract (both review rejections were adapters)
+
+An adapter is the wing that touches the host's API, and it is where
+work gets returned. The paradigm that survived review, as a contract:
+
+1. **Structural predicates, never identity.** Recognition reads slots,
+   shapes and parameter presence (`in_proj_qkv` + `conv1d` + `A_log` +
+   the 48/16-head profile *is* a fused gated-delta layer; a
+   `scale_shift_table` parameter + 4-D `temb` *is* a per-token
+   modulated block). Class names and model IDs are forbidden evidence.
+2. **Refuse with the reason, and let the ladder fall.** Out-of-profile
+   hosts and packages predating an entry raise `ValueError("refused:
+   ...")` once; registration order is the ladder (fused form before
+   rule-level form), and a refusal is a routing event, not an error.
+3. **Resolve at bind, freeze in a closure.** Weights are detached,
+   cast, packed and smoke-tested at bind time; the forward touches
+   only what the closure captured. A bind-time smoke on zeros is the
+   difference between a clean bind refusal and a crash inside the
+   host's forward.
+4. **Masks, scales and positions are explicit.** Whatever the host
+   passes (attention masks, cache positions, rope deltas) is either
+   handled or named in the refusal. Two receipts to remember: a cache
+   that misreports its progress sends host glue down the continuation
+   branch, and a KV slot index is not a rotary position on multimodal
+   hosts.
+5. **Declare capabilities, don't sniff.** An adapter that wants the
+   active scheme sets `scheme_aware = True` and takes it as a kwarg;
+   probing call signatures (or catching TypeError) hides real errors.
+6. **Host cache contracts are followed, not replaced.** Slots are
+   written in place with the host's own semantics (last-K raw inputs,
+   final state); repointing a slot strands every captured graph on the
+   old tensors — the repeat-identical gate exists to catch exactly
+   this.
+
+The template test for a new adapter pins: the positive shape case, one
+negative shape case (out of profile → clean refusal), the ladder
+fallthrough (stale package → next adapter), and revert/toggle
+round-trip. `tests/test_structures_gated_delta_core.py`'s fused
+adapter pins are the copyable precedent.
+
 ---
 
 ## 2. Finding and wiring Hub kernels
