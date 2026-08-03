@@ -137,6 +137,11 @@ class FusedGatedDeltaDecodeLayer(GuardedSeam, torch.nn.Module):
                                     device=dev, dtype=torch.bfloat16)
         self._core_out = torch.empty(1, self._hv, self._d, device=dev,
                                      dtype=torch.bfloat16)
+        # prefill chain needs the chunk entries; their absence is not a
+        # bind refusal — prompts simply keep the host form
+        self._chunk_ok = (
+            hasattr(conv, "causal_conv1d_update_chunk_parallel_bf16")
+            and hasattr(gda, "gdn_chunk_from_conv_smem_bf16"))
         guard = self._frt_arm(dtypes=CAST_OK, device=dev, k=d_model)
         guard.notes["host_form_calls"] = 0
         guard.notes["proj_band"] = ("nvfp4" if self._proj_in is not None
@@ -156,6 +161,56 @@ class FusedGatedDeltaDecodeLayer(GuardedSeam, torch.nn.Module):
             guard.notes["host_form_calls"] += 1
         return self.host_layer(*args, **kwargs)
 
+    def _prefill_chain(self, hidden_states, cache_params):
+        """Whole-prompt form: conv chunk + fused gating/split/recurrent.
+
+        Chunks of 64 carry the conv state and the recurrent state
+        forward in place, so any prompt length runs through the same
+        two kernels per chunk. Both host cache slots are written with
+        the host's own semantics (last-K raw inputs; final state).
+        """
+        host = self.host_layer
+        S = hidden_states.shape[1]
+        x = hidden_states.view(S, -1)
+        allp = (self._proj_in(x) if self._proj_in is not None
+                else torch.nn.functional.linear(x, self._packed_w))
+        (q0, q1), (z0, z1), (b0, b1), (a0, a1) = self._splits
+        mixed = allp[:, q0:q1].contiguous()
+        a_all = allp[:, a0:a1].contiguous()
+        b_all = allp[:, b0:b1].contiguous()
+        kk = self._conv_w.shape[-1]
+        conv_state = torch.zeros(1, mixed.shape[1], kk - 1,
+                                 device=mixed.device, dtype=mixed.dtype)
+        state = torch.zeros(self._hv, self._d, self._d,
+                            device=mixed.device, dtype=torch.bfloat16)
+        core_out = torch.empty(S, self._hv, self._d,
+                               device=mixed.device, dtype=torch.bfloat16)
+        for s0 in range(0, S, 64):
+            s1 = min(s0 + 64, S)
+            conv_out = self._conv.causal_conv1d_update_chunk_parallel_bf16(
+                mixed[s0:s1].view(1, s1 - s0, -1), self._conv_w,
+                conv_state, self._conv_b, apply_silu=True)
+            self._gda.gdn_chunk_from_conv_smem_bf16(
+                conv_out.view(s1 - s0, -1), a_all[s0:s1], b_all[s0:s1],
+                self._neg_exp_a, self._dt_bias, state,
+                use_qk_l2norm=True, out=core_out[s0:s1])
+        normed = self._fused.rms_norm_gated_silu_bf16(
+            core_out.view(S * self._hv, self._d),
+            allp[:, z0:z1].contiguous().view(S * self._hv, self._d),
+            host.norm.weight, eps=self._eps)
+        flat_norm = normed.view(S, -1)
+        out = (self._proj_out(flat_norm) if self._proj_out is not None
+               else torch.nn.functional.linear(flat_norm,
+                                               host.out_proj.weight))
+        cache_params.recurrent_states[self._idx] = \
+            state.view(1, self._hv, self._d, self._d)
+        # the host slot keeps the last K *raw* projected inputs
+        slot = mixed.new_zeros(1, mixed.shape[1], kk)
+        take = min(kk, S)
+        slot[0, :, kk - take:] = mixed[S - take:].t()
+        cache_params.conv_states[self._idx] = slot
+        return out.view(1, S, -1).to(hidden_states.dtype)
+
     def forward(self, hidden_states, cache_params=None,
                 attention_mask=None):
         admitted = self._frt_admit(hidden_states)
@@ -168,6 +223,12 @@ class FusedGatedDeltaDecodeLayer(GuardedSeam, torch.nn.Module):
                   and (attention_mask is None
                        or bool(attention_mask.all())))
         if not decode:
+            if (self._chunk_ok and cache_params is not None
+                    and hidden_states.shape[0] == 1
+                    and hidden_states.shape[1] > 1
+                    and (attention_mask is None
+                         or bool(attention_mask.all()))):
+                return self._prefill_chain(hidden_states, cache_params)
             return self._host_form(hidden_states, cache_params,
                                    attention_mask)
 
