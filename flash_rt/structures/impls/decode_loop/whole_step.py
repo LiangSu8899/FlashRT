@@ -239,11 +239,18 @@ class WholeStepDecodeLoop:
 
     @torch.no_grad()
     def enable_mtp(self, ckpt_dir=None, head=None,
-                   projection_format=None, default_k=6):
+                   projection_format=None, default_k=6,
+                   verify_capture=True):
         """Attach the checkpoint's draft head; BF16 unless a scheme
         routes the draft projections elsewhere (judged by acceptance
         length). Pass a prebuilt ``head`` to load it early, while the
-        device still has assembly headroom."""
+        device still has assembly headroom.
+
+        ``verify_capture=False`` keeps the M=K+1 verify and rewrite
+        passes eager: on MoE hosts the multi-token expert path routes
+        on the host and cannot be captured until a grouped expert GEMM
+        ships — the draft chain (single-token steps) is captured either
+        way, and greedy identity holds on both arms."""
         from .mtp_speculative import MtpDraftHead
 
         if projection_format is not None:
@@ -264,6 +271,7 @@ class WholeStepDecodeLoop:
                 f"this loop's slot is {slot}")
         self._mtp = head
         self._default_k = int(default_k)
+        self._verify_capture = bool(verify_capture)
         return self._mtp
 
     def _fwd_full(self, tok_ids, pos_t):
@@ -339,6 +347,13 @@ class WholeStepDecodeLoop:
         self._dgraph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self._dgraph):
             draft_chain()
+        if not getattr(self, "_verify_capture", True):
+            # multi-token passes stay eager (MoE hosts: the T>1 expert
+            # path routes on the host); the draft chain above is the
+            # captured piece either way
+            self._vgraph = None
+            self._rwgraph = None
+            return
         self._vgraph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self._vgraph):
             self._vlg, self._vhn = verify()
@@ -421,11 +436,15 @@ class WholeStepDecodeLoop:
                 self._vseq_buf[:, 1:].copy_(self._dtoks_out)
                 self._vpos_buf.copy_(torch.arange(
                     pos, pos + K + 1, device=dev))
-                self._vgraph.replay()
+                if self._vgraph is not None:
+                    self._vgraph.replay()
+                    lg_v, hn_v = self._vlg, self._vhn
+                else:
+                    lg_v, hn_v = self._fwd_full(self._vseq_buf,
+                                                self._vpos_buf)
                 dtoks = [self._dtoks_out[k].view(1, 1)
                          for k in range(K)]
                 seq = self._vseq_buf
-                lg_v, hn_v = self._vlg, self._vhn
             else:
                 dtoks, dh, dtok = [], h_last, produced[-1]
                 for k in range(k_eff):

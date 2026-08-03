@@ -153,6 +153,32 @@ class MoeExpertsNvfp4Dynamic(GuardedSeam, torch.nn.Module):
                 d = self._expert_mm(b_packed, b_sfa, dn_p[j], dn_s[j],
                                     1, self._gemv_dn)
                 out += wts[j] * d.float()
+        elif hidden_states.shape[0] <= 16:
+            # short multi-token rows (a verify or rewrite pass): the
+            # same gather-then-fixed-shape form, per token — T*k is
+            # small and fixed, so the pass stays capturable where the
+            # routed-loop form below would sync the host. Beyond the
+            # bound the routed loop wins: many tokens share experts and
+            # its per-expert GEMMs amortise the weight reads.
+            for r in range(int(hidden_states.shape[0])):
+                row = hidden_states[r:r + 1]
+                idx = top_k_index[r]
+                wts = top_k_weights[r].float()
+                gu_p = self._gu_packed.index_select(0, idx)
+                gu_s = self._gu_sfb.index_select(0, idx)
+                dn_p = self._dn_packed.index_select(0, idx)
+                dn_s = self._dn_sfb.index_select(0, idx)
+                a_packed, a_sfa = _quantize_activation(self._kern, row)
+                for j in range(int(idx.shape[0])):
+                    y = self._expert_mm(a_packed, a_sfa, gu_p[j],
+                                        gu_s[j], 1, self._gemv_gu)
+                    gate, up = y.chunk(2, dim=-1)
+                    inter = self._act(gate) * up
+                    b_packed, b_sfa = _quantize_activation(
+                        self._kern, inter)
+                    d = self._expert_mm(b_packed, b_sfa, dn_p[j],
+                                        dn_s[j], 1, self._gemv_dn)
+                    out[r] += wts[j] * d.float().view(-1)
         else:
             for e in torch.unique(top_k_index).tolist():
                 pos, tok = torch.where(top_k_index.t() == e)

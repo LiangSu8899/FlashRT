@@ -109,3 +109,22 @@ def test_explain_renders_a_plan_without_a_model():
     assert "decoder_ffn: 2" in text
     assert "amax outlier" in text
     assert "siblings did not share input" in text
+
+
+def test_mtp_tensor_loader_names_its_refusals(tmp_path):
+    import json
+
+    import pytest
+
+    from flash_rt.structures.impls.decode_loop.mtp_speculative import (
+        _load_mtp_tensors)
+
+    # neither shipping form present
+    with pytest.raises(ValueError, match="neither mtp.safetensors"):
+        _load_mtp_tensors(tmp_path)
+
+    # a sharded index that carries no draft head
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"model.embed.weight": "s1"}}))
+    with pytest.raises(ValueError, match="no mtp"):
+        _load_mtp_tensors(tmp_path)

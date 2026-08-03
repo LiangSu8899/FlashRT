@@ -20,6 +20,45 @@ from __future__ import annotations
 import torch
 
 
+def _load_mtp_tensors(ckpt_dir):
+    """The draft's tensors, ``mtp.`` prefix stripped.
+
+    Two shipping forms: a sidecar ``mtp.safetensors``, or ``mtp.*`` keys
+    inside the main sharded checkpoint (the MoE hosts ship this way) —
+    the index says which shards carry them.
+    """
+    import json
+    import pathlib
+
+    from safetensors import safe_open
+
+    d = pathlib.Path(str(ckpt_dir))
+    side = d / "mtp.safetensors"
+    if side.is_file():
+        f = safe_open(str(side), "pt")
+        return {k[len("mtp."):]: f.get_tensor(k) for k in f.keys()}
+    idx_path = d / "model.safetensors.index.json"
+    if not idx_path.is_file():
+        raise ValueError(
+            f"refused: {d} carries neither mtp.safetensors nor a "
+            "sharded index with mtp.* keys")
+    wmap = json.loads(idx_path.read_text())["weight_map"]
+    by_shard: dict[str, list[str]] = {}
+    for key, shard in wmap.items():
+        if key.startswith("mtp."):
+            by_shard.setdefault(shard, []).append(key)
+    if not by_shard:
+        raise ValueError(
+            f"refused: this checkpoint's index carries no mtp.* keys "
+            "(the host ships no draft head)")
+    t = {}
+    for shard, keys in by_shard.items():
+        f = safe_open(str(d / shard), "pt")
+        for k in keys:
+            t[k[len("mtp."):]] = f.get_tensor(k)
+    return t
+
+
 def _dequant_block_fp8(w, scale_inv):
     n, k = w.shape
     bn, bk = n // scale_inv.shape[0], k // scale_inv.shape[1]
@@ -34,7 +73,6 @@ class MtpDraftHead(torch.nn.Module):
 
     def __init__(self, model, lm, ckpt_dir, layer_slot: int):
         super().__init__()
-        from safetensors import safe_open
 
         cfg = getattr(model.config, "text_config", model.config)
         full_idx = next(i for i, t in enumerate(cfg.layer_types)
@@ -44,23 +82,38 @@ class MtpDraftHead(torch.nn.Module):
         hidden = int(cfg.hidden_size)
         dev = lm.norm.weight.device
 
-        f = safe_open(str(ckpt_dir) + "/mtp.safetensors", "pt")
-        t = {k[len("mtp."):]: f.get_tensor(k) for k in f.keys()}
+        t = _load_mtp_tensors(ckpt_dir)
 
         # assemble on CPU, move once — the draft loads while the host
         # still has headroom, and never doubles on the device
         self.layer = layer_cls(cfg, full_idx).to(torch.bfloat16)
         pre = "layers.0."
         with torch.no_grad():
-            for name, mod in self.layer.named_modules():
-                w = t.get(pre + name + ".weight")
+            for name, p in self.layer.named_parameters():
+                w = t.get(pre + name)
                 if w is None:
                     continue
-                s = t.get(pre + name + ".weight_scale_inv")
+                s = t.get(pre + name + "_scale_inv")
                 w = (_dequant_block_fp8(w, s) if s is not None
                      else w.to(torch.bfloat16))
-                mod.weight.copy_(w)
+                p.copy_(w)
             self.layer = self.layer.to(dev)
+            # a draft layer whose MLP is an expert bank must run the
+            # gather-then-fixed-shape form: the draft chain is captured,
+            # and the host bank's routed loop syncs the host. The bank
+            # binds in the same packed representation the adopted main
+            # model runs; draft precision is judged by acceptance length.
+            mlp = getattr(self.layer, "mlp", None)
+            bank = getattr(mlp, "experts", None) if mlp is not None else None
+            if bank is not None and hasattr(bank, "gate_up_proj") \
+                    and torch.is_tensor(bank.gate_up_proj) \
+                    and bank.gate_up_proj.dim() == 3:
+                from ..moe_experts.nvfp4_dynamic import bind_experts_seam
+                bound, rels = bind_experts_seam(
+                    {"gate_up_proj": bank.gate_up_proj.detach(),
+                     "down_proj": bank.down_proj.detach()}, bank.act_fn)
+                mlp.experts = bound
+                self.experts_conversion = rels
             self.fc = torch.nn.Linear(2 * hidden, hidden, bias=False,
                                       device=dev, dtype=torch.bfloat16)
             self.fc.weight.copy_(t["fc.weight"].to(torch.bfloat16))
