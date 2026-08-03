@@ -174,6 +174,23 @@ class FusedGatedDeltaDecodeLayer(GuardedSeam, torch.nn.Module):
         self._chunk_ok = (
             hasattr(conv, "causal_conv1d_update_chunk_parallel_bf16")
             and hasattr(gda, self._chunk_name))
+        # the WY pipeline is the prompt-length core: one fused chain
+        # over all chunks, state carried inside the kernels — the
+        # serial per-chunk walk of the fallback core is the measured
+        # long-prompt TTFT term. Its entries are 48/16-shaped; other
+        # profiles keep the chunk walk until head-generic WY ships.
+        self._wy_ok = (
+            (self._hv, self._hk) == (48, 16)
+            and self._chunk_ok
+            and all(hasattr(gda, n) for n in (
+                "lin_split_qkv_gqa_bf16",
+                "gdn_wy_norm_cumsum_pack_qk_bf16",
+                "gdn_wy_kkt_b64_bf16",
+                "gdn_wy_solve_tril_b64_f32",
+                "gdn_wy_cast_ai_f32_to_bf16",
+                "gdn_wy_recompute_wu_b64_mma_fla_bf16",
+                "gdn_wy_chunk_h_b64_mma_fla_bf16",
+                "gdn_wy_output_o_b64_mma_fla_rawk_bf16")))
         guard = self._frt_arm(dtypes=CAST_OK, device=dev, k=d_model)
         guard.notes["host_form_calls"] = 0
         guard.notes["proj_band"] = ("nvfp4" if self._proj_in is not None
@@ -243,6 +260,12 @@ class FusedGatedDeltaDecodeLayer(GuardedSeam, torch.nn.Module):
                                      dtype=mixed.dtype)
             state = torch.zeros(self._hv, self._d, self._d,
                                 device=mixed.device, dtype=torch.bfloat16)
+        if self._wy_ok and S > 64:
+            core_out = self._wy_core(mixed, a_all, b_all, conv_state,
+                                     state, S)
+            return self._prefill_epilogue(
+                hidden_states, cache_params, allp, mixed, core_out,
+                state, cont, old_slot, S)
         core_out = torch.empty(S, self._hv, self._d,
                                device=mixed.device, dtype=torch.bfloat16)
         for s0 in range(0, S, 64):
@@ -262,8 +285,55 @@ class FusedGatedDeltaDecodeLayer(GuardedSeam, torch.nn.Module):
                     conv_out.view(s1 - s0, -1), a_all[s0:s1],
                     b_all[s0:s1], self._neg_exp_a, self._dt_bias, state,
                     use_qk_l2norm=True, out=core_out[s0:s1])
+        return self._prefill_epilogue(
+            hidden_states, cache_params, allp, mixed, core_out, state,
+            cont, old_slot, S)
+
+    def _wy_core(self, mixed, a_all, b_all, conv_state, state, S):
+        """Whole-prompt gated-delta core: the WY pipeline, one pass.
+
+        The conv update runs the full prompt in one launch; the WY
+        chain (norm/cumsum -> KKT -> triangular solve -> WU recompute
+        -> chunk-state carry -> output) keeps its chunks inside the
+        kernels, carrying ``state`` in place — no serial per-chunk walk
+        on the host, which is the measured long-prompt TTFT term the
+        fallback core pays.
+        """
+        gda = self._gda
+        conv_out = self._conv.causal_conv1d_update_chunk_parallel_bf16(
+            mixed.view(1, S, -1), self._conv_w, conv_state,
+            self._conv_b, apply_silu=True)
+        q16, k16, v48 = gda.lin_split_qkv_gqa_bf16(conv_out.view(S, -1))
+        g, beta = self._gate_fn(
+            a_all.view(S, self._hv), b_all.view(S, self._hv),
+            self._neg_exp_a, self._dt_bias)
+        q16_l2, k16_l2, q_pack_hv, _k_pack_hk, g_cumsum = \
+            gda.gdn_wy_norm_cumsum_pack_qk_bf16(q16, k16, g)
+        big_a = gda.gdn_wy_kkt_b64_bf16(k16_l2, beta, g_cumsum)
+        # the packaged triangular solve walks its rows serially and is
+        # the measured 82% of this chain; the same inverse — semantics
+        # pinned numerically: inv(I + strict_tril(A)) — through the
+        # batched cuBLAS solve runs ~40x faster and stays deterministic
+        eye = torch.eye(64, device=big_a.device,
+                        dtype=big_a.dtype).expand_as(big_a).contiguous()
+        ai = torch.linalg.solve_triangular(
+            eye + torch.tril(big_a, -1), eye, upper=False).contiguous()
+        ai_pack = gda.gdn_wy_cast_ai_f32_to_bf16(ai, S)
+        w_pack, u_pack = gda.gdn_wy_recompute_wu_b64_mma_fla_bf16(
+            k16_l2, v48, beta, g_cumsum, ai_pack)
+        h0, _v_new, v_new_pack, k_pack_hv = \
+            gda.gdn_wy_chunk_h_b64_mma_fla_bf16(
+                k16_l2, w_pack, u_pack, g_cumsum, state)
+        return gda.gdn_wy_output_o_b64_mma_fla_bf16(
+            q_pack_hv, k_pack_hv, v_new_pack, h0, g_cumsum)
+
+    def _prefill_epilogue(self, hidden_states, cache_params, allp,
+                          mixed, core_out, state, cont, old_slot, S):
+        host = self.host_layer
+        (_q0, _q1), (z0, z1), _b, _a = self._splits
+        kk = self._conv_w.shape[-1]
         normed = self._fused.rms_norm_gated_silu_bf16(
-            core_out.view(S * self._hv, self._d),
+            core_out.reshape(S * self._hv, self._d),
             allp[:, z0:z1].contiguous().view(S * self._hv, self._d),
             host.norm.weight, eps=self._eps)
         flat_norm = normed.view(S, -1)
