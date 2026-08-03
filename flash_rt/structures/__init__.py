@@ -84,6 +84,14 @@ def adopt_prequantized(model, fmt="ct_nvfp4", **kwargs):
     return _adopt(model, fmt, **kwargs)
 
 
+def explain(plan):
+    """Coverage table for one plan: bound / routed / kept / refused,
+    each with its reason. See :mod:`flash_rt.structures.explain`."""
+    from flash_rt.structures.explain import explain as _explain
+
+    return _explain(plan)
+
+
 def decode_loop(model, *, max_len, compile_step=True):
     """Serving door: the whole-loop decode form (static cache + compiled
     step + whole-step CUDA graph) over whatever structures are attached.
@@ -105,6 +113,7 @@ __all__ = [
     "StructureSpec",
     "adopt_prequantized",
     "decode_loop",
+    "explain",
     "attach",
     "capture",
     "get",

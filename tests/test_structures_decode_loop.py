@@ -26,7 +26,12 @@ def test_static_hybrid_cache_serves_the_layer_surface():
     c.conv_states[0] = torch.zeros(1)
     assert c.has_previous_state
     assert c.get_mask_sizes(1, 0) == (32, 0)
-    assert c.get_seq_length() == 32
+    # mask sizing is the static window; seq length is TRUE progress —
+    # host glue branches on it (a fake length sends multimodal hosts
+    # down their continuation path, receipts on record)
+    assert c.get_seq_length() == 0
+    c._seen = 7
+    assert c.get_seq_length() == 7
 
 
 def test_stack_discovery_is_by_slots_not_names():
@@ -79,3 +84,28 @@ def test_decode_loop_door_is_exported():
 
     assert callable(structures.decode_loop)
     assert "decode_loop" in structures.__all__
+
+
+def test_explain_renders_a_plan_without_a_model():
+    from types import SimpleNamespace
+
+    from flash_rt import structures
+
+    plan = SimpleNamespace(
+        swaps={"a.mlp": object(), "b.mlp": object()},
+        observed={"c@1.core": object()},
+        seams=[SimpleNamespace(path="a.mlp", structure="decoder_ffn"),
+               SimpleNamespace(path="b.mlp", structure="decoder_ffn")],
+        notes={
+            "scheme": {"name": "w8a16_decode",
+                       "keep_host": {"d.proj": "amax outlier"},
+                       "formats": {"a.mlp": "w8a16_static"}},
+            "refused": [("qkv_pack", "siblings did not share input")],
+        },
+    )
+    text = structures.explain(plan)
+    assert "w8a16_decode" in text
+    assert "2 swapped seam(s)" in text
+    assert "decoder_ffn: 2" in text
+    assert "amax outlier" in text
+    assert "siblings did not share input" in text

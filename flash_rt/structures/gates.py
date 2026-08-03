@@ -377,8 +377,53 @@ def qualify_parity(
     return record
 
 
+def env_lock() -> dict[str, Any]:
+    """The environment a receipt was earned in, reconstructible.
+
+    A receipt without its environment cannot be re-run: a silent torch
+    downgrade broke two GROOT receipts before this existed. The lock
+    carries the exact versions of the packages that decide numerics,
+    plus a digest over the full installed set — enough to detect any
+    drift, small enough to live in every record.
+    """
+    import hashlib as _hashlib
+    import importlib.metadata as _md
+    import platform as _platform
+
+    key = {}
+    for pkg in ("torch", "transformers", "diffusers", "kernels",
+                "compressed-tensors", "safetensors", "numpy"):
+        try:
+            key[pkg] = _md.version(pkg)
+        except _md.PackageNotFoundError:
+            pass
+    frozen = "\n".join(sorted(
+        f"{d.metadata['Name']}=={d.version}"
+        for d in _md.distributions() if d.metadata["Name"]))
+    lock = {
+        "python": _platform.python_version(),
+        "packages": key,
+        "pip_freeze_sha256": _hashlib.sha256(
+            frozen.encode("utf-8")).hexdigest(),
+    }
+    try:
+        import torch as _torch
+
+        lock["cuda"] = _torch.version.cuda
+        if _torch.cuda.is_available():
+            lock["device"] = _torch.cuda.get_device_name(0)
+    except Exception:
+        pass
+    return lock
+
+
 def save_record(record: Mapping[str, Any], directory: str | pathlib.Path) -> pathlib.Path:
-    """Write one qualification record as JSON, named by its plan digest."""
+    """Write one qualification record as JSON, named by its plan digest.
+
+    Every record is stamped with the environment lock unless the caller
+    already supplied one."""
+    if "env_lock" not in record:
+        record = {**record, "env_lock": env_lock()}
     directory = pathlib.Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     digest = record["plan_digest"].split(":", 1)[1][:16]
