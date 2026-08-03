@@ -130,21 +130,29 @@ class MoeExpertsNvfp4Dynamic(GuardedSeam, torch.nn.Module):
         out = torch.zeros(hidden_states.shape[0], self._h,
                           device=hidden_states.device, dtype=torch.float32)
         if hidden_states.shape[0] == 1:
-            # decode row: every hit expert shares the one activation
-            # quantization; the loop is over top-k, in ascending expert
-            # order to keep the reduction order fixed
+            # decode row: gather-then-fixed-shape. The routed experts'
+            # packed rows are gathered device-side (index_select reads
+            # the routing tensor, the host never does), then a fixed
+            # top-k loop of GEMVs runs — no host sync, and the whole
+            # step stays legal inside a compiled region or a captured
+            # graph, where a host-read of the routing would freeze it.
+            # The reduction order is the fixed top-k position order.
+            idx = top_k_index[0]
+            wts = top_k_weights[0].float()
+            gu_p = self._gu_packed.index_select(0, idx)
+            gu_s = self._gu_sfb.index_select(0, idx)
+            dn_p = self._dn_packed.index_select(0, idx)
+            dn_s = self._dn_sfb.index_select(0, idx)
             a_packed, a_sfa = _quantize_activation(self._kern, hidden_states)
-            order = torch.argsort(top_k_index[0])
-            for pos in order.tolist():
-                e = int(top_k_index[0, pos])
-                y = self._expert_mm(a_packed, a_sfa, self._gu_packed[e],
-                                    self._gu_sfb[e], 1, self._gemv_gu)
+            for j in range(int(idx.shape[0])):
+                y = self._expert_mm(a_packed, a_sfa, gu_p[j], gu_s[j],
+                                    1, self._gemv_gu)
                 gate, up = y.chunk(2, dim=-1)
                 inter = self._act(gate) * up
                 b_packed, b_sfa = _quantize_activation(self._kern, inter)
-                d = self._expert_mm(b_packed, b_sfa, self._dn_packed[e],
-                                    self._dn_sfb[e], 1, self._gemv_dn)
-                out += top_k_weights[0, pos] * d.float()
+                d = self._expert_mm(b_packed, b_sfa, dn_p[j], dn_s[j],
+                                    1, self._gemv_dn)
+                out += wts[j] * d.float()
         else:
             for e in torch.unique(top_k_index).tolist():
                 pos, tok = torch.where(top_k_index.t() == e)

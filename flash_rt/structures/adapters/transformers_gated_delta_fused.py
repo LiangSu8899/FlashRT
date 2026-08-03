@@ -17,6 +17,8 @@ from ..impls.gated_delta_core import fused_layer
 
 
 def _fusable(module) -> bool:
+    hv = getattr(module, "num_v_heads", None)
+    hk = getattr(module, "num_k_heads", None)
     return (
         all(isinstance(getattr(module, name, None), torch.nn.Linear)
             for name in ("in_proj_qkv", "in_proj_z", "in_proj_b",
@@ -25,8 +27,12 @@ def _fusable(module) -> bool:
         and getattr(module, "A_log", None) is not None
         and getattr(module, "dt_bias", None) is not None
         and getattr(module, "norm", None) is not None
-        and getattr(module, "num_v_heads", None) == 48
-        and getattr(module, "num_k_heads", None) == 16
+        # the chain's own profile envelope: D=128, v-heads a multiple
+        # of k-heads (the 48/16 host keeps its dedicated entries, other
+        # profiles route the head-generic ones; the bind refuses if the
+        # installed build predates them)
+        and isinstance(hv, int) and isinstance(hk, int)
+        and hv > 0 and hk > 0 and hv % hk == 0
         and getattr(module, "head_k_dim", None) == 128
         and getattr(module, "head_v_dim", None) == 128
     )

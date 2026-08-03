@@ -76,12 +76,44 @@ class FusedGatedDeltaDecodeLayer(GuardedSeam, torch.nn.Module):
         self.host_layer = host
         self._idx = int(layer_idx)
         self._hv = int(host.num_v_heads)
+        self._hk = int(host.num_k_heads)
         self._d = int(host.head_v_dim)
-        if (self._hv, int(host.num_k_heads), self._d,
-                int(host.head_k_dim)) != (48, 16, 128, 128):
+        if (self._d != 128 or int(host.head_k_dim) != 128
+                or self._hv <= 0 or self._hk <= 0
+                or self._hv % self._hk):
             raise ValueError(
-                "fused decode chain serves the 48/16-head, D=128 "
-                "profile; other profiles keep the host layer")
+                "fused decode chain serves D=128 profiles whose v-head "
+                "count is a multiple of the k-head count; other "
+                "profiles keep the host layer")
+        # the original 48/16 profile keeps its dedicated entries,
+        # byte-for-byte; every other profile routes the head-generic
+        # entries, whose absence from an older build is a clean bind
+        # refusal (the ladder falls back to the callable-slot rule)
+        if (self._hv, self._hk) == (48, 16):
+            self._split_fn = gda.lin_split_qkv_broadcast_bf16
+            self._gate_fn = gda.gdn_gating_bf16
+            self._chunk_name = "gdn_chunk_from_conv_smem_bf16"
+        else:
+            for name in ("lin_split_qkv_broadcast_h_bf16",
+                         "gdn_gating_h_bf16"):
+                if not hasattr(gda, name):
+                    raise ValueError(
+                        f"refused: installed build lacks {name}; the "
+                        f"{self._hv}/{self._hk}-head profile needs the "
+                        "head-generic chain entries")
+            hv, hk, d = self._hv, self._hk, self._d
+
+            def _split(conv_out):
+                return gda.lin_split_qkv_broadcast_h_bf16(
+                    conv_out, hv, hk, d)
+
+            def _gate(a, b, neg_exp_a, dt_bias):
+                return gda.gdn_gating_h_bf16(a, b, neg_exp_a, dt_bias,
+                                             num_heads=hv)
+
+            self._split_fn = _split
+            self._gate_fn = _gate
+            self._chunk_name = "gdn_chunk_from_conv_smem_h_bf16"
         dev = host.in_proj_qkv.weight.device
         # the four input projections read the same activation; packing
         # them row-wise turns four GEMV launches into one, bit-identical
@@ -141,7 +173,7 @@ class FusedGatedDeltaDecodeLayer(GuardedSeam, torch.nn.Module):
         # bind refusal — prompts simply keep the host form
         self._chunk_ok = (
             hasattr(conv, "causal_conv1d_update_chunk_parallel_bf16")
-            and hasattr(gda, "gdn_chunk_from_conv_smem_bf16"))
+            and hasattr(gda, self._chunk_name))
         guard = self._frt_arm(dtypes=CAST_OK, device=dev, k=d_model)
         guard.notes["host_form_calls"] = 0
         guard.notes["proj_band"] = ("nvfp4" if self._proj_in is not None
@@ -214,10 +246,18 @@ class FusedGatedDeltaDecodeLayer(GuardedSeam, torch.nn.Module):
             conv_out = self._conv.causal_conv1d_update_chunk_parallel_bf16(
                 mixed[s0:s1].view(1, s1 - s0, -1), self._conv_w,
                 conv_state, self._conv_b, apply_silu=True)
-            self._gda.gdn_chunk_from_conv_smem_bf16(
-                conv_out.view(s1 - s0, -1), a_all[s0:s1], b_all[s0:s1],
-                self._neg_exp_a, self._dt_bias, state,
-                use_qk_l2norm=True, out=core_out[s0:s1])
+            if self._chunk_name.endswith("_h_bf16"):
+                self._gda.gdn_chunk_from_conv_smem_h_bf16(
+                    conv_out.view(s1 - s0, -1), a_all[s0:s1],
+                    b_all[s0:s1], self._neg_exp_a, self._dt_bias, state,
+                    num_v_heads=self._hv, num_k_heads=self._hk,
+                    head_dim=self._d, use_qk_l2norm=True,
+                    out=core_out[s0:s1])
+            else:
+                self._gda.gdn_chunk_from_conv_smem_bf16(
+                    conv_out.view(s1 - s0, -1), a_all[s0:s1],
+                    b_all[s0:s1], self._neg_exp_a, self._dt_bias, state,
+                    use_qk_l2norm=True, out=core_out[s0:s1])
         normed = self._fused.rms_norm_gated_silu_bf16(
             core_out.view(S * self._hv, self._d),
             allp[:, z0:z1].contiguous().view(S * self._hv, self._d),
@@ -295,8 +335,8 @@ class FusedGatedDeltaDecodeLayer(GuardedSeam, torch.nn.Module):
         conv_host[:, :, :-1].copy_(hub_state)
         conv_host[:, :, -1:].copy_(mixed.view(1, -1, 1))
 
-        q, k, v = self._gda.lin_split_qkv_broadcast_bf16(conv_out)
-        g, beta = self._gda.gdn_gating_bf16(
+        q, k, v = self._split_fn(conv_out)
+        g, beta = self._gate_fn(
             a.view(1, self._hv), b.view(1, self._hv),
             self._neg_exp_a, self._dt_bias)
         state_in = cache_params.recurrent_states[self._idx]

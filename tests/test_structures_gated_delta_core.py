@@ -213,12 +213,17 @@ def test_fused_adapter_recognises_by_shape_and_ladders_cleanly(monkeypatch):
             self.A_log = nn.Parameter(torch.zeros(48))
             self.dt_bias = nn.Parameter(torch.zeros(48))
             self.norm = nn.RMSNorm(128)
-            self.num_v_heads = 48 if profile else 32
+            # profile=True is the original 48/16 host; "h32" is the
+            # 32/16 MoE host the head-generic entries serve; False is
+            # a genuinely unservable profile (v-heads not a multiple
+            # of k-heads)
+            self.num_v_heads = {True: 48, "h32": 32, False: 40}[profile]
             self.num_k_heads = 16
             self.head_k_dim = 128
             self.head_v_dim = 128
 
     assert _fusable(_Gdn())
+    assert _fusable(_Gdn(profile="h32"))       # head-generic profile
     assert not _fusable(_Gdn(profile=False))   # out of the fused profile
     assert not _fusable(nn.Linear(8, 8))
     assert _layer_index("model.layers.7.linear_attn") == 7
