@@ -84,6 +84,19 @@ def adopt_prequantized(model, fmt="ct_nvfp4", **kwargs):
     return _adopt(model, fmt, **kwargs)
 
 
+def quantize_on_adopt(model, fmt="moe_experts_nvfp4", **kwargs):
+    """Checkpoint door: quantize a full-precision checkpoint that cannot
+    fit the card, converting its dominant structure family (a sparse-MoE
+    expert bank) into structure impls at load time.
+
+    See :func:`flash_rt.structures.quantize_on_adopt.quantize_on_adopt`.
+    """
+    from flash_rt.structures.quantize_on_adopt import (
+        quantize_on_adopt as _adopt)
+
+    return _adopt(model, fmt, **kwargs)
+
+
 def explain(plan):
     """Coverage table for one plan: bound / routed / kept / refused,
     each with its reason. See :mod:`flash_rt.structures.explain`."""
@@ -123,6 +136,7 @@ __all__ = [
     "list_structures",
     "load",
     "load_binding",
+    "quantize_on_adopt",
     "run_recipe",
     "schemes",
 ]
