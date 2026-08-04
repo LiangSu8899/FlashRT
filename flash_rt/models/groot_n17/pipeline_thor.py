@@ -899,6 +899,10 @@ def dit_forward(gemm, fvk, bufs, weights, dims,
     # bias+residual, bias+GELU+fp4out) and the fused norm->fp4 front-ends
     # additionally remove most of the per-layer elementwise launches.
     use_fp4 = fvk_fp4 is not None and "ff_proj_w_fp4" in weights
+    # Optional per-layer precision ladder: layers not in ``fp4_layers``
+    # fall through to the calibrated FP8 path (whose weight/scale keys
+    # must also be spliced in). None/absent = every layer FP4.
+    fp4_layer_set = weights.get("fp4_layers")
 
     def _ck(rc, what, li):
         if rc != 0:
@@ -912,7 +916,7 @@ def dit_forward(gemm, fvk, bufs, weights, dims,
         # layer index). Map here.
         j_attn = (li - 1) // 2 if is_self else li // 2
 
-        if use_fp4:
+        if use_fp4 and (fp4_layer_set is None or li in fp4_layer_set):
             xn_fp4, xn_sfa = int(bufs["xn_fp4"]), int(bufs["xn_sfa"])
             slots = attn.get_slot_ptrs("dit_self" if is_self else "dit_cross",
                                        j_attn)
@@ -1028,9 +1032,10 @@ def dit_forward(gemm, fvk, bufs, weights, dims,
             fvk.add_bias_bf16(
                 int(bufs["qkv_buf"]), int(weights["qkv_b"][j_self]),
                 Sa, 3 * D, int(stream))
-            fvk.gpu_strided_copy_fp16(int(bufs["qkv_buf"]), Q_ptr, Sa, D, 3 * D, 0, int(stream))
-            fvk.gpu_strided_copy_fp16(int(bufs["qkv_buf"]), K_ptr, Sa, D, 3 * D, D, int(stream))
-            fvk.gpu_strided_copy_fp16(int(bufs["qkv_buf"]), V_ptr, Sa, D, 3 * D, 2 * D, int(stream))
+            if not bufs.get("qkv_strided"):
+                fvk.gpu_strided_copy_fp16(int(bufs["qkv_buf"]), Q_ptr, Sa, D, 3 * D, 0, int(stream))
+                fvk.gpu_strided_copy_fp16(int(bufs["qkv_buf"]), K_ptr, Sa, D, 3 * D, D, int(stream))
+                fvk.gpu_strided_copy_fp16(int(bufs["qkv_buf"]), V_ptr, Sa, D, 3 * D, 2 * D, int(stream))
             attn.run("dit_self", j_attn, q_seq=Sa, kv_seq=Sa, stream=int(stream))
         elif is_self_fp8:
             # Fused FP8 QKV (self-attn): q/k/v share the post-AdaLN input,
@@ -1053,9 +1058,10 @@ def dit_forward(gemm, fvk, bufs, weights, dims,
             fvk.add_bias_bf16(
                 int(bufs["qkv_buf"]), int(weights["qkv_b"][j_self]),
                 Sa, 3 * D, int(stream))
-            fvk.gpu_strided_copy_fp16(int(bufs["qkv_buf"]), Q_ptr, Sa, D, 3 * D, 0, int(stream))
-            fvk.gpu_strided_copy_fp16(int(bufs["qkv_buf"]), K_ptr, Sa, D, 3 * D, D, int(stream))
-            fvk.gpu_strided_copy_fp16(int(bufs["qkv_buf"]), V_ptr, Sa, D, 3 * D, 2 * D, int(stream))
+            if not bufs.get("qkv_strided"):
+                fvk.gpu_strided_copy_fp16(int(bufs["qkv_buf"]), Q_ptr, Sa, D, 3 * D, 0, int(stream))
+                fvk.gpu_strided_copy_fp16(int(bufs["qkv_buf"]), K_ptr, Sa, D, 3 * D, D, int(stream))
+                fvk.gpu_strided_copy_fp16(int(bufs["qkv_buf"]), V_ptr, Sa, D, 3 * D, 2 * D, int(stream))
             attn.run("dit_self", j_attn, q_seq=Sa, kv_seq=Sa, stream=int(stream))
         else:
             gemm.bf16_nn(xn_ptr, int(weights["q_w"][li]),

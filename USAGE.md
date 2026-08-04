@@ -515,6 +515,48 @@ fe = flash_rt.load_model(
 # equivalently: GrootN17TorchFrontendThorFP16(checkpoint, num_views=2, embodiment_tag=...)
 ```
 
+**NVFP4 tier (opt-in, fastest verified Thor config).** `use_fp4=True`
+keeps the FP8 backbone and moves the action-head side to block-scaled
+NVFP4 with fused epilogues, plus a vectorized small-kernel tier and
+masked-softmax attention across the whole pipeline:
+
+* every DiT GEMM (fused self-attn QKV, cross-attn Q, attention output,
+  both FFN projections) runs as an NVFP4 GEMM with per-16-element
+  dynamic activation scales — no calibration pass — with bias,
+  bias+residual and bias+tanh-GELU+FP4-output fused into the epilogues;
+* the per-frame cross-KV projections are NVFP4 as well;
+* the AdaLN / pre-FFN norms emit FP4 directly, the self-attention reads
+  the fused QKV GEMM output in place, and the backbone's small
+  per-layer kernels (norms, RoPE, FP8 quantizes, GQA expand) run
+  16-byte-load vectorized variants;
+* the masked-softmax attention variants drop the per-layer -inf logits
+  pre-fill, which also makes graph replays exactly deterministic.
+
+```python
+fe = flash_rt.load_model(
+    "/path/to/GR00T-N1.7-3B",
+    framework="torch", config="groot_n17", hardware="thor",
+    use_fp4=True,
+    num_views=2, embodiment_tag="oxe_droid_relative_eef_relative_joint",
+)
+# equivalently: GrootN17TorchFrontendThorFP4(checkpoint, num_views=2, embodiment_tag=...)
+```
+
+Reference (Jetson AGX Thor, wall-clock per-frame image→action e2e,
+same-session A/B/A against the FP8 default): **≈ 36 ms** (vision
+backbone graph ≈ 19.5 ms + action graph ≈ 16.3 ms) vs ≈ 50 ms FP8 —
+**1.37×** — with action cosine ≈ 0.9999 vs the FP8 tier on the
+reference fixture and graph-replay determinism exactly 1.0. (Absolute
+Thor latencies drift ~1 ms at day scale; the same-session speedup is
+the stable metric.)
+
+Precision ladder: on an 8-sample reference set the all-FP4 default
+holds worst-sample action cosine ≈ 0.998 vs the FP8 tier (the other
+samples sit at ≈ 0.9999). The first DiT layers are the sensitive ones;
+`GrootN17TorchFrontendThorFP4(..., dit_fp8_layers=(0, 1, 2, 3))` keeps
+them on the calibrated FP8 path and lifts the worst sample to ≈ 0.9998
+for roughly +2 ms per frame.
+
 ### GROOT N1.7 RTX
 
 GROOT N1.7 is registered for the RTX SM120 / SM89 torch path:

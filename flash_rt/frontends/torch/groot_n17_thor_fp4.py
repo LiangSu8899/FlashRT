@@ -32,13 +32,32 @@ from flash_rt.frontends.torch.groot_n17_thor_fp8 import (
 
 
 class GrootN17TorchFrontendThorFP4(GrootN17TorchFrontendThorFP8):
-    """N1.7 Thor inference frontend: FP8 backbone + NVFP4 DiT."""
+    """N1.7 Thor inference frontend: FP8 backbone + NVFP4 DiT.
+
+    ``dit_fp8_layers`` optionally keeps a subset of DiT layers on the
+    calibrated FP8 path (precision ladder). The first few DiT layers are
+    the quantization-sensitive ones on edge fixtures: on the 8-sample
+    reference set the all-FP4 default holds worst-sample action cosine
+    ~0.998 vs the FP8 tier, and ``dit_fp8_layers=(0, 1, 2, 3)`` lifts it
+    to ~0.9993+ for roughly +2 ms per frame.
+    """
 
     _DIT_QUANT = "fp4"
     # Backbone small-kernel tier: vectorized (16-byte-load) norm / rope /
     # quantize / GQA-expand rewrites. Same element math as the scalar
     # kernels; the scalar originals are latency-bound at these shapes.
     _KBB_VEC = True
+    # Layers that stay NVFP4 (None = all 32). Set via ``dit_fp8_layers``.
+    _DIT_FP4_LAYERS = None
+
+    def __init__(self, checkpoint_path, *, dit_fp8_layers=None, **kwargs):
+        if dit_fp8_layers:
+            protect = frozenset(int(x) for x in dit_fp8_layers)
+            bad = [x for x in protect if not (0 <= x < 32)]
+            if bad:
+                raise ValueError(f"dit_fp8_layers out of range: {bad}")
+            self._DIT_FP4_LAYERS = frozenset(range(32)) - protect
+        super().__init__(checkpoint_path, **kwargs)
 
     def _quantize_dit_fp4(self, step_weights, bp, action_horizon) -> None:
         """Quantize every DiT GEMM weight to NVFP4 (per-16 MSE block scales)

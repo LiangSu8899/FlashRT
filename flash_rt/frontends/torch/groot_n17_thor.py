@@ -841,7 +841,19 @@ class GrootN17TorchFrontendThor:
         if getattr(self, "_DIT_QUANT", "fp8") == "fp4":
             # NVFP4 needs no activation calibration (per-16-element dynamic
             # scales); just quantize the weights and splice the pointers.
+            # With a per-layer protection set (_DIT_FP4_LAYERS not None),
+            # the protected layers fall back to the calibrated FP8 path, so
+            # both weight/scale sets are spliced.
+            protect = getattr(self, "_DIT_FP4_LAYERS", None)
+            if protect is not None:
+                self._calibrate_quantize_dit_ffn(
+                    num_inference_timesteps, action_horizon, _state_fwd,
+                    _ae_fwd, _post_fwd, step_weights, bp, dims)
             self._quantize_dit_fp4(step_weights, bp, action_horizon)
+            if protect is not None:
+                fp4_set = frozenset(int(x) for x in protect)
+                for sw in step_weights:
+                    sw["fp4_layers"] = fp4_set
         elif self._DIT_USE_FP8:
             self._calibrate_quantize_dit_ffn(
                 num_inference_timesteps, action_horizon, _state_fwd, _ae_fwd,
@@ -1459,7 +1471,8 @@ class GrootN17TorchFrontendThor:
         # into the GEMM epilogues. The gathered text/image sources are
         # shared across all 16 cross layers, so only two activation
         # quantizes run per frame.
-        if getattr(self, "_DIT_QUANT", "fp8") == "fp4":
+        if (getattr(self, "_DIT_QUANT", "fp8") == "fp4"
+                and getattr(self, "_CK_FP4", True)):
             import flash_rt.flash_rt_fp4 as fvk_fp4
             self._fvk_fp4 = fvk_fp4
             keep = []
