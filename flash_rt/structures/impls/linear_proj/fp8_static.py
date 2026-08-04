@@ -159,14 +159,23 @@ class FusedLinearProj(GuardedSeam, torch.nn.Module):
         shape = x.shape
         flat = x.reshape(-1, shape[-1])
         m = flat.shape[0]
-        bufs = self._bufs.get(m)
-        if bufs is None:
-            bufs = (torch.empty(m, self._w_fp8.shape[1], device=x.device,
-                                dtype=_FP8),
-                    torch.empty(m, self._w_fp8.shape[0], device=x.device,
-                                dtype=torch.bfloat16))
-            self._bufs[m] = bufs
-        x_fp8, out = bufs
+        if torch.compiler.is_compiling():
+            # traced regions run the ops functionally: a persistent
+            # out-buffer is module state mutated by the op, which
+            # functionalization cannot rewrite (the whole-graph export
+            # hit exactly that), and inside a compiled graph the
+            # allocation is planned away regardless
+            x_fp8 = out = None
+        else:
+            bufs = self._bufs.get(m)
+            if bufs is None:
+                bufs = (torch.empty(m, self._w_fp8.shape[1],
+                                    device=x.device, dtype=_FP8),
+                        torch.empty(m, self._w_fp8.shape[0],
+                                    device=x.device,
+                                    dtype=torch.bfloat16))
+                self._bufs[m] = bufs
+            x_fp8, out = bufs
         if self.form == "fp8_in":
             y = self._gemm(flat, self._w_fp8, self._input_scale,
                            self._weight_scale, out=out)
