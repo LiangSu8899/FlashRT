@@ -35,6 +35,10 @@ class GrootN17TorchFrontendThorFP4(GrootN17TorchFrontendThorFP8):
     """N1.7 Thor inference frontend: FP8 backbone + NVFP4 DiT."""
 
     _DIT_QUANT = "fp4"
+    # Backbone small-kernel tier: vectorized (16-byte-load) norm / rope /
+    # quantize / GQA-expand rewrites. Same element math as the scalar
+    # kernels; the scalar originals are latency-bound at these shapes.
+    _KBB_VEC = True
 
     def _quantize_dit_fp4(self, step_weights, bp, action_horizon) -> None:
         """Quantize every DiT GEMM weight to NVFP4 (per-16 MSE block scales)

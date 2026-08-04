@@ -152,22 +152,39 @@ def qwen3vl_vit_forward(gemm, fvk, bufs, weights, dims,
     layer_iter = range(24) if layers_subset is None else list(layers_subset)
     Sper = int(dims.get("Sper_view", S))
 
+    # Vectorized small-kernel tier (16-byte loads): same element math as the
+    # scalar kernels, far better DRAM efficiency at these shapes.
+    vec = bool(dims.get("vec_kernels"))
+
+    def _ln(x, w, b, out, rows):
+        if vec:
+            fvk.layer_norm_fp16_vec(x, w, b, out, rows, D, 1e-6, int(stream))
+        else:
+            fvk.layer_norm_fp16(x, w, b, out, rows, D, 1e-6, int(stream))
+
+    def _q8(src, dst, scale, n):
+        if vec:
+            fvk.quantize_fp8_static_fp16_vec(src, dst, scale, n, int(stream))
+        else:
+            fvk.quantize_fp8_static_fp16(src, dst, scale, n, int(stream))
+
+    def _rope(ptr):
+        if vec:
+            fvk.rope_rotate_half_fp16_vec(ptr, cos_ptr, sin_ptr, S, NH, HD, int(stream))
+        else:
+            fvk.rope_rotate_half_fp16(ptr, cos_ptr, sin_ptr, S, NH, HD, int(stream))
+
     for li in layer_iter:
         slots = attn.get_slot_ptrs("vit", li)
         Q_ptr, K_ptr, V_ptr, O_ptr = slots["Q"], slots["K"], slots["V"], slots["O"]
 
         # ── Pre-attn LayerNorm ──────────────────────────────────────────
-        fvk.layer_norm_fp16(
-            h_ptr, int(weights["norm1_w"][li]), int(weights["norm1_b"][li]),
-            xn_ptr, S, D, 1e-6, int(stream),
-        )
+        _ln(h_ptr, int(weights["norm1_w"][li]), int(weights["norm1_b"][li]),
+            xn_ptr, S)
 
         # ── Q/K/V projections (single shared act-scale on xn for FP8) ───
         if use_fp8:
-            fvk.quantize_fp8_static_fp16(
-                xn_ptr, xn_fp8_ptr, int(scales_dev["act_qkv"][li]),
-                S * D, int(stream),
-            )
+            _q8(xn_ptr, xn_fp8_ptr, int(scales_dev["act_qkv"][li]), S * D)
             gemm.fp8_nn_bias(
                 xn_fp8_ptr, int(weights["q_w"][li]), Q_ptr, int(weights["q_b"][li]),
                 S, D, D, float(weights["alpha_q"][li]), int(stream),
@@ -188,18 +205,15 @@ def qwen3vl_vit_forward(gemm, fvk, bufs, weights, dims,
                 fvk.add_bias_fp16(out, int(weights[bk][li]), S, D, int(stream))
 
         # ── Split-half RoPE on Q and K (contiguous (S, NH, HD)) ─────────
-        fvk.rope_rotate_half_fp16(Q_ptr, cos_ptr, sin_ptr, S, NH, HD, int(stream))
-        fvk.rope_rotate_half_fp16(K_ptr, cos_ptr, sin_ptr, S, NH, HD, int(stream))
+        _rope(Q_ptr)
+        _rope(K_ptr)
 
         # ── Multi-view batched FMHA (separated Q/K/V, stride=D) ─────────
         attn.run("vit", li, q_seq=Sper, kv_seq=Sper, stream=int(stream))
 
         # ── o_proj ──────────────────────────────────────────────────────
         if use_fp8:
-            fvk.quantize_fp8_static_fp16(
-                O_ptr, xn_fp8_ptr, int(scales_dev["act_o"][li]),
-                S * D, int(stream),
-            )
+            _q8(O_ptr, xn_fp8_ptr, int(scales_dev["act_o"][li]), S * D)
             gemm.fp8_nn_bias(
                 xn_fp8_ptr, int(weights["o_w"][li]), o_proj_out,
                 int(weights["o_b"][li]),
@@ -213,26 +227,19 @@ def qwen3vl_vit_forward(gemm, fvk, bufs, weights, dims,
         fvk.residual_add_fp16(h_ptr, o_proj_out, S * D, int(stream))
 
         # ── Pre-FF LayerNorm ───────────────────────────────────────────
-        fvk.layer_norm_fp16(
-            h_ptr, int(weights["norm2_w"][li]), int(weights["norm2_b"][li]),
-            xn_ptr, S, D, 1e-6, int(stream),
-        )
+        _ln(h_ptr, int(weights["norm2_w"][li]), int(weights["norm2_b"][li]),
+            xn_ptr, S)
 
         # ── FF: D → FF (GELU) → D ──────────────────────────────────────
         if use_fp8:
-            fvk.quantize_fp8_static_fp16(
-                xn_ptr, xn_fp8_ptr, int(scales_dev["act_fc1"][li]),
-                S * D, int(stream),
-            )
+            _q8(xn_ptr, xn_fp8_ptr, int(scales_dev["act_fc1"][li]), S * D)
             gemm.fp8_nn_gelu_bias(
                 xn_fp8_ptr, int(weights["fc1_w"][li]), fc1_out_ptr,
                 int(weights["fc1_b"][li]),
                 S, FF, D, float(weights["alpha_fc1"][li]), int(stream),
             )
-            fvk.quantize_fp8_static_fp16(
-                fc1_out_ptr, fc1_fp8_ptr, int(scales_dev["act_fc2"][li]),
-                S * FF, int(stream),
-            )
+            _q8(fc1_out_ptr, fc1_fp8_ptr, int(scales_dev["act_fc2"][li]),
+                S * FF)
             gemm.fp8_nn_bias(
                 fc1_fp8_ptr, int(weights["fc2_w"][li]), o_proj_out,
                 int(weights["fc2_b"][li]),
@@ -444,6 +451,7 @@ def qwen3vl_llm_forward(gemm, fvk, bufs, weights, dims,
 
     inject_ptrs = weights.get("deepstack_inject", [0] * 16)
     layer_iter = range(16) if layers_subset is None else list(layers_subset)
+    vec = bool(dims.get("vec_kernels"))
     # Per-layer precision protection: layers in ``fp16_layers`` run their
     # QKV / O / gate / up GEMMs in fp16 (no input fp8 quant) to protect the
     # large visual-token activation spikes that wreck per-tensor FP8 on the
@@ -499,22 +507,41 @@ def qwen3vl_llm_forward(gemm, fvk, bufs, weights, dims,
             )
 
         # ── Per-head q_norm / k_norm (BEFORE M-RoPE — Qwen3 standard) ──
-        fvk.rms_norm_fp16(
-            Q_ptr, int(weights["q_norm_w"][li]), Q_ptr,
-            S * NHQ, HD, 1e-6, int(stream),
-        )
-        fvk.rms_norm_fp16(
-            K_ptr, int(weights["k_norm_w"][li]), K_ptr,
-            S * NHKV, HD, 1e-6, int(stream),
-        )
+        # These view (S, NH*HD) as (S*NH, HD): thousands of 128-wide rows,
+        # where the block-per-row scalar kernel is latency-bound — the vec
+        # tier runs a warp-per-row 16-byte-load variant instead.
+        if vec:
+            fvk.rms_norm_fp16_vec(
+                Q_ptr, int(weights["q_norm_w"][li]), Q_ptr,
+                S * NHQ, HD, 1e-6, int(stream))
+            fvk.rms_norm_fp16_vec(
+                K_ptr, int(weights["k_norm_w"][li]), K_ptr,
+                S * NHKV, HD, 1e-6, int(stream))
+        else:
+            fvk.rms_norm_fp16(
+                Q_ptr, int(weights["q_norm_w"][li]), Q_ptr,
+                S * NHQ, HD, 1e-6, int(stream),
+            )
+            fvk.rms_norm_fp16(
+                K_ptr, int(weights["k_norm_w"][li]), K_ptr,
+                S * NHKV, HD, 1e-6, int(stream),
+            )
 
         # ── M-RoPE on Q and K ──────────────────────────────────────────
-        fvk.rope_rotate_half_fp16(Q_ptr, cos_ptr, sin_ptr, S, NHQ,  HD, int(stream))
-        fvk.rope_rotate_half_fp16(K_ptr, cos_ptr, sin_ptr, S, NHKV, HD, int(stream))
+        if vec:
+            fvk.rope_rotate_half_fp16_vec(Q_ptr, cos_ptr, sin_ptr, S, NHQ,  HD, int(stream))
+            fvk.rope_rotate_half_fp16_vec(K_ptr, cos_ptr, sin_ptr, S, NHKV, HD, int(stream))
+        else:
+            fvk.rope_rotate_half_fp16(Q_ptr, cos_ptr, sin_ptr, S, NHQ,  HD, int(stream))
+            fvk.rope_rotate_half_fp16(K_ptr, cos_ptr, sin_ptr, S, NHKV, HD, int(stream))
 
         # ── GQA expand: K, V from NHKV → NHQ heads ─────────────────────
-        fvk.gpu_repeat_interleave_heads(K_ptr, K_exp_ptr, S, NHKV, HD, GQA, int(stream))
-        fvk.gpu_repeat_interleave_heads(V_ptr, V_exp_ptr, S, NHKV, HD, GQA, int(stream))
+        if vec:
+            fvk.gpu_repeat_interleave_heads_vec(K_ptr, K_exp_ptr, S, NHKV, HD, GQA, int(stream))
+            fvk.gpu_repeat_interleave_heads_vec(V_ptr, V_exp_ptr, S, NHKV, HD, GQA, int(stream))
+        else:
+            fvk.gpu_repeat_interleave_heads(K_ptr, K_exp_ptr, S, NHKV, HD, GQA, int(stream))
+            fvk.gpu_repeat_interleave_heads(V_ptr, V_exp_ptr, S, NHKV, HD, GQA, int(stream))
 
         # ── MHA via attn backend ───────────────────────────────────────
         # Backend reads the LLM site's Q/K/V/O slots; we wrote the expanded
@@ -527,10 +554,15 @@ def qwen3vl_llm_forward(gemm, fvk, bufs, weights, dims,
                          o_out_ptr, S, D, NHQ * HD, int(stream))
         else:
             # ── Quantize O for o_proj ──────────────────────────────────
-            fvk.quantize_fp8_static_fp16(
-                int(slots["O"]), xn_fp8_ptr, int(scales_dev["act_o"][li]),
-                S * NHQ * HD, int(stream),
-            )
+            if vec:
+                fvk.quantize_fp8_static_fp16_vec(
+                    int(slots["O"]), xn_fp8_ptr, int(scales_dev["act_o"][li]),
+                    S * NHQ * HD, int(stream))
+            else:
+                fvk.quantize_fp8_static_fp16(
+                    int(slots["O"]), xn_fp8_ptr, int(scales_dev["act_o"][li]),
+                    S * NHQ * HD, int(stream),
+                )
             gemm.fp8_nn_bias(
                 xn_fp8_ptr, int(weights["o_w"][li]), o_out_ptr,
                 int(bufs["zero_bias"]), S, D, NHQ * HD,

@@ -293,6 +293,10 @@ class GrootN17TorchFrontendThorFP8(GrootN17TorchFrontendThor):
         # FP8 path. No activation scales are needed in this mode.
         fp16_ref = not self._KBB_USE_FP8
         sh = self._fp16_shadow_weights if fp16_ref else None
+        # Vectorized small-kernel tier (16-byte-load norm/rope/quant/expand
+        # rewrites) — opt-in via the FP4 frontend; element math matches the
+        # scalar kernels.
+        vec = bool(getattr(self, "_KBB_VEC", False))
 
         keep: list = []
         self._kbb_keep = keep
@@ -448,7 +452,8 @@ class GrootN17TorchFrontendThorFP8(GrootN17TorchFrontendThor):
         P.qwen3vl_vit_forward(
             gemm=gemm, fvk=fvkm, bufs=vit_bufs, weights=vw, scales_dev=vit_scales,
             dims={"S": Sv, "D": 1024, "NH": 16, "HD": 64,
-                  "ff_inner": 4096, "Sper_view": Sv // nv},
+                  "ff_inner": 4096, "Sper_view": Sv // nv,
+                  "vec_kernels": vec},
             attn=attn, deepstack_taps=tap_layers, deepstack_capture=dcap,
             use_fp8=self._KBB_USE_FP8)
 
@@ -602,7 +607,8 @@ class GrootN17TorchFrontendThorFP8(GrootN17TorchFrontendThor):
             "gu_fp8": buf8(Se, 6144).data_ptr()}
         P.qwen3vl_llm_forward(
             gemm=gemm, fvk=fvkm, bufs=llm_bufs, weights=lw, scales_dev=llm_scales,
-            dims={"S": Se, "D": 2048, "NHQ": 16, "NHKV": 8, "HD": 128, "FF": 6144},
+            dims={"S": Se, "D": 2048, "NHQ": 16, "NHKV": 8, "HD": 128,
+                  "FF": 6144, "vec_kernels": vec},
             attn=attn, fp16_layers=self.PROTECT_LLM_FP16)
 
         # ═══ vlln + VL self-attn (4L) ═══
@@ -666,9 +672,11 @@ class GrootN17TorchFrontendThorFP8(GrootN17TorchFrontendThor):
         # the caller before replay; the DeepStack inject scatter uses a fixed
         # index_copy (capturable) instead of boolean-mask assignment. ──
         vit_dims = {"S": Sv, "D": 1024, "NH": 16, "HD": 64,
-                    "ff_inner": 4096, "Sper_view": Sv // nv}
+                    "ff_inner": 4096, "Sper_view": Sv // nv,
+                    "vec_kernels": vec}
         ds_dims = {"Nin": Sv, "Din": 1024, "Nout": Nout, "Dmid": 4096, "Dout": 2048}
-        llm_dims = {"S": Se, "D": 2048, "NHQ": 16, "NHKV": 8, "HD": 128, "FF": 6144}
+        llm_dims = {"S": Se, "D": 2048, "NHQ": 16, "NHKV": 8, "HD": 128,
+                    "FF": 6144, "vec_kernels": vec}
         vlln_bufs = {"x": llm_h.data_ptr(), "out": vlsa_h.data_ptr()}
         vlln_w = {"vlln_w": self._vlln_w.data_ptr(), "vlln_b": self._vlln_b.data_ptr()}
         vsa_dims = {"T": Se, "D": 2048, "NH": 32, "HD": 64, "ff_inner": 8192}
