@@ -80,11 +80,24 @@ class Fp8KvBand:
         kp = self.k_pages.get(layer_idx)
         if kp is None:
             return
-        rows_k = k[0].transpose(0, 1).to(kp.dtype)     # [S, kvh, hd]
-        rows_v = v[0].transpose(0, 1).to(kp.dtype)
-        kp.view(-1, _KVH, _HD).index_copy_(0, pos, rows_k)
-        self.v_pages[layer_idx].view(-1, _KVH, _HD).index_copy_(
-            0, pos, rows_v)
+        # eager ATen has no fp8 index_copy kernel (the compiled path
+        # codegens around it); the byte view is the same write
+        rows_k = k[0].transpose(0, 1).to(kp.dtype).view(torch.uint8)
+        rows_v = v[0].transpose(0, 1).to(kp.dtype).view(torch.uint8)
+        kp.view(torch.uint8).view(-1, _KVH, _HD).index_copy_(
+            0, pos, rows_k)
+        self.v_pages[layer_idx].view(torch.uint8).view(
+            -1, _KVH, _HD).index_copy_(0, pos, rows_v)
+
+    def reset(self):
+        """Zero the pages: a fresh prompt must not see the previous
+        stream's rows. The read path is page-granular in the kernel,
+        so rows beyond seq_len are reachable garbage unless cleared —
+        the repeat gate caught exactly that leak."""
+        for kp in self.k_pages.values():
+            kp.view(torch.uint8).zero_()
+        for vp in self.v_pages.values():
+            vp.view(torch.uint8).zero_()
 
     def set_len(self, total):
         """Total sequence length (device tensor or int), in-graph safe."""
@@ -96,12 +109,13 @@ class Fp8KvBand:
     def attend(self, layer_idx, q):
         """``q`` is [1, qh, S, hd] post-rope; returns [1, S, qh, hd]."""
         s = q.shape[2]
-        mask = None
-        if s > 1:
-            mask = self._masks.get(s)
-            if mask is None:
-                mask = self._kern.causal_spec_mask(s, device=q.device)
-                self._masks[s] = mask
+        # the kernel wrapper self-builds a host-side mask when none is
+        # passed - illegal inside a capture - so every shape's mask is
+        # built once here (warmup) and replayed as a device constant
+        mask = self._masks.get(s)
+        if mask is None:
+            mask = self._kern.causal_spec_mask(s, device=q.device)
+            self._masks[s] = mask
         out = self._kern.xqa_bf16_fp8kv(
             q[0].transpose(0, 1).contiguous(),
             self.k_pages[layer_idx], self.v_pages[layer_idx],

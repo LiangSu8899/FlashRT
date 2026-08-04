@@ -207,6 +207,8 @@ class WholeStepDecodeLoop:
                 f"window {self._max}")
         self.cache.frt_continue = False
         self._rope_delta.zero_()
+        if self._kv_band is not None:
+            self._kv_band.reset()
         pf = self._prefill_callable()
         logits = pf(input_ids,
                     torch.arange(L, device=input_ids.device))
