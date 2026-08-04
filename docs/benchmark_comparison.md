@@ -61,6 +61,42 @@ There is no separate third local checkpoint beyond `GR00T-N1.6-3B` and
 | `groot_n17` / `GR00T-N1.7-3B` | RTX 4090 (SM89) | same real 2-view fixture, `T=40`, FP8, fixed SM89 DiT graph path, `use_dit_graph=True` | - | - | first graph capture excluded (`252.98 ms`) | **9.98 ms mean** over steady-state replays | July 3 local graph hot path before extra fusion; measured replays: 10.06 / 9.89 ms after capture | `(1, 40, 132)` finite |
 | `groot_n17` / `GR00T-N1.7-3B` | RTX 4090 (SM89) | same real 2-view fixture, `T=40`, FP8, same graph path plus existing fused `bias_gelu_quantize_fp8_static_bf16` on the DiT FFN up->down handoff | - | - | first graph capture excluded | **9.69 ms mean** over steady-state replays | July 3 local fused re-check; measured replays: 9.74 / 9.68 / 9.67 / 9.67 ms | `(1, 40, 132)` finite |
 
+### GROOT N1.7 on Jetson AGX Thor
+
+Reference numbers published by NVIDIA for the same model family on the
+same board, measured with their harness (`GR00T-N1.7` LIBERO fine-tune on
+`libero_10`, 4 denoising steps, batch size 1, medians over 20 iterations
+after 5 warmup iterations):
+
+| Source | Backbone | Action head | E2E | Frequency |
+|---|---:|---:|---:|---:|
+| PyTorch eager | 47.7 ms | 68.2 ms | ~126 ms | 8.0 Hz |
+| `torch.compile` | 48.6 ms | 46.8 ms | ~105 ms | 9.5 Hz |
+| TensorRT BF16 (full pipeline) | 27.0 ms | 45.0 ms | ~81 ms | 12.3 Hz |
+| TensorRT optimized + FP8 | 14.1 ms | 21.1 ms | ~44 ms | 22.6 Hz |
+| TensorRT optimized + mixed NVFP4 | 13.6 ms | 17.2 ms | ~40 ms | 25.1 Hz |
+
+FlashRT rows below use the same per-frame definition (vision backbone
+then action head, wall clock, medians over 20 iterations after warmup)
+but a different checkpoint and camera count, so they are **not** a
+like-for-like comparison with the table above — read the harness column.
+
+| FlashRT tier | Checkpoint / harness | Backbone | Action head | E2E | Frequency |
+|---|---|---:|---:|---:|---:|
+| FP8 (default) | `GR00T-N1.7-3B`, 2-view real fixture, T=40, 4 steps | 23.6 ms | 26.7 ms | **50.0 ms** | 20 Hz |
+| NVFP4 + FA4 (`use_fp4=True`) | same fixture and steps | 14.8 ms | 16.0 ms | **30.9 ms** | 32 Hz |
+
+Both rows come from one same-session A/B/A run on Jetson AGX Thor
+(JetPack 7.2, MAXN); the NVFP4 tier's action cosine against the FP8 tier
+on that fixture is 0.99994 and its CUDA-graph replays are bit-identical.
+Reproduce with:
+
+```bash
+python benchmarks/groot_n17_thor_latency.py \
+    --ckpt <n17-checkpoint-dir> --aux <aux-fixture.pt> \
+    --tier fp4 --views 2 --warmup 5 --iters 20
+```
+
 ### N1.7 SM89 Steady-State Hot Replay Profile
 
 Local Nsight Systems capture on **July 3, 2026** used the same real
@@ -89,6 +125,42 @@ Top individual kernels from that hot replay:
 | `add_bias_bf16_kernel` | **8.11%** | 570 | 1.48 us |
 | `sm89_xmma_gemm_e4m3bf16_e4m3f32_f32_tn_n_tilesize32x64x64_stage5...` | **6.48%** | 64 | 10.53 us |
 | `quantize_fp8_kernel_generic` | **3.00%** | 256 | 1.22 us |
+
+### GROOT N1.7 on Jetson AGX Thor
+
+Reference numbers published by NVIDIA for the same model family on the
+same board, measured with their harness (`GR00T-N1.7` LIBERO fine-tune on
+`libero_10`, 4 denoising steps, batch size 1, medians over 20 iterations
+after 5 warmup iterations):
+
+| Source | Backbone | Action head | E2E | Frequency |
+|---|---:|---:|---:|---:|
+| PyTorch eager | 47.7 ms | 68.2 ms | ~126 ms | 8.0 Hz |
+| `torch.compile` | 48.6 ms | 46.8 ms | ~105 ms | 9.5 Hz |
+| TensorRT BF16 (full pipeline) | 27.0 ms | 45.0 ms | ~81 ms | 12.3 Hz |
+| TensorRT optimized + FP8 | 14.1 ms | 21.1 ms | ~44 ms | 22.6 Hz |
+| TensorRT optimized + mixed NVFP4 | 13.6 ms | 17.2 ms | ~40 ms | 25.1 Hz |
+
+FlashRT rows below use the same per-frame definition (vision backbone
+then action head, wall clock, medians over 20 iterations after warmup)
+but a different checkpoint and camera count, so they are **not** a
+like-for-like comparison with the table above — read the harness column.
+
+| FlashRT tier | Checkpoint / harness | Backbone | Action head | E2E | Frequency |
+|---|---|---:|---:|---:|---:|
+| FP8 (default) | `GR00T-N1.7-3B`, 2-view real fixture, T=40, 4 steps | 23.6 ms | 26.7 ms | **50.0 ms** | 20 Hz |
+| NVFP4 + FA4 (`use_fp4=True`) | same fixture and steps | 14.8 ms | 16.0 ms | **30.9 ms** | 32 Hz |
+
+Both rows come from one same-session A/B/A run on Jetson AGX Thor
+(JetPack 7.2, MAXN); the NVFP4 tier's action cosine against the FP8 tier
+on that fixture is 0.99994 and its CUDA-graph replays are bit-identical.
+Reproduce with:
+
+```bash
+python benchmarks/groot_n17_thor_latency.py \
+    --ckpt <n17-checkpoint-dir> --aux <aux-fixture.pt> \
+    --tier fp4 --views 2 --warmup 5 --iters 20
+```
 
 ### N1.7 SM89 Steady-State Hot Replay Profile After Reusing Existing Fused Kernel
 

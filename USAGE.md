@@ -530,7 +530,11 @@ masked-softmax attention across the whole pipeline:
   per-layer kernels (norms, RoPE, FP8 quantizes, GQA expand) run
   16-byte-load vectorized variants;
 * the masked-softmax attention variants drop the per-layer -inf logits
-  pre-fill, which also makes graph replays exactly deterministic.
+  pre-fill, which also makes graph replays exactly deterministic;
+* the three backbone attention sites (ViT, LLM causal-GQA,
+  VL-self-attn) run the vendored FlashAttention-4 (CuTe-DSL) forward
+  when its runtime deps are installed (the `thor-fa4` pip extra),
+  falling back to the fmha/cublas chain otherwise.
 
 ```python
 fe = flash_rt.load_model(
@@ -543,12 +547,13 @@ fe = flash_rt.load_model(
 ```
 
 Reference (Jetson AGX Thor, wall-clock per-frame image→action e2e,
-same-session A/B/A against the FP8 default): **≈ 36 ms** (vision
-backbone graph ≈ 19.5 ms + action graph ≈ 16.3 ms) vs ≈ 50 ms FP8 —
-**1.37×** — with action cosine ≈ 0.9999 vs the FP8 tier on the
-reference fixture and graph-replay determinism exactly 1.0. (Absolute
-Thor latencies drift ~1 ms at day scale; the same-session speedup is
-the stable metric.)
+same-session A/B/A against the FP8 default): **≈ 31 ms** (vision
+backbone graph ≈ 14.8 ms + action graph ≈ 16.0 ms) vs ≈ 50 ms FP8 —
+**1.64×** — with action cosine ≈ 0.9999 vs the FP8 tier on the
+reference fixture and graph-replay determinism exactly 1.0. Without
+the FA4 runtime deps the tier still runs (fmha/cublas fallback) at
+≈ 36 ms. (Absolute Thor latencies drift ~1 ms at day scale; the
+same-session speedup is the stable metric.)
 
 Precision ladder: on an 8-sample reference set the all-FP4 default
 holds worst-sample action cosine ≈ 0.998 vs the FP8 tier (the other

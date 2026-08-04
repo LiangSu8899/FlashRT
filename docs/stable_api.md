@@ -68,6 +68,10 @@ Returns a `VLAModel` wrapping the appropriate frontend for the detected
   `use_p1_split_gu` apply to the Pi0.5 torch and JAX NVFP4 encoder path on
   Thor. The JAX path loads Orbax checkpoints; the torch path loads
   safetensors checkpoints.
+- `use_fp4=True` with `config="groot_n17"` on Thor selects the GROOT N1.7
+  NVFP4 tier (NVFP4 DiT action head + cross-KV, vectorized backbone
+  kernels, FA4 attention when available). It takes no Pi0.5 sub-flags and
+  falls back to the FP8 tier when the `flash_rt_fp4` extension is missing.
 - `num_steps`, `vision_pool_factor`, `vision_num_layers`, and
   `cache_frames` apply only to frontends that expose those constructor
   parameters today. The Pi0.5 torch RTX/Orin frontend validates
