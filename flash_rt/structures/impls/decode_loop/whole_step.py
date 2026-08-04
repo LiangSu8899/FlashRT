@@ -115,7 +115,14 @@ class WholeStepDecodeLoop:
         hd = int(getattr(cfg, "head_dim",
                          cfg.hidden_size // cfg.num_attention_heads))
         dev = head.weight.device if hasattr(head, "weight") else "cuda"
-        self._max = int(max_len)
+        # the static window rounds up to a 16-byte row: the fused
+        # attention kernels vector-read the mask row in aligned chunks,
+        # and an unaligned tail overreads into neighbouring allocations
+        # — outputs then drift with allocator contents (the 2K repeat
+        # gate caught it; compute-sanitizer named the aligned kernel).
+        # Rounding the window keeps mask and KV rows contiguous and
+        # aligned; the padded tail rows stay -inf-masked and zero.
+        self._max = -(-int(max_len) // 8) * 8
         self.cache = _StaticHybridCache(
             len(self._layers), self._full, kvh, hd, self._max, dev)
         self._kv_band = None
@@ -205,10 +212,28 @@ class WholeStepDecodeLoop:
             raise ValueError(
                 f"refused: {L}+{max_new_tokens} exceeds the static "
                 f"window {self._max}")
+        if self._graph is None and not getattr(self, "_warming", False):
+            # the loop's true first pass is a throwaway: it compiles,
+            # captures, and settles the library workspaces whose
+            # content the earliest replays see differently from every
+            # later call. Returned generations all come from the
+            # settled regime, which repeats bitwise
+            self._warming = True
+            try:
+                self.generate(input_ids, max_new_tokens)
+            finally:
+                self._warming = False
         self.cache.frt_continue = False
         self._rope_delta.zero_()
         if self._kv_band is not None:
             self._kv_band.reset()
+        # canonical window: rows past the prompt zero before any
+        # produced token. Masked tail rows are not numerically inert
+        # in every attention backend, and the repeat gate compares
+        # calls whose tails would otherwise carry different residue
+        for i in self._full:
+            self.cache.key_cache[i][:, :, L:].zero_()
+            self.cache.value_cache[i][:, :, L:].zero_()
         pf = self._prefill_callable()
         logits = pf(input_ids,
                     torch.arange(L, device=input_ids.device))
@@ -221,17 +246,54 @@ class WholeStepDecodeLoop:
     def _decode_tail(self, max_new_tokens, toks):
         warm = min(3, max_new_tokens - 1)
         if self._graph is None:
+            # first capture takes the uniform path: an eager warmup
+            # step and a replayed step need not be bit-identical, so
+            # no produced token may come off the eager arm — the first
+            # call would disagree with every steady call at the first
+            # post-warmup token. Warm without producing tokens,
+            # capture, roll the state back, and produce every token
+            # from the replay. KV rows (BF16 and FP8 pages alike)
+            # rewrite the same slots on replay, so only the
+            # gated-delta slots and cur/pos need snapshots; those
+            # stage to host — this runs once, and the device is
+            # already packed to the rim.
+            snaps = [(i, self.cache.conv_states[i].to("cpu"),
+                      self.cache.recurrent_states[i].to("cpu"))
+                     for i in self._gdn_slots()]
+            cur0, pos0 = self._cur.clone(), self._pos.clone()
             side = torch.cuda.Stream()
             side.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(side):
                 for _ in range(warm):
                     self._gstep()
-                    toks.append(self._cur.clone())
             torch.cuda.current_stream().wait_stream(side)
             self._graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(self._graph):
                 self._gstep()
-            for _ in range(max_new_tokens - 1 - warm):
+            # prime the pool: capture records without executing, so
+            # the first replay ever reads workspace buffers no replay
+            # has written; its output is discarded and the state
+            # rolled back, so every produced token comes from a replay
+            # whose workspace a previous replay populated
+            self._graph.replay()
+            for i, cs, rs in snaps:
+                self.cache.conv_states[i].copy_(cs)
+                self.cache.recurrent_states[i].copy_(rs)
+            self._cur.copy_(cur0)
+            self._pos.copy_(pos0)
+            # the rollback extends to the written rows: warmup steps
+            # and the priming replay committed KV past the prompt, and
+            # the canonical window holds that region zero before
+            # produced tokens
+            p0 = int(pos0[0])
+            span = warm + 1
+            for i in self._full:
+                self.cache.key_cache[i][:, :, p0:p0 + span].zero_()
+                self.cache.value_cache[i][:, :, p0:p0 + span].zero_()
+            if self._kv_band is not None:
+                self._kv_band.clear_rows(
+                    torch.arange(span, device=pos0.device) + pos0)
+            for _ in range(max_new_tokens - 1):
                 self._graph.replay()
                 toks.append(self._cur.clone())
         else:
@@ -259,6 +321,9 @@ class WholeStepDecodeLoop:
                 f"window {self._max}")
         self.cache.frt_continue = False
         self.cache._seen = 0        # host must take its prefill branch
+        for i in self._full:
+            self.cache.key_cache[i][:, :, L:].zero_()
+            self.cache.value_cache[i][:, :, L:].zero_()
         cp = torch.arange(L, device=ids.device)
         self.cache._cp = cp
         out = self._model(**inputs, past_key_values=self.cache,

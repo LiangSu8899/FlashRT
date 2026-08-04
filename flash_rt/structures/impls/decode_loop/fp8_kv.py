@@ -99,6 +99,20 @@ class Fp8KvBand:
         for vp in self.v_pages.values():
             vp.view(torch.uint8).zero_()
 
+    def clear_rows(self, pos):
+        """Zero the page rows at ``pos`` across every layer.
+
+        The warmup steps before capture write real rows past the
+        prompt; the read path is page-granular, so a later replay
+        from the rolled-back position can still reach them. Clearing
+        restores the exact page state a fresh call would see."""
+        for kp in self.k_pages.values():
+            kp.view(torch.uint8).view(-1, _KVH, _HD).index_fill_(
+                0, pos, 0)
+        for vp in self.v_pages.values():
+            vp.view(torch.uint8).view(-1, _KVH, _HD).index_fill_(
+                0, pos, 0)
+
     def set_len(self, total):
         """Total sequence length (device tensor or int), in-graph safe."""
         if torch.is_tensor(total):
