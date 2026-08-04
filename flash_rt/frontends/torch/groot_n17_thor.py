@@ -40,6 +40,11 @@ class GrootN17TorchFrontendThor:
     # accuracy baseline).
     _DIT_USE_FP8 = True
     _DIT_FP8_IMPL = "thor_epilogue"
+    # DiT quantization tier: "fp8" (calibrated FFN/QKV FP8, default) or
+    # "fp4" (every DiT GEMM as block-scaled NVFP4 with fused epilogues —
+    # see GrootN17TorchFrontendThorFP4). The DiT at M=41 is
+    # weight-bandwidth-bound, so the FP4 tier halves its dominant cost.
+    _DIT_QUANT = "fp8"
 
     def __init__(
         self,
@@ -833,7 +838,11 @@ class GrootN17TorchFrontendThor:
         # quantize. Skipped for the full-FP16 reference (``_DIT_USE_FP8`` off),
         # which keeps the DiT bf16 — dit_forward / _step_fwd fall back to the
         # bf16 path when the FP8 weights are absent from ``step_weights`` / ``bp``.
-        if self._DIT_USE_FP8:
+        if getattr(self, "_DIT_QUANT", "fp8") == "fp4":
+            # NVFP4 needs no activation calibration (per-16-element dynamic
+            # scales); just quantize the weights and splice the pointers.
+            self._quantize_dit_fp4(step_weights, bp, action_horizon)
+        elif self._DIT_USE_FP8:
             self._calibrate_quantize_dit_ffn(
                 num_inference_timesteps, action_horizon, _state_fwd, _ae_fwd,
                 _post_fwd, step_weights, bp, dims)
@@ -842,7 +851,8 @@ class GrootN17TorchFrontendThor:
             _ae_fwd(step, s)
             pipeline_thor.dit_forward(
                 gemm=self._gemm, fvk=K, bufs=bp, weights=step_weights[step],
-                dims=dims, attn=self._dit_attn, stream=s)
+                dims=dims, attn=self._dit_attn, stream=s,
+                fvk_fp4=getattr(self, "_fvk_fp4", None))
             _post_fwd(step, s)
 
         self._kdit_fwd = (_state_fwd, _step_fwd)

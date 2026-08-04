@@ -751,7 +751,8 @@ def vl_self_attn_forward(gemm, fvk, bufs, weights, dims,
 
 
 def dit_forward(gemm, fvk, bufs, weights, dims,
-                *, attn, stream: int = 0, layers_subset=None) -> None:
+                *, attn, stream: int = 0, layers_subset=None,
+                fvk_fp4=None) -> None:
     """32-layer ``AlternateVLDiT`` (interleave_self_attention=True,
     attend_text_every_n_blocks=2). All bf16 GEMMs (no FP8 — N1.6 pattern).
 
@@ -822,12 +823,96 @@ def dit_forward(gemm, fvk, bufs, weights, dims,
 
     layer_iter = range(32) if layers_subset is None else list(layers_subset)
 
+    # NVFP4 fast path: every DiT GEMM (fused QKV / cross-Q / O / FFN up /
+    # FFN down) runs as a block-scaled NVFP4 GEMM with a fused bf16 bias
+    # epilogue. At M=Sa=41 the DiT is weight-bandwidth-bound, so halving
+    # the weight bytes is the dominant win; the fused epilogues (bias,
+    # bias+residual, bias+GELU+fp4out) and the fused norm->fp4 front-ends
+    # additionally remove most of the per-layer elementwise launches.
+    use_fp4 = fvk_fp4 is not None and "ff_proj_w_fp4" in weights
+
+    def _ck(rc, what, li):
+        if rc != 0:
+            raise RuntimeError(
+                f"N1.7 DiT FP4 {what} layer {li} failed rc={rc}")
+
     for li in layer_iter:
         is_self = (li % 2 == 1)
         # Backend's ``dit_self`` and ``dit_cross`` sites are indexed
         # cross-only / self-only (16 entries each, NOT the full 0..31
         # layer index). Map here.
         j_attn = (li - 1) // 2 if is_self else li // 2
+
+        if use_fp4:
+            xn_fp4, xn_sfa = int(bufs["xn_fp4"]), int(bufs["xn_sfa"])
+            slots = attn.get_slot_ptrs("dit_self" if is_self else "dit_cross",
+                                       j_attn)
+            Q_ptr, K_ptr, V_ptr, O_ptr = (slots["Q"], slots["K"], slots["V"],
+                                          slots["O"])
+            # AdaLN-modulated norm1 -> fp4 + SFA (one fused kernel).
+            rc = fvk_fp4.ada_layer_norm_fp4_sfa_bf16(
+                h_ptr, int(weights["scale_msa"][li]),
+                int(weights["shift_msa"][li]),
+                xn_fp4, xn_sfa, Sa, D, 1e-5, int(stream))
+            _ck(rc, "adaln", li)
+            if is_self:
+                j = (li - 1) // 2
+                rc = fvk_fp4.cutlass_fp4_gemm_bias_bf16(
+                    xn_fp4, xn_sfa,
+                    int(weights["qkv_w_fp4"][j]), int(weights["qkv_sfb"][j]),
+                    int(weights["qkv_b_fp4"][j]), int(bufs["qkv_buf"]),
+                    Sa, 3 * D, D, int(stream))
+                _ck(rc, "qkv", li)
+                fvk.gpu_strided_copy_fp16(int(bufs["qkv_buf"]), Q_ptr, Sa, D, 3 * D, 0, int(stream))
+                fvk.gpu_strided_copy_fp16(int(bufs["qkv_buf"]), K_ptr, Sa, D, 3 * D, D, int(stream))
+                fvk.gpu_strided_copy_fp16(int(bufs["qkv_buf"]), V_ptr, Sa, D, 3 * D, 2 * D, int(stream))
+                attn.run("dit_self", j_attn, q_seq=Sa, kv_seq=Sa,
+                         stream=int(stream))
+            else:
+                rc = fvk_fp4.cutlass_fp4_gemm_bias_bf16(
+                    xn_fp4, xn_sfa,
+                    int(weights["q_w_fp4"][j_attn]),
+                    int(weights["q_sfb"][j_attn]),
+                    int(weights["q_b"][li]), Q_ptr,
+                    Sa, D, D, int(stream))
+                _ck(rc, "q", li)
+                target_text = (li % 4 == 0)
+                kv_seq = Skv_text if target_text else Skv_image
+                attn.run("dit_cross", j_attn, q_seq=Sa, kv_seq=kv_seq,
+                         stream=int(stream))
+            # O projection: quantize the attention output, then fused
+            # bias + residual straight into h.
+            rc = fvk_fp4.quantize_fp4_dynamic_sfa_bf16_vec(
+                O_ptr, int(bufs["octx_fp4"]), int(bufs["octx_sfa"]),
+                Sa, D, False, int(stream))
+            _ck(rc, "o-quant", li)
+            rc = fvk_fp4.cutlass_fp4_gemm_bias_res_bf16(
+                int(bufs["octx_fp4"]), int(bufs["octx_sfa"]),
+                int(weights["o_w_fp4"][li]), int(weights["o_sfb"][li]),
+                int(weights["o_b"][li]), h_ptr, h_ptr,
+                Sa, D, D, int(stream))
+            _ck(rc, "o", li)
+            # FFN: LN -> fp4, up GEMM with fused bias+GELU+fp4out, down
+            # GEMM with fused bias+residual into h.
+            rc = fvk_fp4.layer_norm_no_affine_fp4_sfa_bf16(
+                h_ptr, xn_fp4, xn_sfa, Sa, D, 1e-5, int(stream))
+            _ck(rc, "ffn-ln", li)
+            rc = fvk_fp4.cutlass_fp4_gemm_bias_gelu_fp4out_bf16(
+                xn_fp4, xn_sfa,
+                int(weights["ff_proj_w_fp4"][li]),
+                int(weights["ff_proj_sfb"][li]),
+                int(weights["ff_proj_b"][li]),
+                int(bufs["hid_fp4"]), int(bufs["hid_sfa"]),
+                Sa, FF, D, int(stream))
+            _ck(rc, "ffn-up", li)
+            rc = fvk_fp4.cutlass_fp4_gemm_bias_res_bf16(
+                int(bufs["hid_fp4"]), int(bufs["hid_sfa"]),
+                int(weights["ff_down_w_fp4"][li]),
+                int(weights["ff_down_sfb"][li]),
+                int(weights["ff_down_b"][li]), h_ptr, h_ptr,
+                Sa, D, FF, int(stream))
+            _ck(rc, "ffn-down", li)
+            continue
 
         # ── AdaLN modulated norm1 ─────────────────────────────────────
         # For self-attn FP8 QKV, fuse the AdaLN and the FP8 quantize into one

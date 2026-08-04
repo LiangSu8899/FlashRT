@@ -33,6 +33,9 @@
 #endif
 #include "fused_fp4/norm_silu_fp4_sfa.cuh"
 #include "fused_fp4/silu_mul_two_fp4_to_fp4.cuh"
+#include "gemm/fp4/cutlass_fp4_gemm_bias_bf16_sm100.cuh"
+#include "quantize/quantize_fp4_sfa_bf16.cuh"
+#include "fused_fp4/dit_norm_fp4_sfa.cuh"
 
 extern "C" int flash_rt_per_channel_mul_fp16(
     uintptr_t x, uintptr_t inv_s, int S, int D, uintptr_t stream);
@@ -524,6 +527,114 @@ Drop-in for cutlass_fp4_sq_fp16 when downstream consumes FP4 + SFA directly.
         py::arg("out_packed"),  py::arg("out_sfa"),
         py::arg("seq_len"), py::arg("half_dim"), py::arg("stream") = 0,
         "P1: GEGLU over two FP4 inputs → FP4 + SFA.");
+
+  // ── bf16-activation NVFP4 path (GR00T N1.7 DiT) ─────────────────────
+  m.def("quantize_fp4_dynamic_sfa_bf16_vec",
+        [](uintptr_t src, uintptr_t packed, uintptr_t sfa,
+           int N, int D, bool is_sfb, uintptr_t stream) -> int {
+          return flash_rt::fp4::quantize_fp4_dynamic_sfa_bf16_vec(
+              reinterpret_cast<void const*>(src),
+              reinterpret_cast<void*>(packed),
+              reinterpret_cast<void*>(sfa),
+              N, D, is_sfb,
+              reinterpret_cast<cudaStream_t>(stream));
+        },
+        py::arg("src"), py::arg("packed"), py::arg("sfa"),
+        py::arg("N"), py::arg("D"), py::arg("is_sfb"), py::arg("stream") = 0,
+        "Fused: bf16 [N, D] -> NVFP4 packed [N, D/2] + tile-interleaved "
+        "SFA/SFB (vectorized).");
+
+  m.def("cutlass_fp4_gemm_bias_bf16",
+        [](uintptr_t A, uintptr_t SFA, uintptr_t B, uintptr_t SFB,
+           uintptr_t bias, uintptr_t D, int M, int N, int K,
+           uintptr_t stream) -> int {
+          return flash_rt::fp4::cutlass_fp4_gemm_bias_bf16(
+              reinterpret_cast<void const*>(A),
+              reinterpret_cast<void const*>(SFA),
+              reinterpret_cast<void const*>(B),
+              reinterpret_cast<void const*>(SFB),
+              reinterpret_cast<void const*>(bias),
+              reinterpret_cast<void*>(D), M, N, K,
+              reinterpret_cast<cudaStream_t>(stream));
+        },
+        py::arg("A"), py::arg("SFA"), py::arg("B"), py::arg("SFB"),
+        py::arg("bias"), py::arg("D"),
+        py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0,
+        "NVFP4 GEMM, bf16 out: D = A @ B^T + bias[N].");
+
+  m.def("cutlass_fp4_gemm_bias_res_bf16",
+        [](uintptr_t A, uintptr_t SFA, uintptr_t B, uintptr_t SFB,
+           uintptr_t bias, uintptr_t C, uintptr_t D,
+           int M, int N, int K, uintptr_t stream) -> int {
+          return flash_rt::fp4::cutlass_fp4_gemm_bias_res_bf16(
+              reinterpret_cast<void const*>(A),
+              reinterpret_cast<void const*>(SFA),
+              reinterpret_cast<void const*>(B),
+              reinterpret_cast<void const*>(SFB),
+              reinterpret_cast<void const*>(bias),
+              reinterpret_cast<void const*>(C),
+              reinterpret_cast<void*>(D), M, N, K,
+              reinterpret_cast<cudaStream_t>(stream));
+        },
+        py::arg("A"), py::arg("SFA"), py::arg("B"), py::arg("SFB"),
+        py::arg("bias"), py::arg("C"), py::arg("D"),
+        py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0,
+        "NVFP4 GEMM, bf16 out with residual: D = A @ B^T + bias[N] + C "
+        "(C may alias D).");
+
+  m.def("cutlass_fp4_gemm_bias_gelu_fp4out_bf16",
+        [](uintptr_t A, uintptr_t SFA, uintptr_t B, uintptr_t SFB,
+           uintptr_t bias, uintptr_t D_packed, uintptr_t D_SFD,
+           int M, int N, int K, uintptr_t stream) -> int {
+          return flash_rt::fp4::cutlass_fp4_gemm_bias_gelu_fp4out_bf16(
+              reinterpret_cast<void const*>(A),
+              reinterpret_cast<void const*>(SFA),
+              reinterpret_cast<void const*>(B),
+              reinterpret_cast<void const*>(SFB),
+              reinterpret_cast<void const*>(bias),
+              reinterpret_cast<void*>(D_packed),
+              reinterpret_cast<void*>(D_SFD), M, N, K,
+              reinterpret_cast<cudaStream_t>(stream));
+        },
+        py::arg("A"), py::arg("SFA"), py::arg("B"), py::arg("SFB"),
+        py::arg("bias"), py::arg("D_packed"), py::arg("D_SFD"),
+        py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0,
+        "NVFP4 GEMM with fused bias + tanh-GELU + FP4/SFA output "
+        "(bf16 bias).");
+
+  m.def("ada_layer_norm_fp4_sfa_bf16",
+        [](uintptr_t x, uintptr_t scale, uintptr_t shift,
+           uintptr_t packed, uintptr_t sfa,
+           int seq_len, int dim, float eps, uintptr_t stream) -> int {
+          return flash_rt::fused_fp4::ada_layer_norm_fp4_sfa_bf16(
+              reinterpret_cast<void const*>(x),
+              reinterpret_cast<void const*>(scale),
+              reinterpret_cast<void const*>(shift),
+              reinterpret_cast<void*>(packed),
+              reinterpret_cast<void*>(sfa),
+              seq_len, dim, eps,
+              reinterpret_cast<cudaStream_t>(stream));
+        },
+        py::arg("x"), py::arg("scale"), py::arg("shift"),
+        py::arg("packed"), py::arg("sfa"),
+        py::arg("seq_len"), py::arg("dim"), py::arg("eps") = 1e-5f,
+        py::arg("stream") = 0,
+        "Fused AdaLN (bf16) -> NVFP4 packed + SFA.");
+
+  m.def("layer_norm_no_affine_fp4_sfa_bf16",
+        [](uintptr_t x, uintptr_t packed, uintptr_t sfa,
+           int seq_len, int dim, float eps, uintptr_t stream) -> int {
+          return flash_rt::fused_fp4::layer_norm_no_affine_fp4_sfa_bf16(
+              reinterpret_cast<void const*>(x),
+              reinterpret_cast<void*>(packed),
+              reinterpret_cast<void*>(sfa),
+              seq_len, dim, eps,
+              reinterpret_cast<cudaStream_t>(stream));
+        },
+        py::arg("x"), py::arg("packed"), py::arg("sfa"),
+        py::arg("seq_len"), py::arg("dim"), py::arg("eps") = 1e-5f,
+        py::arg("stream") = 0,
+        "Fused no-affine LayerNorm (bf16) -> NVFP4 packed + SFA.");
 
   m.attr("__version__") = "0.1.0-dev";
   m.attr("layout_note") = "scales are linear [N, D/16]; Phase 4 adds tile-interleave conversion";
