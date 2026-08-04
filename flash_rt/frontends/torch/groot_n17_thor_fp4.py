@@ -47,6 +47,9 @@ class GrootN17TorchFrontendThorFP4(GrootN17TorchFrontendThorFP8):
     # quantize / GQA-expand rewrites. Same element math as the scalar
     # kernels; the scalar originals are latency-bound at these shapes.
     _KBB_VEC = True
+    # FA4 (CuTe-DSL) attention for the backbone MHA sites; falls back to
+    # the fmha/cublas chain when the FA4 runtime deps are missing.
+    _KBB_FA4 = True
     # Layers that stay NVFP4 (None = all 32). Set via ``dit_fp8_layers``.
     _DIT_FP4_LAYERS = None
 
