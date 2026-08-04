@@ -125,6 +125,17 @@ class WholeStepDecodeLoop:
         self._max = -(-int(max_len) // 8) * 8
         self.cache = _StaticHybridCache(
             len(self._layers), self._full, kvh, hd, self._max, dev)
+        # the loop routes attention through its own interface even
+        # without a band: the maskless prompt pass needs the square
+        # causal slice to stay off SDPA's materialising math path
+        from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+        from .fp8_kv import _INTERFACE_NAME, _interface
+        if _INTERFACE_NAME not in ALL_ATTENTION_FUNCTIONS:
+            ALL_ATTENTION_FUNCTIONS.register(_INTERFACE_NAME, _interface)
+        for i in self._full:
+            self._layers[i].self_attn.config._attn_implementation = \
+                _INTERFACE_NAME
         self._kv_band = None
         if kv_band == "fp8":
             from .fp8_kv import install
@@ -136,9 +147,15 @@ class WholeStepDecodeLoop:
                     "profile (24/4/256); this host keeps BF16 KV")
         elif kv_band is not None:
             raise ValueError(f"refused: unknown kv band {kv_band!r}")
-        self._causal = torch.full(
-            (self._max, self._max), float("-inf"), device=dev,
-            dtype=torch.bfloat16).triu_(1)
+        # no quadratic causal table: the decode mask is one static row
+        # rebuilt in-graph from the position buffer, the prompt pass
+        # rides SDPA's own causal flag (top-left alignment matches the
+        # window layout), and offset multi-row passes build their rows
+        # on demand — at deep windows the [max, max] table and the
+        # prefill's materialised [S, max] mask are gigabytes
+        self._ar = torch.arange(self._max, device=dev)
+        self._mrow = torch.zeros(1, 1, 1, self._max, device=dev,
+                                 dtype=torch.bfloat16)
         self._cur = torch.empty(1, 1, dtype=torch.long, device=dev)
         self._pos = torch.empty(1, dtype=torch.long, device=dev)
         self._rope_delta = torch.zeros(1, dtype=torch.long, device=dev)
@@ -162,8 +179,15 @@ class WholeStepDecodeLoop:
         self.cache._cp = pos_t
         if self._kv_band is not None:
             self._kv_band.set_len(pos_t[-1:] + 1)
-        m4 = self._causal.index_select(0, pos_t).view(
-            1, 1, -1, self._max)
+        if tok_ids.shape[1] == 1:
+            self._mrow.zero_()
+            self._mrow.masked_fill_(
+                (self._ar > pos_t[-1]).view(1, 1, 1, -1), float("-inf"))
+            m4 = self._mrow
+        else:
+            # prompt rows start at zero: SDPA's causal flag is this
+            # exact mask, with nothing materialised
+            m4 = None
         for i, lyr in enumerate(self._layers):
             h = lyr(h, position_embeddings=pe,
                     attention_mask=(m4 if i in self._full_set else None),
@@ -398,8 +422,7 @@ class WholeStepDecodeLoop:
         self.cache._cp = pos_t
         if self._kv_band is not None:
             self._kv_band.set_len(pos_t[-1:] + 1)
-        m4 = self._causal.index_select(0, pos_t).view(
-            1, 1, -1, self._max)
+        m4 = self._row(pos_t)
         for i, lyr in enumerate(self._layers):
             h = lyr(h, position_embeddings=pe,
                     attention_mask=(m4 if i in self._full_set else None),
@@ -409,8 +432,13 @@ class WholeStepDecodeLoop:
         return self._head(hn), hn
 
     def _row(self, pos_t):
-        return self._causal.index_select(0, pos_t).view(
-            1, 1, -1, self._max)
+        # offset multi-row mask (spec verify/rewrite): built on demand
+        # from the positions, a few rows at a time
+        return torch.zeros(
+            1, 1, pos_t.shape[0], self._max, device=pos_t.device,
+            dtype=torch.bfloat16).masked_fill_(
+                (self._ar.view(1, -1) > pos_t.view(-1, 1)).view(
+                    1, 1, -1, self._max), float("-inf"))
 
     def _gdn_slots(self):
         return [i for i, sl in enumerate(self.cache.conv_states)
@@ -422,8 +450,7 @@ class WholeStepDecodeLoop:
         The warmup executions commit real state; the caller's snapshot
         is restored before capture so the first replay starts clean.
         """
-        self._dh_buf = torch.empty(1, 1, self._causal.shape[0] and
-                                   self._embed.weight.shape[1],
+        self._dh_buf = torch.empty(1, 1, self._embed.weight.shape[1],
                                    device=dev, dtype=torch.bfloat16)
         self._dtok_buf = torch.empty(1, 1, dtype=torch.long, device=dev)
         self._dpos_buf = torch.empty(1, dtype=torch.long, device=dev)

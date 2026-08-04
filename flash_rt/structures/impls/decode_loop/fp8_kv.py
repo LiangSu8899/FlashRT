@@ -150,6 +150,15 @@ def _interface(module, q, k, v, attention_mask, scaling=None, **kwargs):
             and q.shape[2] <= _XQA_MAX_Q \
             and k.shape[2] == band._max:
         return band.attend(module.layer_idx, q), None
+    if attention_mask is None and q.shape[2] > 1 \
+            and k.shape[2] > q.shape[2]:
+        # maskless prompt rows over the full static window: causal
+        # rows 0..S-1 never see columns past S, and the square slice
+        # keeps SDPA on its fused causal path — the rectangular case
+        # falls to the math backend, which materialises an [S, window]
+        # score matrix (gigabytes at deep windows)
+        k = k[:, :, :q.shape[2]]
+        v = v[:, :, :q.shape[2]]
     # the fall-through must be the host's own sdpa interface, bit for
     # bit — a lookalike SDPA call differs in repeat/contiguity details
     # and a detached model would stop reproducing its own baseline

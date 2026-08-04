@@ -268,8 +268,24 @@ class FusedGatedDeltaDecodeLayer(GuardedSeam, torch.nn.Module):
             state = torch.zeros(self._hv, self._d, self._d,
                                 device=mixed.device, dtype=torch.bfloat16)
         if self._wy_ok and S > 64:
-            core_out = self._wy_core(mixed, a_all, b_all, conv_state,
-                                     state, S)
+            # the WY pipeline packs the whole span up front — gigabytes
+            # of transients at deep prompts. Slabs bound the working
+            # set: conv_state and state carry in place across slab
+            # calls exactly as they do across the 64-chunks inside, so
+            # the chunk sequence (and the arithmetic) is unchanged.
+            slab = 8192
+            if S > slab:
+                core_out = torch.empty(S, self._hv, self._d,
+                                       device=mixed.device,
+                                       dtype=torch.bfloat16)
+                for s0 in range(0, S, slab):
+                    s1 = min(s0 + slab, S)
+                    core_out[s0:s1] = self._wy_core(
+                        mixed[s0:s1], a_all[s0:s1], b_all[s0:s1],
+                        conv_state, state, s1 - s0)
+            else:
+                core_out = self._wy_core(mixed, a_all, b_all,
+                                         conv_state, state, S)
             return self._prefill_epilogue(
                 hidden_states, cache_params, allp, mixed, core_out,
                 state, cont, old_slot, S)
