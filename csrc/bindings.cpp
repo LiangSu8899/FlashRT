@@ -496,6 +496,13 @@ int quantize_fp8_static_fp16_vec(const __half*, __nv_fp8_e4m3*, const float*,
                                  int, cudaStream_t);
 int gpu_repeat_interleave_heads_vec(const __half*, __half*, int, int, int,
                                     int, cudaStream_t);
+void attention_mha_fp16_masked(cublasHandle_t, const __half*, const __half*,
+                               const __half*, __half*, __half*, int, int, int,
+                               int, float, cudaStream_t);
+void attention_mha_bf16_masked(cublasHandle_t, const __nv_bfloat16*,
+                               const __nv_bfloat16*, const __nv_bfloat16*,
+                               __nv_bfloat16*, __nv_bfloat16*, int, int, int,
+                               int, float, int, int, cudaStream_t);
 }
 
 PYBIND11_MODULE(flash_rt_kernels, m) {
@@ -2579,6 +2586,46 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
        py::arg("S_q"), py::arg("S_kv"), py::arg("NH"), py::arg("HD"),
        py::arg("attn_scale") = 1.0f, py::arg("logits_kv_stride") = 0,
        py::arg("stream") = 0);
+
+    // Masked-softmax MHA variants: no -inf logits pre-fill needed (the
+    // softmax reads/writes only the valid S_kv columns).
+    m.def("attention_mha_fp16_masked",
+          [](FvkContext& ctx, uintptr_t Q, uintptr_t K, uintptr_t V,
+             uintptr_t logits, uintptr_t out,
+             int S_q, int S_kv, int NH, int HD,
+             float attn_scale, uintptr_t stream) {
+        attention_mha_fp16_masked(ctx.cublas_handle,
+                            reinterpret_cast<const __half*>(Q),
+                            reinterpret_cast<const __half*>(K),
+                            reinterpret_cast<const __half*>(V),
+                            reinterpret_cast<__half*>(logits),
+                            reinterpret_cast<__half*>(out),
+                            S_q, S_kv, NH, HD, attn_scale, to_stream(stream));
+    }, py::arg("ctx"), py::arg("Q"), py::arg("K"), py::arg("V"),
+       py::arg("logits"), py::arg("out"),
+       py::arg("S_q"), py::arg("S_kv"), py::arg("NH"), py::arg("HD"),
+       py::arg("attn_scale") = 1.0f, py::arg("stream") = 0);
+
+    m.def("attention_mha_bf16_masked",
+          [](FvkContext& ctx, uintptr_t Q, uintptr_t K, uintptr_t V,
+             uintptr_t logits, uintptr_t out,
+             int S_q, int S_kv, int NH, int HD,
+             float attn_scale, int logits_kv_stride, int qkv_token_stride,
+             uintptr_t stream) {
+        attention_mha_bf16_masked(ctx.cublas_handle,
+                            reinterpret_cast<const __nv_bfloat16*>(Q),
+                            reinterpret_cast<const __nv_bfloat16*>(K),
+                            reinterpret_cast<const __nv_bfloat16*>(V),
+                            reinterpret_cast<__nv_bfloat16*>(logits),
+                            reinterpret_cast<__nv_bfloat16*>(out),
+                            S_q, S_kv, NH, HD, attn_scale,
+                            logits_kv_stride, qkv_token_stride,
+                            to_stream(stream));
+    }, py::arg("ctx"), py::arg("Q"), py::arg("K"), py::arg("V"),
+       py::arg("logits"), py::arg("out"),
+       py::arg("S_q"), py::arg("S_kv"), py::arg("NH"), py::arg("HD"),
+       py::arg("attn_scale") = 1.0f, py::arg("logits_kv_stride") = 0,
+       py::arg("qkv_token_stride") = 0, py::arg("stream") = 0);
 
     // ------------------------------------------------------------------
     //  FP8 block-128 dequantization + GEMM.

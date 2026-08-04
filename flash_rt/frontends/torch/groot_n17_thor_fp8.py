@@ -356,6 +356,10 @@ class GrootN17TorchFrontendThorFP8(GrootN17TorchFrontendThor):
                              "O": 4, "logits": 5, "scale": 1.0 / (48 ** 0.5)},
         )
         self._kbb_attn = attn
+        if vec:
+            # Masked-softmax attention: drops the per-layer -inf logits
+            # pre-fill (see attn_backend run()).
+            attn._use_masked_softmax = True
 
         # ═══ ViT (24L) ═══
         vit_h = buf(Sv, 1024)
@@ -662,7 +666,8 @@ class GrootN17TorchFrontendThorFP8(GrootN17TorchFrontendThor):
         P.vl_self_attn_forward(
             gemm=gemm, fvk=fvkm, bufs=vsa_bufs,
             weights=vsw, scales_dev=vsa_scales,
-            dims={"T": Se, "D": 2048, "NH": 32, "HD": 64, "ff_inner": 8192},
+            dims={"T": Se, "D": 2048, "NH": 32, "HD": 64, "ff_inner": 8192,
+                  "vec_kernels": vec},
             attn=attn, use_fp8=self._KBB_USE_FP8)
         torch.cuda.synchronize()
 
@@ -679,7 +684,8 @@ class GrootN17TorchFrontendThorFP8(GrootN17TorchFrontendThor):
                     "FF": 6144, "vec_kernels": vec}
         vlln_bufs = {"x": llm_h.data_ptr(), "out": vlsa_h.data_ptr()}
         vlln_w = {"vlln_w": self._vlln_w.data_ptr(), "vlln_b": self._vlln_b.data_ptr()}
-        vsa_dims = {"T": Se, "D": 2048, "NH": 32, "HD": 64, "ff_inner": 8192}
+        vsa_dims = {"T": Se, "D": 2048, "NH": 32, "HD": 64, "ff_inner": 8192,
+                    "vec_kernels": vec}
         use_fp8 = self._KBB_USE_FP8
 
         def _kbb_forward(s=0):
@@ -717,7 +723,8 @@ class GrootN17TorchFrontendThorFP8(GrootN17TorchFrontendThor):
                                   scales_dev=llm_scales, dims=llm_dims, attn=attn,
                                   fp16_layers=self.PROTECT_LLM_FP16, stream=s)
             P.vlln_forward(gemm=None, fvk=fvkm, bufs=vlln_bufs, weights=vlln_w,
-                           dims={"S": Se, "D": 2048}, stream=s)
+                           dims={"S": Se, "D": 2048, "vec_kernels": vec},
+                           stream=s)
             P.vl_self_attn_forward(gemm=gemm, fvk=fvkm, bufs=vsa_bufs, weights=vsw,
                                    scales_dev=vsa_scales, dims=vsa_dims, attn=attn,
                                    use_fp8=use_fp8, stream=s)

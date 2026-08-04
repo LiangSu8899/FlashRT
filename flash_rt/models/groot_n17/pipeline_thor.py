@@ -47,6 +47,12 @@ def vlln_forward(gemm, fvk, bufs, weights, dims,
         weights["vlln_b"]    — beta  fp16 (D,)
         dims["S"], dims["D"] — flat sequence × hidden
     """
+    if dims.get("vec_kernels"):
+        fvk.layer_norm_fp16_vec(
+            int(bufs["x"]), int(weights["vlln_w"]), int(weights["vlln_b"]),
+            int(bufs["out"]), int(dims["S"]), int(dims["D"]), 1e-5,
+            int(stream))
+        return
     fvk.layer_norm_fp16(
         int(bufs["x"]),
         int(weights["vlln_w"]),
@@ -680,6 +686,7 @@ def vl_self_attn_forward(gemm, fvk, bufs, weights, dims,
     NH = int(dims["NH"])
     HD = int(dims["HD"])
     FF = int(dims["ff_inner"])
+    vec = bool(dims.get("vec_kernels"))
 
     h_ptr        = int(bufs["h"])
     xn_ptr       = int(bufs["xn"])
@@ -695,17 +702,27 @@ def vl_self_attn_forward(gemm, fvk, bufs, weights, dims,
         Q_ptr, K_ptr, V_ptr, O_ptr = slots["Q"], slots["K"], slots["V"], slots["O"]
 
         # ── Pre-attn LayerNorm ──────────────────────────────────────────
-        fvk.layer_norm_fp16(
-            h_ptr, int(weights["norm1_w"][li]), int(weights["norm1_b"][li]),
-            xn_ptr, T, D, 1e-5, int(stream),
-        )
+        if vec:
+            fvk.layer_norm_fp16_vec(
+                h_ptr, int(weights["norm1_w"][li]), int(weights["norm1_b"][li]),
+                xn_ptr, T, D, 1e-5, int(stream))
+        else:
+            fvk.layer_norm_fp16(
+                h_ptr, int(weights["norm1_w"][li]), int(weights["norm1_b"][li]),
+                xn_ptr, T, D, 1e-5, int(stream),
+            )
 
         # ── Q / K / V projections (single shared act scale for FP8) ──────
         if use_fp8:
-            fvk.quantize_fp8_static_fp16(
-                xn_ptr, xn_fp8_ptr, int(scales_dev["act_qkv"][li]),
-                T * D, int(stream),
-            )
+            if vec:
+                fvk.quantize_fp8_static_fp16_vec(
+                    xn_ptr, xn_fp8_ptr, int(scales_dev["act_qkv"][li]),
+                    T * D, int(stream))
+            else:
+                fvk.quantize_fp8_static_fp16(
+                    xn_ptr, xn_fp8_ptr, int(scales_dev["act_qkv"][li]),
+                    T * D, int(stream),
+                )
             gemm.fp8_nn_bias(
                 xn_fp8_ptr, int(weights["q_w"][li]), Q_ptr, int(weights["q_b"][li]),
                 T, D, D, float(weights["alpha_q"][li]), int(stream),
@@ -730,10 +747,15 @@ def vl_self_attn_forward(gemm, fvk, bufs, weights, dims,
 
         # ── o_proj ──────────────────────────────────────────────────────
         if use_fp8:
-            fvk.quantize_fp8_static_fp16(
-                O_ptr, xn_fp8_ptr, int(scales_dev["act_o"][li]),
-                T * D, int(stream),
-            )
+            if vec:
+                fvk.quantize_fp8_static_fp16_vec(
+                    O_ptr, xn_fp8_ptr, int(scales_dev["act_o"][li]),
+                    T * D, int(stream))
+            else:
+                fvk.quantize_fp8_static_fp16(
+                    O_ptr, xn_fp8_ptr, int(scales_dev["act_o"][li]),
+                    T * D, int(stream),
+                )
             gemm.fp8_nn_bias(
                 xn_fp8_ptr, int(weights["o_w"][li]), o_proj_out, int(weights["o_b"][li]),
                 T, D, D, float(weights["alpha_o"][li]), int(stream),
@@ -746,26 +768,41 @@ def vl_self_attn_forward(gemm, fvk, bufs, weights, dims,
         fvk.residual_add_fp16(h_ptr, o_proj_out, T * D, int(stream))
 
         # ── Pre-FF LayerNorm ───────────────────────────────────────────
-        fvk.layer_norm_fp16(
-            h_ptr, int(weights["norm3_w"][li]), int(weights["norm3_b"][li]),
-            xn_ptr, T, D, 1e-5, int(stream),
-        )
+        if vec:
+            fvk.layer_norm_fp16_vec(
+                h_ptr, int(weights["norm3_w"][li]), int(weights["norm3_b"][li]),
+                xn_ptr, T, D, 1e-5, int(stream))
+        else:
+            fvk.layer_norm_fp16(
+                h_ptr, int(weights["norm3_w"][li]), int(weights["norm3_b"][li]),
+                xn_ptr, T, D, 1e-5, int(stream),
+            )
 
         # ── FF: 2048 → 8192 (GELU) → 2048 ──────────────────────────────
         if use_fp8:
-            fvk.quantize_fp8_static_fp16(
-                xn_ptr, xn_fp8_ptr, int(scales_dev["act_fc1"][li]),
-                T * D, int(stream),
-            )
+            if vec:
+                fvk.quantize_fp8_static_fp16_vec(
+                    xn_ptr, xn_fp8_ptr, int(scales_dev["act_fc1"][li]),
+                    T * D, int(stream))
+            else:
+                fvk.quantize_fp8_static_fp16(
+                    xn_ptr, xn_fp8_ptr, int(scales_dev["act_fc1"][li]),
+                    T * D, int(stream),
+                )
             gemm.fp8_nn_gelu_bias(
                 xn_fp8_ptr, int(weights["fc1_w"][li]), fc1_out_ptr,
                 int(weights["fc1_b"][li]),
                 T, FF, D, float(weights["alpha_fc1"][li]), int(stream),
             )
-            fvk.quantize_fp8_static_fp16(
-                fc1_out_ptr, fc1_fp8_ptr, int(scales_dev["act_fc2"][li]),
-                T * FF, int(stream),
-            )
+            if vec:
+                fvk.quantize_fp8_static_fp16_vec(
+                    fc1_out_ptr, fc1_fp8_ptr, int(scales_dev["act_fc2"][li]),
+                    T * FF, int(stream))
+            else:
+                fvk.quantize_fp8_static_fp16(
+                    fc1_out_ptr, fc1_fp8_ptr, int(scales_dev["act_fc2"][li]),
+                    T * FF, int(stream),
+                )
             gemm.fp8_nn_bias(
                 fc1_fp8_ptr, int(weights["fc2_w"][li]), o_proj_out,
                 int(weights["fc2_b"][li]),
@@ -895,9 +932,13 @@ def dit_forward(gemm, fvk, bufs, weights, dims,
                     int(weights["qkv_b_fp4"][j]), int(bufs["qkv_buf"]),
                     Sa, 3 * D, D, int(stream))
                 _ck(rc, "qkv", li)
-                fvk.gpu_strided_copy_fp16(int(bufs["qkv_buf"]), Q_ptr, Sa, D, 3 * D, 0, int(stream))
-                fvk.gpu_strided_copy_fp16(int(bufs["qkv_buf"]), K_ptr, Sa, D, 3 * D, D, int(stream))
-                fvk.gpu_strided_copy_fp16(int(bufs["qkv_buf"]), V_ptr, Sa, D, 3 * D, 2 * D, int(stream))
+                if not bufs.get("qkv_strided"):
+                    # Slots read the fused QKV output in place (token
+                    # stride 3D) when "qkv_strided" is set; otherwise
+                    # split into the packed per-slot buffers.
+                    fvk.gpu_strided_copy_fp16(int(bufs["qkv_buf"]), Q_ptr, Sa, D, 3 * D, 0, int(stream))
+                    fvk.gpu_strided_copy_fp16(int(bufs["qkv_buf"]), K_ptr, Sa, D, 3 * D, D, int(stream))
+                    fvk.gpu_strided_copy_fp16(int(bufs["qkv_buf"]), V_ptr, Sa, D, 3 * D, 2 * D, int(stream))
                 attn.run("dit_self", j_attn, q_seq=Sa, kv_seq=Sa,
                          stream=int(stream))
             else:

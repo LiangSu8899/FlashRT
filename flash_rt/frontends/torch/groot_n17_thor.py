@@ -1839,6 +1839,8 @@ class GrootN17TorchFrontendThor:
                 "scale": 1.0 / (HD ** 0.5),
             },
         )
+        if getattr(self, "_KBB_VEC", False):
+            self._dit_attn._use_masked_softmax = True
 
     # ────────────────────────────────────────────────────────────────
     # Normalize / Denormalize helpers (statistics.json, q01/q99)

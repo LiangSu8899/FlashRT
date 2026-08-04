@@ -1337,6 +1337,7 @@ pybind11_add_module(flash_rt_kernels
   csrc/kernels/softmax.cu
   csrc/kernels/attention_cublas.cu
   csrc/kernels/attention_mha.cu
+  csrc/kernels/attention_mha_masked.cu
   csrc/kernels/attention_mha_causal.cu
   csrc/kernels/rope_qwen3.cu
   csrc/kernels/vec_fp16_backbone.cu

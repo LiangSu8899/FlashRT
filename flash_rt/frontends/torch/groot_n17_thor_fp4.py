@@ -118,6 +118,12 @@ class GrootN17TorchFrontendThorFP4(GrootN17TorchFrontendThorFP8):
         self._k_qkv_buf = torch.empty(Sa, 3 * D, dtype=torch.bfloat16,
                                       device=dev)
 
+        # Read the fused QKV GEMM output in place from the self-attn site
+        # (token stride 3D) — the three per-layer split copies disappear.
+        base = self._k_qkv_buf.data_ptr()
+        self._dit_attn._slots["dit_self"].update(
+            Q=base, K=base + 2 * D, V=base + 4 * D, qkv_stride=3 * D)
+
         for sw in step_weights:
             sw.update(
                 qkv_w_fp4=qkv_w, qkv_sfb=qkv_sfb, qkv_b_fp4=qkv_b,
@@ -129,4 +135,4 @@ class GrootN17TorchFrontendThorFP4(GrootN17TorchFrontendThorFP8):
             xn_fp4=xn_fp4.data_ptr(), xn_sfa=xn_sfa.data_ptr(),
             octx_fp4=octx_fp4.data_ptr(), octx_sfa=octx_sfa.data_ptr(),
             hid_fp4=hid_fp4.data_ptr(), hid_sfa=hid_sfa.data_ptr(),
-            qkv_buf=self._k_qkv_buf.data_ptr())
+            qkv_buf=self._k_qkv_buf.data_ptr(), qkv_strided=True)
