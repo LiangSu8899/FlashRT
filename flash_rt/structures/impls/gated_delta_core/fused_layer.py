@@ -179,18 +179,25 @@ class FusedGatedDeltaDecodeLayer(GuardedSeam, torch.nn.Module):
         # serial per-chunk walk of the fallback core is the measured
         # long-prompt TTFT term. Its entries are 48/16-shaped; other
         # profiles keep the chunk walk until head-generic WY ships.
-        self._wy_ok = (
-            (self._hv, self._hk) == (48, 16)
-            and self._chunk_ok
-            and all(hasattr(gda, n) for n in (
-                "lin_split_qkv_gqa_bf16",
-                "gdn_wy_norm_cumsum_pack_qk_bf16",
-                "gdn_wy_kkt_b64_bf16",
-                "gdn_wy_solve_tril_b64_f32",
-                "gdn_wy_cast_ai_f32_to_bf16",
-                "gdn_wy_recompute_wu_b64_mma_fla_bf16",
-                "gdn_wy_chunk_h_b64_mma_fla_bf16",
-                "gdn_wy_output_o_b64_mma_fla_rawk_bf16")))
+        self._wy_h = (self._hv, self._hk) != (48, 16)
+        _wy_names = ((
+            "gdn_wy_norm_cumsum_pack_qk_h_bf16",
+            "gdn_wy_kkt_b64_h_bf16",
+            "gdn_wy_cast_ai_h_f32_to_bf16",
+            "gdn_wy_recompute_wu_b64_mma_fla_h_bf16",
+            "gdn_wy_chunk_h_b64_mma_fla_h_bf16",
+            "gdn_wy_output_o_b64_mma_fla_h_bf16",
+        ) if self._wy_h else (
+            "lin_split_qkv_gqa_bf16",
+            "gdn_wy_norm_cumsum_pack_qk_bf16",
+            "gdn_wy_kkt_b64_bf16",
+            "gdn_wy_cast_ai_f32_to_bf16",
+            "gdn_wy_recompute_wu_b64_mma_fla_bf16",
+            "gdn_wy_chunk_h_b64_mma_fla_bf16",
+            "gdn_wy_output_o_b64_mma_fla_bf16",
+        ))
+        self._wy_ok = (self._chunk_ok
+                       and all(hasattr(gda, n) for n in _wy_names))
         guard = self._frt_arm(dtypes=CAST_OK, device=dev, k=d_model)
         guard.notes["host_form_calls"] = 0
         guard.notes["proj_band"] = ("nvfp4" if self._proj_in is not None
@@ -303,10 +310,13 @@ class FusedGatedDeltaDecodeLayer(GuardedSeam, torch.nn.Module):
         conv_out = self._conv.causal_conv1d_update_chunk_parallel_bf16(
             mixed.view(1, S, -1), self._conv_w, conv_state,
             self._conv_b, apply_silu=True)
-        q16, k16, v48 = gda.lin_split_qkv_gqa_bf16(conv_out.view(S, -1))
+        co = conv_out.view(S, -1)
         g, beta = self._gate_fn(
             a_all.view(S, self._hv), b_all.view(S, self._hv),
             self._neg_exp_a, self._dt_bias)
+        if self._wy_h:
+            return self._wy_core_h(gda, co, g, beta, state, S)
+        q16, k16, v48 = gda.lin_split_qkv_gqa_bf16(co)
         q16_l2, k16_l2, q_pack_hv, _k_pack_hk, g_cumsum = \
             gda.gdn_wy_norm_cumsum_pack_qk_bf16(q16, k16, g)
         big_a = gda.gdn_wy_kkt_b64_bf16(k16_l2, beta, g_cumsum)
@@ -326,6 +336,36 @@ class FusedGatedDeltaDecodeLayer(GuardedSeam, torch.nn.Module):
                 k16_l2, w_pack, u_pack, g_cumsum, state)
         return gda.gdn_wy_output_o_b64_mma_fla_bf16(
             q_pack_hv, k_pack_hv, v_new_pack, h0, g_cumsum)
+
+    def _wy_core_h(self, gda, co, g, beta, state, S):
+        """The head-generic arm of the WY pipeline (non-48/16 hosts).
+
+        The GQA split is contiguous column slices of the conv output —
+        pinned bit-equal to the dedicated split kernel on the record —
+        so the head-generic arm slices instead of asking for a kernel.
+        """
+        kd = self._hk * self._d
+        hp = {"num_v_heads": self._hv, "num_k_heads": self._hk,
+              "head_dim": self._d}
+        q = co[:, :kd].contiguous().view(S, self._hk, self._d)
+        k = co[:, kd:2 * kd].contiguous().view(S, self._hk, self._d)
+        v = co[:, 2 * kd:].contiguous().view(S, self._hv, self._d)
+        q_l2, k_l2, q_pack_hv, _k_pack_hk, g_cumsum = \
+            gda.gdn_wy_norm_cumsum_pack_qk_h_bf16(q, k, g, **hp)
+        big_a = gda.gdn_wy_kkt_b64_h_bf16(k_l2, beta, g_cumsum, **hp)
+        eye = torch.eye(64, device=big_a.device,
+                        dtype=big_a.dtype).expand_as(big_a).contiguous()
+        ai = torch.linalg.solve_triangular(
+            eye + torch.tril(big_a, -1), eye, upper=False).contiguous()
+        ai_pack = gda.gdn_wy_cast_ai_h_f32_to_bf16(
+            ai, S, num_v_heads=self._hv)
+        w_pack, u_pack = gda.gdn_wy_recompute_wu_b64_mma_fla_h_bf16(
+            k_l2, v, beta, g_cumsum, ai_pack, **hp)
+        h0, _v_new, v_new_pack, k_pack_hv = \
+            gda.gdn_wy_chunk_h_b64_mma_fla_h_bf16(
+                k_l2, w_pack, u_pack, g_cumsum, state, **hp)
+        return gda.gdn_wy_output_o_b64_mma_fla_h_bf16(
+            q_pack_hv, k_pack_hv, v_new_pack, h0, g_cumsum, **hp)
 
     def _prefill_epilogue(self, hidden_states, cache_params, allp,
                           mixed, core_out, state, cont, old_slot, S):
