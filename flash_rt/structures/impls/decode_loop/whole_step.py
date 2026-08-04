@@ -58,6 +58,11 @@ class _StaticHybridCache:
     def update(self, k, v, layer_idx, cache_kwargs=None):
         self.key_cache[layer_idx].index_copy_(2, self._cp, k)
         self.value_cache[layer_idx].index_copy_(2, self._cp, v)
+        band = getattr(self, "frt_fp8_band", None)
+        if band is not None:
+            # dual-store: the same post-rope rows land in the FP8 pages
+            # the XQA read path consumes; BF16 stays the prefill arm
+            band.write(layer_idx, k, v, self._cp)
         return self.key_cache[layer_idx], self.value_cache[layer_idx]
 
     def get_seq_length(self, layer_idx=0):
@@ -90,7 +95,7 @@ class WholeStepDecodeLoop:
     """Compiled, graph-captured greedy decode over the attached model."""
 
     def __init__(self, model, *, max_len, compile_step=True,
-                 compile_prefill=True):
+                 compile_prefill=True, kv_band=None):
         lm = _find_stack(model)
         self._model = model
         self._lm = lm
@@ -113,6 +118,17 @@ class WholeStepDecodeLoop:
         self._max = int(max_len)
         self.cache = _StaticHybridCache(
             len(self._layers), self._full, kvh, hd, self._max, dev)
+        self._kv_band = None
+        if kv_band == "fp8":
+            from .fp8_kv import install
+
+            self._kv_band = install(model, lm, self.cache, self._max)
+            if self._kv_band is None:
+                raise ValueError(
+                    "refused: fp8 kv band serves the kernel's v1 head "
+                    "profile (24/4/256); this host keeps BF16 KV")
+        elif kv_band is not None:
+            raise ValueError(f"refused: unknown kv band {kv_band!r}")
         self._causal = torch.full(
             (self._max, self._max), float("-inf"), device=dev,
             dtype=torch.bfloat16).triu_(1)
@@ -137,6 +153,8 @@ class WholeStepDecodeLoop:
         # multimodal hosts: the host's rope delta shifts the latter
         pe = self._rotary(h, (pos_t + self._rope_delta).view(1, -1))
         self.cache._cp = pos_t
+        if self._kv_band is not None:
+            self._kv_band.set_len(pos_t[-1:] + 1)
         m4 = self._causal.index_select(0, pos_t).view(
             1, 1, -1, self._max)
         for i, lyr in enumerate(self._layers):
@@ -311,6 +329,8 @@ class WholeStepDecodeLoop:
         h = self._embed(tok_ids)
         pe = self._rotary(h, pos_t.view(1, -1))
         self.cache._cp = pos_t
+        if self._kv_band is not None:
+            self._kv_band.set_len(pos_t[-1:] + 1)
         m4 = self._causal.index_select(0, pos_t).view(
             1, 1, -1, self._max)
         for i, lyr in enumerate(self._layers):
@@ -649,8 +669,9 @@ class WholeStepDecodeLoop:
 
 
 def build_decode_loop(model, *, max_len, compile_step=True,
-                      compile_prefill=True):
+                      compile_prefill=True, kv_band=None):
     """Build the whole-loop form over whatever is attached to ``model``."""
     return WholeStepDecodeLoop(model, max_len=max_len,
                                compile_step=compile_step,
-                               compile_prefill=compile_prefill)
+                               compile_prefill=compile_prefill,
+                               kv_band=kv_band)
