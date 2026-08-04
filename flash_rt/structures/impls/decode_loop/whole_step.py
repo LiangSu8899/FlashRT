@@ -450,6 +450,11 @@ class WholeStepDecodeLoop:
         The warmup executions commit real state; the caller's snapshot
         is restored before capture so the first replay starts clean.
         """
+        if self._kv_band is not None:
+            # every spec shape's mask exists before the compiled passes
+            # trace: a lazy dict fill flips a guard between warmup and
+            # capture, and recompiling mid-capture is illegal
+            self._kv_band.prewarm(range(1, K + 2))
         self._dh_buf = torch.empty(1, 1, self._embed.weight.shape[1],
                                    device=dev, dtype=torch.bfloat16)
         self._dtok_buf = torch.empty(1, 1, dtype=torch.long, device=dev)

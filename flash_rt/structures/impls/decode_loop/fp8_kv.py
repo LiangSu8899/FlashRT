@@ -99,6 +99,17 @@ class Fp8KvBand:
         for vp in self.v_pages.values():
             vp.view(torch.uint8).zero_()
 
+    def prewarm(self, shapes):
+        """Materialise the per-shape masks ahead of compiled use: a
+        lazy build inside a compiled region flips a dynamo guard
+        between warmup and capture, and recompiling while a stream is
+        capturing is illegal."""
+        dev = self._table.device
+        for s in shapes:
+            if s not in self._masks:
+                self._masks[s] = self._kern.causal_spec_mask(
+                    int(s), device=dev)
+
     def clear_rows(self, pos):
         """Zero the page rows at ``pos`` across every layer.
 
