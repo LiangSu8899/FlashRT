@@ -1,5 +1,66 @@
 # Pi0.5 Thor NVFP4 End-to-End Results
 
+## Current Result (2026-08-05)
+
+The configuration is the full Thor NVFP4 tier, which
+`load_model(..., use_fp4=True, use_fp4_decoder=True, use_fa4=True)`
+resolves in one call (see [Implemented Path](#implemented-path)). Each row
+is one same-session A/B; rows are separate sessions, so compare within a
+row only. These are the numbers the README quotes.
+
+| Views | Same-run FP8 p50 | NVFP4 + FA4 p50 | Speedup | Throughput | Gates |
+|---:|---:|---:|---:|---:|---|
+| 1 † | 32.92 ms | **23.01 ms** | 1.431 | 43 Hz | fidelity gates fail |
+| 2 | 38.70 ms | **27.17 ms** | 1.424 | 37 Hz | all pass |
+| 3 | 49.02 ms | **31.74 ms** | 1.544 | 32 Hz | all pass |
+
+Matched-noise fidelity against the same-run FP8 reference:
+
+| Views | Raw cosine / worst | Final action cosine / worst |
+|---:|---:|---:|
+| 1 † | 0.991367 / 0.965022 | 0.993474 / 0.971119 |
+| 2 | 0.999206 / 0.998030 | 0.999720 / 0.999157 |
+| 3 | 0.999036 / 0.997660 | 0.999736 / 0.999435 |
+
+† The 1-view row does not clear the per-sample cosine gates. See
+[One-View Fidelity](#one-view-fidelity-diagnosis-and-passing-configuration-2026-07-27)
+for the diagnosis and a configuration that does clear them.
+
+Both children run FA4, so these speedups isolate NVFP4 against FP8 with the
+attention backend held fixed.
+
+### Public API confirmation run
+
+The table above was measured by constructing the frontends directly. A
+second session re-ran all three view counts through the harness default
+`--construct load_model`, which builds both children with
+`flash_rt.load_model()` (see [Verification Contract](#verification-contract)).
+Every cosine came out identical to the table above at every view count,
+which is the evidence that the two construction paths produce the same
+configuration:
+
+| Views | Same-run FP8 p50 | NVFP4 + FA4 p50 / p95 | Speedup | FP4 100-sample spread |
+|---:|---:|---:|---:|---:|
+| 1 † | 32.80 ms | 23.07 / 23.14 ms | 1.422 | 0.18 ms |
+| 2 | 38.62 ms | 27.29 / 27.34 ms | 1.415 | 0.12 ms |
+| 3 | 45.75 ms | 31.89 / 31.94 ms | 1.435 | 0.11 ms |
+
+The FP4 latencies land within 0.15 ms of the table above. The FP8 baseline
+drifts a few ms between sessions on this hardware, which moves the 3-view
+ratio without moving the FP4 result — the reason only within-row ratios are
+meaningful.
+
+Artifacts (confirmation run):
+
+- `flash_rt_fp4`: `22216c9514bb16c8a3be1578f1f3c814ec9d3a4a02ec77472a911a919984ae79`
+- `flash_rt_kernels`: `c40f72766d8c16def8758b2d2590250de0970f09bf6071c54da96b97b52bfccf`
+- 1-view `result.json`: `5b159a002c61d8de215f82d291bb3a7db1474897f5ea768587ec371d1616ec86`
+- 2-view `result.json`: `cd8bf27a8f16c05e600684f2918d07d6e058c672e22a0680501ec205eaa3d216`
+- 3-view `result.json`: `7f0ad414b7538c9d7208ad39c6e0d4e5f0adbfb7d76d5b1dabc780fb103f81af`
+
+The sections below are the chronological development log that produced this
+configuration; their absolute latencies belong to their own sessions.
+
 ## Vectorized SigLIP LayerNorms (2026-07-27)
 
 The two per-layer SigLIP LayerNorms were the largest non-GEMM item in
@@ -42,10 +103,13 @@ A fully passing configuration exists for deployments that require the
 cosine gates at 1 view — encoder in FP8, decoder in rotated full-INT4:
 
 ```
---num-views 1 \
+--num-views 1 --construct frontend \
 --encoder-fp4-layer-count 0 --siglip-ffn-fp4 0 --encoder-attn-o-fp4 0 \
 --decoder-weight-format e0m3 --decoder-act-format e0m3 --decoder-rht 1
 ```
+
+It deviates from the published preset, so it needs `--construct frontend`;
+`load_model()` does not expose the e0m3 / Hadamard decoder knobs.
 
 Formal 1-view result for this configuration: raw cosine 0.99974 with
 worst sample 0.99954, action cosine 0.99990 with worst sample 0.99973
@@ -138,8 +202,8 @@ compute-bound rather than weight-bandwidth-bound, so NVFP4 only matches
 the FP8 GEMM while the extra fused quantize kernel costs ~18 us per layer
 (~0.33 ms per frame) and the quantization consumes raw-cosine margin.
 The kernels and calibration path remain available behind
-`--encoder-attn-qkv-fp4 1` for shapes where the projection is
-bandwidth-bound.
+`--encoder-attn-qkv-fp4 1` (with `--construct frontend`) for shapes where
+the projection is bandwidth-bound.
 
 ## SigLIP AWQ, 27-Layer Preset (2026-07-27)
 
