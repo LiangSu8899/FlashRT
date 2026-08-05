@@ -68,7 +68,7 @@ def test_rotary_adapter_preserves_processor_semantics(monkeypatch):
 
     monkeypatch.setattr(
         "flash_rt.structures.adapters.diffusers_rotary_attention."
-        "bind_dense_attention",
+        "bind_dense_attention_best",
         lambda rows: _Core(),
     )
     result = DiffusersRotaryAttentionAdapter()(
