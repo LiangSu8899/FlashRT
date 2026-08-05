@@ -49,29 +49,21 @@ def main() -> None:
                     help="save the first inference output to this .pt")
     ap.add_argument("--ref-in", default=None,
                     help="compare the first inference output against this .pt")
-    ap.add_argument("--dit-fp8-layers", default=None,
-                    help="comma-separated DiT layers kept on the FP8 path "
-                         "(fp4 tier precision ladder)")
     args = ap.parse_args()
 
     if args.tier == "fp4":
         from flash_rt.frontends.torch.groot_n17_thor_fp4 import (
             GrootN17TorchFrontendThorFP4 as Frontend)
-        kw = {}
-        if args.dit_fp8_layers:
-            kw["dit_fp8_layers"] = tuple(
-                int(x) for x in args.dit_fp8_layers.split(","))
     else:
         from flash_rt.frontends.torch.groot_n17_thor_fp8 import (
             GrootN17TorchFrontendThorFP8 as Frontend)
-        kw = {}
 
     aux = torch.load(args.aux, weights_only=False, map_location="cpu")
     if isinstance(aux, list):
         aux = aux[0]
 
     fe = Frontend(args.ckpt, num_views=args.views,
-                  embodiment_tag=args.embodiment, **kw)
+                  embodiment_tag=args.embodiment)
     fe.set_prompt(aux=aux, prompt="benchmark")
     if args.calib_aux:
         # Multi-sample act-scale refinement (requires set_prompt first).

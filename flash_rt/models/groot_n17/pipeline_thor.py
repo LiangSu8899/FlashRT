@@ -981,10 +981,6 @@ def dit_forward(gemm, fvk, bufs, weights, dims,
     # bias+residual, bias+GELU+fp4out) and the fused norm->fp4 front-ends
     # additionally remove most of the per-layer elementwise launches.
     use_fp4 = fvk_fp4 is not None and "ff_proj_w_fp4" in weights
-    # Optional per-layer precision ladder: layers not in ``fp4_layers``
-    # fall through to the calibrated FP8 path (whose weight/scale keys
-    # must also be spliced in). None/absent = every layer FP4.
-    fp4_layer_set = weights.get("fp4_layers")
 
     def _ck(rc, what, li):
         if rc != 0:
@@ -998,7 +994,7 @@ def dit_forward(gemm, fvk, bufs, weights, dims,
         # layer index). Map here.
         j_attn = (li - 1) // 2 if is_self else li // 2
 
-        if use_fp4 and (fp4_layer_set is None or li in fp4_layer_set):
+        if use_fp4:
             xn_fp4, xn_sfa = int(bufs["xn_fp4"]), int(bufs["xn_sfa"])
             slots = attn.get_slot_ptrs("dit_self" if is_self else "dit_cross",
                                        j_attn)

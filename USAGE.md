@@ -565,12 +565,10 @@ python benchmarks/groot_n17_thor_latency.py \
     --tier fp4 --views 2 --warmup 5 --iters 20
 ```
 
-Precision ladder: on an 8-sample reference set the all-FP4 default
-holds worst-sample action cosine ≈ 0.998 vs the FP8 tier (the other
-samples sit at ≈ 0.9999). The first DiT layers are the sensitive ones;
-`GrootN17TorchFrontendThorFP4(..., dit_fp8_layers=(0, 1, 2, 3))` keeps
-them on the calibrated FP8 path and lifts the worst sample to ≈ 0.9998
-for roughly +2 ms per frame.
+Across an 8-sample reference set the tier holds action cosine ≥ 0.9993
+against the FP8 tier on 7 of 8 samples, with a worst sample of 0.9976.
+For accuracy-critical deployments, validate on the target task rather
+than on cosine alone, or run the FP8 tier.
 
 ### GROOT N1.7 RTX
 
