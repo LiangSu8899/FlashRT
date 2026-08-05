@@ -85,7 +85,7 @@ _PROBE_DUMMY_H = {}
 
 # FA4 (FlashAttention-4 CuTe-DSL) denoise attention. Measured ~17% faster than
 # the vendored fmha at the denoise shape (Sq=51) via pack_gqa, cos=1.0,
-# CUDA-graph safe. Runs on Thor compiled for sm_110a. Opt-in; falls back to
+# CUDA-graph safe. Runs on Thor compiled for sm_101a. Opt-in; falls back to
 # fmha if FA4 (cutlass-dsl/quack) isn't available.
 _USE_FA4_ATTN = True
 
