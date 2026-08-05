@@ -43,8 +43,13 @@ def load_model(
     use_fp4: bool = False,
     fp4_layers: tuple[int, ...] | None = None,
     use_awq: bool | None = None,
-    awq_alpha: float = 0.5,
+    awq_alpha: float | None = None,   # None -> per-stage production value
     use_p1_split_gu: bool | None = None,
+    use_fp4_decoder: bool = False,
+    use_fa4: bool = False,
+    encoder_p1_combiner: str = "lut_native",
+    encoder_down_variant: int = 7,
+    decoder_gate_up_variant: int = 10,
     num_steps: int | None = None,
     vision_pool_factor: int | None = None,
     vision_num_layers: int | None = None,
@@ -68,6 +73,13 @@ Returns a `VLAModel` wrapping the appropriate frontend for the detected
   `use_p1_split_gu` apply to the Pi0.5 torch and JAX NVFP4 encoder path on
   Thor. The JAX path loads Orbax checkpoints; the torch path loads
   safetensors checkpoints.
+- `use_fp4_decoder`, `use_fa4`, `encoder_p1_combiner`,
+  `encoder_down_variant` and `decoder_gate_up_variant` extend that Pi0.5
+  Thor NVFP4 path: they turn on the NVFP4 decoder and the FA4 attention
+  backend, and select the encoder combiner and the GEMM tile variants.
+  `awq_alpha` defaults to `None`, which resolves to the per-stage
+  production value rather than a single constant. All of them require
+  `use_fp4=True`; they are ignored on other configs and hardware.
 - `use_fp4=True` with `config="groot_n17"` on Thor selects the GROOT N1.7
   NVFP4 tier (NVFP4 DiT action head + cross-KV, vectorized backbone
   kernels, FA4 attention when available). It takes no Pi0.5 sub-flags and
