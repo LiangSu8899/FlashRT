@@ -85,9 +85,17 @@ Baseline comparisons and source methodology live in [Benchmark Comparison](docs/
 | Hardware | Mode | Latency | Throughput | Source |
 |---|---|---:|---:|---|
 | Jetson AGX Thor | FP8, 2-view | **44.0 ms** | **23 Hz** | [Thor VLA](examples/thor/README.md#thor-vla-performance) |
-| Jetson AGX Thor | NVFP4, 2-view | **39.78 ms** | **25 Hz** | [NVFP4](#nvfp4-encoder-ffn-pi05-only) |
-| Jetson AGX Thor | NVFP4, 3-view | **51.51 ms** | **19 Hz** | [NVFP4](#nvfp4-encoder-ffn-pi05-only) |
+| Jetson AGX Thor | NVFP4 + FA4, 1-view † | **23.01 ms** | **43 Hz** | [Pi0.5 Thor NVFP4](docs/pi05_thor_decoder_fp4_e2e.md) |
+| Jetson AGX Thor | NVFP4 + FA4, 2-view | **27.17 ms** | **37 Hz** | [Pi0.5 Thor NVFP4](docs/pi05_thor_decoder_fp4_e2e.md) |
+| Jetson AGX Thor | NVFP4 + FA4, 3-view | **31.74 ms** | **32 Hz** | [Pi0.5 Thor NVFP4](docs/pi05_thor_decoder_fp4_e2e.md) |
 | RTX 5090 | FP8, 2-view | **17.58 ms** | **57 Hz** | [Blackwell VLA](examples/blackwell/README.md#vla-latency-rtx-5090) |
+
+† At 1 view the per-sample action cosine against the FP8 reference does
+not clear the 0.995 gate (worst sample 0.971): with single-view input the
+flow-matching field itself is near a decision boundary on some samples,
+so trajectories land in a different action basin. See
+[one-view fidelity](docs/pi05_thor_decoder_fp4_e2e.md#one-view-fidelity-diagnosis-and-passing-configuration-2026-07-27)
+for the diagnosis and a configuration that does clear the gates at 1 view.
 
 #### Pi0
 
