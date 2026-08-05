@@ -141,10 +141,17 @@ def main() -> int:
         raise ValueError("strict E2E requires --warmup >= 5 and --iters >= 20")
     if args.awq_alpha <= 0:
         raise ValueError("--awq-alpha must be positive")
+    if args.checkpoint is None:
+        parser.error(
+            "--checkpoint is required (or set $PI05_CHECKPOINT)")
     if args.fixture is None:
-        args.fixture = (
-            "/home/tianjianyang/models/pi05_jax_fp4_validation/fixtures/"
-            f"libero_obs_{args.num_views}v_n8.npz")
+        fixture_dir = os.environ.get("PI05_FIXTURE_DIR")
+        if fixture_dir is None:
+            parser.error(
+                "--fixture is required (or set $PI05_FIXTURE_DIR to the "
+                "directory holding libero_obs_<views>v_n8.npz)")
+        args.fixture = os.path.join(
+            fixture_dir, f"libero_obs_{args.num_views}v_n8.npz")
     state = machine_state()
 
     if args.child_mode is not None:
