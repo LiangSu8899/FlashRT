@@ -465,6 +465,23 @@ where they are not.
 implementation second. A spec whose points nothing can locate fails loudly
 at plan time, which is the intent.
 
+**A per-device kernel update** (a package grows an arch build, a tuned
+body, a fused epilogue): decide the tier before writing any code.
+*Same symbols, new arch build* — no code; the package's metadata
+unlocks the device and the impl binds unchanged. *New capability
+entries inside the seam* (fused-bias epilogue, direct BF16 quantize) —
+one **capability probe** in the impl: `getattr(kern, "entry", None)`,
+prefer it when the installed package ships it, keep the existing path
+when it does not; absence is a fallback, never a refusal
+(`nvfp4_dynamic`'s GEMV and BF16-quantize probes are the precedents),
+and one probe serves every device forever. *Fusion that crosses a seam
+boundary* (an epilogue emitting the next GEMM's quantized input) —
+that is a new executable form: an impl variant or a wire-dtype
+negotiation, judged like any variant. Variant count grows with
+executable forms, never with devices; per-device tuning stays
+contained in the packages' build-variant distribution, and within one
+package version an entry's signature is invariant across archs.
+
 **A quantisation scheme**: register an instance in `schemes.py` — two
 methods and nothing else. `statistics` declares what each calibration
 point needs (statistic and granularity: per-tensor, per-channel,

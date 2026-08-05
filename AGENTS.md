@@ -242,6 +242,34 @@ adapter pins are the copyable precedent.
    precedent). A stale build or missing symbol must surface as a bind
    refusal — in a fallback-capable system it can never be caught by
    comparing outputs, because falling back is numerically exact.
+   The smoke's input must carry the host's real rank and shape class —
+   a minimal 2D fixture stays green against a kernel whose contract is
+   2D-only while every real host hands it 3D (the norm_fused
+   incident).
+9. **Device differences absorb at three tiers, and only one of them
+   is your code.** When a kernel package gains per-device work, decide
+   which tier it is before touching an impl:
+   - *Same symbols, new arch build* (a package adds an SM110 variant
+     of entries it already ships): nothing to do. The package's
+     metadata unlocks the device; the impl binds unchanged.
+   - *New capability entries inside the seam* (a fused-bias epilogue,
+     a direct BF16 quantize — better bodies for work the impl already
+     does): add a **capability probe**, once. `getattr(kern, "entry",
+     None)`; prefer the entry when the installed package ships it,
+     keep the existing path when it does not — absence is a fallback,
+     never a refusal (`nvfp4_dynamic`'s GEMV and BF16-quantize probes
+     are the precedents). One probe serves every device forever; no
+     new impl variant.
+   - *Fusion that crosses a seam boundary* (an epilogue that emits the
+     next GEMM's quantized input): that is a new executable form —
+     an impl variant or a wire-dtype negotiation, judged by the same
+     gates as any variant.
+   Variant count grows with executable forms, never with devices;
+   the bulk of per-device tuning must stay contained in the packages'
+   build-variant distribution. The kernels-side half of this bargain:
+   within one package version, an entry's signature is invariant
+   across archs, and capability growth extends the symbol surface
+   without touching existing entries.
 
 ---
 
