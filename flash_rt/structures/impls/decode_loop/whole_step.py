@@ -170,6 +170,7 @@ class WholeStepDecodeLoop:
         else:
             self._step = self._fwd
         self._graph = None
+        self._aot_pf = None
 
     def _fwd(self, tok_ids, pos_t):
         h = self._embed(tok_ids)
@@ -258,7 +259,7 @@ class WholeStepDecodeLoop:
         for i in self._full:
             self.cache.key_cache[i][:, :, L:].zero_()
             self.cache.value_cache[i][:, :, L:].zero_()
-        pf = self._prefill_callable()
+        pf = self._aot_pf or self._prefill_callable()
         logits = pf(input_ids,
                     torch.arange(L, device=input_ids.device))
         self._cur.copy_(logits.float().argmax(-1))
@@ -325,6 +326,45 @@ class WholeStepDecodeLoop:
             for _ in range(max_new_tokens - 1):
                 self._graph.replay()
                 toks.append(self._cur.clone())
+
+    @torch.no_grad()
+    def aot_prefill(self, example_ids, package_path,
+                    inductor_configs=None):
+        """Package the prompt pass whole and route ``generate`` through it.
+
+        S-specialised like the compiled prefill. The package is built
+        weights-external: the graph binary carries no constants, and at
+        load it borrows the live parameters and the loop's own KV rows
+        in place — a second copy of the weights never exists on the
+        card, and the packaged KV writes are writes into the cache the
+        captured decode step reads. The same-token gate downstream
+        checks exactly that hand-off.
+        """
+        if self._kv_band is not None:
+            raise ValueError(
+                "refused: aot_prefill serves the BF16-KV loop; the FP8 "
+                "band's prefill dual-store is not packaged yet")
+        from ...aot import aot_load, aot_package_external
+
+        dev = example_ids.device
+        vehicle = _PrefillVehicle(self)
+        pos = torch.arange(int(example_ids.shape[1]), device=dev)
+        self.cache.frt_continue = False
+        self._rope_delta.zero_()
+        try:
+            path, weights = aot_package_external(
+                vehicle, args=(example_ids, pos),
+                package_path=package_path,
+                inductor_configs=inductor_configs)
+        finally:
+            # tracing rebinds the cache lists through the vehicle's
+            # buffer attributes and leaves fake proxies behind; put the
+            # real tensors back whatever happened
+            for i in self._full:
+                self.cache.key_cache[i] = getattr(vehicle, f"frt_k{i}")
+                self.cache.value_cache[i] = getattr(vehicle, f"frt_v{i}")
+        self._aot_pf = aot_load(path, weights=weights)
+        return path
 
     @torch.no_grad()
     def generate_from(self, inputs, max_new_tokens):
@@ -765,6 +805,42 @@ class WholeStepDecodeLoop:
         self.last_acceptance = (sum(accepted_hist) / len(accepted_hist)
                                 if accepted_hist else 0.0)
         return out[:, :L + max_new_tokens]
+
+
+class _PrefillVehicle(torch.nn.Module):
+    """Export vehicle for the prompt pass.
+
+    The state the pass mutates — the static KV rows, the rope delta —
+    rides as registered buffers so functionalization records the writes
+    as buffer mutations instead of refusing them. The host model hangs
+    in the module hierarchy so every parameter exports under its own
+    FQN. Loaded with the package borrowing these very tensors, the
+    packaged writes land in the loop's own cache.
+    """
+
+    def __init__(self, loop):
+        super().__init__()
+        self.model = loop._model
+        self._frt_loop = loop
+        for i in loop._full:
+            self.register_buffer(f"frt_k{i}", loop.cache.key_cache[i])
+            self.register_buffer(f"frt_v{i}", loop.cache.value_cache[i])
+        self.register_buffer("frt_rope_delta", loop._rope_delta)
+
+    def forward(self, tok_ids, pos_t):
+        # the cache reaches its KV through a plain python object, which
+        # the exporter can only lift as an immutable constant; rerouted
+        # through this module's own attributes the same tensors carry a
+        # buffer source, and the prompt pass's index_copy_ becomes a
+        # legal buffer mutation. Outside tracing the getattr returns
+        # the very same tensors, so this is an identity rebind — but
+        # under fake tracing it leaves proxies in the cache lists,
+        # which ``aot_prefill`` restores right after export.
+        loop = self._frt_loop
+        for i in loop._full:
+            loop.cache.key_cache[i] = getattr(self, f"frt_k{i}")
+            loop.cache.value_cache[i] = getattr(self, f"frt_v{i}")
+        return loop._fwd(tok_ids, pos_t)
 
 
 def build_decode_loop(model, *, max_len, compile_step=True,

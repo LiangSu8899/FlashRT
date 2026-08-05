@@ -142,6 +142,17 @@ class LinearProjW8A16(GuardedSeam, torch.nn.Module):
                  original: torch.nn.Module | None = None):
         super().__init__()
         self._bound = bound
+        # the same tensors, reachable through *module* attributes: an
+        # exporter attributes a tensor by its access path, and a tensor
+        # reached only through a plain object gets lifted as an
+        # anonymous immutable constant — unnameable in a
+        # weights-external package. Identity is unchanged.
+        self.register_buffer("_frt_w_q", bound._w_q)
+        self.register_buffer("_frt_w_scale", bound._w_scale)
+        if bound._bias is not None:
+            self.register_buffer("_frt_bias", bound._bias)
+        else:
+            self._frt_bias = None
         if original is not None:
             self.host_linear = original
         guard = self._frt_arm(dtypes=CAST_OK,
@@ -169,7 +180,14 @@ class LinearProjW8A16(GuardedSeam, torch.nn.Module):
                 if guard is not None and not torch.compiler.is_compiling():
                     guard.notes["dispatched_by_band"] += 1
                 return host(x)
-        return self._bound.project(x)
+            return self._bound.project(x)   # states the refusal
+        shape = x.shape
+        flat = x.reshape(-1, shape[-1])
+        y = self._bound._linear(flat.to(torch.bfloat16).contiguous(),
+                                self._frt_w_q, self._frt_w_scale)
+        if self._frt_bias is not None:
+            y = y + self._frt_bias
+        return y.reshape(*shape[:-1], self._bound._n).to(x.dtype)
 
 
 @torch.no_grad()

@@ -122,7 +122,7 @@ def decode_loop(model, *, max_len, compile_step=True,
 
 
 def aot_package(module, args=(), kwargs=None,
-                package_path="module_aot.pt2"):
+                package_path="module_aot.pt2", **opts):
     """Whole-graph door: export the swapped module and AOT-compile it
     into a reusable package (graph breaks are defects, not fallbacks).
 
@@ -131,14 +131,14 @@ def aot_package(module, args=(), kwargs=None,
     from flash_rt.structures.aot import aot_package as _pkg
 
     return _pkg(module, args=args, kwargs=kwargs,
-                package_path=package_path)
+                package_path=package_path, **opts)
 
 
-def aot_load(package_path):
+def aot_load(package_path, weights=None):
     """Load an AOT package back as a callable graph."""
     from flash_rt.structures.aot import aot_load as _load
 
-    return _load(package_path)
+    return _load(package_path, weights=weights)
 
 
 from . import schemes  # noqa: E402  (registry: quantisation schemes)
