@@ -89,7 +89,7 @@ class BF16Core(Core):
 def test_diffusers_adapter_routes_and_restores(monkeypatch):
     monkeypatch.setattr(
         "flash_rt.structures.adapters.diffusers_attention."
-        "bind_dense_attention",
+        "bind_dense_attention_best",
         lambda captures: Core(),
     )
     root = Root()
@@ -113,7 +113,7 @@ def test_diffusers_adapter_uses_host_instead_of_hidden_dtype_cast(monkeypatch):
     core = BF16Core()
     monkeypatch.setattr(
         "flash_rt.structures.adapters.diffusers_attention."
-        "bind_dense_attention",
+        "bind_dense_attention_best",
         lambda captures: core,
     )
     root = Root()
@@ -135,7 +135,7 @@ def test_diffusers_adapter_matches_capability_not_processor_class_name(
 
     monkeypatch.setattr(
         "flash_rt.structures.adapters.diffusers_attention."
-        "bind_dense_attention",
+        "bind_dense_attention_best",
         lambda captures: Core(),
     )
     root = Root()
@@ -150,7 +150,7 @@ def test_diffusers_adapter_matches_capability_not_processor_class_name(
 def test_diffusers_adapter_refuses_a_live_mask(monkeypatch):
     monkeypatch.setattr(
         "flash_rt.structures.adapters.diffusers_attention."
-        "bind_dense_attention",
+        "bind_dense_attention_best",
         lambda captures: Core(),
     )
     root = Root()

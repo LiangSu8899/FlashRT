@@ -17,6 +17,13 @@ def bind_dense_attention_best(captures):
     allocation-free masked MHA (BF16/FP16, batch-of-one sites), and
     last the FP8 FA4 form. All are judged by the same downstream
     gates; a device none serves keeps the host's own attention.
+
+    The winner carries the trail: ``_frt_variant`` names the bound
+    form and ``_frt_variant_trail`` holds what each preferred variant
+    said when it stepped aside. Without that, a host whose preferred
+    package is merely absent looks identical to one where it was
+    weighed and rejected — the two need different fixes, and only the
+    trail tells them apart.
     """
     # a package can refuse a device three ways: its arch declaration
     # (ValueError from the loader's metadata check), the kernels
@@ -45,11 +52,20 @@ def bind_dense_attention_best(captures):
         try:
             core = binder(captures)
         except (ValueError, RuntimeError, OSError) as refusal:
-            refusals.append(f"{name}: {str(refusal)[:80]}")
+            refusals.append(f"{name}: {str(refusal)[:120]}")
             continue
         if core is not None:
+            # the seam is served, but which variant served it and what
+            # the preferred ones said are both load-bearing facts: a
+            # host silently falling back to a lower-precision or slower
+            # form is exactly the failure the ordering exists to make
+            # visible, and it is invisible unless the superseded
+            # refusals travel with the bound module
+            core._frt_variant = name
+            core._frt_variant_trail = tuple(refusals)
             return core
         declined += 1
+        refusals.append(f"{name}: declined the captured shape form")
     if declined:
         # at least one variant executed its qualification and declined
         # the shape form — a site-level refusal the adapter records,

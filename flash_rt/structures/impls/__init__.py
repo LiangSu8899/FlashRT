@@ -68,6 +68,24 @@ def _cuda_arch_supports_device(
     return device_cc[0] == target[0] and device_cc[1] >= target[1]
 
 
+class KernelUnavailable(ValueError):
+    """This host cannot supply this kernel package.
+
+    One exception type for every way the distribution layer can come up
+    empty — the repository is not published, not staged in an offline
+    cache, has no build variant for the host, or will not import here.
+    They differ only in what an operator has to go fix, which is what
+    the message carries; to a caller they are the same event, and the
+    same one the arch declaration produces: *not here*.
+
+    A ``ValueError`` subclass on purpose. Every layer that already
+    treats a refusal as an outcome to record rather than an error to
+    propagate — the variant families, the recipe engine's per-lever
+    build — catches ``ValueError``, and an absent package must not be
+    the one refusal that aborts a run instead of being written down.
+    """
+
+
 def _check_arch(repo: str, module) -> None:
     archs = _declared_archs(module)
     if archs is None:
@@ -80,7 +98,7 @@ def _check_arch(repo: str, module) -> None:
     want = f"{cc[0]}.{cc[1]}"
     if any(_cuda_arch_supports_device(a, cc) for a in archs):
         return
-    raise ValueError(
+    raise KernelUnavailable(
         f"refused: kernel package {repo!r} declares archs {archs}, "
         f"device is sm {want}")
 
@@ -98,7 +116,12 @@ def hub_kernel(repo: str, version: str):
 
     key = (repo, version)
     if key not in _LOADED:
-        _LOADED[key] = get_kernel(repo, version=version)
+        try:
+            _LOADED[key] = get_kernel(repo, version=version)
+        except (OSError, RuntimeError, ValueError) as unavailable:
+            raise KernelUnavailable(
+                f"kernel package {repo!r} ({version}) is unavailable on "
+                f"this host: {unavailable}") from unavailable
     module = _LOADED[key]
     _check_arch(repo, module)
     return module

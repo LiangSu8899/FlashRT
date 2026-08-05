@@ -192,6 +192,7 @@ class DiffusersAttentionAdapter:
 
         routes = []
         observed = {}
+        variants = {}
         for (path, module, original), rows in zip(sites, captures):
             if not rows:
                 refused.append((
@@ -218,6 +219,11 @@ class DiffusersAttentionAdapter:
             routed = _FlashRTDenseAttnProcessor(core, original)
             routes.append((module, original, routed))
             observed[f"{path}.processor::fa2_core"] = core
+            variants[f"{path}.processor"] = {
+                "bound": getattr(core, "_frt_variant", "fa2"),
+                "superseded": list(
+                    getattr(core, "_frt_variant_trail", ())),
+            }
         if not routes:
             return {}, None, {"refused": refused}
 
@@ -238,4 +244,5 @@ class DiffusersAttentionAdapter:
             "observed": observed,
             "toggle": (enable, disable),
             "refused": refused,
+            "attention_variants": variants,
         }

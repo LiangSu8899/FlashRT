@@ -812,6 +812,10 @@ def auto_swaps(
                 continue
             plan.swaps.update(att_swaps)
             plan.observed.update(extras.get("observed", {}))
+            if extras.get("attention_variants"):
+                plan.notes.setdefault(
+                    "attention_core_variants", {}).update(
+                        extras["attention_variants"])
             plan.revert.extend(extras.get("revert", ()))
             if extras.get("toggle") is not None:
                 plan.toggles.append(extras["toggle"])
