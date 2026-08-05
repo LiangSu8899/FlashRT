@@ -39,7 +39,7 @@ from typing import Mapping, Sequence
 
 __all__ = ["PointStat", "Decision", "QuantScheme", "Fp8Static",
            "NoQuant", "Bf16Structural", "W8A16Decode", "W4A16Decode",
-           "Nvfp4Awq",
+           "Nvfp4Awq", "Nvfp4Balance",
            "register", "get", "names", "resolve_auto", "validate_request"]
 
 #: statistics the collector can currently execute. Granularities other
@@ -280,6 +280,48 @@ class Nvfp4Awq(QuantScheme):
                         formats=formats, params=params)
 
 
+class Nvfp4Balance(QuantScheme):
+    """NVFP4 W4A4 with activation-only channel balance at every GEMM.
+
+    The recorded W4 chain recipe as a scheme decision: projection and
+    FFN seams (``qkv_pack`` / ``vision_ffn`` / ``linear_proj``) route to
+    their ``nvfp4_balance`` impl variants — weights folded with the
+    balance fitted on calibrated per-channel amax, then packed to NVFP4;
+    activations quantized dynamically per call with per-block scale
+    factors. The channel statistic feeds the balance, never a scale, so
+    nothing static exists to drift across a schedule. Everything else
+    stays at host precision: this is the half-weight-bytes showcase
+    band, not a whole-host replacement.
+    """
+
+    name = "nvfp4_balance"
+
+    def __init__(self, alpha: float = 0.5,
+                 clamp: tuple[float, float] = (0.25, 4.0)) -> None:
+        self.alpha = float(alpha)
+        self.clamp = (float(clamp[0]), float(clamp[1]))
+
+    def statistics(self, points: Sequence) -> dict[str, PointStat]:
+        return {f"{p.path}|{p.name}": PointStat("amax", "channel")
+                for p in points}
+
+    def decide(self, report: Mapping[str, Mapping[str, float]]) -> Decision:
+        formats, params, keep = {}, {}, []
+        payload = {"alpha": self.alpha, "clamp": list(self.clamp)}
+        for seam_path, pts in report.items():
+            if getattr(pts, "structure", None) in (
+                    "qkv_pack", "vision_ffn", "linear_proj"):
+                formats[seam_path] = "nvfp4_balance"
+                params[seam_path] = dict(payload)
+            else:
+                keep.append(seam_path)
+        return Decision(keep_host=tuple(keep),
+                        reasons={p: "nvfp4_balance binds projection and "
+                                    "FFN GEMM seams only"
+                                 for p in keep},
+                        formats=formats, params=params)
+
+
 class NoQuant(QuantScheme):
     """Quantisation off: every quantised seam stays at host precision.
 
@@ -433,3 +475,4 @@ register("w4a4_decode_release", W4A4Decode(release_host_weights=True))
 register("none", NoQuant())
 register("bf16_structural", Bf16Structural())
 register("nvfp4_awq", Nvfp4Awq())
+register("nvfp4_balance", Nvfp4Balance())

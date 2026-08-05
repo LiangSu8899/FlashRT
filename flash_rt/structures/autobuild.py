@@ -1064,7 +1064,10 @@ def _bind_auto(model, seam, cap, plan, act_scales, negotiate_fp8,
         return custom(model, seam, cap, points=points, fmt=fmt,
                       fmt_params=fmt_params)
 
-    if fmt and not (seam.structure == "qkv_pack" and fmt == "bf16_pack") \
+    if fmt and not (seam.structure == "qkv_pack"
+                    and fmt in ("bf16_pack", "nvfp4_balance")) \
+            and not (seam.structure == "vision_ffn"
+                     and fmt == "nvfp4_balance") \
             and seam.structure not in ("decoder_ffn", "linear_proj"):
         raise ValueError(f"scheme routed {seam.structure} to format "
                          f"{fmt!r}, which has no impl variant here")
@@ -1104,6 +1107,18 @@ def _bind_auto(model, seam, cap, plan, act_scales, negotiate_fp8,
 
     if seam.structure == "vision_ffn":
         fc2 = (seam.fc_attrs or ("fc1", "fc2"))[1]
+        if fmt == "nvfp4_balance":
+            from .impls.vision_ffn import nvfp4_balance as vis_w4
+            chan_in = points.channel_amax(seam.path, "x_after_norm")
+            chan_hid = points.channel_amax(
+                seam.path + "." + fc2, "hidden_after_act")
+            if chan_in is None or chan_hid is None:
+                return None
+            return vis_w4.bind_mlp_seam(
+                seam_weights(model, seam), channel_in=chan_in,
+                channel_hidden=chan_hid,
+                original=_resolve(model, seam.path),
+                **dict(fmt_params or {}))
         in_s = scale("x_after_norm")
         hid_s = scale("hidden_after_act", seam.path + "." + fc2)
         if in_s is None or hid_s is None:
@@ -1127,6 +1142,15 @@ def _bind_auto(model, seam, cap, plan, act_scales, negotiate_fp8,
                          else points.seen_dtypes(seam.path, "x")))
 
     if seam.structure == "linear_proj":
+        if fmt == "nvfp4_balance":
+            from .impls.linear_proj import nvfp4_balance as proj_w4
+            chan = points.channel_amax(seam.path, "x")
+            if chan is None:
+                return None
+            return proj_w4.bind_proj_seam(
+                seam_weights(model, seam), channel_amax=chan,
+                original=_resolve(model, seam.path),
+                **dict(fmt_params or {}))
         if fmt == "w8a16_static":
             # weight-only decode band: no calibration scale to look up,
             # and the weight dict is already the kernel's [N, K] layout
@@ -1182,6 +1206,23 @@ def _bind_auto(model, seam, cap, plan, act_scales, negotiate_fp8,
             parts = pack_impl.bind_qkv_pack(mods, rows=max(rows_seen))
             return {seam.path + "." + attr: mod
                     for attr, mod in zip(seam.pack_attrs, parts)}
+        if fmt == "nvfp4_balance":
+            if seam.variant.get("bind") == "module":
+                raise ValueError(
+                    "qkv_pack nvfp4_balance supports leaf binding only")
+            from .impls.qkv_pack import nvfp4_balance as pack_w4
+            first = (seam.pack_attrs or ("q_proj",))[0]
+            chan = points.channel_amax(seam.path + "." + first, "x")
+            rows_seen = points.row_profile(seam.path + "." + first, "x")
+            if chan is None or not rows_seen:
+                return None
+            block = _resolve(model, seam.path)
+            mods = [getattr(block, a) for a in seam.pack_attrs]
+            parts = pack_w4.bind_qkv_pack(
+                mods, channel_amax=chan, rows=max(rows_seen),
+                **dict(fmt_params or {}))
+            return {seam.path + "." + a: m
+                    for a, m in zip(seam.pack_attrs, parts)}
         from .impls.qkv_pack import bind_attn_block, bind_qkv_pack
         first = (seam.pack_attrs or ("q_proj",))[0]
         amax = None if points is None else points.amax(
