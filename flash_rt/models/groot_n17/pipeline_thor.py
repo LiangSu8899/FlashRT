@@ -193,13 +193,20 @@ def qwen3vl_vit_forward(gemm, fvk, bufs, weights, dims,
         slots = attn.get_slot_ptrs("vit", li)
         Q_ptr, K_ptr, V_ptr, O_ptr = slots["Q"], slots["K"], slots["V"], slots["O"]
 
-        # ── Pre-attn LayerNorm ──────────────────────────────────────────
-        _ln(h_ptr, int(weights["norm1_w"][li]), int(weights["norm1_b"][li]),
-            xn_ptr, S)
+        # ── Pre-attn LayerNorm (+ fused FP8 quantize on the vec tier) ───
+        if vec and use_fp8:
+            fvk.layer_norm_fp8_static_fp16_vec(
+                h_ptr, int(weights["norm1_w"][li]),
+                int(weights["norm1_b"][li]), xn_fp8_ptr,
+                int(scales_dev["act_qkv"][li]), S, D, 1e-6, int(stream))
+        else:
+            _ln(h_ptr, int(weights["norm1_w"][li]),
+                int(weights["norm1_b"][li]), xn_ptr, S)
 
         # ── Q/K/V projections (single shared act-scale on xn for FP8) ───
         if use_fp8:
-            _q8(xn_ptr, xn_fp8_ptr, int(scales_dev["act_qkv"][li]), S * D)
+            if not vec:
+                _q8(xn_ptr, xn_fp8_ptr, int(scales_dev["act_qkv"][li]), S * D)
             gemm.fp8_nn_bias(
                 xn_fp8_ptr, int(weights["q_w"][li]), Q_ptr, int(weights["q_b"][li]),
                 S, D, D, float(weights["alpha_q"][li]), int(stream),
@@ -254,13 +261,20 @@ def qwen3vl_vit_forward(gemm, fvk, bufs, weights, dims,
         # ── Residual 1 ─────────────────────────────────────────────────
         fvk.residual_add_fp16(h_ptr, o_proj_out, S * D, int(stream))
 
-        # ── Pre-FF LayerNorm ───────────────────────────────────────────
-        _ln(h_ptr, int(weights["norm2_w"][li]), int(weights["norm2_b"][li]),
-            xn_ptr, S)
+        # ── Pre-FF LayerNorm (+ fused FP8 quantize on the vec tier) ────
+        if vec and use_fp8:
+            fvk.layer_norm_fp8_static_fp16_vec(
+                h_ptr, int(weights["norm2_w"][li]),
+                int(weights["norm2_b"][li]), xn_fp8_ptr,
+                int(scales_dev["act_fc1"][li]), S, D, 1e-6, int(stream))
+        else:
+            _ln(h_ptr, int(weights["norm2_w"][li]),
+                int(weights["norm2_b"][li]), xn_ptr, S)
 
         # ── FF: D → FF (GELU) → D ──────────────────────────────────────
         if use_fp8:
-            _q8(xn_ptr, xn_fp8_ptr, int(scales_dev["act_fc1"][li]), S * D)
+            if not vec:
+                _q8(xn_ptr, xn_fp8_ptr, int(scales_dev["act_fc1"][li]), S * D)
             gemm.fp8_nn_gelu_bias(
                 xn_fp8_ptr, int(weights["fc1_w"][li]), fc1_out_ptr,
                 int(weights["fc1_b"][li]),
@@ -739,8 +753,13 @@ def vl_self_attn_forward(gemm, fvk, bufs, weights, dims,
         slots = attn.get_slot_ptrs("vl_self_attn", li)
         Q_ptr, K_ptr, V_ptr, O_ptr = slots["Q"], slots["K"], slots["V"], slots["O"]
 
-        # ── Pre-attn LayerNorm ──────────────────────────────────────────
-        if vec:
+        # ── Pre-attn LayerNorm (+ fused FP8 quantize on the vec tier) ───
+        if vec and use_fp8:
+            fvk.layer_norm_fp8_static_fp16_vec(
+                h_ptr, int(weights["norm1_w"][li]), int(weights["norm1_b"][li]),
+                xn_fp8_ptr, int(scales_dev["act_qkv"][li]), T, D, 1e-5,
+                int(stream))
+        elif vec:
             fvk.layer_norm_fp16_vec(
                 h_ptr, int(weights["norm1_w"][li]), int(weights["norm1_b"][li]),
                 xn_ptr, T, D, 1e-5, int(stream))
@@ -752,11 +771,7 @@ def vl_self_attn_forward(gemm, fvk, bufs, weights, dims,
 
         # ── Q / K / V projections (single shared act scale for FP8) ──────
         if use_fp8:
-            if vec:
-                fvk.quantize_fp8_static_fp16_vec(
-                    xn_ptr, xn_fp8_ptr, int(scales_dev["act_qkv"][li]),
-                    T * D, int(stream))
-            else:
+            if not vec:
                 fvk.quantize_fp8_static_fp16(
                     xn_ptr, xn_fp8_ptr, int(scales_dev["act_qkv"][li]),
                     T * D, int(stream),
@@ -815,8 +830,13 @@ def vl_self_attn_forward(gemm, fvk, bufs, weights, dims,
         # ── Residual 1: h += o_proj_out ────────────────────────────────
         fvk.residual_add_fp16(h_ptr, o_proj_out, T * D, int(stream))
 
-        # ── Pre-FF LayerNorm ───────────────────────────────────────────
-        if vec:
+        # ── Pre-FF LayerNorm (+ fused FP8 quantize on the vec tier) ────
+        if vec and use_fp8:
+            fvk.layer_norm_fp8_static_fp16_vec(
+                h_ptr, int(weights["norm3_w"][li]), int(weights["norm3_b"][li]),
+                xn_fp8_ptr, int(scales_dev["act_fc1"][li]), T, D, 1e-5,
+                int(stream))
+        elif vec:
             fvk.layer_norm_fp16_vec(
                 h_ptr, int(weights["norm3_w"][li]), int(weights["norm3_b"][li]),
                 xn_ptr, T, D, 1e-5, int(stream))
@@ -828,11 +848,7 @@ def vl_self_attn_forward(gemm, fvk, bufs, weights, dims,
 
         # ── FF: 2048 → 8192 (GELU) → 2048 ──────────────────────────────
         if use_fp8:
-            if vec:
-                fvk.quantize_fp8_static_fp16_vec(
-                    xn_ptr, xn_fp8_ptr, int(scales_dev["act_fc1"][li]),
-                    T * D, int(stream))
-            else:
+            if not vec:
                 fvk.quantize_fp8_static_fp16(
                     xn_ptr, xn_fp8_ptr, int(scales_dev["act_fc1"][li]),
                     T * D, int(stream),

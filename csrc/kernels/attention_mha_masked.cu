@@ -38,7 +38,12 @@ __device__ __forceinline__ __nv_bfloat16 from_f<__nv_bfloat16>(float v) { return
 
 // Row-wise softmax over the first ``cols_valid`` of each ``cols_pad``-wide
 // row. Padding columns are neither read nor written.
-template <typename T>
+//
+// ITERS is the per-thread register tile, dispatched from the actual valid
+// column count: a 41-key DiT self-attention row needs 2 registers, not the
+// 32 a worst-case 1024-key row would. Sizing it per call keeps the loops
+// fully unrolled without paying occupancy for columns that do not exist.
+template <typename T, int ITERS>
 __global__ void softmax_masked_kernel(T* data, int rows, int cols_pad,
                                       int cols_valid) {
     const int lane = threadIdx.x % SMM_WARP;
@@ -47,10 +52,10 @@ __global__ void softmax_masked_kernel(T* data, int rows, int cols_pad,
 
     T* src = data + (long)row * cols_pad;
 
-    float reg[SMM_ITERS];
+    float reg[ITERS];
     float mx = -1e30f;
     #pragma unroll
-    for (int it = 0; it < SMM_ITERS; ++it) {
+    for (int it = 0; it < ITERS; ++it) {
         const int c = it * SMM_WARP + lane;
         if (c < cols_valid) {
             reg[it] = to_f<T>(src[c]);
@@ -65,7 +70,7 @@ __global__ void softmax_masked_kernel(T* data, int rows, int cols_pad,
 
     float sum = 0.f;
     #pragma unroll
-    for (int it = 0; it < SMM_ITERS; ++it) {
+    for (int it = 0; it < ITERS; ++it) {
         const int c = it * SMM_WARP + lane;
         if (c < cols_valid) {
             reg[it] = __expf(reg[it] - mx);
@@ -78,10 +83,32 @@ __global__ void softmax_masked_kernel(T* data, int rows, int cols_pad,
     const float inv = 1.0f / sum;
 
     #pragma unroll
-    for (int it = 0; it < SMM_ITERS; ++it) {
+    for (int it = 0; it < ITERS; ++it) {
         const int c = it * SMM_WARP + lane;
         if (c < cols_valid)
             src[c] = from_f<T>(reg[it] * inv);
+    }
+}
+
+template <typename T>
+inline void launch_softmax_masked(T* data, int rows, int cols_pad,
+                                  int cols_valid, cudaStream_t stream) {
+    const int iters = (cols_valid + SMM_WARP - 1) / SMM_WARP;
+    if (iters <= 2) {
+        softmax_masked_kernel<T, 2><<<rows, SMM_WARP, 0, stream>>>(
+            data, rows, cols_pad, cols_valid);
+    } else if (iters <= 4) {
+        softmax_masked_kernel<T, 4><<<rows, SMM_WARP, 0, stream>>>(
+            data, rows, cols_pad, cols_valid);
+    } else if (iters <= 8) {
+        softmax_masked_kernel<T, 8><<<rows, SMM_WARP, 0, stream>>>(
+            data, rows, cols_pad, cols_valid);
+    } else if (iters <= 16) {
+        softmax_masked_kernel<T, 16><<<rows, SMM_WARP, 0, stream>>>(
+            data, rows, cols_pad, cols_valid);
+    } else {
+        softmax_masked_kernel<T, SMM_ITERS><<<rows, SMM_WARP, 0, stream>>>(
+            data, rows, cols_pad, cols_valid);
     }
 }
 
@@ -111,8 +138,7 @@ void attention_mha_fp16_masked(
         NH,
         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
 
-    softmax_masked_kernel<__half><<<NH * S_q, SMM_WARP, 0, stream>>>(
-        logits, NH * S_q, S_kv_pad, S_kv);
+    launch_softmax_masked<__half>(logits, NH * S_q, S_kv_pad, S_kv, stream);
 
     cublasGemmStridedBatchedEx(handle,
         CUBLAS_OP_N, CUBLAS_OP_N,
@@ -154,8 +180,8 @@ void attention_mha_bf16_masked(
         NH,
         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
 
-    softmax_masked_kernel<__nv_bfloat16><<<NH * S_q, SMM_WARP, 0, stream>>>(
-        logits, NH * S_q, kv_stride, S_kv);
+    launch_softmax_masked<__nv_bfloat16>(logits, NH * S_q, kv_stride, S_kv,
+                                         stream);
 
     cublasGemmStridedBatchedEx(handle,
         CUBLAS_OP_N, CUBLAS_OP_N,

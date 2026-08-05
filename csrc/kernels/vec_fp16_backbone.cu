@@ -175,6 +175,65 @@ __global__ void layer_norm_fp16_vec_kernel(
     }
 }
 
+// ── LayerNorm (gamma/beta) fused with a static FP8 quantize ───────────────
+// The norm output feeds only an FP8 GEMM, so emitting fp8 directly removes
+// the fp16 intermediate's write and read-back (and one kernel launch).
+__global__ void layer_norm_fp8_static_fp16_vec_kernel(
+    const __half* __restrict__ x, const __half* __restrict__ w,
+    const __half* __restrict__ b, __nv_fp8_e4m3* __restrict__ out,
+    const float* __restrict__ descale_ptr, int dim, float eps) {
+    const int row = blockIdx.x;
+    const int n4 = dim >> 3;
+    const int4* x4 = reinterpret_cast<const int4*>(x + (long)row * dim);
+    const int4* w4 = reinterpret_cast<const int4*>(w);
+    const int4* b4 = reinterpret_cast<const int4*>(b);
+    uint2* o2 = reinterpret_cast<uint2*>(out + (long)row * dim);
+    __shared__ float sh[32];
+
+    float s = 0.f;
+    for (int i = threadIdx.x; i < n4; i += blockDim.x) {
+        const int4 raw = x4[i];
+        const __half* hh = reinterpret_cast<const __half*>(&raw);
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) s += __half2float(hh[j]);
+    }
+    const float mean = block_sum_v(s, sh) / dim;
+
+    float var = 0.f;
+    for (int i = threadIdx.x; i < n4; i += blockDim.x) {
+        const int4 raw = x4[i];
+        const __half* hh = reinterpret_cast<const __half*>(&raw);
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const float d = __half2float(hh[j]) - mean;
+            var += d * d;
+        }
+    }
+    const float inv_std = rsqrtf(block_sum_v(var, sh) / dim + eps);
+    const float inv_scale = 1.0f / fmaxf(*descale_ptr, 1e-12f);
+
+    for (int i = threadIdx.x; i < n4; i += blockDim.x) {
+        const int4 raw = x4[i];
+        const int4 wr = w4[i];
+        const int4 br = b4[i];
+        const __half* hh = reinterpret_cast<const __half*>(&raw);
+        const __half* wh = reinterpret_cast<const __half*>(&wr);
+        const __half* bh = reinterpret_cast<const __half*>(&br);
+        uint2 res;
+        __nv_fp8_e4m3* rp = reinterpret_cast<__nv_fp8_e4m3*>(&res);
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            // fp16 rounding of the norm output keeps this identical to the
+            // two-step (fp16 LayerNorm, then static quantize) chain.
+            const float v = __half2float(__float2half(
+                (__half2float(hh[j]) - mean) * inv_std * __half2float(wh[j]) +
+                __half2float(bh[j])));
+            rp[j] = __nv_fp8_e4m3(fminf(fmaxf(v * inv_scale, -448.f), 448.f));
+        }
+        o2[i] = res;
+    }
+}
+
 // ── Split-half RoPE, 8 pairs per thread ───────────────────────────────────
 __global__ void rope_rotate_half_fp16_vec_kernel(
     __half* __restrict__ x, const __half* __restrict__ cos_t,
@@ -293,6 +352,21 @@ int layer_norm_fp16_vec(const __half* x, const __half* w, const __half* b,
         (reinterpret_cast<uintptr_t>(out) & 15)) return -1;
     layer_norm_fp16_vec_kernel<<<rows, 256, 0, stream>>>(
         x, w, b, out, dim, eps);
+    const cudaError_t e = cudaGetLastError();
+    return (e == cudaSuccess) ? 0 : -static_cast<int>(e);
+}
+
+int layer_norm_fp8_static_fp16_vec(const __half* x, const __half* w,
+                                   const __half* b, __nv_fp8_e4m3* out,
+                                   const float* d_scale, int rows, int dim,
+                                   float eps, cudaStream_t stream) {
+    if (dim % 8 != 0) return -1;
+    if ((reinterpret_cast<uintptr_t>(x) & 15) ||
+        (reinterpret_cast<uintptr_t>(w) & 15) ||
+        (reinterpret_cast<uintptr_t>(b) & 15) ||
+        (reinterpret_cast<uintptr_t>(out) & 7)) return -1;
+    layer_norm_fp8_static_fp16_vec_kernel<<<rows, 256, 0, stream>>>(
+        x, w, b, out, d_scale, dim, eps);
     const cudaError_t e = cudaGetLastError();
     return (e == cudaSuccess) ? 0 : -static_cast<int>(e);
 }

@@ -490,6 +490,9 @@ int rms_norm_fp16_vec(const __half*, const __half*, __half*, int, int, float,
                       cudaStream_t);
 int layer_norm_fp16_vec(const __half*, const __half*, const __half*, __half*,
                         int, int, float, cudaStream_t);
+int layer_norm_fp8_static_fp16_vec(const __half*, const __half*, const __half*,
+                                   __nv_fp8_e4m3*, const float*, int, int,
+                                   float, cudaStream_t);
 int rope_rotate_half_fp16_vec(__half*, const __half*, const __half*, int, int,
                               int, cudaStream_t);
 int quantize_fp8_static_fp16_vec(const __half*, __nv_fp8_e4m3*, const float*,
@@ -2412,6 +2415,21 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     }, py::arg("x"), py::arg("w"), py::arg("b"), py::arg("out"),
        py::arg("rows"), py::arg("dim"), py::arg("eps") = 1e-6f,
        py::arg("stream") = 0);
+
+    m.def("layer_norm_fp8_static_fp16_vec",
+          [](uintptr_t x, uintptr_t w, uintptr_t b, uintptr_t out,
+             uintptr_t d_scale, int rows, int dim, float eps,
+             uintptr_t stream) -> int {
+        return layer_norm_fp8_static_fp16_vec(
+            reinterpret_cast<const __half*>(x),
+            reinterpret_cast<const __half*>(w),
+            reinterpret_cast<const __half*>(b),
+            reinterpret_cast<__nv_fp8_e4m3*>(out),
+            reinterpret_cast<const float*>(d_scale),
+            rows, dim, eps, to_stream(stream));
+    }, py::arg("x"), py::arg("w"), py::arg("b"), py::arg("out"),
+       py::arg("d_scale"), py::arg("rows"), py::arg("dim"),
+       py::arg("eps") = 1e-6f, py::arg("stream") = 0);
 
     m.def("rope_rotate_half_fp16_vec", [](uintptr_t x, uintptr_t cos_table,
                                           uintptr_t sin_table, int S, int NH,
