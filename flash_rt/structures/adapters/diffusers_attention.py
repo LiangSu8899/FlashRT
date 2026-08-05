@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from ..impls.attention_core import bind_dense_attention
+from ..impls.attention_core import bind_dense_attention_best
 
 
 def _compatible_site(module, processor) -> tuple[bool, str]:
@@ -207,7 +207,7 @@ class DiffusersAttentionAdapter:
                     "the unmasked dense executable form",
                 ))
                 continue
-            core = bind_dense_attention(rows)
+            core = bind_dense_attention_best(rows)
             if core is None:
                 refused.append((
                     f"{path}.processor",

@@ -12,7 +12,7 @@ import inspect
 
 import torch
 
-from ..impls.attention_core import bind_dense_attention
+from ..impls.attention_core import bind_dense_attention_best
 
 
 def _compatible_site(module, processor) -> tuple[bool, str]:
@@ -201,7 +201,7 @@ class DiffusersRotaryAttentionAdapter:
                     "unmasked executable form",
                 ))
                 continue
-            core = bind_dense_attention(rows)
+            core = bind_dense_attention_best(rows)
             if core is None:
                 refused.append((
                     f"{path}.processor",
