@@ -72,10 +72,11 @@ def main() -> None:
 
     fe = Frontend(args.ckpt, num_views=args.views,
                   embodiment_tag=args.embodiment, **kw)
+    fe.set_prompt(aux=aux, prompt="benchmark")
     if args.calib_aux:
+        # Multi-sample act-scale refinement (requires set_prompt first).
         fe.calibrate(torch.load(args.calib_aux, weights_only=False,
                                 map_location="cpu"))
-    fe.set_prompt(aux=aux, prompt="benchmark")
 
     state_normed = torch.zeros(1, 1, 132, dtype=torch.float32)
     noise = aux["initial_noise"].to("cuda").bfloat16().contiguous()
