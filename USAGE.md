@@ -547,28 +547,35 @@ fe = flash_rt.load_model(
 ```
 
 Reference (Jetson AGX Thor, JetPack 7.2, MAXN; wall-clock per-frame
-image→action e2e over a real 2-view fixture, `T=40`, 4 denoising steps,
-batch 1; medians over 20 iterations after warmup, run as one
-same-session A/B/A against the FP8 default): **29.9 ms** (vision
-backbone graph 14.2 ms + action graph 15.6 ms) vs **51.6 / 50.2 ms**
-FP8 — **1.70×**, 33 Hz — with action cosine 0.99994 vs the FP8 tier on
-that fixture and graph-replay determinism exactly 1.0. Without the FA4
-runtime deps the tier still runs (fmha/cublas fallback) at ≈ 35 ms.
-(Absolute Thor latencies drift ~1 ms at day scale; the same-session
-speedup is the stable metric.)
+image→action e2e, 4 denoising steps, batch 1, medians over 20
+iterations after 5 warmup iterations, run as one same-session A/B/A
+against the FP8 default):
+
+| Checkpoint / cameras | FP8 | NVFP4 + FA4 | Speedup |
+|---|---:|---:|---:|
+| LIBERO fine-tune (`libero_10`), 1 camera | 36.8 ms (27 Hz) | **23.7 ms (42 Hz)** | 1.56× |
+| Base `GR00T-N1.7-3B`, 2 cameras, `T=40` | 50.2 ms (20 Hz) | **29.9 ms (33 Hz)** | 1.70× |
+
+Action cosine against the FP8 tier is 1.000000 on the LIBERO fixture
+and 0.99994 on the 2-view base-checkpoint fixture; graph replays are
+bit-identical on both tiers. Without the FA4 runtime deps the tier
+still runs (fmha/cuBLAS fallback), roughly 5 ms slower on the 2-view
+shape. (Absolute Thor latencies drift ~1 ms at day scale; the
+same-session speedup is the stable metric.)
 
 Reproduce with:
 
 ```bash
 python benchmarks/groot_n17_thor_latency.py \
     --ckpt <n17-checkpoint-dir> --aux <aux-fixture.pt> \
-    --tier fp4 --views 2 --warmup 5 --iters 20
+    --tier fp4 --views 1 --embodiment libero_sim --warmup 5 --iters 20
 ```
 
-Across an 8-sample reference set the tier holds action cosine ≥ 0.9993
-against the FP8 tier on 7 of 8 samples, with a worst sample of 0.9976.
-For accuracy-critical deployments, validate on the target task rather
-than on cosine alone, or run the FP8 tier.
+Across an 8-sample set captured from the base checkpoint the tier holds
+action cosine ≥ 0.9993 against the FP8 tier on 7 of 8 samples, with a
+worst sample of 0.9976; on the LIBERO fine-tune it matches the FP8 tier
+to 1.000000. For accuracy-critical deployments, validate on the target
+task rather than on cosine alone, or run the FP8 tier.
 
 ### GROOT N1.7 RTX
 

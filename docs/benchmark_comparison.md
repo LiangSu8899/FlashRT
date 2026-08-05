@@ -76,28 +76,49 @@ after 5 warmup iterations):
 | TensorRT optimized + FP8 | 14.1 ms | 21.1 ms | ~44 ms | 22.6 Hz |
 | TensorRT optimized + mixed NVFP4 | 13.6 ms | 17.2 ms | ~40 ms | 25.1 Hz |
 
-FlashRT rows below use the same per-frame definition (vision backbone
-then action head, wall clock, medians over 20 iterations after warmup)
-but a different checkpoint and camera count, so they are **not** a
-like-for-like comparison with the table above — read the harness column.
+FlashRT on the matched harness — the same `GR00T-N1.7` LIBERO
+fine-tune on `libero_10`, one camera, 4 denoising steps, batch 1,
+medians over 20 iterations after 5 warmup iterations, wall-clock
+vision-backbone then action-head split:
 
-| FlashRT tier | Checkpoint / harness | Backbone | Action head | E2E | Frequency |
-|---|---|---:|---:|---:|---:|
-| FP8 (default) | `GR00T-N1.7-3B`, 2-view real fixture, T=40, 4 steps | 23.5 ms | 26.5 ms | **50.2 ms** | 20 Hz |
-| NVFP4 + FA4 (`use_fp4=True`) | same fixture and steps | 14.2 ms | 15.6 ms | **29.9 ms** | 33 Hz |
+| FlashRT tier | Backbone | Action head | E2E | Frequency |
+|---|---:|---:|---:|---:|
+| FP8 (default) | 11.0 ms | 25.8 ms | **36.8 ms** | 27.2 Hz |
+| NVFP4 + FA4 (`use_fp4=True`) | 8.4 ms | 15.2 ms | **23.7 ms** | 42.3 Hz |
 
-Both rows come from one same-session A/B/A run on Jetson AGX Thor
-(JetPack 7.2, MAXN) — FP8 51.6 ms, NVFP4 29.9 ms, FP8 50.2 ms, so the
-tier is 1.70x on that run. The NVFP4 tier's action cosine against the
-FP8 tier on that fixture is 0.99994 and its CUDA-graph replays are
-bit-identical.
+Measured as one same-session A/B/A on Jetson AGX Thor (JetPack 7.2,
+MAXN): FP8 36.76 ms, NVFP4 23.65 ms, FP8 36.85 ms. The fixture is a
+real `libero_10` observation captured through the official
+preprocessing path; the NVFP4 tier's action cosine against the FP8
+tier on it is 1.000000 and CUDA-graph replays are bit-identical on
+both tiers.
+
+The same tiers on the base `GR00T-N1.7-3B` checkpoint with a 2-view
+fixture (`T=40`, same protocol), for reference:
+
+| FlashRT tier | Backbone | Action head | E2E | Frequency |
+|---|---:|---:|---:|---:|
+| FP8 (default) | 23.5 ms | 26.5 ms | **50.2 ms** | 20 Hz |
+| NVFP4 + FA4 (`use_fp4=True`) | 14.2 ms | 15.6 ms | **29.9 ms** | 33 Hz |
+
+Also one same-session A/B/A (FP8 51.6 / NVFP4 29.9 / FP8 50.2 ms);
+action cosine against the FP8 tier on that fixture is 0.99994.
 Reproduce with:
 
 ```bash
+# LIBERO fine-tune, one camera (matched harness)
 python benchmarks/groot_n17_thor_latency.py \
-    --ckpt <n17-checkpoint-dir> --aux <aux-fixture.pt> \
+    --ckpt <n17-libero-checkpoint-dir> --aux <1-camera-aux-fixture.pt> \
+    --tier fp4 --views 1 --embodiment libero_sim --warmup 5 --iters 20
+
+# base checkpoint, two cameras
+python benchmarks/groot_n17_thor_latency.py \
+    --ckpt <n17-checkpoint-dir> --aux <2-camera-aux-fixture.pt> \
     --tier fp4 --views 2 --warmup 5 --iters 20
 ```
+
+Capture a camera-count-matched fixture with
+`tests/_helpers/groot_n17/capture_aux_multi.py --views N`.
 
 ### N1.7 SM89 Steady-State Hot Replay Profile
 
@@ -143,28 +164,49 @@ after 5 warmup iterations):
 | TensorRT optimized + FP8 | 14.1 ms | 21.1 ms | ~44 ms | 22.6 Hz |
 | TensorRT optimized + mixed NVFP4 | 13.6 ms | 17.2 ms | ~40 ms | 25.1 Hz |
 
-FlashRT rows below use the same per-frame definition (vision backbone
-then action head, wall clock, medians over 20 iterations after warmup)
-but a different checkpoint and camera count, so they are **not** a
-like-for-like comparison with the table above — read the harness column.
+FlashRT on the matched harness — the same `GR00T-N1.7` LIBERO
+fine-tune on `libero_10`, one camera, 4 denoising steps, batch 1,
+medians over 20 iterations after 5 warmup iterations, wall-clock
+vision-backbone then action-head split:
 
-| FlashRT tier | Checkpoint / harness | Backbone | Action head | E2E | Frequency |
-|---|---|---:|---:|---:|---:|
-| FP8 (default) | `GR00T-N1.7-3B`, 2-view real fixture, T=40, 4 steps | 23.5 ms | 26.5 ms | **50.2 ms** | 20 Hz |
-| NVFP4 + FA4 (`use_fp4=True`) | same fixture and steps | 14.2 ms | 15.6 ms | **29.9 ms** | 33 Hz |
+| FlashRT tier | Backbone | Action head | E2E | Frequency |
+|---|---:|---:|---:|---:|
+| FP8 (default) | 11.0 ms | 25.8 ms | **36.8 ms** | 27.2 Hz |
+| NVFP4 + FA4 (`use_fp4=True`) | 8.4 ms | 15.2 ms | **23.7 ms** | 42.3 Hz |
 
-Both rows come from one same-session A/B/A run on Jetson AGX Thor
-(JetPack 7.2, MAXN) — FP8 51.6 ms, NVFP4 29.9 ms, FP8 50.2 ms, so the
-tier is 1.70x on that run. The NVFP4 tier's action cosine against the
-FP8 tier on that fixture is 0.99994 and its CUDA-graph replays are
-bit-identical.
+Measured as one same-session A/B/A on Jetson AGX Thor (JetPack 7.2,
+MAXN): FP8 36.76 ms, NVFP4 23.65 ms, FP8 36.85 ms. The fixture is a
+real `libero_10` observation captured through the official
+preprocessing path; the NVFP4 tier's action cosine against the FP8
+tier on it is 1.000000 and CUDA-graph replays are bit-identical on
+both tiers.
+
+The same tiers on the base `GR00T-N1.7-3B` checkpoint with a 2-view
+fixture (`T=40`, same protocol), for reference:
+
+| FlashRT tier | Backbone | Action head | E2E | Frequency |
+|---|---:|---:|---:|---:|
+| FP8 (default) | 23.5 ms | 26.5 ms | **50.2 ms** | 20 Hz |
+| NVFP4 + FA4 (`use_fp4=True`) | 14.2 ms | 15.6 ms | **29.9 ms** | 33 Hz |
+
+Also one same-session A/B/A (FP8 51.6 / NVFP4 29.9 / FP8 50.2 ms);
+action cosine against the FP8 tier on that fixture is 0.99994.
 Reproduce with:
 
 ```bash
+# LIBERO fine-tune, one camera (matched harness)
 python benchmarks/groot_n17_thor_latency.py \
-    --ckpt <n17-checkpoint-dir> --aux <aux-fixture.pt> \
+    --ckpt <n17-libero-checkpoint-dir> --aux <1-camera-aux-fixture.pt> \
+    --tier fp4 --views 1 --embodiment libero_sim --warmup 5 --iters 20
+
+# base checkpoint, two cameras
+python benchmarks/groot_n17_thor_latency.py \
+    --ckpt <n17-checkpoint-dir> --aux <2-camera-aux-fixture.pt> \
     --tier fp4 --views 2 --warmup 5 --iters 20
 ```
+
+Capture a camera-count-matched fixture with
+`tests/_helpers/groot_n17/capture_aux_multi.py --views N`.
 
 ### N1.7 SM89 Steady-State Hot Replay Profile After Reusing Existing Fused Kernel
 
