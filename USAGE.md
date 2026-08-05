@@ -660,13 +660,18 @@ The gripper DOF is a near-constant scalar whose cosine is intrinsically noisy
 (the bf16 reference itself scores ≈ 0.94); the combined action cosine clears
 the ≥ 0.999 bar on both paths.
 
-RTX 5090 latency (warm, P50):
+RTX 5090 latency (warm, P50), with the backbone run eagerly — that is,
+`infer()` without `aux=`:
 
 | Stage | FP8 (default) | full-FP16 (opt-in) |
 |---|---:|---:|
 | Backbone (ViT+LLM+VL self-attn, per observation) | 12.8 ms | 15.3 ms |
 | Infer (DiT 4-step loop, CUDA graph) | 10.7 ms | 10.9 ms |
 | E2E (backbone + infer) | 24.0 ms | 26.6 ms |
+
+Passing `aux=` to `infer()` on the RTX FP8 path captures and replays the
+backbone graph as well, covering the whole backbone-to-action path and
+bringing E2E to **16.61 ms** on RTX 5090 (2-view base checkpoint).
 
 FP8 saves ≈ 2.7 ms E2E (1.11×), concentrated in the backbone GEMMs (1.19×);
 the DiT is never quantized, so infer is effectively the same on both paths.
