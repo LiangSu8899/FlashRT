@@ -43,6 +43,30 @@ class GrootN17TorchFrontendThorFP4(GrootN17TorchFrontendThorFP8):
     # the fmha/cublas chain when the FA4 runtime deps are missing.
     _KBB_FA4 = True
 
+    # Bindings this tier needs beyond the always-compiled set. They ship
+    # only on SM100-class builds (CMake: FLASHRT_HAVE_THOR_VLA_KERNELS), so
+    # probe once and fail with the build flag named rather than dying on an
+    # AttributeError deep inside graph capture.
+    _REQUIRED_BINDINGS = (
+        "rms_norm_fp16_vec", "layer_norm_fp16_vec",
+        "layer_norm_fp8_static_fp16_vec", "rope_rotate_half_fp16_vec",
+        "quantize_fp8_static_fp16_vec", "gpu_repeat_interleave_heads_vec",
+        "residual_add_fp16_vec", "attention_mha_fp16_masked",
+        "attention_mha_bf16_masked",
+    )
+
+    def __init__(self, *args, **kwargs):
+        import flash_rt.flash_rt_kernels as fvk
+        missing = [n for n in self._REQUIRED_BINDINGS if not hasattr(fvk, n)]
+        if missing:
+            raise RuntimeError(
+                "GROOT N1.7 Thor NVFP4 tier needs the Thor VLA helper "
+                "kernels, which this build of flash_rt_kernels does not "
+                f"carry (missing: {', '.join(missing)}). Rebuild for an "
+                "SM100-class GPU (cmake -B build -S . -DGPU_ARCH=110) or "
+                "use the FP8 tier (GrootN17TorchFrontendThorFP8).")
+        super().__init__(*args, **kwargs)
+
     def _quantize_dit_fp4(self, step_weights, bp, action_horizon) -> None:
         """Quantize every DiT GEMM weight to NVFP4 (per-16 MSE block scales)
         and splice the pointers + activation scratch buffers into

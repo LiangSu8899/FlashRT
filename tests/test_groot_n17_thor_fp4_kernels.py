@@ -295,6 +295,66 @@ def test_layer_norm_vec_matches_scalar(fvk):
     assert _cos(a, b) >= 0.99999
 
 
+@pytest.mark.parametrize("S_kv", [1024, 1025, 2048])
+def test_masked_softmax_mha_wide_rows(fvk, S_kv):
+    """Rows wider than the register-tiled path's reach still softmax
+    correctly — the boundary (1024) and the first row past it (1025) are
+    pinned explicitly, in both dtypes."""
+    torch.manual_seed(9)
+    S_q, NH, HD = 1, 1, 16
+    S_pad = ((S_kv + 7) // 8) * 8
+    ctx = fvk.FvkContext()
+
+    for dtype, masked, plain, fill in (
+        (torch.float16, fvk.attention_mha_fp16_masked,
+         fvk.attention_mha_fp16, fvk.gpu_fill_neginf_fp16),
+        (torch.bfloat16, fvk.attention_mha_bf16_masked,
+         fvk.attention_mha_bf16, fvk.gpu_fill_neginf_bf16),
+    ):
+        q = torch.randn(S_q, NH * HD, dtype=dtype, device=DEV)
+        k = torch.randn(S_kv, NH * HD, dtype=dtype, device=DEV)
+        v = torch.randn(S_kv, NH * HD, dtype=dtype, device=DEV)
+        logits = torch.empty(NH, S_q, S_pad, dtype=dtype, device=DEV)
+        out_ref = torch.empty(S_q, NH * HD, dtype=dtype, device=DEV)
+        out_new = torch.empty_like(out_ref)
+        scale = 1.0 / (HD ** 0.5)
+
+        fill(logits.data_ptr(), NH * S_q * S_pad, 0)
+        if dtype is torch.float16:
+            plain(ctx, q.data_ptr(), k.data_ptr(), v.data_ptr(),
+                  logits.data_ptr(), out_ref.data_ptr(),
+                  S_q, S_kv, NH, HD, scale, 0)
+        else:
+            plain(ctx, q.data_ptr(), k.data_ptr(), v.data_ptr(),
+                  logits.data_ptr(), out_ref.data_ptr(),
+                  S_q, S_kv, NH, HD, scale, S_pad, 0)
+        logits.fill_(float("nan"))
+        if dtype is torch.float16:
+            masked(ctx, q.data_ptr(), k.data_ptr(), v.data_ptr(),
+                   logits.data_ptr(), out_new.data_ptr(),
+                   S_q, S_kv, NH, HD, scale, 0)
+        else:
+            masked(ctx, q.data_ptr(), k.data_ptr(), v.data_ptr(),
+                   logits.data_ptr(), out_new.data_ptr(),
+                   S_q, S_kv, NH, HD, scale, S_pad, 0, 0)
+        torch.cuda.synchronize()
+
+        # Reference the math directly too: the pre-filled kernel shares the
+        # 1024-column ceiling, so it cannot arbitrate past it on its own.
+        ref = torch.nn.functional.scaled_dot_product_attention(
+            q.view(S_q, NH, HD).permute(1, 0, 2).float(),
+            k.view(S_kv, NH, HD).permute(1, 0, 2).float(),
+            v.view(S_kv, NH, HD).permute(1, 0, 2).float(),
+        ).permute(1, 0, 2).reshape(S_q, NH * HD)
+        assert torch.isfinite(out_new.float()).all(), (
+            f"{dtype} S_kv={S_kv}: masked softmax produced non-finite output")
+        cos = _cos(out_new, ref)
+        max_err = float((out_new.float() - ref).abs().max())
+        assert cos >= 0.999, (
+            f"{dtype} S_kv={S_kv}: cosine {cos:.6f} vs torch SDPA "
+            f"(max abs error {max_err:.6f})")
+
+
 def test_masked_softmax_mha_matches_prefilled(fvk):
     """The masked-softmax MHA needs no -inf logits pre-fill and matches the
     pre-filled variant."""

@@ -9,6 +9,10 @@
 //  uses k = S_kv, so the padding is never read anywhere and the pre-fill
 //  disappears.
 //
+//  Any S_kv is supported: rows up to SMM_MAX_COLS use a register-tiled
+//  softmax sized to the row, wider rows fall back to a multi-pass kernel
+//  that holds no per-column registers.
+//
 //  Additive: new symbols only.
 // ============================================================================
 #include <cuda_runtime.h>
@@ -90,10 +94,51 @@ __global__ void softmax_masked_kernel(T* data, int rows, int cols_pad,
     }
 }
 
+// Register-tiled variants above cap at SMM_MAX_COLS columns. Rows wider
+// than that go through this multi-pass kernel instead: it keeps no
+// per-column registers, so it is correct for any width. Three passes over
+// the row (max, exp+sum, scale) make it slower than the tiled path, which
+// is why it only runs past the tiled path's reach.
+template <typename T>
+__global__ void softmax_masked_wide_kernel(T* data, int rows, int cols_pad,
+                                           int cols_valid) {
+    const int lane = threadIdx.x % SMM_WARP;
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+
+    T* src = data + (long)row * cols_pad;
+
+    float mx = -1e30f;
+    for (int c = lane; c < cols_valid; c += SMM_WARP)
+        mx = fmaxf(mx, to_f<T>(src[c]));
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+
+    float sum = 0.f;
+    for (int c = lane; c < cols_valid; c += SMM_WARP) {
+        const float e = __expf(to_f<T>(src[c]) - mx);
+        src[c] = from_f<T>(e);
+        sum += e;
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+        sum += __shfl_xor_sync(0xffffffffu, sum, o);
+    const float inv = 1.0f / sum;
+
+    for (int c = lane; c < cols_valid; c += SMM_WARP)
+        src[c] = from_f<T>(to_f<T>(src[c]) * inv);
+}
+
 template <typename T>
 inline void launch_softmax_masked(T* data, int rows, int cols_pad,
                                   int cols_valid, cudaStream_t stream) {
     const int iters = (cols_valid + SMM_WARP - 1) / SMM_WARP;
+    if (iters > SMM_ITERS) {
+        softmax_masked_wide_kernel<T><<<rows, SMM_WARP, 0, stream>>>(
+            data, rows, cols_pad, cols_valid);
+        return;
+    }
     if (iters <= 2) {
         softmax_masked_kernel<T, 2><<<rows, SMM_WARP, 0, stream>>>(
             data, rows, cols_pad, cols_valid);

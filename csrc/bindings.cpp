@@ -484,7 +484,10 @@ extern "C" int cutlass_fp8_t1_bf16out(void*, void*, void*, int, int, int, float,
 #include "kernels/lingbot_kernels.h"   // LingBot-VLA model kernel decls (lingbot_-prefixed, Thor sm_110a)
 #endif
 
-// Vectorized fp16 backbone helpers (csrc/kernels/vec_fp16_backbone.cu).
+#ifdef FLASHRT_HAVE_THOR_VLA_KERNELS
+// Vectorized fp16 backbone helpers (csrc/kernels/vec_fp16_backbone.cu) and
+// the masked-softmax MHA variants (csrc/kernels/attention_mha_masked.cu).
+// Both compile only on SM100-class builds; see the CMake gate.
 extern "C" {
 int rms_norm_fp16_vec(const __half*, const __half*, __half*, int, int, float,
                       cudaStream_t);
@@ -508,6 +511,7 @@ void attention_mha_bf16_masked(cublasHandle_t, const __nv_bfloat16*,
                                __nv_bfloat16*, __nv_bfloat16*, int, int, int,
                                int, float, int, int, cudaStream_t);
 }
+#endif  // FLASHRT_HAVE_THOR_VLA_KERNELS
 
 PYBIND11_MODULE(flash_rt_kernels, m) {
     m.doc() = "FlashRT C++/CUDA inference kernels";
@@ -2394,6 +2398,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     }, py::arg("x"), py::arg("cos_table"), py::arg("sin_table"),
        py::arg("S"), py::arg("NH"), py::arg("HD"), py::arg("stream") = 0);
 
+#ifdef FLASHRT_HAVE_THOR_VLA_KERNELS
     // ── Vectorized fp16 backbone helpers (16-byte loads; additive) ──
     m.def("rms_norm_fp16_vec", [](uintptr_t x, uintptr_t w, uintptr_t out,
                                   int rows, int dim, float eps,
@@ -2470,6 +2475,8 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
             S, NH_src, HD, repeat, to_stream(stream));
     }, py::arg("src"), py::arg("dst"), py::arg("S"), py::arg("NH_src"),
        py::arg("HD"), py::arg("repeat"), py::arg("stream") = 0);
+
+#endif  // FLASHRT_HAVE_THOR_VLA_KERNELS
 
     // MHA batched cuBLAS attention (for DiT — per-head independent attention)
     m.def("attention_mha_fp16", [](FvkContext& ctx, uintptr_t Q, uintptr_t K, uintptr_t V,
@@ -2613,6 +2620,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
        py::arg("attn_scale") = 1.0f, py::arg("logits_kv_stride") = 0,
        py::arg("stream") = 0);
 
+#ifdef FLASHRT_HAVE_THOR_VLA_KERNELS
     // Masked-softmax MHA variants: no -inf logits pre-fill needed (the
     // softmax reads/writes only the valid S_kv columns).
     m.def("attention_mha_fp16_masked",
@@ -2652,6 +2660,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
        py::arg("S_q"), py::arg("S_kv"), py::arg("NH"), py::arg("HD"),
        py::arg("attn_scale") = 1.0f, py::arg("logits_kv_stride") = 0,
        py::arg("qkv_token_stride") = 0, py::arg("stream") = 0);
+#endif  // FLASHRT_HAVE_THOR_VLA_KERNELS
 
     // ------------------------------------------------------------------
     //  FP8 block-128 dequantization + GEMM.

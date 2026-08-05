@@ -49,6 +49,9 @@ def main() -> None:
                     help="save the first inference output to this .pt")
     ap.add_argument("--ref-in", default=None,
                     help="compare the first inference output against this .pt")
+    ap.add_argument("--min-cosine", type=float, default=None,
+                    help="fail (exit 1) when the action cosine against "
+                         "--ref-in falls below this threshold")
     args = ap.parse_args()
 
     if args.tier == "fp4":
@@ -80,9 +83,13 @@ def main() -> None:
     out0 = e2e_once()
     if args.ref_out:
         torch.save(out0.detach().float().cpu(), args.ref_out)
+    cosine = None
     if args.ref_in:
         ref = torch.load(args.ref_in, weights_only=False, map_location="cpu")
-        print(f"action cosine vs reference: {_cos(out0, ref):.6f}")
+        cosine = _cos(out0, ref)
+        print(f"action cosine vs reference: {cosine:.6f}")
+    elif args.min_cosine is not None:
+        raise SystemExit("--min-cosine requires --ref-in")
 
     for _ in range(args.warmup):
         e2e_once()
@@ -109,6 +116,11 @@ def main() -> None:
           f"({1000.0 / m(e2e):.1f} Hz)  "
           f"[median of {args.iters} after {args.warmup} warmup]  "
           f"replay-determinism={_cos(out0, det):.6f}")
+
+    if args.min_cosine is not None and cosine < args.min_cosine:
+        raise SystemExit(
+            f"action cosine {cosine:.6f} is below --min-cosine "
+            f"{args.min_cosine:.6f}")
 
 
 if __name__ == "__main__":
