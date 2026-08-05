@@ -51,6 +51,10 @@ class LinearProjNvfp4Balance(GuardedSeam, torch.nn.Module):
         kern = _kernel()
         self._kern = kern
         self._gemm = kern.fp4_w4a16_linear_bf16
+        # capability probe: the fused-bias epilogue entry, where the
+        # installed package variant ships it — absence is the ordinary
+        # two-launch path, never a refusal
+        self._gemm_bias = getattr(kern, "nvfp4_gemm_bias_bf16", None)
         if original is not None:
             self.host_linear = original
         self._frt_arm(dtypes=CAST_OK, device=w_packed.device, k=int(k))
@@ -71,10 +75,14 @@ class LinearProjNvfp4Balance(GuardedSeam, torch.nn.Module):
         flat = (x.reshape(-1, shape[-1]).to(torch.float16)
                 * self._inv_s).contiguous()
         a_packed, a_sfa = self._kern.quantize_fp4_sfa_fp16(flat)
-        y = self._gemm(a_packed, self._w_packed, a_sfa, self._w_sfb,
-                       variant=_VARIANT)
-        if self._bias is not None:
-            y = y + self._bias
+        if self._bias is not None and self._gemm_bias is not None:
+            y = self._gemm_bias(a_packed, self._w_packed, a_sfa,
+                                self._w_sfb, self._bias)
+        else:
+            y = self._gemm(a_packed, self._w_packed, a_sfa, self._w_sfb,
+                           variant=_VARIANT)
+            if self._bias is not None:
+                y = y + self._bias
         return y.reshape(*shape[:-1], self._n).type_as(x)
 
 

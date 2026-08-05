@@ -297,9 +297,17 @@ class Nvfp4Balance(QuantScheme):
     name = "nvfp4_balance"
 
     def __init__(self, alpha: float = 0.5,
-                 clamp: tuple[float, float] = (0.25, 4.0)) -> None:
+                 clamp: tuple[float, float] = (0.25, 4.0),
+                 fuse_ffn_wire: bool = False) -> None:
         self.alpha = float(alpha)
         self.clamp = (float(clamp[0]), float(clamp[1]))
+        # the FFN's FP4-wire chain (GEMM emits bias+GELU re-quantized,
+        # the second GEMM consumes it) drops fc2's input-side balance —
+        # a numerics change, so it is a scheme decision the receipt
+        # records, never a silent flip on symbol presence
+        self.fuse_ffn_wire = bool(fuse_ffn_wire)
+        if fuse_ffn_wire:
+            self.name = "nvfp4_balance_wire"
 
     def statistics(self, points: Sequence) -> dict[str, PointStat]:
         return {f"{p.path}|{p.name}": PointStat("amax", "channel")
@@ -313,6 +321,9 @@ class Nvfp4Balance(QuantScheme):
                     "qkv_pack", "vision_ffn", "linear_proj"):
                 formats[seam_path] = "nvfp4_balance"
                 params[seam_path] = dict(payload)
+                if (self.fuse_ffn_wire
+                        and pts.structure == "vision_ffn"):
+                    params[seam_path]["fuse_wire"] = True
             else:
                 keep.append(seam_path)
         return Decision(keep_host=tuple(keep),
@@ -476,3 +487,4 @@ register("none", NoQuant())
 register("bf16_structural", Bf16Structural())
 register("nvfp4_awq", Nvfp4Awq())
 register("nvfp4_balance", Nvfp4Balance())
+register("nvfp4_balance_wire", Nvfp4Balance(fuse_ffn_wire=True))
