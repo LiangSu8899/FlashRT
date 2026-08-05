@@ -83,12 +83,14 @@ like-for-like comparison with the table above — read the harness column.
 
 | FlashRT tier | Checkpoint / harness | Backbone | Action head | E2E | Frequency |
 |---|---|---:|---:|---:|---:|
-| FP8 (default) | `GR00T-N1.7-3B`, 2-view real fixture, T=40, 4 steps | 23.6 ms | 26.7 ms | **50.0 ms** | 20 Hz |
-| NVFP4 + FA4 (`use_fp4=True`) | same fixture and steps | 14.8 ms | 16.0 ms | **30.9 ms** | 32 Hz |
+| FP8 (default) | `GR00T-N1.7-3B`, 2-view real fixture, T=40, 4 steps | 23.5 ms | 26.5 ms | **50.2 ms** | 20 Hz |
+| NVFP4 + FA4 (`use_fp4=True`) | same fixture and steps | 14.2 ms | 15.6 ms | **29.9 ms** | 33 Hz |
 
 Both rows come from one same-session A/B/A run on Jetson AGX Thor
-(JetPack 7.2, MAXN); the NVFP4 tier's action cosine against the FP8 tier
-on that fixture is 0.99994 and its CUDA-graph replays are bit-identical.
+(JetPack 7.2, MAXN) — FP8 51.6 ms, NVFP4 29.9 ms, FP8 50.2 ms, so the
+tier is 1.70x on that run. The NVFP4 tier's action cosine against the
+FP8 tier on that fixture is 0.99994 and its CUDA-graph replays are
+bit-identical.
 Reproduce with:
 
 ```bash
@@ -148,12 +150,14 @@ like-for-like comparison with the table above — read the harness column.
 
 | FlashRT tier | Checkpoint / harness | Backbone | Action head | E2E | Frequency |
 |---|---|---:|---:|---:|---:|
-| FP8 (default) | `GR00T-N1.7-3B`, 2-view real fixture, T=40, 4 steps | 23.6 ms | 26.7 ms | **50.0 ms** | 20 Hz |
-| NVFP4 + FA4 (`use_fp4=True`) | same fixture and steps | 14.8 ms | 16.0 ms | **30.9 ms** | 32 Hz |
+| FP8 (default) | `GR00T-N1.7-3B`, 2-view real fixture, T=40, 4 steps | 23.5 ms | 26.5 ms | **50.2 ms** | 20 Hz |
+| NVFP4 + FA4 (`use_fp4=True`) | same fixture and steps | 14.2 ms | 15.6 ms | **29.9 ms** | 33 Hz |
 
 Both rows come from one same-session A/B/A run on Jetson AGX Thor
-(JetPack 7.2, MAXN); the NVFP4 tier's action cosine against the FP8 tier
-on that fixture is 0.99994 and its CUDA-graph replays are bit-identical.
+(JetPack 7.2, MAXN) — FP8 51.6 ms, NVFP4 29.9 ms, FP8 50.2 ms, so the
+tier is 1.70x on that run. The NVFP4 tier's action cosine against the
+FP8 tier on that fixture is 0.99994 and its CUDA-graph replays are
+bit-identical.
 Reproduce with:
 
 ```bash

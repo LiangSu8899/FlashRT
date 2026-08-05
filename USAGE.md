@@ -546,14 +546,24 @@ fe = flash_rt.load_model(
 # equivalently: GrootN17TorchFrontendThorFP4(checkpoint, num_views=2, embodiment_tag=...)
 ```
 
-Reference (Jetson AGX Thor, wall-clock per-frame image→action e2e,
-same-session A/B/A against the FP8 default): **≈ 31 ms** (vision
-backbone graph ≈ 14.8 ms + action graph ≈ 16.0 ms) vs ≈ 50 ms FP8 —
-**1.64×** — with action cosine ≈ 0.9999 vs the FP8 tier on the
-reference fixture and graph-replay determinism exactly 1.0. Without
-the FA4 runtime deps the tier still runs (fmha/cublas fallback) at
-≈ 36 ms. (Absolute Thor latencies drift ~1 ms at day scale; the
-same-session speedup is the stable metric.)
+Reference (Jetson AGX Thor, JetPack 7.2, MAXN; wall-clock per-frame
+image→action e2e over a real 2-view fixture, `T=40`, 4 denoising steps,
+batch 1; medians over 20 iterations after warmup, run as one
+same-session A/B/A against the FP8 default): **29.9 ms** (vision
+backbone graph 14.2 ms + action graph 15.6 ms) vs **51.6 / 50.2 ms**
+FP8 — **1.70×**, 33 Hz — with action cosine 0.99994 vs the FP8 tier on
+that fixture and graph-replay determinism exactly 1.0. Without the FA4
+runtime deps the tier still runs (fmha/cublas fallback) at ≈ 35 ms.
+(Absolute Thor latencies drift ~1 ms at day scale; the same-session
+speedup is the stable metric.)
+
+Reproduce with:
+
+```bash
+python benchmarks/groot_n17_thor_latency.py \
+    --ckpt <n17-checkpoint-dir> --aux <aux-fixture.pt> \
+    --tier fp4 --views 2 --warmup 5 --iters 20
+```
 
 Precision ladder: on an 8-sample reference set the all-FP4 default
 holds worst-sample action cosine ≈ 0.998 vs the FP8 tier (the other
