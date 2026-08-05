@@ -1510,6 +1510,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
        py::arg("S"), py::arg("Q_dim"), py::arg("K_dim"), py::arg("HD"), py::arg("qkv_stride"),
        py::arg("kc_offset"), py::arg("kc_stride"), py::arg("stream") = 0);
 
+#ifdef FLASHRT_HAVE_THOR_VLA_KERNELS
     // Vectorized bit-exact variant (16B moves); returns nonzero without
     // launching on unaligned shapes so callers can use the scalar kernel.
     m.def("qkv_split_rope_kvcache_fp16_vec", [](uintptr_t qkv, uintptr_t rope,
@@ -1527,6 +1528,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     }, py::arg("qkv"), py::arg("rope"), py::arg("Q"), py::arg("Kc"), py::arg("Vc"),
        py::arg("S"), py::arg("Q_dim"), py::arg("K_dim"), py::arg("HD"), py::arg("qkv_stride"),
        py::arg("kc_offset"), py::arg("kc_stride"), py::arg("stream") = 0);
+#endif  // FLASHRT_HAVE_THOR_VLA_KERNELS
 
     // QKV Split + RoPE + KV Cache (FP16) with runtime device K/V row offset.
     // Same shape contract as qkv_split_rope_kvcache_fp16; K/V row =
@@ -1896,6 +1898,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
        py::arg("S"), py::arg("S_kv_max"), py::arg("NH"), py::arg("HD"),
        py::arg("seqused_k"), py::arg("attn_scale") = 1.0f, py::arg("stream") = 0);
 
+#ifdef FLASHRT_HAVE_THOR_VLA_KERNELS
     m.def("attention_qkv_fp16_seqused_v2", [](FvkContext& ctx, uintptr_t Q, uintptr_t K, uintptr_t V,
                                     uintptr_t logits, uintptr_t out,
                                     int S, int S_kv_max, int NH, int HD,
@@ -1914,7 +1917,8 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
        py::arg("S"), py::arg("S_kv_max"), py::arg("NH"), py::arg("HD"),
        py::arg("seqused_k"), py::arg("attn_scale") = 1.0f, py::arg("stream") = 0,
        "seqused attention with the -inf mask folded into softmax "
-       "(one fewer kernel; S_kv_max <= 1024)");
+       "(one fewer kernel than the mask + softmax chain)");
+#endif  // FLASHRT_HAVE_THOR_VLA_KERNELS
 
     // Padded attention: supports odd S_kv (pads logits lda to even).
     // logits buffer must have room for S*NH * (S_kv + S_kv%2) elements.

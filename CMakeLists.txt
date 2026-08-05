@@ -1330,14 +1330,12 @@ pybind11_add_module(flash_rt_kernels
   csrc/kernels/norm.cu
   csrc/kernels/activation.cu
   csrc/kernels/rope.cu
-  csrc/kernels/rope_vec.cu
   csrc/kernels/quantize.cu
   csrc/kernels/elementwise.cu
   csrc/kernels/fusion.cu
   csrc/kernels/patch_embed.cu
   csrc/kernels/softmax.cu
   csrc/kernels/attention_cublas.cu
-  csrc/kernels/attention_seqused_fused.cu
   csrc/kernels/attention_mha.cu
   csrc/kernels/attention_mha_causal.cu
   csrc/kernels/rope_qwen3.cu
@@ -1371,15 +1369,19 @@ set_target_properties(flash_rt_kernels PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
 
 # ── Thor-class VLA helper kernels (SM100/SM110 only) ──
-# The masked-softmax MHA variants and the 16-byte-load norm/rope/quantize
-# rewrites exist for the GROOT N1.7 Thor path; their element math targets
-# SM100-class memory behaviour and no SM8x frontend calls them. Their
-# bindings in csrc/bindings.cpp are guarded by FLASHRT_HAVE_THOR_VLA_KERNELS
-# so source and binding drop together on other architectures.
+# The masked-softmax MHA variants, the 16-byte-load norm/rope/quantize
+# rewrites, the seqused-fold decoder attention and the vectorized QKV
+# split-RoPE exist for the GROOT N1.7 and Pi0.5 Thor paths; their element
+# math targets SM100-class memory behaviour and no SM8x frontend calls
+# them. Their bindings in csrc/bindings.cpp are guarded by
+# FLASHRT_HAVE_THOR_VLA_KERNELS so source and binding drop together on
+# other architectures.
 if(ENABLE_SM100_CUTLASS)
   target_sources(flash_rt_kernels PRIVATE
     csrc/kernels/attention_mha_masked.cu
-    csrc/kernels/vec_fp16_backbone.cu)
+    csrc/kernels/vec_fp16_backbone.cu
+    csrc/kernels/attention_seqused_fused.cu
+    csrc/kernels/rope_vec.cu)
   target_compile_definitions(flash_rt_kernels PRIVATE FLASHRT_HAVE_THOR_VLA_KERNELS=1)
   message(STATUS "Thor VLA helper kernels: ENABLED (sm_${GPU_ARCH})")
 else()

@@ -23,6 +23,9 @@ namespace {
 #define SMV2_MAX_COLS 1024
 #define SMV2_ITERS (SMV2_MAX_COLS / SMV2_WARP_SIZE)
 
+// Any S_kv_max is supported: rows up to SMV2_MAX_COLS use the register-tiled
+// softmax below, wider rows use the multi-pass variant after it.
+//
 // One warp per logits row. The register-to-column mapping, the reduction
 // order, and the arithmetic are all identical to softmax_fp16_kernel; the
 // only difference is that out-of-range columns take -1e30 at load time
@@ -94,6 +97,47 @@ __global__ void softmax_fp16_seqused_kernel(
     }
 }
 
+// Register-tiled softmax above covers at most SMV2_MAX_COLS columns. Wider
+// logits rows go through this multi-pass variant, which keeps no
+// per-column registers and is therefore correct at any width: without it,
+// columns past the tile were left unnormalized and still fed the PV GEMM.
+__global__ void softmax_fp16_seqused_wide_kernel(
+    __half* data, int rows, int cols, const int* __restrict__ seqused_k) {
+    const int lane = threadIdx.x % SMV2_WARP_SIZE;
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+
+    int valid = seqused_k[0];
+    if (valid < 0) valid = 0;
+    if (valid > cols) valid = cols;
+
+    __half* src = data + (long)row * cols;
+
+    float mx = -1e30f;
+    for (int c = lane; c < cols; c += SMV2_WARP_SIZE) {
+        const float v = (c < valid) ? __half2float(src[c]) : -1e30f;
+        mx = fmaxf(mx, v);
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+
+    float sum = 0.f;
+    for (int c = lane; c < cols; c += SMV2_WARP_SIZE) {
+        const float v = (c < valid) ? __half2float(src[c]) : -1e30f;
+        const float e = __expf(v - mx);
+        src[c] = __float2half(e);
+        sum += e;
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+        sum += __shfl_xor_sync(0xffffffffu, sum, o);
+    const float inv = 1.0f / sum;
+
+    for (int c = lane; c < cols; c += SMV2_WARP_SIZE)
+        src[c] = __float2half(__half2float(src[c]) * inv);
+}
+
 }  // namespace
 
 void attention_qkv_fp16_seqused_v2(
@@ -121,8 +165,13 @@ void attention_qkv_fp16_seqused_v2(
         logits, CUDA_R_16F, S_kv_max,
         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
 
-    softmax_fp16_seqused_kernel<<<S * NH, SMV2_WARP_SIZE, 0, stream>>>(
-        logits, S * NH, S_kv_max, seqused_k);
+    if (S_kv_max <= SMV2_MAX_COLS) {
+        softmax_fp16_seqused_kernel<<<S * NH, SMV2_WARP_SIZE, 0, stream>>>(
+            logits, S * NH, S_kv_max, seqused_k);
+    } else {
+        softmax_fp16_seqused_wide_kernel<<<S * NH, SMV2_WARP_SIZE, 0, stream>>>(
+            logits, S * NH, S_kv_max, seqused_k);
+    }
 
     float one = 1.0f;
     cublasGemmEx(handle,

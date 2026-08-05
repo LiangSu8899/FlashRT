@@ -10,6 +10,7 @@ Each test pins a fused kernel against the unfused chain it replaces:
   pair (the reduction order differs at ulp level).
 """
 
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -70,6 +71,52 @@ def test_seqused_softmax_fold_matches_masked_chain():
         assert torch.equal(out_ref, out_new), (
             f"seqused fold diverged at valid={valid}: "
             f"max |delta| = {(out_ref.float() - out_new.float()).abs().max()}")
+
+
+@pytest.mark.parametrize("S_kv_max", [1024, 1025, 2048])
+def test_seqused_fold_handles_wide_logits(S_kv_max):
+    """Rows wider than the fold's register tile still normalize correctly.
+
+    1024 is where the register-tiled softmax hands over to the multi-pass
+    one; past it the tiled path would leave the tail unnormalized while the
+    PV GEMM still consumed it.
+    """
+    _require_thor()
+    torch.manual_seed(20260805)
+    S, NH, HD = 2, 4, 128
+    ctx = fvk.FvkContext()
+    q = (torch.randn(S, NH * HD, dtype=torch.float16, device='cuda') * 0.7)
+    k = (torch.randn(S_kv_max, HD, dtype=torch.float16, device='cuda') * 0.7)
+    v = (torch.randn(S_kv_max, HD, dtype=torch.float16, device='cuda') * 0.7)
+    scale = 1.0 / (HD ** 0.5)
+
+    for valid in (S_kv_max, S_kv_max - 37):
+        seqused = torch.tensor([valid], dtype=torch.int32, device='cuda')
+        logits = torch.zeros(S * NH, S_kv_max, dtype=torch.float16,
+                             device='cuda')
+        out_new = torch.zeros(S, NH * HD, dtype=torch.float16, device='cuda')
+        fvk.attention_qkv_fp16_seqused_v2(
+            ctx, q.data_ptr(), k.data_ptr(), v.data_ptr(),
+            logits.data_ptr(), out_new.data_ptr(),
+            S, S_kv_max, NH, HD, seqused.data_ptr(), scale, 0)
+        torch.cuda.synchronize()
+
+        # Reference the math directly: the unfused sibling shares the same
+        # 1024-column tile, so it cannot arbitrate past it on its own.
+        qh = q.view(S, NH, HD).permute(1, 0, 2).float()
+        kh = k[:valid].unsqueeze(0).expand(NH, valid, HD).float()
+        vh = v[:valid].unsqueeze(0).expand(NH, valid, HD).float()
+        ref = torch.nn.functional.scaled_dot_product_attention(
+            qh, kh, vh, scale=scale).permute(1, 0, 2).reshape(S, NH * HD)
+        got = out_new.float()
+        assert torch.isfinite(got).all(), (
+            f"S_kv_max={S_kv_max} valid={valid}: non-finite output")
+        a, b = got.flatten().double(), ref.flatten().double()
+        cos = float(a @ b / (a.norm() * b.norm()))
+        assert cos >= 0.999, (
+            f"S_kv_max={S_kv_max} valid={valid}: cosine {cos:.6f} vs torch "
+            f"SDPA (max abs error "
+            f"{float((got - ref).abs().max()):.6f})")
 
 
 def test_fused_geglu_epilogue_matches_split_chain():
