@@ -499,6 +499,7 @@ int quantize_fp8_static_fp16_vec(const __half*, __nv_fp8_e4m3*, const float*,
                                  int, cudaStream_t);
 int gpu_repeat_interleave_heads_vec(const __half*, __half*, int, int, int,
                                     int, cudaStream_t);
+int residual_add_fp16_vec(__half*, const __half*, int, cudaStream_t);
 void attention_mha_fp16_masked(cublasHandle_t, const __half*, const __half*,
                                const __half*, __half*, __half*, int, int, int,
                                int, float, cudaStream_t);
@@ -2451,6 +2452,13 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
             reinterpret_cast<const float*>(d_scale), n, to_stream(stream));
     }, py::arg("in"), py::arg("out"), py::arg("d_scale"), py::arg("n"),
        py::arg("stream") = 0);
+
+    m.def("residual_add_fp16_vec", [](uintptr_t residual, uintptr_t x, int n,
+                                      uintptr_t stream) -> int {
+        return residual_add_fp16_vec(reinterpret_cast<__half*>(residual),
+                                     reinterpret_cast<const __half*>(x),
+                                     n, to_stream(stream));
+    }, py::arg("residual"), py::arg("x"), py::arg("n"), py::arg("stream") = 0);
 
     m.def("gpu_repeat_interleave_heads_vec", [](uintptr_t src, uintptr_t dst,
                                                 int S, int NH_src, int HD,

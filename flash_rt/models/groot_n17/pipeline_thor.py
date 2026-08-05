@@ -171,6 +171,12 @@ def qwen3vl_vit_forward(gemm, fvk, bufs, weights, dims,
     vec = bool(dims.get("vec_kernels"))
     fa4 = _fa4(dims)
 
+    def _res(dst, src, n):
+        if vec:
+            fvk.residual_add_fp16_vec(dst, src, n, int(stream))
+        else:
+            fvk.residual_add_fp16(dst, src, n, int(stream))
+
     def _ln(x, w, b, out, rows):
         if vec:
             fvk.layer_norm_fp16_vec(x, w, b, out, rows, D, 1e-6, int(stream))
@@ -259,7 +265,7 @@ def qwen3vl_vit_forward(gemm, fvk, bufs, weights, dims,
             fvk.add_bias_fp16(o_proj_out, int(weights["o_b"][li]), S, D, int(stream))
 
         # ── Residual 1 ─────────────────────────────────────────────────
-        fvk.residual_add_fp16(h_ptr, o_proj_out, S * D, int(stream))
+        _res(h_ptr, o_proj_out, S * D)
 
         # ── Pre-FF LayerNorm (+ fused FP8 quantize on the vec tier) ────
         if vec and use_fp8:
@@ -295,7 +301,7 @@ def qwen3vl_vit_forward(gemm, fvk, bufs, weights, dims,
             fvk.add_bias_fp16(o_proj_out, int(weights["fc2_b"][li]), S, D, int(stream))
 
         # ── Residual 2 ─────────────────────────────────────────────────
-        fvk.residual_add_fp16(h_ptr, o_proj_out, S * D, int(stream))
+        _res(h_ptr, o_proj_out, S * D)
 
         # ── DeepStack tap callback ─────────────────────────────────────
         if deepstack_capture is not None and li in deepstack_taps:
@@ -495,6 +501,12 @@ def qwen3vl_llm_forward(gemm, fvk, bufs, weights, dims,
     layer_iter = range(16) if layers_subset is None else list(layers_subset)
     vec = bool(dims.get("vec_kernels"))
     fa4 = _fa4(dims)
+
+    def _res(dst, src, n):
+        if vec:
+            fvk.residual_add_fp16_vec(dst, src, n, int(stream))
+        else:
+            fvk.residual_add_fp16(dst, src, n, int(stream))
     # Per-layer precision protection: layers in ``fp16_layers`` run their
     # QKV / O / gate / up GEMMs in fp16 (no input fp8 quant) to protect the
     # large visual-token activation spikes that wreck per-tensor FP8 on the
@@ -629,7 +641,7 @@ def qwen3vl_llm_forward(gemm, fvk, bufs, weights, dims,
         # ── Residual 1 + Pre-FFN RMSNorm ──────────────────────────────
         # FP8 path fuses residual-add + RMSNorm + quantize into one kernel.
         if hi_prec:
-            fvk.residual_add_fp16(h_ptr, o_out_ptr, S * D, int(stream))
+            _res(h_ptr, o_out_ptr, S * D)
             fvk.rms_norm_fp16(
                 h_ptr, int(weights["post_ln_w"][li]), xn_ptr,
                 S, D, 1e-6, int(stream),
@@ -673,12 +685,12 @@ def qwen3vl_llm_forward(gemm, fvk, bufs, weights, dims,
             )
 
         # ── Residual 2 ────────────────────────────────────────────────
-        fvk.residual_add_fp16(h_ptr, o_out_ptr, S * D, int(stream))
+        _res(h_ptr, o_out_ptr, S * D)
 
         # ── DeepStack injection (HF: layers 0, 1, 2) ──────────────────
         inject_ptr = int(inject_ptrs[li]) if li < len(inject_ptrs) else 0
         if inject_ptr != 0:
-            fvk.residual_add_fp16(h_ptr, inject_ptr, S * D, int(stream))
+            _res(h_ptr, inject_ptr, S * D)
 
 
 def vl_self_attn_forward(gemm, fvk, bufs, weights, dims,
@@ -739,6 +751,12 @@ def vl_self_attn_forward(gemm, fvk, bufs, weights, dims,
     FF = int(dims["ff_inner"])
     vec = bool(dims.get("vec_kernels"))
     fa4 = _fa4(dims)
+
+    def _res(dst, src, n):
+        if vec:
+            fvk.residual_add_fp16_vec(dst, src, n, int(stream))
+        else:
+            fvk.residual_add_fp16(dst, src, n, int(stream))
 
     h_ptr        = int(bufs["h"])
     xn_ptr       = int(bufs["xn"])
@@ -828,7 +846,7 @@ def vl_self_attn_forward(gemm, fvk, bufs, weights, dims,
             fvk.add_bias_fp16(o_proj_out, int(weights["o_b"][li]), T, D, int(stream))
 
         # ── Residual 1: h += o_proj_out ────────────────────────────────
-        fvk.residual_add_fp16(h_ptr, o_proj_out, T * D, int(stream))
+        _res(h_ptr, o_proj_out, T * D)
 
         # ── Pre-FF LayerNorm (+ fused FP8 quantize on the vec tier) ────
         if vec and use_fp8:
@@ -880,7 +898,7 @@ def vl_self_attn_forward(gemm, fvk, bufs, weights, dims,
             fvk.add_bias_fp16(o_proj_out, int(weights["fc2_b"][li]), T, D, int(stream))
 
         # ── Residual 2: h += fc2_out ───────────────────────────────────
-        fvk.residual_add_fp16(h_ptr, o_proj_out, T * D, int(stream))
+        _res(h_ptr, o_proj_out, T * D)
 
 
 def dit_forward(gemm, fvk, bufs, weights, dims,

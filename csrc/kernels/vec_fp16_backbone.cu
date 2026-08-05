@@ -302,6 +302,21 @@ __global__ void quantize_fp8_static_fp16_vec_kernel(
     out[idx] = res;
 }
 
+// ── Residual add, 8 elements per thread ───────────────────────────────────
+__global__ void residual_add_fp16_vec_kernel(
+    int4* __restrict__ residual, const int4* __restrict__ x, int n4) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n4) return;
+    int4 r = residual[idx];
+    const int4 v = x[idx];
+    __half* rh = reinterpret_cast<__half*>(&r);
+    const __half* vh = reinterpret_cast<const __half*>(&v);
+    #pragma unroll
+    for (int j = 0; j < 8; ++j)
+        rh[j] = __float2half(__half2float(rh[j]) + __half2float(vh[j]));
+    residual[idx] = r;
+}
+
 // ── GQA repeat-interleave head expand, 8 elements per thread ──────────────
 __global__ void repeat_interleave_heads_vec_kernel(
     const int4* __restrict__ src, int4* __restrict__ dst,
@@ -317,6 +332,18 @@ __global__ void repeat_interleave_heads_vec_kernel(
     const int h_src = h_dst / repeat;
     dst[((long)s * NH_dst + h_dst) * hd4 + c] =
         src[((long)s * NH_src + h_src) * hd4 + c];
+}
+
+// CTA width for the block-per-row norms: one thread per 16-byte vector,
+// rounded to a warp and capped at 256. A 1024-wide row has 128 vectors, so
+// a fixed 256-thread block would leave half the CTA idle through both
+// reduction passes.
+inline int norm_threads(int dim) {
+    const int vecs = dim >> 3;
+    int t = ((vecs + 31) / 32) * 32;
+    if (t < 32) t = 32;
+    if (t > 256) t = 256;
+    return t;
 }
 
 }  // namespace
@@ -335,7 +362,7 @@ int rms_norm_fp16_vec(const __half* x, const __half* w, __half* out,
         rms_norm_fp16_vec_warp_kernel<<<blocks, warps * 32, 0, stream>>>(
             x, w, out, rows, dim, eps);
     } else {
-        rms_norm_fp16_vec_block_kernel<<<rows, 256, 0, stream>>>(
+        rms_norm_fp16_vec_block_kernel<<<rows, norm_threads(dim), 0, stream>>>(
             x, w, out, dim, eps);
     }
     const cudaError_t e = cudaGetLastError();
@@ -350,7 +377,7 @@ int layer_norm_fp16_vec(const __half* x, const __half* w, const __half* b,
         (reinterpret_cast<uintptr_t>(w) & 15) ||
         (reinterpret_cast<uintptr_t>(b) & 15) ||
         (reinterpret_cast<uintptr_t>(out) & 15)) return -1;
-    layer_norm_fp16_vec_kernel<<<rows, 256, 0, stream>>>(
+    layer_norm_fp16_vec_kernel<<<rows, norm_threads(dim), 0, stream>>>(
         x, w, b, out, dim, eps);
     const cudaError_t e = cudaGetLastError();
     return (e == cudaSuccess) ? 0 : -static_cast<int>(e);
@@ -365,7 +392,7 @@ int layer_norm_fp8_static_fp16_vec(const __half* x, const __half* w,
         (reinterpret_cast<uintptr_t>(w) & 15) ||
         (reinterpret_cast<uintptr_t>(b) & 15) ||
         (reinterpret_cast<uintptr_t>(out) & 7)) return -1;
-    layer_norm_fp8_static_fp16_vec_kernel<<<rows, 256, 0, stream>>>(
+    layer_norm_fp8_static_fp16_vec_kernel<<<rows, norm_threads(dim), 0, stream>>>(
         x, w, b, out, d_scale, dim, eps);
     const cudaError_t e = cudaGetLastError();
     return (e == cudaSuccess) ? 0 : -static_cast<int>(e);
@@ -400,6 +427,21 @@ int quantize_fp8_static_fp16_vec(const __half* in, __nv_fp8_e4m3* out,
         (n16 + threads - 1) / threads, threads, 0, stream>>>(
         reinterpret_cast<const int4*>(in), reinterpret_cast<int4*>(out),
         descale_ptr, n16);
+    const cudaError_t e = cudaGetLastError();
+    return (e == cudaSuccess) ? 0 : -static_cast<int>(e);
+}
+
+int residual_add_fp16_vec(__half* residual, const __half* x, int n,
+                          cudaStream_t stream) {
+    if (n % 8 != 0) return -1;
+    if ((reinterpret_cast<uintptr_t>(residual) & 15) ||
+        (reinterpret_cast<uintptr_t>(x) & 15)) return -1;
+    const int n4 = n >> 3;
+    const int threads = 256;
+    residual_add_fp16_vec_kernel<<<
+        (n4 + threads - 1) / threads, threads, 0, stream>>>(
+        reinterpret_cast<int4*>(residual),
+        reinterpret_cast<const int4*>(x), n4);
     const cudaError_t e = cudaGetLastError();
     return (e == cudaSuccess) ? 0 : -static_cast<int>(e);
 }
