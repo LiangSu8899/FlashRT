@@ -86,6 +86,38 @@ class KernelUnavailable(ValueError):
     """
 
 
+#: every package this process could not supply, in the order it was
+#: asked for. Skipping an unavailable package keeps a run moving, which
+#: is the right behaviour — but a package that is *broken* here and one
+#: that was simply never shipped here both come out as "skipped", and
+#: only the first is somebody's bug. So nothing is inferred and nothing
+#: is dropped: the original failure is recorded verbatim and travels
+#: into the receipt, where a reader can tell the two apart.
+_UNAVAILABLE: list[dict] = []
+
+
+def unavailable_report() -> list[dict]:
+    """Packages this process asked for and could not get."""
+    return [dict(row) for row in _UNAVAILABLE]
+
+
+def clear_unavailable_report() -> None:
+    _UNAVAILABLE.clear()
+
+
+def _record_unavailable(repo: str, version: str, cause: BaseException):
+    row = {
+        "repo": repo,
+        "version": version,
+        "error": type(cause).__name__,
+        "detail": str(cause)[:400],
+    }
+    if not any(r["repo"] == repo and r["error"] == row["error"]
+               for r in _UNAVAILABLE):
+        _UNAVAILABLE.append(row)
+    return row
+
+
 def _check_arch(repo: str, module) -> None:
     archs = _declared_archs(module)
     if archs is None:
@@ -98,9 +130,11 @@ def _check_arch(repo: str, module) -> None:
     want = f"{cc[0]}.{cc[1]}"
     if any(_cuda_arch_supports_device(a, cc) for a in archs):
         return
-    raise KernelUnavailable(
+    refusal = KernelUnavailable(
         f"refused: kernel package {repo!r} declares archs {archs}, "
         f"device is sm {want}")
+    _record_unavailable(repo, "declared-archs", refusal)
+    raise refusal
 
 
 #: modules cached independently of the arch check: ``get_kernel`` must
@@ -119,9 +153,11 @@ def hub_kernel(repo: str, version: str):
         try:
             _LOADED[key] = get_kernel(repo, version=version)
         except (OSError, RuntimeError, ValueError) as unavailable:
+            _record_unavailable(repo, version, unavailable)
             raise KernelUnavailable(
                 f"kernel package {repo!r} ({version}) is unavailable on "
-                f"this host: {unavailable}") from unavailable
+                f"this host: {type(unavailable).__name__}: "
+                f"{unavailable}") from unavailable
     module = _LOADED[key]
     _check_arch(repo, module)
     return module

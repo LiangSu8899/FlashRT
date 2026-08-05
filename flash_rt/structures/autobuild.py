@@ -825,6 +825,7 @@ def auto_swaps(
                 if hasattr(adapter, "__name__") else str(adapter)
             break
 
+
     # ---- gated_delta_core: stateful host callable adapters ----
     if "gated_delta_core" in structures:
         from . import adapters as _adapters  # noqa: F401 (registers)
@@ -900,6 +901,18 @@ def auto_swaps(
         plan.precision_spec = _spec(collector, plan_notes_calibration)
     if plan_refusals:
         plan.notes.setdefault("refused", []).extend(plan_refusals)
+    # Skipping a package this host cannot supply is what lets one plan
+    # build everywhere, but it must never be silent: a package that is
+    # broken here and one that was never shipped here both come out as
+    # "skipped", and only the first is a defect. Carry the raw failures
+    # into the plan so they reach the receipt.
+    from .impls import unavailable_report
+    unavailable = unavailable_report()
+    if unavailable:
+        plan.notes["kernel_unavailable"] = unavailable
+        say(f"{len(unavailable)} kernel package(s) unavailable here: "
+            + ", ".join(f"{row['repo']} ({row['error']})"
+                        for row in unavailable))
     say(f"bound {len(plan.swaps)} seam(s), "
         f"{len(plan.notes.get('refused', []))} refused")
     return plan

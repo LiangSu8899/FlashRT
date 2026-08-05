@@ -57,3 +57,29 @@ def test_arch_refusal_uses_the_same_type(monkeypatch):
 
     impls.hub_kernel.cache_clear()
     impls._LOADED.clear()
+
+
+def test_the_run_keeps_going_but_the_failure_is_on_the_record(monkeypatch):
+    # a package that is broken here and one that was never shipped here
+    # both end up skipped; only the first is somebody's defect, so the
+    # raw failure has to survive the skip
+    impls.clear_unavailable_report()
+    impls.hub_kernel.cache_clear()
+    impls._LOADED.clear()
+
+    def import_blew_up(*args, **kwargs):
+        raise RuntimeError("undefined symbol: _ZN3c108internal")
+
+    monkeypatch.setattr("kernels.get_kernel", import_blew_up)
+    with pytest.raises(impls.KernelUnavailable):
+        impls.hub_kernel("flashrt/broken-build", ">=1")
+
+    report = impls.unavailable_report()
+    assert len(report) == 1
+    assert report[0]["repo"] == "flashrt/broken-build"
+    assert report[0]["error"] == "RuntimeError"
+    assert "undefined symbol" in report[0]["detail"]
+
+    impls.clear_unavailable_report()
+    impls.hub_kernel.cache_clear()
+    impls._LOADED.clear()
