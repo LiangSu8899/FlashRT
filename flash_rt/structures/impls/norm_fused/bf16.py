@@ -18,6 +18,12 @@ import torch
 from .. import hub_kernel
 from ...guard import CAST_OK, PROCEED, GuardedSeam
 
+KERNEL_DEP = {
+    "provider": "hf",
+    "repo": "flashrt/flashrt-residual-norm-quant",
+    "version": ">=1",
+}
+
 
 class FusedNorm(GuardedSeam, torch.nn.Module):
     """Drop-in for an affine LayerNorm, computed by a fused kernel."""
@@ -28,8 +34,8 @@ class FusedNorm(GuardedSeam, torch.nn.Module):
     def __init__(self, original: torch.nn.Module):
         super().__init__()
         self.host_norm = original
-        ks = hub_kernel("flashrt/flashrt-siglip-fwd-fusion", ">=1")
-        self._fn = ks.siglip_residual_layernorm_fwd
+        ks = hub_kernel(KERNEL_DEP["repo"], KERNEL_DEP["version"])
+        self._fn = ks.layer_norm_bf16
         self.register_buffer("w", original.weight.detach().to(
             torch.bfloat16))
         self.register_buffer("b", original.bias.detach().to(
@@ -42,9 +48,12 @@ class FusedNorm(GuardedSeam, torch.nn.Module):
         admitted = self._frt_admit(x)
         if admitted is not PROCEED:
             return admitted
-        y = self._fn(x.to(torch.bfloat16), None, self.w, self.b,
-                     self.eps)
-        return y.to(x.dtype)
+        # the kernel's contract is 2D [rows, width]; hosts hand the norm
+        # whatever leading shape their block carries
+        shape = x.shape
+        flat = x.reshape(-1, shape[-1]).to(torch.bfloat16).contiguous()
+        y = self._fn(flat, self.w, self.b, self.eps)
+        return y.reshape(shape).to(x.dtype)
 
     def __getattr__(self, name):
         try:
@@ -71,4 +80,15 @@ def bind_norm_fused(original: torch.nn.Module,
             "norm_fused: host already runs this norm at compute "
             f"dtype ({sorted(str(d) for d in host_dtypes)}) — nothing "
             "to collapse")
-    return FusedNorm(original)
+    bound = FusedNorm(original)
+    # bind-time smoke through the real entry point, at a 3D host shape:
+    # a stale build, a missing symbol, or a kernel whose rank contract
+    # moved must surface here as a clean bind refusal, not mid-forward
+    probe_in = torch.zeros(1, 2, bound.w.shape[0], device=bound.w.device)
+    probe = bound(probe_in)
+    if probe.shape != probe_in.shape or not torch.isfinite(probe).all():
+        raise ValueError(
+            f"refused: norm_fused bind smoke produced shape "
+            f"{tuple(probe.shape)}, "
+            f"finite={bool(torch.isfinite(probe).all())}")
+    return bound
