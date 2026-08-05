@@ -515,6 +515,68 @@ fe = flash_rt.load_model(
 # equivalently: GrootN17TorchFrontendThorFP16(checkpoint, num_views=2, embodiment_tag=...)
 ```
 
+**NVFP4 tier (opt-in, fastest verified Thor config).** `use_fp4=True`
+keeps the FP8 backbone and moves the action-head side to block-scaled
+NVFP4 with fused epilogues, plus a vectorized small-kernel tier and
+masked-softmax attention across the whole pipeline:
+
+* every DiT GEMM (fused self-attn QKV, cross-attn Q, attention output,
+  both FFN projections) runs as an NVFP4 GEMM with per-16-element
+  dynamic activation scales — no calibration pass — with bias,
+  bias+residual and bias+tanh-GELU+FP4-output fused into the epilogues;
+* the per-frame cross-KV projections are NVFP4 as well;
+* the AdaLN / pre-FFN norms emit FP4 directly, the self-attention reads
+  the fused QKV GEMM output in place, and the backbone's small
+  per-layer kernels (norms, RoPE, FP8 quantizes, GQA expand) run
+  16-byte-load vectorized variants;
+* the masked-softmax attention variants drop the per-layer -inf logits
+  pre-fill, which also makes graph replays exactly deterministic;
+* the three backbone attention sites (ViT, LLM causal-GQA,
+  VL-self-attn) run the vendored FlashAttention-4 (CuTe-DSL) forward
+  when its runtime deps are installed (the `thor-fa4` pip extra),
+  falling back to the fmha/cublas chain otherwise.
+
+```python
+fe = flash_rt.load_model(
+    "/path/to/GR00T-N1.7-3B",
+    framework="torch", config="groot_n17", hardware="thor",
+    use_fp4=True,
+    num_views=2, embodiment_tag="oxe_droid_relative_eef_relative_joint",
+)
+# equivalently: GrootN17TorchFrontendThorFP4(checkpoint, num_views=2, embodiment_tag=...)
+```
+
+Reference (Jetson AGX Thor, JetPack 7.2, MAXN; wall-clock per-frame
+image→action e2e, 4 denoising steps, batch 1, medians over 20
+iterations after 5 warmup iterations, run as one same-session A/B/A
+against the FP8 default):
+
+| Checkpoint / cameras | FP8 | NVFP4 + FA4 | Speedup |
+|---|---:|---:|---:|
+| LIBERO fine-tune (`libero_10`), 1 camera | 36.8 ms (27 Hz) | **23.7 ms (42 Hz)** | 1.56× |
+| Base `GR00T-N1.7-3B`, 2 cameras, `T=40` | 50.2 ms (20 Hz) | **29.9 ms (33 Hz)** | 1.70× |
+
+Action cosine against the FP8 tier is 1.000000 on the LIBERO fixture
+and 0.99994 on the 2-view base-checkpoint fixture; graph replays are
+bit-identical on both tiers. Without the FA4 runtime deps the tier
+still runs (fmha/cuBLAS fallback), roughly 5 ms slower on the 2-view
+shape. (Absolute Thor latencies drift ~1 ms at day scale; the
+same-session speedup is the stable metric.)
+
+Reproduce with:
+
+```bash
+python benchmarks/groot_n17_thor_latency.py \
+    --ckpt <n17-checkpoint-dir> --aux <aux-fixture.pt> \
+    --tier fp4 --views 1 --embodiment libero_sim --warmup 5 --iters 20
+```
+
+Across an 8-sample set captured from the base checkpoint the tier holds
+action cosine ≥ 0.9993 against the FP8 tier on 7 of 8 samples, with a
+worst sample of 0.9976; on the LIBERO fine-tune it matches the FP8 tier
+to 1.000000. For accuracy-critical deployments, validate on the target
+task rather than on cosine alone, or run the FP8 tier.
+
 ### GROOT N1.7 RTX
 
 GROOT N1.7 is registered for the RTX SM120 / SM89 torch path:
@@ -598,13 +660,18 @@ The gripper DOF is a near-constant scalar whose cosine is intrinsically noisy
 (the bf16 reference itself scores ≈ 0.94); the combined action cosine clears
 the ≥ 0.999 bar on both paths.
 
-RTX 5090 latency (warm, P50):
+RTX 5090 latency (warm, P50), with the backbone run eagerly — that is,
+`infer()` without `aux=`:
 
 | Stage | FP8 (default) | full-FP16 (opt-in) |
 |---|---:|---:|
 | Backbone (ViT+LLM+VL self-attn, per observation) | 12.8 ms | 15.3 ms |
 | Infer (DiT 4-step loop, CUDA graph) | 10.7 ms | 10.9 ms |
 | E2E (backbone + infer) | 24.0 ms | 26.6 ms |
+
+Passing `aux=` to `infer()` on the RTX FP8 path captures and replays the
+backbone graph as well, covering the whole backbone-to-action path and
+bringing E2E to **16.61 ms** on RTX 5090 (2-view base checkpoint).
 
 FP8 saves ≈ 2.7 ms E2E (1.11×), concentrated in the backbone GEMMs (1.19×);
 the DiT is never quantized, so infer is effectively the same on both paths.

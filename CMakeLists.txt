@@ -1368,6 +1368,22 @@ set_target_properties(flash_rt_kernels PROPERTIES
   LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
 
+# ── Thor-class VLA helper kernels (SM100/SM110 only) ──
+# The masked-softmax MHA variants and the 16-byte-load norm/rope/quantize
+# rewrites exist for the GROOT N1.7 Thor path; their element math targets
+# SM100-class memory behaviour and no SM8x frontend calls them. Their
+# bindings in csrc/bindings.cpp are guarded by FLASHRT_HAVE_THOR_VLA_KERNELS
+# so source and binding drop together on other architectures.
+if(ENABLE_SM100_CUTLASS)
+  target_sources(flash_rt_kernels PRIVATE
+    csrc/kernels/attention_mha_masked.cu
+    csrc/kernels/vec_fp16_backbone.cu)
+  target_compile_definitions(flash_rt_kernels PRIVATE FLASHRT_HAVE_THOR_VLA_KERNELS=1)
+  message(STATUS "Thor VLA helper kernels: ENABLED (sm_${GPU_ARCH})")
+else()
+  message(STATUS "Thor VLA helper kernels: DISABLED (SM100-class only)")
+endif()
+
 if(FLASHRT_ENABLE_COSMOS3_EDGE)
   target_sources(flash_rt_kernels PRIVATE csrc/kernels/cosmos3_edge_misc.cu)
   target_compile_definitions(flash_rt_kernels PRIVATE FLASHRT_HAVE_COSMOS3_EDGE=1)
@@ -1714,6 +1730,9 @@ if(ENABLE_SM100_CUTLASS)
     csrc/fused_fp4/silu_mul_mul_fp4_sfa_v2.cu
     csrc/fused_fp4/silu_mul_two_fp4_to_fp4.cu
     csrc/gemm/fp4/cutlass_fp4_gemm_fp4out.cu
+    csrc/gemm/fp4/cutlass_fp4_gemm_bias_bf16_sm100.cu
+    csrc/quantize/quantize_fp4_sfa_bf16.cu
+    csrc/fused_fp4/dit_norm_fp4_sfa.cu
   )
   if(FLASHRT_ENABLE_COSMOS3_EDGE)
     target_sources(fp4_kernels_obj PRIVATE

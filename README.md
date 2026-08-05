@@ -111,8 +111,11 @@ Baseline comparisons and source methodology live in [Benchmark Comparison](docs/
 
 | Hardware | Mode | Latency | Throughput | Source |
 |---|---|---:|---:|---|
-| Jetson AGX Thor | DiT path | **49 ms** | **20 Hz** | [GROOT N1.7 API](#groot-n17-rtx) |
-| RTX 5090 | DiT path | **22 ms** | **45 Hz** | [GROOT N1.7 API](#groot-n17-rtx) |
+| Jetson AGX Thor | NVFP4 + FA4, LIBERO 1-view | **23.7 ms** | **42 Hz** | [N1.7 Thor NVFP4](USAGE.md#groot-n17-thor) |
+| Jetson AGX Thor | FP8, LIBERO 1-view | **36.8 ms** | **27 Hz** | [Benchmark comparison](docs/benchmark_comparison.md#groot-n17-on-jetson-agx-thor) |
+| Jetson AGX Thor | NVFP4 + FA4, 2-view | **29.9 ms** | **33 Hz** | [N1.7 Thor NVFP4](USAGE.md#groot-n17-thor) |
+| Jetson AGX Thor | FP8, 2-view | **50.2 ms** | **20 Hz** | [GROOT N1.7 API](#groot-n17-rtx) |
+| RTX 5090 | FP8, 2-view base, full graph | **16.6 ms** | **60 Hz** | [GROOT N1.7 API](#groot-n17-rtx) |
 
 #### Pi0-FAST
 
@@ -609,7 +612,8 @@ data regardless of cache.
 Optional NVFP4 (Blackwell block-scaled FP4) quantization on the Pi0.5 encoder
 FFN stack. Implemented for **Pi0.5 torch and JAX on Thor** — passing
 `use_fp4=True` with any other config (pi0 / groot / pi0fast) emits a warning
-and uses the FP8 route.
+and uses the FP8 route. (`config="groot_n17"` on Thor has its own NVFP4
+tier behind the same flag — see [GROOT N1.7 Thor](USAGE.md#groot-n17-thor).)
 
 ```python
 model = flash_rt.load_model(
@@ -1060,7 +1064,7 @@ examples/
 - **Pi0.5** (`config="pi05"`) — [quickstart](#quick-start), [API reference](USAGE.md#api-reference), [NVFP4 notes](USAGE.md#nvfp4-pi05-only), [Thor example](examples/thor/README.md), [RTX 5090 example](examples/blackwell/README.md)
 - **Pi0** (`config="pi0"`) — [API snippets](#api-snippets), [usage guide](USAGE.md#api-reference)
 - **GROOT N1.6** (`config="groot"`) — [API snippets](#api-snippets), [GROOT embodiment slots](#groot-n16-embodiment-slots)
-- **GROOT N1.7** (`config="groot_n17"`) — 49 ms on Jetson AGX Thor, 22 ms on RTX 5090; [usage guide](USAGE.md#groot-n17-rtx), [API snippet](#groot-n17-rtx)
+- **GROOT N1.7** (`config="groot_n17"`) — 23.7 ms on Jetson AGX Thor (NVFP4 + FA4 tier, LIBERO 1-view; 36.8 ms FP8), 16.6 ms on RTX 5090 (2-view base, full graph); [usage guide](USAGE.md#groot-n17-rtx), [API snippet](#groot-n17-rtx)
 - **Pi0-FAST** (`config="pi0fast"`) — [usage guide](USAGE.md#pi0-fast), [performance modes](#pi0-fast-performance-modes)
 - **LingBot-VLA** — [LingBot usage](docs/lingbot_usage.md), [Thor latency](docs/lingbot_usage.md#5-accuracy--latency-thor-sm_110-cuda-graph-replay)
 - **Motus Stage3 RTX beta** (`config="motus"`) — [Motus usage](docs/motus_usage_beta.md), [legacy async chunk runner](docs/rtc_lite_design.md)

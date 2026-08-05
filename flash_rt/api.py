@@ -624,6 +624,15 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             "fallback. For the non-quantized full-FP16 reference pass "
             "use_fp16=True together with use_fp8=False.")
 
+    # GROOT N1.7 on Thor with use_fp4=True: NVFP4 DiT action head +
+    # NVFP4 cross-KV + vectorized backbone tier on top of the FP8
+    # backbone (fastest verified Thor config).
+    _n17_thor_fp4 = (use_fp4 and config == "groot_n17"
+                     and framework == "torch" and arch == "thor")
+    if _n17_thor_fp4 and use_fp16:
+        raise ValueError("use_fp4=True is incompatible with use_fp16=True "
+                         "for GROOT N1.7 on Thor")
+
     if use_fp16:
         if config == "pi05" and framework == "torch" and arch == "thor":
             # Pi0.5 Thor keeps FP8 and full-FP16 in the same frontend; the
@@ -667,6 +676,28 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                         GrootN17TorchFrontendRtxFP16,
                     )
                     pipe_cls = GrootN17TorchFrontendRtxFP16
+
+    # ── FP4 routing (GROOT N1.7 torch on Thor) ──
+    if _n17_thor_fp4:
+        try:
+            import flash_rt.flash_rt_fp4 as _fvk_fp4_n17
+            if not _fvk_fp4_n17.has_nvfp4():
+                logger.warning(
+                    "flash_rt_fp4 loaded but has_nvfp4()=False (SM100+ "
+                    "required). Falling back to the FP8 tier.")
+                _n17_thor_fp4 = False
+        except ImportError:
+            logger.warning(
+                "flash_rt_fp4 extension not available. Falling back to the "
+                "FP8 tier.")
+            _n17_thor_fp4 = False
+        if _n17_thor_fp4:
+            from flash_rt.frontends.torch.groot_n17_thor_fp4 import (
+                GrootN17TorchFrontendThorFP4,
+            )
+            pipe_cls = GrootN17TorchFrontendThorFP4
+            logger.info("GROOT N1.7 Thor NVFP4 tier enabled")
+        use_fp4 = False  # do not fall through to the Pi0.5 FP4 routing
 
     # ── FP4 routing (Pi0.5 torch + Pi0.5 JAX on Thor) ──
     if use_fp4:
