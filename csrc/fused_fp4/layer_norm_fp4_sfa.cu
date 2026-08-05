@@ -155,14 +155,6 @@ __global__ void layer_norm_fp4_sfa_kernel(
 
 #endif  // FV_HAVE_CUTLASS
 
-int layer_norm_fp4_sfa_fp16(
-    const __half* x, const __half* gamma, const __half* beta,
-    void* packed, void* sfa,
-    int seq_len, int dim, float eps, cudaStream_t stream) {
-    return layer_norm_mul_fp4_sfa_fp16(
-        x, gamma, beta, nullptr, packed, sfa, seq_len, dim, eps, stream);
-}
-
 int layer_norm_mul_fp4_sfa_fp16(
     const __half* x, const __half* gamma, const __half* beta,
     const __half* inv_s,

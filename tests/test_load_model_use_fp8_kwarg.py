@@ -385,7 +385,10 @@ def test_load_model_routes_pi05_torch_thor_decoder_fp4(monkeypatch):
         "use_awq": False,
         "awq_alpha": 0.8,
         "use_p1_split_gu": False,
-        "encoder_p1_combiner": "lut_native",
+        # use_fp4_decoder=True selects the measured Thor NVFP4 tier, whose
+        # encoder combiner is the fused GeGLU epilogue. use_fp4=True alone
+        # still resolves to "lut_native".
+        "encoder_p1_combiner": "epilogue_hw",
         "encoder_down_variant": 7,
         "decoder_gate_up_variant": 10,
         "state_prompt_mode": "exact",

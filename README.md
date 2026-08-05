@@ -636,10 +636,25 @@ model = flash_rt.load_model(
 - `use_awq` = `True` — activation-aware weight quantization (AWQ)
 - `use_p1_split_gu` = `True` — P1 split-GU 2-GEMM path
 
-When the experimental decoder path is also selected with
-`use_fp4_decoder=True`, the preset uses `awq_alpha=0.8`. The decoder path is a
-strict opt-in: unavailable kernels and unsupported modes raise errors rather
-than selecting FP8 projections.
+Adding `use_fp4_decoder=True` selects the complete Thor NVFP4 tier the
+latency table above is measured with, resolving the remaining sub-flags to
+`awq_alpha=0.8`, `use_fp4_encoder_attn=True`, `use_fp4_siglip_ffn=True` and
+`encoder_p1_combiner="epilogue_hw"`:
+
+```python
+model = flash_rt.load_model(
+    checkpoint, config="pi05", framework="torch", hardware="thor",
+    num_views=3,
+    use_fp4=True, use_fp4_decoder=True,
+    use_fa4=True,    # attention backend; independent of the NVFP4 flags
+)
+```
+
+The decoder path is a strict opt-in: unavailable kernels and unsupported
+modes raise errors rather than selecting FP8 projections. `use_fa4=True` is
+also supported on the FP8 frontend and is what the FP8 baseline in that
+table runs, so the reported speedup isolates NVFP4 rather than the
+attention backend.
 
 Advanced users can override any sub-flag explicitly at `load_model()` call
 time (e.g. `fp4_layers=(7, 8, 9), use_awq=False` reverts to the conservative

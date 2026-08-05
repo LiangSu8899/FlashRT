@@ -224,24 +224,9 @@ Phase 4 will add the layout conversion helper.
         "Fused LayerNorm + per-channel AWQ inverse scale + NVFP4/SFA "
         "quantize (inv_s = 0 for the plain path).");
 
-  m.def("layer_norm_fp4_sfa_fp16",
-        [](uintptr_t x, uintptr_t gamma, uintptr_t beta,
-           uintptr_t packed, uintptr_t sfa,
-           int seq_len, int dim, float eps, uintptr_t stream) -> int {
-          return flash_rt::fused_fp4::layer_norm_fp4_sfa_fp16(
-              reinterpret_cast<const __half*>(x),
-              reinterpret_cast<const __half*>(gamma),
-              reinterpret_cast<const __half*>(beta),
-              reinterpret_cast<void*>(packed),
-              reinterpret_cast<void*>(sfa),
-              seq_len, dim, eps,
-              reinterpret_cast<cudaStream_t>(stream));
-        },
-        py::arg("x"), py::arg("gamma"), py::arg("beta"),
-        py::arg("packed"), py::arg("sfa"),
-        py::arg("seq_len"), py::arg("dim"), py::arg("eps") = 1e-5f,
-        py::arg("stream") = 0,
-        "Fused LayerNorm (gamma/beta) + NVFP4 quantize + SFA write.");
+  // The plain (no inverse-scale) LayerNorm→NVFP4 variant is reachable
+  // through layer_norm_mul_fp4_sfa_fp16 with inv_s = 0; it is deliberately
+  // not exported a second time under its own name.
 
   // ── Dynamic quantize ──
   m.def("quantize_fp4_dynamic_fp16",

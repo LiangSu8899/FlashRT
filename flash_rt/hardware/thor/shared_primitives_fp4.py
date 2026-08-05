@@ -23,6 +23,21 @@ Uses:
 import math
 
 
+def _check(rc, kernel, layer, **shape):
+    """Raise on a non-zero NVFP4 GEMM status.
+
+    The NVFP4 GEMM bindings report can_implement, initialize, workspace and
+    run failures through a return code rather than an exception, so an
+    unchecked call would leave the destination buffer untouched and let the
+    pipeline consume stale data. (The fused elementwise bindings validate in
+    C++ and raise directly; they return nothing and are not wrapped here.)
+    """
+    if rc != 0:
+        dims = ", ".join(f"{name}={value}" for name, value in shape.items())
+        raise RuntimeError(
+            f"{kernel} failed at encoder layer {layer} ({dims}) rc={rc}")
+
+
 def encoder_forward_with_fp4_subset(gemm, fvk, fvk_fp4, bufs, weights, dims,
                                      stream=0, *, attn=None,
                                      fp4_layers: set = None,
@@ -237,32 +252,38 @@ def encoder_forward_with_fp4_subset(gemm, fvk, fvk_fp4, bufs, weights, dims,
                     # epilogue and writes Down's stock input buffer directly.
                     w_il = fp4_weights[l]['gu_il']
                     if p1_combiner == 'epilogue_hw':
-                        fvk_fp4.cutlass_fp4_gemm_geglu_il_hw(
+                        _check(fvk_fp4.cutlass_fp4_gemm_geglu_il_hw(
                             sc_gu.packed.data_ptr(), sc_gu.sfa.data_ptr(),
                             w_il['packed'].data_ptr(), w_il['sfb'].data_ptr(),
                             p1_dummy,
                             sc_dn.packed.data_ptr(), sc_dn.sfa.data_ptr(),
-                            Se, 2 * H, D, stream)
+                            Se, 2 * H, D, stream),
+                            "cutlass_fp4_gemm_geglu_il_hw", l,
+                            M=Se, N_il=2 * H, K=D)
                     else:
-                        fvk_fp4.cutlass_fp4_gemm_geglu_il(
+                        _check(fvk_fp4.cutlass_fp4_gemm_geglu_il(
                             sc_gu.packed.data_ptr(), sc_gu.sfa.data_ptr(),
                             w_il['packed'].data_ptr(), w_il['sfb'].data_ptr(),
                             p1_il_p4, p1_il_sfa,
-                            Se, 2 * H, D, stream)
+                            Se, 2 * H, D, stream),
+                            "cutlass_fp4_gemm_geglu_il", l,
+                            M=Se, N_il=2 * H, K=D)
                 elif use_p1_split_gu and 'gate' in fp4_weights[l]:
                     # ── P1 split-GU path: 2× fp4out GEMM + geglu_two_fp4 ──
                     w_g = fp4_weights[l]['gate']
                     w_u = fp4_weights[l]['up']
-                    fvk_fp4.cutlass_fp4_gemm_fp4out(
+                    _check(fvk_fp4.cutlass_fp4_gemm_fp4out(
                         sc_gu.packed.data_ptr(), sc_gu.sfa.data_ptr(),
                         w_g['packed'].data_ptr(), w_g['sfb'].data_ptr(),
                         p1_gate_p4, p1_gate_sfa,
-                        Se, H, D, stream)
-                    fvk_fp4.cutlass_fp4_gemm_fp4out(
+                        Se, H, D, stream),
+                        "cutlass_fp4_gemm_fp4out[gate]", l, M=Se, N=H, K=D)
+                    _check(fvk_fp4.cutlass_fp4_gemm_fp4out(
                         sc_gu.packed.data_ptr(), sc_gu.sfa.data_ptr(),
                         w_u['packed'].data_ptr(), w_u['sfb'].data_ptr(),
                         p1_up_p4, p1_up_sfa,
-                        Se, H, D, stream)
+                        Se, H, D, stream),
+                        "cutlass_fp4_gemm_fp4out[up]", l, M=Se, N=H, K=D)
                     # silu_mul → fp4 + SFA, write to sc_dn so the Down GEMM
                     # consumes it identically to the non-P1 path. With AWQ,
                     # apply Down inv_s in the same kernel.
@@ -298,12 +319,14 @@ def encoder_forward_with_fp4_subset(gemm, fvk, fvk_fp4, bufs, weights, dims,
                             f"unknown P1 combiner: {p1_combiner!r}")
                 else:
                     # ── Original AWQ-fused (or non-AWQ) path ──
-                    fvk_fp4.cutlass_fp4_gemm_variant(
+                    _check(fvk_fp4.cutlass_fp4_gemm_variant(
                         variant_gu,
                         sc_gu.packed.data_ptr(), sc_gu.sfa.data_ptr(),
                         w_gu['packed'].data_ptr(), w_gu['sfb'].data_ptr(),
                         gate_fp16_ptr,
-                        Se, H * 2, D, 1.0, 0.0, stream)
+                        Se, H * 2, D, 1.0, 0.0, stream),
+                        f"cutlass_fp4_gemm_variant[gate_up,v{variant_gu}]", l,
+                        M=Se, N=H * 2, K=D)
 
                     if awq_dn is None:
                         fvk_fp4.gate_geglu_fp4_sfa_v2_fp16(
@@ -319,19 +342,23 @@ def encoder_forward_with_fp4_subset(gemm, fvk, fvk_fp4, bufs, weights, dims,
                 if (use_p1_split_gu and 'gu_il' in fp4_weights[l]
                         and p1_combiner == 'epilogue'):
                     w_dx = fp4_weights[l]['down_x']
-                    fvk_fp4.cutlass_fp4_gemm_variant(
+                    _check(fvk_fp4.cutlass_fp4_gemm_variant(
                         variant_dn_x,
                         p1_il_p4, p1_il_sfa,
                         w_dx['packed'].data_ptr(), w_dx['sfb'].data_ptr(),
                         fg_fp16_ptr,
-                        Se, D, 2 * H, 1.0, 0.0, stream)
+                        Se, D, 2 * H, 1.0, 0.0, stream),
+                        f"cutlass_fp4_gemm_variant[down_x,v{variant_dn_x}]", l,
+                        M=Se, N=D, K=2 * H)
                 else:
-                    fvk_fp4.cutlass_fp4_gemm_variant(
+                    _check(fvk_fp4.cutlass_fp4_gemm_variant(
                         variant_dn,
                         sc_dn.packed.data_ptr(), sc_dn.sfa.data_ptr(),
                         w_dn['packed'].data_ptr(), w_dn['sfb'].data_ptr(),
                         fg_fp16_ptr,
-                        Se, D, H, 1.0, 0.0, stream)
+                        Se, D, H, 1.0, 0.0, stream),
+                        f"cutlass_fp4_gemm_variant[down,v{variant_dn}]", l,
+                        M=Se, N=D, K=H)
 
                 # 11. residual + RMSNorm → FP8 for next layer (unchanged)
                 # Uses fg_fp16 (Down GEMM fp16 output) as the residual delta.

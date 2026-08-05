@@ -462,8 +462,24 @@ path uses a precomputed 256-entry FP16 normalization table and a reused host
 buffer. This replaces per-frame uint8-to-FP32-to-FP16 allocations while
 producing bit-identical normalized images and bit-identical model outputs.
 
-The production FP8 frontend remains the default. The opt-in is exposed through
-`load_model(..., use_fp4=True, use_fp4_decoder=True)`. The decoder FP4 path
+The production FP8 frontend remains the default. The complete measured tier is
+exposed through the public API as:
+
+```python
+model = flash_rt.load_model(
+    checkpoint, config="pi05", framework="torch", hardware="thor",
+    num_views=3, use_fp4=True, use_fp4_decoder=True, use_fa4=True)
+```
+
+`use_fp4_decoder=True` resolves the remaining sub-flags to the measured
+values — `use_fp4_encoder_attn=True`, `use_fp4_siglip_ffn=True`,
+`encoder_p1_combiner="epilogue_hw"`, `awq_alpha=0.8` — and each can still be
+overridden explicitly. `use_fp4=True` on its own keeps the earlier
+encoder-only preset. `tests/test_pi05_thor_fp4_routing.py` asserts the
+resolved constructor arguments against the harness's own preset table, so the
+published configuration and the public API cannot drift apart.
+
+The decoder FP4 path
 currently supports standard Torch B=1 inference only. CFG, batched inference,
 and model-runtime export raise explicit errors when enabled. Unsupported
 hardware, shapes, missing kernels, invalid variants, or failed launches also
@@ -471,8 +487,18 @@ raise; none select FP8 implicitly.
 
 ## Verification Contract
 
-The committed harness is `tests/bench_pi05_decoder_fp4_e2e.py`. The current
-multi-view run used:
+The committed harness is `tests/bench_pi05_decoder_fp4_e2e.py`. It defaults to
+`--construct load_model`, which builds both processes through the public
+`flash_rt.load_model()` API and refuses to run when any sweep knob deviates
+from the published preset; `--construct frontend` instantiates the frontend
+classes directly and is required for the exploratory A/B knobs, and results
+from that mode are not public-API numbers. The recorded `result.json` carries
+the mode in `construction` and the exact call in `children.*.public_api_call`.
+
+Both processes run FA4: the comparison isolates NVFP4 against FP8 with the
+attention backend held fixed, so the reported speedup is not an FA4 speedup.
+
+The current multi-view run used:
 
 - NVIDIA Thor, compute capability 11.0, MAXN.
 - GPC min/max/current 1.575 GHz.
@@ -635,8 +661,14 @@ Reproduction command, repeated with `--num-views 1`, `2`, and `3`:
 ```bash
 PYTHONPATH=<repo-root> python tests/bench_pi05_decoder_fp4_e2e.py \
   --num-views 2 \
+  --checkpoint <pi05-safetensors-checkpoint-dir> \
+  --fixture <dir>/libero_obs_2v_n8.npz \
   --output-dir <output-dir>
 ```
+
+`--checkpoint` and `--fixture` also read `$PI05_CHECKPOINT` and
+`$PI05_FIXTURE_DIR` (the latter holding `libero_obs_<views>v_n8.npz`). The
+default `--construct load_model` is what produces the table above.
 
 The FA4 path additionally needs its runtime dependencies on the
 interpreter's path (the `thor-fa4` pip extra) and the CUDA runtime

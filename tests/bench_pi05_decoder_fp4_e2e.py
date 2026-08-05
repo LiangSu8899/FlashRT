@@ -34,6 +34,47 @@ PROMPT_TOKENS = [
     2040, 665, 575, 573, 24655, 108,
 ]
 
+# The published Thor configuration, written as the sweep-knob values that
+#   flash_rt.load_model(config="pi05", hardware="thor", framework="torch",
+#                       use_fp4=True, use_fp4_decoder=True, use_fa4=True)
+# resolves to (either through the load_model preset or through a frontend
+# default load_model leaves untouched). --construct load_model refuses to run
+# with any other value, so a published number can only come from a
+# configuration the public API reproduces.
+PUBLIC_API_PRESET = {
+    "encoder_gu_mode": "p1",
+    "encoder_p1_combiner": "epilogue_hw",
+    "encoder_down_variant": 7,
+    "encoder_down_x_variant": 6,
+    "decoder_gate_up_variant": 10,
+    "decoder_weight_format": "nvfp4",
+    "decoder_act_format": "nvfp4",
+    "decoder_rht": 0,
+    "decoder_fused_attn": 0,
+    "decoder_fused_geglu": 1,
+    "awq_alpha": 0.8,
+    "encoder_attn_o_fp4": 1,
+    "encoder_attn_qkv_fp4": 0,
+    "siglip_ffn_fp4": 1,
+    "encoder_fp4_layer_count": 17,
+}
+
+
+def public_api_kwargs(mode: str, checkpoint: str, num_views: int) -> dict:
+    """The exact load_model() call behind each published latency column."""
+    kwargs = dict(
+        checkpoint=checkpoint,
+        framework="torch",
+        config="pi05",
+        hardware="thor",
+        num_views=num_views,
+        autotune=3,
+        use_fa4=True,
+    )
+    if mode == "fp4":
+        kwargs.update(use_fp4=True, use_fp4_decoder=True)
+    return kwargs
+
 
 def machine_state() -> dict[str, object]:
     power = subprocess.run(
@@ -128,10 +169,19 @@ def main() -> int:
              "the extra quantize step costs ~0.3 ms and precision margin")
     parser.add_argument(
         "--siglip-ffn-fp4", type=int, choices=(0, 1), default=1,
-        help="NVFP4 SigLIP FFN on the validated 16-layer preset")
+        help="NVFP4 SigLIP FFN on all 27 vision layers")
     parser.add_argument(
         "--encoder-fp4-layer-count", type=int, choices=range(18),
         default=17, help="FP4-quantize this many leading live encoder FFNs")
+    parser.add_argument(
+        "--construct", choices=("load_model", "frontend"),
+        default="load_model",
+        help="How to build the pipelines. 'load_model' (default, and the "
+             "mode the published latency table is measured in) goes through "
+             "the public flash_rt.load_model() API and rejects any sweep "
+             "knob that deviates from the published preset. 'frontend' "
+             "instantiates the frontend classes directly and is what the "
+             "non-default sweep knobs require.")
     parser.add_argument(
         "--cuda-profile", action="store_true",
         help="capture one stable-state infer with cudaProfilerStart/Stop")
@@ -139,6 +189,20 @@ def main() -> int:
 
     if args.warmup < 5 or args.iters < 20:
         raise ValueError("strict E2E requires --warmup >= 5 and --iters >= 20")
+    if args.construct == "load_model":
+        deviations = {
+            name: getattr(args, name)
+            for name, expected in PUBLIC_API_PRESET.items()
+            if getattr(args, name) != expected
+        }
+        if deviations:
+            raise ValueError(
+                "--construct load_model runs exactly the configuration "
+                "flash_rt.load_model() produces, so these knobs cannot be "
+                f"overridden: {deviations} (published preset: "
+                f"{ {k: PUBLIC_API_PRESET[k] for k in deviations} }). "
+                "Re-run with --construct frontend to sweep them; results "
+                "from that mode are not public-API numbers.")
     if args.awq_alpha <= 0:
         raise ValueError("--awq-alpha must be positive")
     if args.checkpoint is None:
@@ -178,7 +242,13 @@ def main() -> int:
         if args.output_dir is None:
             raise ValueError("child mode requires --output-dir")
 
-        if args.child_mode == "fp8":
+        if args.construct == "load_model":
+            from flash_rt import load_model
+            pipe = load_model(
+                **public_api_kwargs(
+                    args.child_mode, args.checkpoint, args.num_views)
+            ).pipeline
+        elif args.child_mode == "fp8":
             from flash_rt.frontends.torch.pi05_thor import (
                 Pi05TorchFrontendThor)
             pipe = Pi05TorchFrontendThor(
@@ -262,6 +332,11 @@ def main() -> int:
             raw=raw_array, actions=action_array)
         result = {
             "mode": args.child_mode,
+            "construction": args.construct,
+            "public_api_call": (
+                public_api_kwargs(
+                    args.child_mode, "<checkpoint>", args.num_views)
+                if args.construct == "load_model" else None),
             "device": device_name,
             "compute_capability": list(capability),
             "torch": torch.__version__,
@@ -292,7 +367,7 @@ def main() -> int:
                         "nvfp4_awq" if args.encoder_attn_qkv_fp4
                         else "fp8"),
                     "siglip_ffn": (
-                        "nvfp4_16_layers" if args.siglip_ffn_fp4
+                        "nvfp4_all_27_layers" if args.siglip_ffn_fp4
                         else "fp8"),
                     "encoder_gu_mode": args.encoder_gu_mode,
                     "encoder_p1_combiner": args.encoder_p1_combiner,
@@ -374,6 +449,7 @@ def main() -> int:
             "--encoder-attn-o-fp4", str(args.encoder_attn_o_fp4),
             "--encoder-attn-qkv-fp4", str(args.encoder_attn_qkv_fp4),
             "--siglip-ffn-fp4", str(args.siglip_ffn_fp4),
+            "--construct", args.construct,
         ]
         child = subprocess.run(
             command, check=False, capture_output=True, text=True,
@@ -457,6 +533,7 @@ def main() -> int:
     result = {
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "commit": commit,
+        "construction": args.construct,
         "checkpoint": str(Path(args.checkpoint).resolve()),
         "fixture": str(Path(args.fixture).resolve()),
         "prompt_tokens": PROMPT_TOKENS,
