@@ -62,7 +62,8 @@ LeRobot port. Both are measured on the same prepared model-level
 inputs (exported once, loaded by both), pinned noise, median of
 interleaved rounds, and all three execution forms on each host.
 Parity is the treated output against that host's own untouched eager
-run. The **same `build()` — every seat path, every binder call — ran
+run; each arm re-measures the stock graph in its own process (24 ±3%
+across runs — read speedups, not cross-run milliseconds). The **same `build()` — every seat path, every binder call — ran
 on both hosts without a single edit**: the LeRobot port vendors the
 official module layout, so the seat tables transfer verbatim.
 
@@ -81,8 +82,8 @@ official module layout, so the seat tables transfer verbatim.
 |---|---|---|---|
 | eager | 42.0 ms | 53.6 ms | 51.9 ms |
 | compiled | 33.7 ms | 31.0 ms | 29.7 ms |
-| **captured** | 23.9 ms | 18.16 ms (1.31×) | **16.84 ms** (1.42×) |
-| parity | — | 0.99990 | 0.99989 |
+| **captured** | 23.9 ms | 17.94 ms (1.37×) | **16.84 ms** (1.42×) |
+| parity | — | 0.99962 | 0.99989 |
 | runtime fallbacks | — | 264 (`qkv_rope`, guarded) | 0 |
 
 What the tables say:
@@ -97,12 +98,20 @@ What the tables say:
 3. **The two paths meet at full speed where every seam holds** — on
    the official host the automatic path's 69 extra seams buy 1.4%
    (16.38 vs 16.61). On the LeRobot host the automatic path binds a
-   `qkv_rope` family whose cos/sin contract drifts every call; the
-   guards catch it, fall back to the host, and parity holds — but the
-   captured graph then carries the fallback path per drifted seam,
-   which is the 18.16 vs 16.84 gap. The explicit assembly never
+   `qkv_rope` family whose rope tables can never satisfy the FP32
+   contract on this host (see the loading note below); the guards
+   refuse every call before any work is done and run the host path,
+   parity holds, and the ledger says so. The explicit assembly never
    declared that seat: armor versus aim, measured.
-4. The capture harness itself is where host coupling lives: porting it
+4. **A host loading note that costs real precision**: the LeRobot
+   recipe `from_pretrained(...).to(dtype=bf16)` casts *every* floating
+   buffer — including the rotary `inv_freq` that transformers'
+   dtype-aware loading deliberately keeps in FP32. On this host the
+   vision rope tables are therefore born BF16; loading with
+   `from_pretrained(..., dtype=bf16)` instead keeps them FP32. This is
+   why the `qkv_rope` family refuses here, and it is a precision loss
+   the host pays with or without structures.
+5. The capture harness itself is where host coupling lives: porting it
    from the official host's transformers to the LeRobot venv's newer
    release took three contract adaptations (a rope-index signature, a
    vision-output class, an input whitelist), each visible in

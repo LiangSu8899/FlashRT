@@ -193,6 +193,23 @@ class PackedQkvRopeAdapter:
                         "qkv_rope: host did not provide a (cos, sin) table"
                     )
                 cos, sin = position_embeddings
+                if (
+                    cos.dtype is not torch.float32
+                    or sin.dtype is not torch.float32
+                    or cos.device != hidden_states.device
+                    or sin.device != hidden_states.device
+                    or not cos.is_contiguous()
+                    or not sin.is_contiguous()
+                ):
+                    # checked before any work: a refused call must not
+                    # leave a wasted packed projection behind — under
+                    # CUDA graph capture that dead GEMM would replay
+                    # forever
+                    raise GuardRefused(
+                        "qkv_rope: cos/sin must be contiguous CUDA FP32 "
+                        "(a host loaded with a blanket .to(dtype) casts "
+                        "its rotary buffers and can never satisfy this)"
+                    )
                 packed = F.linear(
                     hidden_states, qkv_proj.weight, None
                 ).view(1, tokens, -1)
@@ -269,6 +286,11 @@ class PackedQkvRopeAdapter:
                     if guard is None or guard.mode == "raise":
                         raise
                     guard.refuse(str(refusal))
+                    if getattr(guard, "detached", False):
+                        # the guard has given up on this seam; honor it
+                        # here too — the host forward returns without
+                        # the routed shim in front of it
+                        self.forward = host_forward
                     # keyword, not positional: host signatures place
                     # extra parameters (rotary_pos_emb) between the
                     # required pair and the embeddings
