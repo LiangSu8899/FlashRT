@@ -186,6 +186,9 @@ def build(model, run_once) -> tuple[Assembly, dict]:
         for i, b in enumerate(vlsa_blocks)}
     PATCH = {"backbone.model.model.visual.patch_embed":
              base.visual.patch_embed}
+    DIT_OUT = {
+        f"action_head.model.transformer_blocks.{i}.attn1.to_out.0":
+        b.attn1.to_out[0] for i, b in enumerate(dit_blocks)}
     VISION_PROJ = {}
     for i, b in enumerate(visual_blocks):
         VISION_PROJ[f"backbone.model.model.visual.blocks.{i}.attn.qkv"] =             b.attn.qkv
@@ -203,6 +206,11 @@ def build(model, run_once) -> tuple[Assembly, dict]:
             slot.setdefault(field + "_rows", x.reshape(-1, x.shape[-1])
                             .shape[0])
             slot.setdefault(field + "_dtype", x.dtype)
+            vec = (x.detach().float().abs()
+                   .reshape(-1, x.shape[-1]).amax(0))
+            prev = slot.get(field + "_cvec")
+            slot[field + "_cvec"] = (vec if prev is None
+                                     else torch.maximum(prev, vec))
         return hook
 
     def record_pair(key):
@@ -245,7 +253,8 @@ def build(model, run_once) -> tuple[Assembly, dict]:
         hooks.extend(record_qkv(path, attn, ("to_q", "to_k", "to_v")))
     for path, norm in DIT_ADALN.items():
         hooks.append(norm.linear.register_forward_hook(record_pair(path)))
-    for path, mod in {**LANG_OPROJ, **VLSA_OUT, **VISION_PROJ}.items():
+    for path, mod in {**LANG_OPROJ, **VLSA_OUT, **VISION_PROJ,
+                      **DIT_OUT}.items():
         hooks.append(mod.register_forward_hook(record_input(path, "x")))
     for path, mod in PATCH.items():
         hooks.append(mod.register_forward_hook(record_input(path, "x")))
@@ -268,14 +277,30 @@ def build(model, run_once) -> tuple[Assembly, dict]:
         if bound is not None:
             asm.place(path, bound)
 
+    from flash_rt.structures.impls.vision_ffn import (
+        nvfp4_balance as vis_w4)
     for path, mlp in {**DIT_FF, **VLSA_FF}.items():
         c = cal[path]
         seam = Seam(structure="vision_ffn", path=path,
                     parent_path=path.rsplit(".", 1)[0], norm_attr="norm3",
                     dims={}, variant={}, fc_attrs=("net.0.proj", "net.2"))
-        bound = asm.take(path, "dit_ffn", lambda: vis_ffn.bind_mlp_seam(
-            seam_weights(model, seam), input_scale=c["x"] / 448.0,
-            hidden_scale=c["hidden"] / 448.0, original=mlp))
+        if c.get("x_rows", 1 << 30) <= 64:
+            # the denoise band is bandwidth-bound: half-width weights
+            # and the FP4 FFN wire (fc1's GEMM re-quantizes its own
+            # output, fc2 consumes the wire) take the seat
+            bound = asm.take(path, "dit_ffn_fp4",
+                             lambda: vis_w4.bind_mlp_seam(
+                                 seam_weights(model, seam),
+                                 channel_in=c["x_cvec"],
+                                 channel_hidden=c["hidden_cvec"],
+                                 original=mlp, fuse_wire=True))
+        else:
+            bound = asm.take(path, "dit_ffn",
+                             lambda: vis_ffn.bind_mlp_seam(
+                                 seam_weights(model, seam),
+                                 input_scale=c["x"] / 448.0,
+                                 hidden_scale=c["hidden"] / 448.0,
+                                 original=mlp))
         if bound is not None:
             asm.place(path, bound)
 
@@ -334,6 +359,22 @@ def build(model, run_once) -> tuple[Assembly, dict]:
     # question disappears on every host.
     for path, mod in {**LANG_OPROJ, **VLSA_OUT, **VISION_PROJ}.items():
         take_proj(path, mod, cal[path])
+
+    from flash_rt.structures.impls.linear_proj import (
+        nvfp4_balance as proj_w4)
+    for path, mod in DIT_OUT.items():
+        c = cal[path]
+        if "x_cvec" not in c or c.get("x_rows", 1 << 30) > 64:
+            continue
+        weights = {"w": mod.weight}
+        if mod.bias is not None:
+            weights["b"] = mod.bias
+        bound = asm.take(path, "linear_proj_fp4",
+                         lambda: proj_w4.bind_proj_seam(
+                             weights, channel_amax=c["x_cvec"],
+                             original=mod))
+        if bound is not None:
+            asm.place(path, bound)
 
     for path, attn in VLSA_QKV.items():
         c = cal[path]
@@ -437,19 +478,48 @@ def build(model, run_once) -> tuple[Assembly, dict]:
             continue
         scale = torch.tensor([max(c["x"] / 448.0, 1e-8)], device="cuda")
         norm = block.norm1
-        producer = asm.take(norm_path, "adaln_producer",
-                            lambda: bind_adaln_producer(
-                                norm, pairs, act_scale=scale,
-                                rows=c["rows"],
-                                dim=norm.norm.normalized_shape[0],
-                                locator=locator, norm="layer"))
-        if producer is None:
-            continue
-        parts = asm.take(attn_path, "qkv_pack", lambda: bind_qkv_pack(
-            [block.attn1.to_q, block.attn1.to_k, block.attn1.to_v],
-            scale, rows=c["rows"], in_dtype="fp8_static"))
-        if parts is None:
-            continue
+        if c.get("rows", 1 << 30) <= 64:
+            # denoise band: the producer norms straight into packed
+            # NVFP4 + swizzled scale factors and the pack consumes the
+            # wire — the form the chain race seats automatically, taken
+            # here by declaration
+            from flash_rt.structures.impls.qkv_pack import (
+                nvfp4_balance as pack_w4)
+            producer = asm.take(norm_path, "adaln_producer",
+                                lambda: bind_adaln_producer(
+                                    norm, pairs, act_scale=None,
+                                    rows=c["rows"],
+                                    dim=norm.norm.normalized_shape[0],
+                                    locator=locator, norm="layer",
+                                    out_format="nvfp4"))
+            if producer is None:
+                continue
+            parts = asm.take(attn_path, "qkv_pack_fp4",
+                             lambda: pack_w4.bind_qkv_pack(
+                                 [block.attn1.to_q, block.attn1.to_k,
+                                  block.attn1.to_v],
+                                 channel_amax=None, rows=c["rows"],
+                                 wire=True))
+            if parts is None:
+                continue
+            parts[0].accept_wire(producer.wire_sfa)
+        else:
+            producer = asm.take(norm_path, "adaln_producer",
+                                lambda: bind_adaln_producer(
+                                    norm, pairs, act_scale=scale,
+                                    rows=c["rows"],
+                                    dim=norm.norm.normalized_shape[0],
+                                    locator=locator, norm="layer"))
+            if producer is None:
+                continue
+            parts = asm.take(attn_path, "qkv_pack",
+                             lambda: bind_qkv_pack(
+                                 [block.attn1.to_q, block.attn1.to_k,
+                                  block.attn1.to_v],
+                                 scale, rows=c["rows"],
+                                 in_dtype="fp8_static"))
+            if parts is None:
+                continue
         locator = locator or producer.locator
         asm.place(norm_path, producer)
         for attr, mod in zip(("to_q", "to_k", "to_v"), parts):
