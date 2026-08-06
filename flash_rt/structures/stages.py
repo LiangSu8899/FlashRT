@@ -73,6 +73,16 @@ class CapturedStage:
     output: Any
     windows: Mapping[str, torch.Tensor]
     certification: dict[str, Any] = field(default_factory=dict)
+    #: family shape-lowerings applied to the host before capture. Replay
+    #: does not need them (a graph replays kernels, not Python), but the
+    #: host object stays pinned for any eager use until they are undone.
+    lowerings: tuple = ()
+
+    def restore_host(self) -> None:
+        """Undo every family lowering; the host runs eager as loaded."""
+        for lowering in reversed(self.lowerings):
+            lowering.undo()
+        self.lowerings = ()
 
     def replay(self, sync: bool = True) -> Any:
         with torch.cuda.stream(self.stream):
@@ -174,6 +184,14 @@ def capture(
         say(f"schedule normalized: {schedule.family}, "
             f"{schedule.steps} fixed step(s), exact={exact}")
 
+    lowerings: list = []
+    if model is not None:
+        from .impls.graph_lowering import lower_for_capture
+        lowerings = lower_for_capture(model, fn)
+        for lowering in lowerings:
+            say(f"graph lowering applied: {lowering.family} "
+                f"[{', '.join(lowering.pins)}]")
+
     declared_windows = dict(schedule.windows) if schedule is not None else {}
     for name, tensor in dict(windows or {}).items():
         if name in declared_windows \
@@ -184,23 +202,35 @@ def capture(
         declared_windows[name] = tensor
     windows = declared_windows
     stream = torch.cuda.Stream()
-    with torch.no_grad(), torch.cuda.stream(stream):
-        for _ in range(max(1, warmup)):
-            fn()
-        torch.cuda.synchronize()
+    try:
+        with torch.no_grad(), torch.cuda.stream(stream):
+            for _ in range(max(1, warmup)):
+                fn()
+            torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=stream):
+        # same grad mode as the warmups: a mode switch here changes the
+        # dynamo guards and a compiled fn recompiles inside the capture,
+        # which runs CUDA work no capture may record
+        with torch.no_grad(), torch.cuda.graph(graph, stream=stream):
             output = fn()
         torch.cuda.synchronize()
+    except Exception:
+        for lowering in reversed(lowerings):
+            lowering.undo()
+        raise
     say(f"stage captured ({len(windows)} window(s))")
 
     stage = CapturedStage(graph=graph, stream=stream, output=output,
-                          windows=windows)
+                          windows=windows, lowerings=tuple(lowerings))
     pick = output_of or (lambda out: out)
 
     cert: dict[str, Any] = {"windows": sorted(windows),
                             "gate_cos": gate_cos,
                             "min_speedup": min_speedup}
+    if lowerings:
+        cert["graph_lowering"] = [
+            {"family": low.family, "pins": list(low.pins),
+             **dict(low.details)} for low in lowerings]
     if schedule is not None:
         cert["schedule"] = {
             "family": schedule.family,

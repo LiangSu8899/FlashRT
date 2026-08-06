@@ -27,11 +27,22 @@ Everything is in-process and `handle.detach()` restores the host
 bit-for-bit. This buys the eager/compiled band with per-seam guards
 and a ledger.
 
-**Captured (full speed)** — a *form*, not a path: whole-graph CUDA
-capture needs the host's shape-derived constants pinned first (the
-lowering in `full_graph.py`, 176 lines, per host family). The
-automatic and explicit assemblies both reach their fastest numbers
-through this same harness; neither gets it for free.
+**Captured (full speed)** — one more mechanism call, not a harness:
+
+```python
+stage = structures.capture(torch.compile(hot), model=model)
+stage.replay()
+```
+
+When `capture` is handed the model, the registered host-family
+lowering adapter recognizes it, records one real request, pins that
+family's shape glue (both transformers vision-contract generations,
+plus wrapper glue via capability probe), and writes the family and its
+pins into the stage certification. `stage.restore_host()` takes every
+pin back off. The automatic and explicit assemblies reach their
+fastest numbers through this same door; a host no family recognizes is
+captured as-is, and a family that cannot pin safely refuses with a
+reason instead of leaving the host half-pinned.
 
 **Explicit** — the only tier with real orchestration in user code:
 seat tables, the author's own calibration hooks, direct binder calls —
@@ -47,7 +58,7 @@ seat.
 | official Isaac-GR00T source | **nothing** | 0 lines |
 | LeRobot source | **nothing** | 0 lines |
 | host process at run time | structure swaps attached onto the module tree | revertible; `detach()` restores the host bit-for-bit |
-| host process at run time (captured form only) | fixed-shape lowering: a set of function pins applied before capture and undone after | in-process only, never written to disk; every pin is one function in `full_graph.py::lower_backbone_to_fixed_shapes` (176 lines), each pinning a shape-derived constant of one fixed request |
+| host process at run time (captured form only) | fixed-shape lowering: function pins applied by the registered family adapter inside `structures.capture(model=...)`, undone by `stage.restore_host()` | in-process only, never written to disk; the family and its pins are listed in the stage certification |
 
 The author-owned code, by role:
 
@@ -55,7 +66,7 @@ The author-owned code, by role:
 |---|---|---|
 | `groot_n17.py::build` | **the explicit assembly itself** — seat tables, calibration hooks, binder calls | 215 |
 | `groot_n17.py` (rest) | host loading (34), input capture (~30), timing/report harness (132) | 287 |
-| `full_graph.py` | fixed-shape lowering (176) + capture/replay/noise-pin helpers (64) + harness (111) | 398 |
+| `full_graph.py` | captured-form harness: two `structures.capture` calls, interleaved replay timing, noise pin | 205 |
 | `lerobot_host.py`, `lerobot_full_graph.py` | the same measurement on the LeRobot host; `build()` is imported, not rewritten | ~300 |
 | `make_model_inputs.py` | exports one set of prepared model-level inputs both hosts consume | ~60 |
 

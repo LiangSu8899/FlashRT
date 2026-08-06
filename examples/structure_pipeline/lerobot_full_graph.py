@@ -1,11 +1,10 @@
 """LeRobot GR00T N1.7 at the captured form — explicit and automatic arms.
 
-Symmetry with the official-host measurement: same checkpoint, same
-prepared inputs, same fixed-shape lowering, same capture-and-replay
-protocol. The LeRobot backbone adds two per-call glue helpers on top of
-the shared Qwen3-VL forward; both early-exit when their result is
-already present in the input, so precomputing the two tensors once
-removes the capture-illegal work without touching host code.
+Same protocol as the official-host measurement, through the same
+mechanism door: the registered Qwen3-VL family lowering recognizes this
+host too (including its legacy position-id glue, pinned via a
+capability probe), so this file is loading, arms and timing — no
+host-specific capture engineering.
 """
 
 import argparse
@@ -17,8 +16,9 @@ import torch
 
 from transformers.feature_extraction_utils import BatchFeature
 
-from full_graph import (capture, lower_backbone_to_fixed_shapes,
-                        pin_action_noise, replay_ms)
+from flash_rt.structures import capture as capture_stage
+
+from full_graph import pin_action_noise, replay_ms
 from groot_n17 import build
 
 
@@ -45,35 +45,12 @@ def main() -> int:
         device="cuda", dtype=torch.bfloat16).eval()
     payload = torch.load(args.inputs, map_location="cpu",
                          weights_only=False)
-    vl_data = {k: (v.cuda() if torch.is_tensor(v) else v)
-               for k, v in payload["backbone_inputs"].items()}
+    vl_input = BatchFeature(data={
+        k: (v.cuda() if torch.is_tensor(v) else v)
+        for k, v in payload["backbone_inputs"].items()})
     action_input = BatchFeature(data={
         k: (v.cuda() if torch.is_tensor(v) else v)
         for k, v in payload["action_inputs"].items()})
-
-    # Precompute the two per-call glue tensors once. Both helpers
-    # early-exit when their key is already present, so the per-call
-    # path becomes pure tensor compute with fixed shapes.
-    glue = {k: vl_data[k] for k in
-            ("input_ids", "attention_mask", "pixel_values",
-             "image_grid_thw")}
-    model.backbone._ensure_mm_token_type_ids(glue)
-    model.backbone._ensure_legacy_qwen3_position_ids(glue)
-    if "mm_token_type_ids" in glue:
-        vl_data["mm_token_type_ids"] = glue["mm_token_type_ids"]
-    vl_input = BatchFeature(data=vl_data)
-
-    # position_ids is not on the backbone's input whitelist, so passing
-    # it through the request cannot reach the helper's early exit; pin
-    # the helper itself to the precomputed tensor. Same class of act as
-    # the rest of the lowering: a shape-derived constant of one fixed
-    # request, never a value-dependent quantity.
-    fixed_position_ids = glue.get("position_ids")
-    if fixed_position_ids is not None:
-        def pinned_position_ids(model_input,
-                                _pids=fixed_position_ids):
-            model_input["position_ids"] = _pids
-        model.backbone._ensure_legacy_qwen3_position_ids =             pinned_position_ids
 
     unpin = pin_action_noise()
 
@@ -82,18 +59,14 @@ def main() -> int:
         return model.action_head.get_action(
             features, action_input)["action_pred"]
 
-    with torch.inference_mode():
-        reference = hot().detach().float().cpu()
-
-    undo = lower_backbone_to_fixed_shapes(model, vl_data)
     try:
         with torch.inference_mode():
-            lowered = hot().detach().float().cpu()
-        lowering_cos = float(torch.nn.functional.cosine_similarity(
-            lowered.flatten(), reference.flatten(), dim=0))
+            reference = hot().detach().float().cpu()
 
-        pool = torch.cuda.graph_pool_handle()
-        stock_graph, _, _ = capture(hot, pool)
+        stock = capture_stage(
+            torch.compile(hot, mode="max-autotune-no-cudagraphs",
+                          fullgraph=False),
+            model=model, warmup=8, gate_cos=0, min_speedup=0)
 
         def run_once():
             with torch.inference_mode():
@@ -126,22 +99,25 @@ def main() -> int:
                 refresh_cross_attention_kv(
                     statics, processed["backbone_features"])
 
-        treated_graph, treated_out, _ = capture(hot, pool)
-        medians = replay_ms({"stock_graph": stock_graph,
-                             "structures_graph": treated_graph})
-        treated_graph.replay()
-        torch.cuda.synchronize()
-        parity = float(torch.nn.functional.cosine_similarity(
-            treated_out.detach().float().cpu().flatten(),
-            reference.flatten(), dim=0))
+        torch._dynamo.reset()
+        treated = capture_stage(
+            torch.compile(hot, mode="max-autotune-no-cudagraphs",
+                          fullgraph=False),
+            model=model, warmup=8, gate_cos=0, min_speedup=0)
 
+        medians = replay_ms({"stock_graph": stock,
+                             "structures_graph": treated})
+        treated.replay()
+        parity = float(torch.nn.functional.cosine_similarity(
+            treated.output.detach().float().cpu().flatten(),
+            reference.flatten(), dim=0))
         report = {
             "host": "lerobot GR00TN17",
             "arm": args.arm,
             "device": torch.cuda.get_device_name(),
             **seats,
             "kernel_unavailable": unavailable_report(),
-            "lowering_cosine": lowering_cos,
+            "graph_lowering": treated.certification.get("graph_lowering"),
             "parity_cosine": parity,
             "stock_graph_ms": medians["stock_graph"],
             "structures_graph_ms": medians["structures_graph"],
@@ -151,11 +127,12 @@ def main() -> int:
         }
         print(json.dumps(report, indent=2, default=str))
         if args.report:
-            args.report.write_text(
-                json.dumps(report, indent=2, default=str))
+            args.report.write_text(json.dumps(report, indent=2,
+                                              default=str))
         handle.detach()
+        treated.restore_host()
+        stock.restore_host()
     finally:
-        undo()
         unpin()
     return 0
 
