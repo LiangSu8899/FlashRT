@@ -116,3 +116,72 @@ def refresh_cross_attention_kv(
                 static.host_module(encoder_hidden_states)
             )
             static.refreshed()
+
+
+def wire_refresh_to_producer(
+    model: torch.nn.Module,
+    statics: Sequence[StaticOutput],
+    forward: Callable[[], object],
+):
+    """Wire the K/V refresh into the producing module's own forward.
+
+    The manual :func:`refresh_cross_attention_kv` form leaves the
+    refresh outside the hot path. That is the right split when only the
+    fast loop is captured — but a *whole-pipeline* capture then records
+    an encoder whose output feeds nothing: the banks are written outside
+    the graph, so replaying on a new observation silently reuses the old
+    encoding. This wires the split shut: one probe forward identifies
+    the module whose output tensor the statics' host projections consume
+    (by object identity), and a forward hook on that producer refreshes
+    every bank whenever it runs. Eager, compiled and captured forms all
+    carry the observation through; within one call the banks are still
+    written once and read every loop step, so the cadence saving stands.
+
+    Returns ``(producer, handle)``; ``handle.remove()`` unwires.
+    Raises ``ValueError`` when no single producer can be identified —
+    the caller keeps the explicit-refresh contract in that case.
+    """
+    if not statics:
+        raise ValueError("cadence_static: no statics to wire")
+    consumed: dict[int, None] = {}
+    probes = []
+    for static in statics:
+        def grab(_module, args, _consumed=consumed):
+            if args and torch.is_tensor(args[0]):
+                _consumed[id(args[0])] = None
+        probes.append(static.register_forward_pre_hook(grab))
+    produced: dict[int, torch.nn.Module] = {}
+
+    def note(module, _args, output):
+        if torch.is_tensor(output):
+            # parents fire after children, so an identity-preserving
+            # wrapper chain resolves to its outermost module
+            produced[id(output)] = module
+
+    watchers = [module.register_forward_hook(note)
+                for _, module in model.named_modules()]
+    try:
+        with torch.no_grad():
+            forward()
+    finally:
+        for hook in probes + watchers:
+            hook.remove()
+    producers = {id(produced[x]): produced[x]
+                 for x in consumed if x in produced}
+    if len(producers) != 1:
+        raise ValueError(
+            "cadence_static: could not identify one producer module for "
+            f"the cross-attention statics ({len(producers)} candidate(s) "
+            "matched by tensor identity)")
+    (producer,) = producers.values()
+
+    def refresh(_module, _args, output):
+        if not torch.is_tensor(output):
+            return None
+        with torch.no_grad():
+            for static in statics:
+                static.buffer.copy_(static.host_module(output))
+                static.refreshed()
+        return None
+
+    return producer, producer.register_forward_hook(refresh)
