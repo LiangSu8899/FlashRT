@@ -189,6 +189,12 @@ def build(model, run_once) -> tuple[Assembly, dict]:
     DIT_OUT = {
         f"action_head.model.transformer_blocks.{i}.attn1.to_out.0":
         b.attn1.to_out[0] for i, b in enumerate(dit_blocks)}
+    MERGER_PROJ = {}
+    for name, mod in (("merger", base.visual.merger),
+                      *((f"deepstack_merger_list.{i}", m) for i, m in
+                        enumerate(base.visual.deepstack_merger_list))):
+        for fc in ("linear_fc1", "linear_fc2"):
+            MERGER_PROJ[f"backbone.model.model.visual.{name}.{fc}"] =                 getattr(mod, fc)
     VISION_PROJ = {}
     for i, b in enumerate(visual_blocks):
         VISION_PROJ[f"backbone.model.model.visual.blocks.{i}.attn.qkv"] =             b.attn.qkv
@@ -254,7 +260,7 @@ def build(model, run_once) -> tuple[Assembly, dict]:
     for path, norm in DIT_ADALN.items():
         hooks.append(norm.linear.register_forward_hook(record_pair(path)))
     for path, mod in {**LANG_OPROJ, **VLSA_OUT, **VISION_PROJ,
-                      **DIT_OUT}.items():
+                      **DIT_OUT, **MERGER_PROJ}.items():
         hooks.append(mod.register_forward_hook(record_input(path, "x")))
     for path, mod in PATCH.items():
         hooks.append(mod.register_forward_hook(record_input(path, "x")))
@@ -357,7 +363,8 @@ def build(model, run_once) -> tuple[Assembly, dict]:
     # census showed the same mm landing in a 3x slower template under
     # one transformers generation). Seat them and the partitioning
     # question disappears on every host.
-    for path, mod in {**LANG_OPROJ, **VLSA_OUT, **VISION_PROJ}.items():
+    for path, mod in {**LANG_OPROJ, **VLSA_OUT, **VISION_PROJ,
+                      **MERGER_PROJ}.items():
         take_proj(path, mod, cal[path])
 
     from flash_rt.structures.impls.linear_proj import (
