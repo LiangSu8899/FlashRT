@@ -73,8 +73,8 @@ official module layout, so the seat tables transfer verbatim.
 |---|---|---|---|
 | eager | 45.7 ms | 50.2 ms | 56.7 ms |
 | compiled | 33.9 ms | — | 30.1 ms |
-| **captured** | 24.8 ms | **16.38 ms** (1.51×, 285 seams) | **16.61 ms** (1.45×, 216 seats) |
-| parity | — | 0.99989 | 0.99990 |
+| **captured** | 23.4 ms | **14.79 ms** (1.58×, 285 seams) | **15.87 ms** (1.48×, 216 seats) |
+| parity | — | 0.99990 | 0.99988 |
 
 **LeRobot host:**
 
@@ -82,22 +82,24 @@ official module layout, so the seat tables transfer verbatim.
 |---|---|---|---|
 | eager | 42.0 ms | 53.6 ms | 51.9 ms |
 | compiled | 33.7 ms | 31.0 ms | 29.7 ms |
-| **captured** | 23.9 ms | 17.94 ms (1.37×) | **16.84 ms** (1.42×) |
-| parity | — | 0.99962 | 0.99989 |
-| runtime fallbacks | — | 264 (`qkv_rope`, guarded) | 0 |
+| **captured** | ~24 ms | 18.24 ms (1.37×) | **17.02 ms** (1.42×) |
+| parity | — | 0.99989 | 0.99987 |
+| runtime fallbacks | — | 72 (`qkv_rope`, guarded, refused before any work) | 0 |
 
 What the tables say:
 
-1. **The explicit assembly lands within 1.4% of the same number on
-   both hosts** (16.61 / 16.84 ms) from one unchanged file, at 0.9999
-   parity on each.
+1. **The explicit assembly lands in one band on both hosts**
+   (15.87 / 17.02 ms) from one unchanged file, at 0.9999 parity on
+   each — and the captured form is one mechanism call:
+   `structures.capture(torch.compile(hot), model=model)`. The
+   registered host-family adapter pins the shape glue and lists its
+   pins in the stage certification.
 2. **Speedups may only be read within a row.** Eager pays a per-call
    Python admission check at every guarded seam and is *slower* than
    the host — printed, not hidden. Captured is the deployed form,
    where guards and glue are paid once at capture time.
-3. **The two paths meet at full speed where every seam holds** — on
-   the official host the automatic path's 69 extra seams buy 1.4%
-   (16.38 vs 16.61). On the LeRobot host the automatic path binds a
+3. **Where every seam holds, the automatic path wins** — its 69
+   extra seams buy 7% on the official host (14.79 vs 15.87). On the LeRobot host the automatic path binds a
    `qkv_rope` family whose rope tables can never satisfy the FP32
    contract on this host (see the loading note below); the guards
    refuse every call before any work is done and run the host path,
@@ -111,11 +113,12 @@ What the tables say:
    `from_pretrained(..., dtype=bf16)` instead keeps them FP32. This is
    why the `qkv_rope` family refuses here, and it is a precision loss
    the host pays with or without structures.
-5. The capture harness itself is where host coupling lives: porting it
-   from the official host's transformers to the LeRobot venv's newer
-   release took three contract adaptations (a rope-index signature, a
-   vision-output class, an input whitelist), each visible in
-   `full_graph.py` as a probed branch — the assembly needed none.
+5. Host coupling lives in the capture lowering, and the lowering
+   lives in the library: the registered Qwen3-VL family adapter
+   carries the probed branches for both transformers vision-contract
+   generations and the LeRobot wrapper glue. Porting the measurement
+   between the two hosts changed none of the assembly and none of the
+   capture code — the same door served both.
 
 ## Running
 
