@@ -656,6 +656,25 @@ def auto_swaps(
     # produced it. Bind the pair together, or leave both on BF16.
     plan = AutoPlan(seams=seams)
     plan._requested_structures = frozenset(structures)
+    # ---- backbone attention interface: measured band decision. This
+    # must precede every adapter that resolves the host's attention
+    # registry into a closure (the rope routes, the vision pin), or a
+    # switched interface arrives after the traffic already left ----
+    if "attention_core" in structures:
+        from .adapters.transformers_attention_interface import (
+            TransformersAttentionInterfaceAdapter)
+        try:
+            iface = TransformersAttentionInterfaceAdapter()(model, plan)
+        except (ValueError, RuntimeError) as refusal:
+            plan.notes.setdefault("refused", []).append(
+                ("backbone_attn", str(refusal)[:80]))
+            iface = None
+        if iface:
+            if iface.get("refused"):
+                plan.notes.setdefault("refused", []).extend(
+                    iface["refused"])
+            plan.revert.extend(iface.get("revert", ()))
+            plan.notes.update(iface.get("notes", {}))
     plan.notes["scheme"] = scheme_note
     if schedule_notes:
         plan.notes["schedules"] = schedule_notes
