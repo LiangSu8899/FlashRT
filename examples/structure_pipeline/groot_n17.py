@@ -103,6 +103,7 @@ class Assembly:
         self.swaps: dict[str, torch.nn.Module] = {}
         self.refused: list[tuple[str, str]] = []
         self.families = defaultdict(int)
+        self.notes: dict = {}
 
     def take(self, path: str, family: str, build):
         """Run one seat's binder; a refusal is recorded, never raised."""
@@ -290,24 +291,32 @@ def build(model, run_once) -> tuple[Assembly, dict]:
         seam = Seam(structure="vision_ffn", path=path,
                     parent_path=path.rsplit(".", 1)[0], norm_attr="norm3",
                     dims={}, variant={}, fc_attrs=("net.0.proj", "net.2"))
-        if c.get("x_rows", 1 << 30) <= 64:
-            # the denoise band is bandwidth-bound: half-width weights
-            # and the FP4 FFN wire (fc1's GEMM re-quantizes its own
-            # output, fc2 consumes the wire) take the seat
-            bound = asm.take(path, "dit_ffn_fp4",
-                             lambda: vis_w4.bind_mlp_seam(
-                                 seam_weights(model, seam),
-                                 channel_in=c["x_cvec"],
-                                 channel_hidden=c["hidden_cvec"],
-                                 original=mlp, fuse_wire=True))
-        else:
-            bound = asm.take(path, "dit_ffn",
-                             lambda: vis_ffn.bind_mlp_seam(
-                                 seam_weights(model, seam),
-                                 input_scale=c["x"] / 448.0,
-                                 hidden_scale=c["hidden"] / 448.0,
-                                 original=mlp))
+        from flash_rt.structures.adjudicate import (FormCandidate,
+                                                    adjudicate)
+        rows = c.get("x_rows", 1 << 30)
+        dim_in = mlp.net[0].proj.weight.shape[1]
+        x_bench = torch.randn(rows, dim_in, device="cuda",
+                              dtype=torch.bfloat16) * (c["x"] / 4)
+        winner, bound = adjudicate(path, [
+            FormCandidate(
+                "ffn_fp8",
+                build=lambda: vis_ffn.bind_mlp_seam(
+                    seam_weights(model, seam),
+                    input_scale=c["x"] / 448.0,
+                    hidden_scale=c["hidden"] / 448.0, original=mlp),
+                run=lambda b: b(x_bench), precision_rank=0),
+            FormCandidate(
+                "ffn_fp4_wire",
+                build=lambda: vis_w4.bind_mlp_seam(
+                    seam_weights(model, seam),
+                    channel_in=c["x_cvec"],
+                    channel_hidden=c["hidden_cvec"],
+                    original=mlp, fuse_wire=True),
+                run=lambda b: b(x_bench),
+                qualify=lambda: rows <= 512, precision_rank=1),
+        ], notes=asm.notes)
         if bound is not None:
+            asm.families["dit_ffn_" + winner.split("_", 1)[1]] += 1
             asm.place(path, bound)
 
     for path, mlp in LANG_FFN.items():
@@ -369,18 +378,30 @@ def build(model, run_once) -> tuple[Assembly, dict]:
 
     from flash_rt.structures.impls.linear_proj import (
         nvfp4_balance as proj_w4)
+    from flash_rt.structures.adjudicate import (FormCandidate,
+                                                adjudicate)
     for path, mod in DIT_OUT.items():
         c = cal[path]
-        if "x_cvec" not in c or c.get("x_rows", 1 << 30) > 64:
+        if "x_cvec" not in c:
             continue
         weights = {"w": mod.weight}
         if mod.bias is not None:
             weights["b"] = mod.bias
-        bound = asm.take(path, "linear_proj_fp4",
-                         lambda: proj_w4.bind_proj_seam(
-                             weights, channel_amax=c["x_cvec"],
-                             original=mod))
-        if bound is not None:
+        rows = c.get("x_rows", 1)
+        xb = torch.randn(rows, mod.weight.shape[1], device="cuda",
+                         dtype=torch.bfloat16) * (c["x"] / 4)
+        winner, bound = adjudicate(path, [
+            FormCandidate(
+                "proj_host", build=lambda: mod,
+                run=lambda b: b(xb), precision_rank=0),
+            FormCandidate(
+                "proj_fp4",
+                build=lambda: proj_w4.bind_proj_seam(
+                    weights, channel_amax=c["x_cvec"], original=mod),
+                run=lambda b: b(xb), precision_rank=1),
+        ], notes=asm.notes)
+        if bound is not None and winner != "proj_host":
+            asm.families["linear_proj_fp4"] += 1
             asm.place(path, bound)
 
     for path, attn in VLSA_QKV.items():
@@ -485,48 +506,50 @@ def build(model, run_once) -> tuple[Assembly, dict]:
             continue
         scale = torch.tensor([max(c["x"] / 448.0, 1e-8)], device="cuda")
         norm = block.norm1
-        if c.get("rows", 1 << 30) <= 64:
-            # denoise band: the producer norms straight into packed
-            # NVFP4 + swizzled scale factors and the pack consumes the
-            # wire — the form the chain race seats automatically, taken
-            # here by declaration
-            from flash_rt.structures.impls.qkv_pack import (
-                nvfp4_balance as pack_w4)
-            producer = asm.take(norm_path, "adaln_producer",
-                                lambda: bind_adaln_producer(
-                                    norm, pairs, act_scale=None,
-                                    rows=c["rows"],
-                                    dim=norm.norm.normalized_shape[0],
-                                    locator=locator, norm="layer",
-                                    out_format="nvfp4"))
-            if producer is None:
-                continue
-            parts = asm.take(attn_path, "qkv_pack_fp4",
-                             lambda: pack_w4.bind_qkv_pack(
-                                 [block.attn1.to_q, block.attn1.to_k,
-                                  block.attn1.to_v],
-                                 channel_amax=None, rows=c["rows"],
-                                 wire=True))
-            if parts is None:
-                continue
-            parts[0].accept_wire(producer.wire_sfa)
-        else:
-            producer = asm.take(norm_path, "adaln_producer",
-                                lambda: bind_adaln_producer(
-                                    norm, pairs, act_scale=scale,
-                                    rows=c["rows"],
-                                    dim=norm.norm.normalized_shape[0],
-                                    locator=locator, norm="layer"))
-            if producer is None:
-                continue
-            parts = asm.take(attn_path, "qkv_pack",
-                             lambda: bind_qkv_pack(
-                                 [block.attn1.to_q, block.attn1.to_k,
-                                  block.attn1.to_v],
-                                 scale, rows=c["rows"],
-                                 in_dtype="fp8_static"))
-            if parts is None:
-                continue
+        from flash_rt.structures.adjudicate import (FormCandidate,
+                                                    adjudicate)
+        from flash_rt.structures.impls.qkv_pack import (
+            nvfp4_balance as pack_w4)
+        dim_n = norm.norm.normalized_shape[0]
+        mods3 = [block.attn1.to_q, block.attn1.to_k, block.attn1.to_v]
+        cond0 = pairs[0][0].detach()
+        xb = torch.randn(c["rows"], dim_n, device="cuda",
+                         dtype=torch.bfloat16)
+
+        def _fp8_chain():
+            prod = bind_adaln_producer(
+                norm, pairs, act_scale=scale, rows=c["rows"],
+                dim=dim_n, locator=locator, norm="layer")
+            pk = bind_qkv_pack(mods3, scale, rows=c["rows"],
+                               in_dtype="fp8_static")
+            return prod, pk
+
+        def _fp4_chain():
+            prod = bind_adaln_producer(
+                norm, pairs, act_scale=None, rows=c["rows"],
+                dim=dim_n, locator=locator, norm="layer",
+                out_format="nvfp4")
+            pk = pack_w4.bind_qkv_pack(mods3, channel_amax=None,
+                                       rows=c["rows"], wire=True)
+            pk[0].accept_wire(prod.wire_sfa)
+            return prod, pk
+
+        winner, built = adjudicate(norm_path, [
+            FormCandidate("chain_fp8", build=_fp8_chain,
+                          run=lambda b: b[1][0](b[0](xb, cond0)),
+                          precision_rank=0),
+            FormCandidate("chain_fp4_wire", build=_fp4_chain,
+                          run=lambda b: b[1][0](b[0](xb, cond0)),
+                          qualify=lambda: c["rows"] <= 512,
+                          precision_rank=1),
+        ], notes=asm.notes)
+        if built is None:
+            asm.refused.append((norm_path, "adaln chain: no form"))
+            continue
+        producer, parts = built
+        asm.families["adaln_producer"] += 1
+        asm.families["qkv_pack" + ("_fp4" if "fp4" in winner
+                                   else "")] += 1
         locator = locator or producer.locator
         asm.place(norm_path, producer)
         for attr, mod in zip(("to_q", "to_k", "to_v"), parts):
