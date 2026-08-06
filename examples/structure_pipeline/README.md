@@ -75,17 +75,32 @@ each call carries its own observation and pays its own refresh.
 
 | captured | official host | LeRobot host |
 |---|---|---|
-| stock graph | 23.39 ms | 24.91 ms |
-| automatic (3 lines) | 15.27 ms (1.532×) p=0.99928 | 17.09 ms (1.457×) p=0.99947, **96 guarded refusals** |
-| explicit (this folder) | **15.26 ms (1.533×)** p=0.99921 | **17.08 ms (1.458×)** p=0.99987, **0 refusals at run time** |
+| stock graph | ~23.3 ms | ~23.5 ms |
+| automatic (3 lines, 285 seats) | 15.16 ms (1.541×) p=0.99945 | 16.20 ms (1.482×) p=0.99990, **96 guarded refusals** |
+| explicit (this folder, 333 seats) | **14.90 ms (1.566×)** p=0.99949 | **14.85 ms (1.565×)** p=0.99975, **0 refusals at run time** |
 
-Both arms bind the same 285-seat book on each host, and land on the
-same number — the measured proof that the two paths differ in **who
-writes the seat book**, not in what the seats can do. The kernel
-profile says the same thing bucket by bucket: after the explicit
-assembly claimed its full book, every bucket (fp8 structures,
-attention, fused elementwise, norm/rope, memops) agrees with the
-automatic arm within 0.02 ms.
+At a matched 285-seat book the two arms land within 0.01 ms of each
+other on either host — the measured proof that the paths differ in
+**who writes the seat book**, not in what the seats can do; the
+kernel profile agrees bucket by bucket within 0.02 ms. The explicit
+book then goes past the automatic one — 48 vision projection seats
+automatic qualification does not claim — and lands **flat across
+hosts**: 14.90 versus 14.85, a 0.05 ms spread from one unchanged
+`build()`.
+
+The cross-host story deserves its own line, because it was never
+about semantics. With matched books the gap traced to two
+compiler-fortune artifacts in the *unclaimed* territory: an 86-GFLOP
+projection into the full vocabulary that a feature-extraction
+pipeline never reads (one host's wrapper form let the compiler
+dead-code-eliminate it, the other's kept it alive at 0.86 ms per
+call), and one large matrix product whose template partitioning
+differed threefold between transformers generations. The family
+lowering now pins the dead head under a bit-exact proof — skip the
+head, re-run the recorded request, keep the pin only when the
+pipeline output is bit-identical — and the vision seats take the
+partitioning question away from the compiler. What remains between
+hosts is 0.05 ms.
 
 **The explicit ladder on the official host** (same assembly, cheaper
 forms):
@@ -94,16 +109,18 @@ forms):
 |---|---|---|
 | eager | 46.1 ms | 57.1 ms (0.81× — the per-call guard admission is real and printed) |
 | compiled | 33.9 ms | 27.7 ms (1.22×) |
-| captured | 23.4 ms | 15.26 ms (1.53×) |
+| captured | 23.3 ms | 14.90 ms (1.57×) |
 
 What the tables say:
 
-1. **A matched seat book is the whole game.** The first explicit
-   assembly stopped at 216 seats and lost 9% to the automatic path;
-   the kernel-bucket profile located the missing milliseconds
-   (norm/rope fusion, the projection seats, the patch seat), the seat
-   tables grew to the same 285-seat book, and the two arms now land
-   within 0.01 ms of each other on both hosts.
+1. **A matched seat book is the whole game — and the explicit book
+   may keep going.** The first explicit assembly stopped at 216 seats
+   and lost 9% to the automatic path; the kernel-bucket profile
+   located the missing milliseconds, the tables grew to the matched
+   285-seat book and the arms met within 0.01 ms; then 48 vision
+   projection seats the automatic qualification does not claim took
+   another 0.3 ms on each host and flattened the cross-host spread to
+   0.05 ms.
 2. **Where they differ is the run-time story, not the speed.** On the
    LeRobot host the automatic path also engages the vision
    `packed_qkv_rope` family, whose rope tables can never satisfy the
