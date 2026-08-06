@@ -44,12 +44,33 @@ fastest numbers through this same door; a host no family recognizes is
 captured as-is, and a family that cannot pin safely refuses with a
 reason instead of leaving the host half-pinned.
 
+**Finalize (production memory)** — a verified attachment holds every
+replaced module's original weights for fallback and `detach()`; that
+reversibility is a development default, not a production bill. After
+your parity gate passes, `handle.finalize()` frees the held originals
+(receipt says how many bytes), flips the seams from fall-back to
+refuse, and forbids `detach` — irreversible, and recorded as such.
+Seat scratch (sibling stashes, producer workspaces, wire buffers) is
+pooled by shape: sequential layers share one buffer, so the memory
+bill is one layer's worth, not layers x tokens
+(`structures.workspace.report()` is the receipt's memory column).
+Binding itself is budgeted: under 512 MiB free VRAM a seat refuses
+with `insufficient_vram(...)` instead of eating the remainder.
+
 **Explicit** — the only tier with real orchestration in user code:
 seat tables, the author's own calibration hooks, direct binder calls —
 `build()`, 215 lines. It exists for control the automatic
 qualification will not exercise: claiming seats discovery refuses,
 writing a producer negotiation out as code, choosing a scheme per
 seat.
+
+The explicit DiT band form (FP8 chains versus the FP4 wire) is an
+author pin backed by captured-form receipts, selected by
+`FRT_DIT_BAND` (`fp4` default — the Thor-measured winner; `fp8` — the
+5090-measured winner) until the band-level adjudicator with its
+decision cache lands. Seat-level micro-timing was refuted in both
+directions by production-form measurement; the design doc in the
+records repo carries the receipts.
 
 ## The footprint
 

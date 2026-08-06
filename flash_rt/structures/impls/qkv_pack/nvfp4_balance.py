@@ -22,6 +22,7 @@ import torch
 
 from .. import hub_kernel
 from ...guard import CAST_OK, PROCEED, GuardedSeam
+from ...workspace import lease
 from .fp8_static import StashReader
 
 
@@ -76,8 +77,9 @@ class PackedLinearNvfp4(GuardedSeam, torch.nn.Module):
         self.register_buffer("bias_cat", bias_cat)
         dev = w_packed.device
         for i, n in enumerate(splits[1:], 1):
-            self.register_buffer(f"stash{i}", torch.zeros(
-                rows, n, device=dev, dtype=torch.bfloat16))
+            setattr(self, f"stash{i}", lease(
+                (rows, n), torch.bfloat16, dev,
+                tag=f"qkv_stash{i}"))
         self._frt_arm(dtypes=CAST_OK, device=dev,
                       k=int(mods[0].weight.shape[1]), row_capacity=rows)
 

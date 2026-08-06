@@ -61,6 +61,32 @@ class AttachHandle:
     _guards: dict[str, SeamGuard] = field(default_factory=dict)
     _revert: list[Any] = field(default_factory=list)
 
+    def finalize(self) -> dict:
+        """Release the host originals a verified attachment holds.
+
+        The reversible form keeps every replaced module's weights alive
+        for fallback and for ``detach`` — the right default for
+        development, and a double weight bill production should not
+        pay. After the parity gate has passed, ``finalize`` frees the
+        held entries' parameter storage, flips fallback off (there is
+        nothing left to fall back to) and forbids ``detach``.
+        Irreversible, and says so in the receipt it returns.
+        """
+        freed = 0
+        for parent, attr, original in self._entries:
+            for par in original.parameters(recurse=False):
+                freed += par.numel() * par.element_size()
+                par.data = par.data.new_empty(0)
+            # the seam standing at this path can no longer fall back —
+            # a contract miss must refuse now, not run an emptied host
+            current = _get(parent, attr)
+            if hasattr(current, "_frt_can_fallback"):
+                current._frt_can_fallback = False
+        self.records = dict(self.records,
+                            finalized={"freed_bytes": freed})
+        self._finalized = True
+        return {"finalized": True, "freed_bytes": freed}
+
     def detach(self) -> None:
         """Restore every swapped module. Idempotent.
 
@@ -69,6 +95,10 @@ class AttachHandle:
         library-level function — and restoring only what ``setattr`` can
         reach would leave those live while reporting the model as restored.
         """
+        if getattr(self, "_finalized", False):
+            raise RuntimeError(
+                "attachment was finalized: the host originals were "
+                "released and detach is impossible")
         if not self.active:
             return
         for parent, attr, original in reversed(self._entries):

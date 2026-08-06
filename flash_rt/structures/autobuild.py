@@ -1069,6 +1069,20 @@ def _bind_auto(model, seam, cap, plan, act_scales, negotiate_fp8,
     ``fmt_params`` is the decision's recipe payload for that format
     (algorithm parameters, never bytes), handed to the variant's binder.
     """
+    dev0 = None
+    if model is not None:
+        dev0 = next(model.parameters(), torch.empty(0)).device
+    if dev0 is not None and dev0.type == "cuda":
+        free, _total = torch.cuda.mem_get_info(dev0)
+        if free < (512 << 20):
+            # binding is a transaction against a budget: below the
+            # headroom every further seat is refused with the number,
+            # instead of eating the remainder and failing later as an
+            # unattributable OOM in the first treated forward
+            raise ValueError(
+                f"insufficient_vram(free={free >> 20}MiB, "
+                "headroom=512MiB) — host keeps this seam")
+
     from .impls.decoder_ffn import fp8_static as ffn_impl
     from .impls.vision_ffn import fp8_static as vis_impl
 

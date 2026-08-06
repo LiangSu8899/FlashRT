@@ -34,6 +34,7 @@ from typing import Sequence
 import torch
 
 from .. import hub_kernel
+from ...workspace import lease
 from ...guard import CAST_OK, FP8_ONLY, PROCEED, GuardRefused, GuardedSeam
 
 _FP8 = torch.float8_e4m3fn
@@ -88,8 +89,9 @@ class PackedLinear(GuardedSeam, torch.nn.Module):
         self.register_buffer("act_scale", act_scale)
         dev = w8.device
         for i, n in enumerate(splits[1:], 1):
-            self.register_buffer(f"stash{i}", torch.zeros(
-                rows, n, device=dev, dtype=torch.bfloat16))
+            setattr(self, f"stash{i}", lease(
+                (rows, n), torch.bfloat16, dev,
+                tag=f"qkv_stash{i}"))
         # a bias-add is its own kernel. Hosts whose projections carry no
         # bias (the whole Gemma family) would otherwise pay a launch per
         # call to add zeros — measured 3 kernels/call with the bias

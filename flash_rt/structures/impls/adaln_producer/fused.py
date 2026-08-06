@@ -36,6 +36,7 @@ from __future__ import annotations
 import torch
 
 from .. import hub_kernel
+from ...workspace import lease
 from ...guard import CAST_OK, PROCEED, GuardedSeam
 
 
@@ -184,8 +185,10 @@ class AdaLNProducer(GuardedSeam, torch.nn.Module):
                                 dtype=torch.bfloat16)
             zero = torch.zeros(dim, device=dev, dtype=torch.bfloat16)
             packed, sfa = self._fn4(probe, zero, zero)
-            self.register_buffer("wire_packed", packed)
-            self.register_buffer("wire_sfa", sfa)
+            self.wire_packed = lease(tuple(packed.shape), packed.dtype,
+                                     dev, tag="producer_wire")
+            self.wire_sfa = lease(tuple(sfa.shape), sfa.dtype, dev,
+                                  tag="producer_wire_sfa")
         elif norm == "layer":
             # LayerNorm hosts (DiT AdaLayerNorm): style is (scale,
             # shift), no gate, and the fused kernel takes the raw
@@ -209,12 +212,12 @@ class AdaLNProducer(GuardedSeam, torch.nn.Module):
         # has to be re-established on every call — a buffer that is
         # merely allocated zeroed drifts silently from the second tick
         # onward, and the drift compounds.
-        self.register_buffer("w_ones", torch.ones(
-            dim, device=dev, dtype=torch.bfloat16))
-        self.register_buffer("resid", torch.zeros(
-            rows, dim, device=dev, dtype=torch.bfloat16))
-        self.register_buffer("gate_ones", torch.ones(
-            rows, dim, device=dev, dtype=torch.bfloat16))
+        self.w_ones = lease((dim,), torch.bfloat16, dev,
+                            tag="producer_ones", fill="ones")
+        self.resid = lease((rows, dim), torch.bfloat16, dev,
+                           tag="producer_resid")
+        self.gate_ones = lease((rows, dim), torch.bfloat16, dev,
+                               tag="producer_ones", fill="ones")
         # the rms form works through the preallocated residual and gate
         # buffers, so its row count is fixed; the layer form's kernel
         # takes scale and shift directly and leaves rows free
