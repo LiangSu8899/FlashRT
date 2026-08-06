@@ -95,11 +95,6 @@ class _Recorder:
         self, attn, hidden_states, encoder_hidden_states=None,
         attention_mask=None, temb=None, *args, **kwargs,
     ):
-        if attention_mask is not None:
-            self.rows.append({"mask": attention_mask.detach()})
-            return self.original(
-                attn, hidden_states, encoder_hidden_states, attention_mask,
-                temb, *args, **kwargs)
         query, key, value, mask = _qkv(
             attn, hidden_states, encoder_hidden_states, attention_mask, temb)
         self.rows.append({
@@ -124,10 +119,11 @@ class _FlashRTDenseAttnProcessor:
         self, attn, hidden_states, encoder_hidden_states=None,
         attention_mask=None, temb=None, *args, **kwargs,
     ):
-        # The dense Hub form has no live mask input.  Binding therefore
-        # accepts only unmasked captures, and a later masked call returns to
-        # the host instead of reusing a frozen calibration mask.
-        if attention_mask is not None:
+        # A live mask is served only by a core that baked this site's
+        # fixed mask pattern at bind time (packed ranges); a maskless
+        # core keeps the host path rather than reuse a frozen mask.
+        if attention_mask is not None and not getattr(
+                self.core, "allowed_ranges", ()):
             return self.original(
                 attn, hidden_states, encoder_hidden_states, attention_mask,
                 temb, *args, **kwargs)
@@ -199,13 +195,6 @@ class DiffusersAttentionAdapter:
                     f"{path}.processor",
                     "attention_core dense: compatible processor was not "
                     "called during calibration",
-                ))
-                continue
-            if any(row["mask"] is not None for row in rows):
-                refused.append((
-                    f"{path}.processor",
-                    "attention_core dense: live attention masks are outside "
-                    "the unmasked dense executable form",
                 ))
                 continue
             core = bind_dense_attention_best(rows)

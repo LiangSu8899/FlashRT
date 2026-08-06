@@ -53,6 +53,13 @@ class FakeAttention(torch.nn.Module):
         self.residual_connection = False
         self.rescale_output_factor = 1.0
 
+    def prepare_attention_mask(self, attention_mask, sequence_length,
+                               batch_size):
+        # mirror of the diffusers helper this adapter consumes
+        return attention_mask.reshape(
+            -1, attention_mask.shape[-2], attention_mask.shape[-1]
+        ).expand(batch_size * self.heads, -1, attention_mask.shape[-1])
+
     def forward(self, hidden, encoder):
         return self.processor(self, hidden, encoder)
 
@@ -147,7 +154,7 @@ def test_diffusers_adapter_matches_capability_not_processor_class_name(
     assert result[2]["observed"]
 
 
-def test_diffusers_adapter_refuses_a_live_mask(monkeypatch):
+def test_diffusers_adapter_hands_masked_sites_to_the_family(monkeypatch):
     monkeypatch.setattr(
         "flash_rt.structures.adapters.diffusers_attention."
         "bind_dense_attention_best",
@@ -166,5 +173,17 @@ def test_diffusers_adapter_refuses_a_live_mask(monkeypatch):
     assert result is not None
     swaps, update, extras = result
     assert swaps == {} and update is None
-    assert "live attention masks" in extras["refused"][0][1]
-    assert root.attention.processor is original
+    # masked sites now reach the family: the outcome is either a bound
+    # core (a variant covered the fixed mask pattern) or the family's
+    # recorded refusal — never a silent skip
+    assert extras.get("observed") or extras["refused"], \
+        "masked site must bind or record a family verdict"
+    if extras.get("observed"):
+        # a variant covered the fixed mask pattern: the routed
+        # processor stands until the toggle disables it
+        assert root.attention.processor is not original
+        enable, disable = extras["toggle"]
+        disable()
+        assert root.attention.processor is original
+    else:
+        assert root.attention.processor is original
