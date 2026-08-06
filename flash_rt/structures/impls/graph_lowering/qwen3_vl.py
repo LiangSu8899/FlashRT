@@ -58,6 +58,24 @@ def _find_glue_owner(model: Any, qwen: Any):
     return None
 
 
+def _first_output_tensor(value):
+    """One deterministic tensor from a pipeline output, for proofs."""
+    if torch.is_tensor(value):
+        return value
+    if isinstance(value, dict):
+        for key in sorted(value):
+            found = _first_output_tensor(value[key])
+            if found is not None:
+                return found
+        return None
+    if isinstance(value, (tuple, list)):
+        for item in value:
+            found = _first_output_tensor(item)
+            if found is not None:
+                return found
+    return None
+
+
 class Qwen3VLGraphLoweringAdapter:
     """Pin the Qwen3-VL backbone's shape glue for one fixed request."""
 
@@ -286,6 +304,41 @@ class Qwen3VLGraphLoweringAdapter:
         if "glue" in saved:
             pins.append("legacy_position_ids_glue")
 
+        # ---- dead-output pin, held only under proof ------------------
+        # A feature-extraction pipeline never reads the vocabulary
+        # logits, but whether a compiler can prove that depends on the
+        # host's wrapper form — one host's graph dead-code-eliminates
+        # the [tokens, vocab] projection, another's keeps it alive and
+        # pays real milliseconds for it every call. The family settles
+        # it with a receipt instead: skip the head, re-run the recorded
+        # request, and keep the pin only if the pipeline output is
+        # bit-identical. Any mismatch or error restores the head alone.
+        lm_head = getattr(qwen, "lm_head", None)
+        if lm_head is not None and hasattr(lm_head, "forward"):
+            with torch.inference_mode():
+                before = _first_output_tensor(runner())
+            saved_head = lm_head.forward
+
+            def skipped_head(self, hidden_states, *args, **kwargs):
+                del args, kwargs
+                return hidden_states[..., :0]
+
+            lm_head.forward = types.MethodType(skipped_head, lm_head)
+            proven = False
+            if before is not None:
+                try:
+                    with torch.inference_mode():
+                        after = _first_output_tensor(runner())
+                    proven = after is not None and torch.equal(before,
+                                                               after)
+                except Exception:   # noqa: BLE001 — proof failed
+                    proven = False
+            if proven:
+                saved["lm_head"] = saved_head
+                pins.append("lm_head_dead_output")
+            else:
+                lm_head.forward = saved_head
+
         def undo():
             visual.forward = saved["visual_forward"]
             for block, fwd in zip(visual.blocks, saved["attn_forwards"]):
@@ -299,6 +352,8 @@ class Qwen3VLGraphLoweringAdapter:
                 base.get_rope_index = saved["get_rope_index"]
             if "glue" in saved:
                 glue_owner._ensure_legacy_qwen3_position_ids = saved["glue"]
+            if "lm_head" in saved:
+                qwen.lm_head.forward = saved["lm_head"]
 
         return GraphLowering(
             undo=undo, family=self.family, pins=tuple(pins),
