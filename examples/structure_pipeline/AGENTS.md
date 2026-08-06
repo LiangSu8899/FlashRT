@@ -1,9 +1,44 @@
-# Reproducing the two-host GR00T N1.7 matrix
+# Working in this folder — the usage model, the footprint, the recipe
 
 Every number in the README comes from the scripts in this folder run
-against **unmodified host checkouts**. This page is the complete
-recipe: what to fetch, what each script touches, and — first, because
-it is the question that matters — exactly how large the footprint is.
+against **unmodified host checkouts**. Read this before touching or
+reproducing anything: it states what each tier of the library actually
+requires from a user, what each script touches, and exactly how large
+the footprint is.
+
+## The usage model, tier by tier
+
+**Automatic** — install once, then two calls, nothing else:
+
+```bash
+pip install flash-rt kernels   # hub kernel packages fetch per host at first bind
+```
+
+```python
+plan = structures.auto_swaps(model, run_once)   # run_once: the host's hot path, once
+handle = swap.attach(model, plan.swaps, observe=plan.observed,
+                     revert=plan.revert)
+```
+
+Zero host-source changes, zero files edited, nothing forked. The user
+supplies the loaded model and one callable that runs its hot path on a
+representative observation (that single pass is the calibration).
+Everything is in-process and `handle.detach()` restores the host
+bit-for-bit. This buys the eager/compiled band with per-seam guards
+and a ledger.
+
+**Captured (full speed)** — a *form*, not a path: whole-graph CUDA
+capture needs the host's shape-derived constants pinned first (the
+lowering in `full_graph.py`, 176 lines, per host family). The
+automatic and explicit assemblies both reach their fastest numbers
+through this same harness; neither gets it for free.
+
+**Explicit** — the only tier with real orchestration in user code:
+seat tables, the author's own calibration hooks, direct binder calls —
+`build()`, 215 lines. It exists for control the automatic
+qualification will not exercise: claiming seats discovery refuses,
+writing a producer negotiation out as code, choosing a scheme per
+seat.
 
 ## The footprint
 
@@ -23,14 +58,6 @@ The author-owned code, by role:
 | `full_graph.py` | fixed-shape lowering (176) + capture/replay/noise-pin helpers (64) + harness (111) | 398 |
 | `lerobot_host.py`, `lerobot_full_graph.py` | the same measurement on the LeRobot host; `build()` is imported, not rewritten | ~300 |
 | `make_model_inputs.py` | exports one set of prepared model-level inputs both hosts consume | ~60 |
-
-The automatic path, for comparison, is two calls:
-
-```python
-plan = structures.auto_swaps(model, run_once)
-handle = swap.attach(model, plan.swaps, observe=plan.observed,
-                     revert=plan.revert)
-```
 
 ## What you need
 
