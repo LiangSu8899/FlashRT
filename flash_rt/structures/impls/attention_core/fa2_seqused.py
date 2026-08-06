@@ -363,7 +363,10 @@ def _allowed_ranges(mask):
             ranges.append([index, index + 1])
         else:
             ranges[-1][1] += 1
-    if len(ranges) > 2:
+    if len(ranges) > 8:
+        # the packed-copy loop is linear in segments; past a handful
+        # the copies outweigh the masked-out keys and the masked
+        # executable form serves better
         return None
     if len(ranges) == 1 and ranges[0] == [0, mask.shape[-1]]:
         return ()
