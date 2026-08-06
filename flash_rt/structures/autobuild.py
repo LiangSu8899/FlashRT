@@ -1378,7 +1378,8 @@ def _bind_negotiated(model, p_seam, k_seam, p_cap, points, scale, rows,
     # GEMM bands at this row count — so it is measured here, on the
     # calibrated shape with the real conditioning, and the winner takes
     # the seats. A candidate that cannot build or run loses by default.
-    if dim >= 512:
+    import os
+    if dim >= 512 and not os.environ.get("FRT_DISABLE_FP4_RACE"):
         try:
             prod4 = bind_adaln_producer(
                 norm, p_cap["pairs"], act_scale=None, rows=rows,
