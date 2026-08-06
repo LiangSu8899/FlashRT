@@ -59,14 +59,15 @@ seat.
 | LeRobot source | **nothing** | 0 lines |
 | host process at run time | structure swaps attached onto the module tree | revertible; `detach()` restores the host bit-for-bit |
 | host process at run time (captured form only) | fixed-shape lowering: function pins applied by the registered family adapter inside `structures.capture(model=...)`, undone by `stage.restore_host()` | in-process only, never written to disk; the family and its pins are listed in the stage certification |
+| host process at run time (cadence seats) | the cross-attention K/V bank refresh is wired onto the producing module's own forward (`wire_refresh_to_producer`), so eager, compiled and captured forms all carry the current observation | removed with the wire handle; `detach()` restores the host bit-for-bit |
 
 The author-owned code, by role:
 
 | file | role | lines |
 |---|---|---|
-| `groot_n17.py::build` | **the explicit assembly itself** — seat tables, calibration hooks, binder calls | 215 |
-| `groot_n17.py` (rest) | host loading (34), input capture (~30), timing/report harness (132) | 287 |
-| `full_graph.py` | captured-form harness: two `structures.capture` calls, interleaved replay timing, noise pin | 205 |
+| `groot_n17.py::build` | **the explicit assembly itself** — seat tables, calibration hooks, binder calls, family-adapter entries | 345 |
+| `groot_n17.py` (rest) | host loading (34), input capture (~30), timing/report harness (~150) | 282 |
+| `full_graph.py` | captured-form harness (both arms): `structures.capture` per arm, interleaved replay timing, noise pin | 227 |
 | `lerobot_host.py`, `lerobot_full_graph.py` | the same measurement on the LeRobot host; `build()` is imported, not rewritten | ~300 |
 | `make_model_inputs.py` | exports one set of prepared model-level inputs both hosts consume | ~60 |
 

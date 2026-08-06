@@ -95,6 +95,8 @@ def replay_ms(stages, *, iters=50, rounds=9):
 
 def main() -> int:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--arm", choices=("explicit", "auto"),
+                        default="explicit")
     parser.add_argument("--host", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--backbone-assets", type=Path, required=True)
@@ -110,7 +112,7 @@ def main() -> int:
     from flash_rt.structures import swap
     from flash_rt.structures.impls import unavailable_report
     from flash_rt.structures.impls.cadence_static.cross_attention import (
-        refresh_cross_attention_kv)
+        wire_refresh_to_producer)
 
     captured = {}
     original_get_action = model.get_action
@@ -151,17 +153,38 @@ def main() -> int:
             with torch.inference_mode():
                 hot()
 
-        asm, extras = build(model, run_once)
-        handle = swap.attach(model, asm.swaps,
-                             observe=extras["observed"],
-                             on_guard_fail="raise")
-        if extras["cadence_statics"]:
-            with torch.inference_mode():
-                out = model.backbone(backbone_inputs)
-                processed = model.action_head.process_backbone_output(out)
-                refresh_cross_attention_kv(
-                    extras["cadence_statics"],
-                    processed["backbone_features"])
+        if args.arm == "explicit":
+            asm, extras = build(model, run_once)
+            handle = swap.attach(model, asm.swaps,
+                                 observe=extras["observed"],
+                                 revert=extras["revert"],
+                                 on_guard_fail="raise")
+            statics = extras["cadence_statics"]
+            seats = {"seats_bound": dict(asm.families),
+                     "swaps": len(asm.swaps),
+                     "refused": len(asm.refused)}
+        else:
+            from flash_rt import structures
+            from flash_rt.structures.impls.cadence_static.cross_attention \
+                import (bind_cross_attention_kv, capture_cross_attention_kv,
+                        discover_cross_attention_kv)
+            sites = discover_cross_attention_kv(model)
+            caps = capture_cross_attention_kv(sites, run_once)
+            plan = structures.auto_swaps(model, run_once, verbose=True)
+            statics = []
+            if sites:
+                cadence_swaps, statics = bind_cross_attention_kv(
+                    sites, caps, replacements=plan.swaps)
+                plan.swaps.update(cadence_swaps)
+            handle = swap.attach(model, plan.swaps, observe=plan.observed,
+                                 revert=plan.revert)
+            seats = {"swaps": len(plan.swaps),
+                     "observed": len(plan.observed),
+                     "refused": len(plan.notes.get("refused", []))}
+        if statics:
+            # the refresh rides the producer's forward: the captured
+            # graph writes the banks from this call's own features
+            wire_refresh_to_producer(model, statics, run_once)
 
         torch._dynamo.reset()
         treated = capture_stage(
@@ -176,10 +199,9 @@ def main() -> int:
             treated.output.detach().float().cpu().flatten(),
             reference.flatten(), dim=0))
         report = {
+            "arm": args.arm,
             "device": torch.cuda.get_device_name(),
-            "seats_bound": dict(asm.families),
-            "swaps": len(asm.swaps),
-            "refused": len(asm.refused),
+            **seats,
             "kernel_unavailable": unavailable_report(),
             "graph_lowering": treated.certification.get("graph_lowering"),
             "parity_cosine": parity,

@@ -33,6 +33,7 @@ import argparse
 import json
 import statistics
 import sys
+import types
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -168,6 +169,23 @@ def build(model, run_once) -> tuple[Assembly, dict]:
                  if type(b.norm1).__name__ == "AdaLayerNorm"}
     DIT_QKV = {f"action_head.model.transformer_blocks.{i}.attn1": b.attn1
                for i, b in enumerate(dit_blocks)}
+    vlsa_blocks = list(
+        model.action_head.vl_self_attention.transformer_blocks)
+    LANG_OPROJ = {
+        f"backbone.model.model.language_model.layers.{i}"
+        ".self_attn.o_proj": l.self_attn.o_proj
+        for i, l in enumerate(lang_layers)}
+    VLSA_FF = {f"action_head.vl_self_attention.transformer_blocks.{i}.ff":
+               b.ff for i, b in enumerate(vlsa_blocks)}
+    VLSA_QKV = {
+        f"action_head.vl_self_attention.transformer_blocks.{i}.attn1":
+        b.attn1 for i, b in enumerate(vlsa_blocks)}
+    VLSA_OUT = {
+        f"action_head.vl_self_attention.transformer_blocks.{i}"
+        ".attn1.to_out.0": b.attn1.to_out[0]
+        for i, b in enumerate(vlsa_blocks)}
+    PATCH = {"backbone.model.model.visual.patch_embed":
+             base.visual.patch_embed}
 
     # ---- calibration: one pass, author-owned hooks -----------------------
     cal = defaultdict(dict)
@@ -180,6 +198,7 @@ def build(model, run_once) -> tuple[Assembly, dict]:
             slot[field] = max(slot.get(field, 0.0), amax(x))
             slot.setdefault(field + "_rows", x.reshape(-1, x.shape[-1])
                             .shape[0])
+            slot.setdefault(field + "_dtype", x.dtype)
         return hook
 
     def record_pair(key):
@@ -203,7 +222,7 @@ def build(model, run_once) -> tuple[Assembly, dict]:
         return [getattr(attn, a).register_forward_hook(make(a))
                 for a in attrs]
 
-    for path, mlp in {**VISION_FFN, **DIT_FF}.items():
+    for path, mlp in {**VISION_FFN, **DIT_FF, **VLSA_FF}.items():
         hooks.append(mlp.register_forward_hook(record_input(path, "x")))
         fc2 = mlp.linear_fc2 if hasattr(mlp, "linear_fc2") else mlp.net[2]
         hooks.append(fc2.register_forward_hook(record_input(path, "hidden")))
@@ -215,8 +234,17 @@ def build(model, run_once) -> tuple[Assembly, dict]:
         hooks.extend(record_qkv(path, attn, ("q_proj", "k_proj", "v_proj")))
     for path, attn in DIT_QKV.items():
         hooks.extend(record_qkv(path, attn, ("to_q", "to_k", "to_v")))
+        for attr in ("to_q", "to_k", "to_v"):
+            hooks.append(getattr(attn, attr).register_forward_hook(
+                record_input(f"{path}.{attr}", "x")))
+    for path, attn in VLSA_QKV.items():
+        hooks.extend(record_qkv(path, attn, ("to_q", "to_k", "to_v")))
     for path, norm in DIT_ADALN.items():
         hooks.append(norm.linear.register_forward_hook(record_pair(path)))
+    for path, mod in {**LANG_OPROJ, **VLSA_OUT}.items():
+        hooks.append(mod.register_forward_hook(record_input(path, "x")))
+    for path, mod in PATCH.items():
+        hooks.append(mod.register_forward_hook(record_input(path, "x")))
 
     cross_sites = discover_cross_attention_kv(model)
     cross_captures = capture_cross_attention_kv(cross_sites, run_once)
@@ -236,7 +264,7 @@ def build(model, run_once) -> tuple[Assembly, dict]:
         if bound is not None:
             asm.place(path, bound)
 
-    for path, mlp in DIT_FF.items():
+    for path, mlp in {**DIT_FF, **VLSA_FF}.items():
         c = cal[path]
         seam = Seam(structure="vision_ffn", path=path,
                     parent_path=path.rsplit(".", 1)[0], norm_attr="norm3",
@@ -276,6 +304,77 @@ def build(model, run_once) -> tuple[Assembly, dict]:
             for attr, mod in zip(("q_proj", "k_proj", "v_proj"), parts):
                 asm.place(f"{path}.{attr}", mod)
 
+    # projections the packs do not cover: the language o_proj and the
+    # vl-self-attention output projection each take an FP8 seat of
+    # their own — the same linear_proj family the automatic path binds.
+    from flash_rt.structures.impls.linear_proj.fp8_static import (
+        bind_proj_seam)
+
+    def take_proj(path, mod, c):
+        if "x" not in c:
+            return
+        weights = {"w": mod.weight}
+        if mod.bias is not None:
+            weights["b"] = mod.bias
+        bound = asm.take(path, "linear_proj", lambda: bind_proj_seam(
+            weights, input_scale=c["x"] / 448.0,
+            row_profile=[c["x_rows"]], original=mod))
+        if bound is not None:
+            asm.place(path, bound)
+
+    for path, mod in {**LANG_OPROJ, **VLSA_OUT}.items():
+        take_proj(path, mod, cal[path])
+
+    for path, attn in VLSA_QKV.items():
+        c = cal[path]
+        if not c.get("shared"):
+            asm.refused.append(
+                (path, "qkv_pack: siblings do not share one input "
+                       "this tick — host keeps its projections"))
+            continue
+        scale = torch.tensor([max(c["x"] / 448.0, 1e-8)], device="cuda")
+        parts = asm.take(path, "qkv_pack", lambda: bind_qkv_pack(
+            [attn.to_q, attn.to_k, attn.to_v], scale,
+            rows=c["rows"], in_dtype="bf16_fused_quant"))
+        if parts is not None:
+            for attr, mod in zip(("to_q", "to_k", "to_v"), parts):
+                asm.place(f"{path}.{attr}", mod)
+
+    # the vision patch projection: one full-patch seat
+    from flash_rt.structures.impls.patch_projection import (
+        bind_flat_patch_projection)
+    for path, mod in PATCH.items():
+        c = cal[path]
+        proj = getattr(mod, "proj", mod)
+        if "x" not in c or not hasattr(proj, "weight"):
+            continue
+        weights = {"w": proj.weight.reshape(proj.weight.shape[0], -1)}
+        if getattr(proj, "bias", None) is not None:
+            weights["b"] = proj.bias
+        bound = asm.take(path, "patch_projection",
+                         lambda: bind_flat_patch_projection(
+                             weights, row_profile=[c["x_rows"]],
+                             host_dtypes=[c["x_dtype"]], original=mod))
+        if bound is not None:
+            asm.place(path, bound)
+
+    # language attention: fold the per-head q/k norm and rope into the
+    # packed projection's tail — the family composition the automatic
+    # path engages, called through the same adapter entry. It requires
+    # the packs above to be in the seat map already.
+    from flash_rt.structures.adapters.qwen_per_head_qk_norm_rope import (
+        PerHeadGqaQkNormRopeAdapter)
+    reverts = []
+    rope_result = PerHeadGqaQkNormRopeAdapter()(
+        model, types.SimpleNamespace(swaps=asm.swaps, notes={}))
+    rope_observed = {}
+    if rope_result:
+        rope_observed = rope_result.get("observed", {})
+        asm.refused.extend(rope_result.get("refused", []))
+        reverts.extend(rope_result.get("revert", ()))
+        if rope_observed:
+            asm.families["qk_norm_rope"] = len(rope_observed)
+
     # The DiT self-attention blocks carry a negotiated chain, and the
     # explicit form writes the negotiation out: the adaptive norm emits
     # FP8 at a shared activation scale, and the packed QKV consumes that
@@ -291,10 +390,40 @@ def build(model, run_once) -> tuple[Assembly, dict]:
         if norm_path not in DIT_ADALN or not pairs:
             continue
         if not c.get("shared"):
-            asm.refused.append(
-                (norm_path, "adaln_producer: no packed consumer — the "
-                            "layer-norm form emits FP8 and this block's "
-                            "attention reads two streams"))
+            # cross block: no pack, but the chain does not vanish — the
+            # producer still emits FP8 at the query projection's scale
+            # and to_q consumes it directly (the fp8-in form has no
+            # work-band floor); to_k/to_v read the encoder stream and
+            # take plain FP8 seats of their own
+            norm = block.norm1
+            cq = cal[f"{attn_path}.to_q"]
+            rows_q = cq.get("x_rows", c.get("rows"))
+            q_scale = torch.tensor(
+                [max(cq.get("x", 0.0) / 448.0, 1e-8)], device="cuda")
+            producer = asm.take(norm_path, "adaln_producer",
+                                lambda: bind_adaln_producer(
+                                    norm, pairs, act_scale=q_scale,
+                                    rows=rows_q,
+                                    dim=norm.norm.normalized_shape[0],
+                                    locator=locator, norm="layer"))
+            if producer is not None:
+                locator = locator or producer.locator
+                asm.place(norm_path, producer)
+                mod = block.attn1.to_q
+                weights = {"w": mod.weight}
+                if mod.bias is not None:
+                    weights["b"] = mod.bias
+                bound = asm.take(f"{attn_path}.to_q", "linear_proj",
+                                 lambda: bind_proj_seam(
+                                     weights,
+                                     input_scale=cq["x"] / 448.0,
+                                     row_profile=[rows_q], original=mod,
+                                     in_dtype="fp8_static"))
+                if bound is not None:
+                    asm.place(f"{attn_path}.to_q", bound)
+            for attr in ("to_k", "to_v"):
+                key = f"{attn_path}.{attr}"
+                take_proj(key, getattr(block.attn1, attr), cal[key])
             continue
         scale = torch.tensor([max(c["x"] / 448.0, 1e-8)], device="cuda")
         norm = block.norm1
@@ -320,15 +449,16 @@ def build(model, run_once) -> tuple[Assembly, dict]:
     # rank themselves; whichever the host's packages can serve binds, and
     # the losers' reasons ride along on the bound core.
     adapter_result = DiffusersAttentionAdapter()(model, run_once)
-    observed, toggles, variants = {}, [], {}
+    observed, toggles, variants = dict(rope_observed), [], {}
     if adapter_result is not None:
         _, _, extras = adapter_result
-        observed = extras.get("observed", {})
+        observed.update(extras.get("observed", {}))
         variants = extras.get("attention_variants", {})
         asm.refused.extend(extras.get("refused", []))
+        reverts.extend(extras.get("revert", ()))
         if extras.get("toggle"):
             toggles.append(extras["toggle"])
-        asm.families["attention_core"] = len(observed)
+        asm.families["attention_core"] = len(extras.get("observed", {}))
 
     cadence_statics = []
     if cross_sites:
@@ -339,7 +469,8 @@ def build(model, run_once) -> tuple[Assembly, dict]:
         asm.families["cadence_static"] = len(cadence_swaps)
 
     extras = {"observed": observed, "toggles": toggles,
-              "variants": variants, "cadence_statics": cadence_statics}
+              "variants": variants, "cadence_statics": cadence_statics,
+              "revert": reverts}
     return asm, extras
 
 
@@ -430,24 +561,18 @@ def main() -> int:
     asm, extras = build(model, run_once)
 
     handle = swap.attach(model, asm.swaps, observe=extras["observed"],
-                         on_guard_fail="raise")
+                         revert=extras["revert"], on_guard_fail="raise")
 
-    def refresh():
-        # cross-attention K/V follow the observation cadence, not the
-        # denoise cadence: recompute them from the current backbone
-        # features once per observation, exactly as the native pipeline
-        # computes them once per tick
-        if extras["cadence_statics"]:
-            from flash_rt.structures.impls.cadence_static.cross_attention \
-                import refresh_cross_attention_kv
-            with torch.inference_mode():
-                out = model.backbone(backbone_inputs)
-                processed = model.action_head.process_backbone_output(out)
-                refresh_cross_attention_kv(
-                    extras["cadence_statics"],
-                    processed["backbone_features"])
-
-    refresh()
+    if extras["cadence_statics"]:
+        # cross-attention K/V follow the observation cadence: wire the
+        # bank refresh into the producer's own forward, so every form of
+        # the hot path (eager, compiled, captured) carries the current
+        # observation through — and pays the refresh it would pay in
+        # production
+        from flash_rt.structures.impls.cadence_static.cross_attention \
+            import wire_refresh_to_producer
+        wire_refresh_to_producer(model, extras["cadence_statics"],
+                                 run_once)
     with torch.inference_mode():
         treated = hot().detach().float().cpu()
         treated_ms = median_ms(lambda: hot())

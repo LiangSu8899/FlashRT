@@ -39,7 +39,7 @@ def main() -> int:
     from flash_rt.structures import swap
     from flash_rt.structures.impls import unavailable_report
     from flash_rt.structures.impls.cadence_static.cross_attention import (
-        refresh_cross_attention_kv)
+        wire_refresh_to_producer)
 
     model = GR00TN17.from_pretrained(args.checkpoint).to(
         device="cuda", dtype=torch.bfloat16).eval()
@@ -76,28 +76,33 @@ def main() -> int:
             asm, extras = build(model, run_once)
             handle = swap.attach(model, asm.swaps,
                                  observe=extras["observed"],
+                                 revert=extras["revert"],
                                  on_guard_fail="raise")
             statics = extras["cadence_statics"]
             seats = {"seats_bound": dict(asm.families),
                      "swaps": len(asm.swaps),
                      "refused": len(asm.refused)}
         else:
+            from flash_rt.structures.impls.cadence_static.cross_attention \
+                import (bind_cross_attention_kv, capture_cross_attention_kv,
+                        discover_cross_attention_kv)
+            sites = discover_cross_attention_kv(model)
+            caps = capture_cross_attention_kv(sites, run_once)
             plan = structures.auto_swaps(model, run_once, verbose=True)
+            statics = []
+            if sites:
+                cadence_swaps, statics = bind_cross_attention_kv(
+                    sites, caps, replacements=plan.swaps)
+                plan.swaps.update(cadence_swaps)
             handle = swap.attach(model, plan.swaps,
                                  observe=plan.observed,
                                  revert=plan.revert)
-            statics = []
             seats = {"swaps": len(plan.swaps),
                      "observed": len(plan.observed),
                      "refused": len(plan.notes.get("refused", []))}
 
         if statics:
-            with torch.inference_mode():
-                features = model.backbone(vl_input)
-                processed = model.action_head.process_backbone_output(
-                    features)
-                refresh_cross_attention_kv(
-                    statics, processed["backbone_features"])
+            wire_refresh_to_producer(model, statics, run_once)
 
         torch._dynamo.reset()
         treated = capture_stage(

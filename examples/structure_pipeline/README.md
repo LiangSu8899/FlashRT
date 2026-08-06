@@ -41,84 +41,99 @@ what can be reached:
 | safety net | per-seam guards; refusals recorded; production mode falls back to the host per call | identical — the same guards arm at bind time |
 
 The practical meaning of the last rows showed up in this very
-measurement. On the LeRobot host the automatic path binds a
-`qkv_rope` seam whose cos/sin contract drifts at run time; the guard
-catches it on every call, falls back to the host, and the ledger
-reports 2568 fallbacks — while parity holds at 0.9999. The explicit
-assembly never declared that seat, so it pays neither the drift nor
-the fallback overhead. One path is armor, the other is aim.
+measurement. On the LeRobot host the automatic path binds the vision
+`packed_qkv_rope` family whose rope tables can never satisfy the FP32
+contract there; the guards refuse every one of those calls before any
+work is done and the ledger counts them — while parity holds at
+0.9999. The explicit book never declared that seat: zero run-time
+refusals. One path is armor, the other is aim.
 
 Neither path is faster by construction: they bind the same
-implementation layer, and at the captured form they land on the same
-number. Explicit control matters where automatic qualification is
-conservative — a specialist seat the discovery cannot prove safe, a
-cadence the author knows (observation-rate cross-attention K/V versus
-denoise-rate compute), a scheme choice per seat.
+implementation layer, and with a matched seat book the captured form
+lands on the same number on both hosts. Explicit control matters
+where automatic qualification is conservative — a specialist seat the
+discovery cannot prove safe, a cadence the author knows
+(observation-rate cross-attention K/V versus denoise-rate compute), a
+scheme choice per seat.
 
 ## Measured — RTX 5090, one checkpoint, one input set, one protocol
 
 GR00T N1.7 has two hosts — the official Isaac-GR00T repository and the
 LeRobot port. Both are measured on the same prepared model-level
 inputs (exported once, loaded by both), pinned noise, median of
-interleaved rounds, and all three execution forms on each host.
-Parity is the treated output against that host's own untouched eager
-run; each arm re-measures the stock graph in its own process (24 ±3%
-across runs — read speedups, not cross-run milliseconds). The **same `build()` — every seat path, every binder call — ran
-on both hosts without a single edit**: the LeRobot port vendors the
-official module layout, so the seat tables transfer verbatim.
+interleaved rounds. Parity is the treated output against that host's
+own untouched eager run; each arm re-measures the stock graph in its
+own process (±3% across runs — read speedups, not cross-run
+milliseconds). The **same `build()` — every seat path, every binder
+call — ran on both hosts without a single edit**: the LeRobot port
+vendors the official module layout, so the seat tables transfer
+verbatim. Every number is the production form: the cross-attention
+K/V banks refresh inside the hot path (wired to their producer), so
+each call carries its own observation and pays its own refresh.
 
-**Official Isaac-GR00T host:**
+**The captured form (deployed), both hosts, both arms:**
 
-| form | host | automatic (3 lines) | explicit (this folder) |
-|---|---|---|---|
-| eager | 45.7 ms | 50.2 ms | 56.7 ms |
-| compiled | 33.9 ms | — | 30.1 ms |
-| **captured** | 23.4 ms | **14.79 ms** (1.58×, 285 seams) | **15.87 ms** (1.48×, 216 seats) |
-| parity | — | 0.99990 | 0.99988 |
+| captured | official host | LeRobot host |
+|---|---|---|
+| stock graph | 23.39 ms | 24.91 ms |
+| automatic (3 lines) | 15.27 ms (1.532×) p=0.99928 | 17.09 ms (1.457×) p=0.99947, **96 guarded refusals** |
+| explicit (this folder) | **15.26 ms (1.533×)** p=0.99921 | **17.08 ms (1.458×)** p=0.99987, **0 refusals at run time** |
 
-**LeRobot host:**
+Both arms bind the same 285-seat book on each host, and land on the
+same number — the measured proof that the two paths differ in **who
+writes the seat book**, not in what the seats can do. The kernel
+profile says the same thing bucket by bucket: after the explicit
+assembly claimed its full book, every bucket (fp8 structures,
+attention, fused elementwise, norm/rope, memops) agrees with the
+automatic arm within 0.02 ms.
 
-| form | host | automatic (3 lines) | explicit (this folder) |
-|---|---|---|---|
-| eager | 42.0 ms | 53.6 ms | 51.9 ms |
-| compiled | 33.7 ms | 31.0 ms | 29.7 ms |
-| **captured** | ~24 ms | 18.24 ms (1.37×) | **17.02 ms** (1.42×) |
-| parity | — | 0.99989 | 0.99987 |
-| runtime fallbacks | — | 72 (`qkv_rope`, guarded, refused before any work) | 0 |
+**The explicit ladder on the official host** (same assembly, cheaper
+forms):
+
+| form | host | explicit |
+|---|---|---|
+| eager | 46.1 ms | 57.1 ms (0.81× — the per-call guard admission is real and printed) |
+| compiled | 33.9 ms | 27.7 ms (1.22×) |
+| captured | 23.4 ms | 15.26 ms (1.53×) |
 
 What the tables say:
 
-1. **The explicit assembly lands in one band on both hosts**
-   (15.87 / 17.02 ms) from one unchanged file, at 0.9999 parity on
-   each — and the captured form is one mechanism call:
-   `structures.capture(torch.compile(hot), model=model)`. The
-   registered host-family adapter pins the shape glue and lists its
-   pins in the stage certification.
-2. **Speedups may only be read within a row.** Eager pays a per-call
+1. **A matched seat book is the whole game.** The first explicit
+   assembly stopped at 216 seats and lost 9% to the automatic path;
+   the kernel-bucket profile located the missing milliseconds
+   (norm/rope fusion, the projection seats, the patch seat), the seat
+   tables grew to the same 285-seat book, and the two arms now land
+   within 0.01 ms of each other on both hosts.
+2. **Where they differ is the run-time story, not the speed.** On the
+   LeRobot host the automatic path also engages the vision
+   `packed_qkv_rope` family, whose rope tables can never satisfy the
+   FP32 contract on this host (see the loading note below); the guards
+   refuse every one of those calls before any work is done — 96
+   refusals per run, parity held, ledger says so. The explicit book
+   never declared that seat: zero run-time refusals. Armor versus
+   aim, measured.
+3. **Speedups may only be read within a row.** Eager pays a per-call
    Python admission check at every guarded seam and is *slower* than
    the host — printed, not hidden. Captured is the deployed form,
    where guards and glue are paid once at capture time.
-3. **Where every seam holds, the automatic path wins** — its 69
-   extra seams buy 7% on the official host (14.79 vs 15.87). On the LeRobot host the automatic path binds a
-   `qkv_rope` family whose rope tables can never satisfy the FP32
-   contract on this host (see the loading note below); the guards
-   refuse every call before any work is done and run the host path,
-   parity holds, and the ledger says so. The explicit assembly never
-   declared that seat: armor versus aim, measured.
 4. **A host loading note that costs real precision**: the LeRobot
    recipe `from_pretrained(...).to(dtype=bf16)` casts *every* floating
    buffer — including the rotary `inv_freq` that transformers'
    dtype-aware loading deliberately keeps in FP32. On this host the
    vision rope tables are therefore born BF16; loading with
    `from_pretrained(..., dtype=bf16)` instead keeps them FP32. This is
-   why the `qkv_rope` family refuses here, and it is a precision loss
-   the host pays with or without structures.
+   why the vision `qkv_rope` family refuses here, and it is a
+   precision loss the host pays with or without structures.
 5. Host coupling lives in the capture lowering, and the lowering
    lives in the library: the registered Qwen3-VL family adapter
    carries the probed branches for both transformers vision-contract
    generations and the LeRobot wrapper glue. Porting the measurement
    between the two hosts changed none of the assembly and none of the
    capture code — the same door served both.
+6. **Teardown is a gate, not a hope**: every adapter's undo rides
+   `extras["revert"]` into `attach`, and `handle.detach()` restores
+   the host bit-for-bit — measured by re-running the untouched eager
+   pass after detach and comparing exactly.
 
 ## Running
 
