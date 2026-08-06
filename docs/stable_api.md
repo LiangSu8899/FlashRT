@@ -29,7 +29,7 @@ def load_model(
     autotune: int = 3,              # 0=off, 3=default, 5+=thorough
     recalibrate: bool = False,
     weight_cache: bool = True,      # JAX only
-    config: str = "pi05",           # "pi05" | "pi0" | "groot" | "groot_n17" | "pi0fast" | "motus" | "wan22_ti2v_5b" | "cosmos3_video" | "cosmos3_edge" | "chameleon"
+    config: str = "pi05",           # "pi05" | "pi0" | "groot" | "groot_n17" | "pi0fast" | "motus" | "wan22_ti2v_5b" | "cosmos3_video" | "cosmos3_edge" | "chameleon" | "hyvla"
     device=None,                    # reserved
     # Pi0-FAST-specific:
     decode_cuda_graph: bool = False,
@@ -169,6 +169,10 @@ Returns a `VLAModel` wrapping the appropriate frontend for the detected
   `ChameleonTorchFrontendRtxSm87` (Jetson Orin SM87) or
   `ChameleonTorchFrontendThor` (Jetson Thor SM110).
   See `docs/chameleon_usage.md`.
+- `config="hyvla"` (Hy-Embodied-0.5-VLA) is registered for
+  `framework="torch"` on `hardware="thor"`. Thor uses runtime dynamic
+  FP8 with fused megakernels and optional NVFP4 FFN (`use_fp4=True`).
+  See `docs/hyvla05_thor_sm110.md`.
 
 ### `flash_rt.VLAModel`
 
