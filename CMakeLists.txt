@@ -483,6 +483,69 @@ if(ENABLE_SM100_CUTLASS)
   )
   target_link_libraries(fmha_fp16_strided PRIVATE CUDA::cudart)
   message(STATUS "libfmha_fp16_strided.so: building for sm_${GPU_ARCH} (Thor FMHA for SigLIP)")
+
+  # ── libfmha_fp16_causal.so — CUTLASS SM100 FP16 causal FMHA for Chameleon ──
+  # Same as fmha_fp16_strided but with CausalMask<true>/<false> and
+  # CausalIndividualTileScheduler. Used by Chameleon-7B LLM self-attention
+  # (is_causal=True). Loaded at runtime via ctypes in
+  # hardware/thor/attn_backend_chameleon.py.
+  add_library(fmha_fp16_causal SHARED csrc/attention/fmha_fp16_causal.cu)
+  set_target_properties(fmha_fp16_causal PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt
+    CUDA_STANDARD 17
+    POSITION_INDEPENDENT_CODE ON
+    CUDA_ARCHITECTURES "${GPU_ARCH}a"
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+    PREFIX "lib"
+    OUTPUT_NAME "fmha_fp16_causal"
+  )
+  target_include_directories(fmha_fp16_causal PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention
+    ${CUTLASS_DIR}/examples/77_blackwell_fmha
+    ${CUTLASS_INCLUDE}
+    ${CUTLASS_DIR}/tools/util/include
+  )
+  target_compile_options(fmha_fp16_causal PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr --expt-extended-lambda -O3
+      ${GPU_GENCODE}
+    >
+  )
+  target_link_libraries(fmha_fp16_causal PRIVATE CUDA::cudart)
+  message(STATUS "libfmha_fp16_causal.so: building for sm_${GPU_ARCH} (Thor causal FMHA for Chameleon)")
+
+  # ── libfmha_fp8_causal.so — CUTLASS SM100 FP8 causal FMHA ──
+  # FP8 (E4M3) input variant of fmha_fp16_causal for Chameleon-7B. Inputs
+  # Q/K/V are FP8, outputs O FP16, accumulators FP32. CUTLASS Sm100 FMHA
+  # mainloop has FP8-aware kPRescale logic that triggers when
+  # ``Element == cutlass::float_e4m3_t``. Loaded via dlopen at runtime
+  # alongside libfmha_fp16_causal.so as a drop-in alternative.
+  add_library(fmha_fp8_causal SHARED csrc/attention/fmha_fp8_causal.cu)
+  set_target_properties(fmha_fp8_causal PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt
+    CUDA_STANDARD 17
+    POSITION_INDEPENDENT_CODE ON
+    CUDA_ARCHITECTURES "${GPU_ARCH}a"
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+    PREFIX "lib"
+    OUTPUT_NAME "fmha_fp8_causal"
+  )
+  target_include_directories(fmha_fp8_causal PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention
+    ${CUTLASS_DIR}/examples/77_blackwell_fmha
+    ${CUTLASS_INCLUDE}
+    ${CUTLASS_DIR}/tools/util/include
+  )
+  target_compile_options(fmha_fp8_causal PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr --expt-extended-lambda -O3
+      ${GPU_GENCODE}
+    >
+  )
+  target_link_libraries(fmha_fp8_causal PRIVATE CUDA::cudart)
+  message(STATUS "libfmha_fp8_causal.so: building for sm_${GPU_ARCH} (Thor FP8 causal FMHA for Chameleon)")
 endif()
 
 # ── CUTLASS SM120a block-128 FP8 GEMM (Path B for Qwen3.6) ──
@@ -869,11 +932,18 @@ if(ENABLE_FA2 AND
       csrc/attention/fa2_causal_inst/flash_fwd_split_hdim256_bf16_sm80_causal.cu
     )
   endif()
+  # fp16 hdim=128 serves Chameleon-7B causal prefill/decode on Orin SM87.
+  if("128" IN_LIST FA2_HDIMS AND "fp16" IN_LIST FA2_DTYPES)
+    list(APPEND FA2_SRCS
+      csrc/attention/fa2_causal_inst/flash_fwd_hdim128_fp16_sm80_causal.cu
+      csrc/attention/fa2_causal_inst/flash_fwd_split_hdim128_fp16_sm80_causal.cu
+    )
+  endif()
   if(FLASHRT_ENABLE_NATIVE_CPP)
     # The native C boundary has a stable five-symbol surface. Its causal
     # wrapper contains native-only fail-fast dispatch for a slim matrix.
     list(APPEND FA2_SRCS csrc/attention/fa2_wrapper_causal.cu)
-  elseif("bf16" IN_LIST FA2_DTYPES AND
+  elseif(("bf16" IN_LIST FA2_DTYPES OR "fp16" IN_LIST FA2_DTYPES) AND
          ("128" IN_LIST FA2_HDIMS OR "256" IN_LIST FA2_HDIMS))
     # Preserve the existing Python-only source matrix exactly by default.
     list(APPEND FA2_SRCS csrc/attention/fa2_wrapper_causal.cu)
