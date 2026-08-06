@@ -108,7 +108,6 @@ class PerHeadGqaQkNormRopeAdapter:
                     continue
             sliding_window = getattr(module, "sliding_window", None)
             scaling = module.scaling
-            output_projection = module.o_proj
             layer_index = getattr(module, "layer_idx", None)
 
             try:
@@ -139,7 +138,6 @@ class PerHeadGqaQkNormRopeAdapter:
                 packed=pack,
                 attention_fn=attention,
                 attention_scale=scaling,
-                output_proj=output_projection,
                 cache_layer=layer_index,
                 window=sliding_window,
                 **kwargs,
@@ -182,7 +180,9 @@ class PerHeadGqaQkNormRopeAdapter:
                     **attention_kwargs,
                 )
                 output = output.reshape(batch, tokens, -1).contiguous()
-                return output_proj(output), weights
+                # resolve through the module: attach may have seated a
+                # structure at o_proj after this route was recorded
+                return self.o_proj(output), weights
 
             routed_method = types.MethodType(routed, module)
             routes.append(
