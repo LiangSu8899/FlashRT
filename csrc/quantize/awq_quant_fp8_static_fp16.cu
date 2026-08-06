@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Phase 3.1 — Fused AWQ activation per-K scale + per-tensor static FP8 e4m3
-// quantize for FP16 inputs (Chameleon-7B variant).
+// Fused AWQ activation per-K scale + per-tensor static FP8 e4m3 quantize
+// for FP16 inputs (Chameleon-7B variant).
 //
 // Mirrors ``awq_quant_fp8_static_bf16`` but consumes FP16 activations,
-// matching the Chameleon-7B residual-stream dtype. Used by Phase 3 of the
-// LLM optimization plan to pre-scale xn (the post-RMSNorm input to V_proj)
-// by a per-input-channel SmoothQuant factor before per-tensor FP8 quantize:
+// matching the Chameleon-7B residual-stream dtype. Pre-scales xn (the
+// post-RMSNorm input to V_proj) by a per-input-channel SmoothQuant factor
+// before per-tensor FP8 quantize:
 //
 //     out[m, k] = clip( in[m, k] * inv_s[k] / act_scale, ±448 )
 //

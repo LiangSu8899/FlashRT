@@ -334,7 +334,6 @@ extern "C" void fht_int4_quant_fp16(
 // *unmodified* cutlass_int8_rowwise_* GEMMs consume it. Conditions the
 // Chameleon massive-activation channels (which destroy plain per-row INT8)
 // without paying INT4's quantization noise.
-// See docs/chameleon7b_rtx_sm87.md.
 
 extern "C" void residual_add_rms_norm_fht_int8_fp16(
         __half* residual, const __half* x, const __half* weight,
