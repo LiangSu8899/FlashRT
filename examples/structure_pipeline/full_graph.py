@@ -187,7 +187,8 @@ def main() -> int:
                                  revert=plan.revert)
             seats = {"swaps": len(plan.swaps),
                      "observed": len(plan.observed),
-                     "refused": len(plan.notes.get("refused", []))}
+                     "refused": len(plan.notes.get("refused", [])),
+                     "format_race": plan.notes.get("format_race")}
         if statics:
             # the refresh rides the producer's forward: the captured
             # graph writes the banks from this call's own features

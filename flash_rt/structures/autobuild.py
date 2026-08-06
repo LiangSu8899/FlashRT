@@ -1371,6 +1371,61 @@ def _bind_negotiated(model, p_seam, k_seam, p_cap, points, scale, rows,
     mods = [getattr(consumer, a) for a in k_seam.pack_attrs]
     parts = bind_qkv_pack(mods, scale, rows=rows,
                           in_dtype="fp8_static")
+    # ---- the FP4 wire is a second candidate for the same seats: a
+    # producer that norms straight into packed NVFP4 + swizzled scale
+    # factors, and a pack that consumes the wire with no quantize of
+    # its own. Which chain is faster is a property of this device's
+    # GEMM bands at this row count — so it is measured here, on the
+    # calibrated shape with the real conditioning, and the winner takes
+    # the seats. A candidate that cannot build or run loses by default.
+    if dim >= 512:
+        try:
+            prod4 = bind_adaln_producer(
+                norm, p_cap["pairs"], act_scale=None, rows=rows,
+                dim=dim, locator=prod.locator, norm=form,
+                out_format="nvfp4")
+            from .impls.qkv_pack import nvfp4_balance as pack_w4
+            parts4 = pack_w4.bind_qkv_pack(
+                mods, channel_amax=None, rows=rows, wire=True)
+            parts4[0].accept_wire(prod4.wire_sfa)
+            cond0 = p_cap["pairs"][0][0].detach()
+            dev = prod4.wire_sfa.device
+            x_bench = torch.randn(rows, dim, device=dev,
+                                  dtype=torch.bfloat16)
+
+            def _chain_ms(producer, head, iters=30):
+                def once():
+                    y = producer(x_bench, cond0)
+                    head(y)
+                for _ in range(5):
+                    once()
+                torch.cuda.synchronize()
+                start = torch.cuda.Event(True)
+                end = torch.cuda.Event(True)
+                start.record()
+                for _ in range(iters):
+                    once()
+                end.record()
+                torch.cuda.synchronize()
+                return start.elapsed_time(end) / iters
+
+            with torch.no_grad():
+                a_ms = _chain_ms(prod, parts[0])
+                b_ms = _chain_ms(prod4, parts4[0])
+            race = {"layer": p_seam.path, "rows": int(rows),
+                    "dim": int(dim), "fp8_chain_ms": round(a_ms, 4),
+                    "nvfp4_wire_ms": round(b_ms, 4),
+                    "winner": "nvfp4_wire" if b_ms < a_ms else
+                              "fp8_chain"}
+            plan.notes.setdefault("format_race", []).append(race)
+            if b_ms < a_ms:
+                prod, parts = prod4, parts4
+                swaps[p_seam.path] = prod4
+        except (ValueError, RuntimeError, KeyError, OSError) as lost:
+            plan.notes.setdefault("format_race", []).append(
+                {"layer": p_seam.path,
+                 "winner": "fp8_chain",
+                 "nvfp4_wire": f"refused: {str(lost)[:80]}"})
     swaps.update({k_seam.path + "." + a: m
                   for a, m in zip(k_seam.pack_attrs, parts)})
     return swaps

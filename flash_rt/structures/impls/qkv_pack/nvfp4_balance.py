@@ -24,6 +24,24 @@ from .. import hub_kernel
 from ...guard import CAST_OK, PROCEED, GuardedSeam
 from .fp8_static import StashReader
 
+
+class WireStashReader(StashReader):
+    """Stash tail for a wire-fed pack: the packed uint8 input is the
+    negotiated form itself, admitted at negotiation time exactly as the
+    head's wire path is — the per-call dtype contract only applies to
+    the fallback (BF16) form. Rows come from the packed width, which is
+    half the logical feature width."""
+
+    def forward(self, x):
+        head = self._packed[0]
+        if (x.dtype is torch.uint8
+                and getattr(head, "_wire_sfa", None) is not None):
+            self._frt_touch()
+            logical_rows = x.numel() // x.shape[-1]
+            buf = getattr(head, f"stash{self.index}")[:logical_rows]
+            return buf.reshape(*x.shape[:-1], buf.shape[-1])
+        return super().forward(x)
+
 KERNEL_DEP = {
     "provider": "huggingface_kernels",
     "repo": "flashrt/fp4-gemm",
@@ -173,6 +191,7 @@ def bind_qkv_pack(mods: Sequence[torch.nn.Module], *, channel_amax,
         mods, w_packed, w_sfb, inv_s.to(torch.float16),
         torch.cat(biases), splits, rows)
     out = [packed]
+    reader = WireStashReader if wire else StashReader
     for i, m in enumerate(mods[1:], 1):
-        out.append(StashReader(m, packed, i))
+        out.append(reader(m, packed, i))
     return out

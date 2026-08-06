@@ -150,7 +150,7 @@ class AdaLNProducer(GuardedSeam, torch.nn.Module):
     def __init__(self, host_norm: torch.nn.Module,
                  styles: torch.Tensor, locator: StepLocator,
                  act_scale: torch.Tensor | None, rows: int, dim: int,
-                 norm: str = "rms"):
+                 norm: str = "rms", out_format: str | None = None):
         super().__init__()
         self.host_norm = host_norm
         self.locator = locator
@@ -163,8 +163,30 @@ class AdaLNProducer(GuardedSeam, torch.nn.Module):
         self.register_buffer("styles",
                              styles.to(torch.bfloat16).contiguous())
         self.out_fp8 = act_scale is not None
+        self.out_nvfp4 = out_format == "nvfp4"
         dev = styles.device
-        if norm == "layer":
+        if self.out_nvfp4:
+            # NVFP4 wire emission: the fused kernel norms, modulates and
+            # quantizes into preallocated packed/SFA buffers, so a
+            # downstream pack takes the scale factors once at bind time
+            # (accept_wire) and every call — eager, compiled, captured —
+            # reads the same storage. Layer flavour serves the DiT form;
+            # the rms flavour rides the fp4-fused-ops twins when a host
+            # needs it.
+            if norm != "layer":
+                raise ValueError(
+                    "adaln_producer: nvfp4 emission currently serves "
+                    "the layer form")
+            kq = hub_kernel("flashrt/adaptive-layernorm-producers",
+                            ">=1")
+            self._fn4 = kq.ada_layer_norm_quant_nvfp4_swizzled_bf16
+            probe = torch.zeros(rows, dim, device=dev,
+                                dtype=torch.bfloat16)
+            zero = torch.zeros(dim, device=dev, dtype=torch.bfloat16)
+            packed, sfa = self._fn4(probe, zero, zero)
+            self.register_buffer("wire_packed", packed)
+            self.register_buffer("wire_sfa", sfa)
+        elif norm == "layer":
             # LayerNorm hosts (DiT AdaLayerNorm): style is (scale,
             # shift), no gate, and the fused kernel takes the raw
             # scale — it applies the (1 + scale) itself.
@@ -197,7 +219,8 @@ class AdaLNProducer(GuardedSeam, torch.nn.Module):
         # buffers, so its row count is fixed; the layer form's kernel
         # takes scale and shift directly and leaves rows free
         self._frt_arm(dtypes=CAST_OK, device=dev, k=int(dim),
-                      rows=None if norm == "layer" else int(rows))
+                      rows=(None if norm == "layer"
+                            and not self.out_nvfp4 else int(rows)))
 
     # ---- block-facing entries -------------------------------------
     # A caller that owns the whole block (see ``impls.decoder_block``)
@@ -297,6 +320,16 @@ class AdaLNProducer(GuardedSeam, torch.nn.Module):
         if admitted is not PROCEED:            # unreachable: this form
             return admitted                    # refuses rather than reverts
         idx = self.locator(cond)
+        if self.out_nvfp4:
+            style = self.styles.index_select(0, idx)
+            scale, shift = style[0].chunk(2, dim=-1)
+            self._fn4(
+                x.reshape(-1, x.shape[-1]).to(torch.bfloat16)
+                .contiguous(),
+                scale.contiguous(), shift.contiguous(),
+                packed=self.wire_packed, sf_swizzled=self.wire_sfa)
+            return self.wire_packed.reshape(
+                *x.shape[:-1], x.shape[-1] // 2)
         if self.norm == "layer":
             style = self.styles.index_select(0, idx)
             scale, shift = style[0].chunk(2, dim=-1)
@@ -336,7 +369,8 @@ def bind_adaln_producer(host_norm: torch.nn.Module, pairs, *,
                         act_scale: torch.Tensor | None = None,
                         rows: int, dim: int,
                         locator: StepLocator | None = None,
-                        max_steps: int = 64, norm: str = "rms"):
+                        max_steps: int = 64, norm: str = "rms",
+                        out_format: str | None = None):
     """Bind an adaptive-norm producer from real ``(cond, style)`` pairs.
 
     ``pairs`` come from hooking the host's own conditioning projection
@@ -347,4 +381,5 @@ def bind_adaln_producer(host_norm: torch.nn.Module, pairs, *,
     """
     built, styles = bind_step_locator(pairs, max_steps=max_steps)
     return AdaLNProducer(host_norm, styles, locator or built,
-                         act_scale, rows, dim, norm=norm)
+                         act_scale, rows, dim, norm=norm,
+                         out_format=out_format)
