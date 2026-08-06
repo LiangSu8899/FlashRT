@@ -83,3 +83,19 @@ def test_the_run_keeps_going_but_the_failure_is_on_the_record(monkeypatch):
     impls.clear_unavailable_report()
     impls.hub_kernel.cache_clear()
     impls._LOADED.clear()
+
+
+def test_qkv_rope_mid_forward_refusal_falls_back_in_production_mode():
+    # a contract check tripping inside a routed adapter body must have
+    # the same two mode outcomes as every other refusal: strict raises,
+    # production counts it and runs the host — never an abort. The
+    # regression this locks: one drifted cos/sin table killing a whole
+    # forward that was attached with the fallback default.
+    import inspect
+
+    from flash_rt.structures.adapters import packed_qkv_rope
+
+    source = inspect.getsource(packed_qkv_rope)
+    assert "except GuardRefused" in source
+    assert "guard.refuse(str(refusal))" in source
+    assert "return host_forward(" in source

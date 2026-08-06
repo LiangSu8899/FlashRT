@@ -159,7 +159,7 @@ class PackedQkvRopeAdapter:
             original = module.forward
             had_instance_forward = "forward" in module.__dict__
 
-            def routed(
+            def _routed_impl(
                 self,
                 hidden_states,
                 cu_seqlens,
@@ -250,6 +250,31 @@ class PackedQkvRopeAdapter:
                     output = torch.cat(outputs, dim=1)
                 output = output.reshape(tokens, -1).contiguous()
                 return output_proj(output)
+
+            def routed(self, hidden_states, cu_seqlens,
+                       position_embeddings=None, *, rope=bound,
+                       host_forward=original, **kwargs):
+                # A contract check tripping inside the routed body is a
+                # refusal like any other: strict mode raises, production
+                # mode counts it and runs the call on the host module
+                # this seam replaced. Before this net existed, one
+                # drifted cos/sin table aborted the whole forward even
+                # in fallback mode — the exact two-fates defect the
+                # unified refusal type was introduced to remove.
+                try:
+                    return _routed_impl(self, hidden_states, cu_seqlens,
+                                        position_embeddings, **kwargs)
+                except GuardRefused as refusal:
+                    guard = getattr(rope, "_frt_guard", None)
+                    if guard is None or guard.mode == "raise":
+                        raise
+                    guard.refuse(str(refusal))
+                    # keyword, not positional: host signatures place
+                    # extra parameters (rotary_pos_emb) between the
+                    # required pair and the embeddings
+                    return host_forward(
+                        hidden_states, cu_seqlens,
+                        position_embeddings=position_embeddings, **kwargs)
 
             routed_method = types.MethodType(routed, module)
             routes.append(
