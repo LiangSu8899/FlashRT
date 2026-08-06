@@ -129,19 +129,31 @@ def _step_tables(model, chain, probe):
     n_layers = len(blocks)
     dim = blocks[0].dim
     seen: list[tuple[torch.Tensor, torch.Tensor]] = []
+    masks: dict = {}
 
     def note(_module, args, output):
         t = args[0].reshape(-1)[:1].float()
         if not any(torch.allclose(t, prev) for prev, _ in seen):
             seen.append((t.detach().clone(), output.detach().clone()))
 
-    hook = dit.timestep_encoder.register_forward_hook(note)
+    def grab_masks(_module, _args, kwargs):
+        img = kwargs.get("image_mask")
+        bb = kwargs.get("backbone_attention_mask")
+        if img is not None and bb is not None and not masks:
+            masks["image"] = img.detach().clone()
+            masks["backbone"] = bb.detach().clone()
+
+    hooks = [dit.timestep_encoder.register_forward_hook(note),
+             dit.register_forward_pre_hook(grab_masks, with_kwargs=True)]
     try:
         probe()
     finally:
-        hook.remove()
+        for hook in hooks:
+            hook.remove()
     if not seen:
         raise RuntimeError("dit chain: probe saw no timestep encodings")
+    if not masks:
+        raise RuntimeError("dit chain: probe saw no attention masks")
 
     silu = torch.nn.functional.silu
     keys, mods, tails = [], [], []
@@ -153,9 +165,13 @@ def _step_tables(model, chain, probe):
         shift, scale = dit.proj_out_1(silu(temb)).chunk(2, dim=1)
         tails.append(torch.stack(
             [shift.reshape(dim), scale.reshape(dim)]).to(torch.bfloat16))
+    image_rows = (masks["image"] & masks["backbone"]).reshape(-1)
+    text_rows = (~masks["image"] & masks["backbone"]).reshape(-1)
     return (torch.cat(keys).contiguous(),
             torch.stack(mods).contiguous(),
-            torch.stack(tails).contiguous())
+            torch.stack(tails).contiguous(),
+            torch.where(text_rows)[0].contiguous(),
+            torch.where(image_rows)[0].contiguous())
 
 
 def apply_dit_fp4_chain(model, chain: dict,
@@ -171,7 +187,8 @@ def apply_dit_fp4_chain(model, chain: dict,
     dit, blocks, _, _ = _dit(model)
     n_layers = len(blocks)
     dim = blocks[0].dim
-    t_keys, mods_table, tails_table = _step_tables(model, chain, probe)
+    (t_keys, mods_table, tails_table,
+     text_idx, image_idx) = _step_tables(model, chain, probe)
 
     ada_fp4 = kq.ada_layer_norm_quant_nvfp4_swizzled_bf16
     ln_fp4 = kq.layer_norm_no_affine_quant_nvfp4_swizzled_bf16
@@ -182,7 +199,7 @@ def apply_dit_fp4_chain(model, chain: dict,
     sdpa = torch.nn.functional.scaled_dot_product_attention
     kv_calls = [(b.attn1.to_k, b.attn1.to_v) for b in blocks]
 
-    def layer(li, h, sa, scale, shift, enc, mask):
+    def layer(li, h, sa, scale, shift, enc, rows):
         entry = table[li]
         xp, xs = ada_fp4(h, scale, shift)
         if entry["is_self"]:
@@ -195,13 +212,15 @@ def apply_dit_fp4_chain(model, chain: dict,
             q = gemm_bias(xp, entry["q"][0], xs, entry["q"][1],
                           entry["q_b"])
             to_k, to_v = kv_calls[li]
-            kb = to_k(enc)
-            vb = to_v(enc)
-            skv = kb.shape[-2]
+            # compact-row banks, native style: gathering the attended
+            # rows makes the mask disappear, and an unmasked SDPA keeps
+            # its fused backend
+            kb = to_k(enc).index_select(-2, rows)
+            vb = to_v(enc).index_select(-2, rows)
+            skv = rows.shape[0]
             o = sdpa(q.view(1, sa, nh, hd).transpose(1, 2),
-                     kb.view(1, skv, nh, hd).transpose(1, 2),
-                     vb.view(1, skv, nh, hd).transpose(1, 2),
-                     attn_mask=mask)
+                     kb.reshape(1, skv, nh, hd).transpose(1, 2),
+                     vb.reshape(1, skv, nh, hd).transpose(1, 2))
         o = o.transpose(1, 2).reshape(sa, dim).contiguous()
         op, osf = quant_act(o)
         h = gemm_bias_res(op, entry["o"][0], osf, entry["o"][1],
@@ -222,10 +241,6 @@ def apply_dit_fp4_chain(model, chain: dict,
         idx = (t_keys - t).abs().argmin().reshape(1)
         mods = mods_table.index_select(0, idx)[0]
         tail = tails_table.index_select(0, idx)[0]
-        img = image_mask & backbone_attention_mask
-        text = (~image_mask) & backbone_attention_mask
-        img = img.reshape(1, 1, 1, -1)
-        text = text.reshape(1, 1, 1, -1)
 
         b, sa, d = hidden_states.shape
         h = hidden_states.reshape(sa, d).to(torch.bfloat16).contiguous()
@@ -234,9 +249,9 @@ def apply_dit_fp4_chain(model, chain: dict,
             if li % 2 == 1:
                 h = layer(li, h, sa, mods[li, 0], mods[li, 1], None, None)
             else:
-                mask = text if li % (2 * every_n) == 0 else img
+                rows = text_idx if li % (2 * every_n) == 0 else image_idx
                 h = layer(li, h, sa, mods[li, 0], mods[li, 1],
-                          encoder_hidden_states, mask)
+                          encoder_hidden_states, rows)
             if all_h is not None:
                 all_h.append(h.reshape(b, sa, d))
 
