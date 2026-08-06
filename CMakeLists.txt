@@ -1339,6 +1339,7 @@ pybind11_add_module(flash_rt_kernels
   csrc/kernels/attention_mha.cu
   csrc/kernels/attention_mha_causal.cu
   csrc/kernels/rope_qwen3.cu
+  csrc/kernels/qk_norm_rope_fused.cu
   csrc/kernels/decoder_fused.cu
   csrc/kernels/dit_bf16.cu
   csrc/kernels/attention_dit_bf16.cu
@@ -1428,6 +1429,7 @@ endif()
 if(NOT FLASHRT_SLIM_BUILD)
   target_sources(flash_rt_kernels PRIVATE
     csrc/quantize/awq_quant_fp8_static_bf16.cu
+    csrc/quantize/awq_quant_fp8_static_fp16.cu
     csrc/quantize/bf16_ndhwc_to_ncdhw_transpose.cu
     csrc/quantize/bf16_quant_fp8_ncdhw_to_ndhwc.cu
     csrc/quantize/bf16_rms_silu_ncdhw.cu
@@ -1578,6 +1580,11 @@ if(ENABLE_SM80_INT8_CUTLASS)
   target_sources(flash_rt_kernels PRIVATE
     csrc/gemm/cutlass_sm80_int8_rowwise.cu
     csrc/gemm/cutlass_sm80_int8_rowwise_t64x128.cu
+    csrc/gemm/cutlass_sm80_int8_rowwise_fp16out.cu
+    csrc/gemm/cutlass_sm80_int8_rowwise_fp16out_t64x128.cu
+    csrc/gemm/cutlass_sm80_int8_rowwise_fp16out_t256x128.cu
+    csrc/gemm/cutlass_sm80_int4_rowwise.cu
+    csrc/kernels/fht_int4.cu
     csrc/gemm/cutlass_sm80_int8_silu_gated.cu)
   target_compile_definitions(flash_rt_kernels PRIVATE ENABLE_SM80_INT8_CUTLASS=1)
 endif()
