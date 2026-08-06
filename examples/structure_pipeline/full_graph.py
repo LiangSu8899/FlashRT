@@ -97,6 +97,10 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--arm", choices=("explicit", "auto"),
                         default="explicit")
+    parser.add_argument("--scheme", default=None,
+                        help="named precision scheme for the auto arm "
+                             "(e.g. nvfp4_balance); default negotiates "
+                             "FP8 chains")
     parser.add_argument("--host", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--backbone-assets", type=Path, required=True)
@@ -170,7 +174,10 @@ def main() -> int:
                         discover_cross_attention_kv)
             sites = discover_cross_attention_kv(model)
             caps = capture_cross_attention_kv(sites, run_once)
-            plan = structures.auto_swaps(model, run_once, verbose=True)
+            scheme_kw = ({"scheme": args.scheme}
+                         if args.scheme else {})
+            plan = structures.auto_swaps(model, run_once, verbose=True,
+                                         **scheme_kw)
             statics = []
             if sites:
                 cadence_swaps, statics = bind_cross_attention_kv(
@@ -200,6 +207,7 @@ def main() -> int:
             reference.flatten(), dim=0))
         report = {
             "arm": args.arm,
+            "scheme": args.scheme,
             "device": torch.cuda.get_device_name(),
             **seats,
             "kernel_unavailable": unavailable_report(),
