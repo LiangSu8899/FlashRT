@@ -1154,6 +1154,31 @@ def _bind_auto(model, seam, cap, plan, act_scales, negotiate_fp8,
         hid_s = scale("hidden_after_act", seam.path + "." + fc2)
         if in_s is None or hid_s is None:
             return None
+        rows_seen = points.row_profile(seam.path, "x_after_norm")
+        rows_med = rows_seen[len(rows_seen) // 2] if rows_seen else 1 << 30
+        if rows_med <= 64:
+            # the small-M denoise band: the measured band decision for
+            # this box (recorded by a band run, cached per device)
+            # routes these seats — never a shape rule alone, never a
+            # device name
+            from .decisions import lookup as _band_lookup
+            if _band_lookup("groot_dit", default="fp8") == "fp4":
+                from .impls.vision_ffn import nvfp4_balance as vis_w4
+                w = seam_weights(model, seam)
+                dev = w["w_fc1"].device
+                try:
+                    # flat channel vectors: no balance folded — the W4
+                    # quantizer alone, judged by the parity gate
+                    return vis_w4.bind_mlp_seam(
+                        w,
+                        channel_in=torch.ones(
+                            w["w_fc1"].shape[1], device=dev),
+                        channel_hidden=torch.ones(
+                            w["w_fc2"].shape[1], device=dev),
+                        original=_resolve(model, seam.path),
+                        fuse_wire=True)
+                except (ValueError, RuntimeError):
+                    pass
         return vis_impl.bind_mlp_seam(
             seam_weights(model, seam), input_scale=in_s,
             hidden_scale=hid_s, original=_resolve(model, seam.path))

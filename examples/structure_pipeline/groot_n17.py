@@ -127,6 +127,16 @@ def amax(t: torch.Tensor) -> float:
     return float(t.detach().float().abs().max())
 
 
+def _dit_band() -> str:
+    """Author pin > measured decision cache > precision-order default."""
+    import os
+    pin = os.environ.get("FRT_DIT_BAND")
+    if pin:
+        return pin
+    from flash_rt.structures.decisions import lookup
+    return lookup("groot_dit", default="fp8")
+
+
 def build(model, run_once) -> tuple[Assembly, dict]:
     """Declare, calibrate and bind every seat of the GR00T N1.7 graph.
 
@@ -290,8 +300,7 @@ def build(model, run_once) -> tuple[Assembly, dict]:
         seam = Seam(structure="vision_ffn", path=path,
                     parent_path=path.rsplit(".", 1)[0], norm_attr="norm3",
                     dims={}, variant={}, fc_attrs=("net.0.proj", "net.2"))
-        import os
-        _band = os.environ.get("FRT_DIT_BAND", "fp4")
+        _band = _dit_band()
         if _band == "fp4" and c.get("x_rows", 1 << 30) <= 64:
             # the denoise band is bandwidth-bound: half-width weights
             # and the FP4 FFN wire (fc1's GEMM re-quantizes its own
@@ -373,8 +382,7 @@ def build(model, run_once) -> tuple[Assembly, dict]:
         nvfp4_balance as proj_w4)
     for path, mod in DIT_OUT.items():
         c = cal[path]
-        import os
-        if (os.environ.get("FRT_DIT_BAND", "fp4") != "fp4"
+        if (_dit_band() != "fp4"
                 or "x_cvec" not in c or c.get("x_rows", 1 << 30) > 64):
             continue
         weights = {"w": mod.weight}
@@ -489,8 +497,7 @@ def build(model, run_once) -> tuple[Assembly, dict]:
             continue
         scale = torch.tensor([max(c["x"] / 448.0, 1e-8)], device="cuda")
         norm = block.norm1
-        import os
-        if (os.environ.get("FRT_DIT_BAND", "fp4") == "fp4"
+        if (_dit_band() == "fp4"
                 and c.get("rows", 1 << 30) <= 64):
             # denoise band: the producer norms straight into packed
             # NVFP4 + swizzled scale factors and the pack consumes the
