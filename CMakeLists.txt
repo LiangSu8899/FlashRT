@@ -1369,15 +1369,19 @@ set_target_properties(flash_rt_kernels PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
 
 # ── Thor-class VLA helper kernels (SM100/SM110 only) ──
-# The masked-softmax MHA variants and the 16-byte-load norm/rope/quantize
-# rewrites exist for the GROOT N1.7 Thor path; their element math targets
-# SM100-class memory behaviour and no SM8x frontend calls them. Their
-# bindings in csrc/bindings.cpp are guarded by FLASHRT_HAVE_THOR_VLA_KERNELS
-# so source and binding drop together on other architectures.
+# The masked-softmax MHA variants, the 16-byte-load norm/rope/quantize
+# rewrites, the seqused-fold decoder attention and the vectorized QKV
+# split-RoPE exist for the GROOT N1.7 and Pi0.5 Thor paths; their element
+# math targets SM100-class memory behaviour and no SM8x frontend calls
+# them. Their bindings in csrc/bindings.cpp are guarded by
+# FLASHRT_HAVE_THOR_VLA_KERNELS so source and binding drop together on
+# other architectures.
 if(ENABLE_SM100_CUTLASS)
   target_sources(flash_rt_kernels PRIVATE
     csrc/kernels/attention_mha_masked.cu
-    csrc/kernels/vec_fp16_backbone.cu)
+    csrc/kernels/vec_fp16_backbone.cu
+    csrc/kernels/attention_seqused_fused.cu
+    csrc/kernels/rope_vec.cu)
   target_compile_definitions(flash_rt_kernels PRIVATE FLASHRT_HAVE_THOR_VLA_KERNELS=1)
   message(STATUS "Thor VLA helper kernels: ENABLED (sm_${GPU_ARCH})")
 else()
@@ -1721,9 +1725,13 @@ if(ENABLE_SM100_CUTLASS)
     csrc/quantize/quantize_fp4_dynamic.cu
     csrc/quantize/reshape_scales_sfa.cu
     csrc/quantize/quantize_fp4_sfa.cu
+    csrc/quantize/quantize_fp4_sfa_vec.cu
     csrc/fused_fp16/rms_norm_noweight_fp16.cu
     csrc/fused_fp4/norm_silu_fp4_sfa.cu
     csrc/fused_fp4/silu_mul_fp4_sfa_v2.cu
+    csrc/fused_fp4/silu_mul_fp4_sfa_vec.cu
+    csrc/fused_fp4/layer_norm_fp4_sfa.cu
+    csrc/gemm/fp4/cutlass_fp4_gemm_siglip_ffn_sm100.cu
     csrc/fused_fp4/res_rms_fp4_sfa_v2.cu
     csrc/fused_fp4/per_channel_mul_fp16.cu
     csrc/fused_fp4/res_rms_mul_fp4_sfa.cu
@@ -1733,6 +1741,11 @@ if(ENABLE_SM100_CUTLASS)
     csrc/gemm/fp4/cutlass_fp4_gemm_bias_bf16_sm100.cu
     csrc/quantize/quantize_fp4_sfa_bf16.cu
     csrc/fused_fp4/dit_norm_fp4_sfa.cu
+    csrc/gemm/fp4/cutlass_fp4_gemm_geglu_il_sm100.cu
+    csrc/quantize/quantize_e0m3_sfa.cu
+    csrc/gemm/fp4/cutlass_fp4_gemm_e0m3w_sm100.cu
+    csrc/fused_fp4/pi05_e0m3_act.cu
+    csrc/fused_fp4/siglip_ln_vec.cu
   )
   if(FLASHRT_ENABLE_COSMOS3_EDGE)
     target_sources(fp4_kernels_obj PRIVATE
