@@ -1,3 +1,5 @@
+import torch
+
 from .fa2_seqused import (DenseAttention, PackedKVAttention,
                           bind_attention_core,
                           bind_dense_attention, plan_packed_kv)
@@ -54,6 +56,12 @@ def bind_dense_attention_best(captures):
         except (ValueError, RuntimeError, OSError) as refusal:
             refusals.append(f"{name}: {str(refusal)[:120]}")
             continue
+        if core is not None and not _beats_host(core, captures[0]):
+            refusals.append(
+                f"{name}: bound but measured slower than the host "
+                "attention at the captured shape — stepped aside")
+            declined += 1
+            core = None
         if core is not None:
             # the seam is served, but which variant served it and what
             # the preferred ones said are both load-bearing facts: a
@@ -74,6 +82,46 @@ def bind_dense_attention_best(captures):
     raise ValueError(
         "attention_core: no variant serves this device — "
         + "; ".join(refusals))
+
+
+def _beats_host(core, capture, margin: float = 0.02, iters: int = 20):
+    """The family's speed gate: a variant seats only if it measures at
+    least as fast as the host's own attention on the captured shape.
+    Availability and precision order decide who gets weighed first;
+    this decides whether the winner actually serves — bands are
+    measured, not conceded, in this family too."""
+    import torch.nn.functional as F
+
+    query = capture.get("q")
+    key = capture.get("key", capture.get("k"))
+    value = capture.get("value", capture.get("v"))
+    mask = capture.get("mask")
+    if query is None or key is None or value is None:
+        return True
+    if not query.is_cuda:
+        return True
+
+    def _time(fn):
+        with torch.no_grad():
+            for _ in range(4):
+                fn()
+            torch.cuda.synchronize()
+            start = torch.cuda.Event(True)
+            end = torch.cuda.Event(True)
+            start.record()
+            for _ in range(iters):
+                fn()
+            end.record()
+            torch.cuda.synchronize()
+        return start.elapsed_time(end) / iters
+
+    try:
+        ours = _time(lambda: core(query, key, value))
+        host = _time(lambda: F.scaled_dot_product_attention(
+            query, key, value, attn_mask=mask))
+    except (RuntimeError, ValueError):
+        return False
+    return ours <= host * (1.0 + margin)
 
 
 __all__ = ["DenseAttention", "PackedKVAttention",
