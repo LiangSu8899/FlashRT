@@ -186,6 +186,10 @@ def build(model, run_once) -> tuple[Assembly, dict]:
         for i, b in enumerate(vlsa_blocks)}
     PATCH = {"backbone.model.model.visual.patch_embed":
              base.visual.patch_embed}
+    VISION_PROJ = {}
+    for i, b in enumerate(visual_blocks):
+        VISION_PROJ[f"backbone.model.model.visual.blocks.{i}.attn.qkv"] =             b.attn.qkv
+        VISION_PROJ[f"backbone.model.model.visual.blocks.{i}.attn.proj"] =             b.attn.proj
 
     # ---- calibration: one pass, author-owned hooks -----------------------
     cal = defaultdict(dict)
@@ -241,7 +245,7 @@ def build(model, run_once) -> tuple[Assembly, dict]:
         hooks.extend(record_qkv(path, attn, ("to_q", "to_k", "to_v")))
     for path, norm in DIT_ADALN.items():
         hooks.append(norm.linear.register_forward_hook(record_pair(path)))
-    for path, mod in {**LANG_OPROJ, **VLSA_OUT}.items():
+    for path, mod in {**LANG_OPROJ, **VLSA_OUT, **VISION_PROJ}.items():
         hooks.append(mod.register_forward_hook(record_input(path, "x")))
     for path, mod in PATCH.items():
         hooks.append(mod.register_forward_hook(record_input(path, "x")))
@@ -322,7 +326,13 @@ def build(model, run_once) -> tuple[Assembly, dict]:
         if bound is not None:
             asm.place(path, bound)
 
-    for path, mod in {**LANG_OPROJ, **VLSA_OUT}.items():
+    # the vision attention projections are the one large-M band the
+    # automatic book leaves to the compiler, and the compiler's
+    # partitioning of them is host-form dependent (the cross-host
+    # census showed the same mm landing in a 3x slower template under
+    # one transformers generation). Seat them and the partitioning
+    # question disappears on every host.
+    for path, mod in {**LANG_OPROJ, **VLSA_OUT, **VISION_PROJ}.items():
         take_proj(path, mod, cal[path])
 
     for path, attn in VLSA_QKV.items():
