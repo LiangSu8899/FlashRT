@@ -289,7 +289,14 @@ def _pair_vision_norm_fp8(model, plan, points, stream) -> None:
              "smoke_cos": round(float(cos), 6),
              "winner": ("fp8_norm_chain" if ms_b < ms_a
                         else "bf16_chain")})
-        if ms_b >= ms_a:
+        # the bind-time race is a qualification signal, not the
+        # activation: seat-level micro-timing was refuted in both
+        # directions by production-form measurement (28/28 race wins
+        # here measured +0.6ms end-to-end on one device). Activation
+        # needs a production-form receipt for this box.
+        from . import decisions as _dec
+        if ms_b >= ms_a or _dec.lookup(
+                "vision_norm_fp8") != "fp8_norm_chain":
             continue
         plan.swaps[seam.path] = twin
         plan.swaps[norm_path] = producer

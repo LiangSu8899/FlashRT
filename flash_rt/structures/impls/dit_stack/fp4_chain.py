@@ -180,31 +180,12 @@ def _make_run(bound: BoundDitFp4Chain, dit) -> Callable:
     table = bound.table
     blocks = bound.blocks
 
-    mha = bound.kernels.get("mha")
-
     def layer(li, h, sa, scale, shift, enc, rows):
         entry = table[li]
         xp, xs = ada_fp4(h, scale, shift)
         if entry["is_self"]:
             qkv = gemm_bias(xp, entry["qkv"][0], xs, entry["qkv"][1],
                             entry["qkv_b"])
-            if mha is not None:
-                # the native form: strided (S, H, D) views straight
-                # over the packed QKV buffer — no permute, no copies,
-                # and a fixed accumulation order (the SDPA backend
-                # swing disappears with the backend choice)
-                t = qkv.view(sa, 3, nh, hd)
-                o_flat = mha.forward(t[:, 0], t[:, 1], t[:, 2]) \
-                    .reshape(sa, dim)
-                op, osf = quant_act(o_flat)
-                hres = gemm_bias_res(op, entry["o"][0], osf,
-                                     entry["o"][1], entry["o_b"], h)
-                np_, ns = ln_fp4(hres)
-                hp, hs = gemm_gelu_fp4(np_, entry["up"][0], ns,
-                                       entry["up"][1], entry["up_b"])
-                return gemm_bias_res(hp, entry["down"][0], hs,
-                                     entry["down"][1], entry["down_b"],
-                                     hres)
             packs = qkv.view(sa, 3, nh, hd).permute(1, 2, 0, 3)
             o = sdpa(packs[0].unsqueeze(0), packs[1].unsqueeze(0),
                      packs[2].unsqueeze(0))
@@ -279,14 +260,6 @@ def bind_dit_fp4_chain(model, root: str,
         kq = hub_kernel(NORM_PACKAGE, ">=1")
     except KernelUnavailable as exc:
         return {"refused": f"dit_fp4_chain: {exc}"}
-    try:
-        # optional: the native self-attention form. Absence keeps the
-        # mask-free SDPA path — a fallback, never a refusal.
-        mha = hub_kernel("flashrt/masked-mha-runtime", ">=1")
-        if not hasattr(mha, "forward"):
-            mha = None
-    except KernelUnavailable:
-        mha = None
     gaps = missing_symbols()
     if gaps:
         return {"refused": f"dit_fp4_chain missing: {', '.join(gaps)}"}
@@ -295,7 +268,7 @@ def bind_dit_fp4_chain(model, root: str,
     blocks, nh, hd, dim, n_layers = _stack_parts(dit)
 
     bound = BoundDitFp4Chain()
-    bound.kernels = {"kg": kg, "kq": kq, "mha": mha}
+    bound.kernels = {"kg": kg, "kq": kq}
     bound.blocks = blocks
     bound.dims = {"nh": nh, "hd": hd, "dim": dim, "n_layers": n_layers,
                   "every_n": getattr(dit, "attend_text_every_n_blocks", 2)}
