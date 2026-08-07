@@ -42,6 +42,10 @@ class StaticOutput(GuardedSeam, torch.nn.Module):
 
     _frt_host_attr = "host_module"
     _frt_can_fallback = True
+    # the retained host is not a fallback copy: the cadence refresh
+    # projects through it every observation, so its weights must stay
+    # resident — consumption would corrupt the banks silently
+    _frt_host_serving = True
 
     def __init__(self, original: torch.nn.Module, value: torch.Tensor):
         super().__init__()

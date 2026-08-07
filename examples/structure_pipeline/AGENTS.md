@@ -44,18 +44,31 @@ fastest numbers through this same door; a host no family recognizes is
 captured as-is, and a family that cannot pin safely refuses with a
 reason instead of leaving the host half-pinned.
 
-**Finalize (production memory)** — a verified attachment holds every
-replaced module's original weights for fallback and `detach()`; that
-reversibility is a development default, not a production bill. After
-your parity gate passes, `handle.finalize()` frees the held originals
-(receipt says how many bytes), flips the seams from fall-back to
-refuse, and forbids `detach` — irreversible, and recorded as such.
-Seat scratch (sibling stashes, producer workspaces, wire buffers) is
-pooled by shape: sequential layers share one buffer, so the memory
-bill is one layer's worth, not layers x tokens
-(`structures.workspace.report()` is the receipt's memory column).
-Binding itself is budgeted: under 512 MiB free VRAM a seat refuses
-with `insufficient_vram(...)` instead of eating the remainder.
+**Weight residency (a lifecycle, not a mode)** — attach → validate →
+`handle.consume()` → optionally `handle.finalize()`. There is no
+resident tier: after your parity gate passes, `consume()` moves every
+replaced original's truth off the device — to the checkpoint file when
+provenance verifies (a sampled-block match against the live tensor),
+to pinned host RAM otherwise — and frees its device storage. The
+receipt names bytes freed and the tier split. Fallback and `detach`
+survive as restore-from-store: a seam called outside its contract
+restores its host once (the ledger notes `restored_for_fallback`), and
+`detach` reloads before it puts the host back, still bit-exact. Seats
+that actively serve through their retained host (a cadence bank
+refreshing through the host projection) declare `_frt_host_serving`
+and are kept whole — the receipt counts them. `handle.finalize()`
+then drops the restore tickets: fallback flips to refusal, `detach`
+is forbidden, irreversible and recorded as such. Consumption comes
+after validation because until then the attached model still owes the
+host schema (state_dict, A/B reference arms, and any capture that
+aliases host weights dies the moment its pointers are freed).
+Seat scratch (sibling stashes, producer workspaces, the packed-output
+and quantize scratch, wire buffers) is pooled by shape: sequential
+layers share one buffer, so the memory bill is one layer's worth, not
+layers x tokens (`structures.workspace.report()` is the receipt's
+memory column). Binding itself is budgeted: under 512 MiB free VRAM a
+seat refuses with `insufficient_vram(...)` instead of eating the
+remainder.
 
 **Explicit** — the only tier with real orchestration in user code:
 seat tables, the author's own calibration hooks, direct binder calls —

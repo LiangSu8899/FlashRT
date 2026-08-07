@@ -74,7 +74,7 @@ def main() -> int:
 
         if args.arm == "explicit":
             asm, extras = build(model, run_once)
-            handle = swap.attach(model, asm.swaps,
+            handle = swap.attach(model, asm.swaps, consume=False,
                                  observe=extras["observed"],
                                  revert=extras["revert"],
                                  on_guard_fail="raise")
@@ -94,7 +94,7 @@ def main() -> int:
                 cadence_swaps, statics = bind_cross_attention_kv(
                     sites, caps, replacements=plan.swaps)
                 plan.swaps.update(cadence_swaps)
-            handle = swap.attach(model, plan.swaps,
+            handle = swap.attach(model, plan.swaps, consume=False,
                                  observe=plan.observed,
                                  revert=plan.revert)
             seats = {"swaps": len(plan.swaps),

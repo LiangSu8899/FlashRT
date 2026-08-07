@@ -119,7 +119,7 @@ def main() -> int:
                 hot()
 
         asm, extras = build(model, run_once)
-        handle = swap.attach(model, asm.swaps,
+        handle = swap.attach(model, asm.swaps, consume=False,
                              observe=extras["observed"],
                              revert=extras["revert"],
                              on_guard_fail="raise")

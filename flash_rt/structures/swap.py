@@ -60,28 +60,69 @@ class AttachHandle:
     active: bool = True
     _guards: dict[str, SeamGuard] = field(default_factory=dict)
     _revert: list[Any] = field(default_factory=list)
+    _store: Any = None
+    _paths: list[str] = field(default_factory=list)
+
+    def consume(self, store=None) -> dict:
+        """Move every replaced module's weights off the device.
+
+        The resident tier is gone: an attachment no longer keeps a
+        second copy of the model in device memory for the sake of an
+        instant fallback. Each original's truth moves to the weight
+        store — the checkpoint file when provenance verifies, pinned
+        host memory otherwise — and its device storage is freed.
+        Fallback and ``detach`` both survive as restore-from-store:
+        slower, never wrong. Reversible until :meth:`finalize`.
+        """
+        from .storage import WeightStore
+
+        if store is None:
+            store = self._store or WeightStore(
+                checkpoint=self.records.get("checkpoint"))
+        self._store = store
+        freed = 0
+        serving = 0
+        paths = self._paths or [""] * len(self._entries)
+        for path, (parent, attr, original) in zip(paths, self._entries):
+            # a seat that actively calls its retained host (a cadence
+            # bank refreshing through the host projection) declares it:
+            # that original is serving, not merely held for fallback,
+            # and consuming it would corrupt the live path
+            current = _get(parent, attr)
+            if getattr(current, "_frt_host_serving", False):
+                serving += 1
+                continue
+            freed += store.stash_module(path, original)
+        self.records = dict(self.records, consumed=dict(
+            store.stats, freed_bytes=freed, kept_serving=serving))
+        return {"consumed": True, "freed_bytes": freed,
+                "kept_serving": serving,
+                "tiers": {"disk": store.stats["disk"],
+                          "ram": store.stats["ram"]}}
 
     def finalize(self) -> dict:
-        """Release the host originals a verified attachment holds.
+        """Make the consumption permanent.
 
-        The reversible form keeps every replaced module's weights alive
-        for fallback and for ``detach`` — the right default for
-        development, and a double weight bill production should not
-        pay. After the parity gate has passed, ``finalize`` frees the
-        held entries' parameter storage, flips fallback off (there is
-        nothing left to fall back to) and forbids ``detach``.
+        Drops the restore tickets (including any host-RAM spill), flips
+        fallback off — a contract miss must refuse now, not restore —
+        and forbids ``detach``. Consumes first when the caller has not.
         Irreversible, and says so in the receipt it returns.
         """
-        freed = 0
+        if self._store is None:
+            self.consume()
+        freed = self.records.get("consumed", {}).get("freed_bytes", 0)
+        paths = set(self._paths)
         for parent, attr, original in self._entries:
-            for par in original.parameters(recurse=False):
-                freed += par.numel() * par.element_size()
-                par.data = par.data.new_empty(0)
-            # the seam standing at this path can no longer fall back —
-            # a contract miss must refuse now, not run an emptied host
+            self._store.drop_module(original)
             current = _get(parent, attr)
             if hasattr(current, "_frt_can_fallback"):
                 current._frt_can_fallback = False
+        # the guard is the one that answers at call time: flip its own
+        # fallback bit too, or a contract miss would run an emptied host
+        for site, guard in self._guards.items():
+            root_site = site.split("::", 1)[0]
+            if root_site in paths:
+                guard.can_fallback = False
         self.records = dict(self.records,
                             finalized={"freed_bytes": freed})
         self._finalized = True
@@ -89,6 +130,10 @@ class AttachHandle:
 
     def detach(self) -> None:
         """Restore every swapped module. Idempotent.
+
+        Consumed weights come back from the store first — the promise
+        is the same bit-exact host, backed by the checkpoint file or
+        the host-RAM spill instead of a resident device copy.
 
         Also runs any ``revert`` callables the caller handed over. Some
         seams are not modules at paths — an adapter that patches a
@@ -102,6 +147,8 @@ class AttachHandle:
         if not self.active:
             return
         for parent, attr, original in reversed(self._entries):
+            if self._store is not None:
+                self._store.restore_module(original)
             _set(parent, attr, original)
         for undo in reversed(self._revert):
             undo()
@@ -180,6 +227,8 @@ def attach(
     allow_training: bool = False,
     observe: Mapping[str, torch.nn.Module] | None = None,
     revert: Any = None,
+    store: Any = None,
+    consume: bool = False,
 ) -> AttachHandle:
     """Atomically replace the modules at ``swaps`` paths.
 
@@ -204,6 +253,19 @@ def attach(
     — an adapter's routed seam. They are reported in the ledger and never
     installed. ``revert`` collects undo callables for host mutations made
     before this call, so ``detach`` restores those too.
+
+    Weight residency is a lifecycle, not a mode: attach → validate →
+    ``handle.consume()`` → optionally ``handle.finalize()``. Consuming
+    moves each replaced original's truth to the weight ``store`` (the
+    checkpoint file when provenance verifies, pinned host memory
+    otherwise) and frees its device storage — there is no resident
+    tier to keep. Fallback and ``detach`` restore from the store;
+    seats that declare their retained host as actively serving keep it
+    whole. Consumption comes after the caller's validation pass
+    because the attached model still owes the host schema (state_dict,
+    A/B reference arms, captures that alias host weights) until then;
+    ``consume=True`` collapses the steps for callers with no such
+    pass.
     """
     if not swaps and not observe:
         raise ValueError("no swaps or routed seams staged")
@@ -268,8 +330,12 @@ def attach(
             guard.bind_site(site, restore=restore, mode=on_guard_fail)
             guards[site] = guard
 
-    return AttachHandle(_entries=entries, records=dict(records or {}),
-                        _guards=guards, _revert=list(revert or ()))
+    handle = AttachHandle(_entries=entries, records=dict(records or {}),
+                          _guards=guards, _revert=list(revert or ()),
+                          _store=store, _paths=list(swaps.keys()))
+    if consume:
+        handle.consume(store)
+    return handle
 
 
 __all__ = ["AttachHandle", "attach", "resolve_parent", "GUARD_ATTR"]

@@ -315,6 +315,19 @@ class GuardedSeam:
             raise GuardRefused(
                 f"{guard.site or guard.kind}: {reason}; this structure has "
                 "no equivalent host module to fall back to")
+        if any(p.numel() == 0 for p in host.parameters()) and not \
+                getattr(host, "_frt_tickets", None):
+            raise GuardRefused(
+                f"{guard.site or guard.kind}: {reason}; the host module's "
+                "weights were consumed and cannot be restored")
+        if getattr(host, "_frt_tickets", None):
+            # the host's weights were consumed (their truth lives in the
+            # weight store); a live fallback restores them once — slower
+            # than a resident copy, never wrong — and the ledger says so
+            from .storage import restore_for_fallback
+            restore_for_fallback(host)
+            guard.notes["restored_for_fallback"] = (
+                guard.notes.get("restored_for_fallback", 0) + 1)
         guard.refuse(reason)
         return self._frt_host_call(host, x, *args, **kwargs)
 

@@ -660,7 +660,7 @@ def main() -> int:
 
     asm, extras = build(model, run_once)
 
-    handle = swap.attach(model, asm.swaps, observe=extras["observed"],
+    handle = swap.attach(model, asm.swaps, consume=False, observe=extras["observed"],
                          revert=extras["revert"], on_guard_fail="raise")
 
     if extras["cadence_statics"]:
