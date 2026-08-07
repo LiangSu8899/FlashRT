@@ -55,7 +55,7 @@ def test_consume_frees_and_detach_restores_bitwise():
     handle = attach(host, {"proj": FakeSeam(host.proj)})
     receipt = handle.consume()
     assert receipt["consumed"] and receipt["freed_bytes"] > 0
-    assert orig.weight.numel() == 0
+    assert orig.weight.is_meta
     handle.detach()
     assert torch.equal(host.proj.weight, before)
     assert host.proj.bias.numel() == 3
@@ -66,12 +66,12 @@ def test_fallback_on_consumed_seam_restores_on_demand():
     seam = FakeSeam(host.proj)
     handle = attach(host, {"proj": seam})
     handle.consume()
-    assert seam.host_linear.weight.numel() == 0
+    assert seam.host_linear.weight.is_meta
     # a wrong-rows input violates the contract (the host can still
     # run it): the guard restores the host from the store and runs it
     out = host.proj(torch.randn(3, 4))
     assert out.shape[-1] == 3
-    assert seam.host_linear.weight.numel() > 0
+    assert not seam.host_linear.weight.is_meta
     entry = handle.report()["proj"]
     assert entry["fallbacks"] == 1
     assert entry["notes"]["restored_for_fallback"] == 1
@@ -99,7 +99,7 @@ def test_serving_host_is_kept_whole():
     handle = attach(host, {"proj": ServingSeam(host.proj)})
     receipt = handle.consume()
     assert receipt["kept_serving"] == 1
-    assert host.proj.host_linear.weight.numel() > 0
+    assert not host.proj.host_linear.weight.is_meta
     handle.detach()
 
 

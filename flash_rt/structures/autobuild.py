@@ -774,6 +774,22 @@ def auto_swaps(
             else:
                 plan.swaps[seam.path] = bound
                 _stream(seam.path)
+    # ---- streaming window: the later stages record through the model,
+    # and the streamed originals are meta now — so the bound seats stand
+    # in for them for the duration. Temporarily attached with plain
+    # setattr (no guards armed), undone before returning: the caller's
+    # attach() must still find the originals at every path.
+    _stream_temp = []
+    if stream_store is not None:
+        from .swap import resolve_parent as _srp, _get as _sgt, _set as _sst
+        for _p, _m in list(plan.swaps.items()):
+            try:
+                _par, _at = _srp(model, _p)
+                _stream_temp.append((_par, _at, _sgt(_par, _at)))
+                _sst(_par, _at, _m)
+            except (AttributeError, TypeError, ValueError):
+                continue
+
     # ---- qk_norm_rope: compose a packed QKV seam with host attention ----
     if "qk_norm_rope" in structures:
         from . import adapters as _adapters  # noqa: F401 (registers)
@@ -938,6 +954,11 @@ def auto_swaps(
         for child in _BLOCK_OWNED:
             plan.swaps.pop(seam.path + "." + child, None)
         plan.swaps[seam.path] = block
+
+    if stream_store is not None:
+        from .swap import _set as _sst2
+        for _par, _at, _orig in reversed(_stream_temp):
+            _sst2(_par, _at, _orig)
 
     # what discovery took on trust, for the seams that actually bound. An
     # assumption that reaches the model without reaching the receipt is

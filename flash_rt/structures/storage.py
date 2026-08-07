@@ -137,39 +137,48 @@ class WeightStore:
         only the storage leaves.
         """
         freed = 0
-        for pname, par in module.named_parameters(recurse=True):
-            if par.numel() == 0:
-                continue
-            skey = par.data.data_ptr()
-            ticket = self._by_storage.get(skey)
-            if ticket is None:
-                full = f"{name}.{pname}" if name else pname
-                source = self._disk_source(full, par.data)
-                if source is not None:
-                    ticket = _Ticket(
-                        tier="disk", shape=par.shape, dtype=par.dtype,
-                        device=par.device, shard=source[0],
-                        key=source[1], storage_key=skey)
-                    self.stats["disk"] += 1
-                else:
-                    spill = torch.empty(
-                        par.shape, dtype=par.dtype, device="cpu",
-                        pin_memory=torch.cuda.is_available())
-                    spill.copy_(par.data)
-                    ticket = _Ticket(
-                        tier="ram", shape=par.shape, dtype=par.dtype,
-                        device=par.device, spill=spill, storage_key=skey)
-                    self.stats["ram"] += 1
-                self._by_storage[skey] = ticket
-            tickets = getattr(module, "_frt_tickets", None)
-            if tickets is None:
-                tickets = {}
-                module._frt_tickets = tickets
-                module._frt_store = self
-                self._stashed.append(module)
-            tickets[pname] = ticket
-            freed += par.numel() * par.element_size()
-            par.data = par.data.new_empty(0)
+        for mpath, sub in module.named_modules():
+            for leaf, par in list(sub._parameters.items()):
+                if par is None or par.is_meta or par.numel() == 0:
+                    continue
+                pname = f"{mpath}.{leaf}" if mpath else leaf
+                skey = par.data.data_ptr()
+                ticket = self._by_storage.get(skey)
+                if ticket is None:
+                    full = f"{name}.{pname}" if name else pname
+                    source = self._disk_source(full, par.data)
+                    if source is not None:
+                        ticket = _Ticket(
+                            tier="disk", shape=par.shape, dtype=par.dtype,
+                            device=par.device, shard=source[0],
+                            key=source[1], storage_key=skey)
+                        self.stats["disk"] += 1
+                    else:
+                        spill = torch.empty(
+                            par.shape, dtype=par.dtype, device="cpu",
+                            pin_memory=torch.cuda.is_available())
+                        spill.copy_(par.data)
+                        ticket = _Ticket(
+                            tier="ram", shape=par.shape, dtype=par.dtype,
+                            device=par.device, spill=spill, storage_key=skey)
+                        self.stats["ram"] += 1
+                    self._by_storage[skey] = ticket
+                tickets = getattr(module, "_frt_tickets", None)
+                if tickets is None:
+                    tickets = {}
+                    module._frt_tickets = tickets
+                    module._frt_store = self
+                    self._stashed.append(module)
+                tickets[pname] = ticket
+                freed += par.numel() * par.element_size()
+                # release to a meta parameter of the SAME shape: the
+                # storage is gone, but shape probes (an attention family
+                # deriving head counts from a weight) still see the truth
+                # — compute on it fails loudly and per-site, instead of
+                # collapsing a whole discovery stage on a 1-D empty
+                sub._parameters[leaf] = torch.nn.Parameter(
+                    torch.empty(par.shape, dtype=par.dtype,
+                                device="meta"), requires_grad=False)
         self.stats["freed_bytes"] += freed
         return freed
 
@@ -179,10 +188,12 @@ class WeightStore:
         tickets = getattr(module, "_frt_tickets", None)
         if not tickets:
             return False
-        params = dict(module.named_parameters(recurse=True))
+        subs = dict(module.named_modules())
         for pname, ticket in tickets.items():
-            par = params.get(pname)
-            if par is None or par.numel() != 0:
+            mpath, _, leaf = pname.rpartition(".")
+            sub = subs.get(mpath)
+            par = None if sub is None else sub._parameters.get(leaf)
+            if par is None or not par.is_meta:
                 continue
             if ticket.tier == "disk":
                 from safetensors import safe_open
@@ -195,7 +206,8 @@ class WeightStore:
                 raise RuntimeError(
                     f"weight store: {pname} restored to {tuple(data.shape)}"
                     f", expected {tuple(ticket.shape)}")
-            par.data = data
+            sub._parameters[leaf] = torch.nn.Parameter(
+                data, requires_grad=False)
             self.stats["restored"] += 1
         del module._frt_tickets
         del module._frt_store

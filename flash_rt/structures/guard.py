@@ -315,7 +315,8 @@ class GuardedSeam:
             raise GuardRefused(
                 f"{guard.site or guard.kind}: {reason}; this structure has "
                 "no equivalent host module to fall back to")
-        if any(p.numel() == 0 for p in host.parameters()) and not \
+        if any(p.is_meta or p.numel() == 0
+               for p in host.parameters()) and not \
                 getattr(host, "_frt_tickets", None):
             raise GuardRefused(
                 f"{guard.site or guard.kind}: {reason}; the host module's "

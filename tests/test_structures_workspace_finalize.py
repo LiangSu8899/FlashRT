@@ -45,7 +45,7 @@ def test_finalize_frees_originals_and_forbids_detach():
     handle = attach(host, {"0": repl})
     receipt = handle.finalize()
     assert receipt["freed_bytes"] > 0
-    assert original.weight.numel() == 0
+    assert original.weight.is_meta or original.weight.numel() == 0
     with pytest.raises(RuntimeError):
         handle.detach()
 
