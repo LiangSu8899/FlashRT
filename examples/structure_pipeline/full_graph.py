@@ -97,6 +97,12 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--arm", choices=("explicit", "auto"),
                         default="explicit")
+    parser.add_argument("--baseline", choices=("interleaved", "sequential"),
+                        default="interleaved",
+                        help="sequential: measure the stock graph first, "
+                             "release it, then bind with immediate "
+                             "consumption — the tight-memory bind mode; "
+                             "peaks are reported per phase")
     parser.add_argument("--scheme", default=None,
                         help="named precision scheme for the auto arm "
                              "(e.g. nvfp4_balance); default negotiates "
@@ -148,10 +154,29 @@ def main() -> int:
 
         # the host at full speed: the registered family lowering pins
         # the shape glue, the capture door does the rest
+        peaks = {}
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
         stock = capture_stage(
             torch.compile(hot, mode="max-autotune-no-cudagraphs",
                           fullgraph=False),
             model=model, warmup=8, gate_cos=0, min_speedup=0)
+
+        sequential = args.baseline == "sequential"
+        stock_ms = None
+        if sequential:
+            # the baseline is measured and released before anything
+            # binds: under locked clocks a sequential A-then-B holds,
+            # and the bind window never carries the stock graph's alias
+            # of the original weights
+            stock_ms = replay_ms({"stock_graph": stock})["stock_graph"]
+            stock.restore_host()
+            del stock
+            torch._dynamo.reset()
+            if torch.cuda.is_available():
+                peaks["baseline_phase_gb"] = round(
+                    torch.cuda.max_memory_allocated() / 2**30, 3)
+                torch.cuda.reset_peak_memory_stats()
 
         def run_once():
             with torch.inference_mode():
@@ -190,6 +215,11 @@ def main() -> int:
                      "observed": len(plan.observed),
                      "refused": len(plan.notes.get("refused", [])),
                      "format_race": plan.notes.get("format_race")}
+        weights_receipt = None
+        if sequential:
+            from flash_rt.structures.storage import WeightStore
+            weights_receipt = handle.consume(
+                WeightStore(checkpoint=str(args.checkpoint)))
         if statics:
             # the refresh rides the producer's forward: the captured
             # graph writes the banks from this call's own features
@@ -201,8 +231,18 @@ def main() -> int:
                           fullgraph=False),
             model=model, warmup=8, gate_cos=0, min_speedup=0)
 
-        medians = replay_ms({"stock_graph": stock,
-                             "structures_graph": treated})
+        if sequential:
+            if torch.cuda.is_available():
+                peaks["bind_phase_gb"] = round(
+                    torch.cuda.max_memory_allocated() / 2**30, 3)
+                torch.cuda.reset_peak_memory_stats()
+            medians = {"stock_graph": stock_ms,
+                       "structures_graph": replay_ms(
+                           {"structures_graph": treated})
+                       ["structures_graph"]}
+        else:
+            medians = replay_ms({"stock_graph": stock,
+                                 "structures_graph": treated})
         treated.replay()
         parity = float(torch.nn.functional.cosine_similarity(
             treated.output.detach().float().cpu().flatten(),
@@ -210,6 +250,8 @@ def main() -> int:
         report = {
             "arm": args.arm,
             "scheme": args.scheme,
+            "baseline": args.baseline,
+            "peaks": peaks or None,
             "device": torch.cuda.get_device_name(),
             **seats,
             "kernel_unavailable": unavailable_report(),
@@ -221,16 +263,19 @@ def main() -> int:
                                        / medians["structures_graph"]),
             "ledger": handle.summary(),
         }
-        from flash_rt.structures.storage import WeightStore
-        report["weights"] = handle.consume(
-            WeightStore(checkpoint=str(args.checkpoint)))
+        if weights_receipt is None:
+            from flash_rt.structures.storage import WeightStore
+            weights_receipt = handle.consume(
+                WeightStore(checkpoint=str(args.checkpoint)))
+        report["weights"] = weights_receipt
         print(json.dumps(report, indent=2, default=str))
         if args.report:
             args.report.write_text(json.dumps(report, indent=2,
                                               default=str))
         handle.detach()
         treated.restore_host()
-        stock.restore_host()
+        if not sequential:
+            stock.restore_host()
     finally:
         unpin()
     return 0

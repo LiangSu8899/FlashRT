@@ -74,6 +74,7 @@ class WeightStore:
     _index: dict[str, str] | None = field(default=None, repr=False)
     _by_storage: dict[int, _Ticket] = field(default_factory=dict,
                                             repr=False)
+    _stashed: list = field(default_factory=list, repr=False)
     stats: dict[str, Any] = field(default_factory=lambda: {
         "disk": 0, "ram": 0, "freed_bytes": 0, "restored": 0})
 
@@ -165,6 +166,7 @@ class WeightStore:
                 tickets = {}
                 module._frt_tickets = tickets
                 module._frt_store = self
+                self._stashed.append(module)
             tickets[pname] = ticket
             freed += par.numel() * par.element_size()
             par.data = par.data.new_empty(0)
@@ -199,12 +201,29 @@ class WeightStore:
         del module._frt_store
         return True
 
+    def restore_all(self) -> int:
+        """Abort path: put every stashed module's weights back.
+
+        For a bind or attach that dies midway — the model returns to
+        runnable, whatever the failure was.
+        """
+        return _restore_all_of(self)
+
     def drop_module(self, module: torch.nn.Module) -> None:
         """Forget a module's tickets — its consumption becomes final."""
         if hasattr(module, "_frt_tickets"):
             del module._frt_tickets
         if hasattr(module, "_frt_store"):
             del module._frt_store
+
+
+def _restore_all_of(store: "WeightStore") -> int:
+    count = 0
+    for module in list(store._stashed):
+        if store.restore_module(module):
+            count += 1
+    store._stashed.clear()
+    return count
 
 
 def restore_for_fallback(host: torch.nn.Module) -> bool:
