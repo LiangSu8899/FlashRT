@@ -482,6 +482,28 @@ executable forms, never with devices; per-device tuning stays
 contained in the packages' build-variant distribution, and within one
 package version an entry's signature is invariant across archs.
 
+**A region family** (`regions.py`): when hardware disagrees about the
+*shape* of a span larger than one seat — a fused launch chain on one
+device, the seat-by-seat composition on another — the difference is a
+region family, never a device branch and never adapter registration
+order. Declare a `RegionFamily` (a structural identifier over the
+module graph) and its `RegionCandidate`s; each candidate states the
+factual prerequisites it needs (hub symbols, shape band, memory plan)
+and binds through structure primitives — seats, producers, workspace
+leases, guards. A form that swaps in a hand-written forward has no
+seat here: nothing for the ledger, the fallback contract, or revert
+to certify. The tier discipline is fixed: the automatic tier consumes
+receipts only (author pin > decision cache > `seated` floor) and
+never experiments at bind — a cold box runs seated, correct but
+possibly not full speed, until a production-form measurement run
+records the winner per `(device, region)` through `regions.record`
+(which refuses undeclared names — a typo dies at the writer, not at
+every reader). A receipt naming a form this box cannot qualify falls
+through to seated with the reason on the trail. The explicit tier is
+maximum host replacement: it pins winners and claims regions
+discovery refuses, over the same candidate set — so anything it
+proves, the automatic tier inherits through the cache.
+
 **A quantisation scheme**: register an instance in `schemes.py` — two
 methods and nothing else. `statistics` declares what each calibration
 point needs (statistic and granularity: per-tensor, per-channel,
