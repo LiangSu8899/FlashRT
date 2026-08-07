@@ -111,3 +111,24 @@ def test_layer_a_outputs_survive_layer_b(monkeypatch):
     _ = parts_b[0](x)
     want_q = mods_a[0](x).float()
     torch.testing.assert_close(q_a.float(), want_q, atol=2e-2, rtol=2e-2)
+
+
+def test_host_form_reads_stay_fresh_after_joint_enable(monkeypatch):
+    """The H3 0.714 lesson: a joint-enabled head whose module is NOT
+    routed still serves host-form calls — forward must stash, and a
+    genuinely skipped slot must refuse loudly, never read stale."""
+    mods, parts = _bind(monkeypatch, seed=1)
+    head, k_reader, _ = parts
+    x1 = torch.randn(5, 4).to(torch.bfloat16)
+    x2 = torch.randn(5, 4).to(torch.bfloat16)
+    _ = head(x1)
+    _ = k_reader(x1)
+    head.enable_joint(3)
+    _ = head(x2)                      # host-form call: must stash
+    got = k_reader(x2)
+    want = mods[1](x2).float()
+    torch.testing.assert_close(got.float(), want, atol=2e-2, rtol=2e-2)
+
+    _ = head.joint(x1)                # joint consumer: skips stashes
+    with pytest.raises(Exception, match="stale"):
+        k_reader(x1)

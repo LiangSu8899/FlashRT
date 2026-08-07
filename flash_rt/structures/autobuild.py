@@ -719,7 +719,7 @@ def auto_swaps(
             iface = TransformersAttentionInterfaceAdapter()(model, plan)
         except (ValueError, RuntimeError) as refusal:
             plan.notes.setdefault("refused", []).append(
-                ("backbone_attn", str(refusal)[:80]))
+                ("backbone_attn", str(refusal)[:200]))
             iface = None
         if iface:
             if iface.get("refused"):
@@ -748,7 +748,7 @@ def auto_swaps(
                     chain_rows[f"{lay}|{c_slot}"], plan)
             except (ValueError, RuntimeError) as refusal:
                 plan.notes.setdefault("refused", []).append(
-                    (f"{lay} [{c_slot} chain]", str(refusal)[:80]))
+                    (f"{lay} [{c_slot} chain]", str(refusal)[:200]))
                 continue
             plan.swaps.update(pair)
             _stream(list(pair))
@@ -779,7 +779,7 @@ def auto_swaps(
                                    fmt_params=fmt_params.get(key))
             except (ValueError, RuntimeError) as refusal:
                 plan.notes.setdefault("refused", []).append(
-                    (key, str(refusal)[:80]))
+                    (key, str(refusal)[:200]))
                 continue
             if bound is None:
                 continue
@@ -828,7 +828,7 @@ def auto_swaps(
                     result = adapter(model, plan)
                 except (ValueError, RuntimeError) as refusal:
                     plan.notes.setdefault("refused", []).append(
-                        ("qk_norm_rope", str(refusal)[:80]))
+                        ("qk_norm_rope", str(refusal)[:200]))
                     continue
                 if result is None:
                     continue
@@ -895,7 +895,7 @@ def auto_swaps(
                                      prefix_cadence=prefix_cadence)
                 except (ValueError, RuntimeError) as refusal:
                     plan.notes.setdefault("refused", []).append(
-                        ("attention_core", str(refusal)[:80]))
+                        ("attention_core", str(refusal)[:200]))
                     continue
                 if result is None:
                     continue
@@ -977,7 +977,7 @@ def auto_swaps(
                     model, seam, caps.get(_seam_key(seam), {}), plan)
             except (ValueError, RuntimeError) as refusal:
                 plan.notes.setdefault("refused", []).append(
-                    (seam.path + " [block]", str(refusal)[:80]))
+                    (seam.path + " [block]", str(refusal)[:200]))
                 continue
             if block is None:
                 continue
@@ -1056,7 +1056,7 @@ def _attach_brokers(caps, plan, say) -> None:
             broker = bind_style_broker([m for _, _, m in members], key[2])
         except (ValueError, RuntimeError) as refusal:
             plan.notes.setdefault("refused", []).append(
-                (f"style_broker[{key[1]}x{key[2]}]", str(refusal)[:80]))
+                (f"style_broker[{key[1]}x{key[2]}]", str(refusal)[:200]))
             continue
         if broker is None:
             continue
@@ -1143,7 +1143,7 @@ def _alias_kv_region(plan, path: str, sublayer) -> None:
     except (ValueError, RuntimeError) as refusal:
         core._alias_v = False
         plan.notes.setdefault("refused", []).append(
-            (path + " [kv alias]", str(refusal)[:80]))
+            (path + " [kv alias]", str(refusal)[:200]))
         return
     plan.notes.setdefault("aliased_kv", []).append(path)
 
@@ -1577,7 +1577,7 @@ def _bind_negotiated(model, p_seam, k_seam, p_cap, points, scale, rows,
             plan.notes.setdefault("format_race", []).append(
                 {"layer": p_seam.path,
                  "winner": "fp8_chain",
-                 "nvfp4_wire": f"refused: {str(lost)[:80]}"})
+                 "nvfp4_wire": f"refused: {str(lost)[:200]}"})
     swaps.update({k_seam.path + "." + a: m
                   for a, m in zip(k_seam.pack_attrs, parts)})
     return swaps

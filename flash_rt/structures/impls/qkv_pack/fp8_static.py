@@ -104,9 +104,8 @@ class PackedLinear(GuardedSeam, torch.nn.Module):
         # two copies. Zero keeps the sibling-by-sibling contract.
         self.joint_slots = joint_slots
         if joint_slots:
-            self.register_buffer("packed", torch.empty(
-                rows, sum(splits), device=w8.device,
-                dtype=torch.bfloat16))
+            self.packed = lease((rows, sum(splits)), torch.bfloat16,
+                                w8.device, tag="qkv_joint")
         if in_dtype == "fp8_static":
             self._fn = (kf.fp8_gemm_bf16 if self.no_bias
                         else kf.fp8_linear_bias_bf16)
@@ -180,9 +179,9 @@ class PackedLinear(GuardedSeam, torch.nn.Module):
             raise ValueError(f"qkv_pack: cannot join {slots} sibling(s)")
         self.joint_slots = slots
         if not hasattr(self, "packed"):
-            self.register_buffer("packed", torch.empty(
-                self.rows, sum(self.splits), device=self.w8.device,
-                dtype=torch.bfloat16))
+            self.packed = lease((self.rows, sum(self.splits)),
+                                torch.bfloat16, self.w8.device,
+                                tag="qkv_joint")
 
     def disable_joint(self) -> None:
         """Restore the sibling-by-sibling stash contract."""
@@ -207,11 +206,11 @@ class PackedLinear(GuardedSeam, torch.nn.Module):
                 # Still write the refusal into the ordinary seam ledger.
                 self._frt_guard.refuse(reason)
                 raise GuardRefused(f"qkv_pack: joint refused — {reason}")
-        self._run(flat)
+        self._run(flat, stash_all=False)
         width = sum(self.splits[:self.joint_slots])
         return self.packed[:flat.shape[0], :width]
 
-    def _run(self, flat):
+    def _run(self, flat, stash_all: bool = True):
         logical_rows = flat.shape[0]
         out = (self.packed[:logical_rows]
                if self.joint_slots and self.in_dtype == "fp8_static"
@@ -228,13 +227,26 @@ class PackedLinear(GuardedSeam, torch.nn.Module):
                          self.w_scale, input_fp8=self.x8_buf,
                          out=out if out is not None else self.y_buf)
         # siblings the caller takes jointly are read straight out of the
-        # packed buffer; only the rest need stashing
-        off = sum(self.splits[:max(1, self.joint_slots)])
+        # packed buffer; only the rest need stashing. A plain forward
+        # always stashes — a host-form call on a module whose joint
+        # consumer is enabled but not routed must leave fresh stashes,
+        # not silently stale ones (measured cos ~1e-5 on the sibling
+        # read when this was skipped).
+        if not torch.compiler.is_compiling():
+            self._stash_epoch = getattr(self, "_stash_epoch", 0) + 1
+        skip = 0 if stash_all else self.joint_slots
+        off = sum(self.splits[:max(1, skip)]) if skip else self.splits[0]
         for i, n in enumerate(self.splits[1:], 1):
-            if i < self.joint_slots:
+            if i < skip:
                 continue
             getattr(self, f"stash{i}")[:logical_rows].copy_(
                 y[:, off:off + n])
+            if not torch.compiler.is_compiling():
+                epochs = getattr(self, "_stash_epochs", None)
+                if epochs is None:
+                    epochs = {}
+                    self._stash_epochs = epochs
+                epochs[i] = self._stash_epoch
             off += n
         return y
 
@@ -289,6 +301,15 @@ class StashReader(GuardedSeam, torch.nn.Module):
         admitted = self._frt_admit(x)
         if admitted is not PROCEED:
             return admitted
+        head = self._packed[0]
+        if not torch.compiler.is_compiling():
+            epoch = getattr(head, "_stash_epoch", 0)
+            written = getattr(head, "_stash_epochs", {}).get(self.index)
+            if epoch and written != epoch:
+                raise GuardRefused(
+                    "qkv_pack: sibling stash is stale — the head's last "
+                    "run did not write this slot (a joint consumer "
+                    "skipped it); reading it would be silently wrong")
         logical_rows = x.numel() // x.shape[-1]
         buf = getattr(self._packed[0], f"stash{self.index}")[:logical_rows]
         out = buf.reshape(*x.shape[:-1], buf.shape[-1])

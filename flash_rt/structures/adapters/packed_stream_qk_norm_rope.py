@@ -130,6 +130,12 @@ class PackedStreamQkNormRopeAdapter:
 
             def lazy_permute(rotary_dim: int, _pack=pack, _bound=bound,
                              _state=state, _heads=heads, _qw=q_w, _kw=k_w):
+                if (torch.cuda.is_available()
+                        and torch.cuda.is_current_stream_capturing()):
+                    raise GuardRefused(
+                        "qk_norm_rope: the rotary permutation warms up on "
+                        "the first eager call — run one eager forward "
+                        "before capturing")
                 if rotary_dim % 2 or rotary_dim > 128:
                     raise GuardRefused(
                         "qk_norm_rope: rotary width must be even and "
@@ -191,11 +197,35 @@ class PackedStreamQkNormRopeAdapter:
             def routed(self, hidden_states, rotary_emb=None,
                        attention_mask=None, *, _pack=pack, _bound=bound,
                        _remap=remap_tables, _dispatch=dispatch,
-                       _proc=processor):
+                       _proc=processor, _state=state, _heads=heads):
                 if rotary_emb is None:
-                    raise GuardRefused(
-                        "qk_norm_rope: the bound form needs the rotary "
-                        "tables")
+                    # a rotary-less caller (the same attention class in
+                    # a refiner role): same joint read, the host's own
+                    # per-head norms, no rope, no kernel. Refused only
+                    # when this site already permuted for a rotary form
+                    # — the two forms cannot share one weight layout.
+                    if _state["r"] is not None:
+                        raise GuardRefused(
+                            "qk_norm_rope: this site was bound for "
+                            "rotary calls and now received none")
+                    flat = _pack.joint(hidden_states)
+                    lead = hidden_states.shape[:-1]
+                    d = _heads * 128
+                    q_, k_, v_ = flat.split([d, d, d], dim=-1)
+                    q_ = self.norm_q(q_.unflatten(-1, (_heads, 128))[None])
+                    k_ = self.norm_k(k_.unflatten(-1, (_heads, 128))[None])
+                    v_ = v_.unflatten(-1, (_heads, 128))[None]
+                    out = _dispatch(
+                        q_, k_, v_, attn_mask=attention_mask,
+                        dropout_p=0.0, is_causal=False,
+                        backend=getattr(_proc, "_attention_backend", None),
+                        parallel_config=getattr(_proc, "_parallel_config",
+                                                None))
+                    out = out.flatten(2, 3).type_as(q_)
+                    out = out.reshape(*lead, out.shape[-1])
+                    for layer in self.to_out:
+                        out = layer(out)
+                    return out
                 cos, sin = rotary_emb
                 cos, sin = _remap(cos.to(torch.bfloat16),
                                   sin.to(torch.bfloat16))
