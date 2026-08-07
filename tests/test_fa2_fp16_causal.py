@@ -88,8 +88,8 @@ def test_q_len_1_decode_matches_last_row():
     v = torch.randn(B, SK, NH, HD, device="cuda", dtype=torch.float16)
     o = _run_fp16_causal(q, k, v)
     # q_len=1 attends to all SK keys (causal mask degenerates to full row).
-    scores = (q.float() @ k.float().transpose(-1, -2)) * SCALE
-    ref = torch.softmax(scores, dim=-1) @ v.float()
+    scores = torch.einsum("bqhd,bkhd->bhqk", q.float(), k.float()) * SCALE
+    ref = torch.einsum("bhqk,bkhd->bqhd", torch.softmax(scores, dim=-1), v.float())
     assert _cos(o, ref) >= 0.999, f"decode cosine {_cos(o, ref)} < 0.999"
 
 

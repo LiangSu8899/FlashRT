@@ -56,26 +56,29 @@ def test_int4_rowwise_fp16out_matches_dequant_reference():
     x = torch.randn(M, K, device="cuda", dtype=torch.float16)
     w = torch.randn(N, K, device="cuda", dtype=torch.float16) * 0.02
 
-    x_amax = x.abs().amax(dim=1, keepdim=True).clamp_min(1e-6).float()
-    x_scale = x_amax / 127.0
-    x_q = torch.clamp(torch.round(x.float() / x_scale), -127, 127).to(torch.int8)
+    # W4A4: BOTH operands are packed s4 (even index in the low nibble,
+    # cutlass::int4b_t order — the production weight-prep layout).
+    def quant_pack_int4(t):
+        amax = t.abs().amax(dim=1, keepdim=True).clamp_min(1e-6).float()
+        scale = amax / 7.0
+        q = torch.clamp(torch.round(t.float() / scale), -7, 7).to(torch.int8)
+        lo = (q[:, 0::2] & 0x0F).to(torch.uint8)
+        hi = (q[:, 1::2] & 0x0F).to(torch.uint8)
+        return (lo | (hi << 4)).contiguous(), q, scale.float().contiguous()
 
-    # INT4 weights: pack two nibbles per byte, per-row scale over [-7, 7].
-    w_amax = w.abs().amax(dim=1, keepdim=True).clamp_min(1e-6).float()
-    w_scale = w_amax / 7.0
-    w_q = torch.clamp(torch.round(w.float() / w_scale), -7, 7).to(torch.int8)
-    w_packed = (w_q[:, 0::2] & 0x0F) | ((w_q[:, 1::2] & 0x0F) << 4)
+    x_packed, x_q, x_scale = quant_pack_int4(x)
+    w_packed, w_q, w_scale = quant_pack_int4(w)
 
     d = torch.empty(M, N, device="cuda", dtype=torch.float16)
     err = fvk.cutlass_int4_rowwise_fp16out(
-        x_q.data_ptr(), w_packed.data_ptr(), x_scale.data_ptr(), w_scale.data_ptr(),
-        d.data_ptr(), M, N, K)
-    if err != 0:
-        pytest.skip(f"kernel rejected shapes (err={err}); packing layout may differ")
+        x_packed.data_ptr(), w_packed.data_ptr(), x_scale.data_ptr(),
+        w_scale.data_ptr(), d.data_ptr(), M, N, K)
+    assert err == 0, f"cutlass_int4_rowwise_fp16out returned {err}"
     torch.cuda.synchronize()
 
     ref = (x_q.float() @ w_q.float().T) * (x_scale * w_scale.T)
-    assert _cos(d, ref) >= 0.99, f"cosine {_cos(d, ref)} < 0.99 (int4 quant error)"
+    cos = _cos(d, ref)
+    assert cos >= 0.99, f"cosine {cos} < 0.99 (int4 quant error)"
 
 
 @pytest.mark.skipif(not hasattr(fvk, "fht_int4_quant_fp16"),

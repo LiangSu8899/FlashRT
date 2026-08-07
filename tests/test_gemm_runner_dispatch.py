@@ -17,6 +17,12 @@ except ImportError as exc:  # pragma: no cover
 if not hasattr(fvk, "GemmRunner"):
     pytest.skip("GemmRunner not exported", allow_module_level=True)
 
+if torch.cuda.get_device_capability() < (8, 9):
+    pytest.skip(
+        "FP8 GEMM requires sm_89+ tensor cores "
+        "(cuBLASLt returns CUBLAS_STATUS_NOT_SUPPORTED below that)",
+        allow_module_level=True)
+
 torch.manual_seed(0)
 
 
