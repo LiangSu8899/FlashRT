@@ -21,7 +21,6 @@ import torch
 
 from flash_rt.structures import capture as capture_stage
 
-from dit_fp4_chain import apply_dit_fp4_chain, prepare_dit_fp4_chain
 from full_graph import pin_action_noise, replay_ms
 from groot_n17 import build, clone_tree, load_policy
 
@@ -114,8 +113,6 @@ def main() -> int:
             model=model, warmup=8, gate_cos=0, min_speedup=0)
 
         fa4_note = install_fa4_interface(model)
-        chain = prepare_dit_fp4_chain(model)
-        chain_note = (chain or {}).get("unavailable")
 
         def run_once():
             with torch.inference_mode():
@@ -129,12 +126,6 @@ def main() -> int:
         if extras["cadence_statics"]:
             wire_refresh_to_producer(model, extras["cadence_statics"],
                                      run_once)
-        undo_chain = None
-        if chain_note is None:
-            # the native transcription owns the DiT blocks: eight
-            # kernels per layer, residuals in the GEMM epilogues,
-            # per-step modulators resolved from bind-time tables
-            undo_chain = apply_dit_fp4_chain(model, chain, run_once)
 
         torch._dynamo.reset()
         treated = capture_stage(
@@ -151,7 +142,6 @@ def main() -> int:
         report = {
             "arm": "fp4_specialist",
             "fa4_interface": fa4_note or "installed",
-            "dit_chain": chain_note or "native transcription (32 blocks)",
             "device": torch.cuda.get_device_name(),
             "seats_bound": dict(asm.families),
             "swaps": len(asm.swaps),
@@ -164,8 +154,6 @@ def main() -> int:
         if args.report:
             args.report.write_text(json.dumps(report, indent=2,
                                               default=str))
-        if undo_chain is not None:
-            undo_chain()
         handle.detach()
         treated.restore_host()
         stock.restore_host()
