@@ -113,10 +113,17 @@ class PackedLinear(GuardedSeam, torch.nn.Module):
         else:
             self._fn = kf.bf16_fp8_linear_bias_bf16
             k = mods[0].weight.shape[1]
-            self.register_buffer("x8_buf", torch.empty(
-                rows, k, device=dev, dtype=_FP8))
-            self.register_buffer("y_buf", torch.empty(
-                rows, sum(splits), device=dev, dtype=torch.bfloat16))
+            # Call-lifetime scratch, so the pool owns it: the quantize
+            # scratch is written and read inside the kernel call, and
+            # the packed output is fully consumed before forward returns
+            # (q sliced out by copy, later siblings copied to stashes).
+            # Layers run sequentially, so every same-shape pack shares
+            # one allocation instead of paying ~900 MiB per layer — the
+            # difference between binding a 52-layer host and refusing
+            # most of it on budget.
+            self.x8_buf = lease((rows, k), _FP8, dev, tag="qkv_x8")
+            self.y_buf = lease((rows, sum(splits)), torch.bfloat16, dev,
+                               tag="qkv_y")
         self._frt_arm(
             dtypes=FP8_ONLY if in_dtype == "fp8_static" else CAST_OK,
             device=dev, k=int(mods[0].weight.shape[1]),
