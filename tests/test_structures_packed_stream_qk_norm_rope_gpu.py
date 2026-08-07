@@ -233,3 +233,42 @@ def test_norm_rope_stage_matches_torch_on_identical_input():
                 atol=1e-3, rtol=1e-3)
     finally:
         handle.detach()
+
+
+@cuda
+def test_each_route_permutes_its_own_pack():
+    """The late-binding lesson: loop-scope closures resolve free
+    variables to the LAST iteration — the first route's warmup then
+    permuted a stranger's weights (proven empirically) while every
+    single-site check stayed above a loose floor and fifty stacked
+    layers compounded to 0.71. Ownership is the invariant to pin."""
+    from flash_rt.structures import workspace
+    from flash_rt.structures.adapters.packed_stream_qk_norm_rope import (
+        PackedStreamQkNormRopeAdapter)
+    from flash_rt.structures.swap import attach
+
+    workspace.clear()
+    host, plan = _build()
+    seq = 16
+    x = torch.randn(1, seq, DIM, device="cuda", dtype=torch.bfloat16)
+    rope = _tables(seq, "cuda")
+    with torch.inference_mode():
+        ref = host(x, rope).float()
+    res = PackedStreamQkNormRopeAdapter()(host, plan)
+    handle = attach(host, plan.swaps, observe=res["observed"],
+                    revert=res["revert"])
+    try:
+        w0 = plan.swaps["attn0.to_q"].w8.clone()
+        w1 = plan.swaps["attn1.to_q"].w8.clone()
+        with torch.inference_mode():
+            host.attn0(x, rope)
+        assert not torch.equal(w0, plan.swaps["attn0.to_q"].w8), \
+            "attn0's warmup did not permute its own pack"
+        assert torch.equal(w1, plan.swaps["attn1.to_q"].w8), \
+            "attn0's warmup touched attn1's pack"
+        with torch.inference_mode():
+            got = host(x, rope).float()
+        cos = F.cosine_similarity(got.flatten(), ref.flatten(), dim=0)
+        assert float(cos) > 0.998, float(cos)
+    finally:
+        handle.detach()

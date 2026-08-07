@@ -60,7 +60,7 @@ class PackedStreamQkNormRopeAdapter:
 
     __name__ = "packed_stream_qk_norm_rope"
 
-    SMOKE_FLOOR = 0.99
+    SMOKE_FLOOR = 0.995
 
     def __call__(self, model, plan, probe=None):
         routes = []
@@ -179,10 +179,16 @@ class PackedStreamQkNormRopeAdapter:
                     _bound.k_norm_weight.copy_(
                         _kw.detach().to(dev, torch.bfloat16)[pdev])
 
-            def remap_tables(cos, sin, _state=state, _site=site):
+            def remap_tables(cos, sin, _state=state, _site=site,
+                             _lazy_permute=lazy_permute):
                 r = cos.shape[-1]
                 if _state["r"] is None:
-                    lazy_permute(r)
+                    # early-bound above: a loop-scope free variable here
+                    # resolves to the LAST route's function — the first
+                    # route's call then permutes a stranger's weights
+                    # and never its own (proven: attn0's first call
+                    # permuted attn1's pack)
+                    _lazy_permute(r)
                 elif _state["r"] != r:
                     raise GuardRefused(
                         f"qk_norm_rope[{_site}]: rotary width changed "
