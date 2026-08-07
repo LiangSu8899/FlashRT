@@ -552,3 +552,15 @@ to measure along it.
   eager survivors as the pipeline result measures a different program.
 - **Refusals record the form and the shape.** "refused" must never read as
   "this cannot be bound", only as "not in that form, at that size".
+
+- **The race qualifies; the receipt activates.** A bind-time A/B
+  micro-race is a qualification signal, never an activation: the
+  norm→FP8 pairing won its race at 28 of 28 sites on a device where
+  the same flip cost 0.6ms end-to-end in the captured form, in the
+  same day that a kernel-form swap winning its standalone numbers
+  cost another 1.0ms inside a fused chain. Anything that changes a
+  production form activates only on a production-form receipt for
+  this box (`decisions` — the same cache, transport and manifest
+  column the bands and regions use); the race result goes to the
+  trail so the refusal is auditable. This is the seat-level
+  micro-timing refutation, promoted from a finding to a gate.

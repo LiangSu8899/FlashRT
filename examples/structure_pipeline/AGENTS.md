@@ -192,3 +192,12 @@ reproduction by, in order:
 3. speedups within a form row land in the same band — clocks move a
    few percent between runs, so read ratios, not milliseconds across
    processes.
+
+Region adjudication in reports: the automatic arm's `seats` block
+carries `regions` (the resolution trail: winner, source, fall-through
+reasons), `regions_bound` (root, claimed seam count, smoke cosine) and
+`regions_refused`. A cold box shows `seated (default)` and unchanged
+numbers; a box with a recorded receipt grows the winning form from
+`source=cache`. The receipts themselves live in the decision cache and
+travel with `import_decisions`, and `handle.manifest()` lists every
+entry for this device — bands, regions, and pairing receipts alike.
