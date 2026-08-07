@@ -197,6 +197,84 @@ def _seam_key(seam: Seam) -> str:
     return seam.path
 
 
+def _bind_regions(model, seams, *, probe, say):
+    """Resolve and bind every registered region family on this host.
+
+    Returns ``None`` when no family identifies a region here. The
+    stability contract: resolution reads receipts (pin > cache >
+    seated) and a winning candidate binds *before* any seat, so its
+    failure — refused symbols, a smoke miss, an exception — leaves
+    every seam in place and lands on the trail. Only a successful
+    bind claims the seams under its root; the seated floor is what
+    remains everywhere else, always.
+    """
+    from . import regions
+    from .impls.dit_stack import region as _dit_region
+    _dit_region.register()
+
+    notes: dict = {}
+    extras = {"seams": list(seams), "observed": {}, "revert": [],
+              "toggles": [], "notes": notes}
+    engaged = False
+    for fam in regions.registered():
+        try:
+            roots = list(fam.identify(model))
+        except Exception:       # noqa: BLE001 — identify never kills
+            continue
+        if not roots:
+            continue
+        engaged = True
+        winner, source = regions.resolve(fam.family, notes=notes)
+        if winner == regions.SEATED:
+            say(f"region {fam.family}: seated ({source})")
+            continue
+        cand = fam.candidate(winner)
+        for root in roots:
+            label = f"{root}::{winner}"
+            if probe is None:
+                notes.setdefault("regions_refused", []).append(
+                    (label, "no probe callable"))
+                continue
+            try:
+                result = cand.bind(model, root, probe)
+            except Exception as exc:  # noqa: BLE001 — never kills
+                result = {"refused": f"{type(exc).__name__}: {exc}"}
+            if not result or result.get("refused"):
+                reason = (result or {}).get(
+                    "refused", "bind returned nothing")
+                notes.setdefault("regions_refused", []).append(
+                    (label, str(reason)[:200]))
+                say(f"region {fam.family}@{root}: {winner} refused "
+                    "-> seated")
+                continue
+            prefix = root + "." if root else ""
+            keep, claimed = [], 0
+            for s in extras["seams"]:
+                if s.path == root or s.path.startswith(prefix):
+                    claimed += 1
+                else:
+                    keep.append(s)
+            extras["seams"] = keep
+            extras["observed"].update(result.get("observed", {}))
+            extras["revert"].extend(result.get("revert", ()))
+            if result.get("toggle") is not None:
+                extras["toggles"].append(result["toggle"])
+            notes.setdefault("regions_bound", []).append(
+                {"family": fam.family, "root": root, "winner": winner,
+                 "source": source, "claimed_seams": claimed,
+                 "smoke_cos": result.get("smoke_cos")})
+            say(f"region {fam.family}@{root}: {winner} bound "
+                f"({claimed} seam(s) claimed, source={source})")
+    return extras if engaged else None
+
+
+def _merge_region_extras(plan, extras) -> None:
+    plan.notes.update(extras["notes"])
+    plan.observed.update(extras["observed"])
+    plan.revert.extend(extras["revert"])
+    plan.toggles.extend(extras["toggles"])
+
+
 def auto_swaps(
     model: torch.nn.Module,
     forward: Callable[..., Any] | Sequence[Callable[[], Any]],
@@ -302,10 +380,24 @@ def auto_swaps(
 
     seams = discover(model, structures, refused=plan_refusals)
     say(f"discovered {len(seams)} seam(s)")
+
+    # ---- region adjudication: the structure-level winner is a receipt.
+    # Resolution reads author pin > decision cache > seated and never
+    # experiments here; a winning candidate binds before any seat does
+    # (its failure leaves every seam in place — seated is always the
+    # floor), and only a *successful* bind claims the seams it absorbs.
+    region_extras = _bind_regions(
+        model, seams, probe=(thunks[0] if thunks else None), say=say)
+    if region_extras is not None:
+        seams = region_extras["seams"]
+
     adapter_only = not seams and bool(
         {"attention_core", "gated_delta_core"}.intersection(structures))
     if not seams and not adapter_only:
-        return AutoPlan()
+        plan = AutoPlan()
+        if region_extras is not None:
+            _merge_region_extras(plan, region_extras)
+        return plan
 
     # ---- one calibration pass, structure-aware capture ----
     # Activation scales go through the house two-level statistic: a max
@@ -672,6 +764,8 @@ def auto_swaps(
     # produced it. Bind the pair together, or leave both on BF16.
     plan = AutoPlan(seams=seams)
     plan._requested_structures = frozenset(structures)
+    if region_extras is not None:
+        _merge_region_extras(plan, region_extras)
 
     # ---- per-seat streaming consumption (the bind-peak lever) ----
     # With a weight store handed in, every leaf placement immediately

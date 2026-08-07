@@ -221,7 +221,11 @@ def main() -> int:
             seats = {"swaps": len(plan.swaps),
                      "observed": len(plan.observed),
                      "refused": len(plan.notes.get("refused", [])),
-                     "format_race": plan.notes.get("format_race")}
+                     "format_race": plan.notes.get("format_race"),
+                     "regions": plan.notes.get("regions"),
+                     "regions_bound": plan.notes.get("regions_bound"),
+                     "regions_refused": plan.notes.get(
+                         "regions_refused")}
         weights_receipt = None
         if sequential:
             weights_receipt = handle.consume(wstore)

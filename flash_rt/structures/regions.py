@@ -106,6 +106,10 @@ def family(name: str) -> RegionFamily:
     return _FAMILIES[name]
 
 
+def registered() -> tuple[RegionFamily, ...]:
+    return tuple(_FAMILIES.values())
+
+
 def _pin_env(fam: str) -> str:
     return "FRT_REGION_" + re.sub(r"[^A-Za-z0-9]", "_", fam).upper()
 
