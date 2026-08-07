@@ -92,8 +92,23 @@ class CapturedStage:
         return self.output
 
     def write(self, name: str, value: torch.Tensor) -> None:
-        """Rewrite one declared window in place."""
-        self.windows[name].copy_(value)
+        """Rewrite one declared window in place.
+
+        The window's form is the graph's contract: ``copy_`` would
+        silently broadcast a wrong shape or cast a wrong dtype, and the
+        replay would then run baked kernels over coerced data with no
+        guard anywhere to notice — the captured tier's ledger blindness
+        is by design, so the door has to check.
+        """
+        window = self.windows[name]
+        if (value.shape != window.shape or value.dtype != window.dtype
+                or value.device != window.device):
+            raise ValueError(
+                f"captured stage: window {name!r} expects "
+                f"{tuple(window.shape)}/{window.dtype}/{window.device}, "
+                f"got {tuple(value.shape)}/{value.dtype}/{value.device}"
+                " — a replay over a coerced write is silently wrong")
+        window.copy_(value)
 
     def export(self, *, ports, regions=(), stages=None, roles=None,
                identity=None, manifest_extra=None):

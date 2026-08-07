@@ -28,7 +28,22 @@ _LEASES: dict[str, int] = {}
 
 def lease(shape, dtype, device, *, tag: str,
           fill: str = "scratch") -> torch.Tensor:
-    """One shared tensor for every seat asking this (shape, tag)."""
+    """One shared tensor for every seat asking this (shape, tag).
+
+    The pool's safety argument is single-stream sequential execution:
+    layer i's scratch is dead before layer i+1 writes it *because they
+    share one stream*. A caller leasing from a non-default stream is
+    outside that argument, and the pool refuses rather than corrupt
+    silently — multi-stream serving needs per-lane isolation first.
+    """
+    if (torch.cuda.is_available()
+            and str(device).startswith("cuda")
+            and torch.cuda.current_stream()
+            != torch.cuda.default_stream()):
+        raise RuntimeError(
+            "workspace: leasing from a non-default CUDA stream — the "
+            "shared pool's lifetime argument only covers single-stream "
+            "sequential execution; isolate per-stream lanes first")
     key = (tuple(shape), dtype, str(device), tag, fill)
     buf = _POOL.get(key)
     if buf is None:

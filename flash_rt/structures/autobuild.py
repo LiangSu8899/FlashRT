@@ -128,6 +128,21 @@ class AutoPlan:
         for _, off in self.toggles:
             off()
 
+    def abort(self) -> None:
+        """Roll back everything this plan touched without an attach.
+
+        The plan mutates the host as it builds (adapter routes enable,
+        interface switches land, streamed originals leave the device).
+        ``attach`` is the commit point; a caller that decides not to
+        commit — or a bind that dies midway — calls this instead, and
+        the model returns to the loaded form.
+        """
+        self.disable_routed()
+        self.revert_all()
+        store = self.notes.get("stream_store")
+        if store is not None:
+            store.restore_all()
+
     def revert_all(self) -> None:
         """Undo the plan-time host mutations. Idempotent per adapter."""
         for undo in reversed(self.revert):
@@ -790,175 +805,192 @@ def auto_swaps(
             except (AttributeError, TypeError, ValueError):
                 continue
 
-    # ---- qk_norm_rope: compose a packed QKV seam with host attention ----
-    if "qk_norm_rope" in structures:
-        from . import adapters as _adapters  # noqa: F401 (registers)
-        for adapter in _QK_NORM_ROPE_ADAPTERS:
-            try:
-                result = adapter(model, plan)
-            except (ValueError, RuntimeError) as refusal:
-                plan.notes.setdefault("refused", []).append(
-                    ("qk_norm_rope", str(refusal)[:80]))
-                continue
-            if result is None:
-                continue
-            extras = result
-            if extras.get("refused"):
-                plan.notes.setdefault("refused", []).extend(
-                    extras["refused"])
-            engaged = bool(
-                extras.get("observed")
-                or extras.get("revert")
-                or extras.get("toggle")
-            )
-            if not engaged:
-                continue
-            plan.observed.update(extras.get("observed", {}))
-            plan.revert.extend(extras.get("revert", ()))
-            if extras.get("toggle") is not None:
-                plan.notes["qk_norm_rope_toggle_index"] = len(plan.toggles)
-                plan.toggles.append(extras["toggle"])
-            plan.notes["qk_norm_rope_adapter"] = (
-                type(adapter).__name__
-                if hasattr(adapter, "__name__")
-                else str(adapter)
-            )
-            break
-    # ---- qkv_rope: packed biased QKV plus rotate-half RoPE ----
-    if "qkv_rope" in structures:
-        from . import adapters as _adapters  # noqa: F401 (registers)
-        for adapter in _QKV_ROPE_ADAPTERS:
-            try:
-                result = adapter(model, plan, caps)
-            except (ValueError, RuntimeError) as refusal:
-                plan.notes.setdefault("refused", []).append(
-                    ("qkv_rope", str(refusal)[:100]))
-                continue
-            if result is None:
-                continue
-            if result.get("refused"):
-                plan.notes.setdefault("refused", []).extend(result["refused"])
-            engaged = bool(
-                result.get("observed")
-                or result.get("revert")
-                or result.get("toggle")
-            )
-            if not engaged:
-                continue
-            plan.observed.update(result.get("observed", {}))
-            plan.revert.extend(result.get("revert", ()))
-            if result.get("toggle") is not None:
-                plan.toggles.append(result["toggle"])
-            plan.notes["qkv_rope_adapter"] = type(adapter).__name__
-            break
-    # ---- attention_core: host-family adapters (fa2 seam) ----
-    if "attention_core" in structures:
-        from . import adapters as _adapters  # noqa: F401 (registers)
-        for adapter in _ATTENTION_ADAPTERS:
-            try:
-                # the adapter needs "run the host once", which is what a
-                # thunk is. Handing it the caller's callable breaks the
-                # sample entry, where that callable takes a sample —
-                # the whole point of normalising the three ways in was
-                # that nothing downstream should see the difference
-                result = adapter(model, thunks[0],
-                                 prefix_cadence=prefix_cadence)
-            except (ValueError, RuntimeError) as refusal:
-                plan.notes.setdefault("refused", []).append(
-                    ("attention_core", str(refusal)[:80]))
-                continue
-            if result is None:
-                continue
-            # an adapter may hand back a third element for the parts of
-            # its seam that are not modules at paths: how to undo them,
-            # and what to report
-            att_swaps, update = result[0], result[1]
-            extras = result[2] if len(result) > 2 else {}
-            if extras.get("refused"):
-                plan.notes.setdefault("refused", []).extend(
-                    extras["refused"])
-            engaged = bool(
-                att_swaps or update
-                or extras.get("observed")
-                or extras.get("revert")
-                or extras.get("toggle")
-            )
-            if not engaged:
-                continue
-            plan.swaps.update(att_swaps)
-            plan.observed.update(extras.get("observed", {}))
-            if extras.get("attention_variants"):
-                plan.notes.setdefault(
-                    "attention_core_variants", {}).update(
-                        extras["attention_variants"])
-            plan.revert.extend(extras.get("revert", ()))
-            if extras.get("toggle") is not None:
-                plan.toggles.append(extras["toggle"])
-            if update is not None:
-                plan.updates.append(update)
-            plan.notes["attention_adapter"] = type(adapter).__name__ \
-                if hasattr(adapter, "__name__") else str(adapter)
-            break
-
-
-    # ---- gated_delta_core: stateful host callable adapters ----
-    if "gated_delta_core" in structures:
-        from . import adapters as _adapters  # noqa: F401 (registers)
-        for adapter in _GATED_DELTA_ADAPTERS:
-            try:
-                # adapters that declare scheme awareness receive the
-                # active scheme; the rest keep the two-argument call
-                if getattr(adapter, "scheme_aware", False):
-                    result = adapter(model, thunks[0], scheme=scheme_obj)
-                else:
-                    result = adapter(model, thunks[0])
-            except (ValueError, RuntimeError) as refusal:
-                plan.notes.setdefault("refused", []).append(
-                    ("gated_delta_core", str(refusal)[:120]))
-                continue
-            if result is None:
-                continue
-            plan.observed.update(result.get("observed", {}))
-            plan.revert.extend(result.get("revert", ()))
-            if result.get("toggle") is not None:
-                plan.toggles.append(result["toggle"])
-            plan.notes["gated_delta_adapter"] = type(adapter).__name__ \
-                if hasattr(adapter, "__name__") else str(adapter)
-            break
-
-    # ---- one step-scoped style materialisation per conditioning stream
-    # Every adaptive-norm producer on one stream resolves the same step,
-    # so the whole stream's styles are fixed for the step's duration.
-    # Materialising them once beats materialising them per call by the
-    # launch count, which is what that work actually costs. Runs before
-    # the block assembly: a block holds its producers directly and drops
-    # them from the swap map, so afterwards they are no longer findable
-    # here.
-    _attach_brokers(caps, plan, say)
-
-    # ---- decoder_block: compose the bound sublayers into one block ----
-    # last, because it is assembled from what the region structures
-    # produced. The swaps it absorbs are dropped from the plan: the
-    # block holds those modules directly, and a swap that also targeted
-    # the host child would leave two live copies of the same seam.
-    for seam in (s for s in seams if s.structure == "decoder_block"):
-        try:
-            block = _bind_block(
-                model, seam, caps.get(_seam_key(seam), {}), plan)
-        except (ValueError, RuntimeError) as refusal:
-            plan.notes.setdefault("refused", []).append(
-                (seam.path + " [block]", str(refusal)[:80]))
-            continue
-        if block is None:
-            continue
-        for child in _BLOCK_OWNED:
-            plan.swaps.pop(seam.path + "." + child, None)
-        plan.swaps[seam.path] = block
-
     if stream_store is not None:
+        plan.notes["stream_store"] = stream_store
+
+    def _stream_window_undo():
+        if not _stream_temp:
+            return
         from .swap import _set as _sst2
         for _par, _at, _orig in reversed(_stream_temp):
             _sst2(_par, _at, _orig)
+        _stream_temp.clear()
+
+    # every later stage may record through the seated model; whatever
+    # they do the window closes, and a stage that dies rolls the whole
+    # plan back — a half-routed model is worse than no plan
+    try:
+        # ---- qk_norm_rope: compose a packed QKV seam with host attention ----
+        if "qk_norm_rope" in structures:
+            from . import adapters as _adapters  # noqa: F401 (registers)
+            for adapter in _QK_NORM_ROPE_ADAPTERS:
+                try:
+                    result = adapter(model, plan)
+                except (ValueError, RuntimeError) as refusal:
+                    plan.notes.setdefault("refused", []).append(
+                        ("qk_norm_rope", str(refusal)[:80]))
+                    continue
+                if result is None:
+                    continue
+                extras = result
+                if extras.get("refused"):
+                    plan.notes.setdefault("refused", []).extend(
+                        extras["refused"])
+                engaged = bool(
+                    extras.get("observed")
+                    or extras.get("revert")
+                    or extras.get("toggle")
+                )
+                if not engaged:
+                    continue
+                plan.observed.update(extras.get("observed", {}))
+                plan.revert.extend(extras.get("revert", ()))
+                if extras.get("toggle") is not None:
+                    plan.notes["qk_norm_rope_toggle_index"] = len(plan.toggles)
+                    plan.toggles.append(extras["toggle"])
+                plan.notes["qk_norm_rope_adapter"] = (
+                    type(adapter).__name__
+                    if hasattr(adapter, "__name__")
+                    else str(adapter)
+                )
+                break
+        # ---- qkv_rope: packed biased QKV plus rotate-half RoPE ----
+        if "qkv_rope" in structures:
+            from . import adapters as _adapters  # noqa: F401 (registers)
+            for adapter in _QKV_ROPE_ADAPTERS:
+                try:
+                    result = adapter(model, plan, caps)
+                except (ValueError, RuntimeError) as refusal:
+                    plan.notes.setdefault("refused", []).append(
+                        ("qkv_rope", str(refusal)[:100]))
+                    continue
+                if result is None:
+                    continue
+                if result.get("refused"):
+                    plan.notes.setdefault("refused", []).extend(result["refused"])
+                engaged = bool(
+                    result.get("observed")
+                    or result.get("revert")
+                    or result.get("toggle")
+                )
+                if not engaged:
+                    continue
+                plan.observed.update(result.get("observed", {}))
+                plan.revert.extend(result.get("revert", ()))
+                if result.get("toggle") is not None:
+                    plan.toggles.append(result["toggle"])
+                plan.notes["qkv_rope_adapter"] = type(adapter).__name__
+                break
+        # ---- attention_core: host-family adapters (fa2 seam) ----
+        if "attention_core" in structures:
+            from . import adapters as _adapters  # noqa: F401 (registers)
+            for adapter in _ATTENTION_ADAPTERS:
+                try:
+                    # the adapter needs "run the host once", which is what a
+                    # thunk is. Handing it the caller's callable breaks the
+                    # sample entry, where that callable takes a sample —
+                    # the whole point of normalising the three ways in was
+                    # that nothing downstream should see the difference
+                    result = adapter(model, thunks[0],
+                                     prefix_cadence=prefix_cadence)
+                except (ValueError, RuntimeError) as refusal:
+                    plan.notes.setdefault("refused", []).append(
+                        ("attention_core", str(refusal)[:80]))
+                    continue
+                if result is None:
+                    continue
+                # an adapter may hand back a third element for the parts of
+                # its seam that are not modules at paths: how to undo them,
+                # and what to report
+                att_swaps, update = result[0], result[1]
+                extras = result[2] if len(result) > 2 else {}
+                if extras.get("refused"):
+                    plan.notes.setdefault("refused", []).extend(
+                        extras["refused"])
+                engaged = bool(
+                    att_swaps or update
+                    or extras.get("observed")
+                    or extras.get("revert")
+                    or extras.get("toggle")
+                )
+                if not engaged:
+                    continue
+                plan.swaps.update(att_swaps)
+                plan.observed.update(extras.get("observed", {}))
+                if extras.get("attention_variants"):
+                    plan.notes.setdefault(
+                        "attention_core_variants", {}).update(
+                            extras["attention_variants"])
+                plan.revert.extend(extras.get("revert", ()))
+                if extras.get("toggle") is not None:
+                    plan.toggles.append(extras["toggle"])
+                if update is not None:
+                    plan.updates.append(update)
+                plan.notes["attention_adapter"] = type(adapter).__name__ \
+                    if hasattr(adapter, "__name__") else str(adapter)
+                break
+
+
+        # ---- gated_delta_core: stateful host callable adapters ----
+        if "gated_delta_core" in structures:
+            from . import adapters as _adapters  # noqa: F401 (registers)
+            for adapter in _GATED_DELTA_ADAPTERS:
+                try:
+                    # adapters that declare scheme awareness receive the
+                    # active scheme; the rest keep the two-argument call
+                    if getattr(adapter, "scheme_aware", False):
+                        result = adapter(model, thunks[0], scheme=scheme_obj)
+                    else:
+                        result = adapter(model, thunks[0])
+                except (ValueError, RuntimeError) as refusal:
+                    plan.notes.setdefault("refused", []).append(
+                        ("gated_delta_core", str(refusal)[:120]))
+                    continue
+                if result is None:
+                    continue
+                plan.observed.update(result.get("observed", {}))
+                plan.revert.extend(result.get("revert", ()))
+                if result.get("toggle") is not None:
+                    plan.toggles.append(result["toggle"])
+                plan.notes["gated_delta_adapter"] = type(adapter).__name__ \
+                    if hasattr(adapter, "__name__") else str(adapter)
+                break
+
+        # ---- one step-scoped style materialisation per conditioning stream
+        # Every adaptive-norm producer on one stream resolves the same step,
+        # so the whole stream's styles are fixed for the step's duration.
+        # Materialising them once beats materialising them per call by the
+        # launch count, which is what that work actually costs. Runs before
+        # the block assembly: a block holds its producers directly and drops
+        # them from the swap map, so afterwards they are no longer findable
+        # here.
+        _attach_brokers(caps, plan, say)
+
+        # ---- decoder_block: compose the bound sublayers into one block ----
+        # last, because it is assembled from what the region structures
+        # produced. The swaps it absorbs are dropped from the plan: the
+        # block holds those modules directly, and a swap that also targeted
+        # the host child would leave two live copies of the same seam.
+        for seam in (s for s in seams if s.structure == "decoder_block"):
+            try:
+                block = _bind_block(
+                    model, seam, caps.get(_seam_key(seam), {}), plan)
+            except (ValueError, RuntimeError) as refusal:
+                plan.notes.setdefault("refused", []).append(
+                    (seam.path + " [block]", str(refusal)[:80]))
+                continue
+            if block is None:
+                continue
+            for child in _BLOCK_OWNED:
+                plan.swaps.pop(seam.path + "." + child, None)
+            plan.swaps[seam.path] = block
+
+    except BaseException:
+        _stream_window_undo()
+        plan.abort()
+        raise
+    finally:
+        _stream_window_undo()
 
     # what discovery took on trust, for the seams that actually bound. An
     # assumption that reaches the model without reaching the receipt is

@@ -210,6 +210,52 @@ class AttachHandle:
             "clean": not fell_back,
         }
 
+    def manifest(self) -> dict[str, Any]:
+        """One document answering "why does this box run this form".
+
+        The receipts exist — band decisions, variant trails, format
+        races, the workspace ledger, the weight-residency receipt — but
+        scattered, each with its own schema. Cross-box drift diagnosis
+        and decision transport both need the single view: device
+        fingerprint, every seam with its kind and its story, the
+        decisions consumed, the memory plan, and what happened to the
+        weights. Read-only; safe to serialize.
+        """
+        import json as _json
+
+        device = (torch.cuda.get_device_name(0)
+                  if torch.cuda.is_available() else "cpu")
+        decisions: dict[str, Any] = {}
+        try:
+            from .decisions import _cache_path
+            decisions = _json.loads(_cache_path().read_text())
+        except Exception:
+            pass
+        workspace_report: Any = None
+        try:
+            from .workspace import report as _ws_report
+            workspace_report = _ws_report()
+        except Exception:
+            pass
+        seams = {}
+        for site, guard in sorted(self._guards.items()):
+            entry = guard.entry()
+            seams[site] = {
+                "kind": entry.get("kind"),
+                "calls": entry.get("calls"),
+                "fallbacks": entry.get("fallbacks"),
+                "notes": entry.get("notes"),
+            }
+        return {
+            "device": device,
+            "seams": seams,
+            "summary": self.summary(),
+            "records": dict(self.records),
+            "decisions": {k: v for k, v in decisions.items()
+                          if k.startswith(device + "|")},
+            "workspace": workspace_report,
+        }
+
     def raise_on_fallback(self) -> None:
         """Assertion helper: fail loudly if any seam fell back.
 

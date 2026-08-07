@@ -150,3 +150,16 @@ def test_decision_import_merges_and_local_wins(tmp_path, monkeypatch):
     receipt = decisions.import_decisions(str(src))
     assert receipt["imported"] == 1          # the foreign-device entry
     assert decisions.lookup("groot_dit") == "fp8"   # local measurement wins
+
+
+def test_manifest_is_one_serializable_document():
+    import json
+
+    host = Host().eval()
+    handle = attach(host, {"proj": FakeSeam(host.proj)})
+    handle.consume()
+    m = handle.manifest()
+    assert "proj" in m["seams"]
+    assert m["records"]["consumed"]["freed_bytes"] > 0
+    json.dumps(m, default=str)   # must serialize whole
+    handle.detach()

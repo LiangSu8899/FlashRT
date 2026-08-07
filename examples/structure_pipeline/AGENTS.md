@@ -68,7 +68,23 @@ layers share one buffer, so the memory bill is one layer's worth, not
 layers x tokens (`structures.workspace.report()` is the receipt's
 memory column). Binding itself is budgeted: under 512 MiB free VRAM a
 seat refuses with `insufficient_vram(...)` instead of eating the
-remainder.
+remainder. The pool's safety argument is single-stream sequential
+execution — leasing from a non-default CUDA stream refuses loudly.
+
+**Receipts (one document)** — `handle.manifest()` answers "why does
+this box run this form" in one serializable dict: device fingerprint,
+every seam with kind/calls/fallbacks/notes, the band decisions this
+device consumed, the workspace ledger, and the weight-residency
+receipt. Captured windows are strict at the door: `stage.write(name,
+value)` requires the exact shape/dtype/device the graph was captured
+with — a broadcastable-but-wrong write refuses instead of replaying
+over coerced data.
+
+**Transaction boundary** — `attach` is the commit point. A bind that
+dies midway rolls the whole plan back (routes disabled, host
+mutations reverted, streamed weights restored); a caller that decides
+not to commit calls `plan.abort()`. There is no half-routed state to
+clean up by hand.
 
 **Explicit** — the only tier with real orchestration in user code:
 seat tables, the author's own calibration hooks, direct binder calls —
