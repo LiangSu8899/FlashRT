@@ -6,6 +6,7 @@ import torch
 
 from .. import hub_kernel
 from ...guard import PROCEED, GuardRefused, GuardedSeam
+from ...workspace import lease
 
 
 class PerHeadGqaQkNormRope(GuardedSeam, torch.nn.Module):
@@ -23,6 +24,7 @@ class PerHeadGqaQkNormRope(GuardedSeam, torch.nn.Module):
         kv_heads: int,
         head_dim: int,
         eps: float = 1e-6,
+        workspace_lane: str | None = None,
     ) -> None:
         super().__init__()
         if row_capacity <= 0 or q_heads <= 0 or kv_heads <= 0:
@@ -62,33 +64,48 @@ class PerHeadGqaQkNormRope(GuardedSeam, torch.nn.Module):
             k_norm_weight.detach().to(torch.bfloat16).contiguous(),
         )
         device = q_norm_weight.device
-        self.register_buffer(
-            "q_out",
-            torch.empty(
-                self.row_capacity,
-                self.q_heads,
-                128,
-                device=device,
-                dtype=torch.bfloat16,
-            ),
-            persistent=False,
-        )
-        self.register_buffer(
-            "k_out",
-            torch.empty(
-                self.row_capacity,
-                self.kv_heads,
-                128,
-                device=device,
-                dtype=torch.bfloat16,
-            ),
-            persistent=False,
-        )
-        self.register_buffer(
-            "v_out",
-            torch.empty_like(self.k_out),
-            persistent=False,
-        )
+        if workspace_lane is not None:
+            # a caller that declares its outputs call-scoped (no cache,
+            # consumed inside the layer) shares one workspace per lane
+            # across every same-shape layer — the difference between a
+            # 19k-token host binding 52 layers and OOMing on the 53rd
+            self.q_out = lease((self.row_capacity, self.q_heads, 128),
+                               torch.bfloat16, device,
+                               tag=f"qkr_q|{workspace_lane}")
+            self.k_out = lease((self.row_capacity, self.kv_heads, 128),
+                               torch.bfloat16, device,
+                               tag=f"qkr_k|{workspace_lane}")
+            self.v_out = lease((self.row_capacity, self.kv_heads, 128),
+                               torch.bfloat16, device,
+                               tag=f"qkr_v|{workspace_lane}")
+        else:
+            self.register_buffer(
+                "q_out",
+                torch.empty(
+                    self.row_capacity,
+                    self.q_heads,
+                    128,
+                    device=device,
+                    dtype=torch.bfloat16,
+                ),
+                persistent=False,
+            )
+            self.register_buffer(
+                "k_out",
+                torch.empty(
+                    self.row_capacity,
+                    self.kv_heads,
+                    128,
+                    device=device,
+                    dtype=torch.bfloat16,
+                ),
+                persistent=False,
+            )
+            self.register_buffer(
+                "v_out",
+                torch.empty_like(self.k_out),
+                persistent=False,
+            )
         self._frt_arm(
             dtypes={torch.bfloat16},
             device=device,
@@ -160,6 +177,7 @@ def bind_per_head_gqa_qk_norm_rope(
     kv_heads: int,
     head_dim: int,
     eps: float = 1e-6,
+    workspace_lane: str | None = None,
 ) -> PerHeadGqaQkNormRope:
     """Bind the capacity-guarded per-head GQA implementation.
 
@@ -177,4 +195,5 @@ def bind_per_head_gqa_qk_norm_rope(
         kv_heads=kv_heads,
         head_dim=head_dim,
         eps=eps,
+        workspace_lane=workspace_lane,
     )
