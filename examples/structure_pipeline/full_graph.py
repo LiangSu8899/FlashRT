@@ -182,6 +182,11 @@ def main() -> int:
             with torch.inference_mode():
                 hot()
 
+        wstore = None
+        if sequential:
+            from flash_rt.structures.storage import WeightStore
+            wstore = WeightStore(checkpoint=str(args.checkpoint))
+
         if args.arm == "explicit":
             asm, extras = build(model, run_once)
             handle = swap.attach(model, asm.swaps, consume=False,
@@ -201,6 +206,8 @@ def main() -> int:
             caps = capture_cross_attention_kv(sites, run_once)
             scheme_kw = ({"scheme": args.scheme}
                          if args.scheme else {})
+            if wstore is not None:
+                scheme_kw["stream_store"] = wstore
             plan = structures.auto_swaps(model, run_once, verbose=True,
                                          **scheme_kw)
             statics = []
@@ -217,9 +224,7 @@ def main() -> int:
                      "format_race": plan.notes.get("format_race")}
         weights_receipt = None
         if sequential:
-            from flash_rt.structures.storage import WeightStore
-            weights_receipt = handle.consume(
-                WeightStore(checkpoint=str(args.checkpoint)))
+            weights_receipt = handle.consume(wstore)
         if statics:
             # the refresh rides the producer's forward: the captured
             # graph writes the banks from this call's own features

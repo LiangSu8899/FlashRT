@@ -201,6 +201,7 @@ def auto_swaps(
     max_samples: int | None = None,
     scheme: str | Any = "auto",
     verbose: bool = False,
+    stream_store: Any = None,
 ) -> AutoPlan:
     """Discover, calibrate in one pass, and bind every applicable seam.
 
@@ -656,6 +657,42 @@ def auto_swaps(
     # produced it. Bind the pair together, or leave both on BF16.
     plan = AutoPlan(seams=seams)
     plan._requested_structures = frozenset(structures)
+
+    # ---- per-seat streaming consumption (the bind-peak lever) ----
+    # With a weight store handed in, every leaf placement immediately
+    # moves the replaced original's truth off the device: the originals
+    # shrink as the quantized copies grow, and the bind peak stays near
+    # one model instead of two. Regions whose later stages still read
+    # host originals are excluded up front — the decoder_block seams
+    # compose from their children, and the cross-attention K/V
+    # projections serve the cadence banks — those wait for the
+    # attachment's own consume().
+    _stream_exclude: set[str] = set()
+    if stream_store is not None:
+        for _s in seams:
+            if _s.structure == "decoder_block":
+                _stream_exclude.add(_s.path)
+        from .impls.cadence_static.cross_attention import (
+            discover_cross_attention_kv as _discover_ckv)
+        for _cand in _discover_ckv(model):
+            _stream_exclude.add(_cand.path)
+
+    def _stream(placed) -> None:
+        if stream_store is None:
+            return
+        paths = placed if isinstance(placed, (list, tuple, set)) \
+            else [placed]
+        from .swap import resolve_parent as _rp, _get as _sg
+        for p in paths:
+            if any(p == e or p.startswith(e + ".")
+                   for e in _stream_exclude):
+                continue
+            try:
+                parent, attr = _rp(model, p)
+                stream_store.stash_module(p, _sg(parent, attr))
+            except (AttributeError, TypeError, ValueError):
+                continue
+        plan.notes["streamed_bytes"] = stream_store.stats["freed_bytes"]
     # ---- backbone attention interface: measured band decision. This
     # must precede every adapter that resolves the host's attention
     # registry into a closure (the rope routes, the vision pin), or a
@@ -699,6 +736,7 @@ def auto_swaps(
                     (f"{lay} [{c_slot} chain]", str(refusal)[:80]))
                 continue
             plan.swaps.update(pair)
+            _stream(list(pair))
             handled.update({_seam_key(p_seam), _seam_key(c_seam)})
             for chain in (
                 seam for seam in seams
@@ -732,8 +770,10 @@ def auto_swaps(
                 continue
             if isinstance(bound, dict):
                 plan.swaps.update(bound)
+                _stream(list(bound))
             else:
                 plan.swaps[seam.path] = bound
+                _stream(seam.path)
     # ---- qk_norm_rope: compose a packed QKV seam with host attention ----
     if "qk_norm_rope" in structures:
         from . import adapters as _adapters  # noqa: F401 (registers)
