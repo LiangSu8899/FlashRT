@@ -184,8 +184,9 @@ PYBIND11_MODULE(flash_rt_fa2, m) {
 
     // Causal sibling. Same signature as fwd_bf16 but applies a causal
     // mask inside FA2 (template Is_causal=true). Currently only
-    // head_dim=128 is built; calls with other head_dim abort with a
-    // clear message. Used by Qwen3-8B prefill (S=N causal self-attn).
+    // head_dim=128 is built; calls with other head_dim raise a
+    // RuntimeError with a clear message. Used by Qwen3-8B prefill
+    // (S=N causal self-attn).
     m.def("fwd_bf16_causal", make_fwd(&fvk_attention_fa2_fwd_bf16_causal),
         py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("O"), py::arg("softmax_lse"),
         py::arg("softmax_lse_accum") = 0, py::arg("o_accum") = 0,
