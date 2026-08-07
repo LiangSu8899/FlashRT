@@ -93,10 +93,21 @@ class AttachHandle:
                 serving += 1
                 continue
             freed += store.stash_module(path, original)
+        # the caching allocator keeps the bind-era blocks reserved;
+        # hand them back so co-tenant CUDA consumers see the space —
+        # only unused cached blocks are released, capture pools are
+        # private and untouched
+        returned = 0
+        if torch.cuda.is_available():
+            before = torch.cuda.memory_reserved()
+            torch.cuda.empty_cache()
+            returned = before - torch.cuda.memory_reserved()
         self.records = dict(self.records, consumed=dict(
-            store.stats, freed_bytes=freed, kept_serving=serving))
+            store.stats, freed_bytes=freed, kept_serving=serving,
+            cache_returned_bytes=returned))
         return {"consumed": True, "freed_bytes": freed,
                 "kept_serving": serving,
+                "cache_returned_bytes": returned,
                 "tiers": {"disk": store.stats["disk"],
                           "ram": store.stats["ram"]}}
 
