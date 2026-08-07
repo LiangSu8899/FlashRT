@@ -15,6 +15,10 @@ from .qwen3_vl import Qwen3VLGraphLoweringAdapter
 # by class name or version string.
 register_graph_lowering_adapter(Qwen3VLGraphLoweringAdapter())
 
+from .pi052_denoise import Pi05DenoiseGraphLoweringAdapter  # noqa: E402
+
+register_graph_lowering_adapter(Pi05DenoiseGraphLoweringAdapter())
+
 __all__ = [
     "GraphLowering",
     "GraphLoweringRefused",
