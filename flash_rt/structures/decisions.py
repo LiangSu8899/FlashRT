@@ -51,3 +51,30 @@ def record(band: str, winner: str, times_ms: dict) -> pathlib.Path:
     data[_key(band)] = {"winner": winner, "times_ms": times_ms}
     path.write_text(json.dumps(data, indent=1))
     return path
+
+
+def import_decisions(source: str) -> dict:
+    """Merge a decision file measured elsewhere into the local cache.
+
+    The peak-avoidance path for a memory-tight box: adjudicate on a
+    roomy machine of the same device fingerprint, ship the file, and
+    the tight box binds warm from its first run — the race (and its
+    peak) never happens there. Entries whose device fingerprint does
+    not match this box are carried along untouched (the cache is keyed
+    by device, so they are inert here and correct if the file travels
+    on). Local entries win on conflict: a number measured on this box
+    outranks an imported one. Returns a receipt of what was merged.
+    """
+    imported = json.loads(pathlib.Path(source).read_text())
+    path = _cache_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        local = json.loads(path.read_text())
+    except (OSError, ValueError):
+        local = {}
+    added = [k for k in imported if k not in local]
+    merged = dict(imported)
+    merged.update(local)
+    path.write_text(json.dumps(merged, indent=2))
+    return {"imported": len(added), "kept_local": len(local),
+            "entries": sorted(added)}

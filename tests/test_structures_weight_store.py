@@ -135,3 +135,18 @@ def test_mutated_weight_falls_to_ram_tier(tmp_path):
     assert store.stats["ram"] >= 1
     handle.detach()
     assert torch.equal(host.proj.weight, mutated)
+
+
+def test_decision_import_merges_and_local_wins(tmp_path, monkeypatch):
+    from flash_rt.structures import decisions
+
+    monkeypatch.setenv("FRT_DECISION_CACHE", str(tmp_path / "local.json"))
+    decisions.record("groot_dit", "fp8", {"fp8": 1.0})
+    key = decisions._key("groot_dit")
+    remote = {key: {"winner": "fp4", "times_ms": {"fp4": 0.5}},
+              "OtherBox|groot_dit": {"winner": "fp4", "times_ms": {}}}
+    src = tmp_path / "remote.json"
+    src.write_text(__import__("json").dumps(remote))
+    receipt = decisions.import_decisions(str(src))
+    assert receipt["imported"] == 1          # the foreign-device entry
+    assert decisions.lookup("groot_dit") == "fp8"   # local measurement wins
