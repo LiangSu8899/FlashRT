@@ -195,6 +195,7 @@ void residual_add_rms_norm_fp16(__half* residual, const __half* x,
                                  const __half* weight, __half* out,
                                  int seq_len, int dim, float eps,
                                  cudaStream_t stream = 0);
+#ifdef FLASHRT_ENABLE_CHAMELEON
 void rms_norm_int8_rowwise_fp16(const __half* x,
                                  const __half* weight,
                                  int8_t* out, float* scales,
@@ -206,3 +207,4 @@ void residual_add_rms_norm_int8_rowwise_fp16(
         int8_t* out, float* scales,
         int seq_len, int dim, float eps,
         cudaStream_t stream = 0);
+#endif  // FLASHRT_ENABLE_CHAMELEON

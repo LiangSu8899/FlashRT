@@ -327,9 +327,11 @@ void dequant_int32_to_bf16(const int32_t* input, __nv_bfloat16* output,
                            int n, cudaStream_t stream = 0);
 
 // FP16-input per-row INT8 quantize (FP16 sibling of quantize_int8_rowwise)
+#ifdef FLASHRT_ENABLE_CHAMELEON
 void quantize_int8_rowwise_fp16(const __half* input, int8_t* output,
                                  float* d_scales, int rows, int cols,
                                  cudaStream_t stream = 0);
+#endif  // FLASHRT_ENABLE_CHAMELEON
 
 // ---- Fused norm/activation + dynamic per-tensor FP8 quantize (FP16) ----
 // Measure the amax inside the norm/activation write pass (one fewer full

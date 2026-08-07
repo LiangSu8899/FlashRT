@@ -2870,6 +2870,7 @@ void residual_add_rms_norm_quantize_dynamic_fp8_fp16(
     quantize_fp8_kernel_generic<__half><<<blocks, threads, 0, stream>>>(xn_out, fp8_out, d_scale, n);
 }
 
+#ifdef FLASHRT_ENABLE_CHAMELEON
 // ── FP16-input per-row INT8 quantization ──
 // FP16 siblings of quantize_int8_rowwise (bf16). Skip the FP16→BF16 cast
 // a FP16-backbone model on Orin SM87 would otherwise pay before the bf16
@@ -3021,3 +3022,4 @@ void quantize_int8_rowwise_fp16(const __half* input, int8_t* output,
     quantize_int8_rowwise_fp16_kernel<<<rows, threads, 0, stream>>>(
         input, output, d_scales, rows, cols);
 }
+#endif  // FLASHRT_ENABLE_CHAMELEON

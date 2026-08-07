@@ -144,6 +144,7 @@ extern "C" int cutlass_int8_rowwise_bf16out(
 extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
     void const*, void const*, void const*, void const*, void*,
     int, int, int, cudaStream_t);
+#ifdef FLASHRT_ENABLE_CHAMELEON
 extern "C" int cutlass_int8_rowwise_fp16out(
     void const*, void const*, void const*, void const*, void*,
     int, int, int, cudaStream_t);
@@ -181,8 +182,10 @@ extern "C" void fht_int8_quant_fp16(
     const __half*, int8_t*, float*, int, int, cudaStream_t);
 extern "C" void fht128_int4_quant_bf16(
     const __nv_bfloat16*, uint8_t*, float*, int, int, cudaStream_t);
-#endif
+#endif  // FLASHRT_ENABLE_CHAMELEON
+#endif  // ENABLE_SM80_INT8_CUTLASS
 
+#ifdef FLASHRT_ENABLE_CHAMELEON
 // Fused QK-LayerNorm + rotate_half RoPE kernel.
 // Implementation: csrc/kernels/qk_norm_rope_fused.cu
 extern "C" void flash_rt_qk_norm_rope_fused_fp16(
@@ -203,6 +206,7 @@ extern "C" void flash_rt_awq_quant_fp8_static_fp16(
     const float* act_scale,
     long long M, int K,
     cudaStream_t stream);
+#endif  // FLASHRT_ENABLE_CHAMELEON
 
 #include "kernels/kernels.h"
 #include "kernels/fusion.cuh"
@@ -1707,20 +1711,32 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         clamp_inplace_fp16(reinterpret_cast<__half*>(x), limit, n, to_stream(stream));
     }, py::arg("x"), py::arg("limit"), py::arg("n"), py::arg("stream") = 0,
        "In-place symmetric clamp: x = min(max(x, -limit), +limit). "
-       "CUDA-Graph safe. Keeps FP16 activations in range before a "
-       "down_proj GEMM (Chameleon-7B L31).");
+       "CUDA-Graph safe. Generic fp16 activation-range guard.");
 
+#ifdef FLASHRT_ENABLE_CHAMELEON
     // Fused QK-LayerNorm + rotate_half RoPE, FP16, in-place on q/k.
     //   q, k       : [Se, NH*HD] FP16 (head-interleaved, in-place)
     //   q_w/q_b    : [HD] FP16 (per-head LayerNorm params, shared across heads)
     //   cos/sin    : [Se, HD] FP16 (rotate_half-tiled)
-    //   dim        : HD (must be ≤ 256 for the warp-only path)
+    //   dim        : HD — the RoPE writeback currently covers exactly the
+    //                Chameleon production shape dim=128; other dimensions are
+    //                rejected until the kernel genuinely supports them.
     m.def("qk_norm_rope_fused_fp16", [](uintptr_t q, uintptr_t k,
                                          uintptr_t q_weight, uintptr_t q_bias,
                                          uintptr_t k_weight, uintptr_t k_bias,
                                          uintptr_t cos_table, uintptr_t sin_table,
                                          int seq_len, int num_heads, int dim,
                                          float eps, uintptr_t stream) {
+        if (dim != 128)
+            throw py::value_error(
+                "qk_norm_rope_fused_fp16 currently supports dim==128 only, got "
+                + std::to_string(dim));
+        if (seq_len <= 0 || num_heads <= 0)
+            throw py::value_error(
+                "qk_norm_rope_fused_fp16 requires seq_len>0 and num_heads>0, got "
+                + std::to_string(seq_len) + ", " + std::to_string(num_heads));
+        if (!(eps > 0.f))
+            throw py::value_error("qk_norm_rope_fused_fp16 requires eps>0");
         flash_rt_qk_norm_rope_fused_fp16(
             reinterpret_cast<const __half*>(q),       reinterpret_cast<const __half*>(k),
             reinterpret_cast<const __half*>(q_weight), reinterpret_cast<const __half*>(q_bias),
@@ -1735,6 +1751,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
        py::arg("cos_table"), py::arg("sin_table"),
        py::arg("seq_len"), py::arg("num_heads"), py::arg("dim"),
        py::arg("eps") = 1e-5f, py::arg("stream") = 0);
+#endif  // FLASHRT_ENABLE_CHAMELEON
 
     m.def("gate_mul_residual_fp16",
           [](uintptr_t residual, uintptr_t x, uintptr_t gate,
@@ -3526,7 +3543,9 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("stream") = 0);
 
     // FP16 variant of awq_quant_fp8_static for FP16-backbone models
-    // (Chameleon-7B residual stream).
+    // (Chameleon-7B residual stream). Requires both the Motus FP8 gate
+    // and the Chameleon build option.
+#ifdef FLASHRT_ENABLE_CHAMELEON
     m.def("awq_quant_fp8_static_fp16",
         [](uintptr_t in_fp16, uintptr_t inv_s_fp16, uintptr_t out_fp8,
            uintptr_t act_scale, long long M, int K, uintptr_t stream) {
@@ -3541,6 +3560,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("out_fp8"), py::arg("act_scale"),
         py::arg("M"), py::arg("K"),
         py::arg("stream") = 0);
+#endif  // FLASHRT_ENABLE_CHAMELEON
 #endif  // FLASHRT_HAVE_MOTUS_VAE_FP8
 
     // Motus 205ms path bindings. These are the production fused kernels
@@ -8072,6 +8092,8 @@ graph-replay safe) to fill the SMs on long K. M in 1..16; N%8==0; K%64==0;
        py::arg("seq_len"), py::arg("dim"), py::arg("eps") = 1e-6f,
        py::arg("stream") = 0);
 
+#ifdef FLASHRT_ENABLE_CHAMELEON
+    // Chameleon-7B INT8 rowwise-per-token quantize with FP16 backbone.
     m.def("rms_norm_int8_rowwise_fp16", [](uintptr_t x, uintptr_t weight,
                                             uintptr_t out, uintptr_t scales,
                                             int seq_len, int dim, float eps,
@@ -8097,6 +8119,7 @@ graph-replay safe) to fill the SMs on long K. M in 1..16; N%8==0; K%64==0;
        py::arg("out"), py::arg("scales"),
        py::arg("seq_len"), py::arg("dim"), py::arg("eps") = 1e-6f,
        py::arg("stream") = 0);
+#endif  // FLASHRT_ENABLE_CHAMELEON
 
     m.def("bias_residual_layer_norm_bf16", [](uintptr_t residual, uintptr_t x,
                                                 uintptr_t bias_pre,
@@ -8168,12 +8191,14 @@ graph-replay safe) to fill the SMs on long K. M in 1..16; N%8==0; K%64==0;
                               reinterpret_cast<float*>(d_scales), rows, cols, to_stream(stream));
     }, py::arg("input"), py::arg("output"), py::arg("d_scales"), py::arg("rows"), py::arg("cols"), py::arg("stream") = 0);
 
+#ifdef FLASHRT_ENABLE_CHAMELEON
     m.def("quantize_int8_rowwise_fp16", [](uintptr_t input, uintptr_t output,
                                             uintptr_t d_scales, int rows, int cols,
                                             uintptr_t stream) {
         quantize_int8_rowwise_fp16(typed_ptr<__half>(input), typed_ptr<int8_t>(output),
                                     reinterpret_cast<float*>(d_scales), rows, cols, to_stream(stream));
     }, py::arg("input"), py::arg("output"), py::arg("d_scales"), py::arg("rows"), py::arg("cols"), py::arg("stream") = 0);
+#endif  // FLASHRT_ENABLE_CHAMELEON
 
     m.def("quantize_int8_rowwise_static", [](uintptr_t input, uintptr_t output,
                                               uintptr_t d_scales, int rows, int cols,
@@ -8227,14 +8252,19 @@ graph-replay safe) to fill the SMs on long K. M in 1..16; N%8==0; K%64==0;
           }, py::arg("A"), py::arg("B"), py::arg("act_scale"), py::arg("weight_scale"),
           py::arg("D"), py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0);
 
+#ifdef FLASHRT_ENABLE_CHAMELEON
+    // Chameleon-7B SM80/SM87 INT8/INT4 rowwise GEMM (fp16-out) + FHT/QuaRot
+    // rotation bindings. Gated on FLASHRT_ENABLE_CHAMELEON (outer guard) in
+    // addition to ENABLE_SM80_INT8_CUTLASS (inner guards below).
     m.def("cutlass_int8_rowwise_fp16out",
           [](uintptr_t A, uintptr_t B, uintptr_t act_scale, uintptr_t weight_scale,
              uintptr_t D, int M, int N, int K, uintptr_t stream) {
-#ifdef ENABLE_SM80_INT8_CUTLASS
+#if defined(ENABLE_SM80_INT8_CUTLASS) && defined(FLASHRT_ENABLE_CHAMELEON)
               return cutlass_int8_rowwise_fp16out(to_ptr(A), to_ptr(B), to_ptr(act_scale),
                   to_ptr(weight_scale), to_ptr(D), M, N, K, to_stream(stream));
 #else
-              throw std::runtime_error("cutlass_int8_rowwise_fp16out was not built");
+              throw std::runtime_error("cutlass_int8_rowwise_fp16out was not built "
+                  "(requires ENABLE_SM80_INT8_CUTLASS and FLASHRT_ENABLE_CHAMELEON)");
 #endif
           }, py::arg("A"), py::arg("B"), py::arg("act_scale"), py::arg("weight_scale"),
           py::arg("D"), py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0);
@@ -8242,11 +8272,12 @@ graph-replay safe) to fill the SMs on long K. M in 1..16; N%8==0; K%64==0;
     m.def("cutlass_int8_rowwise_fp16out_bias",
           [](uintptr_t A, uintptr_t B, uintptr_t act_scale, uintptr_t weight_scale,
              uintptr_t bias, uintptr_t D, int M, int N, int K, uintptr_t stream) {
-#ifdef ENABLE_SM80_INT8_CUTLASS
+#if defined(ENABLE_SM80_INT8_CUTLASS) && defined(FLASHRT_ENABLE_CHAMELEON)
               return cutlass_int8_rowwise_fp16out_bias(to_ptr(A), to_ptr(B), to_ptr(act_scale),
                   to_ptr(weight_scale), to_ptr(bias), to_ptr(D), M, N, K, to_stream(stream));
 #else
-              throw std::runtime_error("cutlass_int8_rowwise_fp16out_bias was not built");
+              throw std::runtime_error("cutlass_int8_rowwise_fp16out_bias was not built "
+                  "(requires ENABLE_SM80_INT8_CUTLASS and FLASHRT_ENABLE_CHAMELEON)");
 #endif
           }, py::arg("A"), py::arg("B"), py::arg("act_scale"), py::arg("weight_scale"),
           py::arg("bias"), py::arg("D"), py::arg("M"), py::arg("N"), py::arg("K"),
@@ -8255,11 +8286,12 @@ graph-replay safe) to fill the SMs on long K. M in 1..16; N%8==0; K%64==0;
     m.def("cutlass_int4_rowwise_fp16out",
           [](uintptr_t A, uintptr_t B, uintptr_t act_scale, uintptr_t weight_scale,
              uintptr_t D, int M, int N, int K, uintptr_t stream) {
-#ifdef ENABLE_SM80_INT8_CUTLASS
+#if defined(ENABLE_SM80_INT8_CUTLASS) && defined(FLASHRT_ENABLE_CHAMELEON)
               return cutlass_int4_rowwise_fp16out(to_ptr(A), to_ptr(B), to_ptr(act_scale),
                   to_ptr(weight_scale), to_ptr(D), M, N, K, to_stream(stream));
 #else
-              throw std::runtime_error("cutlass_int4_rowwise_fp16out was not built");
+              throw std::runtime_error("cutlass_int4_rowwise_fp16out was not built "
+                  "(requires ENABLE_SM80_INT8_CUTLASS and FLASHRT_ENABLE_CHAMELEON)");
 #endif
           }, py::arg("A"), py::arg("B"), py::arg("act_scale"), py::arg("weight_scale"),
           py::arg("D"), py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0);
@@ -8267,11 +8299,12 @@ graph-replay safe) to fill the SMs on long K. M in 1..16; N%8==0; K%64==0;
     m.def("cutlass_int4_rowwise_fp16out_bias",
           [](uintptr_t A, uintptr_t B, uintptr_t act_scale, uintptr_t weight_scale,
              uintptr_t bias, uintptr_t D, int M, int N, int K, uintptr_t stream) {
-#ifdef ENABLE_SM80_INT8_CUTLASS
+#if defined(ENABLE_SM80_INT8_CUTLASS) && defined(FLASHRT_ENABLE_CHAMELEON)
               return cutlass_int4_rowwise_fp16out_bias(to_ptr(A), to_ptr(B), to_ptr(act_scale),
                   to_ptr(weight_scale), to_ptr(bias), to_ptr(D), M, N, K, to_stream(stream));
 #else
-              throw std::runtime_error("cutlass_int4_rowwise_fp16out_bias was not built");
+              throw std::runtime_error("cutlass_int4_rowwise_fp16out_bias was not built "
+                  "(requires ENABLE_SM80_INT8_CUTLASS and FLASHRT_ENABLE_CHAMELEON)");
 #endif
           }, py::arg("A"), py::arg("B"), py::arg("act_scale"), py::arg("weight_scale"),
           py::arg("bias"), py::arg("D"), py::arg("M"), py::arg("N"), py::arg("K"),
@@ -8280,11 +8313,12 @@ graph-replay safe) to fill the SMs on long K. M in 1..16; N%8==0; K%64==0;
     m.def("cutlass_int4_rowwise_bf16out",
           [](uintptr_t A, uintptr_t B, uintptr_t act_scale, uintptr_t weight_scale,
              uintptr_t D, int M, int N, int K, uintptr_t stream) {
-#ifdef ENABLE_SM80_INT8_CUTLASS
+#if defined(ENABLE_SM80_INT8_CUTLASS) && defined(FLASHRT_ENABLE_CHAMELEON)
               return cutlass_int4_rowwise_bf16out(to_ptr(A), to_ptr(B), to_ptr(act_scale),
                   to_ptr(weight_scale), to_ptr(D), M, N, K, to_stream(stream));
 #else
-              throw std::runtime_error("cutlass_int4_rowwise_bf16out was not built");
+              throw std::runtime_error("cutlass_int4_rowwise_bf16out was not built "
+                  "(requires ENABLE_SM80_INT8_CUTLASS and FLASHRT_ENABLE_CHAMELEON)");
 #endif
           }, py::arg("A"), py::arg("B"), py::arg("act_scale"), py::arg("weight_scale"),
           py::arg("D"), py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0);
@@ -8292,11 +8326,12 @@ graph-replay safe) to fill the SMs on long K. M in 1..16; N%8==0; K%64==0;
     m.def("cutlass_int4_silu_gated_bf16out",
           [](uintptr_t act, uintptr_t up_w, uintptr_t act_s, uintptr_t wt_s,
              uintptr_t gate, uintptr_t D, int M, int N, int K, uintptr_t stream) {
-#ifdef ENABLE_SM80_INT8_CUTLASS
+#if defined(ENABLE_SM80_INT8_CUTLASS) && defined(FLASHRT_ENABLE_CHAMELEON)
               return cutlass_int4_silu_gated_bf16out(to_ptr(act), to_ptr(up_w), to_ptr(act_s),
                   to_ptr(wt_s), to_ptr(gate), to_ptr(D), M, N, K, to_stream(stream));
 #else
-              throw std::runtime_error("cutlass_int4_silu_gated_bf16out was not built");
+              throw std::runtime_error("cutlass_int4_silu_gated_bf16out was not built "
+                  "(requires ENABLE_SM80_INT8_CUTLASS and FLASHRT_ENABLE_CHAMELEON)");
 #endif
           }, py::arg("act"), py::arg("up_w"), py::arg("act_scale"), py::arg("wt_scale"),
              py::arg("gate_buf"), py::arg("D"), py::arg("M"), py::arg("N"), py::arg("K"),
@@ -8305,14 +8340,15 @@ graph-replay safe) to fill the SMs on long K. M in 1..16; N%8==0; K%64==0;
     m.def("residual_add_rms_norm_fht_int4_fp16",
           [](uintptr_t residual, uintptr_t x, uintptr_t weight, uintptr_t out,
              uintptr_t scales, int seq_len, int dim, float eps, uintptr_t stream) {
-#ifdef ENABLE_SM80_INT8_CUTLASS
+#if defined(ENABLE_SM80_INT8_CUTLASS) && defined(FLASHRT_ENABLE_CHAMELEON)
               residual_add_rms_norm_fht_int4_fp16(
                   typed_ptr<__half>(residual), typed_ptr<__half>(x),
                   typed_ptr<__half>(weight), typed_ptr<uint8_t>(out),
                   reinterpret_cast<float*>(scales), seq_len, dim, eps,
                   to_stream(stream));
 #else
-              throw std::runtime_error("residual_add_rms_norm_fht_int4_fp16 was not built");
+              throw std::runtime_error("residual_add_rms_norm_fht_int4_fp16 was not built "
+                  "(requires ENABLE_SM80_INT8_CUTLASS and FLASHRT_ENABLE_CHAMELEON)");
 #endif
           }, py::arg("residual"), py::arg("x"), py::arg("weight"), py::arg("out"),
           py::arg("scales"), py::arg("seq_len"), py::arg("dim"),
@@ -8321,13 +8357,14 @@ graph-replay safe) to fill the SMs on long K. M in 1..16; N%8==0; K%64==0;
     m.def("rms_norm_fht_int4_fp16",
           [](uintptr_t x, uintptr_t weight, uintptr_t out, uintptr_t scales,
              int seq_len, int dim, float eps, uintptr_t stream) {
-#ifdef ENABLE_SM80_INT8_CUTLASS
+#if defined(ENABLE_SM80_INT8_CUTLASS) && defined(FLASHRT_ENABLE_CHAMELEON)
               rms_norm_fht_int4_fp16(
                   typed_ptr<__half>(x), typed_ptr<__half>(weight),
                   typed_ptr<uint8_t>(out), reinterpret_cast<float*>(scales),
                   seq_len, dim, eps, to_stream(stream));
 #else
-              throw std::runtime_error("rms_norm_fht_int4_fp16 was not built");
+              throw std::runtime_error("rms_norm_fht_int4_fp16 was not built "
+                  "(requires ENABLE_SM80_INT8_CUTLASS and FLASHRT_ENABLE_CHAMELEON)");
 #endif
           }, py::arg("x"), py::arg("weight"), py::arg("out"), py::arg("scales"),
           py::arg("seq_len"), py::arg("dim"), py::arg("eps") = 1e-5f,
@@ -8336,13 +8373,14 @@ graph-replay safe) to fill the SMs on long K. M in 1..16; N%8==0; K%64==0;
     m.def("fht_int4_quant_fp16",
           [](uintptr_t x, uintptr_t out, uintptr_t scales,
              int seq_len, int dim, uintptr_t stream) {
-#ifdef ENABLE_SM80_INT8_CUTLASS
+#if defined(ENABLE_SM80_INT8_CUTLASS) && defined(FLASHRT_ENABLE_CHAMELEON)
               fht_int4_quant_fp16(
                   typed_ptr<__half>(x), typed_ptr<uint8_t>(out),
                   reinterpret_cast<float*>(scales), seq_len, dim,
                   to_stream(stream));
 #else
-              throw std::runtime_error("fht_int4_quant_fp16 was not built");
+              throw std::runtime_error("fht_int4_quant_fp16 was not built "
+                  "(requires ENABLE_SM80_INT8_CUTLASS and FLASHRT_ENABLE_CHAMELEON)");
 #endif
           }, py::arg("x"), py::arg("out"), py::arg("scales"),
           py::arg("seq_len"), py::arg("dim"), py::arg("stream") = 0);
@@ -8355,14 +8393,15 @@ graph-replay safe) to fill the SMs on long K. M in 1..16; N%8==0; K%64==0;
     m.def("residual_add_rms_norm_fht_int8_fp16",
           [](uintptr_t residual, uintptr_t x, uintptr_t weight, uintptr_t out,
              uintptr_t scales, int seq_len, int dim, float eps, uintptr_t stream) {
-#ifdef ENABLE_SM80_INT8_CUTLASS
+#if defined(ENABLE_SM80_INT8_CUTLASS) && defined(FLASHRT_ENABLE_CHAMELEON)
               residual_add_rms_norm_fht_int8_fp16(
                   typed_ptr<__half>(residual), typed_ptr<__half>(x),
                   typed_ptr<__half>(weight), typed_ptr<int8_t>(out),
                   reinterpret_cast<float*>(scales), seq_len, dim, eps,
                   to_stream(stream));
 #else
-              throw std::runtime_error("residual_add_rms_norm_fht_int8_fp16 was not built");
+              throw std::runtime_error("residual_add_rms_norm_fht_int8_fp16 was not built "
+                  "(requires ENABLE_SM80_INT8_CUTLASS and FLASHRT_ENABLE_CHAMELEON)");
 #endif
           }, py::arg("residual"), py::arg("x"), py::arg("weight"), py::arg("out"),
           py::arg("scales"), py::arg("seq_len"), py::arg("dim"),
@@ -8371,13 +8410,14 @@ graph-replay safe) to fill the SMs on long K. M in 1..16; N%8==0; K%64==0;
     m.def("rms_norm_fht_int8_fp16",
           [](uintptr_t x, uintptr_t weight, uintptr_t out, uintptr_t scales,
              int seq_len, int dim, float eps, uintptr_t stream) {
-#ifdef ENABLE_SM80_INT8_CUTLASS
+#if defined(ENABLE_SM80_INT8_CUTLASS) && defined(FLASHRT_ENABLE_CHAMELEON)
               rms_norm_fht_int8_fp16(
                   typed_ptr<__half>(x), typed_ptr<__half>(weight),
                   typed_ptr<int8_t>(out), reinterpret_cast<float*>(scales),
                   seq_len, dim, eps, to_stream(stream));
 #else
-              throw std::runtime_error("rms_norm_fht_int8_fp16 was not built");
+              throw std::runtime_error("rms_norm_fht_int8_fp16 was not built "
+                  "(requires ENABLE_SM80_INT8_CUTLASS and FLASHRT_ENABLE_CHAMELEON)");
 #endif
           }, py::arg("x"), py::arg("weight"), py::arg("out"), py::arg("scales"),
           py::arg("seq_len"), py::arg("dim"), py::arg("eps") = 1e-5f,
@@ -8386,13 +8426,14 @@ graph-replay safe) to fill the SMs on long K. M in 1..16; N%8==0; K%64==0;
     m.def("fht_int8_quant_fp16",
           [](uintptr_t x, uintptr_t out, uintptr_t scales,
              int seq_len, int dim, uintptr_t stream) {
-#ifdef ENABLE_SM80_INT8_CUTLASS
+#if defined(ENABLE_SM80_INT8_CUTLASS) && defined(FLASHRT_ENABLE_CHAMELEON)
               fht_int8_quant_fp16(
                   typed_ptr<__half>(x), typed_ptr<int8_t>(out),
                   reinterpret_cast<float*>(scales), seq_len, dim,
                   to_stream(stream));
 #else
-              throw std::runtime_error("fht_int8_quant_fp16 was not built");
+              throw std::runtime_error("fht_int8_quant_fp16 was not built "
+                  "(requires ENABLE_SM80_INT8_CUTLASS and FLASHRT_ENABLE_CHAMELEON)");
 #endif
           }, py::arg("x"), py::arg("out"), py::arg("scales"),
           py::arg("seq_len"), py::arg("dim"), py::arg("stream") = 0);
@@ -8400,16 +8441,18 @@ graph-replay safe) to fill the SMs on long K. M in 1..16; N%8==0; K%64==0;
     m.def("fht128_int4_quant_bf16",
           [](uintptr_t x, uintptr_t out, uintptr_t scales,
              int seq_len, int dim, uintptr_t stream) {
-#ifdef ENABLE_SM80_INT8_CUTLASS
+#if defined(ENABLE_SM80_INT8_CUTLASS) && defined(FLASHRT_ENABLE_CHAMELEON)
               fht128_int4_quant_bf16(
                   typed_ptr<__nv_bfloat16>(x), typed_ptr<uint8_t>(out),
                   reinterpret_cast<float*>(scales), seq_len, dim,
                   to_stream(stream));
 #else
-              throw std::runtime_error("fht128_int4_quant_bf16 was not built");
+              throw std::runtime_error("fht128_int4_quant_bf16 was not built "
+                  "(requires ENABLE_SM80_INT8_CUTLASS and FLASHRT_ENABLE_CHAMELEON)");
 #endif
           }, py::arg("x"), py::arg("out"), py::arg("scales"),
           py::arg("seq_len"), py::arg("dim"), py::arg("stream") = 0);
+#endif  // FLASHRT_ENABLE_CHAMELEON
 
 
 #ifdef ENABLE_MOTUS

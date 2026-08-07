@@ -1512,6 +1512,7 @@ void residual_add_rms_norm_fp16(__half* residual, const __half* x,
         residual, x, weight, out, dim, eps);
 }
 
+#ifdef FLASHRT_ENABLE_CHAMELEON
 // ── FP16 variants of the INT8-rowwise fused norms ──
 // Same math as the bf16 kernels above, reading/writing FP16 residual
 // streams (FP16-backbone models on Orin SM87).
@@ -1622,3 +1623,4 @@ void residual_add_rms_norm_int8_rowwise_fp16(
     residual_add_rms_norm_int8_rowwise_fp16_kernel<<<seq_len, 256, smem, stream>>>(
         residual, x, weight, out, scales, seq_len, dim, eps);
 }
+#endif  // FLASHRT_ENABLE_CHAMELEON
