@@ -197,6 +197,105 @@ def _seam_key(seam: Seam) -> str:
     return seam.path
 
 
+def _race_ms(fn, *, warmup: int = 3, iters: int = 10) -> float:
+    with torch.no_grad():
+        for _ in range(warmup):
+            fn()
+        torch.cuda.synchronize()
+        start = torch.cuda.Event(True)
+        end = torch.cuda.Event(True)
+        start.record()
+        for _ in range(iters):
+            fn()
+        end.record()
+        torch.cuda.synchronize()
+    return start.elapsed_time(end) / iters
+
+
+def _pair_vision_norm_fp8(model, plan, points, stream) -> None:
+    """Seat an FP8-emitting norm producer where its FFN seat consumes.
+
+    Seat-to-seat only — the measured lesson stands: a *host* handed
+    FP8 keeps going and the output is silent garbage, so the producer
+    is created here, paired with the FFN seat as its direct consumer,
+    and nowhere else. Both forms quantize at the same static scale, so
+    the pair's smoke against the bf16 form isolates wiring breakage
+    rather than calibration; the flip itself is decided by a bind-time
+    measurement (the flip-only-if-faster house rule) and recorded next
+    to the other format races.
+    """
+    import dataclasses
+    from .impls import KernelUnavailable
+    from .impls.vision_ffn import fp8_static as vis_impl
+
+    for seam in plan.seams:
+        if seam.structure != "vision_ffn" \
+                or not getattr(seam, "norm_attr", None):
+            continue
+        seat = plan.swaps.get(seam.path)
+        if not isinstance(seat, vis_impl.FusedGeluMlp):
+            continue
+        bound = seat._bound
+        if bound.in_dtype != "bf16" or not bound.fc1_fp8.is_cuda:
+            continue
+        norm_path = (f"{seam.parent_path}.{seam.norm_attr}"
+                     if seam.parent_path else seam.norm_attr)
+        try:
+            host_norm = model.get_submodule(norm_path)
+        except AttributeError:
+            continue
+        try:
+            from .impls.norm_fused.fp8_producer import (
+                bind_norm_fp8_producer)
+            producer = bind_norm_fp8_producer(host_norm,
+                                              bound.input_scale)
+            kern = vis_impl._kernel()
+            twin = vis_impl.FusedGeluMlp(
+                dataclasses.replace(
+                    bound, in_dtype="fp8_static",
+                    fused_mlp=(getattr(kern, "fp8_gelu_mlp_v2_bf16",
+                                       None)
+                               or kern.fp8_gelu_mlp_bf16)),
+                original=seat._frt_host())
+        except (KernelUnavailable, ValueError,
+                RuntimeError) as refusal:
+            plan.notes.setdefault("refused", []).append(
+                (f"{norm_path}::norm_fp8_producer",
+                 str(refusal)[:200]))
+            continue
+        rows_seen = points.row_profile(seam.path, "x_after_norm")
+        rows = rows_seen[len(rows_seen) // 2] if rows_seen else 128
+        dim = int(host_norm.weight.shape[0])
+        dev = producer.w.device
+        x = torch.randn(rows, dim, device=dev, dtype=torch.bfloat16)
+        current_norm = plan.swaps.get(norm_path)
+        norm_a = current_norm if current_norm is not None else host_norm
+        with torch.no_grad():
+            ref = seat(norm_a(x).to(torch.bfloat16))
+            got = twin(producer(x))
+            cos = torch.nn.functional.cosine_similarity(
+                got.float().flatten(), ref.float().flatten(), dim=0)
+        if float(cos) < 0.98:
+            plan.notes.setdefault("refused", []).append(
+                (f"{norm_path}::norm_fp8_producer",
+                 f"pair smoke cos {float(cos):.6f} < 0.98"))
+            continue
+        ms_a = _race_ms(lambda: seat(norm_a(x).to(torch.bfloat16)))
+        ms_b = _race_ms(lambda: twin(producer(x)))
+        plan.notes.setdefault("format_race", []).append(
+            {"layer": norm_path, "rows": rows, "dim": dim,
+             "bf16_chain_ms": round(ms_a, 4),
+             "fp8_norm_chain_ms": round(ms_b, 4),
+             "smoke_cos": round(float(cos), 6),
+             "winner": ("fp8_norm_chain" if ms_b < ms_a
+                        else "bf16_chain")})
+        if ms_b >= ms_a:
+            continue
+        plan.swaps[seam.path] = twin
+        plan.swaps[norm_path] = producer
+        stream(norm_path)
+
+
 def _bind_regions(model, seams, *, probe, say):
     """Resolve and bind every registered region family on this host.
 
@@ -883,6 +982,14 @@ def auto_swaps(
             else:
                 plan.swaps[seam.path] = bound
                 _stream(seam.path)
+    # ---- pre-FFN norm → FP8 producer pairs (seat-to-seat only) ----
+    # The norm's sole consumer is the FFN seat, so the pair moves the
+    # FFN's input quantize into the norm kernel. Both ends are seats
+    # (the FP8_ONLY guard refuses anything else between them), the
+    # smoke compares the pair against the bf16 form it would replace,
+    # and the flip happens only when the measured chain is faster.
+    _pair_vision_norm_fp8(model, plan, collector, _stream)
+
     # ---- streaming window: the later stages record through the model,
     # and the streamed originals are meta now — so the bound seats stand
     # in for them for the duration. Temporarily attached with plain
