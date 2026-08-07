@@ -182,10 +182,19 @@ def _build(weights, input_scale, hidden_scale, eps, variant=None):
     fc1_scale = _amax_scale(weights["w_fc1"])
     fc2_scale = _amax_scale(weights["w_fc2"])
     to_bf16 = lambda t: t.to(torch.bfloat16)
+    # capability probe: the v2 entries carry the down bias in the GEMM
+    # epilogue (one launch and one full output write fewer). Prefer
+    # them when the installed package ships them; absence is a
+    # fallback, never a refusal.
+    kern = _kernel()
+    if variant.get("in_dtype") == "fp8_static":
+        fused = (getattr(kern, "fp8_gelu_mlp_v2_bf16", None)
+                 or kern.fp8_gelu_mlp_bf16)
+    else:
+        fused = (getattr(kern, "bf16_fp8_gelu_mlp_v2_bf16", None)
+                 or kern.bf16_fp8_gelu_mlp_bf16)
     return BoundVisionFfnFp8(
-        fused_mlp=(_kernel().fp8_gelu_mlp_bf16
-                   if variant.get("in_dtype") == "fp8_static"
-                   else _kernel().bf16_fp8_gelu_mlp_bf16),
+        fused_mlp=fused,
         in_dtype=variant.get("in_dtype", "bf16"),
         w_norm=weights["w_norm"],
         b_norm=weights["b_norm"],

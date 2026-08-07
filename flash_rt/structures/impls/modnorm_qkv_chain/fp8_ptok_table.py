@@ -271,7 +271,8 @@ def bind_block_seam(model, seam, *, points):
     wrapper = PerTokenModChainBlock(
         block, wires, scales, ffn_state,
         producer_pkg.ada_layer_norm_quant_fp8_ptok_table_bf16,
-        ffn_pkg.fp8_gelu_mlp_bf16, table, eps)
+        (getattr(ffn_pkg, "fp8_gelu_mlp_v2_bf16", None)
+         or ffn_pkg.fp8_gelu_mlp_bf16), table, eps)
 
     # bind-time smoke: both producer sites launch once on zeros before
     # the seam is handed out
