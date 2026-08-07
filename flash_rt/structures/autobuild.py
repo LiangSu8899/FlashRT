@@ -823,9 +823,16 @@ def auto_swaps(
         # ---- qk_norm_rope: compose a packed QKV seam with host attention ----
         if "qk_norm_rope" in structures:
             from . import adapters as _adapters  # noqa: F401 (registers)
+            import inspect as _inspect
+            _probe0 = (forward if callable(forward)
+                       else (forward[0] if forward else None))
             for adapter in _QK_NORM_ROPE_ADAPTERS:
                 try:
-                    result = adapter(model, plan)
+                    if "probe" in _inspect.signature(
+                            adapter.__call__).parameters:
+                        result = adapter(model, plan, probe=_probe0)
+                    else:
+                        result = adapter(model, plan)
                 except (ValueError, RuntimeError) as refusal:
                     plan.notes.setdefault("refused", []).append(
                         ("qk_norm_rope", str(refusal)[:200]))

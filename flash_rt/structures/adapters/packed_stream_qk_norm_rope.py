@@ -60,7 +60,9 @@ class PackedStreamQkNormRopeAdapter:
 
     __name__ = "packed_stream_qk_norm_rope"
 
-    def __call__(self, model, plan):
+    SMOKE_FLOOR = 0.99
+
+    def __call__(self, model, plan, probe=None):
         routes = []
         observed = {}
         refused = []
@@ -129,13 +131,14 @@ class PackedStreamQkNormRopeAdapter:
             state = {"perm": None, "inv": None, "r": None}
 
             def lazy_permute(rotary_dim: int, _pack=pack, _bound=bound,
-                             _state=state, _heads=heads, _qw=q_w, _kw=k_w):
+                             _state=state, _heads=heads, _qw=q_w,
+                             _kw=k_w, _site=site):
                 if (torch.cuda.is_available()
                         and torch.cuda.is_current_stream_capturing()):
                     raise GuardRefused(
-                        "qk_norm_rope: the rotary permutation warms up on "
-                        "the first eager call — run one eager forward "
-                        "before capturing")
+                        f"qk_norm_rope[{_site}]: the rotary permutation "
+                        "warms up on the first eager call — run one eager "
+                        "forward before capturing")
                 if rotary_dim % 2 or rotary_dim > 128:
                     raise GuardRefused(
                         "qk_norm_rope: rotary width must be even and "
@@ -176,13 +179,14 @@ class PackedStreamQkNormRopeAdapter:
                     _bound.k_norm_weight.copy_(
                         _kw.detach().to(dev, torch.bfloat16)[pdev])
 
-            def remap_tables(cos, sin, _state=state):
+            def remap_tables(cos, sin, _state=state, _site=site):
                 r = cos.shape[-1]
                 if _state["r"] is None:
                     lazy_permute(r)
                 elif _state["r"] != r:
                     raise GuardRefused(
-                        "qk_norm_rope: rotary width changed after binding")
+                        f"qk_norm_rope[{_site}]: rotary width changed "
+                        "after binding")
                 if r == 128:
                     return cos, sin
                 half = r // 2
@@ -253,6 +257,75 @@ class PackedStreamQkNormRopeAdapter:
                            types.MethodType(routed, module), original,
                            had_instance_forward))
             observed[f"{path}::per_head_qk_norm_rope"] = bound
+
+        if probe is not None and routes:
+            # the routed form consumes jointly: open the joint reads for
+            # the audition, close them again for whoever is not kept
+            for _m, _p, _s2, _f, _o, _h in routes:
+                _p.enable_joint(3)
+            verdicts: dict[int, tuple] = {}
+            hooks = []
+            for idx, (module, _pack_m, _st, routed_fn, _orig, _hd) in \
+                    enumerate(routes):
+                def check(mod, args, kwargs, output, _i=idx,
+                          _fn=routed_fn):
+                    if _i in verdicts:
+                        return None
+                    try:
+                        got = _fn(*args, **kwargs)
+                        ref = output.float().flatten()
+                        cos = torch.nn.functional.cosine_similarity(
+                            got.float().flatten(), ref, dim=0)
+                        verdicts[_i] = (float(cos), None)
+                    except Exception as exc:   # noqa: BLE001 — verdict
+                        verdicts[_i] = (None, f"{type(exc).__name__}: "
+                                        f"{exc}")
+                    return None
+                hooks.append(module.register_forward_hook(
+                    check, with_kwargs=True))
+            try:
+                with torch.inference_mode():
+                    probe()
+            finally:
+                for h in hooks:
+                    h.remove()
+            kept = []
+            for idx, route in enumerate(routes):
+                module, _p, st, _fn, _o, _h = route
+                path = next(p for p, m in model.named_modules()
+                            if m is module)
+                cos, err = verdicts.get(idx, (None, "never called by "
+                                              "the probe forward"))
+                if err is not None:
+                    refused.append((f"{path}::packed_stream_qk_norm_rope",
+                                    f"qk_norm_rope smoke failed: {err}"))
+                    continue
+                if cos < self.SMOKE_FLOOR:
+                    refused.append((f"{path}::packed_stream_qk_norm_rope",
+                                    f"qk_norm_rope smoke cos {cos:.6f} "
+                                    f"< {self.SMOKE_FLOOR} on the "
+                                    "probe input"))
+                    continue
+                for key, b in observed.items():
+                    if key.startswith(path + "::"):
+                        b._frt_guard.notes["smoke_cos"] = round(cos, 6)
+                        b._frt_guard.notes["rotary_r"] = st.get("r")
+                kept.append(route)
+            for route in routes:
+                if route not in kept:
+                    route[1].disable_joint()
+                    # the failed audition bumped the stash epoch with a
+                    # joint (stash-skipping) run; clear it so the host
+                    # form's next sibling read is not falsely refused
+                    route[1]._stash_epoch = 0
+            dropped = {id(r[0]) for r in routes} - {id(r[0])
+                                                    for r in kept}
+            if dropped:
+                observed = {k: v for k, v in observed.items()
+                            if not any(k.startswith(p + "::")
+                                       for p, m in model.named_modules()
+                                       if id(m) in dropped)}
+            routes = kept
 
         if not routes:
             return {"refused": refused} if refused else None
