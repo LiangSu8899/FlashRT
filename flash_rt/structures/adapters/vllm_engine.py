@@ -64,12 +64,13 @@ _SEATS_BY_IDX: dict[int, Any] = {}
 @torch.library.custom_op("flash_rt_structures::vllm_moe_seat",
                          mutates_args=())
 def _vllm_moe_seat_op(hidden: torch.Tensor, router_logits: torch.Tensor,
+                      top_idx: torch.Tensor, top_w: torch.Tensor,
                       idx: int) -> torch.Tensor:
-    return _SEATS_BY_IDX[idx].run(hidden, router_logits)
+    return _SEATS_BY_IDX[idx].run(hidden, router_logits, top_idx, top_w)
 
 
 @_vllm_moe_seat_op.register_fake
-def _(hidden, router_logits, idx):
+def _(hidden, router_logits, top_idx, top_w, idx):
     return torch.empty_like(hidden)
 
 
@@ -105,22 +106,26 @@ class _MoESeat(nn.Module):
         self.idx = len(_SEATS_BY_IDX)
         _SEATS_BY_IDX[self.idx] = self
 
-    def run(self, hidden_states, router_logits):
+    def run(self, hidden_states, router_logits, top_idx, top_w):
         if hidden_states.shape[0] > self.BAND_T and self.host is not None:
             logits = (hidden_states if self.host_internal else router_logits)
             return self.host(hidden_states=hidden_states,
                              router_logits=logits)
-        w = torch.softmax(router_logits.float(), dim=-1)
-        tw, ti = torch.topk(w, self.top_k, dim=-1)
-        if self.renormalize:
-            tw = tw / tw.sum(dim=-1, keepdim=True)
-        out = self.seam(hidden_states, ti, tw)
+        out = self.seam(hidden_states, top_idx, top_w)
         if self.shared is not None:
             out = out + self.shared(hidden_states)
         return out.to(hidden_states.dtype)
 
     def forward(self, hidden_states, router_logits):
-        return _vllm_moe_seat_op(hidden_states, router_logits, self.idx)
+        # routing stays in the traced region so inductor fuses the
+        # softmax/topk/renormalize chain; the opaque op keeps only what
+        # tracing would freeze — the band branch and the bank walk
+        w = torch.softmax(router_logits.float(), dim=-1)
+        tw, ti = torch.topk(w, self.top_k, dim=-1)
+        if self.renormalize:
+            tw = tw / tw.sum(dim=-1, keepdim=True)
+        return _vllm_moe_seat_op(hidden_states, router_logits, ti, tw,
+                                 self.idx)
 
 
 class _SlabbedHeadMethod:
