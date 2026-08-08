@@ -233,6 +233,8 @@ def _alloc(bound) -> None:
     b["seqused"] = torch.full((1,), bound.s_used, device=dev,
                               dtype=torch.int32)
     b["ones_w"] = torch.ones(D, device=dev, dtype=bf)
+    b["out_full"] = torch.zeros(bound.dims["seq_full"], D, device=dev,
+                                dtype=bf)
     b["att"] = torch.empty(1, S, nh, hd, device=dev, dtype=bf)
 
 
@@ -257,9 +259,11 @@ def _make_run(bound: BoundPrefillFp8Chain):
 
     rf = torch.profiler.record_function
 
+    S_full = bound.dims["seq_full"]
+
     def run(x2d, pkv):
         res = b["res"]
-        res.copy_(x2d)
+        res.copy_(x2d[:S])
         for l in range(L):
             e = table[l]
             if l == 0:
@@ -302,9 +306,10 @@ def _make_run(bound: BoundPrefillFp8Chain):
         fin = res.float()
         fin = fin * torch.rsqrt(fin.square().mean(-1, keepdim=True)
                                 + eps)
-        out = (fin * bound.final_w).to(torch.bfloat16)
-        return bound.out_ctor(last_hidden_state=out.view(1, S, D),
-                              past_key_values=pkv)
+        b["out_full"][:S] = (fin * bound.final_w).to(torch.bfloat16)
+        return bound.out_ctor(
+            last_hidden_state=b["out_full"].view(1, S_full, D),
+            past_key_values=pkv)
 
     return run
 
@@ -464,7 +469,8 @@ def bind_prefill_fp8_chain(model, root: str,
                            f"site(s) {dead[:6]} of {len(dead)}; "
                            f"sample={ {k: amax[k] for k in list(amax)[:4]} }"}
 
-    bound.dims["seq"] = S
+    bound.dims["seq"] = s_used
+    bound.dims["seq_full"] = S
     bound.s_used = s_used
     bound.out_ctor = first["out_type"]
     bound.cache_type = first["cache_type"]

@@ -594,9 +594,10 @@ def bind_adarms_fp8_chain(model, root: str,
                 continue
             st = torch.addmm(bound.style_b, cnd, bound.style_w_t)
             step_conds.append(cnd)
+            # rows=1 broadcast: the norm kernels accept a single
+            # style row, so the table stays one row per norm
             style_tables.append(
                 st.view(n_norms, 1, 3 * dim)
-                  .expand(n_norms, S, 3 * dim)
                   .to(torch.bfloat16).contiguous())
             fin_tables.append(
                 st[0, (n_norms - 1) * 3 * dim:].view(3, dim).clone())
