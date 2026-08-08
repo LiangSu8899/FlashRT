@@ -318,9 +318,11 @@ def _bind_regions(model, seams, *, probe, say):
     from .impls.dit_stack import region as _dit_region
     from .impls.adarms_stack import region as _adarms_region
     from .impls.prefill_tower import region as _prefill_region
+    from .impls.vision_tower import region as _vision_region
     _dit_region.register()
     _adarms_region.register()
     _prefill_region.register()
+    _vision_region.register()
 
     notes: dict = {}
     extras = {"seams": list(seams), "observed": {}, "revert": [],
