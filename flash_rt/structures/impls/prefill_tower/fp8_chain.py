@@ -289,11 +289,9 @@ def _make_run(bound: BoundPrefillFp8Chain):
             kn.rms_norm_quant_fp8_static_bf16(
                 res, b["ones_w"], e["sc_gu"], eps, out=b["xn8"])
             gemm(e, "gu", b["xn8"], b["gu"])
-            hid = torch.nn.functional.gelu(
-                b["gu"][:, :H].float(), approximate="tanh") \
-                * b["gu"][:, H:].float()
-            h8 = (hid * e["inv_dn"]).clamp(-FP8_MAX, FP8_MAX).to(fp8)
-            gemm(e, "dn", h8, b["fg"])
+            kf.gate_geglu_merged_quant_fp8_static_bf16(
+                b["gu"], e["t_sc_dn"], out=b["hid8"])
+            gemm(e, "dn", b["hid8"], b["fg"])
             if l < L - 1:
                 nxt = table[l + 1]
                 kn.residual_add_rms_norm_quant_fp8_static_bf16(
