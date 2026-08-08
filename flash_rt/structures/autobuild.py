@@ -316,7 +316,9 @@ def _bind_regions(model, seams, *, probe, say):
     """
     from . import regions
     from .impls.dit_stack import region as _dit_region
+    from .impls.adarms_stack import region as _adarms_region
     _dit_region.register()
+    _adarms_region.register()
 
     notes: dict = {}
     extras = {"seams": list(seams), "observed": {}, "revert": [],

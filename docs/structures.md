@@ -504,6 +504,20 @@ maximum host replacement: it pins winners and claims regions
 discovery refuses, over the same candidate set — so anything it
 proves, the automatic tier inherits through the cache.
 
+Inside a candidate, an element the hosts disagree about — the
+attention entry is the recurring case — is a *ladder*, not a device
+branch: rungs in preference order, each resolved by loading its
+package and running one functional probe at the bound shapes during
+bind. The first rung that executes serves; the ones that fell through
+land on the guard's notes. The same candidate then binds its best
+form on every host without naming any device, and the receipts stay
+comparable because the measured thing is still the one candidate.
+Both shipped families follow this file layout: `region.py` holds the
+structural identifier and the `RegionFamily`, the chain module holds
+the candidate — `dit_stack/` (a DiT block stack, NVFP4 chain) and
+`adarms_stack/` (a conditioned-norm decoder tower over a cached
+prefix, static-FP8 chain with the FA4/FA2 attention ladder).
+
 **A quantisation scheme**: register an instance in `schemes.py` — two
 methods and nothing else. `statistics` declares what each calibration
 point needs (statistic and granularity: per-tensor, per-channel,

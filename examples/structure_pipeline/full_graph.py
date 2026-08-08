@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import statistics
 import types
 from pathlib import Path
@@ -239,6 +240,38 @@ def main() -> int:
             torch.compile(hot, mode="max-autotune-no-cudagraphs",
                           fullgraph=False),
             model=model, warmup=8, gate_cos=0, min_speedup=0)
+
+        if os.environ.get("FRT_KPROFILE"):
+            # kernel census of the bound form: eager names every chain
+            # kernel; the replay table shows what capture actually runs
+            from torch.profiler import ProfilerActivity, profile
+
+            def _t(row):
+                return getattr(row, "self_device_time_total",
+                               getattr(row, "self_cuda_time_total", 0.0))
+
+            def census(label, fn):
+                for _ in range(3):
+                    fn()
+                torch.cuda.synchronize()
+                with profile(activities=[ProfilerActivity.CUDA]) as prof:
+                    for _ in range(3):
+                        fn()
+                    torch.cuda.synchronize()
+                rows = prof.key_averages()
+                print(f"=== KPROFILE {label} ===", flush=True)
+                print(rows.table(sort_by="self_cuda_time_total",
+                                 row_limit=100), flush=True)
+                print(f"KTOTAL {label} {sum(_t(r) for r in rows) / 3:.1f}"
+                      "us per call", flush=True)
+
+            def eager_hot():
+                with torch.inference_mode():
+                    hot()
+
+            census("eager", eager_hot)
+            census("replay", treated.replay)
+            return 0
 
         if sequential:
             if torch.cuda.is_available():
