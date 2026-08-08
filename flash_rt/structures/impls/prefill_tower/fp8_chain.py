@@ -41,6 +41,29 @@ ROPE_SYMBOLS = ("qkv_split_rope_kvcache_bf16",)
 
 SMOKE_FLOOR = 0.985
 
+#: transition rung (author-gated): a native kernel module whose
+#: cutlass_fp8_*_bf16out entries serve the rows the hub entry refuses.
+#: Test-only — the hub rung wins the moment its package covers the
+#: band, with no code change here.
+FVK_SO_ENV = "FRT_FVK_SO"
+_FVK_SITE = {"qkv": "cutlass_fp8_sq_bf16out",
+             "o": "cutlass_fp8_sq_bf16out",
+             "gu": "cutlass_fp8_t1_bf16out",
+             "dn": "cutlass_fp8_wide_bf16out"}
+
+
+def _load_fvk():
+    import importlib.util
+    import os
+    so = os.environ.get(FVK_SO_ENV)
+    if not so or not os.path.exists(so):
+        return None
+    spec = importlib.util.spec_from_file_location(
+        "flash_rt_kernels", so)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
 
 def missing_symbols() -> list[str]:
     gaps: list[str] = []
@@ -209,6 +232,8 @@ def _make_run(bound: BoundPrefillFp8Chain):
     kperm_inv = bound.kperm_inv
     kh = b["kc"][0].view(S, hd)
 
+    gemm = bound.kernels["gemm"]
+
     def run(x2d, pkv):
         res = b["res"]
         res.copy_(x2d)
@@ -217,8 +242,7 @@ def _make_run(bound: BoundPrefillFp8Chain):
             if l == 0:
                 kn.rms_norm_quant_fp8_static_bf16(
                     res, e["nw_in"], e["sc_qkv"], eps, out=b["xn8"])
-            kg.fp8_linear_bf16(b["xn8"], e["qkv"], alpha=e["a_qkv"],
-                               out=b["qkv"])
+            gemm(e, "qkv", b["xn8"], b["qkv"])
             kr.qkv_split_rope_kvcache_bf16(
                 qkv3, bound.rope, nh, kv, hd, 0, q_out=b["q"],
                 k_cache=b["kc"][0], v_cache=b["vc"][0], max_seq_len=S)
@@ -231,17 +255,16 @@ def _make_run(bound: BoundPrefillFp8Chain):
             att2 = attend(l)
             o8 = (att2.float() * e["inv_o"]).clamp(
                 -FP8_MAX, FP8_MAX).to(fp8)
-            kg.fp8_linear_bf16(o8, e["o"], alpha=e["a_o"], out=b["fg"])
+            gemm(e, "o", o8, b["fg"])
             res.add_(b["fg"])
             kn.rms_norm_quant_fp8_static_bf16(
                 res, e["nw_post"], e["sc_gu"], eps, out=b["xn8"])
-            kg.fp8_linear_bf16(b["xn8"], e["gu"], alpha=e["a_gu"],
-                               out=b["gu"])
+            gemm(e, "gu", b["xn8"], b["gu"])
             hid = torch.nn.functional.gelu(
                 b["gu"][:, :H].float(), approximate="tanh") \
                 * b["gu"][:, H:].float()
             h8 = (hid * e["inv_dn"]).clamp(-FP8_MAX, FP8_MAX).to(fp8)
-            kg.fp8_linear_bf16(h8, e["dn"], alpha=e["a_dn"], out=b["fg"])
+            gemm(e, "dn", h8, b["fg"])
             if l < L - 1:
                 nxt = table[l + 1]
                 kn.residual_add_rms_norm_quant_fp8_static_bf16(
@@ -389,16 +412,38 @@ def bind_prefill_fp8_chain(model, root: str,
     bound.out_ctor = first["out_type"]
     bound.cache_type = first["cache_type"]
     # the GEMM entry's row band is a runtime fact, not a symbol fact:
-    # probe it at the bound shape before spending any weight packing
+    # probe it at the bound shape, then fall to the transition rung
+    gemm_mode = "hub"
     try:
         kg.fp8_linear_bf16(
             torch.zeros(S, dim, device="cuda",
                         dtype=torch.float8_e4m3fn),
             torch.zeros(dim, dim, device="cuda",
                         dtype=torch.float8_e4m3fn), alpha=1.0)
-    except Exception as exc:  # noqa: BLE001 — a band fact, not a crash
-        return {"refused": "prefill_fp8_chain: the FP8 GEMM entry "
-                           f"refuses {S} rows ({exc})"}
+    except Exception as hub_exc:  # noqa: BLE001 — a band fact
+        fvk = _load_fvk()
+        if fvk is None or any(not hasattr(fvk, n)
+                              for n in set(_FVK_SITE.values())):
+            return {"refused": "prefill_fp8_chain: the FP8 GEMM entry "
+                               f"refuses {S} rows ({hub_exc})"}
+        gemm_mode = "fvk"
+        bound.kernels["fvk"] = fvk
+    if gemm_mode == "hub":
+        def gemm(e, site, x8, out):
+            kg.fp8_linear_bf16(x8, e[site], alpha=e["a_" + site],
+                               out=out)
+    else:
+        fvk = bound.kernels["fvk"]
+        fns = {site: getattr(fvk, name)
+               for site, name in _FVK_SITE.items()}
+
+        def gemm(e, site, x8, out):
+            w = e[site]
+            stream = torch.cuda.current_stream().cuda_stream
+            fns[site](x8.data_ptr(), w.data_ptr(), out.data_ptr(),
+                      x8.shape[0], w.shape[0], w.shape[1],
+                      e["a_" + site], 0.0, stream)
+    bound.kernels["gemm"] = gemm
     if not _build_rope(bound, stack, first["pos"]):
         return {"refused": "prefill_fp8_chain: rotary table is not "
                            "half-duplicated"}
@@ -434,6 +479,7 @@ def bind_prefill_fp8_chain(model, root: str,
     guard.notes["n_layers"] = len(layers)
     guard.notes["s_used"] = s_used
     guard.notes["attention"] = attn_mode
+    guard.notes["gemm"] = gemm_mode
 
     # ---- smoke: hidden states and the cache the tower left behind ----
     worst = None
