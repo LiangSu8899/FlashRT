@@ -380,13 +380,30 @@ def _band_elements(bound: BoundAdaRmsFp8Chain):
         xp4, xsf4 = b["xp4"], b["xsf4"]
         op4, osf4 = b["op4"], b["osf4"]
         st4 = b["st4"]
+        # bind-time layout probe: a producer that accepts a single
+        # style row drops both the staging copy and the kernel's
+        # full-rows style read; an older producer falls back to the
+        # staged form. The smoke and the captured parity gate judge.
+        try:
+            _t = torch.zeros(2, D, device="cuda", dtype=torch.bfloat16)
+            norm4(_t, _t, _t.clone(),
+                  torch.zeros(1, 3 * D, device="cuda",
+                              dtype=torch.bfloat16))
+            torch.cuda.synchronize()
+            rows1 = True
+        except Exception:   # noqa: BLE001 — a layout fact, not an error
+            rows1 = False
 
-        def stage_styles(styles):
-            # one broadcast copy stages every layer's rows for the
-            # step — the per-norm expand+contiguous kernels (and
-            # their per-call allocations) never enter the graph
-            st4.copy_(styles[:2 * L].expand(-1, S, -1))
-            return st4
+        if rows1:
+            def stage_styles(styles):
+                return styles
+        else:
+            def stage_styles(styles):
+                # one broadcast copy stages every layer's rows for
+                # the step — the per-norm expand+contiguous kernels
+                # never enter the graph
+                st4.copy_(styles[:2 * L].expand(-1, S, -1))
+                return st4
 
         def norm_project(styles, slot, x, prev_gate, e, site, out,
                          gate_out):
