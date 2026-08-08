@@ -301,7 +301,7 @@ def _make_attend(bound: BoundAdaRmsFp8Chain, mode: str, kern):
             kern.forward_static(
                 b["q"], b["kc"][layer_index], b["vc"][layer_index],
                 b["att"], softmax_scale=scaling, causal=False,
-                pack_gqa=True)
+                pack_gqa=True, seqused_k=b["seqused"])
             return att2
         return attend
     lse = kern.allocate_outputs(b["q"])[1]
