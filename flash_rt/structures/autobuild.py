@@ -336,7 +336,14 @@ def _bind_regions(model, seams, *, probe, say):
         if not roots:
             continue
         engaged = True
-        winner, source = regions.resolve(fam.family, notes=notes)
+        try:
+            first = (model.get_submodule(roots[0]) if roots[0]
+                     else model)
+            host_sig = regions.structural_signature(first)
+        except Exception:   # noqa: BLE001 — scoping never kills a bind
+            host_sig = None
+        winner, source = regions.resolve(fam.family, host_sig=host_sig,
+                                         notes=notes)
         if winner == regions.SEATED:
             say(f"region {fam.family}: seated ({source})")
             continue

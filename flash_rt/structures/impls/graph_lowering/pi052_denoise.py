@@ -62,7 +62,8 @@ class Pi05DenoiseGraphLoweringAdapter:
             device = kwargs.get("device")
             if (device is not None and isinstance(data, (list, tuple))
                     and data
-                    and all(isinstance(x, float) for x in data)):
+                    and all(isinstance(x, (float, int, bool))
+                            for x in data)):
                 key = (tuple(data), str(device),
                        str(kwargs.get("dtype")))
                 hit = cache.get(key)
@@ -72,12 +73,27 @@ class Pi05DenoiseGraphLoweringAdapter:
                 return hit
             return real_tensor(data, *args, **kwargs)
 
+        real_setitem = torch.Tensor.__setitem__
+
+        def filling_setitem(t, idx, val):
+            # a python-scalar write into a CUDA tensor is a
+            # host-to-device copy the capture stream refuses; the same
+            # store as an immediate-value fill is graph-legal and
+            # bit-identical
+            if (t.is_cuda and isinstance(idx, int)
+                    and isinstance(val, (int, float, bool))):
+                t.narrow(0, idx, 1).fill_(val)
+                return
+            real_setitem(t, idx, val)
+
         def pinned(self, *args, **kwargs):
             torch.tensor = caching_tensor
+            torch.Tensor.__setitem__ = filling_setitem
             try:
                 return host_fn(*args, **kwargs)
             finally:
                 torch.tensor = real_tensor
+                torch.Tensor.__setitem__ = real_setitem
 
         target.sample_actions = types.MethodType(pinned, target)
 
@@ -90,5 +106,5 @@ class Pi05DenoiseGraphLoweringAdapter:
 
         return GraphLowering(
             undo=undo, family="pi05_denoise",
-            pins=("resident_step_schedule",),
+            pins=("resident_step_schedule", "scalar_setitem_fill"),
             details={"host": type(target).__name__})

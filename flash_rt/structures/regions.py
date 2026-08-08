@@ -114,7 +114,31 @@ def _pin_env(fam: str) -> str:
     return "FRT_REGION_" + re.sub(r"[^A-Za-z0-9]", "_", fam).upper()
 
 
-def resolve(family_name: str, *,
+def structural_signature(module) -> str:
+    """A host-structure fingerprint that scopes receipts to a host.
+
+    Two hosts on one box can carry the same region kind with different
+    winners (a 300M expert stack and a 2B one answer the same
+    identifier), so a receipt keyed by device and family alone would
+    leak across them. The fingerprint is structural — stack class,
+    depth, and the head layer's first projection widths — never a
+    model name: identical structures share receipts by construction,
+    which is exactly the transportability the cache promises.
+    """
+    import torch
+
+    parts = [type(module).__name__]
+    layers = getattr(module, "layers", None)
+    if isinstance(layers, torch.nn.ModuleList) and len(layers):
+        parts.append(f"L{len(layers)}")
+        for _name, sub in layers[0].named_modules():
+            if isinstance(sub, torch.nn.Linear):
+                parts.append(f"{sub.in_features}x{sub.out_features}")
+                break
+    return "-".join(parts)
+
+
+def resolve(family_name: str, *, host_sig: str | None = None,
             notes: dict | None = None) -> tuple[str, str]:
     """Which form does this box run for this region kind, and why.
 
@@ -130,7 +154,12 @@ def resolve(family_name: str, *,
     fell_through: list[dict] = []
     winner, source = SEATED, "default"
     pin = os.environ.get(_pin_env(family_name))
-    cached = decisions.lookup(f"region:{family_name}")
+    # host-scoped receipt first; the unscoped key stays readable so
+    # every receipt measured before scoping existed keeps working
+    cached = (decisions.lookup(f"region:{family_name}@{host_sig}")
+              if host_sig else None)
+    if cached is None:
+        cached = decisions.lookup(f"region:{family_name}")
     for src, name in (("pin", pin), ("cache", cached)):
         if not name:
             continue
@@ -154,11 +183,12 @@ def resolve(family_name: str, *,
     if notes is not None:
         notes.setdefault("regions", []).append(
             {"family": family_name, "winner": winner, "source": source,
-             "fell_through": fell_through})
+             "host_sig": host_sig, "fell_through": fell_through})
     return winner, source
 
 
-def record(family_name: str, winner: str, times_ms: dict):
+def record(family_name: str, winner: str, times_ms: dict,
+           host_sig: str | None = None):
     """Write a measured region winner into the decision cache.
 
     The receipt is what the automatic tier will obey unquestioningly,
@@ -173,4 +203,6 @@ def record(family_name: str, winner: str, times_ms: dict):
             f"'{winner}' is not a candidate of region family "
             f"'{family_name}' (have: "
             f"{[c.name for c in fam.candidates]} + '{SEATED}')")
-    return decisions.record(f"region:{family_name}", winner, times_ms)
+    key = (f"region:{family_name}@{host_sig}" if host_sig
+           else f"region:{family_name}")
+    return decisions.record(key, winner, times_ms)

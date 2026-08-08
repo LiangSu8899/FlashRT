@@ -59,6 +59,18 @@ FP4_NORM_PACKAGE = "flashrt/fp4-fused-ops"
 FP4_GEMM_SYMBOLS = ("nvfp4_gemm_bias_bf16", "quantize_fp4_sfa_bf16")
 FP4_NORM_SYMBOLS = ("gate_res_ada_rms_norm_quant_nvfp4_swizzled_bf16",)
 
+#: the band table IS the recipe: one row per precision band, naming
+#: the extra packages the band assembles and its candidate rank. The
+#: chain body stays one form; adding a band means adding a row (and
+#: its two element closures in :func:`_band_elements`), never another
+#: branch in the loop.
+BANDS: dict[str, dict] = {
+    "fp8": {"packages": (), "precision_rank": 0},
+    "fp4": {"packages": ((FP4_GEMM_PACKAGE, FP4_GEMM_SYMBOLS),
+                         (FP4_NORM_PACKAGE, FP4_NORM_SYMBOLS)),
+            "precision_rank": 1},
+}
+
 #: the attention element resolves per host: the house CuTe FA4
 #: runtime first — it carries the D256 2CTA forward this stack's
 #: 8-query/1-KV heads need, which the community FA4 package does not
@@ -73,26 +85,17 @@ SMOKE_FLOOR = 0.985
 
 
 def missing_symbols_fp4() -> list[str]:
-    gaps = missing_symbols()
-    for repo, symbols in ((FP4_GEMM_PACKAGE, FP4_GEMM_SYMBOLS),
-                          (FP4_NORM_PACKAGE, FP4_NORM_SYMBOLS)):
-        try:
-            kern = hub_kernel(repo, ">=1")
-        except KernelUnavailable:
-            gaps.append(repo)
-            continue
-        gaps.extend(f"{repo}:{sym}" for sym in symbols
-                    if not hasattr(kern, sym))
-    return gaps
+    return missing_symbols(band="fp4")
 
 
-def missing_symbols() -> list[str]:
+def missing_symbols(band: str = "fp8") -> list[str]:
     """The factual prerequisites this box does not meet (may be empty)."""
     gaps: list[str] = []
-    for repo, symbols in ((GEMM_PACKAGE, GEMM_SYMBOLS),
-                          (NORM_PACKAGE, NORM_SYMBOLS),
-                          (ROPE_PACKAGE, ROPE_SYMBOLS),
-                          (FUSE_PACKAGE, FUSE_SYMBOLS)):
+    packages = ((GEMM_PACKAGE, GEMM_SYMBOLS),
+                (NORM_PACKAGE, NORM_SYMBOLS),
+                (ROPE_PACKAGE, ROPE_SYMBOLS),
+                (FUSE_PACKAGE, FUSE_SYMBOLS)) + BANDS[band]["packages"]
+    for repo, symbols in packages:
         try:
             kern = hub_kernel(repo, ">=1")
         except KernelUnavailable:
@@ -287,6 +290,19 @@ def _alloc(bound: BoundAdaRmsFp8Chain) -> None:
                for _ in range(L)]
     b["seqused"] = torch.full((1,), T, device=dev, dtype=torch.int32)
     b["att"] = torch.empty(1, S, nh, hd, device=dev, dtype=bf)
+    if bound.band == "fp4":
+        # static FP4 out-buffers, sized by the quantizer's own
+        # allocator: the SF tensor's tile-padding entries are zeroed
+        # once here and never written by the producers, so one
+        # zero-padded pair per site stays valid across every replay —
+        # no per-call allocation, no per-call SF memset in the graph
+        quant4 = bound.kernels["kg4"].quantize_fp4_sfa_bf16
+        b["xp4"], b["xsf4"] = quant4(b["zero"])
+        b["op4"], b["osf4"] = quant4(
+            torch.zeros(S, nh * hd, device=dev, dtype=bf))
+        # the norm kernel's style contract is contiguous (rows, 3*dim):
+        # one static stage, filled by a single broadcast copy per step
+        b["st4"] = torch.empty(2 * L, S, 3 * D, device=dev, dtype=bf)
 
 
 def _make_attend(bound: BoundAdaRmsFp8Chain, mode: str, kern):
@@ -314,6 +330,75 @@ def _make_attend(bound: BoundAdaRmsFp8Chain, mode: str, kern):
     return attend
 
 
+def _band_elements(bound: BoundAdaRmsFp8Chain):
+    """The band row's two element closures, plus the style stager.
+
+    Every band expresses the same three moves — stage the step's
+    styles, feed a style-conditioned producer into a projection site,
+    project the attention output — so the chain loop stays one form
+    and a band is a table row plus this closure pair.
+
+    - ``stage_styles(styles)``: per-step staging; returns the handle
+      the producer consumes.
+    - ``norm_project(styles, slot, x, prev_gate, e, site, out,
+      gate_out)``: gated-residual AdaRMS producer into the ``site``
+      GEMM, result in ``out``, the norm's gate in ``gate_out``.
+    - ``out_project(att2, e, out)``: quantize the attention output and
+      run the output projection into ``out``.
+    """
+    b = bound.buf
+    kg = bound.kernels["kg"]
+    kn = bound.kernels["kn"]
+    kf = bound.kernels["kf"]
+    eps = bound.eps
+    S, D, L = (bound.dims[k] for k in ("seq", "dim", "layers"))
+    if bound.band == "fp4":
+        norm4 = bound.kernels["kn4"]             .gate_res_ada_rms_norm_quant_nvfp4_swizzled_bf16
+        gemm4 = bound.kernels["kg4"].nvfp4_gemm_bias_bf16
+        quant4 = bound.kernels["kg4"].quantize_fp4_sfa_bf16
+        zb = bound.zero_bias
+        xp4, xsf4 = b["xp4"], b["xsf4"]
+        op4, osf4 = b["op4"], b["osf4"]
+        st4 = b["st4"]
+
+        def stage_styles(styles):
+            # one broadcast copy stages every layer's rows for the
+            # step — the per-norm expand+contiguous kernels (and
+            # their per-call allocations) never enter the graph
+            st4.copy_(styles[:2 * L].expand(-1, S, -1))
+            return st4
+
+        def norm_project(styles, slot, x, prev_gate, e, site, out,
+                         gate_out):
+            norm4(x, prev_gate, b["res"], styles[slot], packed=xp4,
+                  sf_swizzled=xsf4, gate=gate_out)
+            wp, wsf = e[site]
+            gemm4(xp4, wp, xsf4, wsf, zb[out.shape[1]], out=out)
+
+        def out_project(att2, e, out):
+            quant4(att2, op4, osf4)
+            gemm4(op4, e["o"][0], osf4, e["o"][1], zb[D], out=out)
+
+        return stage_styles, norm_project, out_project
+
+    def stage_styles(styles):
+        return styles
+
+    def norm_project(styles, slot, x, prev_gate, e, site, out,
+                     gate_out):
+        kn.gate_residual_ada_norm_fp8_static_bf16(
+            b["res"], x, prev_gate, b["ones_w"], styles[slot],
+            e["sc_" + site], eps, out=b["xn8"], gate_out=gate_out)
+        kg.fp8_linear_bf16(b["xn8"], e[site], alpha=e["a_" + site],
+                           out=out)
+
+    def out_project(att2, e, out):
+        kf.quantize_fp8_static_bf16(att2, e["t_sc_o"], out=b["o8"])
+        kg.fp8_linear_bf16(b["o8"], e["o"], alpha=e["a_o"], out=out)
+
+    return stage_styles, norm_project, out_project
+
+
 def _make_run(bound: BoundAdaRmsFp8Chain):
     kg = bound.kernels["kg"]
     kn = bound.kernels["kn"]
@@ -329,12 +414,7 @@ def _make_run(bound: BoundAdaRmsFp8Chain):
     eps = bound.eps
     qkv3 = b["qkv"].view(1, S, (nh + 2 * kv) * hd)
     fp8 = torch.float8_e4m3fn
-    fp4 = bound.band == "fp4"
-    if fp4:
-        norm4 = bound.kernels["kn4"]             .gate_res_ada_rms_norm_quant_nvfp4_swizzled_bf16
-        gemm4 = bound.kernels["kg4"].nvfp4_gemm_bias_bf16
-        quant4 = bound.kernels["kg4"].quantize_fp4_sfa_bf16
-        zb = bound.zero_bias
+    stage_styles, norm_project, out_project = _band_elements(bound)
 
     kperm = bound.kperm
 
@@ -358,6 +438,7 @@ def _make_run(bound: BoundAdaRmsFp8Chain):
             styles = bound.style_table.index_select(
                 0, step.view(1))[0]
             fin = bound.fin_table.index_select(0, step.view(1))[0]
+            styles = stage_styles(styles)
         res = b["res"]
         res.copy_(x2d)
         delta, gate = b["zero"], b["zero"]
@@ -365,46 +446,20 @@ def _make_run(bound: BoundAdaRmsFp8Chain):
         rf_layers.__enter__()
         for l in range(L):
             e = table[l]
-            if fp4:
-                _, xp, xsf, g1 = norm4(delta, gate, res,
-                                       styles[2 * l].expand(S, -1).contiguous())
-                gemm4(xp, e["qkv"][0], xsf, e["qkv"][1],
-                      zb[b["qkv"].shape[1]], out=b["qkv"])
-            else:
-                kn.gate_residual_ada_norm_fp8_static_bf16(
-                    res, delta, gate, b["ones_w"], styles[2 * l],
-                    e["sc_qkv"], eps, out=b["xn8"], gate_out=b["g1"])
-                g1 = b["g1"]
-                kg.fp8_linear_bf16(b["xn8"], e["qkv"],
-                                   alpha=e["a_qkv"], out=b["qkv"])
+            norm_project(styles, 2 * l, delta, gate, e, "qkv",
+                         b["qkv"], b["g1"])
             kr.qkv_split_rope_kvcache_bf16(
                 qkv3, bound.rope, nh, kv, hd, P, q_out=b["q"],
                 k_cache=b["kc"][l], v_cache=b["vc"][l], max_seq_len=T)
             att2 = attend(l)
-            if fp4:
-                op, osf = quant4(att2)
-                gemm4(op, e["o"][0], osf, e["o"][1], zb[D],
-                      out=b["dn"])
-                _, xp, xsf, g2 = norm4(b["dn"], g1, res,
-                                       styles[2 * l + 1].expand(S, -1).contiguous())
-                gemm4(xp, e["gu"][0], xsf, e["gu"][1],
-                      zb[2 * H], out=b["gu"])
-            else:
-                kf.quantize_fp8_static_bf16(att2, e["t_sc_o"],
-                                            out=b["o8"])
-                kg.fp8_linear_bf16(b["o8"], e["o"], alpha=e["a_o"],
-                                   out=b["dn"])
-                kn.gate_residual_ada_norm_fp8_static_bf16(
-                    res, b["dn"], g1, b["ones_w"], styles[2 * l + 1],
-                    e["sc_gu"], eps, out=b["xn8"], gate_out=b["g2"])
-                g2 = b["g2"]
-                kg.fp8_linear_bf16(b["xn8"], e["gu"],
-                                   alpha=e["a_gu"], out=b["gu"])
+            out_project(att2, e, b["dn"])
+            norm_project(styles, 2 * l + 1, b["dn"], b["g1"], e, "gu",
+                         b["gu"], b["g2"])
             kf.gate_geglu_merged_quant_fp8_static_bf16(
                 b["gu"], e["t_sc_dn"], out=b["hid8"])
             kg.fp8_linear_bf16(b["hid8"], e["dn"], alpha=e["a_dn"],
                                out=b["dn"])
-            delta, gate = b["dn"], g2
+            delta, gate = b["dn"], b["g2"]
         rf_layers.__exit__(None, None, None)
         with rf("ad:tail"):
             res = res.float() + gate.float() * delta.float()

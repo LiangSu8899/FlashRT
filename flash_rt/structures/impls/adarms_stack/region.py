@@ -73,24 +73,24 @@ def identify(model) -> list[str]:
     return roots
 
 
-def _bind(model, root, probe):
-    return fp8_chain.bind_adarms_fp8_chain(model, root, probe)
+def _band_candidate(band: str, row: dict) -> regions.RegionCandidate:
+    return regions.RegionCandidate(
+        name=f"{band}_chain",
+        missing=lambda band=band: fp8_chain.missing_symbols(band=band),
+        bind=lambda model, root, probe, band=band:
+            fp8_chain.bind_adarms_fp8_chain(model, root, probe,
+                                            band=band),
+        precision_rank=row["precision_rank"],
+    )
 
 
+#: the candidate list is generated from the band table — adding a
+#: precision band to the family is a table row, not new wiring here
 FAMILY = regions.RegionFamily(
     family="adarms_stack",
     identify=identify,
-    candidates=[regions.RegionCandidate(
-        name="fp8_chain",
-        missing=fp8_chain.missing_symbols,
-        bind=_bind,
-    ), regions.RegionCandidate(
-        name="fp4_chain",
-        missing=fp8_chain.missing_symbols_fp4,
-        bind=lambda model, root, probe:
-            fp8_chain.bind_adarms_fp4_chain(model, root, probe),
-        precision_rank=1,
-    )],
+    candidates=[_band_candidate(band, row)
+                for band, row in fp8_chain.BANDS.items()],
 )
 
 
