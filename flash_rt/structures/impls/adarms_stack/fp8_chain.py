@@ -46,6 +46,13 @@ ROPE_SYMBOLS = ("qkv_split_rope_kvcache_bf16",)
 FUSE_PACKAGE = "flashrt/transformer-fused-ops"
 FUSE_SYMBOLS = ("gate_geglu_merged_quant_fp8_static_bf16",
                 "quantize_fp8_static_bf16")
+#: the mixed-precision band, the native decoder's own form: the three
+#: norm-fed GEMMs ride W4A4 NVFP4 with dynamic block scales, the down
+#: projection stays static FP8 (its input is the fused GEGLU's FP8)
+FP4_GEMM_PACKAGE = "flashrt/fp4-gemm"
+FP4_NORM_PACKAGE = "flashrt/fp4-fused-ops"
+FP4_GEMM_SYMBOLS = ("nvfp4_gemm_bias_bf16", "quantize_fp4_sfa_bf16")
+FP4_NORM_SYMBOLS = ("gate_res_ada_rms_norm_quant_nvfp4_swizzled_bf16",)
 
 #: the attention element resolves per host: the house CuTe FA4
 #: runtime first — it carries the D256 2CTA forward this stack's
@@ -76,6 +83,20 @@ def _attention_rungs() -> list[tuple[str, object]]:
         if hasattr(kern, symbol):
             rungs.append((mode, kern))
     return rungs
+
+
+def missing_symbols_fp4() -> list[str]:
+    gaps = missing_symbols()
+    for repo, symbols in ((FP4_GEMM_PACKAGE, FP4_GEMM_SYMBOLS),
+                          (FP4_NORM_PACKAGE, FP4_NORM_SYMBOLS)):
+        try:
+            kern = hub_kernel(repo, ">=1")
+        except KernelUnavailable:
+            gaps.append(repo)
+            continue
+        gaps.extend(f"{repo}:{sym}" for sym in symbols
+                    if not hasattr(kern, sym))
+    return gaps
 
 
 def missing_symbols() -> list[str]:
@@ -132,6 +153,8 @@ class BoundAdaRmsFp8Chain(GuardedSeam, torch.nn.Module):
         self.step_conds = None
         self.style_table = None
         self.fin_table = None
+        self.band = "fp8"
+        self.zero_bias: dict = {}
 
 
 def _stack_parts(stack):
@@ -187,9 +210,14 @@ def _gelu_tanh_like(act: Callable) -> bool:
 
 @torch.no_grad()
 def _quantize(bound: BoundAdaRmsFp8Chain, layers, amax: dict) -> None:
-    """FP8-pack every stack GEMM from the pristine host, folding the
-    probe-calibrated activation scale into each GEMM's alpha."""
+    """Pack every stack GEMM from the pristine host: static FP8 with
+    the calibrated activation scale folded into alpha, or — on the
+    mixed band — NVFP4 with dynamic block scales for the norm-fed
+    GEMMs (the down projection stays FP8; its input already is)."""
     nh, kv, hd = (bound.dims[k] for k in ("nh", "kv", "hd"))
+    fp4 = bound.band == "fp4"
+    quant4 = (bound.kernels["kg4"].quantize_fp4_sfa_bf16
+              if fp4 else None)
     for i, ly in enumerate(layers):
         attn, mlp = ly.self_attn, ly.mlp
         a_qkv, a_o, a_gu, a_dn = (amax[(i, s)] / FP8_MAX for s in
@@ -204,6 +232,16 @@ def _quantize(bound: BoundAdaRmsFp8Chain, layers, amax: dict) -> None:
                              ("o", attn.o_proj.weight, a_o),
                              ("gu", gu_w, a_gu),
                              ("dn", mlp.down_proj.weight, a_dn)):
+            if fp4 and name != "dn":
+                wp, wsf = quant4(
+                    w.detach().to("cuda", torch.bfloat16)
+                    .contiguous(), is_sfb=True)
+                entry[name] = (wp, wsf)
+                if w.shape[0] not in bound.zero_bias:
+                    bound.zero_bias[w.shape[0]] = torch.zeros(
+                        w.shape[0], device="cuda",
+                        dtype=torch.bfloat16)
+                continue
             packed, w_scale = _fp8_weight(w)
             entry[name] = packed
             entry[f"a_{name}"] = act * w_scale
@@ -342,6 +380,12 @@ def _make_run(bound: BoundAdaRmsFp8Chain):
     eps = bound.eps
     qkv3 = b["qkv"].view(1, S, (nh + 2 * kv) * hd)
     fp8 = torch.float8_e4m3fn
+    fp4 = bound.band == "fp4"
+    if fp4:
+        norm4 = bound.kernels["kn4"]             .gate_res_ada_rms_norm_quant_nvfp4_swizzled_bf16
+        gemm4 = bound.kernels["kg4"].nvfp4_gemm_bias_bf16
+        quant4 = bound.kernels["kg4"].quantize_fp4_sfa_bf16
+        zb = bound.zero_bias
 
     kperm = bound.kperm
 
@@ -372,29 +416,46 @@ def _make_run(bound: BoundAdaRmsFp8Chain):
         rf_layers.__enter__()
         for l in range(L):
             e = table[l]
-            kn.gate_residual_ada_norm_fp8_static_bf16(
-                res, delta, gate, b["ones_w"], styles[2 * l],
-                e["sc_qkv"], eps, out=b["xn8"], gate_out=b["g1"])
-            kg.fp8_linear_bf16(b["xn8"], e["qkv"], alpha=e["a_qkv"],
-                               out=b["qkv"])
+            if fp4:
+                _, xp, xsf, g1 = norm4(delta, gate, res,
+                                       styles[2 * l].expand(S, -1).contiguous())
+                gemm4(xp, e["qkv"][0], xsf, e["qkv"][1],
+                      zb[b["qkv"].shape[1]], out=b["qkv"])
+            else:
+                kn.gate_residual_ada_norm_fp8_static_bf16(
+                    res, delta, gate, b["ones_w"], styles[2 * l],
+                    e["sc_qkv"], eps, out=b["xn8"], gate_out=b["g1"])
+                g1 = b["g1"]
+                kg.fp8_linear_bf16(b["xn8"], e["qkv"],
+                                   alpha=e["a_qkv"], out=b["qkv"])
             kr.qkv_split_rope_kvcache_bf16(
                 qkv3, bound.rope, nh, kv, hd, P, q_out=b["q"],
                 k_cache=b["kc"][l], v_cache=b["vc"][l], max_seq_len=T)
             att2 = attend(l)
-            kf.quantize_fp8_static_bf16(att2, e["t_sc_o"],
-                                        out=b["o8"])
-            kg.fp8_linear_bf16(b["o8"], e["o"], alpha=e["a_o"],
-                               out=b["dn"])
-            kn.gate_residual_ada_norm_fp8_static_bf16(
-                res, b["dn"], b["g1"], b["ones_w"], styles[2 * l + 1],
-                e["sc_gu"], eps, out=b["xn8"], gate_out=b["g2"])
-            kg.fp8_linear_bf16(b["xn8"], e["gu"], alpha=e["a_gu"],
-                               out=b["gu"])
+            if fp4:
+                op, osf = quant4(att2)
+                gemm4(op, e["o"][0], osf, e["o"][1], zb[D],
+                      out=b["dn"])
+                _, xp, xsf, g2 = norm4(b["dn"], g1, res,
+                                       styles[2 * l + 1].expand(S, -1).contiguous())
+                gemm4(xp, e["gu"][0], xsf, e["gu"][1],
+                      zb[2 * H], out=b["gu"])
+            else:
+                kf.quantize_fp8_static_bf16(att2, e["t_sc_o"],
+                                            out=b["o8"])
+                kg.fp8_linear_bf16(b["o8"], e["o"], alpha=e["a_o"],
+                                   out=b["dn"])
+                kn.gate_residual_ada_norm_fp8_static_bf16(
+                    res, b["dn"], g1, b["ones_w"], styles[2 * l + 1],
+                    e["sc_gu"], eps, out=b["xn8"], gate_out=b["g2"])
+                g2 = b["g2"]
+                kg.fp8_linear_bf16(b["xn8"], e["gu"],
+                                   alpha=e["a_gu"], out=b["gu"])
             kf.gate_geglu_merged_quant_fp8_static_bf16(
                 b["gu"], e["t_sc_dn"], out=b["hid8"])
             kg.fp8_linear_bf16(b["hid8"], e["dn"], alpha=e["a_dn"],
                                out=b["dn"])
-            delta, gate = b["dn"], b["g2"]
+            delta, gate = b["dn"], g2
         rf_layers.__exit__(None, None, None)
         with rf("ad:tail"):
             res = res.float() + gate.float() * delta.float()
@@ -407,8 +468,14 @@ def _make_run(bound: BoundAdaRmsFp8Chain):
     return run
 
 
-def bind_adarms_fp8_chain(model, root: str,
+def bind_adarms_fp4_chain(model, root: str,
                           probe: Callable[[], Any]) -> dict:
+    return bind_adarms_fp8_chain(model, root, probe, band="fp4")
+
+
+def bind_adarms_fp8_chain(model, root: str,
+                          probe: Callable[[], Any],
+                          band: str = "fp8") -> dict:
     """Bind the chain onto the stack at ``root``; adapter contract out.
 
     One probe run does all the observation: the suffix calls (smoke
@@ -423,10 +490,15 @@ def bind_adarms_fp8_chain(model, root: str,
         kn = hub_kernel(NORM_PACKAGE, ">=1")
         kr = hub_kernel(ROPE_PACKAGE, ">=1")
         kf = hub_kernel(FUSE_PACKAGE, ">=1")
+        kg4 = kn4 = None
+        if band == "fp4":
+            kg4 = hub_kernel(FP4_GEMM_PACKAGE, ">=1")
+            kn4 = hub_kernel(FP4_NORM_PACKAGE, ">=1")
     except KernelUnavailable as exc:
-        return {"refused": f"adarms_fp8_chain: {exc}"}
+        return {"refused": f"adarms_{band}_chain: {exc}"}
     rungs = _attention_rungs()
-    gaps = missing_symbols()
+    gaps = (missing_symbols_fp4() if band == "fp4"
+            else missing_symbols())
     if gaps:
         return {"refused": f"adarms_fp8_chain missing: {', '.join(gaps)}"}
 
@@ -444,7 +516,9 @@ def bind_adarms_fp8_chain(model, root: str,
                            "scaling differs"}
 
     bound = BoundAdaRmsFp8Chain()
-    bound.kernels = {"kg": kg, "kn": kn, "kr": kr, "kf": kf}
+    bound.kernels = {"kg": kg, "kn": kn, "kr": kr, "kf": kf,
+                     "kg4": kg4, "kn4": kn4}
+    bound.band = band
     bound.scaling = scalings.pop()
     bound.dims = {"nh": nh, "kv": kv, "hd": hd, "dim": dim,
                   "hidden": hidden, "layers": len(layers)}

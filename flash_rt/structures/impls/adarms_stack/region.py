@@ -84,6 +84,12 @@ FAMILY = regions.RegionFamily(
         name="fp8_chain",
         missing=fp8_chain.missing_symbols,
         bind=_bind,
+    ), regions.RegionCandidate(
+        name="fp4_chain",
+        missing=fp8_chain.missing_symbols_fp4,
+        bind=lambda model, root, probe:
+            fp8_chain.bind_adarms_fp4_chain(model, root, probe),
+        precision_rank=1,
     )],
 )
 
