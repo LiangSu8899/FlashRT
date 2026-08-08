@@ -384,7 +384,59 @@ def _bind_regions(model, seams, *, probe, say):
                  "smoke_cos": result.get("smoke_cos")})
             say(f"region {fam.family}@{root}: {winner} bound "
                 f"({claimed} seam(s) claimed, source={source})")
+    if engaged:
+        _wire_region_products(extras, notes, say)
     return extras if engaged else None
+
+
+def _wire_region_products(extras, notes, say) -> None:
+    """Cross-region wires: a bound producer feeds a bound consumer's
+    chain buffers directly, and the consumer drops its own in-graph
+    restaging. Structure-level, receipt-visible, and only ever armed
+    when both ends are bound with agreeing facts — a missing or
+    refused end simply leaves both chains in their standalone form.
+
+    First wire: a prefill tower's per-layer K/V (already in the shared
+    adjacent-pair chain layout — both chains assemble the same split
+    kernel) into a conditioned decoder stack's cache prefix rows. The
+    decoder's per-step prefix gather is the identity of this write, so
+    it leaves the graph.
+    """
+    towers, stacks = [], []
+    for label, bound in extras["observed"].items():
+        if "::prefill_" in label and getattr(bound, "prefix_sinks",
+                                             "no") != "no":
+            towers.append((label, bound))
+        if "::adarms_" in label and getattr(bound, "prefix_wired",
+                                            "no") != "no":
+            stacks.append((label, bound))
+    if len(towers) != 1 or len(stacks) != 1:
+        return
+    (t_label, tower), (s_label, stack) = towers[0], stacks[0]
+    tk = {k: tower.dims.get(k) for k in ("seq", "hd", "layers")}
+    if (tk["seq"] != stack.p_used or tk["hd"] != stack.dims.get("hd")
+            or tk["layers"] != stack.dims.get("layers")
+            or not stack.buf.get("kc")):
+        notes.setdefault("region_wires", []).append(
+            {"wire": "prefix_kv", "armed": False,
+             "reason": f"facts disagree: tower {tk} vs stack "
+                       f"P={stack.p_used}"})
+        return
+    P = stack.p_used
+    tower.prefix_sinks = [
+        (stack.buf["kc"][l][0, :P, 0], stack.buf["vc"][l][0, :P, 0])
+        for l in range(tk["layers"])]
+    stack.prefix_wired = True
+
+    def unwire() -> None:
+        tower.prefix_sinks = None
+        stack.prefix_wired = False
+
+    extras["revert"].append(unwire)
+    notes.setdefault("region_wires", []).append(
+        {"wire": "prefix_kv", "armed": True, "producer": t_label,
+         "consumer": s_label, "rows": P})
+    say(f"region wire prefix_kv: {t_label} -> {s_label} ({P} rows)")
 
 
 def _merge_region_extras(plan, extras) -> None:

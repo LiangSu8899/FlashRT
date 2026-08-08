@@ -145,6 +145,12 @@ class BoundAdaRmsFp8Chain(GuardedSeam, torch.nn.Module):
         self.fin_table = None
         self.band = "fp8"
         self.zero_bias: dict = {}
+        #: armed by the region wire (autobuild) once a bound producer
+        #: guarantees the chain caches' prefix rows are written
+        #: in-graph before the first decoder step: the per-step prefix
+        #: gather leaves the graph. Bind-time state — constant by
+        #: capture time, so both a capture and a compile bake one arm.
+        self.prefix_wired = False
 
 
 def _stack_parts(stack):
@@ -421,14 +427,18 @@ def _make_run(bound: BoundAdaRmsFp8Chain):
     rf = torch.profiler.record_function
 
     def run(x2d, cond, prefix_kv):
-        with rf("ad:prefix"):
-            for l, (pk, pv) in enumerate(prefix_kv):
-                # rotated pairs are adjacent; the host cached prefix
-                # keys in rotate-half layout — gather them into the
-                # shared permutation so q·k stays layout-consistent
-                torch.index_select(pk, -1, kperm,
-                                   out=b["kc"][l][0, :P, 0])
-                b["vc"][l][0, :P, 0].copy_(pv)
+        if not bound.prefix_wired:
+            with rf("ad:prefix"):
+                for l, (pk, pv) in enumerate(prefix_kv):
+                    # rotated pairs are adjacent; the host cached
+                    # prefix keys in rotate-half layout — gather them
+                    # into the shared permutation so q·k stays
+                    # layout-consistent. A wired prefix skips this:
+                    # the producer already wrote these rows in chain
+                    # layout, and kperm∘kperm_inv is the identity.
+                    torch.index_select(pk, -1, kperm,
+                                       out=b["kc"][l][0, :P, 0])
+                    b["vc"][l][0, :P, 0].copy_(pv)
         # nearest-neighbour step resolution, fully on-device: the
         # schedule is a bind-time fact, so the live conditioning names
         # its baked table without a host round-trip or Python state

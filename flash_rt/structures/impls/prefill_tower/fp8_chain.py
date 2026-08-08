@@ -116,6 +116,12 @@ class BoundPrefillFp8Chain(GuardedSeam, torch.nn.Module):
         self.final_w = None
         self.cache_type = None
         self.kernels: dict = {}
+        #: region wire (armed by autobuild): per-layer (k, v) sink
+        #: views of a bound consumer's chain caches. The tower's K is
+        #: already in chain layout (same split kernel, same adjacent-
+        #: pair convention), so writing the sink is the identity of
+        #: the consumer's own gather — the consumer drops it in-graph.
+        self.prefix_sinks = None
 
 
 def _plain_norm_weight(norm) -> torch.Tensor | None:
@@ -278,6 +284,11 @@ def _make_run(bound: BoundPrefillFp8Chain):
                     qkv3, bound.rope, nh, kv, hd, 0, q_out=b["q"],
                     k_cache=b["kc"][0], v_cache=b["vc"][0],
                     max_seq_len=S)
+            if bound.prefix_sinks is not None:
+                with rf("pf:wire"):
+                    dk, dv = bound.prefix_sinks[l]
+                    dk.copy_(kh)
+                    dv.copy_(b["vc"][0].view(S, hd))
             if pkv is not None:
                 # fresh tensors per layer: the cache keeps references,
                 # and the shared buffers are overwritten next layer
