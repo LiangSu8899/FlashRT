@@ -16,6 +16,7 @@ notes like any other. A package without metadata is loaded as before —
 absence of a declaration is not evidence of incompatibility.
 """
 
+import os
 import json
 import pathlib
 import re
@@ -150,8 +151,16 @@ def hub_kernel(repo: str, version: str):
 
     key = (repo, version)
     if key not in _LOADED:
+        # author pin for artifact bisection: an exact hub revision
+        # outranks version resolution for this repo only. A perf or
+        # correctness drift that arrives with a rebuilt artifact is
+        # isolated by flipping one env var, not by editing caches.
+        rev = os.environ.get(
+            "FRT_KERNEL_REV_" + re.sub(r"[^A-Za-z0-9]", "_",
+                                       repo).upper())
         try:
-            _LOADED[key] = get_kernel(repo, version=version)
+            _LOADED[key] = (get_kernel(repo, revision=rev) if rev
+                            else get_kernel(repo, version=version))
         except (OSError, RuntimeError, ValueError) as unavailable:
             _record_unavailable(repo, version, unavailable)
             raise KernelUnavailable(

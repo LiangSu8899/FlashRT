@@ -97,14 +97,78 @@ class Pi05DenoiseGraphLoweringAdapter:
 
         target.sample_actions = types.MethodType(pinned, target)
 
+        # ---- pin 3: the pixel-patch embedding stack rides the band ----
+        # The host keeps norms/embeddings in fp32 as a training-fidelity
+        # choice; in the captured serving form every consumer of the
+        # patch embeds casts to bf16 at its own entry, so the fp32 conv
+        # pair is pure spend. Structural match only (a full-patch
+        # Conv2d — kernel == stride — beside a position Embedding),
+        # weights carried down in place with the originals retained,
+        # and the arm's end-to-end parity gate stays the judge.
+        embed_saved: list = []
+        embed_hooks: list = []
+        for _n, mod in getattr(model, "named_modules", lambda: ())():
+            pe = getattr(mod, "patch_embedding", None)
+            pos = getattr(mod, "position_embedding", None)
+            if not (isinstance(pe, torch.nn.Conv2d)
+                    and isinstance(pos, torch.nn.Embedding)):
+                continue
+            if tuple(pe.kernel_size) != tuple(pe.stride):
+                continue
+            f32 = [p for p in mod.parameters()
+                   if p.dtype == torch.float32]
+            if not f32:
+                continue
+            for p in f32:
+                embed_saved.append((p, p.data))
+                p.data = p.data.to(torch.bfloat16)
+            embed_hooks.append(pe.register_forward_pre_hook(
+                lambda _m, args: (args[0].to(torch.bfloat16),)
+                + tuple(args[1:])))
+            # dtype-transparent at the module boundary: every
+            # downstream consumer keeps seeing the dtype the host
+            # chose; only the patch projection itself rides the band
+            embed_hooks.append(mod.register_forward_hook(
+                lambda _m, _a, out: out.to(torch.float32)
+                if isinstance(out, torch.Tensor) else out))
+        # ---- pin 4: fp32 host linears ride the band, transparently --
+        # The same fidelity policy leaves a handful of glue linears
+        # (modality projector, time/action MLPs) in fp32, which on this
+        # class of device means simt kernels with no tensor cores. Each
+        # one is carried down in place with both boundaries cast back,
+        # so every consumer and producer keeps its dtype contract and
+        # the parity gate judges the whole move.
+        for _n, mod in getattr(model, "named_modules", lambda: ())():
+            if not isinstance(mod, torch.nn.Linear):
+                continue
+            if mod.weight.dtype is not torch.float32:
+                continue
+            embed_saved.append((mod.weight, mod.weight.data))
+            mod.weight.data = mod.weight.data.to(torch.bfloat16)
+            if mod.bias is not None:
+                embed_saved.append((mod.bias, mod.bias.data))
+                mod.bias.data = mod.bias.data.to(torch.bfloat16)
+            embed_hooks.append(mod.register_forward_pre_hook(
+                lambda _m, args: (args[0].to(torch.bfloat16),)
+                + tuple(args[1:])))
+            embed_hooks.append(mod.register_forward_hook(
+                lambda _m, _a, out: out.to(torch.float32)))
+        pins = ["resident_step_schedule", "scalar_setitem_fill"]
+        if embed_saved:
+            pins.append("patch_embed_band")
+
         def undo() -> None:
             torch.tensor = real_tensor
             if had_instance:
                 target.sample_actions = host_fn
             elif "sample_actions" in target.__dict__:
                 del target.sample_actions
+            for hook in embed_hooks:
+                hook.remove()
+            for p, data in embed_saved:
+                p.data = data
 
         return GraphLowering(
             undo=undo, family="pi05_denoise",
-            pins=("resident_step_schedule", "scalar_setitem_fill"),
+            pins=tuple(pins),
             details={"host": type(target).__name__})
