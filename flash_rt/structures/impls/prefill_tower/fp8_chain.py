@@ -34,10 +34,12 @@ from ..adarms_stack.fp8_chain import (
 GEMM_PACKAGE = "flashrt/fp8-gemm"
 NORM_PACKAGE = "flashrt/flashrt-residual-norm-quant"
 ROPE_PACKAGE = "flashrt/flashrt-qkv-cache-rope"
+FFN_PACKAGE = "flashrt/flashrt-fp8-swiglu-ffn"
 GEMM_SYMBOLS = ("fp8_linear_bf16",)
 NORM_SYMBOLS = ("rms_norm_quant_fp8_static_bf16",
                 "residual_add_rms_norm_quant_fp8_static_bf16")
 ROPE_SYMBOLS = ("qkv_split_rope_kvcache_bf16",)
+FFN_SYMBOLS = ("fp8_geglu_mlp_bf16",)
 
 #: whole-tower smoke over hidden states and every layer's cached K/V
 #: — a min over ~37 tensors after 18 residual layers of static FP8,
@@ -75,7 +77,8 @@ def missing_symbols() -> list[str]:
     gaps: list[str] = []
     for repo, symbols in ((GEMM_PACKAGE, GEMM_SYMBOLS),
                           (NORM_PACKAGE, NORM_SYMBOLS),
-                          (ROPE_PACKAGE, ROPE_SYMBOLS)):
+                          (ROPE_PACKAGE, ROPE_SYMBOLS),
+                          (FFN_PACKAGE, FFN_SYMBOLS)):
         try:
             kern = hub_kernel(repo, ">=1")
         except KernelUnavailable:
@@ -196,6 +199,12 @@ def _quantize(bound, layers, amax) -> None:
                                       dtype=torch.float32)
         entry["inv_o"] = 1.0 / a_o if a_o > 0 else 1.0
         entry["inv_dn"] = 1.0 / a_dn if a_dn > 0 else 1.0
+        def _t(v):
+            return torch.tensor([v], device="cuda",
+                                dtype=torch.float32)
+        entry["t_wsc_gu"] = _t(entry["a_gu"] / a_gu)
+        entry["t_sc_dn"] = _t(a_dn)
+        entry["t_wsc_dn"] = _t(entry["a_dn"] / a_dn)
         bound.table.append(entry)
 
 
@@ -225,6 +234,7 @@ def _make_run(bound: BoundPrefillFp8Chain):
     kg = bound.kernels["kg"]
     kn = bound.kernels["kn"]
     kr = bound.kernels["kr"]
+    kf = bound.kernels["kf"]
     attend = bound.kernels["attend"]
     S, D, nh, kv, hd, H, L = (bound.dims[k] for k in
                               ("seq", "dim", "nh", "kv", "hd",
@@ -294,6 +304,7 @@ def bind_prefill_fp8_chain(model, root: str,
         kg = hub_kernel(GEMM_PACKAGE, ">=1")
         kn = hub_kernel(NORM_PACKAGE, ">=1")
         kr = hub_kernel(ROPE_PACKAGE, ">=1")
+        kf = hub_kernel(FFN_PACKAGE, ">=1")
     except KernelUnavailable as exc:
         return {"refused": f"prefill_fp8_chain: {exc}"}
     rungs = _attention_rungs()
@@ -323,7 +334,7 @@ def bind_prefill_fp8_chain(model, root: str,
                            "affine RMS norm"}
 
     bound = BoundPrefillFp8Chain()
-    bound.kernels = {"kg": kg, "kn": kn, "kr": kr}
+    bound.kernels = {"kg": kg, "kn": kn, "kr": kr, "kf": kf}
     bound.scaling = scalings.pop()
     bound.dims = {"nh": nh, "kv": kv, "hd": hd, "dim": dim,
                   "hidden": hidden, "layers": len(layers)}
