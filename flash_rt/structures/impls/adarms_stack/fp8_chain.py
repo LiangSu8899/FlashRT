@@ -35,6 +35,11 @@ from typing import Any, Callable
 import torch
 
 from .. import KernelUnavailable, hub_kernel
+from ..chain_elements import (
+    ATTN_RUNGS, FP8_MAX, attention_rungs as _attention_rungs,
+    cache_kv as _cache_kv, fp8_weight as _fp8_weight,
+    gelu_tanh_like as _gelu_tanh_like,
+    interleave_rows as _interleave_rows)
 from ...guard import GuardedSeam
 
 GEMM_PACKAGE = "flashrt/fp8-gemm"
@@ -62,27 +67,9 @@ FP4_NORM_SYMBOLS = ("gate_res_ada_rms_norm_quant_nvfp4_swizzled_bf16",)
 #: non-causal call into a caller-owned output; a rung that loads but
 #: cannot execute is eliminated by the bind-time functional probe,
 #: not by device lists.
-ATTN_RUNGS = (("fa4_cute", "flashrt/fa4-cute-runtime", ">=1",
-               "forward_static"),
-              ("fa2_seqused", "flashrt/fa2-seqused-runtime", ">=1",
-               "forward_seqused_static"))
-
 #: whole-stack smoke on every probe call; the arm's end-to-end parity
 #: gate (0.99 vs the host's own eager run) stays the judge
 SMOKE_FLOOR = 0.985
-FP8_MAX = 448.0
-
-
-def _attention_rungs() -> list[tuple[str, object]]:
-    rungs = []
-    for mode, repo, version, symbol in ATTN_RUNGS:
-        try:
-            kern = hub_kernel(repo, version)
-        except KernelUnavailable:
-            continue
-        if hasattr(kern, symbol):
-            rungs.append((mode, kern))
-    return rungs
 
 
 def missing_symbols_fp4() -> list[str]:
@@ -168,44 +155,6 @@ def _stack_parts(stack):
     dim = attn.q_proj.in_features
     hidden = layers[0].mlp.gate_proj.out_features
     return layers, nh, kv, head_dim, dim, hidden
-
-
-def _interleave_rows(w: torch.Tensor, heads: int,
-                     head_dim: int) -> torch.Tensor:
-    """Permute projection rows so adjacent-pair rotation carries the
-    host's rotate-half convention."""
-    half = head_dim // 2
-    w = w.reshape(heads, head_dim, w.shape[-1])
-    out = torch.empty_like(w)
-    out[:, 0::2] = w[:, :half]
-    out[:, 1::2] = w[:, half:]
-    return out.reshape(heads * head_dim, w.shape[-1])
-
-
-def _fp8_weight(w: torch.Tensor) -> tuple[torch.Tensor, float]:
-    w = w.detach().to("cuda", torch.float32)
-    scale = float(w.abs().amax()) / FP8_MAX
-    if scale <= 0.0:
-        scale = 1.0
-    packed = (w / scale).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
-    return packed.contiguous(), scale
-
-
-def _cache_kv(cache, idx: int):
-    layers = getattr(cache, "layers", None)
-    if layers is not None:
-        return layers[idx].keys, layers[idx].values
-    return cache.key_cache[idx], cache.value_cache[idx]
-
-
-def _gelu_tanh_like(act: Callable) -> bool:
-    t = torch.linspace(-4, 4, 65, device="cuda", dtype=torch.bfloat16)
-    try:
-        got = act(t)
-    except Exception:       # noqa: BLE001 — a weird act refuses, not kills
-        return False
-    ref = torch.nn.functional.gelu(t.float(), approximate="tanh")
-    return bool(torch.allclose(got.float(), ref, atol=2e-2))
 
 
 @torch.no_grad()

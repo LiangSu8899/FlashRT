@@ -27,9 +27,12 @@ import torch
 
 from .. import KernelUnavailable, hub_kernel
 from ...guard import GuardedSeam
-from ..adarms_stack.fp8_chain import (
-    ATTN_RUNGS, FP8_MAX, _attention_rungs, _cache_kv, _fp8_weight,
-    _gelu_tanh_like, _interleave_rows, _make_attend)
+from ..adarms_stack.fp8_chain import _make_attend
+from ..chain_elements import (
+    ATTN_RUNGS, FP8_MAX, attention_rungs as _attention_rungs,
+    cache_kv as _cache_kv, fp8_weight as _fp8_weight,
+    gelu_tanh_like as _gelu_tanh_like,
+    interleave_rows as _interleave_rows)
 
 GEMM_PACKAGE = "flashrt/fp8-gemm"
 NORM_PACKAGE = "flashrt/flashrt-residual-norm-quant"

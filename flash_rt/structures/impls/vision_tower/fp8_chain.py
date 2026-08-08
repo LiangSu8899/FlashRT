@@ -23,7 +23,8 @@ import torch
 
 from .. import KernelUnavailable, hub_kernel
 from ...guard import GuardedSeam
-from ..adarms_stack.fp8_chain import _fp8_weight, _gelu_tanh_like
+from ..chain_elements import (
+    fp8_weight as _fp8_weight, gelu_tanh_like as _gelu_tanh_like)
 
 GEMM_PACKAGE = "flashrt/fp8-gemm"
 FUSE_PACKAGE = "flashrt/transformer-fused-ops"
