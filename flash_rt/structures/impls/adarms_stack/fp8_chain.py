@@ -120,6 +120,10 @@ class BoundAdaRmsFp8Chain(GuardedSeam, torch.nn.Module):
         self.out_ctor = None
         self.kperm = None
         self.kernels: dict = {}
+        #: capture-epoch flag: within one captured window the prefix
+        #: is written once by the in-graph prefill, so only the first
+        #: traced suffix call bakes the prefix copy into the graph
+        self._was_capturing = False
 
 
 def _stack_parts(stack):
@@ -328,13 +332,16 @@ def _make_run(bound: BoundAdaRmsFp8Chain):
 
     kperm = bound.kperm
 
-    def run(x2d, cond, prefix_kv):
-        for l, (pk, pv) in enumerate(prefix_kv):
-            # the chain's rotated pairs are adjacent; the host cached
-            # its prefix keys in rotate-half layout — gather them into
-            # the shared permutation so q·k stays layout-consistent
-            torch.index_select(pk, -1, kperm, out=b["kc"][l][0, :P, 0])
-            b["vc"][l][0, :P, 0].copy_(pv)
+    def run(x2d, cond, prefix_kv, copy_prefix=True):
+        if copy_prefix:
+            for l, (pk, pv) in enumerate(prefix_kv):
+                # the chain's rotated pairs are adjacent; the host
+                # cached its prefix keys in rotate-half layout —
+                # gather them into the shared permutation so q·k
+                # stays layout-consistent
+                torch.index_select(pk, -1, kperm,
+                                   out=b["kc"][l][0, :P, 0])
+                b["vc"][l][0, :P, 0].copy_(pv)
         st = torch.addmm(bound.style_b, cond.float(), bound.style_w_t)
         style_buf.copy_(st.view(n_norms, 1, 3 * D)
                           .expand(n_norms, S, 3 * D)
@@ -615,7 +622,14 @@ def bind_adarms_fp8_chain(model, root: str,
             k, v = _cache_kv(pkv, i)
             prefix.append((k[0, 0, :bound.p_used],
                            v[0, 0, :bound.p_used]))
-        return run(embs[0].to(torch.bfloat16), cond, prefix)
+        if capturing_now:
+            copy_prefix = not bound._was_capturing
+            bound._was_capturing = True
+        else:
+            bound._was_capturing = False
+            copy_prefix = True
+        return run(embs[0].to(torch.bfloat16), cond, prefix,
+                   copy_prefix=copy_prefix)
 
     def enable() -> None:
         stack.forward = types.MethodType(routed, stack)

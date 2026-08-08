@@ -290,12 +290,21 @@ def _vision_norm_variant(
 ) -> tuple[str | None, str]:
     """Classify the exact LayerNorm affine contract at a vision-FFN seam."""
     shape = getattr(norm, "normalized_shape", None)
+    if shape is None:
+        # a fused LayerNorm twin (host accelerator libraries swap these
+        # in) often drops ``normalized_shape`` while keeping the affine
+        # contract itself: a 1-D weight names the normalized width just
+        # as authoritatively, and the parity gates certify the math
+        weight = getattr(norm, "weight", None)
+        if weight is not None and getattr(weight, "ndim", 0) == 1:
+            shape = tuple(weight.shape)
     if isinstance(shape, int):
         shape = (shape,)
     try:
         shape = tuple(shape)
     except TypeError:
-        return None, "norm has no LayerNorm normalized_shape contract"
+        return None, ("norm has no LayerNorm shape contract "
+                      "(normalized_shape or 1-D affine weight)")
     if shape != (dim,) or not hasattr(norm, "eps"):
         return None, (
             f"norm shape/epsilon is not LayerNorm({dim}); got shape={shape}")
