@@ -44,6 +44,25 @@ NORM_SYMBOLS = ("rms_norm_quant_fp8_static_bf16",
 ROPE_SYMBOLS = ("qkv_split_rope_kvcache_bf16",)
 FFN_SYMBOLS = ("gate_geglu_merged_quant_fp8_static_bf16",
                "quantize_fp8_static_bf16")
+FP4_GEMM_PACKAGE = "flashrt/fp4-gemm"
+FP4_FUSE_PACKAGE = "flashrt/fp4-fused-ops"
+
+#: the band table IS the recipe (same convention as the decoder
+#: stack). The ``fp4`` row is the native encoder preset: the FFN pair
+#: and the attention output projection ride NVFP4 with dynamic block
+#: scales, QKV stays static FP8. The row qualifies when the fused
+#: GEGLU producer ships a bf16 entry and the FP4 GEMM accepts the
+#: prefix row band (a bind-time functional probe, not a device list).
+BANDS: dict[str, dict] = {
+    "fp8": {"packages": (), "precision_rank": 0},
+    "fp4": {"packages": (
+        (FP4_GEMM_PACKAGE, ("nvfp4_gemm_bias_bf16",
+                            "quantize_fp4_sfa_bf16")),
+        (FP4_FUSE_PACKAGE,
+         ("residual_add_rms_norm_quant_nvfp4_swizzled_bf16",
+          "gelu_mul_nvfp4_bf16"))),
+        "precision_rank": 1},
+}
 
 #: whole-tower smoke over hidden states and every layer's cached K/V
 #: — a min over ~37 tensors after 18 residual layers of static FP8,
@@ -77,12 +96,13 @@ def _load_fvk():
     return mod
 
 
-def missing_symbols() -> list[str]:
+def missing_symbols(band: str = "fp8") -> list[str]:
     gaps: list[str] = []
     for repo, symbols in ((GEMM_PACKAGE, GEMM_SYMBOLS),
                           (NORM_PACKAGE, NORM_SYMBOLS),
                           (ROPE_PACKAGE, ROPE_SYMBOLS),
-                          (FFN_PACKAGE, FFN_SYMBOLS)):
+                          (FFN_PACKAGE, FFN_SYMBOLS)
+                          ) + BANDS[band]["packages"]:
         try:
             kern = hub_kernel(repo, ">=1")
         except KernelUnavailable:
@@ -116,6 +136,7 @@ class BoundPrefillFp8Chain(GuardedSeam, torch.nn.Module):
         self.final_w = None
         self.cache_type = None
         self.kernels: dict = {}
+        self.band = "fp8"
         #: region wire (armed by autobuild): per-layer (k, v) sink
         #: views of a bound consumer's chain caches. The tower's K is
         #: already in chain layout (same split kernel, same adjacent-
@@ -181,6 +202,9 @@ def _build_rope(bound, stack, position_ids) -> bool:
 @torch.no_grad()
 def _quantize(bound, layers, amax) -> None:
     nh, kv, hd = (bound.dims[k] for k in ("nh", "kv", "hd"))
+    fp4 = BANDS[bound.band]["packages"] != ()
+    quant4 = (bound.kernels["kg4"].quantize_fp4_sfa_bf16
+              if fp4 else None)
     for i, ly in enumerate(layers):
         attn, mlp = ly.self_attn, ly.mlp
         a_qkv, a_o, a_gu, a_dn = (amax[(i, s)] / FP8_MAX for s in
@@ -200,6 +224,14 @@ def _quantize(bound, layers, amax) -> None:
                              ("o", attn.o_proj.weight, a_o),
                              ("gu", gu_w, a_gu),
                              ("dn", mlp.down_proj.weight, a_dn)):
+            if fp4 and name != "qkv":
+                # the native encoder preset: FFN pair and the output
+                # projection ride NVFP4 dynamic block scales
+                wp, wsf = quant4(
+                    w.detach().to("cuda", torch.bfloat16)
+                    .contiguous(), is_sfb=True)
+                entry[name] = (wp, wsf)
+                continue
             packed, w_scale = _fp8_weight(w)
             entry[name] = packed
             entry[f"a_{name}"] = act * w_scale
@@ -242,6 +274,16 @@ def _alloc(bound) -> None:
     b["seqused"] = torch.full((1,), bound.s_used, device=dev,
                               dtype=torch.int32)
     b["ones_w"] = torch.ones(D, device=dev, dtype=bf)
+    if BANDS[bound.band]["packages"] != ():
+        quant4 = bound.kernels["kg4"].quantize_fp4_sfa_bf16
+        b["zero_x"] = torch.zeros(S, D, device=dev, dtype=bf)
+        b["xp4"], b["xsf4"] = quant4(b["zero_x"])
+        b["op4"], b["osf4"] = quant4(
+            torch.zeros(S, nh * hd, device=dev, dtype=bf))
+        b["hp4"], b["hsf4"] = quant4(
+            torch.zeros(S, H, device=dev, dtype=bf))
+        b["zb"] = {n: torch.zeros(n, device=dev, dtype=bf)
+                   for n in (2 * H, D)}
     b["out_full"] = torch.zeros(bound.dims["seq_full"], D, device=dev,
                                 dtype=bf)
     b["att"] = torch.empty(1, S, nh, hd, device=dev, dtype=bf)
@@ -265,6 +307,46 @@ def _make_run(bound: BoundPrefillFp8Chain):
     kh = b["kc"][0].view(S, hd)
 
     gemm = bound.kernels["gemm"]
+
+    if BANDS[bound.band]["packages"] != ():
+        kg4 = bound.kernels["kg4"]
+        kf4 = bound.kernels["kf4"]
+        gemm4 = kg4.nvfp4_gemm_bias_bf16
+        quant4 = kg4.quantize_fp4_sfa_bf16
+        geglu4 = kf4.gelu_mul_nvfp4_bf16
+        norm4 = kf4.residual_add_rms_norm_quant_nvfp4_swizzled_bf16
+        xp4, xsf4 = b["xp4"], b["xsf4"]
+        op4, osf4 = b["op4"], b["osf4"]
+        hp4, hsf4 = b["hp4"], b["hsf4"]
+        zb = b["zb"]
+
+        def out_project(att2, e):
+            quant4(att2, op4, osf4)
+            gemm4(op4, e["o"][0], osf4, e["o"][1], zb[D], out=b["fg"])
+
+        def ffn_project(res, e):
+            # x=0 keeps the residual untouched; the producer emits
+            # rms(res) straight to packed FP4 for the gate/up GEMM
+            norm4(res, b["zero_x"], b["ones_w"], eps,
+                  packed=xp4, sfa=xsf4)
+            gemm4(xp4, e["gu"][0], xsf4, e["gu"][1], zb[2 * H],
+                  out=b["gu"])
+            geglu4(b["gu"], packed=hp4, sfa=hsf4)
+            gemm4(hp4, e["dn"][0], hsf4, e["dn"][1], zb[D],
+                  out=b["fg"])
+    else:
+        def out_project(att2, e):
+            kf.quantize_fp8_static_bf16(att2, e["t_sc_o"],
+                                        out=b["o8"])
+            gemm(e, "o", b["o8"], b["fg"])
+
+        def ffn_project(res, e):
+            kn.rms_norm_quant_fp8_static_bf16(
+                res, b["ones_w"], e["sc_gu"], eps, out=b["xn8"])
+            gemm(e, "gu", b["xn8"], b["gu"])
+            kf.gate_geglu_merged_quant_fp8_static_bf16(
+                b["gu"], e["t_sc_dn"], out=b["hid8"])
+            gemm(e, "dn", b["hid8"], b["fg"])
 
     rf = torch.profiler.record_function
 
@@ -300,16 +382,9 @@ def _make_run(bound: BoundPrefillFp8Chain):
             with rf("pf:attn"):
                 att2 = attend(l)
             with rf("pf:o"):
-                kf.quantize_fp8_static_bf16(att2, e["t_sc_o"],
-                                            out=b["o8"])
-                gemm(e, "o", b["o8"], b["fg"])
+                out_project(att2, e)
                 res.add_(b["fg"])
-            kn.rms_norm_quant_fp8_static_bf16(
-                res, b["ones_w"], e["sc_gu"], eps, out=b["xn8"])
-            gemm(e, "gu", b["xn8"], b["gu"])
-            kf.gate_geglu_merged_quant_fp8_static_bf16(
-                b["gu"], e["t_sc_dn"], out=b["hid8"])
-            gemm(e, "dn", b["hid8"], b["fg"])
+            ffn_project(res, e)
             if l < L - 1:
                 nxt = table[l + 1]
                 kn.residual_add_rms_norm_quant_fp8_static_bf16(
@@ -329,17 +404,22 @@ def _make_run(bound: BoundPrefillFp8Chain):
 
 
 def bind_prefill_fp8_chain(model, root: str,
-                           probe: Callable[[], Any]) -> dict:
+                           probe: Callable[[], Any],
+                           band: str = "fp8") -> dict:
     """Bind the chain onto the tower at ``root``; adapter contract out."""
     try:
         kg = hub_kernel(GEMM_PACKAGE, ">=1")
         kn = hub_kernel(NORM_PACKAGE, ">=1")
         kr = hub_kernel(ROPE_PACKAGE, ">=1")
         kf = hub_kernel(FFN_PACKAGE, ">=1")
+        kg4 = kf4 = None
+        if BANDS[band]["packages"]:
+            kg4 = hub_kernel(FP4_GEMM_PACKAGE, ">=1")
+            kf4 = hub_kernel(FP4_FUSE_PACKAGE, ">=1")
     except KernelUnavailable as exc:
-        return {"refused": f"prefill_fp8_chain: {exc}"}
+        return {"refused": f"prefill_{band}_chain: {exc}"}
     rungs = _attention_rungs()
-    gaps = missing_symbols()
+    gaps = missing_symbols(band=band)
     if gaps:
         return {"refused": "prefill_fp8_chain missing: "
                            f"{', '.join(gaps)}"}
@@ -365,7 +445,9 @@ def bind_prefill_fp8_chain(model, root: str,
                            "affine RMS norm"}
 
     bound = BoundPrefillFp8Chain()
-    bound.kernels = {"kg": kg, "kn": kn, "kr": kr, "kf": kf}
+    bound.kernels = {"kg": kg, "kn": kn, "kr": kr, "kf": kf,
+                     "kg4": kg4, "kf4": kf4}
+    bound.band = band
     bound.scaling = scalings.pop()
     bound.dims = {"nh": nh, "kv": kv, "hd": hd, "dim": dim,
                   "hidden": hidden, "layers": len(layers)}

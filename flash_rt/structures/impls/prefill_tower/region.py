@@ -70,14 +70,24 @@ def _bind(model, root, probe):
     return fp8_chain.bind_prefill_fp8_chain(model, root, probe)
 
 
+def _band_candidate(band: str, row: dict) -> regions.RegionCandidate:
+    return regions.RegionCandidate(
+        name=f"{band}_chain",
+        missing=lambda band=band: fp8_chain.missing_symbols(band=band),
+        bind=lambda model, root, probe, band=band:
+            fp8_chain.bind_prefill_fp8_chain(model, root, probe,
+                                             band=band),
+        precision_rank=row["precision_rank"],
+    )
+
+
+#: candidates generate from the band table — a precision band is a
+#: table row in the chain module, never new wiring here
 FAMILY = regions.RegionFamily(
     family="prefill_tower",
     identify=identify,
-    candidates=[regions.RegionCandidate(
-        name="fp8_chain",
-        missing=fp8_chain.missing_symbols,
-        bind=_bind,
-    )],
+    candidates=[_band_candidate(band, row)
+                for band, row in fp8_chain.BANDS.items()],
 )
 
 
