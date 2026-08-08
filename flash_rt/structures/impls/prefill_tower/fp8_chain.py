@@ -34,12 +34,13 @@ from ..adarms_stack.fp8_chain import (
 GEMM_PACKAGE = "flashrt/fp8-gemm"
 NORM_PACKAGE = "flashrt/flashrt-residual-norm-quant"
 ROPE_PACKAGE = "flashrt/flashrt-qkv-cache-rope"
-FFN_PACKAGE = "flashrt/flashrt-fp8-swiglu-ffn"
+FFN_PACKAGE = "flashrt/transformer-fused-ops"
 GEMM_SYMBOLS = ("fp8_linear_bf16",)
 NORM_SYMBOLS = ("rms_norm_quant_fp8_static_bf16",
                 "residual_add_rms_norm_quant_fp8_static_bf16")
 ROPE_SYMBOLS = ("qkv_split_rope_kvcache_bf16",)
-FFN_SYMBOLS = ("fp8_geglu_mlp_bf16",)
+FFN_SYMBOLS = ("gate_geglu_merged_quant_fp8_static_bf16",
+               "quantize_fp8_static_bf16")
 
 #: whole-tower smoke over hidden states and every layer's cached K/V
 #: — a min over ~37 tensors after 18 residual layers of static FP8,
@@ -205,6 +206,7 @@ def _quantize(bound, layers, amax) -> None:
         entry["t_wsc_gu"] = _t(entry["a_gu"] / a_gu)
         entry["t_sc_dn"] = _t(a_dn)
         entry["t_wsc_dn"] = _t(entry["a_dn"] / a_dn)
+        entry["t_sc_o"] = _t(a_o)
         bound.table.append(entry)
 
 
@@ -224,6 +226,10 @@ def _alloc(bound) -> None:
     b["vc"] = [vc] * L
     b["fg"] = torch.empty(S, D, device=dev, dtype=bf)
     b["gu"] = torch.empty(S, 2 * H, device=dev, dtype=bf)
+    b["hid8"] = torch.empty(S, H, device=dev,
+                            dtype=torch.float8_e4m3fn)
+    b["o8"] = torch.empty(S, nh * hd, device=dev,
+                          dtype=torch.float8_e4m3fn)
     b["seqused"] = torch.full((1,), bound.s_used, device=dev,
                               dtype=torch.int32)
     b["ones_w"] = torch.ones(D, device=dev, dtype=bf)
@@ -249,6 +255,8 @@ def _make_run(bound: BoundPrefillFp8Chain):
 
     gemm = bound.kernels["gemm"]
 
+    rf = torch.profiler.record_function
+
     def run(x2d, pkv):
         res = b["res"]
         res.copy_(x2d)
@@ -258,20 +266,26 @@ def _make_run(bound: BoundPrefillFp8Chain):
                 kn.rms_norm_quant_fp8_static_bf16(
                     res, b["ones_w"], e["sc_qkv"], eps, out=b["xn8"])
             gemm(e, "qkv", b["xn8"], b["qkv"])
-            kr.qkv_split_rope_kvcache_bf16(
-                qkv3, bound.rope, nh, kv, hd, 0, q_out=b["q"],
-                k_cache=b["kc"][0], v_cache=b["vc"][0], max_seq_len=S)
+            with rf("pf:rope"):
+                kr.qkv_split_rope_kvcache_bf16(
+                    qkv3, bound.rope, nh, kv, hd, 0, q_out=b["q"],
+                    k_cache=b["kc"][0], v_cache=b["vc"][0],
+                    max_seq_len=S)
             if pkv is not None:
                 # fresh tensors per layer: the cache keeps references,
                 # and the shared buffers are overwritten next layer
-                k_host = torch.index_select(kh, -1, kperm_inv)
-                pkv.update(k_host.view(1, 1, S, hd),
-                           b["vc"][0].reshape(1, 1, S, hd).clone(), l)
-            att2 = attend(l)
-            o8 = (att2.float() * e["inv_o"]).clamp(
-                -FP8_MAX, FP8_MAX).to(fp8)
-            gemm(e, "o", o8, b["fg"])
-            res.add_(b["fg"])
+                with rf("pf:cache"):
+                    k_host = torch.index_select(kh, -1, kperm_inv)
+                    pkv.update(k_host.view(1, 1, S, hd),
+                               b["vc"][0].reshape(1, 1, S, hd)
+                               .clone(), l)
+            with rf("pf:attn"):
+                att2 = attend(l)
+            with rf("pf:o"):
+                kf.quantize_fp8_static_bf16(att2, e["t_sc_o"],
+                                            out=b["o8"])
+                gemm(e, "o", b["o8"], b["fg"])
+                res.add_(b["fg"])
             kn.rms_norm_quant_fp8_static_bf16(
                 res, b["ones_w"], e["sc_gu"], eps, out=b["xn8"])
             gemm(e, "gu", b["xn8"], b["gu"])

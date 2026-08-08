@@ -43,6 +43,9 @@ ROPE_PACKAGE = "flashrt/flashrt-qkv-cache-rope"
 GEMM_SYMBOLS = ("fp8_linear_bf16",)
 NORM_SYMBOLS = ("gate_residual_ada_norm_fp8_static_bf16",)
 ROPE_SYMBOLS = ("qkv_split_rope_kvcache_bf16",)
+FUSE_PACKAGE = "flashrt/transformer-fused-ops"
+FUSE_SYMBOLS = ("gate_geglu_merged_quant_fp8_static_bf16",
+                "quantize_fp8_static_bf16")
 
 #: the attention element resolves per host: the house CuTe FA4
 #: runtime first — it carries the D256 2CTA forward this stack's
@@ -80,7 +83,8 @@ def missing_symbols() -> list[str]:
     gaps: list[str] = []
     for repo, symbols in ((GEMM_PACKAGE, GEMM_SYMBOLS),
                           (NORM_PACKAGE, NORM_SYMBOLS),
-                          (ROPE_PACKAGE, ROPE_SYMBOLS)):
+                          (ROPE_PACKAGE, ROPE_SYMBOLS),
+                          (FUSE_PACKAGE, FUSE_SYMBOLS)):
         try:
             kern = hub_kernel(repo, ">=1")
         except KernelUnavailable:
@@ -209,6 +213,10 @@ def _quantize(bound: BoundAdaRmsFp8Chain, layers, amax: dict) -> None:
                                       dtype=torch.float32)
         entry["inv_o"] = 1.0 / a_o if a_o > 0 else 1.0
         entry["inv_dn"] = 1.0 / a_dn if a_dn > 0 else 1.0
+        entry["t_sc_o"] = torch.tensor([a_o], device="cuda",
+                                       dtype=torch.float32)
+        entry["t_sc_dn"] = torch.tensor([a_dn], device="cuda",
+                                        dtype=torch.float32)
         bound.table.append(entry)
 
 
@@ -282,6 +290,10 @@ def _alloc(bound: BoundAdaRmsFp8Chain) -> None:
     b["qkv"] = torch.empty(S, (nh + 2 * kv) * hd, device=dev, dtype=bf)
     b["q"] = torch.empty(1, S, nh, hd, device=dev, dtype=bf)
     b["gu"] = torch.empty(S, 2 * H, device=dev, dtype=bf)
+    b["hid8"] = torch.empty(S, H, device=dev,
+                            dtype=torch.float8_e4m3fn)
+    b["o8"] = torch.empty(S, nh * hd, device=dev,
+                          dtype=torch.float8_e4m3fn)
     b["kc"] = [torch.zeros(1, T, kv, hd, device=dev, dtype=bf)
                for _ in range(L)]
     b["vc"] = [torch.zeros(1, T, kv, hd, device=dev, dtype=bf)
@@ -319,6 +331,7 @@ def _make_run(bound: BoundAdaRmsFp8Chain):
     kg = bound.kernels["kg"]
     kn = bound.kernels["kn"]
     kr = bound.kernels["kr"]
+    kf = bound.kernels["kf"]
     attend = bound.kernels["attend"]
     S, D, nh, kv, hd, H, L = (bound.dims[k] for k in
                               ("seq", "dim", "nh", "kv", "hd",
@@ -332,22 +345,31 @@ def _make_run(bound: BoundAdaRmsFp8Chain):
 
     kperm = bound.kperm
 
+    rf = torch.profiler.record_function
+
     def run(x2d, cond, prefix_kv):
-        for l, (pk, pv) in enumerate(prefix_kv):
-            # the chain's rotated pairs are adjacent; the host cached
-            # its prefix keys in rotate-half layout — gather them into
-            # the shared permutation so q·k stays layout-consistent
-            torch.index_select(pk, -1, kperm, out=b["kc"][l][0, :P, 0])
-            b["vc"][l][0, :P, 0].copy_(pv)
+        with rf("ad:prefix"):
+            for l, (pk, pv) in enumerate(prefix_kv):
+                # rotated pairs are adjacent; the host cached prefix
+                # keys in rotate-half layout — gather them into the
+                # shared permutation so q·k stays layout-consistent
+                torch.index_select(pk, -1, kperm,
+                                   out=b["kc"][l][0, :P, 0])
+                b["vc"][l][0, :P, 0].copy_(pv)
         # nearest-neighbour step resolution, fully on-device: the
         # schedule is a bind-time fact, so the live conditioning names
         # its baked table without a host round-trip or Python state
-        step = (bound.step_conds - cond.float()).abs().sum(-1).argmin()
-        styles = bound.style_table.index_select(0, step.view(1))[0]
-        fin = bound.fin_table.index_select(0, step.view(1))[0]
+        with rf("ad:style"):
+            step = (bound.step_conds
+                    - cond.float()).abs().sum(-1).argmin()
+            styles = bound.style_table.index_select(
+                0, step.view(1))[0]
+            fin = bound.fin_table.index_select(0, step.view(1))[0]
         res = b["res"]
         res.copy_(x2d)
         delta, gate = b["zero"], b["zero"]
+        rf_layers = rf("ad:layers")
+        rf_layers.__enter__()
         for l in range(L):
             e = table[l]
             kn.gate_residual_ada_norm_fp8_static_bf16(
@@ -359,24 +381,26 @@ def _make_run(bound: BoundAdaRmsFp8Chain):
                 qkv3, bound.rope, nh, kv, hd, P, q_out=b["q"],
                 k_cache=b["kc"][l], v_cache=b["vc"][l], max_seq_len=T)
             att2 = attend(l)
-            o8 = (att2.float() * e["inv_o"]).clamp(
-                -FP8_MAX, FP8_MAX).to(fp8)
-            kg.fp8_linear_bf16(o8, e["o"], alpha=e["a_o"], out=b["dn"])
+            kf.quantize_fp8_static_bf16(att2, e["t_sc_o"],
+                                        out=b["o8"])
+            kg.fp8_linear_bf16(b["o8"], e["o"], alpha=e["a_o"],
+                               out=b["dn"])
             kn.gate_residual_ada_norm_fp8_static_bf16(
                 res, b["dn"], b["g1"], b["ones_w"], styles[2 * l + 1],
                 e["sc_gu"], eps, out=b["xn8"], gate_out=b["g2"])
             kg.fp8_linear_bf16(b["xn8"], e["gu"], alpha=e["a_gu"],
                                out=b["gu"])
-            hid = torch.nn.functional.gelu(
-                b["gu"][:, :H].float(), approximate="tanh") \
-                * b["gu"][:, H:].float()
-            h8 = (hid * e["inv_dn"]).clamp(-FP8_MAX, FP8_MAX).to(fp8)
-            kg.fp8_linear_bf16(h8, e["dn"], alpha=e["a_dn"], out=b["dn"])
+            kf.gate_geglu_merged_quant_fp8_static_bf16(
+                b["gu"], e["t_sc_dn"], out=b["hid8"])
+            kg.fp8_linear_bf16(b["hid8"], e["dn"], alpha=e["a_dn"],
+                               out=b["dn"])
             delta, gate = b["dn"], b["g2"]
-        res = res.float() + gate.float() * delta.float()
-        normed = res * torch.rsqrt(
-            res.square().mean(-1, keepdim=True) + eps)
-        out = (normed * (1 + fin[0]) + fin[1]).to(torch.bfloat16)
+        rf_layers.__exit__(None, None, None)
+        with rf("ad:tail"):
+            res = res.float() + gate.float() * delta.float()
+            normed = res * torch.rsqrt(
+                res.square().mean(-1, keepdim=True) + eps)
+            out = (normed * (1 + fin[0]) + fin[1]).to(torch.bfloat16)
         return bound.out_ctor(last_hidden_state=out.view(1, S, D),
                               past_key_values=None)
 
@@ -398,6 +422,7 @@ def bind_adarms_fp8_chain(model, root: str,
         kg = hub_kernel(GEMM_PACKAGE, ">=1")
         kn = hub_kernel(NORM_PACKAGE, ">=1")
         kr = hub_kernel(ROPE_PACKAGE, ">=1")
+        kf = hub_kernel(FUSE_PACKAGE, ">=1")
     except KernelUnavailable as exc:
         return {"refused": f"adarms_fp8_chain: {exc}"}
     rungs = _attention_rungs()
@@ -419,7 +444,7 @@ def bind_adarms_fp8_chain(model, root: str,
                            "scaling differs"}
 
     bound = BoundAdaRmsFp8Chain()
-    bound.kernels = {"kg": kg, "kn": kn, "kr": kr}
+    bound.kernels = {"kg": kg, "kn": kn, "kr": kr, "kf": kf}
     bound.scaling = scalings.pop()
     bound.dims = {"nh": nh, "kv": kv, "hd": hd, "dim": dim,
                   "hidden": hidden, "layers": len(layers)}
