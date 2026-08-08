@@ -103,6 +103,7 @@ class _MoESeat(nn.Module):
         self.host = host
         self.host_internal = bool(getattr(host, "is_internal_router", False))
         self.is_internal_router = False   # the host block branches on this
+        self._frt_host_serving = True     # prefill band runs through host
         self.idx = len(_SEATS_BY_IDX)
         _SEATS_BY_IDX[self.idx] = self
 

@@ -86,7 +86,7 @@ def _dense_weight(module):
 
 
 def attach_engine(model, *, seats=DENSE_SEAT_SUFFIXES, use_gemv=None,
-                  verbose=True):
+                  release=False, verbose=True):
     """Seat an SGLang model's dense projections; returns the handle."""
     from .. import swap as _swap
     from ..impls.linear_proj import nvfp4_dynamic as _linear
@@ -102,23 +102,51 @@ def attach_engine(model, *, seats=DENSE_SEAT_SUFFIXES, use_gemv=None,
             self._gemv = None
         _linear.LinearProjNvfp4Dynamic.__init__ = _init
 
-    swaps, refused = {}, []
+    refused = []
     targets = [(n, m) for n, m in model.named_modules()
                if any(n.endswith(s) for s in seats) and _is_projection(m)]
     targets.sort(key=lambda t: t[1].weight.numel())
+    model.eval()
+
+    # On a tight card the relief must land while binding continues, not
+    # after it: with release, seats attach in slabs of original bytes
+    # and each slab's originals move to the weight store before the
+    # next slab binds. Without release, one handle carries everything.
+    GROUP = 512 << 20
+    handles, swaps, group_bytes, seated = [], {}, 0, 0
+
+    def flush():
+        nonlocal swaps, group_bytes, seated
+        if not swaps:
+            return
+        handle = _swap.attach(model, swaps)
+        if release:
+            handle.consume()
+        handles.append(handle)
+        seated += len(swaps)
+        swaps, group_bytes = {}, 0
+
     for name, mod in targets:
         try:
             seam, _ = _linear.bind_proj_seam({"w": _dense_weight(mod)})
-            swaps[name] = _ProjSeat(seam)
         except Exception as e:
+            if not refused:
+                print(f"[structures.sglang] first refusal {name}: "
+                      f"{e!r}"[:180], flush=True)
             refused.append((name, repr(e)[:120]))
-    model.eval()
-    handle = _swap.attach(model, swaps)
+            continue
+        swaps[name] = _ProjSeat(seam)
+        group_bytes += mod.weight.numel() * mod.weight.element_size()
+        if release and group_bytes >= GROUP:
+            flush()
+    flush()
     if verbose:
-        print(f"[structures.sglang] {len(swaps)} seats, "
-              f"{len(refused)} refused", flush=True)
-    handle.notes = {"refused": refused}
-    return handle
+        print(f"[structures.sglang] {seated} seats "
+              f"({len(handles)} handles), {len(refused)} refused",
+              flush=True)
+    for h in handles:
+        h.notes = {"refused": refused}
+    return handles if len(handles) != 1 else handles[0]
 
 
 def _patch_runner():
@@ -132,7 +160,8 @@ def _patch_runner():
         seats = tuple(s for s in os.environ.get(_SEATS_VAR, "").split(",")
                       if s) or DENSE_SEAT_SUFFIXES
         try:
-            attach_engine(self.model, seats=seats)
+            attach_engine(self.model, seats=seats,
+                          release=os.environ.get("FRT_SGLANG_RELEASE") == "1")
         except Exception as e:
             print(f"[structures.sglang] attach refused: {e!r}", flush=True)
     mr.ModelRunner.load_model = load_model
@@ -151,7 +180,7 @@ if os.environ.get({flag!r}) == "1":
 """
 
 
-def install(*, seats=None, structures_path=None):
+def install(*, seats=None, structures_path=None, release=False):
     """Arm the spawn hook; call before constructing the engine.
 
     Writes a ``sitecustomize`` into a temporary directory, prepends it
@@ -167,6 +196,8 @@ def install(*, seats=None, structures_path=None):
     os.environ[_ATTACH_FLAG] = "1"
     if seats:
         os.environ[_SEATS_VAR] = ",".join(seats)
+    if release:
+        os.environ["FRT_SGLANG_RELEASE"] = "1"
     prev = os.environ.get("PYTHONPATH", "")
     os.environ["PYTHONPATH"] = (hook_dir + (":" + prev if prev else ""))
     # the launcher itself may import sitecustomize-late; patch it too so
