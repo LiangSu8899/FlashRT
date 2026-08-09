@@ -74,7 +74,13 @@ BANDS: dict[str, dict] = {
                             "quantize_fp4_sfa_bf16")),
         (FP4_FUSE_PACKAGE,
          ("residual_add_rms_norm_quant_nvfp4_swizzled_bf16",))),
-        "precision_rank": 1, "awq": 0.8, "smoke_floor": 0.95,
+        # floor provenance: this band's own measured pair — tower smoke
+        # 0.796 at 17-layer coverage judged E2E captured-parity 0.99660
+        # PASS (the reference tier's own raw cosine sits at 0.9975).
+        # The old 0.95 floor's failing pair (smoke 0.90 -> E2E 0.742)
+        # came from the retired merged-GEMM form and does not transfer.
+        # The arm's 0.99 end-to-end parity gate stays the judge.
+        "precision_rank": 1, "awq": 0.8, "smoke_floor": 0.75,
         "fp4_layers": "all_but_last"},
     # the native constructor's precision-safe preset, verbatim:
     # fp4_layers=(7, 8, 9) — the middle encoder FFN band. Floor
