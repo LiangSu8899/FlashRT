@@ -62,6 +62,35 @@ BANDS: dict[str, dict] = {
          ("residual_add_rms_norm_quant_nvfp4_swizzled_bf16",
           "gelu_mul_nvfp4_bf16"))),
         "precision_rank": 1, "awq": 0.8, "smoke_floor": 0.95},
+    # the native published-tier P1 form (epilogue_hw): the gate/up
+    # weight is pairwise row-interleaved with the down-projection's AWQ
+    # 1/s folded into the up rows at pack time, ONE GEMM computes
+    # gelu(gate)*up in the epilogue and writes the down GEMM's packed
+    # FP4 input directly — the bf16 hidden intermediate, its quantize
+    # round-trip, and the separate combiner all leave the chain
+    "fp4_p1": {"packages": (
+        (FP4_GEMM_PACKAGE, ("nvfp4_gemm_bias_bf16",
+                            "cutlass_fp4_gemm_geglu_il_hw_v10",
+                            "quantize_fp4_sfa_bf16")),
+        (FP4_FUSE_PACKAGE,
+         ("residual_add_rms_norm_quant_nvfp4_swizzled_bf16",))),
+        "precision_rank": 1, "awq": 0.8, "smoke_floor": 0.95,
+        "fp4_layers": "all_but_last"},
+    # the native constructor's precision-safe preset, verbatim:
+    # fp4_layers=(7, 8, 9) — the middle encoder FFN band. Floor
+    # calibrated per coverage (the gate scales with layer count):
+    # measured smoke 0.938 at 3-layer coverage judged E2E
+    # captured-parity 0.99828 PASS, while the 0.95 floor's provenance
+    # (smoke 0.90 -> E2E 0.742) came from a 15-layer arm and does not
+    # transfer to a 3-layer preset.
+    "fp4_p1_mid": {"packages": (
+        (FP4_GEMM_PACKAGE, ("nvfp4_gemm_bias_bf16",
+                            "cutlass_fp4_gemm_geglu_il_hw_v10",
+                            "quantize_fp4_sfa_bf16")),
+        (FP4_FUSE_PACKAGE,
+         ("residual_add_rms_norm_quant_nvfp4_swizzled_bf16",))),
+        "precision_rank": 1, "awq": 0.8, "smoke_floor": 0.92,
+        "fp4_layers": (7, 8, 9)},
 }
 
 #: whole-tower smoke over hidden states and every layer's cached K/V
@@ -200,6 +229,24 @@ def _build_rope(bound, stack, position_ids) -> bool:
 
 
 @torch.no_grad()
+def _interleave_gu_rows(g16: torch.Tensor, u16: torch.Tensor,
+                        inv_s_dn: torch.Tensor | None = None
+                        ) -> torch.Tensor:
+    """Pairwise interleave gate/up rows along N for the fused GeGLU
+    epilogue GEMM (il[2j] = gate[j], il[2j+1] = up[j]) — the native
+    pack, verbatim. Any per-output-column scale must live in the
+    weights because the epilogue applies no per-column vector; the
+    down-projection AWQ inv_s is folded into the up rows
+    (gelu(g) * u * inv_s == gelu(g) * (u * inv_s))."""
+    if inv_s_dn is not None:
+        u16 = (u16.float() * inv_s_dn.float().unsqueeze(1)).to(u16.dtype)
+    il = torch.empty(2 * g16.shape[0], g16.shape[1],
+                     dtype=g16.dtype, device=g16.device)
+    il[0::2] = g16
+    il[1::2] = u16
+    return il.contiguous()
+
+
 def _awq_scale(chan_amax: torch.Tensor, alpha: float) -> torch.Tensor:
     """The native per-input-channel AWQ pre-scale, verbatim:
     ``s = (a / a.mean())^alpha`` clamped to [0.25, 4]. The GEMM columns
@@ -221,14 +268,23 @@ def _quantize(bound, layers, amax, chan=None) -> None:
     # outlier stays on the calibrated FP8 form; the receipt records
     # which layers rode the band
     import os as _os3
-    outlier = float(_os3.environ.get("FRT_PREFILL_FP4_OUTLIER", "20"))
     skip: set = set()
-    if fp4 and chan is not None:
-        for i in range(len(layers)):
-            v = chan.get((i, "dn"))
-            if v is not None and float(v.max()) > outlier * float(
-                    v.median()):
-                skip.add(i)
+    preset = BANDS[bound.band].get("fp4_layers")
+    if preset == "all_but_last":
+        # the native published-tier preset: fp4_layers = range(17) —
+        # every layer except the last rides FP4, no data-driven subset
+        skip = {len(layers) - 1}
+    elif preset is not None:
+        skip = set(range(len(layers))) - set(preset)
+    else:
+        outlier = float(_os3.environ.get("FRT_PREFILL_FP4_OUTLIER",
+                                         "20"))
+        if fp4 and chan is not None:
+            for i in range(len(layers)):
+                v = chan.get((i, "dn"))
+                if v is not None and float(v.max()) > outlier * float(
+                        v.median()):
+                    skip.add(i)
     bound.dims["fp4_skipped"] = sorted(skip)
     for i, ly in enumerate(layers):
         attn, mlp = ly.self_attn, ly.mlp
@@ -256,6 +312,7 @@ def _quantize(bound, layers, amax, chan=None) -> None:
                 # gu's 1/s by the norm producer's weight vector, dn's
                 # 1/s by the up rows it multiplies through
                 wq = w.detach().float().to("cuda")
+                il_hw = BANDS[bound.band].get("fp4_layers") is not None
                 if alpha and name == "gu" and chan is not None:
                     H = wq.shape[0] // 2
                     s_gu = _awq_scale(chan[(i, "gu")], alpha)
@@ -263,21 +320,36 @@ def _quantize(bound, layers, amax, chan=None) -> None:
                     entry["inv_s_gu"] = (1.0 / s_gu).to(
                         torch.bfloat16).contiguous()
                     s_dn = _awq_scale(chan[(i, "dn")], alpha)
-                    wq[H:] = wq[H:] / s_dn[:, None]
+                    if il_hw:
+                        # native il pack: dn's 1/s folds into the up
+                        # rows at interleave time, not at runtime
+                        entry["inv_s_dn"] = (1.0 / s_dn).to(
+                            torch.float16).contiguous()
+                    else:
+                        wq[H:] = wq[H:] / s_dn[:, None]
                     entry["s_dn"] = s_dn
                 if alpha and name == "dn" and chan is not None:
                     wq = wq * entry["s_dn"][None, :]
-                mse = getattr(bound.kernels["kg4"],
-                              "quantize_fp4_sfa_mse_fp16", None)
-                if mse is not None:
-                    # the native weight path: per-block MSE scales
-                    wp, wsf = mse(wq.to(torch.float16).contiguous(),
+                mse = (None if il_hw else
+                       getattr(bound.kernels["kg4"],
+                               "quantize_fp4_sfa_mse_fp16", None))
+
+                def _pack_fp4(mat):
+                    if mse is not None:
+                        # the archived fp4 band's per-block MSE scales;
+                        # the native published tier quantizes plain RTN
+                        return mse(mat.to(torch.float16).contiguous(),
+                                   is_sfb=True)
+                    return quant4(mat.to(torch.bfloat16).contiguous(),
                                   is_sfb=True)
-                else:
-                    wp, wsf = quant4(
-                        wq.to(torch.bfloat16).contiguous(),
-                        is_sfb=True)
-                entry[name] = (wp, wsf)
+
+                if il_hw and name == "gu":
+                    H = wq.shape[0] // 2
+                    entry["gu_il"] = _pack_fp4(_interleave_gu_rows(
+                        wq[:H].contiguous(), wq[H:].contiguous(),
+                        entry.get("inv_s_dn")))
+                    continue
+                entry[name] = _pack_fp4(wq)
                 continue
             packed, w_scale = _fp8_weight(w)
             entry[name] = packed
@@ -333,6 +405,9 @@ def _alloc(bound) -> None:
             torch.zeros(S, H, device=dev, dtype=bf))
         b["zb"] = {n: torch.zeros(n, device=dev, dtype=bf)
                    for n in (2 * H, D)}
+        if BANDS[bound.band].get("fp4_layers") is not None:
+            b["il_scratch"] = torch.empty(S, H, device=dev,
+                                          dtype=torch.uint8)
     b["out_full"] = torch.zeros(bound.dims["seq_full"], D, device=dev,
                                 dtype=bf)
     b["att"] = torch.empty(1, S, nh, hd, device=dev, dtype=bf)
@@ -362,7 +437,6 @@ def _make_run(bound: BoundPrefillFp8Chain):
         kf4 = bound.kernels["kf4"]
         gemm4 = kg4.nvfp4_gemm_bias_bf16
         quant4 = kg4.quantize_fp4_sfa_bf16
-        geglu4 = kf4.gelu_mul_nvfp4_bf16
         norm4 = kf4.residual_add_rms_norm_quant_nvfp4_swizzled_bf16
         xp4, xsf4 = b["xp4"], b["xsf4"]
         op4, osf4 = b["op4"], b["osf4"]
@@ -378,28 +452,50 @@ def _make_run(bound: BoundPrefillFp8Chain):
             quant4(att2, op4, osf4)
             gemm4(op4, e["o"][0], osf4, e["o"][1], zb[D], out=b["fg"])
 
-        def ffn_project(res, e):
-            if not isinstance(e["gu"], tuple):
-                # an outlier layer kept on the calibrated FP8 form
-                kn.rms_norm_quant_fp8_static_bf16(
-                    res, b["ones_w"], e["sc_gu"], eps, out=b["xn8"])
-                gemm(e, "gu", b["xn8"], b["gu"])
-                kf.gate_geglu_merged_quant_fp8_static_bf16(
-                    b["gu"], e["t_sc_dn"], out=b["hid8"])
-                gemm(e, "dn", b["hid8"], b["fg"])
-                return
-            # x=0 keeps the residual untouched; the producer emits
-            # rms(res) straight to packed FP4 for the gate/up GEMM.
-            # Its weight vector doubles as the AWQ 1/s carrier.
-            w_gu = e.get("inv_s_gu")
-            norm4(res, b["zero_x"],
-                  w_gu if w_gu is not None else b["ones_w"], eps,
-                  packed=xp4, sfa=xsf4)
-            gemm4(xp4, e["gu"][0], xsf4, e["gu"][1], zb[2 * H],
-                  out=b["gu"])
-            geglu4(b["gu"], packed=hp4, sfa=hsf4)
-            gemm4(hp4, e["dn"][0], hsf4, e["dn"][1], zb[D],
-                  out=b["fg"])
+        def _ffn_fp8(res, e):
+            # an outlier layer kept on the calibrated FP8 form
+            kn.rms_norm_quant_fp8_static_bf16(
+                res, b["ones_w"], e["sc_gu"], eps, out=b["xn8"])
+            gemm(e, "gu", b["xn8"], b["gu"])
+            kf.gate_geglu_merged_quant_fp8_static_bf16(
+                b["gu"], e["t_sc_dn"], out=b["hid8"])
+            gemm(e, "dn", b["hid8"], b["fg"])
+
+        if BANDS[bound.band].get("fp4_layers") is not None:
+            geglu_hw = kg4.cutlass_fp4_gemm_geglu_il_hw_v10
+            il_scr = b["il_scratch"]
+
+            def ffn_project(res, e):
+                if "gu_il" not in e:
+                    _ffn_fp8(res, e)
+                    return
+                w_gu = e.get("inv_s_gu")
+                norm4(res, b["zero_x"],
+                      w_gu if w_gu is not None else b["ones_w"], eps,
+                      packed=xp4, sfa=xsf4)
+                geglu_hw(xp4, e["gu_il"][0], xsf4, e["gu_il"][1],
+                         scratch=il_scr, out_packed=hp4, out_sfa=hsf4)
+                gemm4(hp4, e["dn"][0], hsf4, e["dn"][1], zb[D],
+                      out=b["fg"])
+        else:
+            geglu4 = kf4.gelu_mul_nvfp4_bf16
+
+            def ffn_project(res, e):
+                if not isinstance(e.get("gu"), tuple):
+                    _ffn_fp8(res, e)
+                    return
+                # x=0 keeps the residual untouched; the producer emits
+                # rms(res) straight to packed FP4 for the gate/up GEMM.
+                # Its weight vector doubles as the AWQ 1/s carrier.
+                w_gu = e.get("inv_s_gu")
+                norm4(res, b["zero_x"],
+                      w_gu if w_gu is not None else b["ones_w"], eps,
+                      packed=xp4, sfa=xsf4)
+                gemm4(xp4, e["gu"][0], xsf4, e["gu"][1], zb[2 * H],
+                      out=b["gu"])
+                geglu4(b["gu"], packed=hp4, sfa=hsf4)
+                gemm4(hp4, e["dn"][0], hsf4, e["dn"][1], zb[D],
+                      out=b["fg"])
     else:
         def out_project(att2, e):
             kf.quantize_fp8_static_bf16(att2, e["t_sc_o"],

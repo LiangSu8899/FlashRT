@@ -40,11 +40,12 @@ FP4_FUSE_PACKAGE = "flashrt/fp4-fused-ops"
 BANDS: dict[str, dict] = {
     "fp8": {"packages": (), "precision_rank": 0},
     "fp4": {"packages": (
-        (FP4_GEMM_PACKAGE, ("nvfp4_gemm_bias_gelu_nvfp4",
+        (FP4_GEMM_PACKAGE, ("nvfp4_gemm_bias_bf16",
                             "nvfp4_gemm_bias_residual_bf16",
-                            "quantize_fp4_sfa_bf16")),
+                            "quantize_fp4_sfa_bf16",
+                            "pack_nvfp4_weight_bf16")),
         (FP4_FUSE_PACKAGE, ("layer_norm_nvfp4_bf16",))),
-        "precision_rank": 1},
+        "precision_rank": 1, "awq": 0.8},
 }
 
 FUSE_SYMBOLS = ("layer_norm_quant_fp8_static_bf16",
@@ -102,8 +103,16 @@ def _stack_parts(stack):
     return layers, heads, dim // heads, dim, hidden
 
 
+def _awq_scale(chan_amax: torch.Tensor, alpha: float) -> torch.Tensor:
+    """Native per-input-channel AWQ pre-scale, verbatim:
+    s = (a / a.mean())^alpha clamped to [0.25, 4]."""
+    a = chan_amax.float().clamp(min=1e-6)
+    return (a / a.mean()).pow(alpha).clamp(min=0.25, max=4.0)
+
+
 @torch.no_grad()
-def _quantize(bound, layers, amax) -> None:
+def _quantize(bound, layers, amax, chan=None) -> None:
+    alpha = BANDS[bound.band].get("awq", 0.0)
     for i, ly in enumerate(layers):
         attn, mlp = ly.self_attn, ly.mlp
         a_qkv, a_o, a_fc1, a_fc2 = (amax[(i, s)] / FP8_MAX for s in
@@ -114,23 +123,40 @@ def _quantize(bound, layers, amax) -> None:
                            attn.v_proj.bias], dim=0)
         entry: dict[str, Any] = {}
         fp4 = BANDS[bound.band]["packages"] != ()
-        quant4 = (bound.kernels["kg4"].quantize_fp4_sfa_bf16
-                  if fp4 else None)
-        for name, w, act in (("qkv", qkv_w, a_qkv),
-                             ("o", attn.out_proj.weight, a_o),
-                             ("fc1", mlp.fc1.weight, a_fc1),
-                             ("fc2", mlp.fc2.weight, a_fc2)):
+        pack4 = (bound.kernels["kg4"].pack_nvfp4_weight_bf16
+                 if fp4 else None)
+        for name, w, bias, act in (
+                ("qkv", qkv_w, None, a_qkv),
+                ("o", attn.out_proj.weight, None, a_o),
+                ("fc1", mlp.fc1.weight, mlp.fc1.bias, a_fc1),
+                ("fc2", mlp.fc2.weight, mlp.fc2.bias, a_fc2)):
             if fp4 and name in ("fc1", "fc2"):
-                wp, wsf = quant4(
-                    w.detach().to("cuda", torch.bfloat16)
-                    .contiguous(), is_sfb=True)
+                # the padded pack carries SigLIP's logical 4304 as the
+                # physical aligned width; FC1's FP4 output is born at
+                # that width, so FC2 consumes it with zero glue. The
+                # native tier rides AWQ on the up (FC1) weight only:
+                # s into the columns, 1/s carried by the LN producer.
+                w = w.detach().to("cuda", torch.float32)
+                if (alpha and name == "fc1" and chan is not None
+                        and (i, "fc1") in chan):
+                    s = _awq_scale(chan[(i, "fc1")].to("cuda"), alpha)
+                    w = w * s[None, :]
+                    entry["inv_s_fc1"] = (1.0 / s).to(
+                        torch.bfloat16).contiguous()
+                wp, wsf, pb, _ = pack4(
+                    w.to(torch.bfloat16).contiguous(),
+                    bias.detach().to("cuda", torch.bfloat16)
+                    .contiguous(), mse=True)
                 entry[name] = (wp, wsf)
+                entry[f"{name}_b"] = pb
                 continue
             packed, w_scale = _fp8_weight(w)
             entry[name] = packed
             entry[f"a_{name}"] = act * w_scale
         for name, b in (("qkv_b", qkv_b), ("o_b", attn.out_proj.bias),
                         ("fc1_b", mlp.fc1.bias), ("fc2_b", mlp.fc2.bias)):
+            if name in entry:
+                continue
             entry[name] = b.detach().to("cuda", torch.bfloat16)
         for name, norm in (("ln1", ly.layer_norm1),
                            ("ln2", ly.layer_norm2)):
@@ -184,18 +210,64 @@ def _make_run(bound: BoundVisionFp8Chain):
         kg4 = bound.kernels["kg4"]
         kf4 = bound.kernels["kf4"]
         ln4 = kf4.layer_norm_nvfp4_bf16
-        gemm_gelu4 = kg4.nvfp4_gemm_bias_gelu_nvfp4
         gemm_res4 = kg4.nvfp4_gemm_bias_residual_bf16
+        quant4 = kg4.quantize_fp4_sfa_bf16
         xp4, xsf4 = b["xp4"], b["xsf4"]
         hp4, hsf4 = b["hp4"], b["hsf4"]
+        e0 = table[0]
+        # FC1 element ladder, bind-time facts (shape and device, never
+        # a device list): the fused FP4-out epilogue, then the fused
+        # bf16-GELU epilogue, then the plain bias GEMM with the GELU
+        # and quantize as separate elements.
+        def _try(fn, *args, **kw):
+            try:
+                fn(*args, **kw)
+                torch.cuda.synchronize()
+                return fn
+            except Exception:   # noqa: BLE001 — next rung
+                return None
 
-        def ffn(res, e):
-            ln4(res, e["ln2_w"], e["ln2_b"], None, e["ln2_eps"],
-                packed=xp4, sfa=xsf4)
-            gemm_gelu4(xp4, e["fc1"][0], xsf4, e["fc1"][1],
+        fused4 = getattr(kg4, "nvfp4_gemm_bias_gelu_nvfp4", None)
+        if fused4 is not None:
+            fused4 = _try(fused4, xp4, e0["fc1"][0], xsf4,
+                          e0["fc1"][1], e0["fc1_b"],
+                          out_packed=hp4, out_sfa=hsf4)
+        fusedb = getattr(kg4, "nvfp4_gemm_bias_gelu_bf16", None)
+        if fused4 is None and fusedb is not None:
+            fusedb = _try(fusedb, xp4, e0["fc1"][0], xsf4,
+                          e0["fc1"][1], e0["fc1_b"], out=b["hid"])
+        else:
+            fusedb = None
+
+        if fused4 is not None:
+            def ffn(res, e):
+                ln4(res, e["ln2_w"], e["ln2_b"], e.get("inv_s_fc1"),
+                    e["ln2_eps"], packed=xp4, sfa=xsf4)
+                fused4(xp4, e["fc1"][0], xsf4, e["fc1"][1],
                        e["fc1_b"], out_packed=hp4, out_sfa=hsf4)
-            gemm_res4(hp4, e["fc2"][0], hsf4, e["fc2"][1],
-                      e["fc2_b"], res)
+                gemm_res4(hp4, e["fc2"][0], hsf4, e["fc2"][1],
+                          e["fc2_b"], res, out=res)
+        elif fusedb is not None:
+            def ffn(res, e):
+                ln4(res, e["ln2_w"], e["ln2_b"], e.get("inv_s_fc1"),
+                    e["ln2_eps"], packed=xp4, sfa=xsf4)
+                fusedb(xp4, e["fc1"][0], xsf4, e["fc1"][1],
+                       e["fc1_b"], out=b["hid"])
+                quant4(b["hid"], hp4, hsf4)
+                gemm_res4(hp4, e["fc2"][0], hsf4, e["fc2"][1],
+                          e["fc2_b"], res, out=res)
+        else:
+            gemm_bias4 = kg4.nvfp4_gemm_bias_bf16
+            gelu = torch.nn.functional.gelu
+
+            def ffn(res, e):
+                ln4(res, e["ln2_w"], e["ln2_b"], e.get("inv_s_fc1"),
+                    e["ln2_eps"], packed=xp4, sfa=xsf4)
+                gemm_bias4(xp4, e["fc1"][0], xsf4, e["fc1"][1],
+                           e["fc1_b"], out=b["hid"])
+                quant4(gelu(b["hid"], approximate="tanh"), hp4, hsf4)
+                gemm_res4(hp4, e["fc2"][0], hsf4, e["fc2"][1],
+                          e["fc2_b"], res, out=res)
     else:
         def ffn(res, e):
             kf.layer_norm_quant_fp8_static_bf16(
@@ -276,11 +348,22 @@ def bind_vision_fp8_chain(model, root: str,
 
     calls: list[dict] = []
     amax: dict = {}
+    chan: dict = {}
 
     def note(site):
         def hook(_m, args):
             peak = float(args[0].detach().abs().amax())
             amax[site] = max(amax.get(site, 0.0), peak)
+        return hook
+
+    def cnote(site):
+        # per-input-channel amax at the FC1 input — the native SigLIP
+        # AWQ statistic (collected on the LN output the producer emits)
+        def hook(_m, args):
+            v = args[0].detach().float().abs()
+            v = v.reshape(-1, v.shape[-1]).amax(0)
+            prev = chan.get(site)
+            chan[site] = v if prev is None else torch.maximum(prev, v)
         return hook
 
     hooks = []
@@ -289,6 +372,9 @@ def bind_vision_fp8_chain(model, root: str,
             note((i, "qkv"))))
         hooks.append(ly.self_attn.out_proj.register_forward_pre_hook(
             note((i, "o"))))
+        if BANDS[band]["packages"] and BANDS[band].get("awq"):
+            hooks.append(ly.mlp.fc1.register_forward_pre_hook(
+                cnote((i, "fc1"))))
         hooks.append(ly.mlp.fc1.register_forward_pre_hook(
             note((i, "fc1"))))
         hooks.append(ly.mlp.fc2.register_forward_pre_hook(
@@ -340,7 +426,7 @@ def bind_vision_fp8_chain(model, root: str,
     bound.dims["batch"], bound.dims["seq"] = B, S
     bound.out_ctor = first["out_type"]
     bound.out_dtype = first["out"].dtype
-    _quantize(bound, layers, amax)
+    _quantize(bound, layers, amax, chan)
     dev, bf = "cuda", torch.bfloat16
     b = bound.buf
     b["res"] = torch.empty(B * S, dim, device=dev, dtype=bf)
@@ -349,15 +435,21 @@ def bind_vision_fp8_chain(model, root: str,
     b["qkv"] = torch.empty(B * S, 3 * dim, device=dev, dtype=bf)
     b["o8"] = torch.empty(B * S, dim, device=dev,
                           dtype=torch.float8_e4m3fn)
-    b["hid"] = torch.empty(B * S, hidden, device=dev, dtype=bf)
-    b["h8"] = torch.empty(B * S, hidden, device=dev,
-                          dtype=torch.float8_e4m3fn)
     if BANDS[bound.band]["packages"] != ():
-        quant4 = bound.kernels["kg4"].quantize_fp4_sfa_bf16
+        kg4 = bound.kernels["kg4"]
+        aligned = getattr(kg4, "aligned_fp4_dim",
+                          lambda d, alignment=32: -(-d // 32) * 32)
+        hidden_p = int(aligned(hidden))
+        b["hid"] = torch.empty(B * S, hidden_p, device=dev, dtype=bf)
+        quant4 = kg4.quantize_fp4_sfa_bf16
         b["xp4"], b["xsf4"] = quant4(
             torch.zeros(B * S, dim, device=dev, dtype=bf))
         b["hp4"], b["hsf4"] = quant4(
-            torch.zeros(B * S, hidden, device=dev, dtype=bf))
+            torch.zeros(B * S, hidden_p, device=dev, dtype=bf))
+    else:
+        b["hid"] = torch.empty(B * S, hidden, device=dev, dtype=bf)
+        b["h8"] = torch.empty(B * S, hidden, device=dev,
+                              dtype=torch.float8_e4m3fn)
 
     attend, attn_mode = None, None
     try:
