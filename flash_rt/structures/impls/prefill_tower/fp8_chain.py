@@ -70,7 +70,7 @@ BANDS: dict[str, dict] = {
     # round-trip, and the separate combiner all leave the chain
     "fp4_p1": {"packages": (
         (FP4_GEMM_PACKAGE, ("nvfp4_gemm_bias_bf16",
-                            "cutlass_fp4_gemm_geglu_il_hw_v10",
+                            "nvfp4_gemm_geglu_nvfp4_fp16",
                             "quantize_fp4_sfa_bf16")),
         (FP4_FUSE_PACKAGE,
          ("residual_add_rms_norm_quant_nvfp4_swizzled_bf16",))),
@@ -91,7 +91,7 @@ BANDS: dict[str, dict] = {
     # transfer to a 3-layer preset.
     "fp4_p1_mid": {"packages": (
         (FP4_GEMM_PACKAGE, ("nvfp4_gemm_bias_bf16",
-                            "cutlass_fp4_gemm_geglu_il_hw_v10",
+                            "nvfp4_gemm_geglu_nvfp4_fp16",
                             "quantize_fp4_sfa_bf16")),
         (FP4_FUSE_PACKAGE,
          ("residual_add_rms_norm_quant_nvfp4_swizzled_bf16",))),
@@ -468,7 +468,7 @@ def _make_run(bound: BoundPrefillFp8Chain):
             gemm(e, "dn", b["hid8"], b["fg"])
 
         if BANDS[bound.band].get("fp4_layers") is not None:
-            geglu_hw = kg4.cutlass_fp4_gemm_geglu_il_hw_v10
+            geglu_hw = kg4.nvfp4_gemm_geglu_nvfp4_fp16
             il_scr = b["il_scratch"]
 
             def ffn_project(res, e):
@@ -479,8 +479,12 @@ def _make_run(bound: BoundPrefillFp8Chain):
                 norm4(res, b["zero_x"],
                       w_gu if w_gu is not None else b["ones_w"], eps,
                       packed=xp4, sfa=xsf4)
+                # skinny=False: the encoder-M schedule (element-benched
+                # 301us vs the narrow-N decoder schedule's 484us at
+                # M=657 x 2H=32768 x K=2048)
                 geglu_hw(xp4, e["gu_il"][0], xsf4, e["gu_il"][1],
-                         scratch=il_scr, out_packed=hp4, out_sfa=hsf4)
+                         skinny=False, scratch=il_scr,
+                         out_packed=hp4, out_sfa=hsf4)
                 gemm4(hp4, e["dn"][0], hsf4, e["dn"][1], zb[D],
                       out=b["fg"])
         else:
