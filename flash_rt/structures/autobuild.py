@@ -557,8 +557,18 @@ def auto_swaps(
     # experiments here; a winning candidate binds before any seat does
     # (its failure leaves every seam in place — seated is always the
     # floor), and only a *successful* bind claims the seams it absorbs.
+    # region binds observe every calibration sample: the probe runs
+    # all thunks and exposes the sample boundaries so a chain can keep
+    # per-sample statistics and reduce them with the house percentile
+    region_probe = thunks[0] if thunks else None
+    if thunks and len(thunks) > 1:
+        def _region_probe():
+            for t in thunks:
+                t()
+        _region_probe.samples = tuple(thunks)
+        region_probe = _region_probe
     region_extras = _bind_regions(
-        model, seams, probe=(thunks[0] if thunks else None), say=say)
+        model, seams, probe=region_probe, say=say)
     if region_extras is not None:
         seams = region_extras["seams"]
 

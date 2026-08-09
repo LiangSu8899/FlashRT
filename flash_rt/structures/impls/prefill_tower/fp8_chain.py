@@ -220,11 +220,13 @@ def _quantize(bound, layers, amax, chan=None) -> None:
     # layer whose down-projection input carries a >20x-median channel
     # outlier stays on the calibrated FP8 form; the receipt records
     # which layers rode the band
+    import os as _os3
+    outlier = float(_os3.environ.get("FRT_PREFILL_FP4_OUTLIER", "20"))
     skip: set = set()
     if fp4 and chan is not None:
         for i in range(len(layers)):
             v = chan.get((i, "dn"))
-            if v is not None and float(v.max()) > 20.0 * float(
+            if v is not None and float(v.max()) > outlier * float(
                     v.median()):
                 skip.add(i)
     bound.dims["fp4_skipped"] = sorted(skip)
@@ -521,6 +523,8 @@ def bind_prefill_fp8_chain(model, root: str,
     # ---- one probe: the prefill call, mask fact, amax sites ----
     calls: list[dict] = []
     amax: dict[tuple[int, str], float] = {}
+    samples_amax: list[dict] = []
+    samples_chan: list[dict] = []
     # the quantizer statistic is a high element quantile, not the raw
     # peak: one outlier element must cost itself saturation, not the
     # whole tensor's resolution (the house two-level rule, single-call
@@ -622,8 +626,17 @@ def bind_prefill_fp8_chain(model, root: str,
 
     stack.forward = types.MethodType(capturing, stack)
     try:
+        sample_fns = list(getattr(probe, "samples", None) or (probe,))
         with torch.inference_mode():
-            probe()
+            for fn in sample_fns:
+                fn()
+                if amax:
+                    samples_amax.append(dict(amax))
+                    amax.clear()
+                if chan:
+                    samples_chan.append({k: v.clone()
+                                         for k, v in chan.items()})
+                    chan.clear()
     finally:
         for hook in hooks:
             hook.remove()
@@ -635,6 +648,23 @@ def bind_prefill_fp8_chain(model, root: str,
     if not calls:
         return {"refused": "prefill_fp8_chain: probe never made a "
                            "prefill call"}
+    # the house two-level statistic: max over calls within one sample
+    # (the hooks), then the calibration percentile across samples —
+    # one sample degenerates to today's raw max exactly
+    if samples_amax:
+        import numpy as np
+
+        from flash_rt.core.calibration import accumulate_amax
+        sites = set().union(*(d.keys() for d in samples_amax))
+        amax = {site: float(accumulate_amax(
+            [np.asarray([d[site]]) for d in samples_amax
+             if site in d], percentile=99.9)[0]) for site in sites}
+        ckeys = (set().union(*(d.keys() for d in samples_chan))
+                 if samples_chan else set())
+        chan = {k: torch.from_numpy(accumulate_amax(
+            [d[k].cpu().numpy() for d in samples_chan if k in d],
+            percentile=99.9)).to("cuda")
+            for k in ckeys}
     first = calls[0]
     if first["mask"] is None or first["pos"] is None:
         return {"refused": "prefill_fp8_chain: probe call carried no "
