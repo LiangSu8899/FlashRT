@@ -159,8 +159,38 @@ def hub_kernel(repo: str, version: str):
             "FRT_KERNEL_REV_" + re.sub(r"[^A-Za-z0-9]", "_",
                                        repo).upper())
         try:
-            _LOADED[key] = (get_kernel(repo, revision=rev) if rev
-                            else get_kernel(repo, version=version))
+            import inspect as _ins
+            _kw = {}
+            if "trust_remote_code" in _ins.signature(
+                    get_kernel).parameters:
+                # the trust gate arrived with newer kernels; our own
+                # first-party artifacts are the explicit trust set
+                _kw["trust_remote_code"] = True
+            try:
+                try:
+                    _LOADED[key] = (get_kernel(repo, revision=rev,
+                                               **_kw)
+                                    if rev
+                                    else get_kernel(repo,
+                                                    version=version,
+                                                    **_kw))
+                except ValueError as ve:
+                    # newer kernels resolve an exact integer version
+                    # where older ones accepted a range string; the
+                    # range's floor is the same request in both bands
+                    m = re.match(r"^\s*>=\s*v?(\d+)", str(version))
+                    if not (m and "available versions" in str(ve)):
+                        raise
+                    _LOADED[key] = get_kernel(
+                        repo, version=int(m.group(1)), **_kw)
+            except TypeError:
+                # kernels<0.13 — the band transformers pins — has no
+                # semver resolution kwarg; the default revision is
+                # exactly what that library resolved before semver
+                # tags existed. Widest-band compat: 0.12 through 0.16
+                # serve the same call site.
+                _LOADED[key] = (get_kernel(repo, revision=rev) if rev
+                                else get_kernel(repo))  # pre-semver band
         except (OSError, RuntimeError, ValueError) as unavailable:
             _record_unavailable(repo, version, unavailable)
             raise KernelUnavailable(
