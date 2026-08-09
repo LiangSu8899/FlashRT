@@ -70,6 +70,10 @@ _STRUCTURE_BY_IMPL = {
     "FlatPatchProjection": "patch_projection",
     "PackedLinear": "qkv_pack", "StashReader": "qkv_pack",
     "AttnBlockPacked": "qkv_pack", "AdaLNProducer": "adaln_producer",
+    # the vision pre-FFN norm producer is one gate unit with its FFN
+    # consumer: judged apart, an on-producer/off-consumer arm hands the
+    # host MLP an FP8 tensor (the exact failure the note below names)
+    "FusedNormFp8Producer": "vision_ffn",
     "StyleTable": "adaln_producer", "FusedNorm": "norm_fused",
     "FusedDecoderBlock": "decoder_block", "StaticOutput": "cadence_static",
 }
@@ -290,6 +294,7 @@ def attach(
     iters: int = 10,
     on_guard_fail: str = "fallback",
     scheme: str | Any = "auto",
+    negotiate_fp8: bool = True,
     verbose: bool = True,
 ) -> Plan:
     """Discover, calibrate, gate and activate structures in one call.
@@ -343,7 +348,8 @@ def attach(
     plan = auto_swaps(model, forward, structures=structures,
                       observations=observations, percentile=percentile,
                       max_samples=max_samples, prefix_cadence=prefix_cadence,
-                      scheme=scheme, verbose=verbose)
+                      scheme=scheme, negotiate_fp8=negotiate_fp8,
+                      verbose=verbose)
     if not plan.swaps and not plan.toggles:
         plan.revert_all()
         return Plan({}, {}, {"digest": "none", "seams": 0,

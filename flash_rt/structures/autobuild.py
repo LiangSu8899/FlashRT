@@ -270,17 +270,31 @@ def _pair_vision_norm_fp8(model, plan, points, stream) -> None:
         x = torch.randn(rows, dim, device=dev, dtype=torch.bfloat16)
         current_norm = plan.swaps.get(norm_path)
         norm_a = current_norm if current_norm is not None else host_norm
-        with torch.no_grad():
-            ref = seat(norm_a(x).to(torch.bfloat16))
-            got = twin(producer(x))
-            cos = torch.nn.functional.cosine_similarity(
-                got.float().flatten(), ref.float().flatten(), dim=0)
+        # the host norm keeps whatever dtype its fidelity policy chose
+        # (fp32 norms under selective-bf16 hosts) — probe it in its own
+        # dtype, and a probe that still refuses records a refusal
+        # rather than killing the scan
+        w_dt = getattr(getattr(norm_a, "weight", None), "dtype",
+                       torch.bfloat16)
+        try:
+            with torch.no_grad():
+                ref = seat(norm_a(x.to(w_dt)).to(torch.bfloat16))
+                got = twin(producer(x))
+                cos = torch.nn.functional.cosine_similarity(
+                    got.float().flatten(), ref.float().flatten(),
+                    dim=0)
+        except RuntimeError as refusal:
+            plan.notes.setdefault("refused", []).append(
+                (f"{norm_path}::norm_fp8_producer",
+                 f"pair probe: {refusal}"))
+            continue
         if float(cos) < 0.98:
             plan.notes.setdefault("refused", []).append(
                 (f"{norm_path}::norm_fp8_producer",
                  f"pair smoke cos {float(cos):.6f} < 0.98"))
             continue
-        ms_a = _race_ms(lambda: seat(norm_a(x).to(torch.bfloat16)))
+        ms_a = _race_ms(lambda: seat(norm_a(x.to(w_dt))
+                                     .to(torch.bfloat16)))
         ms_b = _race_ms(lambda: twin(producer(x)))
         plan.notes.setdefault("format_race", []).append(
             {"layer": norm_path, "rows": rows, "dim": dim,
@@ -1070,7 +1084,8 @@ def auto_swaps(
     # (the FP8_ONLY guard refuses anything else between them), the
     # smoke compares the pair against the bf16 form it would replace,
     # and the flip happens only when the measured chain is faster.
-    _pair_vision_norm_fp8(model, plan, collector, _stream)
+    if negotiate_fp8:
+        _pair_vision_norm_fp8(model, plan, collector, _stream)
 
     # ---- streaming window: the later stages record through the model,
     # and the streamed originals are meta now — so the bound seats stand
