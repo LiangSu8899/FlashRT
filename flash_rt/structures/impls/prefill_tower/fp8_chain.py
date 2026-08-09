@@ -244,9 +244,11 @@ def _quantize(bound, layers, amax) -> None:
         def _t(v):
             return torch.tensor([v], device="cuda",
                                 dtype=torch.float32)
-        entry["t_wsc_gu"] = _t(entry["a_gu"] / a_gu)
+        if "a_gu" in entry:
+            entry["t_wsc_gu"] = _t(entry["a_gu"] / a_gu)
         entry["t_sc_dn"] = _t(a_dn)
-        entry["t_wsc_dn"] = _t(entry["a_dn"] / a_dn)
+        if "a_dn" in entry:
+            entry["t_wsc_dn"] = _t(entry["a_dn"] / a_dn)
         entry["t_sc_o"] = _t(a_o)
         bound.table.append(entry)
 
