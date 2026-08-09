@@ -54,14 +54,14 @@ FP4_FUSE_PACKAGE = "flashrt/fp4-fused-ops"
 #: GEGLU producer ships a bf16 entry and the FP4 GEMM accepts the
 #: prefix row band (a bind-time functional probe, not a device list).
 BANDS: dict[str, dict] = {
-    "fp8": {"packages": (), "precision_rank": 0},
+    "fp8": {"packages": (), "precision_rank": 0, "awq": 0.0},
     "fp4": {"packages": (
         (FP4_GEMM_PACKAGE, ("nvfp4_gemm_bias_bf16",
                             "quantize_fp4_sfa_bf16")),
         (FP4_FUSE_PACKAGE,
          ("residual_add_rms_norm_quant_nvfp4_swizzled_bf16",
           "gelu_mul_nvfp4_bf16"))),
-        "precision_rank": 1},
+        "precision_rank": 1, "awq": 0.8, "smoke_floor": 0.95},
 }
 
 #: whole-tower smoke over hidden states and every layer's cached K/V
@@ -200,11 +200,34 @@ def _build_rope(bound, stack, position_ids) -> bool:
 
 
 @torch.no_grad()
-def _quantize(bound, layers, amax) -> None:
+def _awq_scale(chan_amax: torch.Tensor, alpha: float) -> torch.Tensor:
+    """The native per-input-channel AWQ pre-scale, verbatim:
+    ``s = (a / a.mean())^alpha`` clamped to [0.25, 4]. The GEMM columns
+    carry ``s``; whichever element feeds the GEMM carries ``1/s`` —
+    the math is preserved exactly, only the quantizer sees a tamer
+    channel spread."""
+    a = chan_amax.float().clamp(min=1e-6)
+    return (a / a.mean()).pow(alpha).clamp(min=0.25, max=4.0)
+
+
+def _quantize(bound, layers, amax, chan=None) -> None:
     nh, kv, hd = (bound.dims[k] for k in ("nh", "kv", "hd"))
     fp4 = BANDS[bound.band]["packages"] != ()
+    alpha = BANDS[bound.band].get("awq", 0.0)
     quant4 = (bound.kernels["kg4"].quantize_fp4_sfa_bf16
               if fp4 else None)
+    # data-driven layer subset (the native preset runs 17 of 18): a
+    # layer whose down-projection input carries a >20x-median channel
+    # outlier stays on the calibrated FP8 form; the receipt records
+    # which layers rode the band
+    skip: set = set()
+    if fp4 and chan is not None:
+        for i in range(len(layers)):
+            v = chan.get((i, "dn"))
+            if v is not None and float(v.max()) > 20.0 * float(
+                    v.median()):
+                skip.add(i)
+    bound.dims["fp4_skipped"] = sorted(skip)
     for i, ly in enumerate(layers):
         attn, mlp = ly.self_attn, ly.mlp
         a_qkv, a_o, a_gu, a_dn = (amax[(i, s)] / FP8_MAX for s in
@@ -224,12 +247,34 @@ def _quantize(bound, layers, amax) -> None:
                              ("o", attn.o_proj.weight, a_o),
                              ("gu", gu_w, a_gu),
                              ("dn", mlp.down_proj.weight, a_dn)):
-            if fp4 and name != "qkv":
+            if fp4 and name != "qkv" and i not in skip:
                 # the native encoder preset: FFN pair and the output
-                # projection ride NVFP4 dynamic block scales
-                wp, wsf = quant4(
-                    w.detach().to("cuda", torch.bfloat16)
-                    .contiguous(), is_sfb=True)
+                # projection ride NVFP4 dynamic block scales, with the
+                # AWQ pre-scale carried by whatever feeds each GEMM —
+                # gu's 1/s by the norm producer's weight vector, dn's
+                # 1/s by the up rows it multiplies through
+                wq = w.detach().float().to("cuda")
+                if alpha and name == "gu" and chan is not None:
+                    H = wq.shape[0] // 2
+                    s_gu = _awq_scale(chan[(i, "gu")], alpha)
+                    wq = wq * s_gu[None, :]
+                    entry["inv_s_gu"] = (1.0 / s_gu).to(
+                        torch.bfloat16).contiguous()
+                    s_dn = _awq_scale(chan[(i, "dn")], alpha)
+                    wq[H:] = wq[H:] / s_dn[:, None]
+                    entry["s_dn"] = s_dn
+                if alpha and name == "dn" and chan is not None:
+                    wq = wq * entry["s_dn"][None, :]
+                mse = getattr(bound.kernels["kg4"],
+                              "quantize_fp4_sfa_mse_fp16", None)
+                if mse is not None:
+                    # the native weight path: per-block MSE scales
+                    wp, wsf = mse(wq.to(torch.float16).contiguous(),
+                                  is_sfb=True)
+                else:
+                    wp, wsf = quant4(
+                        wq.to(torch.bfloat16).contiguous(),
+                        is_sfb=True)
                 entry[name] = (wp, wsf)
                 continue
             packed, w_scale = _fp8_weight(w)
@@ -323,13 +368,30 @@ def _make_run(bound: BoundPrefillFp8Chain):
         zb = b["zb"]
 
         def out_project(att2, e):
+            if not isinstance(e["o"], tuple):
+                kf.quantize_fp8_static_bf16(att2, e["t_sc_o"],
+                                            out=b["o8"])
+                gemm(e, "o", b["o8"], b["fg"])
+                return
             quant4(att2, op4, osf4)
             gemm4(op4, e["o"][0], osf4, e["o"][1], zb[D], out=b["fg"])
 
         def ffn_project(res, e):
+            if not isinstance(e["gu"], tuple):
+                # an outlier layer kept on the calibrated FP8 form
+                kn.rms_norm_quant_fp8_static_bf16(
+                    res, b["ones_w"], e["sc_gu"], eps, out=b["xn8"])
+                gemm(e, "gu", b["xn8"], b["gu"])
+                kf.gate_geglu_merged_quant_fp8_static_bf16(
+                    b["gu"], e["t_sc_dn"], out=b["hid8"])
+                gemm(e, "dn", b["hid8"], b["fg"])
+                return
             # x=0 keeps the residual untouched; the producer emits
-            # rms(res) straight to packed FP4 for the gate/up GEMM
-            norm4(res, b["zero_x"], b["ones_w"], eps,
+            # rms(res) straight to packed FP4 for the gate/up GEMM.
+            # Its weight vector doubles as the AWQ 1/s carrier.
+            w_gu = e.get("inv_s_gu")
+            norm4(res, b["zero_x"],
+                  w_gu if w_gu is not None else b["ones_w"], eps,
                   packed=xp4, sfa=xsf4)
             gemm4(xp4, e["gu"][0], xsf4, e["gu"][1], zb[2 * H],
                   out=b["gu"])
@@ -490,6 +552,24 @@ def bind_prefill_fp8_chain(model, root: str,
             amax[site] = max(amax.get(site, 0.0), peak)
         return hook
 
+    chan: dict = {}
+
+    def cnote(site, unfold=None):
+        safe = (unfold.abs().clamp(min=1e-6).cuda()
+                if unfold is not None else None)
+
+        def hook(_m, args):
+            x = args[0].detach()
+            v = x.float().abs().reshape(-1, x.shape[-1]).amax(dim=0)
+            if safe is not None:
+                # the chain's producer emits the pure-RMS output — the
+                # host folds (1+w) in; measure what the chain will see
+                v = v / safe
+            prev = chan.get(site)
+            chan[site] = (v if prev is None
+                          else torch.maximum(prev, v))
+        return hook
+
     hooks = []
     for i, ly in enumerate(layers):
         fold_in = (1.0 + ly.input_layernorm.weight.detach().float())
@@ -503,6 +583,11 @@ def bind_prefill_fp8_chain(model, root: str,
             note((i, "gu"), fold_post)))
         hooks.append(ly.mlp.down_proj.register_forward_pre_hook(
             note((i, "dn"))))
+        if BANDS[band]["packages"] and BANDS[band].get("awq"):
+            hooks.append(ly.mlp.gate_proj.register_forward_pre_hook(
+                cnote((i, "gu"), fold_post)))
+            hooks.append(ly.mlp.down_proj.register_forward_pre_hook(
+                cnote((i, "dn"))))
 
     saved_probe = stack.__dict__.get("forward")
     host_forward = stack.forward
@@ -608,7 +693,7 @@ def bind_prefill_fp8_chain(model, root: str,
     if not _build_rope(bound, stack, first["pos"]):
         return {"refused": "prefill_fp8_chain: rotary table is not "
                            "half-duplicated"}
-    _quantize(bound, layers, amax)
+    _quantize(bound, layers, amax, chan=chan)
     _alloc(bound)
     half = hd // 2
     kperm = torch.empty(hd, dtype=torch.long, device="cuda")
@@ -644,8 +729,13 @@ def bind_prefill_fp8_chain(model, root: str,
 
     # ---- smoke: hidden states and the cache the tower left behind ----
     import os as _os2
+    # the smoke floor is a band fact: the FP8 calibration set the 0.95
+    # line at its own compounding depth; a deeper-compounding band
+    # carries its own line and the arm's captured parity gate (0.99
+    # against the stock reference) stays the end-to-end judge either way
+    band_floor = BANDS[band].get("smoke_floor", SMOKE_FLOOR)
     floor = float(_os2.environ.get("FRT_PREFILL_SMOKE_FLOOR",
-                                   str(SMOKE_FLOOR)))
+                                   str(band_floor)))
     scores: list[tuple[float, str]] = []
     with torch.inference_mode():
         for c in calls:
