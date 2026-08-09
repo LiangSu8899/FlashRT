@@ -381,3 +381,31 @@ real distribution; check the ledger is clean and the kernel path was
 exercised; probe generality on a third host (correct discovery or
 correct absence); and scan the diff for anything that does not belong
 in a public repository.
+
+## 6. Calibration discipline (hard rule, incident-tested)
+
+Every activation statistic in this repository — static-scale amax,
+AWQ channel vectors, anything a producer or GEMM consumes — flows
+through the house calibration machinery, never a private copy:
+
+- Samples enter through ``auto_swaps(observations=...)``; a region
+  bind's ``probe`` carries them with per-sample boundaries exposed
+  via ``probe.samples``. A chain may register its own collection
+  hooks at bind, but the statistic itself is the house two-level
+  reduction: max over calls within one sample, then
+  ``flash_rt.core.calibration.accumulate_amax`` across samples.
+- Calibration data is the host's real input distribution, with
+  provenance (source, frame indices, basic statistics). Synthetic or
+  random tensors are never calibration data and never a fidelity
+  reference.
+- Sample count is not a fidelity remedy. One real frame is a valid
+  calibration; more samples change *recipe selection* (channel
+  statistics drive layer subsets and therefore which form binds),
+  which is a different effect and must be reasoned about as such.
+- Attribution requires a controlled experiment. When a fidelity or
+  latency shift spans more than one changed variable, the record says
+  "correlates" — "caused by" is earned only by re-running with a
+  single variable moved.
+- Smoke floors are load-bearing. A band may carry its own floor only
+  together with the end-to-end parity judge, and no receipt is ever
+  written from a floor-relaxation experiment.
