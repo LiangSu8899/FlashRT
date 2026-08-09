@@ -40,6 +40,8 @@ def _need(name: str) -> str:
 
 
 CKPT = _need("PI05_CKPT")
+VIEWS = int(os.environ.get("PI05_VIEWS", "2"))
+OBS3 = os.environ.get("PI05_OBS3_NPZ")  # npz: img_0/wrist_0/wrist_right_0
 TOKENIZER = _need("PI05_TOKENIZER")
 BUNDLE = _need("PI05_OBS_BUNDLE")
 
@@ -170,13 +172,17 @@ def load_host():
     n = _shim_vision_state_keys(policy)
     if n:
         print(f"[pi05] vision tower keys re-targeted: {n}", flush=True)
-    policy.config.input_features = {
+    feats = {
         "observation.images.image": PolicyFeature(
             FeatureType.VISUAL, (3, 224, 224)),
         "observation.images.image2": PolicyFeature(
             FeatureType.VISUAL, (3, 224, 224)),
         "observation.state": PolicyFeature(FeatureType.STATE, (32,)),
     }
+    if VIEWS >= 3:
+        feats["observation.images.image3"] = PolicyFeature(
+            FeatureType.VISUAL, (3, 224, 224))
+    policy.config.input_features = feats
     policy.config.output_features = {
         "action": PolicyFeature(FeatureType.ACTION, (32,))}
     policy.config.compile_model = False
@@ -207,13 +213,24 @@ def build_inputs(policy):
         preprocessor_overrides={"tokenizer_processor": {
             "tokenizer_name": TOKENIZER}})
     bundle = torch.load(BUNDLE, map_location="cpu", weights_only=False)
-    imgs = ((bundle["input_images"].float() + 1.0) / 2.0).clamp(0, 1)
-    imgs = imgs.permute(0, 3, 1, 2).contiguous()
-    batch = pre({
-        "observation.images.image": imgs[0:1],
-        "observation.images.image2": imgs[1:2],
-        "observation.state": bundle["state"].float().unsqueeze(0),
-        "task": bundle["prompt"]})
+    obs = {"observation.state": bundle["state"].float().unsqueeze(0),
+           "task": bundle["prompt"]}
+    if VIEWS >= 3 and OBS3:
+        # the native three-view protocol: image / wrist / wrist_right,
+        # a real observation set (never synthetic views)
+        import numpy as np
+        fx = np.load(OBS3)
+        for slot, key in (("image", "img_0"), ("image2", "wrist_0"),
+                          ("image3", "wrist_right_0")):
+            im = torch.from_numpy(fx[key]).float() / 255.0
+            obs[f"observation.images.{slot}"] = (
+                im.permute(2, 0, 1).unsqueeze(0).contiguous())
+    else:
+        imgs = ((bundle["input_images"].float() + 1.0) / 2.0).clamp(0, 1)
+        imgs = imgs.permute(0, 3, 1, 2).contiguous()
+        obs["observation.images.image"] = imgs[0:1]
+        obs["observation.images.image2"] = imgs[1:2]
+    batch = pre(obs)
     batch = {k: (v.to("cuda") if torch.is_tensor(v) else v)
              for k, v in batch.items()}
 
