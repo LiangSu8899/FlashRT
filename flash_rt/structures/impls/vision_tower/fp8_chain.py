@@ -30,6 +30,23 @@ GEMM_PACKAGE = "flashrt/fp8-gemm"
 FUSE_PACKAGE = "flashrt/transformer-fused-ops"
 GEMM_SYMBOLS = ("fp8_linear_bias_bf16", "fp8_linear_bias_residual_bf16",
                 "fp8_linear_bias_gelu_bf16")
+FP4_GEMM_PACKAGE = "flashrt/fp4-gemm"
+FP4_FUSE_PACKAGE = "flashrt/fp4-fused-ops"
+
+#: the band table IS the recipe (house convention). The ``fp4`` row is
+#: the native SigLIP preset: the FFN pair rides NVFP4 — the LN
+#: producer emits packed FP4, FC1 fuses bias+GELU and emits packed FP4
+#: straight into FC2's residual GEMM. The attention half stays FP8.
+BANDS: dict[str, dict] = {
+    "fp8": {"packages": (), "precision_rank": 0},
+    "fp4": {"packages": (
+        (FP4_GEMM_PACKAGE, ("nvfp4_gemm_bias_gelu_nvfp4",
+                            "nvfp4_gemm_bias_residual_bf16",
+                            "quantize_fp4_sfa_bf16")),
+        (FP4_FUSE_PACKAGE, ("layer_norm_nvfp4_bf16",))),
+        "precision_rank": 1},
+}
+
 FUSE_SYMBOLS = ("layer_norm_quant_fp8_static_bf16",
                 "quantize_fp8_static_bf16")
 FA4_REPO = "flashrt/fa4-cute-runtime"
@@ -38,10 +55,11 @@ SMOKE_FLOOR = 0.97
 FP8_MAX = 448.0
 
 
-def missing_symbols() -> list[str]:
+def missing_symbols(band: str = "fp8") -> list[str]:
     gaps: list[str] = []
     for repo, symbols in ((GEMM_PACKAGE, GEMM_SYMBOLS),
-                          (FUSE_PACKAGE, FUSE_SYMBOLS)):
+                          (FUSE_PACKAGE, FUSE_SYMBOLS)
+                          ) + BANDS[band]["packages"]:
         try:
             kern = hub_kernel(repo, ">=1")
         except KernelUnavailable:
@@ -66,6 +84,7 @@ class BoundVisionFp8Chain(GuardedSeam, torch.nn.Module):
         self.out_ctor = None
         self.out_dtype = None
         self.kernels: dict = {}
+        self.band = "fp8"
 
 
 def _stack_parts(stack):
@@ -94,10 +113,19 @@ def _quantize(bound, layers, amax) -> None:
         qkv_b = torch.cat([attn.q_proj.bias, attn.k_proj.bias,
                            attn.v_proj.bias], dim=0)
         entry: dict[str, Any] = {}
+        fp4 = BANDS[bound.band]["packages"] != ()
+        quant4 = (bound.kernels["kg4"].quantize_fp4_sfa_bf16
+                  if fp4 else None)
         for name, w, act in (("qkv", qkv_w, a_qkv),
                              ("o", attn.out_proj.weight, a_o),
                              ("fc1", mlp.fc1.weight, a_fc1),
                              ("fc2", mlp.fc2.weight, a_fc2)):
+            if fp4 and name in ("fc1", "fc2"):
+                wp, wsf = quant4(
+                    w.detach().to("cuda", torch.bfloat16)
+                    .contiguous(), is_sfb=True)
+                entry[name] = (wp, wsf)
+                continue
             packed, w_scale = _fp8_weight(w)
             entry[name] = packed
             entry[f"a_{name}"] = act * w_scale
@@ -152,6 +180,36 @@ def _make_run(bound: BoundVisionFp8Chain):
     table = bound.table
     rf = torch.profiler.record_function
 
+    if BANDS[bound.band]["packages"] != ():
+        kg4 = bound.kernels["kg4"]
+        kf4 = bound.kernels["kf4"]
+        ln4 = kf4.layer_norm_nvfp4_bf16
+        gemm_gelu4 = kg4.nvfp4_gemm_bias_gelu_nvfp4
+        gemm_res4 = kg4.nvfp4_gemm_bias_residual_bf16
+        xp4, xsf4 = b["xp4"], b["xsf4"]
+        hp4, hsf4 = b["hp4"], b["hsf4"]
+
+        def ffn(res, e):
+            ln4(res, e["ln2_w"], e["ln2_b"], None, e["ln2_eps"],
+                packed=xp4, sfa=xsf4)
+            gemm_gelu4(xp4, e["fc1"][0], xsf4, e["fc1"][1],
+                       e["fc1_b"], out_packed=hp4, out_sfa=hsf4)
+            gemm_res4(hp4, e["fc2"][0], hsf4, e["fc2"][1],
+                      e["fc2_b"], res)
+    else:
+        def ffn(res, e):
+            kf.layer_norm_quant_fp8_static_bf16(
+                res, e["ln2_w"], e["ln2_b"], e["sc_fc1"],
+                eps=e["ln2_eps"], out=b["xn8"])
+            kg.fp8_linear_bias_gelu_bf16(
+                b["xn8"], e["fc1"], e["fc1_b"], alpha=e["a_fc1"],
+                out=b["hid"])
+            kf.quantize_fp8_static_bf16(b["hid"], e["sc_fc2"],
+                                        out=b["h8"])
+            kg.fp8_linear_bias_residual_bf16(
+                b["h8"], e["fc2"], e["fc2_b"], res,
+                alpha=e["a_fc2"])
+
     def run(x3d):
         res = b["res"]
         res.copy_(x3d.reshape(B * S, D))
@@ -173,17 +231,7 @@ def _make_run(bound: BoundVisionFp8Chain):
                 kg.fp8_linear_bias_residual_bf16(
                     b["o8"], e["o"], e["o_b"], res, alpha=e["a_o"])
             with rf("vi:ffn"):
-                kf.layer_norm_quant_fp8_static_bf16(
-                    res, e["ln2_w"], e["ln2_b"], e["sc_fc1"],
-                    eps=e["ln2_eps"], out=b["xn8"])
-                kg.fp8_linear_bias_gelu_bf16(
-                    b["xn8"], e["fc1"], e["fc1_b"], alpha=e["a_fc1"],
-                    out=b["hid"])
-                kf.quantize_fp8_static_bf16(b["hid"], e["sc_fc2"],
-                                            out=b["h8"])
-                kg.fp8_linear_bias_residual_bf16(
-                    b["h8"], e["fc2"], e["fc2_b"], res,
-                    alpha=e["a_fc2"])
+                ffn(res, e)
         return bound.out_ctor(
             last_hidden_state=res.view(B, S, D)
             .to(bound.out_dtype).clone())
@@ -192,14 +240,19 @@ def _make_run(bound: BoundVisionFp8Chain):
 
 
 def bind_vision_fp8_chain(model, root: str,
-                          probe: Callable[[], Any]) -> dict:
+                          probe: Callable[[], Any],
+                          band: str = "fp8") -> dict:
     """Bind the chain onto the tower at ``root``; adapter contract out."""
     try:
         kg = hub_kernel(GEMM_PACKAGE, ">=1")
         kf = hub_kernel(FUSE_PACKAGE, ">=1")
+        kg4 = kf4 = None
+        if BANDS[band]["packages"]:
+            kg4 = hub_kernel(FP4_GEMM_PACKAGE, ">=1")
+            kf4 = hub_kernel(FP4_FUSE_PACKAGE, ">=1")
     except KernelUnavailable as exc:
-        return {"refused": f"vision_fp8_chain: {exc}"}
-    gaps = missing_symbols()
+        return {"refused": f"vision_{band}_chain: {exc}"}
+    gaps = missing_symbols(band=band)
     if gaps:
         return {"refused": f"vision_fp8_chain missing: "
                            f"{', '.join(gaps)}"}
@@ -215,7 +268,8 @@ def bind_vision_fp8_chain(model, root: str,
     scaling = float(scale_attr) if scale_attr else hd ** -0.5
 
     bound = BoundVisionFp8Chain()
-    bound.kernels = {"kg": kg, "kf": kf}
+    bound.kernels = {"kg": kg, "kf": kf, "kg4": kg4, "kf4": kf4}
+    bound.band = band
     bound.scaling = scaling
     bound.dims = {"nh": nh, "hd": hd, "dim": dim, "hidden": hidden,
                   "layers": len(layers)}
@@ -298,6 +352,12 @@ def bind_vision_fp8_chain(model, root: str,
     b["hid"] = torch.empty(B * S, hidden, device=dev, dtype=bf)
     b["h8"] = torch.empty(B * S, hidden, device=dev,
                           dtype=torch.float8_e4m3fn)
+    if BANDS[bound.band]["packages"] != ():
+        quant4 = bound.kernels["kg4"].quantize_fp4_sfa_bf16
+        b["xp4"], b["xsf4"] = quant4(
+            torch.zeros(B * S, dim, device=dev, dtype=bf))
+        b["hp4"], b["hsf4"] = quant4(
+            torch.zeros(B * S, hidden, device=dev, dtype=bf))
 
     attend, attn_mode = None, None
     try:
