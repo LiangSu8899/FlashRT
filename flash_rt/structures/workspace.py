@@ -20,10 +20,16 @@ held and the reuse count per tag — the memory column of the receipt.
 
 from __future__ import annotations
 
+import weakref
+
 import torch
 
 _POOL: dict[tuple, torch.Tensor] = {}
 _LEASES: dict[str, int] = {}
+# exclusive leases are owned by their seats, not the pool; the receipt
+# tracks them through weak references so bytes leave the ledger the
+# moment a detached seat releases its buffer
+_EXCLUSIVE: dict[str, list] = {}
 
 
 def lease(shape, dtype, device, *, tag: str,
@@ -59,6 +65,7 @@ def lease(shape, dtype, device, *, tag: str,
         if fill == "ones":
             buf.fill_(1)
         _LEASES[tag] = _LEASES.get(tag, 0) + 1
+        _EXCLUSIVE.setdefault(tag, []).append(weakref.ref(buf))
         return buf
     key = (tuple(shape), dtype, str(device), tag, fill)
     buf = _POOL.get(key)
@@ -72,11 +79,27 @@ def lease(shape, dtype, device, *, tag: str,
 
 
 def report() -> dict:
-    """Bytes held and lease counts — the receipt's memory column."""
+    """Bytes held and lease counts — the receipt's memory column.
+
+    ``held_bytes`` covers both the shared pool and every live exclusive
+    lease; ``exclusive_by_tag`` breaks the latter out so the receipt
+    shows what stayed private and what the pool actually deduplicated.
+    """
     by_tag: dict[str, int] = {}
     for (shape, dtype, _dev, tag, _fill), buf in _POOL.items():
         by_tag[tag] = by_tag.get(tag, 0) + buf.numel() * buf.element_size()
-    return {"held_bytes": sum(by_tag.values()), "by_tag": by_tag,
+    exclusive_by_tag: dict[str, int] = {}
+    for tag, refs in _EXCLUSIVE.items():
+        live = [ref() for ref in refs]
+        refs[:] = [ref for ref, buf in zip(refs, live) if buf is not None]
+        held = sum(buf.numel() * buf.element_size()
+                   for buf in live if buf is not None)
+        if held:
+            exclusive_by_tag[tag] = held
+    return {"held_bytes": sum(by_tag.values())
+            + sum(exclusive_by_tag.values()),
+            "by_tag": by_tag,
+            "exclusive_by_tag": exclusive_by_tag,
             "leases": dict(_LEASES)}
 
 
@@ -84,3 +107,4 @@ def clear() -> None:
     """Drop every pooled buffer (between hosts, or in tests)."""
     _POOL.clear()
     _LEASES.clear()
+    _EXCLUSIVE.clear()
