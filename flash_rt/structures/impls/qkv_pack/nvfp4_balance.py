@@ -66,8 +66,22 @@ class PackedLinearNvfp4(GuardedSeam, torch.nn.Module):
         self._kern = kern
         self._gemm = kern.fp4_w4a16_linear_bf16
         # capability probe: fused-bias epilogue where the installed
-        # variant ships it; absence keeps the two-launch path
+        # variant ships it; absence keeps the two-launch path.
+        # Presence is not qualification: the same artifact can carry an
+        # entry built for another arch (an SM110-specialized bias op in
+        # a package whose base ops serve SM120). One smoke launch at
+        # bind is the fact; a refusal keeps the two-launch path.
         self._gemm_bias = getattr(kern, "nvfp4_gemm_bias_bf16", None)
+        if self._gemm_bias is not None:
+            try:
+                z = torch.zeros(1, mods[0].weight.shape[1],
+                                dtype=torch.float16,
+                                device=w_packed.device)
+                zp, zsf = kern.quantize_fp4_sfa_fp16(z)
+                self._gemm_bias(zp, w_packed, zsf, w_sfb,
+                                bias_cat.to(torch.bfloat16))
+            except (RuntimeError, ValueError):
+                self._gemm_bias = None
         self.splits = splits
         self.rows = rows
         self.register_buffer("wp", w_packed)
