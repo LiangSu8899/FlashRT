@@ -156,6 +156,33 @@ def build(model, run_once) -> tuple[Assembly, dict]:
     from flash_rt.structures.impls.vision_ffn import fp8_static as vis_ffn
 
     asm = Assembly()
+    reverts = []
+    chain_observed: dict = {}
+    chain_toggle = None
+
+    # ---- backbone attention interface: measured band decision ------
+    # The native correspondence for this tier's backbone attention is
+    # the hub FA4 interface; whether it actually wins on a box is the
+    # recorded band decision (``decisions.lookup("backbone_attn")``,
+    # an empty cache keeps the host's own interface). The switch must
+    # land before any adapter resolves the host's attention registry
+    # into a closure (the per-head rope route below, the capture
+    # lowering's vision pin), or the traffic has already left through
+    # the old interface.
+    from flash_rt.structures.adapters.transformers_attention_interface \
+        import TransformersAttentionInterfaceAdapter
+    try:
+        iface = TransformersAttentionInterfaceAdapter()(model)
+    except (ValueError, RuntimeError) as refusal:
+        asm.refused.append(("backbone_attn", str(refusal)[:160]))
+        iface = None
+    if iface:
+        if iface.get("refused"):
+            asm.refused.extend(iface["refused"])
+        reverts.extend(iface.get("revert", ()))
+        if iface.get("notes", {}).get("backbone_attn"):
+            asm.families["backbone_attn_interface"] = 1
+
     base = model.backbone.model.model
     visual_blocks = list(base.visual.blocks)
     lang_layers = list(base.language_model.layers)
@@ -280,6 +307,42 @@ def build(model, run_once) -> tuple[Assembly, dict]:
     for h in hooks:
         h.remove()
 
+    # ---- the DiT stack: the fused chain rung first -----------------------
+    # The chain is the native correspondence for the whole stack — fused
+    # NVFP4 GEMMs with bias/residual/GELU epilogues, norms emitting FP4
+    # directly, step-table modulators, compact-row cross banks. When it
+    # binds, the per-seat DiT declarations below yield their claim (one
+    # owner per span); when it refuses, they are the next rung and bind
+    # exactly as before. Cross ``to_k``/``to_v`` stay call-time resolved,
+    # so the cadence banks bound at the end of this build still serve
+    # the chain's encoder reads.
+    from flash_rt.structures.impls import KernelUnavailable as _KU
+    from flash_rt.structures.impls.dit_stack import region as dit_region
+    from flash_rt.structures.impls.dit_stack.fp4_chain import (
+        bind_dit_fp4_chain)
+    chain_root = None
+    for root in dit_region.identify(model):
+        try:
+            result = bind_dit_fp4_chain(model, root, run_once)
+        except (_KU, ValueError) as refusal:
+            result = {"refused": f"{type(refusal).__name__}: {refusal}"}
+        if result.get("refused"):
+            asm.refused.append((f"{root}::dit_fp4_chain",
+                                str(result["refused"])[:160]))
+            continue
+        chain_root = root
+        chain_observed.update(result.get("observed", {}))
+        reverts.extend(result.get("revert", ()))
+        chain_toggle = result.get("toggle")
+        asm.families["dit_block:fp4_chain"] += 1
+        print(f"[groot] dit_fp4_chain@{root}: bound "
+              f"(smoke {result.get('smoke_cos'):.5f})", flush=True)
+    if chain_root is not None:
+        DIT_FF = {}
+        DIT_ADALN = {}
+        DIT_QKV = {}
+        DIT_OUT = {}
+
     # ---- bind: direct library-binder calls -------------------------------
     for path, mlp in VISION_FFN.items():
         c = cal[path]
@@ -356,6 +419,19 @@ def build(model, run_once) -> tuple[Assembly, dict]:
     from flash_rt.structures.impls.linear_proj.fp8_static import (
         bind_proj_seam)
 
+    def _lap_ms(fn, iters=30):
+        for _ in range(5):
+            fn()
+        torch.cuda.synchronize()
+        start = torch.cuda.Event(True)
+        end = torch.cuda.Event(True)
+        start.record()
+        for _ in range(iters):
+            fn()
+        end.record()
+        torch.cuda.synchronize()
+        return start.elapsed_time(end) / iters
+
     def take_proj(path, mod, c):
         if "x" not in c:
             return
@@ -365,8 +441,31 @@ def build(model, run_once) -> tuple[Assembly, dict]:
         bound = asm.take(path, "linear_proj", lambda: bind_proj_seam(
             weights, input_scale=c["x"] / 448.0,
             row_profile=[c["x_rows"]], original=mod))
-        if bound is not None:
-            asm.place(path, bound)
+        if bound is None:
+            return
+        # the family speed gate, this family too: a variant seats only
+        # if it measures faster than the host on the calibrated shape.
+        # On one device the FP8 projection's separate bias/quantize
+        # launches lose to the host's bias-fused GEMM; on another they
+        # win — the same declaration, raced, gives each box its answer.
+        probe = torch.randn(int(c["x_rows"]), mod.in_features,
+                            device=mod.weight.device,
+                            dtype=c.get("x_dtype", torch.bfloat16))
+        with torch.inference_mode():
+            host_ms = _lap_ms(lambda: mod(probe))
+            bound_ms = _lap_ms(lambda: bound(probe))
+        verdict = "seat" if bound_ms <= host_ms * 0.98 else "host"
+        print(f"[race] {path}: bound {bound_ms * 1e3:.0f}us vs host "
+              f"{host_ms * 1e3:.0f}us @rows={c['x_rows']} -> {verdict}",
+              flush=True)
+        if verdict == "host":
+            asm.families["linear_proj"] -= 1
+            asm.refused.append(
+                (path, f"linear_proj: loses the race "
+                       f"({bound_ms * 1e3:.0f}us vs host "
+                       f"{host_ms * 1e3:.0f}us @rows={c['x_rows']})"))
+            return
+        asm.place(path, bound)
 
     # the vision attention projections are the one large-M band the
     # automatic book leaves to the compiler, and the compiler's
@@ -434,7 +533,6 @@ def build(model, run_once) -> tuple[Assembly, dict]:
     # the packs above to be in the seat map already.
     from flash_rt.structures.adapters.qwen_per_head_qk_norm_rope import (
         PerHeadGqaQkNormRopeAdapter)
-    reverts = []
     rope_result = PerHeadGqaQkNormRopeAdapter()(
         model, types.SimpleNamespace(swaps=asm.swaps, notes={}))
     rope_observed = {}
@@ -550,6 +648,9 @@ def build(model, run_once) -> tuple[Assembly, dict]:
     # the losers' reasons ride along on the bound core.
     adapter_result = DiffusersAttentionAdapter()(model, run_once)
     observed, toggles, variants = dict(rope_observed), [], {}
+    observed.update(chain_observed)
+    if chain_toggle is not None:
+        toggles.append(chain_toggle)
     if adapter_result is not None:
         _, _, extras = adapter_result
         observed.update(extras.get("observed", {}))

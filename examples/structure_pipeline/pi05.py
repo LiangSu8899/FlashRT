@@ -140,7 +140,7 @@ def _shim_vision_state_keys(policy) -> int:
         flat = k.replace(".vision_model.", ".")
         for mk in want:
             if mk.endswith(flat) or flat.endswith(mk):
-                fixed[mk] = v
+                fixed[mk] = v.to(msd[mk].dtype)
                 break
     if fixed:
         policy.load_state_dict(fixed, strict=False)

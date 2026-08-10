@@ -158,14 +158,21 @@ def main() -> int:
         peaks = {}
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
-        stock = capture_stage(
-            torch.compile(hot, mode="max-autotune-no-cudagraphs",
-                          fullgraph=False),
-            model=model, warmup=8, gate_cos=0, min_speedup=0)
+        # the stock graph is a receipt, not a rerun: with the baseline
+        # on file, FRT_SKIP_STOCK=1 skips its compile entirely and
+        # FRT_STOCK_MS carries the archived number into the report
+        skip_stock = bool(os.environ.get("FRT_SKIP_STOCK"))
+        stock = None
+        if not skip_stock:
+            stock = capture_stage(
+                torch.compile(hot, mode="max-autotune-no-cudagraphs",
+                              fullgraph=False),
+                model=model, warmup=8, gate_cos=0, min_speedup=0)
 
         sequential = args.baseline == "sequential"
-        stock_ms = None
-        if sequential:
+        stock_ms = (float(os.environ["FRT_STOCK_MS"])
+                    if os.environ.get("FRT_STOCK_MS") else None)
+        if sequential and stock is not None:
             # the baseline is measured and released before anything
             # binds: under locked clocks a sequential A-then-B holds,
             # and the bind window never carries the stock graph's alias
@@ -282,6 +289,11 @@ def main() -> int:
                        "structures_graph": replay_ms(
                            {"structures_graph": treated})
                        ["structures_graph"]}
+        elif stock is None:
+            medians = {"stock_graph": stock_ms,
+                       "structures_graph": replay_ms(
+                           {"structures_graph": treated})
+                       ["structures_graph"]}
         else:
             medians = replay_ms({"stock_graph": stock,
                                  "structures_graph": treated})
@@ -301,8 +313,9 @@ def main() -> int:
             "parity_cosine": parity,
             "stock_graph_ms": medians["stock_graph"],
             "structures_graph_ms": medians["structures_graph"],
-            "speedup_vs_stock_graph": (medians["stock_graph"]
-                                       / medians["structures_graph"]),
+            "speedup_vs_stock_graph": (
+                medians["stock_graph"] / medians["structures_graph"]
+                if medians["stock_graph"] else None),
             "ledger": handle.summary(),
         }
         if weights_receipt is None:
@@ -316,7 +329,7 @@ def main() -> int:
                                               default=str))
         handle.detach()
         treated.restore_host()
-        if not sequential:
+        if not sequential and stock is not None:
             stock.restore_host()
     finally:
         unpin()
