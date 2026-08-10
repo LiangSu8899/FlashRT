@@ -797,15 +797,6 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         }, py::arg("A"), py::arg("B"), py::arg("D"),
            py::arg("M"), py::arg("N"), py::arg("K"),
            py::arg("d_scale_a"), py::arg("d_scale_b"), py::arg("num_algos") = 16)
-        .def("autotune_fp8_nn_bias", [](GemmRunner& self,
-                                         uintptr_t A, uintptr_t B, uintptr_t D, uintptr_t bias,
-                                         int M, int N, int K, float alpha,
-                                         int num_algos) {
-            self.autotune_fp8_nn_bias(to_ptr(A), to_ptr(B), to_ptr(D), to_ptr(bias),
-                                       M, N, K, alpha, num_algos);
-        }, py::arg("A"), py::arg("B"), py::arg("D"), py::arg("bias"),
-           py::arg("M"), py::arg("N"), py::arg("K"),
-           py::arg("alpha") = 1.0f, py::arg("num_algos") = 16)
 #ifdef ENABLE_NVFP4
         .def("fp4_nn_dev", [](GemmRunner& self,
                                uintptr_t A_fp4, uintptr_t SFA,

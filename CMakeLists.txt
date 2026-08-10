@@ -1078,6 +1078,10 @@ if(ENABLE_FA2 AND
     string(TOUPPER ${_dt} _DT_UP)
     target_compile_definitions(fa2_vendor_obj PRIVATE FA2_HAS_${_DT_UP}=1)
   endforeach()
+  if(FLASHRT_ENABLE_CHAMELEON)
+    target_compile_definitions(fa2_vendor_obj PRIVATE
+      FLASHRT_ENABLE_CHAMELEON=1)
+  endif()
 
   string(REPLACE ";" "," _FA2_H "${FA2_BUILT_HDIMS}")
   string(REPLACE ";" "," _FA2_D "${FA2_BUILT_DTYPES}")
@@ -1127,6 +1131,10 @@ if(ENABLE_FA2 AND
     target_include_directories(flash_rt_fa2 PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/csrc
     )
+    if(FLASHRT_ENABLE_CHAMELEON)
+      target_compile_definitions(flash_rt_fa2 PRIVATE
+        FLASHRT_ENABLE_CHAMELEON=1)
+    endif()
     if(FLASHRT_ENABLE_NATIVE_CPP)
       target_compile_definitions(flash_rt_fa2 PRIVATE
         FLASHRT_FA2_NATIVE_SHARED=1)

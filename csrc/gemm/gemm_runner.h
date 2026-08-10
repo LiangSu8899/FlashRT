@@ -193,13 +193,6 @@ public:
                                   int M, int N, int K,
                                   float* d_scale_a, float* d_scale_b,
                                   int num_algos = 16);
-    // Autotune fp8_nn_bias: benchmark top-N candidate algorithms for the
-    // bias-fused FP8 GEMM shapes (Chameleon-7B QKV/O projections). Must be
-    // called before CUDA Graph capture so the cached algorithm descriptor
-    // is baked into the captured graph.
-    void autotune_fp8_nn_bias(void* A, void* B, void* D, void* bias,
-                              int M, int N, int K, float alpha,
-                              int num_algos = 16);
     void autotune_fp8_nt_dev(void* A, void* B, void* D,
                              int M, int N, int K,
                              float* d_scale_a, float* d_scale_b,

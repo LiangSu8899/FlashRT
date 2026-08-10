@@ -1,6 +1,8 @@
 """Validation of the FA2 FP16 causal forward path (Chameleon-7B on SM87)."""
 
 import math
+import os
+from pathlib import Path
 
 import pytest
 
@@ -11,6 +13,23 @@ import torch.nn.functional as F  # noqa: E402
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
+
+build_dir = os.environ.get("FLASHRT_BUILD_DIR")
+if build_dir:
+    cache = Path(build_dir) / "CMakeCache.txt"
+    if cache.is_file():
+        configured_arch = next(
+            (line.rsplit("=", 1)[-1].strip()
+             for line in cache.read_text(errors="replace").splitlines()
+             if line.startswith("GPU_ARCH:")),
+            None,
+        )
+        device_arch = "".join(map(str, torch.cuda.get_device_capability(0)))
+        if configured_arch and configured_arch.rstrip("a") != device_arch:
+            pytest.skip(
+                f"FA2 was built for SM{configured_arch}, device is SM{device_arch}",
+                allow_module_level=True,
+            )
 
 try:
     import flash_rt.flash_rt_fa2 as fa2

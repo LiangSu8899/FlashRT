@@ -80,6 +80,7 @@ FLASHRT_FA2_NATIVE_API void fvk_attention_fa2_fwd_bf16_causal(
     int o_batch_stride, int o_row_stride, int o_head_stride,
     float softmax_scale, int num_sms, cudaStream_t stream);
 
+#ifdef FLASHRT_ENABLE_CHAMELEON
 FLASHRT_FA2_NATIVE_API void fvk_attention_fa2_fwd_fp16_causal(
     const void* q_ptr, const void* k_ptr, const void* v_ptr,
     void* o_ptr, void* softmax_lse_ptr,
@@ -91,6 +92,7 @@ FLASHRT_FA2_NATIVE_API void fvk_attention_fa2_fwd_fp16_causal(
     int v_batch_stride, int v_row_stride, int v_head_stride,
     int o_batch_stride, int o_row_stride, int o_head_stride,
     float softmax_scale, int num_sms, cudaStream_t stream);
+#endif
 
 #ifdef __cplusplus
 }
