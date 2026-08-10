@@ -22,6 +22,46 @@ import pathlib
 
 import torch
 
+#: True while ``torch.export`` traces a module through this door.
+#: Export functionalization supports in-place writes only into
+#: *registered* buffers (it lifts them as graph outputs); structure
+#: code holding pool-leased plain-attribute tensors checks this flag
+#: and re-homes them as owned registered buffers before writing.
+_EXPORTING = False
+
+
+def is_exporting() -> bool:
+    return _EXPORTING
+
+
+def _own_leased_stashes(module: torch.nn.Module) -> int:
+    """Re-home pool-leased stash tensors as registered buffers.
+
+    The pack heads write later siblings into stash tensors with a
+    plain ``copy_``. Export functionalization lifts an in-place write
+    only when its target is a *registered buffer* (the mutation
+    becomes a graph output); a pool-leased plain-attribute tensor is
+    inexpressible and kills the export. Re-homing has to happen here,
+    before tracing — inside a traced forward the module would be
+    mutated with fake tensors. The owned copy detaches the tensor
+    from the workspace pool for this module only; readers resolve the
+    same attribute name and see the registered buffer.
+    """
+    owned = 0
+    for m in module.modules():
+        splits = getattr(m, "splits", None)
+        if not isinstance(splits, (list, tuple)) or len(splits) < 2:
+            continue
+        for i in range(1, len(splits)):
+            name = f"stash{i}"
+            t = m.__dict__.get(name)
+            if t is not None and torch.is_tensor(t):
+                del m.__dict__[name]
+                m.register_buffer(name, t.detach().clone(),
+                                  persistent=False)
+                owned += 1
+    return owned
+
 __all__ = ["aot_package", "aot_package_external", "aot_load", "AotModule"]
 
 
@@ -48,9 +88,15 @@ def aot_package(module: torch.nn.Module, args=(), kwargs=None,
             "refused: AOT packaging compiles for the present GPU; "
             "no CUDA device is visible")
     kwargs = dict(kwargs or {})
-    with torch.no_grad():
-        exported = torch.export.export(module, args=tuple(args),
-                                       kwargs=kwargs)
+    _own_leased_stashes(module)
+    global _EXPORTING
+    _EXPORTING = True
+    try:
+        with torch.no_grad():
+            exported = torch.export.export(module, args=tuple(args),
+                                           kwargs=kwargs)
+    finally:
+        _EXPORTING = False
     configs = dict(inductor_configs or {})
     if external_weights:
         configs["aot_inductor.package_constants_in_so"] = False
@@ -77,9 +123,15 @@ def aot_package_external(module: torch.nn.Module, args=(), kwargs=None,
             "refused: AOT packaging compiles for the present GPU; "
             "no CUDA device is visible")
     kwargs = dict(kwargs or {})
-    with torch.no_grad():
-        exported = torch.export.export(module, args=tuple(args),
-                                       kwargs=kwargs)
+    _own_leased_stashes(module)
+    global _EXPORTING
+    _EXPORTING = True
+    try:
+        with torch.no_grad():
+            exported = torch.export.export(module, args=tuple(args),
+                                           kwargs=kwargs)
+    finally:
+        _EXPORTING = False
     weights = dict(module.named_parameters())
     weights.update(dict(module.named_buffers()))
     weights.update({k: v for k, v in (exported.constants or {}).items()
