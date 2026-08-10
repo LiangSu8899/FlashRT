@@ -10,9 +10,11 @@ import pytest
 pytest.importorskip("torch")
 
 try:
-    from flash_rt import flash_rt_kernels as fvk
-except ImportError as exc:  # pragma: no cover
-    pytest.skip(f"flash_rt_kernels is not built: {exc}", allow_module_level=True)
+    import flash_rt.flash_rt_kernels as fvk
+except ModuleNotFoundError as exc:  # pragma: no cover
+    if exc.name != "flash_rt.flash_rt_kernels":
+        raise
+    pytest.skip("flash_rt_kernels was not built", allow_module_level=True)
 
 if not hasattr(fvk, "hyvla_rope_qknorm_kvwrite_bf16"):
     pytest.skip("HyVLA kernels require FLASHRT_ENABLE_HYVLA", allow_module_level=True)

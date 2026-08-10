@@ -8,8 +8,10 @@ torch = pytest.importorskip("torch")
 
 try:
     import flash_rt.frontends.torch.hyvla_thor as hy_mod
-except ImportError as exc:  # pragma: no cover
-    pytest.skip(f"hyvla_thor frontend not importable: {exc}", allow_module_level=True)
+except ModuleNotFoundError as exc:  # pragma: no cover
+    if exc.name != "flash_rt.flash_rt_kernels":
+        raise
+    pytest.skip("flash_rt_kernels was not built", allow_module_level=True)
 
 
 class _Probe:
