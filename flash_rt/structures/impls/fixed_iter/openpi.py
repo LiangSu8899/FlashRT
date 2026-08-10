@@ -159,9 +159,13 @@ def _fixed_forward(
         use_cache=True,
     )
 
-    dt = torch.tensor(-1.0 / steps, dtype=torch.float32, device=device)
+    # device-native creation: torch.tensor(scalar, device=cuda) stages
+    # on the CPU and copies, which a capturing stream refuses the
+    # moment a seat's graph break makes these lines run eager
+    dt = torch.full((), -1.0 / steps, dtype=torch.float32,
+                    device=device)
     value = noise
-    timestep = torch.tensor(1.0, dtype=torch.float32, device=device)
+    timestep = torch.ones((), dtype=torch.float32, device=device)
     for _ in range(steps):
         velocity = model.denoise_step(
             state,
