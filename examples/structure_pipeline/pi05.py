@@ -299,6 +299,9 @@ def build(policy, hot):
                 notes["regions_refused"].append(
                     (f"{family}:{band}",
                      str((result or {}).get("refused"))[:160]))
+                print(f"[pi05] {family}:{band} refused: "
+                      f"{str((result or {}).get('refused'))[:200]}",
+                      flush=True)
             if bound is None:
                 print(f"[pi05] {family}@{root}: every rung refused",
                       flush=True)
