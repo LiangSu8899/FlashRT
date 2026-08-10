@@ -93,7 +93,12 @@ class PackedLinearNvfp4(GuardedSeam, torch.nn.Module):
         for i, n in enumerate(splits[1:], 1):
             setattr(self, f"stash{i}", lease(
                 (rows, n), torch.bfloat16, dev,
-                tag=f"qkv_stash{i}"))
+                tag=f"qkv_stash{i}",
+                # state, not scratch: the host may retain the
+                # reader's view (a KV cache did, and the shared
+                # slab clobbered every cached slice) — sharing
+                # needs immediacy-of-consumption as a fact
+                exclusive=True))
         self._frt_arm(dtypes=CAST_OK, device=dev,
                       k=int(mods[0].weight.shape[1]), row_capacity=rows)
 

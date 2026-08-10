@@ -91,7 +91,12 @@ class PackedLinear(GuardedSeam, torch.nn.Module):
         for i, n in enumerate(splits[1:], 1):
             setattr(self, f"stash{i}", lease(
                 (rows, n), torch.bfloat16, dev,
-                tag=f"qkv_stash{i}"))
+                tag=f"qkv_stash{i}",
+                # state, not scratch: the host may retain the
+                # reader's view (a KV cache did, and the shared
+                # slab clobbered every cached slice) — sharing
+                # needs immediacy-of-consumption as a fact
+                exclusive=True))
         # a bias-add is its own kernel. Hosts whose projections carry no
         # bias (the whole Gemma family) would otherwise pay a launch per
         # call to add zeros — measured 3 kernels/call with the bias

@@ -27,7 +27,8 @@ _LEASES: dict[str, int] = {}
 
 
 def lease(shape, dtype, device, *, tag: str,
-          fill: str = "scratch") -> torch.Tensor:
+          fill: str = "scratch",
+          exclusive: bool = False) -> torch.Tensor:
     """One shared tensor for every seat asking this (shape, tag).
 
     The pool's safety argument is single-stream sequential execution:
@@ -35,6 +36,15 @@ def lease(shape, dtype, device, *, tag: str,
     share one stream*. A caller leasing from a non-default stream is
     outside that argument, and the pool refuses rather than corrupt
     silently — multi-stream serving needs per-lane isolation first.
+
+    ``exclusive=True`` allocates a private tensor instead of joining
+    the shared slab, still counted in the pool's receipt. It exists
+    for *state*, not scratch: a buffer whose consumer is the host may
+    be retained past the tick (a KV cache holding a reader's view was
+    the measured failure — every layer's write clobbered every other
+    layer's cached slice, with every ledger clean). Sharing such a
+    buffer requires the immediacy of consumption as a verified fact;
+    absent that fact, state is exclusive.
     """
     if (torch.cuda.is_available()
             and str(device).startswith("cuda")
@@ -44,6 +54,12 @@ def lease(shape, dtype, device, *, tag: str,
             "workspace: leasing from a non-default CUDA stream — the "
             "shared pool's lifetime argument only covers single-stream "
             "sequential execution; isolate per-stream lanes first")
+    if exclusive:
+        buf = torch.zeros(*shape, dtype=dtype, device=device)
+        if fill == "ones":
+            buf.fill_(1)
+        _LEASES[tag] = _LEASES.get(tag, 0) + 1
+        return buf
     key = (tuple(shape), dtype, str(device), tag, fill)
     buf = _POOL.get(key)
     if buf is None:
