@@ -211,6 +211,27 @@ class HyVLATorchFrontendOrin(HyVLATorchFrontendThor):
         (fp64 math), and the suffix mask — is computed once per prompt and
         reused across frames. Only the image-dependent ``prefix_embs`` are
         rebuilt each call."""
+        if state is not None:
+            state_size = (
+                state.numel() if torch.is_tensor(state)
+                else np.asarray(state).size
+            )
+            if state_size > self.max_state_dim:
+                raise ValueError(
+                    f"state has {state_size} dims, max_state_dim is "
+                    f"{self.max_state_dim}")
+        if noise is not None:
+            noise_size = (
+                noise.numel() if torch.is_tensor(noise)
+                else np.asarray(noise).size
+            )
+            want = self.chunk * self.max_action_dim
+            if noise_size != want:
+                raise ValueError(
+                    f"noise must have {want} elements "
+                    f"(chunk={self.chunk} x max_action_dim={self.max_action_dim}), "
+                    f"got {noise_size}")
+
         if prompt is not None and prompt != self._prompt:
             self.set_prompt(prompt)
         if self._lang_tokens is None:
@@ -226,11 +247,8 @@ class HyVLATorchFrontendOrin(HyVLATorchFrontendThor):
         if state is None:
             state_t = torch.zeros(1, self.max_state_dim, device=dev, dtype=_BF16)
         else:
-            st = torch.as_tensor(np.asarray(state), device=dev, dtype=_BF16).reshape(1, -1)
-            if st.shape[1] > self.max_state_dim:
-                raise ValueError(
-                    f"state has {st.shape[1]} dims, max_state_dim is "
-                    f"{self.max_state_dim}")
+            source = state if torch.is_tensor(state) else np.asarray(state)
+            st = torch.as_tensor(source, device=dev, dtype=_BF16).reshape(1, -1)
             if st.shape[1] < self.max_state_dim:
                 st = F.pad(st, (0, self.max_state_dim - st.shape[1]))
             state_t = st
@@ -274,13 +292,8 @@ class HyVLATorchFrontendOrin(HyVLATorchFrontendThor):
             noise_t = torch.randn(1, self.chunk, self.max_action_dim,
                                   dtype=torch.float32, device=dev)
         else:
-            noise_t = torch.as_tensor(np.asarray(noise), device=dev, dtype=torch.float32)
-            want = self.chunk * self.max_action_dim
-            if noise_t.numel() != want:
-                raise ValueError(
-                    f"noise must have {want} elements "
-                    f"(chunk={self.chunk} x max_action_dim={self.max_action_dim}), "
-                    f"got {noise_t.numel()}")
+            source = noise if torch.is_tensor(noise) else np.asarray(noise)
+            noise_t = torch.as_tensor(source, device=dev, dtype=torch.float32)
             noise_t = noise_t.reshape(1, self.chunk, self.max_action_dim)
 
         x_t = self._graph_forward(stat["S_p"], stat["n_vis"], prefix_embs,

@@ -16,37 +16,37 @@ except ImportError:  # pragma: no cover - torch < 2.2
     SDPBackend = None
 
 import flash_rt.flash_rt_kernels as fvk
-import flash_rt.models.hyvla.pipeline_thor as _thor_pipeline
 from flash_rt.models.hyvla.pipeline_thor import HyVLAThorBF16Pipeline, _rot_half
 
 
-if not hasattr(_thor_pipeline.F, "rms_norm"):
-    def _rms_norm_torch(x, weight, eps):
-        y = x.float() * torch.rsqrt(x.float().pow(2).mean(dim=-1, keepdim=True) + eps)
-        if weight is not None:
-            y = y * weight.float()
-        return y.to(x.dtype)
+def _rms_norm_torch(x, weight, eps):
+    y = x.float() * torch.rsqrt(
+        x.float().pow(2).mean(dim=-1, keepdim=True) + eps)
+    if weight is not None:
+        y = y * weight.float()
+    return y.to(x.dtype)
 
-    def _rms_norm(x, normalized_shape, weight=None, eps=1e-5):
-        # torch 2.3 lacks F.rms_norm. The single-launch fvk.rms_norm kernel
-        # implements the exact reference math (fp32 sum-of-squares -> rsqrt ->
-        # weight multiply -> bf16 rounding) and is bit-equal to the torch
-        # expansion on contiguous rows; fall back for anything exotic.
-        if (x.is_cuda and x.dtype == torch.bfloat16 and weight is not None
-                and weight.dtype == torch.bfloat16
-                and len(normalized_shape) == 1
-                and normalized_shape[0] == x.shape[-1]):
-            xc = x if x.is_contiguous() else x.contiguous()
-            wc = weight if weight.is_contiguous() else weight.contiguous()
-            rows = xc.numel() // xc.shape[-1]
-            out = torch.empty_like(xc)
-            fvk.rms_norm(xc.data_ptr(), wc.data_ptr(), out.data_ptr(),
-                         rows, xc.shape[-1], eps,
-                         torch.cuda.current_stream().cuda_stream)
-            return out.reshape(x.shape)
-        return _rms_norm_torch(x, weight, eps)
 
-    _thor_pipeline.F.rms_norm = _rms_norm
+def _rms_norm(x, normalized_shape, weight=None, eps=1e-5):
+    native = getattr(F, "rms_norm", None)
+    if native is not None:
+        return native(x, normalized_shape, weight, eps)
+
+    # Torch 2.3 lacks F.rms_norm. Keep the compatibility path local to HyVLA
+    # so importing this module never modifies torch.nn.functional globally.
+    if (x.is_cuda and x.dtype == torch.bfloat16 and weight is not None
+            and weight.dtype == torch.bfloat16
+            and len(normalized_shape) == 1
+            and normalized_shape[0] == x.shape[-1]):
+        xc = x if x.is_contiguous() else x.contiguous()
+        wc = weight if weight.is_contiguous() else weight.contiguous()
+        rows = xc.numel() // xc.shape[-1]
+        out = torch.empty_like(xc)
+        fvk.rms_norm(xc.data_ptr(), wc.data_ptr(), out.data_ptr(),
+                     rows, xc.shape[-1], eps,
+                     torch.cuda.current_stream().cuda_stream)
+        return out.reshape(x.shape)
+    return _rms_norm_torch(x, weight, eps)
 
 
 class _W8Int8:
@@ -99,10 +99,6 @@ class HyVLAOrinBF16Pipeline(HyVLAThorBF16Pipeline):
 
     def autotune_gemms(self, shapes, num_algos=16):
         return 0
-
-    def _attn(self, q, k, v, mask):
-        out = super()._attn(q, k, v, mask)
-        return torch.nan_to_num(out)
 
     # ------------------------------------------------------------------
     #  ViT INT8 GEMM sites (SM87). Weight lists are replaced in-place by
@@ -269,8 +265,8 @@ class HyVLAOrinBF16Pipeline(HyVLAThorBF16Pipeline):
         D = hs.shape[2]
         hd, nh, nkv = self.head_dim, self.n_heads, self.n_kv
 
-        hs_v = F.rms_norm(hs[0, :n_vis], (D,), w_vis[4], self.rms_eps)
-        hs_t = F.rms_norm(hs[0, n_vis:], (D,), w_text[4], self.rms_eps)
+        hs_v = _rms_norm(hs[0, :n_vis], (D,), w_vis[4], self.rms_eps)
+        hs_t = _rms_norm(hs[0, n_vis:], (D,), w_text[4], self.rms_eps)
         qkv = torch.cat([hs_v @ w_vis[0].t(), hs_t @ w_text[0].t()], 0)
 
         if getattr(self, "_fused_attn", False):
@@ -283,8 +279,8 @@ class HyVLAOrinBF16Pipeline(HyVLAThorBF16Pipeline):
             v = v.view(S, nkv, hd).transpose(0, 1)[None]
             q = q * cos + _rot_half(q) * sin
             k = k * cos + _rot_half(k) * sin
-            q = F.rms_norm(q, (hd,), qk_w[0], self.rms_eps)
-            k = F.rms_norm(k, (hd,), qk_w[1], self.rms_eps)
+            q = _rms_norm(q, (hd,), qk_w[0], self.rms_eps)
+            k = _rms_norm(k, (hd,), qk_w[1], self.rms_eps)
             if kbuf.shape[1] != nkv:
                 r = kbuf.shape[1] // nkv
                 k = k.repeat_interleave(r, dim=1)
@@ -298,8 +294,8 @@ class HyVLAOrinBF16Pipeline(HyVLAThorBF16Pipeline):
         o_t = att[0, n_vis:] @ w_text[1].t()
         hs = hs + torch.cat([o_v, o_t], 0)[None]
 
-        hs_v = F.rms_norm(hs[0, :n_vis], (D,), w_vis[5], self.rms_eps)
-        hs_t = F.rms_norm(hs[0, n_vis:], (D,), w_text[5], self.rms_eps)
+        hs_v = _rms_norm(hs[0, :n_vis], (D,), w_vis[5], self.rms_eps)
+        hs_t = _rms_norm(hs[0, n_vis:], (D,), w_text[5], self.rms_eps)
         gu = torch.cat([self._int8_rowwise_gemm(hs_v, ffnv[0], ffnv[1]),
                         self._int8_rowwise_gemm(hs_t, ffnt[0], ffnt[1])], 0)
         g, u = gu.chunk(2, -1)
@@ -365,7 +361,7 @@ class HyVLAOrinBF16Pipeline(HyVLAThorBF16Pipeline):
         hd, nh, nkv = self.head_dim, self.n_heads, self.n_kv
 
         if pending is None:
-            hs_n = F.rms_norm(hs, (D,), w[4], self.rms_eps)
+            hs_n = _rms_norm(hs, (D,), w[4], self.rms_eps)
         else:
             hs_n = self._res_add_rms_norm(hs, pending, w[4])
 
@@ -380,8 +376,8 @@ class HyVLAOrinBF16Pipeline(HyVLAThorBF16Pipeline):
             v = v.view(S, nkv, hd).transpose(0, 1)[None]
             q = q * cos + _rot_half(q) * sin
             k = k * cos + _rot_half(k) * sin
-            q = F.rms_norm(q, (hd,), qk_w[0], self.rms_eps)
-            k = F.rms_norm(k, (hd,), qk_w[1], self.rms_eps)
+            q = _rms_norm(q, (hd,), qk_w[0], self.rms_eps)
+            k = _rms_norm(k, (hd,), qk_w[1], self.rms_eps)
             if kbuf.shape[1] != nkv:
                 r = kbuf.shape[1] // nkv
                 k = k.repeat_interleave(r, dim=1)

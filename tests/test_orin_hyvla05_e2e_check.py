@@ -24,10 +24,7 @@ if not CKPT or not os.path.isdir(CKPT):
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
 
-try:
-    from flash_rt.frontends.torch.hyvla_orin import HyVLATorchFrontendOrin
-except ImportError as exc:  # pragma: no cover
-    pytest.skip(f"hyvla_orin frontend not importable: {exc}", allow_module_level=True)
+from flash_rt.frontends.torch.hyvla_orin import HyVLATorchFrontendOrin
 
 PROMPT = "pick up the bottle"
 
