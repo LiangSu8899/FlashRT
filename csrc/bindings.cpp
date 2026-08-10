@@ -8634,7 +8634,7 @@ graph-replay safe) to fill the SMs on long K. M in 1..16; N%8==0; K%64==0;
                 throw py::value_error(
                     "hyvla_rope_qknorm_kvwrite_bf16 supports hd==128 only, "
                     "got " + std::to_string(hd));
-            if (off < 0 || off + S > S_tot)
+            if (off < 0 || S > S_tot || off > S_tot - S)
                 throw py::value_error(
                     "hyvla_rope_qknorm_kvwrite_bf16: invalid offset window "
                     "off=" + std::to_string(off) + " S=" + std::to_string(S) +
@@ -8645,6 +8645,12 @@ graph-replay safe) to fill the SMs on long K. M in 1..16; N%8==0; K%64==0;
             if (kv_rep < 1)
                 throw py::value_error(
                     "hyvla_rope_qknorm_kvwrite_bf16 requires kv_rep>=1");
+            if (nq % nkv != 0 || nq / nkv != kv_rep)
+                throw py::value_error(
+                    "hyvla_rope_qknorm_kvwrite_bf16 requires "
+                    "nq == nkv * kv_rep; got nq=" + std::to_string(nq) +
+                    " nkv=" + std::to_string(nkv) +
+                    " kv_rep=" + std::to_string(kv_rep));
             hyvla_rope_qknorm_kvwrite_bf16(
                 reinterpret_cast<const void*>(qkv),
                 reinterpret_cast<const void*>(cos),

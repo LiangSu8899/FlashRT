@@ -42,6 +42,10 @@ def test_rope_qknorm_rejects_nonpositive_shapes():
         fvk.hyvla_rope_qknorm_kvwrite_bf16(
             0, 0, 0, 0, 0, 0, 0, 0, S=8, nq=4, nkv=1, hd=128, S_tot=8, off=0,
             kv_rep=0)
+    with pytest.raises(ValueError, match="nq == nkv \\* kv_rep"):
+        fvk.hyvla_rope_qknorm_kvwrite_bf16(
+            0, 0, 0, 0, 0, 0, 0, 0, S=8, nq=4, nkv=2, hd=128,
+            S_tot=8, off=0, kv_rep=1)
 
 
 def test_vit_add_layer_norm_rejects_odd_dim():
@@ -59,6 +63,30 @@ def test_vit_add_layer_norm_rejects_nonpositive_rows():
 def test_quant_fp8_dyn_rejects_nonpositive_n():
     with pytest.raises(ValueError, match="n>0"):
         fvk.hyvla_quant_fp8_dyn_bf16(0, 0, 0, 0)
+
+
+@pytest.mark.skipif(
+    not hasattr(fvk, "hyvla_quant_fp8_dyn_bf16"),
+    reason="Thor-only kernel",
+)
+def test_quant_fp8_dyn_handles_odd_tail():
+    import torch
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (11, 0):
+        pytest.skip("requires a Thor SM110 device")
+    for n in (1, 3, 513):
+        x = torch.linspace(-2.0, 3.0, n, device="cuda", dtype=torch.bfloat16)
+        out = torch.empty(n, device="cuda", dtype=torch.float8_e4m3fn)
+        scale = torch.empty(1, device="cuda", dtype=torch.float32)
+        fvk.hyvla_quant_fp8_dyn_bf16(
+            x.data_ptr(), out.data_ptr(), scale.data_ptr(), n,
+            torch.cuda.current_stream().cuda_stream)
+        expected_scale = torch.clamp(x.float().abs().amax() / 448.0, min=1e-12)
+        expected = torch.clamp(
+            x.float() / expected_scale, -448.0, 448.0).to(torch.float8_e4m3fn)
+        torch.cuda.synchronize()
+        assert torch.equal(out.float(), expected.float())
+        assert torch.equal(scale, expected_scale.reshape(1))
 
 
 @pytest.mark.skipif(not hasattr(fvk, "hyvla_ffn_gu_silu_bf16"),

@@ -1,10 +1,17 @@
 """Dispatch and registration smoke tests for HyVLA (no GPU required)."""
 
+import pytest
+
 
 def test_hyvla_thor_dispatch_resolves():
     from flash_rt.hardware import resolve_pipeline_class
 
-    cls = resolve_pipeline_class("hyvla", "torch", "thor")
+    try:
+        cls = resolve_pipeline_class("hyvla", "torch", "thor")
+    except ModuleNotFoundError as exc:
+        if exc.name != "flash_rt.flash_rt_kernels":
+            raise
+        pytest.skip("flash_rt_kernels was not built")
     assert cls.__name__ == "HyVLATorchFrontendThor"
     assert cls.__module__ == "flash_rt.frontends.torch.hyvla_thor"
 

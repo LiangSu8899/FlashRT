@@ -7,7 +7,7 @@
 // cross-block atomics -> fully deterministic -> trivially CUDA-graph-safe.
 //
 // Numerics are bit-identical to quantize_fp8_device:
-//   amax  = max|x| over n>>1 bf16 pairs   (odd tail dropped, as in reference)
+//   amax  = max|x| over all n bf16 elements
 //   scale = max(amax/448, 1e-12)
 //   out[i]= e4m3( clamp(x[i] * (1/scale), +-448) )
 #include "common.cuh"
@@ -28,6 +28,8 @@ __global__ void hyvla_quant_fp8_dyn_bf16_kernel(
                           fmaxf(fabsf(to_f32<__nv_bfloat16>(v.x)),
                                 fabsf(to_f32<__nv_bfloat16>(v.y))));
     }
+    if ((n & 1) != 0 && threadIdx.x == 0)
+        local_max = fmaxf(local_max, fabsf(to_f32<__nv_bfloat16>(x[n - 1])));
     float amax = block_reduce_max(local_max, red);   // broadcast to all lanes
     float sc = fmaxf(amax / 448.0f, 1e-12f);
     if (threadIdx.x == 0) *scale = sc;
@@ -39,6 +41,11 @@ __global__ void hyvla_quant_fp8_dyn_bf16_kernel(
         float v1 = to_f32<__nv_bfloat16>(v.y) * inv_s;
         out[2 * i]     = __nv_fp8_e4m3(fminf(fmaxf(v0, -448.0f), 448.0f));
         out[2 * i + 1] = __nv_fp8_e4m3(fminf(fmaxf(v1, -448.0f), 448.0f));
+    }
+    if ((n & 1) != 0 && threadIdx.x == 0) {
+        float tail = to_f32<__nv_bfloat16>(x[n - 1]) * inv_s;
+        out[n - 1] = __nv_fp8_e4m3(
+            fminf(fmaxf(tail, -448.0f), 448.0f));
     }
 }
 

@@ -79,7 +79,7 @@ def _camera_tensor(image):
 
 class HyVLATorchFrontendThor:
     #: Development override for the hardware gate (e.g. running the weight
-    #: loader on a non-Thor box). Any non-empty value skips the capability
+    #: loader on a non-Thor box). Only the exact value "1" skips the capability
     #: probe; kernels still require the real hardware at runtime. Not a
     #: supported production path.
     _FORCE_ARCH_ENV = "FLASHRT_HYVLA_FORCE_ARCH"
@@ -89,7 +89,7 @@ class HyVLATorchFrontendThor:
     def _require_arch(self):
         import os
 
-        if os.environ.get(self._FORCE_ARCH_ENV, ""):
+        if os.environ.get(self._FORCE_ARCH_ENV) == "1":
             return  # explicit documented dev override: skip the probe
         if not torch.cuda.is_available():
             raise RuntimeError(
@@ -582,6 +582,27 @@ class HyVLATorchFrontendThor:
                         use_graph=True):
         """Full native forward. images: (num_cam,K,3,H,W) [0,1] array/tensor.
         Returns raw action chunk (1, chunk, max_action_dim) as numpy fp32."""
+        if state is not None:
+            state_size = (
+                state.numel() if torch.is_tensor(state)
+                else np.asarray(state).size
+            )
+            if state_size > self.max_state_dim:
+                raise ValueError(
+                    f"state has {state_size} dims, max_state_dim is "
+                    f"{self.max_state_dim}")
+        if noise is not None:
+            noise_size = (
+                noise.numel() if torch.is_tensor(noise)
+                else np.asarray(noise).size
+            )
+            want = self.chunk * self.max_action_dim
+            if noise_size != want:
+                raise ValueError(
+                    f"noise must have {want} elements "
+                    f"(chunk={self.chunk} x max_action_dim={self.max_action_dim}), "
+                    f"got {noise_size}")
+
         if prompt is not None and prompt != self._prompt:
             self.set_prompt(prompt)
         if self._lang_tokens is None:
@@ -598,11 +619,8 @@ class HyVLATorchFrontendThor:
         if state is None:
             state_t = torch.zeros(1, self.max_state_dim, device=dev, dtype=_BF16)
         else:
-            st = torch.as_tensor(np.asarray(state), device=dev, dtype=_BF16).reshape(1, -1)
-            if st.shape[1] > self.max_state_dim:
-                raise ValueError(
-                    f"state has {st.shape[1]} dims, max_state_dim is "
-                    f"{self.max_state_dim}")
+            source = state if torch.is_tensor(state) else np.asarray(state)
+            st = torch.as_tensor(source, device=dev, dtype=_BF16).reshape(1, -1)
             if st.shape[1] < self.max_state_dim:
                 st = F.pad(st, (0, self.max_state_dim - st.shape[1]))
             state_t = st
@@ -638,13 +656,8 @@ class HyVLATorchFrontendThor:
             noise_t = torch.randn(1, self.chunk, self.max_action_dim,
                                   dtype=torch.float32, device=dev)
         else:
-            noise_t = torch.as_tensor(np.asarray(noise), device=dev, dtype=torch.float32)
-            want = self.chunk * self.max_action_dim
-            if noise_t.numel() != want:
-                raise ValueError(
-                    f"noise must have {want} elements "
-                    f"(chunk={self.chunk} x max_action_dim={self.max_action_dim}), "
-                    f"got {noise_t.numel()}")
+            source = noise if torch.is_tensor(noise) else np.asarray(noise)
+            noise_t = torch.as_tensor(source, device=dev, dtype=torch.float32)
             noise_t = noise_t.reshape(1, self.chunk, self.max_action_dim)
 
         x_t = self._graph_forward(S_p, n_vis, prefix_embs, pmask, pcos, psin,
