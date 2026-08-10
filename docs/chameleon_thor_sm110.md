@@ -77,7 +77,7 @@ The checkpoint's `self_attn.q_norm.weight` / `k_norm.weight` (and corresponding 
 
 ## 3. Image Input and Real-Data Validation
 
-**All precision/performance validation uses real images**, not synthetic token ids (path: `/path/to/images/*.jpg`, a directory of real photographs; validation uses a real hand photograph). VQGAN image tokenization uses the `<IMG_START, h_grid_tok, w_grid_tok, [VQ tokens with NEWLINE per row], IMG_END>` layout (`ChameleonTorchFrontendThor._vqgan_encode`), backed by the in-repo `flash_rt/models/chameleon/vqgan/` (`ImageTokenizer` + `VocabTranslation.convert_img2bp2`).
+**All precision/performance validation uses real images**, not synthetic token ids (path: `/path/to/images/*.jpg`, a directory of real photographs; validation uses a real hand photograph). VQGAN image tokenization uses the `<IMG_START, h_grid_tok, w_grid_tok, [VQ tokens with NEWLINE per row], IMG_END>` layout (`ChameleonTorchFrontendThor._vqgan_encode`), backed by the Apache-2.0 Transformers `ChameleonVQVAE` and `ChameleonImageVocabularyMapping` implementations.
 
 ### 3.1 Validation Scripts
 

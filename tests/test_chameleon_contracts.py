@@ -7,25 +7,54 @@ eager-vs-graph consistency lives in the precision scripts
 (scripts/check_chameleon_thor_precision.py) which need a checkpoint.
 """
 
+import importlib
+import os
+from pathlib import Path
+
 import pytest
 
 torch = pytest.importorskip("torch")
 
 from flash_rt.hardware import _PIPELINE_MAP, resolve_pipeline_class
 
-try:
-    from flash_rt.frontends.torch.chameleon_thor import (
-        PAD_ID, ChameleonTorchFrontendThor)
-    _THOR_IMPORT = True
-except Exception:  # pragma: no cover - kernels not built
-    _THOR_IMPORT = False
+REPO_ROOT = Path(__file__).resolve().parents[1]
+_OPTIONAL_BUILD_MODULES = {
+    "flash_rt.flash_rt_kernels",
+    "flash_rt.flash_rt_fa2",
+}
 
-try:
-    from flash_rt.frontends.torch.chameleon_rtx_sm87 import (
-        ChameleonTorchFrontendRtxSm87)
-    _ORIN_IMPORT = True
-except Exception:  # pragma: no cover - kernels not built
-    _ORIN_IMPORT = False
+
+def _chameleon_build_enabled() -> bool:
+    build_dir = Path(os.environ.get("FLASHRT_BUILD_DIR", REPO_ROOT / "build"))
+    cache = build_dir / "CMakeCache.txt"
+    if not cache.is_file():
+        return False
+    return any(
+        line.startswith("FLASHRT_ENABLE_CHAMELEON:BOOL=")
+        and line.rsplit("=", 1)[-1].upper() in {"ON", "TRUE", "1"}
+        for line in cache.read_text(errors="replace").splitlines()
+    )
+
+
+def _load_frontend(module_name: str, class_name: str):
+    try:
+        module = importlib.import_module(module_name)
+    except ModuleNotFoundError as exc:
+        if _chameleon_build_enabled() or exc.name not in _OPTIONAL_BUILD_MODULES:
+            raise
+        return None
+    return getattr(module, class_name)
+
+
+ChameleonTorchFrontendThor = _load_frontend(
+    "flash_rt.frontends.torch.chameleon_thor", "ChameleonTorchFrontendThor")
+ChameleonTorchFrontendRtxSm87 = _load_frontend(
+    "flash_rt.frontends.torch.chameleon_rtx_sm87",
+    "ChameleonTorchFrontendRtxSm87",
+)
+_THOR_IMPORT = ChameleonTorchFrontendThor is not None
+_ORIN_IMPORT = ChameleonTorchFrontendRtxSm87 is not None
+PAD_ID = 1
 
 needs_thor = pytest.mark.skipif(not _THOR_IMPORT,
                                 reason="chameleon_thor frontend not importable")
@@ -51,16 +80,27 @@ def test_registry_entries_are_lazy_module_strings():
         assert isinstance(mod, str) and isinstance(cls_name, str)
 
 
+def test_frontend_import_link_errors_are_not_swallowed(monkeypatch):
+    def fail_import(_):
+        raise ImportError("undefined symbol: chameleon_test_symbol")
+
+    monkeypatch.setattr(importlib, "import_module", fail_import)
+    with pytest.raises(ImportError, match="undefined symbol"):
+        _load_frontend("flash_rt.frontends.torch.chameleon_thor", "Frontend")
+
+
 @needs_thor
 def test_resolve_thor_pipeline_class():
     cls = resolve_pipeline_class("chameleon", "torch", "thor")
-    assert cls is ChameleonTorchFrontendThor
+    assert cls.__module__ == "flash_rt.frontends.torch.chameleon_thor"
+    assert cls.__name__ == "ChameleonTorchFrontendThor"
 
 
 @needs_orin
 def test_resolve_orin_pipeline_class():
     cls = resolve_pipeline_class("chameleon", "torch", "rtx_sm87")
-    assert cls is ChameleonTorchFrontendRtxSm87
+    assert cls.__module__ == "flash_rt.frontends.torch.chameleon_rtx_sm87"
+    assert cls.__name__ == "ChameleonTorchFrontendRtxSm87"
 
 
 def test_sm87_allowlist_rejects_unsupported_config():
@@ -113,6 +153,14 @@ def test_thor_documented_env_override_skips_probe(monkeypatch):
     monkeypatch.setenv("FLASHRT_CHAMELEON_THOR_FORCE", "1")
     # No CUDA mocking: the override must return before touching torch.cuda.
     _thor_probe()
+
+
+@needs_thor
+@pytest.mark.parametrize("max_seq", [-16, -1, 0, 15])
+def test_thor_rejects_too_small_max_seq(monkeypatch, tmp_path, max_seq):
+    monkeypatch.setenv("FLASHRT_CHAMELEON_THOR_FORCE", "1")
+    with pytest.raises(ValueError, match="max_seq must be at least 16"):
+        ChameleonTorchFrontendThor(tmp_path, max_seq=max_seq)
 
 
 # ----------------------------------------------- Thor prompt padding bounds

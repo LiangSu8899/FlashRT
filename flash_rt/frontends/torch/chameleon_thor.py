@@ -23,7 +23,9 @@ import torch
 import flash_rt.flash_rt_kernels as fvk
 try:
     import flash_rt.flash_rt_fp4 as fvk_fp4
-except Exception:
+except ModuleNotFoundError as exc:
+    if exc.name != "flash_rt.flash_rt_fp4":
+        raise
     fvk_fp4 = None
 from flash_rt.hardware.thor.attn_backend_chameleon import (
     ThorChameleonAttnBackend,
@@ -106,6 +108,8 @@ class ChameleonTorchFrontendThor:
         self._use_fp8 = bool(use_fp8)
         self._use_cuda_graph = bool(use_cuda_graph)
         self._max_pos = int(max_seq)
+        if self._max_pos < 16:
+            raise ValueError(f"max_seq must be at least 16, got {max_seq}")
         self.target_size = int(target_size)
         self.tokenizer_path = tokenizer_path
         self.vqgan_path = vqgan_path
@@ -369,44 +373,13 @@ class ChameleonTorchFrontendThor:
         raise FileNotFoundError("Chameleon tokenizer not found")
 
     def _load_vqgan(self) -> None:
-        roots: list[pathlib.Path] = []
-        if self.vqgan_path:
-            roots.append(pathlib.Path(self.vqgan_path))
-        env = os.environ.get("FLASHRT_VQGAN_DIR")
-        if env:
-            roots.append(pathlib.Path(env))
-        roots.extend([
-            self.checkpoint_dir / "original_tokenizers",
-            self.checkpoint_dir,
-        ])
+        from flash_rt.models.chameleon.vqvae_hf import load_chameleon_vqvae
 
-        yaml_path = ckpt_path = None
-        for root in roots:
-            for d in (root, root / "original_tokenizers", root / "tokenizer"):
-                if (d / "vqgan.yaml").exists() and (d / "vqgan.ckpt").exists():
-                    yaml_path = d / "vqgan.yaml"
-                    ckpt_path = d / "vqgan.ckpt"
-                    break
-            if yaml_path is not None:
-                break
-        if yaml_path is None or ckpt_path is None:
-            raise FileNotFoundError("Chameleon VQGAN assets not found")
-
-        # Chameleon-7B VQGAN reference implementation (Meta Chameleon
-        # license), vendored into the repo at flash_rt/models/chameleon/vqgan.
-        from flash_rt.models.chameleon import vqgan as chameleon_vae_ori  # type: ignore
-
-        self._vqgan_tokenizer = chameleon_vae_ori.ImageTokenizer(
-            cfg_path=str(yaml_path), ckpt_path=str(ckpt_path), device="cuda")
-
-        text_tok = pathlib.Path(yaml_path).parent / "text_tokenizer.json"
-        if not text_tok.exists():
-            text_tok = self.checkpoint_dir / "original_tokenizers" / "text_tokenizer.json"
-        with open(text_tok, encoding="utf8") as f:
-            vocab_json = json.load(f)
-        vocab_info = chameleon_vae_ori.VocabInfo(vocab_json["model"]["vocab"])
-        self._vqgan_translation = chameleon_vae_ori.VocabTranslation(vocab_info, device="cuda")
-        logger.info("VQGAN loaded: yaml=%s ckpt=%s", yaml_path, ckpt_path)
+        checkpoint = pathlib.Path(self.vqgan_path).expanduser() \
+            if self.vqgan_path else self.checkpoint_dir
+        self._vqgan_model, self._vqgan_translation = load_chameleon_vqvae(
+            checkpoint, device="cuda", dtype=torch.float32)
+        logger.info("Transformers Chameleon VQ-VAE loaded from %s", checkpoint)
 
     @property
     def vqgan_backend(self) -> str:
@@ -480,7 +453,7 @@ class ChameleonTorchFrontendThor:
                     indices = self._trt_vqgan_backend.encode(img)
                     if indices is not None:
                         latent_ids = indices.view(-1)
-                        global_ids = self._vqgan_translation.convert_img2bp2(
+                        global_ids = self._vqgan_translation.convert_img2bpe(
                             latent_ids).view(-1)
                         h_lat = H_eng // 16
                         w_lat = W_eng // 16
@@ -527,8 +500,16 @@ class ChameleonTorchFrontendThor:
         crop_size_list = generate_crop_size_list(
             (self.target_size // PATCH_SIZE) ** 2, PATCH_SIZE)
         cropped = var_center_crop(image, crop_size_list=crop_size_list)
-        latent_ids = self._vqgan_tokenizer.img_tokens_from_pil(cropped)
-        global_ids = self._vqgan_translation.convert_img2bp2(latent_ids).view(-1)
+        from flash_rt.models.chameleon.vqvae_hf import (
+            encode_vqvae_tokens,
+            preprocess_vqvae_image,
+        )
+
+        pixels = preprocess_vqvae_image(
+            cropped, device="cuda", dtype=torch.float32)
+        with torch.no_grad():
+            latent_ids = encode_vqvae_tokens(self._vqgan_model, pixels)
+        global_ids = self._vqgan_translation.convert_img2bpe(latent_ids).view(-1)
 
         w_grids = cropped.size[0] // PATCH_SIZE
         h_grids = cropped.size[1] // PATCH_SIZE

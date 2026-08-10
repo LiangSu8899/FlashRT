@@ -16,7 +16,7 @@ latency on Jetson AGX Thor (sm_110).
 
 | stage | detail |
 |---|---|
-| VQGAN image tokenizer | Chameleon VQGAN (`vqgan.ckpt`), eager PyTorch default; TensorRT opt-in |
+| VQGAN image tokenizer | Transformers `ChameleonVQVAE`, eager PyTorch default; TensorRT opt-in |
 | LLM backbone | 32 layers, MHA, D=4096, 32 heads, HD=128, SwiGLU Dff=11008, per-head QK LayerNorm + RoPE, `attention_bias=false` |
 | Output | lm_head over 65536 vocab, `mask_image_logits` applied (image-codebook ids suppressed) |
 
@@ -32,7 +32,7 @@ git clone --depth 1 --branch v4.4.2 \
     https://github.com/NVIDIA/cutlass.git third_party/cutlass
 cmake -B build -S . -DGPU_ARCH=110
 cmake --build build -j$(nproc)
-pip install -e ".[torch]"        # add ,thor-fa4 for the FA4 fast path
+pip install -e ".[chameleon]"    # add ,thor-fa4 for the FA4 fast path
 ```
 
 Sanity-check the optional FA4 attention backend:
@@ -152,11 +152,9 @@ quantize, norm+quantize) and the FA4 attention fast path.
   counts can differ slightly between backends (expected behavior
   difference, not a bug).
 
-## 9. Third-party license (VQ-GAN)
+## 9. VQ-VAE implementation
 
-The VQ-GAN module under `flash_rt/models/chameleon/vqgan/` is vendored from
-Meta Chameleon and is governed by the Chameleon Research License — not by this
-repository's Apache-2.0 license. See `flash_rt/models/chameleon/vqgan/LICENSE`
-and `NOTICE` for the full text, provenance (including the upstream CompVis
-MIT attribution), and the modification record. The license is noncommercial-
-research-only; treat that subdirectory as a separately-licensed component.
+The eager image tokenizer uses the Apache-2.0 Transformers
+`ChameleonVQVAE` implementation. FlashRT loads only the
+`model.vqmodel.*` tensors from the user-provided Transformers checkpoint;
+no separately licensed VQGAN source is vendored or included in the FlashRT wheel.

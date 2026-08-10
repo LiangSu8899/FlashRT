@@ -9,14 +9,12 @@ Must be run on the TARGET hardware (engines are not portable across GPUs).
 Usage
 -----
 python scripts/build_vqgan_trt.py \
-    --cfg_path /path/to/chameleon/tokenizer/vqgan.yaml \
-    --ckpt_path /path/to/chameleon/tokenizer/vqgan.ckpt \
+    --checkpoint /path/to/Chameleon_7B_mGPT \
     --resolutions 384x512 384x384 384x672 512x512 \
     --verify
 """
 
 import argparse
-import hashlib
 import json
 import os
 import platform
@@ -29,7 +27,10 @@ import torch
 import torch.nn as nn
 import tensorrt as trt
 
-from flash_rt.models.chameleon.vqgan import ImageTokenizer
+from flash_rt.models.chameleon.vqvae_hf import (
+    load_chameleon_vqvae,
+    vqvae_checkpoint_digest,
+)
 
 
 class VQGANEncoderWrapper(nn.Module):
@@ -70,9 +71,9 @@ class VQGANEncoderWrapper(nn.Module):
         return idx
 
 
-def build_vqmodel(cfg_path: str, ckpt_path: str, device: torch.device) -> nn.Module:
-    tokenizer = ImageTokenizer(cfg_path=cfg_path, ckpt_path=ckpt_path, device=device)
-    vq_model = tokenizer._vq_model.eval()
+def build_vqmodel(checkpoint: str, device: torch.device) -> nn.Module:
+    vq_model, _ = load_chameleon_vqvae(
+        checkpoint, device=device, dtype=torch.float32)
     for p in vq_model.parameters():
         p.requires_grad_(False)
     return vq_model
@@ -220,19 +221,10 @@ def verify_engine(engine_path, torch_wrapper, height, width, batch, device):
     return ok
 
 
-def compute_ckpt_hash(ckpt_path: str) -> str:
-    h = hashlib.sha256()
-    with open(ckpt_path, "rb") as f:
-        h.update(f.read(65536))
-    return h.hexdigest()[:16]
-
-
 def main():
     parser = argparse.ArgumentParser(description="Build TRT engines for VQ-GAN encoder")
-    parser.add_argument("--cfg_path", type=str, required=True,
-                        help="Path to the Chameleon VQ-GAN vqgan.yaml config")
-    parser.add_argument("--ckpt_path", type=str, required=True,
-                        help="Path to the Chameleon VQ-GAN vqgan.ckpt checkpoint")
+    parser.add_argument("--checkpoint", type=str, required=True,
+                        help="Path to a Transformers Chameleon checkpoint")
     parser.add_argument("--resolutions", nargs="+", default=["384x512", "384x384", "384x672", "512x512"],
                         help="HxW resolutions to build engines for")
     parser.add_argument("--batch", type=int, default=1)
@@ -258,8 +250,8 @@ def main():
     print(f"Resolutions: {args.resolutions}")
     print()
 
-    vq_model = build_vqmodel(args.cfg_path, args.ckpt_path, device)
-    ckpt_hash = compute_ckpt_hash(args.ckpt_path)
+    vq_model = build_vqmodel(args.checkpoint, device)
+    ckpt_hash = vqvae_checkpoint_digest(args.checkpoint)
 
     manifest_path = output_dir / "manifest.json"
     if manifest_path.exists():

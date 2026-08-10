@@ -185,7 +185,7 @@ embedding-lookup kernel is needed.
 ### 2.6 R6 — deferred
 
 Original `original_tokenizers/vqgan.{yaml,ckpt}` vs HF `model.vqmodel.*` equivalence only gates
-the **TRT engine** track (a TRT engine built from `vqgan.ckpt` must produce the same tokens as
+the **TRT engine** track (a TRT engine built from the checkpoint VQ-VAE weights must produce the same tokens as
 the safetensors weights). Deferred to Phase 5.
 
 ## 3. Design
