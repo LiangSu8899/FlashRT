@@ -35,6 +35,7 @@ callables on the same handle, so one ``detach`` restores all of it.
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import torch
@@ -92,7 +93,19 @@ class _MoESeat(nn.Module):
     declared band — decode rows walk the packed bank, prefill rows go
     to the retained host module."""
 
-    BAND_T = 8
+    #: rows above which the retained host module serves the batch.
+    #: Measured, not assumed. A routed-MoE decode does not amortise the
+    #: way a dense one does — eight tokens pick their own top-8 experts,
+    #: so expert traffic grows with the batch instead of being shared,
+    #: and a packed bank keeps paying well past batch one. Measured on
+    #: Thor against vLLM 0.26 (35B-A3B, 128-token generations): 2.10x at
+    #: batch 1, 2.45x at 4, 2.51x at 8, 1.65x at 16. The earlier value
+    #: of 8 handed batch-16 traffic back to the host and threw that
+    #: 1.65x away — the arm measured 0.98x, because at that batch the
+    #: dense seats alone are worth nothing while the MoE seat is worth
+    #: everything. 16 is the largest batch measured to pay; sweep with
+    #: ``FRT_MOE_BAND_T`` before raising it further.
+    BAND_T = int(os.environ.get("FRT_MOE_BAND_T", "16"))
 
     def __init__(self, seam, top_k, renormalize, shared, host):
         super().__init__()
