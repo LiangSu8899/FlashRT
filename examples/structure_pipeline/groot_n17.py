@@ -413,6 +413,101 @@ def build(model, run_once) -> tuple[Assembly, dict]:
             for attr, mod in zip(("q_proj", "k_proj", "v_proj"), parts):
                 asm.place(f"{path}.{attr}", mod)
 
+    # ---- native correspondence: a norm feeds its FFN in FP8 --------
+    # Every native backbone block norms and quantizes in one step (the
+    # LayerNorm output's only consumer is the FP8 FFN), so the book
+    # writes that pair out: an FP8-emitting norm producer seated with
+    # an FP8-input FFN twin as its direct consumer — seat-to-seat only,
+    # and flipped only where the measured pair is faster (house rule).
+    import dataclasses as _dc
+
+    from flash_rt.structures.impls.norm_fused.fp8_producer import (
+        bind_norm_fp8_producer)
+
+    def _pair_lap_ms(fn, iters=30):
+        for _ in range(5):
+            fn()
+        torch.cuda.synchronize()
+        start = torch.cuda.Event(True)
+        end = torch.cuda.Event(True)
+        start.record()
+        for _ in range(iters):
+            fn()
+        end.record()
+        torch.cuda.synchronize()
+        return start.elapsed_time(end) / iters
+
+    def pair_norm_producer(mlp_path, norm_attr):
+        seat = asm.swaps.get(mlp_path)
+        if not isinstance(seat, vis_ffn.FusedGeluMlp):
+            return
+        bound = seat._bound
+        if bound.in_dtype != "bf16":
+            return
+        norm_path = f"{mlp_path.rsplit('.', 1)[0]}.{norm_attr}"
+        try:
+            host_norm = model.get_submodule(norm_path)
+        except AttributeError:
+            return
+        from flash_rt.structures.impls import KernelUnavailable as _KU2
+        try:
+            producer = bind_norm_fp8_producer(host_norm,
+                                              bound.input_scale)
+            kern = vis_ffn._kernel()
+            twin = vis_ffn.FusedGeluMlp(
+                _dc.replace(
+                    bound, in_dtype="fp8_static",
+                    fused_mlp=(getattr(kern, "fp8_gelu_mlp_v2_bf16",
+                                       None)
+                               or kern.fp8_gelu_mlp_bf16)),
+                original=seat._frt_host())
+        except (_KU2, ValueError, RuntimeError) as refusal:
+            asm.refused.append(
+                (norm_path, f"norm_fp8_producer: {str(refusal)[:120]}"))
+            return
+        rows = int(cal[mlp_path].get("x_rows", 128))
+        dim = int(host_norm.weight.shape[0])
+        x = torch.randn(rows, dim, device=producer.w.device,
+                        dtype=torch.bfloat16)
+        w_dt = host_norm.weight.dtype
+        try:
+            with torch.no_grad():
+                ref = seat(host_norm(x.to(w_dt)).to(torch.bfloat16))
+                got = twin(producer(x))
+                cos = float(torch.nn.functional.cosine_similarity(
+                    got.float().flatten(), ref.float().flatten(),
+                    dim=0))
+        except RuntimeError as refusal:
+            asm.refused.append(
+                (norm_path,
+                 f"norm_fp8_producer probe: {str(refusal)[:120]}"))
+            return
+        if cos < 0.999:
+            asm.refused.append(
+                (norm_path, f"norm_fp8_producer pair smoke {cos:.5f}"))
+            return
+        with torch.inference_mode():
+            chain_ms = _pair_lap_ms(
+                lambda: seat(host_norm(x.to(w_dt)).to(torch.bfloat16)))
+            pair_ms = _pair_lap_ms(lambda: twin(producer(x)))
+        verdict = "pair" if pair_ms <= chain_ms * 0.98 else "keep"
+        print(f"[race] {norm_path}: pair {pair_ms * 1e3:.0f}us vs "
+              f"chain {chain_ms * 1e3:.0f}us -> {verdict}", flush=True)
+        if verdict == "keep":
+            asm.refused.append(
+                (norm_path,
+                 f"norm_fp8_producer: pair loses "
+                 f"({pair_ms * 1e3:.0f} vs {chain_ms * 1e3:.0f}us)"))
+            return
+        asm.place(norm_path, producer)
+        asm.place(mlp_path, twin)
+        asm.families["norm_fp8_producer"] += 1
+
+    for path in VISION_FFN:
+        pair_norm_producer(path, "norm2")
+    for path in VLSA_FF:
+        pair_norm_producer(path, "norm3")
+
     # projections the packs do not cover: the language o_proj and the
     # vl-self-attention output projection each take an FP8 seat of
     # their own — the same linear_proj family the automatic path binds.
