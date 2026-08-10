@@ -86,7 +86,7 @@ class SeamGuard:
     __slots__ = ("dtypes", "device", "k", "rows", "row_capacity", "kind",
                  "can_fallback", "calls", "fallbacks", "consecutive",
                  "last_reason", "detached", "site", "mode", "notes",
-                 "thread", "_restore", "_warned")
+                 "thread", "_restore", "_warned", "pair")
 
     def __init__(self, *, kind: str, dtypes: Iterable[torch.dtype] | None,
                  device: torch.device, k: int | None, rows: int | None,
@@ -118,6 +118,12 @@ class SeamGuard:
         self.thread: int | None = None
         self._restore: Callable[[], None] | None = None
         self._warned: set[str] = set()
+        #: the other half of a negotiated pair (a producer whose only
+        #: consumer this seam is, or vice versa). A pair is
+        #: all-or-nothing: one out-of-contract call falsifies the
+        #: premise for both seats, and a producer left seated alone
+        #: keeps feeding a host that cannot read its format.
+        self.pair: "SeamGuard | None" = None
 
     # ---- site binding (attach time) --------------------------------
 
@@ -191,6 +197,15 @@ class SeamGuard:
                 f"{reason}. Further fallbacks of this kind are counted in "
                 f"handle.report() and not repeated here.",
                 RuntimeWarning, stacklevel=4)
+        if self.pair is not None and not self.detached:
+            # a negotiated pair collapses on the first out-of-contract
+            # call: the runtime path has disproved the bind-time
+            # premise, and every call the pair survives past this one
+            # is a producer feeding a consumer that is no longer there
+            self._self_detach()
+            if not self.pair.detached:
+                self.pair._self_detach()
+            return
         if (self.consecutive >= SELF_DETACH_AFTER and not self.detached):
             self._self_detach()
 

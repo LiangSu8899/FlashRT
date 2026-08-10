@@ -212,7 +212,8 @@ def _race_ms(fn, *, warmup: int = 3, iters: int = 10) -> float:
     return start.elapsed_time(end) / iters
 
 
-def _pair_vision_norm_fp8(model, plan, points, stream) -> None:
+def _pair_vision_norm_fp8(model, plan, points, stream,
+                          probe=None) -> None:
     """Seat an FP8-emitting norm producer where its FFN seat consumes.
 
     Seat-to-seat only — the measured lesson stands: a *host* handed
@@ -223,10 +224,62 @@ def _pair_vision_norm_fp8(model, plan, points, stream) -> None:
     rather than calibration; the flip itself is decided by a bind-time
     measurement (the flip-only-if-faster house rule) and recorded next
     to the other format races.
+
+    The premise itself — "the norm's sole consumer is the FFN" — is a
+    runtime fact, not a shape: one probe forward verifies per pair
+    that the norm's output tensor *is* the seat's input tensor. A
+    host that modulates between them, or recomputes the norm inside a
+    fused path, fails identity here and never flips (a paired seat on
+    such a host measured 0.97 teacher-forced and thirty dead seats).
+    No probe, no fact, no flip — the check fails closed.
     """
     import dataclasses
     from .impls import KernelUnavailable
     from .impls.vision_ffn import fp8_static as vis_impl
+
+    direct_feed: dict[str, bool] = {}
+    candidates = []
+    for seam in plan.seams:
+        if seam.structure != "vision_ffn" \
+                or not getattr(seam, "norm_attr", None):
+            continue
+        seat = plan.swaps.get(seam.path)
+        if not isinstance(seat, vis_impl.FusedGeluMlp):
+            continue
+        if seat._bound.in_dtype != "bf16":
+            continue
+        norm_path = (f"{seam.parent_path}.{seam.norm_attr}"
+                     if seam.parent_path else seam.norm_attr)
+        try:
+            candidates.append((norm_path,
+                               model.get_submodule(norm_path),
+                               model.get_submodule(seam.path)))
+        except AttributeError:
+            continue
+    if candidates and probe is not None:
+        last_out: dict[str, int] = {}
+        hooks = []
+        for norm_path, host_norm, host_mlp in candidates:
+            direct_feed[norm_path] = True
+
+            def _out(_m, _a, out, _p=norm_path):
+                if torch.is_tensor(out):
+                    last_out[_p] = out.data_ptr()
+
+            def _inp(_m, args, _p=norm_path):
+                if args and torch.is_tensor(args[0]) \
+                        and last_out.get(_p) != args[0].data_ptr():
+                    direct_feed[_p] = False
+
+            hooks.append(host_norm.register_forward_hook(_out))
+            hooks.append(host_mlp.register_forward_pre_hook(_inp))
+        try:
+            probe()
+        except Exception:  # noqa: BLE001 — no fact, no flip
+            direct_feed.clear()
+        finally:
+            for hook in hooks:
+                hook.remove()
 
     for seam in plan.seams:
         if seam.structure != "vision_ffn" \
@@ -243,6 +296,12 @@ def _pair_vision_norm_fp8(model, plan, points, stream) -> None:
         try:
             host_norm = model.get_submodule(norm_path)
         except AttributeError:
+            continue
+        if not direct_feed.get(norm_path):
+            plan.notes.setdefault("refused", []).append(
+                (f"{norm_path}::norm_fp8_producer",
+                 "pair premise unverified: the norm's output is not "
+                 "the seat's input on this host's runtime path"))
             continue
         try:
             from .impls.norm_fused.fp8_producer import (
@@ -314,6 +373,13 @@ def _pair_vision_norm_fp8(model, plan, points, stream) -> None:
             continue
         plan.swaps[seam.path] = twin
         plan.swaps[norm_path] = producer
+        # the pair's guards know each other: one out-of-contract call
+        # at runtime demotes both seats as a unit (all-or-nothing, the
+        # same atomicity the gate group gives their bind-time verdict)
+        if (twin._frt_guard is not None
+                and producer._frt_guard is not None):
+            twin._frt_guard.pair = producer._frt_guard
+            producer._frt_guard.pair = twin._frt_guard
         stream(norm_path)
 
 
@@ -1085,7 +1151,8 @@ def auto_swaps(
     # smoke compares the pair against the bf16 form it would replace,
     # and the flip happens only when the measured chain is faster.
     if negotiate_fp8:
-        _pair_vision_norm_fp8(model, plan, collector, _stream)
+        _pair_vision_norm_fp8(model, plan, collector, _stream,
+                              probe=region_probe)
 
     # ---- streaming window: the later stages record through the model,
     # and the streamed originals are meta now — so the bound seats stand
