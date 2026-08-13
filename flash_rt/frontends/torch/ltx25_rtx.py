@@ -46,6 +46,7 @@ class Ltx25TorchFrontendRtx:
         num_views: int = 1,
         attention: Optional[str] = None,
         quantization: str = "nvfp4-prequant",
+        fuse: Optional[bool] = None,
         dtype: torch.dtype = torch.bfloat16,
         **_: Any,
     ) -> None:
@@ -58,6 +59,9 @@ class Ltx25TorchFrontendRtx:
         self.quantization = quantization
         self.attention = attention or os.environ.get(
             "FLASH_RT_LTX25_ATTN", "auto")
+        if fuse is None:
+            fuse = os.environ.get("FLASH_RT_LTX25_FUSE", "1") == "1"
+        self.fuse = bool(fuse)
         self.device = torch.device("cuda")
         self.prompt: Optional[str] = None
         self._pipe = None
@@ -187,6 +191,12 @@ class Ltx25TorchFrontendRtx:
         if attn is not None and getattr(attn, "label", "") != "sdpa":
             pipe.stage = pipe.stage.with_attention(attn)
         self._attn_label = getattr(attn, "label", str(self.attention))
+
+        if self.fuse:
+            from flash_rt.models.ltx25._nvfp4_ffn_swap import (
+                SwapInstallingBuilder, install_nvfp4_ffn)
+            pipe.stage = pipe.stage.with_builder(SwapInstallingBuilder(
+                pipe.stage._transformer_builder, [install_nvfp4_ffn]))
         self._load_seconds = time.perf_counter() - t0
         logger.info("[ltx25] pipeline ready in %.1fs (attention=%s)",
                     self._load_seconds, self._attn_label)
