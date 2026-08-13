@@ -70,6 +70,9 @@ Issues = "https://github.com/flashrt-project/FlashRT/issues"
 
 [tool.setuptools.packages.find]
 include = ["flash_rt*"]
+# flash_rt.tests ships with the repo, not with the wheel: the
+# distribution gate is zero test files in what a user installs.
+exclude = ["flash_rt.tests*"]
 
 [tool.setuptools.package-data]
 # Recursive. Structure specs, per-host bindings and tokenizer models live
