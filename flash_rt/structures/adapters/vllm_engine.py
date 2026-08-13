@@ -174,8 +174,39 @@ def _expert_holder(module):
     return None
 
 
+class _NoSeats:
+    """The handle shape for a host where nothing could be seated.
+
+    Every seat refusing is a normal outcome, not an error: the hub may be
+    unreachable, this architecture may have no build, the memory budget
+    may leave no room. What must not happen is the engine dying because
+    its accelerator was absent — a server that fails to start is worse
+    than one that starts unaccelerated. So the refusals are reported and
+    the host is handed back untouched, with a handle of the same shape so
+    callers need no special case.
+    """
+
+    def __init__(self, refused, reverts):
+        self.notes = {"refused": refused, "head_slabs": 0, "seated": 0}
+        self._reverts = list(reverts)
+
+    def detach(self):
+        for fn in reversed(self._reverts):
+            fn()
+        self._reverts.clear()
+
+    def report(self):
+        return {}
+
+    def summary(self):
+        return {"seams": 0, "guarded_calls": 0, "fallbacks": 0,
+                "seams_fell_back": [], "seams_self_detached": [],
+                "seams_never_called": [], "clean": True,
+                "refused": len(self.notes["refused"])}
+
+
 def attach_engine(model, *, seats=DENSE_SEAT_SUFFIXES, experts=True,
-                  head=True, use_gemv=None, verbose=True):
+                  head=True, use_gemv=None, verbose=True, strict=False):
     """Seat a vLLM model: dense projections, expert banks, LM head.
 
     Call between weight load and the engine's first trace (see
@@ -260,6 +291,21 @@ def attach_engine(model, *, seats=DENSE_SEAT_SUFFIXES, experts=True,
                 refused.append(("lm_head", repr(e)[:120]))
 
     model.eval()
+    if not swaps:
+        if strict:
+            raise RuntimeError(
+                "refused: no seat could be bound on this host (%d refusals; "
+                "first: %s). Pass strict=False to let the engine start "
+                "unaccelerated." % (len(refused),
+                                    refused[0][1] if refused else "none"))
+        if verbose:
+            print(f"[structures.vllm] 0 seats, {len(refused)} refused — "
+                  f"host runs unmodified", flush=True)
+            for name, why in refused[:3]:
+                print(f"[structures.vllm]   {name}: {why}", flush=True)
+        handle = _NoSeats(refused, reverts)
+        handle.notes["refused"] = refused
+        return handle
     handle = _swap.attach(model, swaps, revert=reverts)
     if verbose:
         print(f"[structures.vllm] {len(swaps)} seats "

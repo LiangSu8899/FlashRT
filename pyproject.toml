@@ -8,7 +8,22 @@ version = "0.1.0"
 description = "FlashRT — realtime CUDA inference engine for small-batch, latency-sensitive AI workloads. Ships VLA frontends for Pi0, Pi0.5, Pi0-FAST, GROOT N1.6/N1.7."
 readme = "README.md"
 license = {text = "Apache-2.0"}
+# Every interpreter listed below is qualified by a clean-room install of
+# this wheel, not by intent: see release_qual/S2-import-py3*.
 requires-python = ">=3.10"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: GPU :: NVIDIA CUDA",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
 dependencies = [
     "numpy",
     "pyyaml",
@@ -48,8 +63,24 @@ flash-attn = ["flash-attn"]
 thor-fa4 = ["nvidia-cutlass-dsl==4.5.1", "quack-kernels==0.4.1"]
 all = ["flash-rt[torch,jax,server,eval,minimax-remover,motus]"]
 
+[project.urls]
+Homepage = "https://github.com/flashrt-project/FlashRT"
+Repository = "https://github.com/flashrt-project/FlashRT"
+Issues = "https://github.com/flashrt-project/FlashRT/issues"
+
 [tool.setuptools.packages.find]
 include = ["flash_rt*"]
 
 [tool.setuptools.package-data]
-flash_rt = ["*.so", "*.yaml", "*.model"]
+# Recursive. Structure specs, per-host bindings and tokenizer models live
+# in subdirectories, several of which are data directories rather than
+# packages; a non-recursive glob ships none of them. Kernel sources ship
+# so the CUDA extensions can be built from an installed tree.
+#
+# No ``*.so``: this distribution carries no compiled artifact. Kernels are
+# obtained from the kernel hub, or built locally (see README).
+flash_rt = [
+    "**/*.yaml", "**/*.model", "**/*.json",
+    "**/*.cu", "**/*.cuh", "**/*.cpp", "**/*.h",
+    "py.typed",
+]

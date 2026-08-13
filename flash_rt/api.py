@@ -473,6 +473,13 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             "Nexn2TorchFrontendRtx\n"
             "See docs/nexn2_usage.md.")
 
+    # Refuse before the frontend import: a frontend that imports the
+    # extension at module scope would otherwise fail as a bare
+    # ModuleNotFoundError, which reads as a broken install rather than as
+    # a build the user still has to run.
+    from flash_rt import _extensions
+    _extensions.require(config=config)
+
     from flash_rt.hardware import detect_arch, resolve_pipeline_class
     arch = detect_arch() if hardware == "auto" else hardware
 
