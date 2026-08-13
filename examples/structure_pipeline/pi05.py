@@ -182,6 +182,8 @@ def load_host():
     if VIEWS >= 3:
         feats["observation.images.image3"] = PolicyFeature(
             FeatureType.VISUAL, (3, 224, 224))
+    elif VIEWS == 1:
+        del feats["observation.images.image2"]
     policy.config.input_features = feats
     policy.config.output_features = {
         "action": PolicyFeature(FeatureType.ACTION, (32,))}
@@ -229,7 +231,8 @@ def build_inputs(policy):
         imgs = ((bundle["input_images"].float() + 1.0) / 2.0).clamp(0, 1)
         imgs = imgs.permute(0, 3, 1, 2).contiguous()
         obs["observation.images.image"] = imgs[0:1]
-        obs["observation.images.image2"] = imgs[1:2]
+        if VIEWS != 1:
+            obs["observation.images.image2"] = imgs[1:2]
     batch = pre(obs)
     batch = {k: (v.to("cuda") if torch.is_tensor(v) else v)
              for k, v in batch.items()}
