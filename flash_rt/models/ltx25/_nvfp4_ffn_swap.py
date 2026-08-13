@@ -112,6 +112,12 @@ def _make_ffn_forward(ff: torch.nn.Module, buffers: _FfnBuffers):
     up = ff.net[0].proj
     down = ff.net[2]
     dim, inner = up.in_features, up.out_features
+    # Survive re-installs across stage rebuilds: always chain to the true
+    # original forward, not a previous swap closure.
+    upstream_forward = getattr(ff, "_flash_rt_ffn_orig", None)
+    if upstream_forward is None:
+        upstream_forward = ff.forward
+        ff._flash_rt_ffn_orig = upstream_forward
 
     up_p, up_sf, _ = _repack_nvfp4_linear(up)
     dn_p, dn_sf, _ = _repack_nvfp4_linear(down)
@@ -128,8 +134,13 @@ def _make_ffn_forward(ff: torch.nn.Module, buffers: _FfnBuffers):
     def forward(x: torch.Tensor) -> torch.Tensor:
         shape = x.shape
         x2 = x.reshape(-1, shape[-1])
-        x2 = x2 if x2.is_contiguous() else x2.contiguous()
         m = x2.shape[0]
+        if m % 128 != 0:
+            # The CUTLASS chain rejects unaligned M (can_implement status 11)
+            # without writing the output; e.g. the ~126-token audio branch.
+            # Those calls are negligible work -- keep them on upstream.
+            return upstream_forward(x)
+        x2 = x2 if x2.is_contiguous() else x2.contiguous()
         stream = _stream()
         xq, xsf, h4, h4sf, y = buffers.get(x2.device, m, dim, inner)
         fvk.quantize_bf16_to_nvfp4_swizzled(
