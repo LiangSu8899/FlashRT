@@ -578,3 +578,32 @@ to measure along it.
   column the bands and regions use); the race result goes to the
   trail so the refusal is auditable. This is the seat-level
   micro-timing refutation, promoted from a finding to a gate.
+- **Qualification collects runtime-path facts, not static-shape facts.**
+  Three failures with every ledger green shared one form: a premise true
+  in the calibration context and false on another host's runtime path.
+  "This norm's only consumer is the FFN" needs a tensor-identity probe,
+  not a graph read; "a pooled attribute write survives export" is false
+  under functionalization; "the stash is consumed before the next layer
+  writes" is false the moment a host keeps the reader's view in a KV
+  cache. Default to exclusive, direct, and refuse; sharing, fusion, and
+  activation are unlocked by a collected fact, never by an assumption.
+- **State is exclusive; only scratch joins the pool.** A buffer whose
+  consumer is the host may be retained past the tick. The measured
+  failure: a shared stash slab behind a KV cache silently corrupted
+  every cached slice at cosine $-0.13$ while every gate stayed green,
+  because immediacy-of-consumption was in no gate's fact list.
+- **Capture-path scalars are built device-native.** A
+  `torch.tensor(scalar, device=cuda)` is a CPU staging copy; compiled it
+  folds away, but the first seat that breaks the graph drops it eager
+  onto the capturing stream and the capture refuses. `torch.full` /
+  `torch.ones` on the device, always.
+- **Presence is not qualification.** The same hub artifact can carry an
+  entry built for another architecture. One smoke launch at bind is the
+  fact; a refusal keeps the fallback path. An entry that imports,
+  resolves, and then asserts `requires SM110` at launch time was live in
+  a published x86 package.
+- **A headline latency is a median.** A min-of-N headline once promoted
+  a single lucky allocator state into the ledger; every later run read
+  as a regression until the receipt's own scatter told the truth.
+  Min-of-N may steady a cross-process A/B, but it never names the
+  number.
