@@ -43,7 +43,7 @@ See [Supported Models](#supported-models), [Hardware Support](#hardware-support)
 - [2026/05] **Qwen3.6-27B NVFP4** is supported with 256 K context on a single RTX 5090, OpenAI-compatible serving, FP8-KV long-context verify, and **145 tok/s warm decode at 256 K**. See [Qwen3.6 NVFP4](docs/qwen36_nvfp4.md) and [Benchmark](#benchmark).
 - [2026/05] **Qwen3-8B NVFP4** text-only serving is supported on RTX 5090, with **9.1 ms TTFT at P=64** and **150 tok/s** warm decode. See [Qwen3-8B NVFP4](docs/qwen3_8b_nvfp4.md) and [Benchmark](#benchmark).
 - [2026/05] **Wan2.2 TI2V-5B** official-pipeline baseline is available on RTX SM120, with opt-in TeaCache acceleration. See [Wan2.2 usage](docs/wan22_usage.md).
-- [2026/05] **Lingbot-VLA** is supported. See [Lingbot usage](https://github.com/LiangSu8899/FlashRT/blob/main/docs/lingbot_usage.md).
+- [2026/05] **Lingbot-VLA** is supported. See [Lingbot usage](https://github.com/flashrt-project/FlashRT/blob/main/docs/lingbot_usage.md).
 - [2026/05] Community Pi0.5 hardware benchmarks: thanks to [@cuihengrui35](https://github.com/cuihengrui35) for **RTX 5060 Ti** results (**41.4 ms / ~24 Hz**, plus LIBERO Spatial **344/350 = 98.3%**) and [@wangerforcs](https://github.com/wangerforcs) for **NVIDIA L40** results (**26.6 ms / 38 Hz**) on 2-view FP8. See [community benchmarks](#community-benchmarks).
 - [2026/05] Special thanks to [@gugudeshubao](https://github.com/gugudeshubao) for the **Pi0.5 Jetson AGX Orin (SM87) port**: INT8 W8A8 kernels, Orin tile dispatch, frame-cache inference, deployment docs, and benchmark results. Thanks also to [@strayberry](https://github.com/strayberry) for Orin BF16 Pi0.5 testing. See [Orin deployment](docs/deployment_orin.md) and [community benchmarks](#community-benchmarks).
 - [2026/05] **Motus RTX beta** lands in FlashRT: Stage3 fast profile reaches **~167 ms** E2E on RTX 5090, **~100 ms** with TeaCache, and legacy async chunk runner supports 50 Hz action streaming. See [Motus usage](docs/motus_usage_beta.md) and [Benchmark](#benchmark).
@@ -677,7 +677,7 @@ If you need a different GPU arch, want to pin a specific commit, or
 prefer to vet the image source:
 
 ```bash
-git clone https://github.com/LiangSu8899/FlashRT.git
+git clone https://github.com/flashrt-project/FlashRT.git
 cd FlashRT
 docker build -t flashrt:dev -f docker/Dockerfile .
 docker run --rm --gpus all -it flashrt:dev
@@ -741,7 +741,7 @@ pip install jax==0.5.3 jax-cuda12-pjrt==0.5.3 jax-cuda12-plugin==0.5.3 ml_dtypes
 Then build:
 
 ```bash
-git clone https://github.com/LiangSu8899/FlashRT.git
+git clone https://github.com/flashrt-project/FlashRT.git
 cd FlashRT
 git clone --depth 1 --branch v4.4.2 \
     https://github.com/NVIDIA/cutlass.git third_party/cutlass

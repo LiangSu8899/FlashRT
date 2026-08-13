@@ -30,7 +30,7 @@ the source tree under `flash_rt/`, so non-editable installs commonly import
 a stale copy.
 
 ```bash
-git clone https://github.com/LiangSu8899/FlashRT.git
+git clone https://github.com/flashrt-project/FlashRT.git
 cd FlashRT
 git clone --depth 1 --branch v4.4.2 \
     https://github.com/NVIDIA/cutlass.git third_party/cutlass
@@ -295,12 +295,12 @@ say so in the PR and include the reason.
 For external contributors, use the standard fork workflow:
 
 ```bash
-# 1. Fork LiangSu8899/FlashRT on GitHub, then clone your fork.
+# 1. Fork flashrt-project/FlashRT on GitHub, then clone your fork.
 git clone git@github.com:<your-user>/FlashRT.git
 cd FlashRT
 
 # 2. Keep the upstream repository available for sync.
-git remote add upstream git@github.com:LiangSu8899/FlashRT.git
+git remote add upstream git@github.com:flashrt-project/FlashRT.git
 git fetch upstream
 
 # 3. Start from the latest upstream main.
