@@ -179,7 +179,8 @@ class Ltx25TorchFrontendRtx:
         if self.compile_mode:
             from ltx_core.model.transformer.compiling import CompilationConfig
             if self.compile_mode == "capture":
-                compilation = CompilationConfig(capture=True)
+                compilation = CompilationConfig(
+                    capture=True, seq_dim_dynamic=False)
             elif self.compile_mode == "default":
                 # Per-shape specialization: the two-stage pipeline sees a
                 # fixed (stage1, stage2) sequence-length pair, and the
@@ -213,8 +214,17 @@ class Ltx25TorchFrontendRtx:
         if self.fuse:
             from flash_rt.models.ltx25._nvfp4_ffn_swap import (
                 SwapInstallingBuilder, install_nvfp4_ffn)
-            pipe.stage = pipe.stage.with_builder(SwapInstallingBuilder(
-                pipe.stage._transformer_builder, [install_nvfp4_ffn]))
+            if self.compile_mode == "capture":
+                import functools
+                from flash_rt.models.ltx25._resident_graph import (
+                    CachingPromptEncoder, ResidentSwapBuilder)
+                pipe.stage = pipe.stage.with_builder(ResidentSwapBuilder(
+                    pipe.stage._transformer_builder,
+                    [functools.partial(install_nvfp4_ffn, free_upstream=True)]))
+                pipe.prompt_encoder = CachingPromptEncoder(pipe.prompt_encoder)
+            else:
+                pipe.stage = pipe.stage.with_builder(SwapInstallingBuilder(
+                    pipe.stage._transformer_builder, [install_nvfp4_ffn]))
         self._load_seconds = time.perf_counter() - t0
         logger.info("[ltx25] pipeline ready in %.1fs (attention=%s)",
                     self._load_seconds, self._attn_label)
@@ -252,12 +262,34 @@ class Ltx25TorchFrontendRtx:
         num_frames = num_frames or self.DEFAULT_FRAMES
         frame_rate = frame_rate or self.DEFAULT_FPS
 
+        tiling_config = AUTO_TILING
+        if self.compile_mode == "capture":
+            # AUTO tiling sizes itself from free memory before the resident
+            # transformer (and its capture pools) exist; resolve it against
+            # the memory decode will actually see.
+            from ltx_pipelines.utils.helpers import tiling_config_for_vae
+            free, _ = torch.cuda.mem_get_info()
+            reserved_slack = (torch.cuda.memory_reserved()
+                              - torch.cuda.memory_allocated())
+            builder = pipe.stage._transformer_builder
+            resident = getattr(builder, "_holder", {}).get("model") is not None
+            # Before the first build the transformer and its capture pools
+            # (~20GB) still have to fit; once resident, most of what the
+            # allocator reports free really is available to decode.
+            headroom = (23 << 30) if not resident else (2 << 30)
+            budget = max(5 << 30, free + reserved_slack - headroom)
+            tiling_config = tiling_config_for_vae(
+                self._resolve_paths()["video_vae"],
+                height=height, width=width, num_frames=num_frames,
+                device=self.device, free_bytes=budget,
+            )
+
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         video, audio, frames, tiling = pipe(
             prompt=prompt, seed=seed, height=height, width=width,
             num_frames=num_frames, frame_rate=frame_rate,
-            images=[], tiling_config=AUTO_TILING,
+            images=[], tiling_config=tiling_config,
         )
         torch.cuda.synchronize()
         denoise_s = time.perf_counter() - t0

@@ -108,7 +108,8 @@ class _FfnBuffers:
         return bufs
 
 
-def _make_ffn_forward(ff: torch.nn.Module, buffers: _FfnBuffers):
+def _make_ffn_forward(ff: torch.nn.Module, buffers: _FfnBuffers,
+                      free_upstream: bool = False):
     up = ff.net[0].proj
     down = ff.net[2]
     dim, inner = up.in_features, up.out_features
@@ -133,6 +134,17 @@ def _make_ffn_forward(ff: torch.nn.Module, buffers: _FfnBuffers):
         inner, dtype=torch.bfloat16, device=up_p.device)
     dn_bias = down.bias.detach() if down.bias is not None else None
 
+    freed = False
+    if free_upstream and dim >= 4096:
+        # Resident mode never reloads the checkpoint, so the upstream fp4
+        # storage is dead weight (~3.6GB across the video FFNs). Audio FFNs
+        # keep theirs -- their unaligned-M calls fall back to upstream.
+        up.weight.data = up.weight.data.new_empty(0)
+        up.weight_scale.data = up.weight_scale.data.new_empty(0)
+        down.weight.data = down.weight.data.new_empty(0)
+        down.weight_scale.data = down.weight_scale.data.new_empty(0)
+        freed = True
+
     # The upstream fp4 params stay in place: the builder reuses the module
     # across stage rebuilds and reloads the state dict into them. The
     # repacked copies add ~4.8GB resident for the 48-block model, which fits
@@ -147,6 +159,11 @@ def _make_ffn_forward(ff: torch.nn.Module, buffers: _FfnBuffers):
             # The CUTLASS chain rejects unaligned M (can_implement status 11)
             # without writing the output; e.g. the ~126-token audio branch.
             # Those calls are negligible work -- keep them on upstream.
+            if freed:
+                raise RuntimeError(
+                    f"ltx25 FFN: M={m} is not 128-aligned but the upstream "
+                    "weights were freed (resident mode). Use dimensions whose "
+                    "token counts are 128-aligned, or disable capture mode.")
             return upstream_forward(x)
         x2 = x2 if x2.is_contiguous() else x2.contiguous()
         stream = _stream()
@@ -175,7 +192,8 @@ def _make_ffn_forward(ff: torch.nn.Module, buffers: _FfnBuffers):
     return forward
 
 
-def install_nvfp4_ffn(model: torch.nn.Module) -> int:
+def install_nvfp4_ffn(model: torch.nn.Module, *,
+                      free_upstream: bool = False) -> int:
     """Swap every NVFP4 FeedForward on ``model`` to the fvk W4A4 chain.
 
     Returns the number of FeedForward modules swapped. Modules whose linears
@@ -197,7 +215,8 @@ def install_nvfp4_ffn(model: torch.nn.Module) -> int:
             continue
         if proj.in_features % 16 or proj.out_features % 16:
             continue
-        module.forward = _make_ffn_forward(module, buffers)
+        module.forward = _make_ffn_forward(module, buffers,
+                                           free_upstream=free_upstream)
         count += 1
     logger.info("[ltx25] swapped %d FeedForward modules to fvk W4A4 chain",
                 count)
