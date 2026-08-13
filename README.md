@@ -807,7 +807,7 @@ If you need a different GPU arch, want to pin a specific commit, or
 prefer to vet the image source:
 
 ```bash
-git clone https://github.com/LiangSu8899/FlashRT.git
+git clone https://github.com/flashrt-project/FlashRT.git
 cd FlashRT
 docker build -t flashrt:dev -f docker/Dockerfile .
 docker run --rm --gpus all -it flashrt:dev
@@ -871,7 +871,7 @@ pip install jax==0.5.3 jax-cuda12-pjrt==0.5.3 jax-cuda12-plugin==0.5.3 ml_dtypes
 Then build:
 
 ```bash
-git clone https://github.com/LiangSu8899/FlashRT.git
+git clone https://github.com/flashrt-project/FlashRT.git
 cd FlashRT
 git clone --depth 1 --branch v4.4.2 \
     https://github.com/NVIDIA/cutlass.git third_party/cutlass
