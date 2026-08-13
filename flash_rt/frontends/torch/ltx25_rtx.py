@@ -47,6 +47,7 @@ class Ltx25TorchFrontendRtx:
         attention: Optional[str] = None,
         quantization: str = "nvfp4-prequant",
         fuse: Optional[bool] = None,
+        compile_mode: Optional[str] = None,
         dtype: torch.dtype = torch.bfloat16,
         **_: Any,
     ) -> None:
@@ -62,6 +63,8 @@ class Ltx25TorchFrontendRtx:
         if fuse is None:
             fuse = os.environ.get("FLASH_RT_LTX25_FUSE", "1") == "1"
         self.fuse = bool(fuse)
+        self.compile_mode = compile_mode if compile_mode is not None else (
+            os.environ.get("FLASH_RT_LTX25_COMPILE", "") or None)
         self.device = torch.device("cuda")
         self.prompt: Optional[str] = None
         self._pipe = None
@@ -172,6 +175,20 @@ class Ltx25TorchFrontendRtx:
             quant = QuantizationKind(self.quantization).to_policy(
                 paths["transformer"])
 
+        compilation = None
+        if self.compile_mode:
+            from ltx_core.model.transformer.compiling import CompilationConfig
+            if self.compile_mode == "capture":
+                compilation = CompilationConfig(capture=True)
+            elif self.compile_mode == "default":
+                # Per-shape specialization: the two-stage pipeline sees a
+                # fixed (stage1, stage2) sequence-length pair, and the
+                # dynamic-seq marks conflict with the graph breaks our
+                # raw-kernel swaps introduce.
+                compilation = CompilationConfig(seq_dim_dynamic=False)
+            else:
+                compilation = CompilationConfig(mode=self.compile_mode)
+
         t0 = time.perf_counter()
         pipe = DistilledPipeline(
             model_paths=ModelPaths.from_split(
@@ -184,6 +201,7 @@ class Ltx25TorchFrontendRtx:
             spatial_upsampler_path=paths["spatial_upsampler"],
             loras=[],
             quantization=quant,
+            compilation_config=compilation,
         )
 
         from flash_rt.models.ltx25._attn_swap import make_ltx25_attention

@@ -97,6 +97,7 @@ class FvkSage2Attention:
             self._bufs[key] = bufs
         return bufs
 
+    @torch.compiler.disable
     def __call__(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                  heads: int) -> torch.Tensor:
         b, lq, hd = q.shape

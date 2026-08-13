@@ -119,8 +119,16 @@ def _make_ffn_forward(ff: torch.nn.Module, buffers: _FfnBuffers):
         upstream_forward = ff.forward
         ff._flash_rt_ffn_orig = upstream_forward
 
-    up_p, up_sf, _ = _repack_nvfp4_linear(up)
-    dn_p, dn_sf, _ = _repack_nvfp4_linear(down)
+    # The builder reuses module objects across stage rebuilds and reloads the
+    # same checkpoint weights into them, so the repacked tensors stay valid --
+    # cache them on the module instead of repacking per build.
+    pack = getattr(ff, "_flash_rt_ffn_pack", None)
+    if pack is None:
+        up_p, up_sf, _ = _repack_nvfp4_linear(up)
+        dn_p, dn_sf, _ = _repack_nvfp4_linear(down)
+        ff._flash_rt_ffn_pack = (up_p, up_sf, dn_p, dn_sf)
+    else:
+        up_p, up_sf, dn_p, dn_sf = pack
     up_bias = up.bias.detach() if up.bias is not None else torch.zeros(
         inner, dtype=torch.bfloat16, device=up_p.device)
     dn_bias = down.bias.detach() if down.bias is not None else None
@@ -160,6 +168,9 @@ def _make_ffn_forward(ff: torch.nn.Module, buffers: _FfnBuffers):
                 int(y.data_ptr()), int(dn_bias.data_ptr()), m, dim, stream)
         return y.view(*shape[:-1], dim)
 
+    # Raw-pointer launches are opaque to dynamo; keep them eager under
+    # torch.compile (CUDA graph capture still records the kernels).
+    forward = torch._dynamo.disable(forward)
     forward._flash_rt_keep = keep
     return forward
 
