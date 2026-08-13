@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import re
 import subprocess
@@ -152,3 +153,44 @@ def test_built_adapter_dependency_matches_mode():
         assert "RUNPATH" in dynamic and "$ORIGIN" in dynamic
     else:
         assert "libflashrt_fa2_raw.so" not in dynamic
+
+
+def test_built_adapter_chameleon_symbol_matches_build_mode():
+    adapter_value = os.environ.get("FLASHRT_FA2_ADAPTER_LIBRARY")
+    if not adapter_value:
+        pytest.skip("set FLASHRT_FA2_ADAPTER_LIBRARY to validate an adapter")
+    adapter = Path(adapter_value)
+    assert adapter.is_file()
+
+    spec = importlib.util.spec_from_file_location("flash_rt_fa2", adapter)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert hasattr(module, "fwd_fp16_causal") == _cache_bool(
+        "FLASHRT_ENABLE_CHAMELEON")
+
+
+def test_chameleon_fa2_compile_contract_is_consistent():
+    cmake = (REPO_ROOT / "CMakeLists.txt").read_text()
+    wrapper = (
+        REPO_ROOT / "csrc" / "attention" / "fa2_wrapper_causal.cu"
+    ).read_text()
+    header = (
+        REPO_ROOT / "csrc" / "attention" / "fa2_wrapper.h"
+    ).read_text()
+    bindings = (REPO_ROOT / "csrc" / "fa2_bindings.cpp").read_text()
+
+    assert "target_compile_definitions(fa2_vendor_obj PRIVATE\n      FLASHRT_ENABLE_CHAMELEON=1)" in cmake
+    assert "target_compile_definitions(flash_rt_fa2 PRIVATE\n        FLASHRT_ENABLE_CHAMELEON=1)" in cmake
+    assert "defined(FLASHRT_ENABLE_CHAMELEON) && defined(FA2_HAS_FP16)" in wrapper
+    assert "#ifdef FLASHRT_ENABLE_CHAMELEON\nFLASHRT_FA2_NATIVE_API void fvk_attention_fa2_fwd_fp16_causal" in header
+    assert "#ifdef FLASHRT_ENABLE_CHAMELEON\n    // FP16 causal sibling" in bindings
+
+
+def test_unused_fp8_bias_autotune_api_is_absent():
+    for relative in (
+        "csrc/bindings.cpp",
+        "csrc/gemm/gemm_runner.h",
+        "csrc/gemm/gemm_runner.cu",
+    ):
+        assert "autotune_fp8_nn_bias" not in (REPO_ROOT / relative).read_text()

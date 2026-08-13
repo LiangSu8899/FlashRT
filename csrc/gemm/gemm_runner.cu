@@ -74,6 +74,17 @@ GemmRunner::CachedGemm& GemmRunner::get_or_create_cached(GemmType type, int M, i
         CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(entry.B_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order, sizeof(row_order)));
         CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&entry.D_desc, CUDA_R_16BF, M, N, N));
         CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(entry.D_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order, sizeof(row_order)));
+    } else if (type == FP8_NN_DEV_FP16) {
+        // FP8 NN with FP16 output: same A/B layouts as FP8_NN_DEV.
+        CUBLAS_CHECK(cublasLtMatmulDescCreate(&entry.matmul_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(entry.matmul_desc, CUBLASLT_MATMUL_DESC_TRANSA, &op_N, sizeof(op_N)));
+        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(entry.matmul_desc, CUBLASLT_MATMUL_DESC_TRANSB, &op_N, sizeof(op_N)));
+        CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&entry.A_desc, CUDA_R_8F_E4M3, M, K, K));
+        CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(entry.A_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order, sizeof(row_order)));
+        CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&entry.B_desc, CUDA_R_8F_E4M3, K, N, N));
+        CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(entry.B_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order, sizeof(row_order)));
+        CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&entry.D_desc, CUDA_R_16F, M, N, N));
+        CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(entry.D_desc, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_order, sizeof(row_order)));
     } else if (type == FP8_NT_DEV) {
         CUBLAS_CHECK(cublasLtMatmulDescCreate(&entry.matmul_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
         CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(entry.matmul_desc, CUBLASLT_MATMUL_DESC_TRANSA, &op_N, sizeof(op_N)));
@@ -233,6 +244,32 @@ void GemmRunner::autotune_fp8_nn_dev(void* A, void* B, void* D,
                                       int num_algos) {
     auto& entry = get_or_create_cached(FP8_NN_DEV, M, N, K);
     autotune_cached(entry, A, B, D, 1.0f, 0.0f, num_algos, d_scale_a, d_scale_b);
+}
+
+void GemmRunner::autotune_fp8_nn_dev_fp16(void* A, void* B, void* D,
+                                           int M, int N, int K,
+                                           float* d_scale_a, float* d_scale_b,
+                                           int num_algos) {
+    auto& entry = get_or_create_cached(FP8_NN_DEV_FP16, M, N, K);
+    autotune_cached(entry, A, B, D, 1.0f, 0.0f, num_algos, d_scale_a, d_scale_b);
+}
+
+// FP8 no-transpose with FP16 output: D_fp16 = A_fp8(M,K) @ B_fp8(K,N)
+void GemmRunner::fp8_nn_dev_fp16(void* A, void* B, void* D,
+                                  int M, int N, int K,
+                                  float* d_scale_a, float* d_scale_b,
+                                  cudaStream_t stream) {
+    auto& entry = get_or_create_cached(FP8_NN_DEV_FP16, M, N, K);
+    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(entry.matmul_desc,
+        CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &d_scale_a, sizeof(d_scale_a)));
+    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(entry.matmul_desc,
+        CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &d_scale_b, sizeof(d_scale_b)));
+
+    float alpha = 1.0f, beta = 0.0f;
+    CUBLAS_CHECK(cublasLtMatmul(handle_, entry.matmul_desc,
+        &alpha, A, entry.A_desc, B, entry.B_desc,
+        &beta, D, entry.D_desc, D, entry.D_desc,
+        &entry.algo, workspace_, workspace_size_, stream));
 }
 
 void GemmRunner::autotune_fp8_nt_dev(void* A, void* B, void* D,
