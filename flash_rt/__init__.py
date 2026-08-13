@@ -63,6 +63,34 @@ if _sys.platform == 'win32':
     del _root, _sub, _p, _seen, _cuda_roots
 del _os, _sys
 
-from flash_rt.api import load_model, VLAModel  # noqa: E402
+from flash_rt import _extensions as _ext  # noqa: E402
 
-__all__ = ["load_model", "VLAModel"]
+__all__ = ["load_model", "VLAModel", "structures"]
+
+
+def __getattr__(name):
+    """PEP 562. ``import flash_rt`` stays free of torch and of the
+    compiled extensions.
+
+    The catalog, the adapters and the structures layer are all usable
+    without either, and a serving host that only wants
+    ``flash_rt.structures`` should not pay for the VLA API to reach it.
+    Naming ``load_model`` still loads everything it needs.
+
+    An extension name reaching here means the import machinery did not
+    find it beside the package — this distribution ships no ``.so`` — so
+    answer with the build instructions rather than an AttributeError.
+    """
+    if name in ("load_model", "VLAModel"):
+        from flash_rt import api
+        return getattr(api, name)
+    if name == "structures":
+        import flash_rt.structures as mod
+        return mod
+    if name in _ext.EXTENSIONS:
+        return _ext.require(name)
+    raise AttributeError("module %r has no attribute %r" % (__name__, name))
+
+
+def __dir__():
+    return sorted(set(globals()) | set(__all__))
