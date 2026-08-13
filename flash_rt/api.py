@@ -351,7 +351,9 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             after first load. Only affects JAX.
         config: model config name: "pi05", "pi0", "groot", "groot_n17",
             "pi0fast", "motus", "wan22_ti2v_5b", "cosmos3_video",
-            "cosmos3_edge".
+            "cosmos3_edge", "ltx25".
+            "ltx25" is the LTX-2.5 22B distilled audio+video generator:
+            drive it with set_prompt(...) + infer(...), not predict().
             "cosmos3_video" is a non-VLA text2video denoise model: drive it with
             set_prompt(ref=<reference dump>) + infer(...), not predict().
             "cosmos3_edge" is the official Cosmos Framework Thor baseline
@@ -535,12 +537,13 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                 "Supported: pi0, pi05, llm, mllm")
     elif config not in ("pi05", "groot", "groot_n17", "pi0", "pi0fast",
                       "motus", "wan22_ti2v_5b", "cosmos3_video",
-                      "cosmos3_edge", "nexn2", "qwen36_moe", "hyvla"):
+                      "cosmos3_edge", "nexn2", "qwen36_moe", "hyvla",
+                      "ltx25"):
         raise ValueError(
             f"Unknown config: {config}. "
             f"Supported: pi05, groot, groot_n17, pi0, pi0fast, motus, "
             f"wan22_ti2v_5b, cosmos3_video, cosmos3_edge, nexn2, "
-            f"qwen36_moe, hyvla")
+            f"qwen36_moe, hyvla, ltx25")
     if framework not in ("torch", "jax", "jetson_pi"):
         raise ValueError(
             f"Unknown framework: {framework}. Supported: torch, jax, jetson_pi")
