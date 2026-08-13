@@ -30,6 +30,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# The structures layer obtains kernels through the Hugging Face kernel
+# hub client. It is optional because the catalog, the specs and the
+# adapters are all readable without it; a bind refuses legibly and names
+# this extra when it is absent.
+hub = ["kernels>=0.12", "torch"]
 torch = ["torch", "safetensors", "sentencepiece"]
 jax = ["jax", "jaxlib", "ml_dtypes", "orbax-checkpoint", "flax"]
 server = ["fastapi", "uvicorn"]
