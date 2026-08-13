@@ -589,6 +589,39 @@ Reproduce with
 
 ---
 
+## Install from PyPI (structures layer, no local build)
+
+```bash
+pip install flash-rt
+```
+
+The published distribution is **pure Python**: it carries the frontends,
+the structure catalog, the engine adapters and the kernel sources, and no
+`.so` at all. That is enough to read the catalog, inspect a binding, and
+attach the structures layer to a serving host — kernels arrive from the
+kernel hub at bind time. It is *not* enough for the native
+`flash_rt.load_model` path, which needs compiled extensions; asking for
+them without a build produces a refusal that names the cmake line rather
+than a missing-module traceback. Build them with the section below.
+
+Three boundaries are worth knowing before you start, because each one
+produces a refusal that looks like a bug and is not:
+
+- **Kernel availability follows the hub's build matrix, not this
+  package's.** The wheel installs on any torch; the kernels do not exist
+  for every torch. Coverage today is thickest at `torch 2.11 / cu128` on
+  x86-64 — the current PyPI default is torch 2.13, where the published
+  face is much thinner. If binds refuse on a fresh install, check the
+  torch version first.
+- **`HF_HUB_OFFLINE=1` makes every kernel unavailable, even with a fully
+  warm cache**, because a version specifier has to resolve refs online.
+  Air-gapped deployments should stage packages and point at them with
+  `LOCAL_KERNELS=<repo>=<path>` rather than switching the hub offline.
+- **aarch64 (Jetson Thor, sm_110) is not covered by the current
+  qualification pass.** Nothing in the wheel is architecture-bound, but
+  the engine adapters were last verified against vLLM 0.26 on Thor in
+  August 2026, not in the release run.
+
 ## Build & install
 
 This is the hands-on "go from a fresh machine to a green benchmark"
