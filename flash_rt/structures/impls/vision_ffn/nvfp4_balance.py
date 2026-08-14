@@ -62,9 +62,39 @@ class FusedGeluMlpNvfp4(GuardedSeam, torch.nn.Module):
             self.register_buffer(name, t)
         self._d = d
         self._f = f
+        self._chain_min_m = (self._audition_chain()
+                             if self._chain is not None else None)
         if original is not None:
             self.host_mlp = original
         self._frt_arm(dtypes=CAST_OK, device=wp1.device, k=d)
+
+    def _audition_chain(self) -> int | None:
+        """The smallest row count the wire chain will actually serve.
+
+        Presence is not qualification, and this qualification is
+        shape-dependent: a chain entry can decline the single row a
+        decode-shaped call brings while serving every larger one. One
+        launch would answer the wrong question — disqualifying a chain
+        over the one shape it declines, or admitting it and failing on
+        the first M=1 call. Two launches at bind measure the band.
+
+        Returns the smallest M that ran, or ``None`` when nothing did,
+        in which case the two-step form carries every call and stays
+        numerically exact.
+        """
+        for m in (1, 2):
+            try:
+                z = torch.zeros(m, self._d, device=self.wp1.device,
+                                dtype=torch.float16)
+                ap, sfa = self._kern.quantize_fp4_sfa_fp16(z)
+                hp, hsfa = self._chain(ap, self.wp1, sfa, self.sfb1,
+                                       self.b1)
+                self._gemm_bias(hp, self.wp2, hsfa, self.sfb2, self.b2)
+                return m
+            except (RuntimeError, ValueError):
+                continue
+        self._chain = None
+        return None
 
     def __getattr__(self, name):
         try:
@@ -82,7 +112,7 @@ class FusedGeluMlpNvfp4(GuardedSeam, torch.nn.Module):
         flat = (hidden.reshape(-1, shape[-1]).to(torch.float16)
                 * self.inv1).contiguous()
         ap, sfa = self._kern.quantize_fp4_sfa_fp16(flat)
-        if self._chain is not None:
+        if self._chain is not None and flat.shape[0] >= self._chain_min_m:
             hp, hsfa = self._chain(ap, self.wp1, sfa, self.sfb1, self.b1)
             y = self._gemm_bias(hp, self.wp2, hsfa, self.sfb2, self.b2)
             return y.reshape(*shape[:-1], self._d).to(hidden.dtype)
