@@ -50,6 +50,9 @@ class AdoptionReport:
     fmt: str
     replaced: list[str] = field(default_factory=list)
     conversion_rel_l2: dict[str, float] = field(default_factory=dict)
+    #: projections seen but deliberately not adopted, path -> reason
+    #: (a refusal is a routing event; the receipt keeps its reason)
+    retained: dict[str, str] = field(default_factory=dict)
 
     @property
     def worst_conversion(self) -> float:
