@@ -62,39 +62,63 @@ class FusedGeluMlpNvfp4(GuardedSeam, torch.nn.Module):
             self.register_buffer(name, t)
         self._d = d
         self._f = f
-        self._chain_min_m = (self._audition_chain()
-                             if self._chain is not None else None)
+        self._chain_band = (self._audition_chain()
+                            if self._chain is not None else None)
         if original is not None:
             self.host_mlp = original
         self._frt_arm(dtypes=CAST_OK, device=wp1.device, k=d)
 
-    def _audition_chain(self) -> int | None:
-        """The smallest row count the wire chain will actually serve.
+    #: Row counts probed at bind. The first that runs anchors the band;
+    #: the two probes after it say which kind of band it is.
+    _PROBE_M = (1, 2, 4, 8, 16, 32, 64, 128)
+
+    def _chain_runs(self, m: int) -> bool:
+        try:
+            z = torch.zeros(m, self._d, device=self.wp1.device,
+                            dtype=torch.float16)
+            ap, sfa = self._kern.quantize_fp4_sfa_fp16(z)
+            hp, hsfa = self._chain(ap, self.wp1, sfa, self.sfb1, self.b1)
+            self._gemm_bias(hp, self.wp2, hsfa, self.sfb2, self.b2)
+            return True
+        except (RuntimeError, ValueError):
+            return False
+
+    def _audition_chain(self):
+        """Measure which row counts the wire chain will serve.
 
         Presence is not qualification, and this qualification is
-        shape-dependent: a chain entry can decline the single row a
-        decode-shaped call brings while serving every larger one. One
-        launch would answer the wrong question — disqualifying a chain
-        over the one shape it declines, or admitting it and failing on
-        the first M=1 call. Two launches at bind measure the band.
+        shape-dependent — but *how* it depends on shape is itself
+        something to measure rather than assume. A tile-structured entry
+        can decline every row count that is not a multiple of its tile
+        while serving all of them that are, which no lower bound
+        describes: reading such an entry as "serves M >= n" turns off a
+        chain that would have served the aligned shapes a real workload
+        actually has.
 
-        Returns the smallest M that ran, or ``None`` when nothing did,
-        in which case the two-step form carries every call and stays
-        numerically exact.
+        So the probes anchor the band and then ask which kind it is. If
+        the row after the anchor also runs, the band is a floor. If the
+        anchor's double runs but its successor does not, the band is an
+        alignment. If neither, the band is not describable from here and
+        the chain stands down rather than guess.
+
+        Returns ``("min", n)``, ``("align", n)``, or ``None`` — and on
+        ``None`` the two-step form carries every call, exactly.
         """
-        for m in (1, 2):
-            try:
-                z = torch.zeros(m, self._d, device=self.wp1.device,
-                                dtype=torch.float16)
-                ap, sfa = self._kern.quantize_fp4_sfa_fp16(z)
-                hp, hsfa = self._chain(ap, self.wp1, sfa, self.sfb1,
-                                       self.b1)
-                self._gemm_bias(hp, self.wp2, hsfa, self.sfb2, self.b2)
-                return m
-            except (RuntimeError, ValueError):
-                continue
+        anchor = next((m for m in self._PROBE_M if self._chain_runs(m)),
+                      None)
+        if anchor is None:
+            self._chain = None
+            return None
+        if self._chain_runs(anchor + 1):
+            return ("min", anchor)
+        if anchor > 1 and self._chain_runs(anchor * 2):
+            return ("align", anchor)
         self._chain = None
         return None
+
+    def _chain_serves(self, rows: int) -> bool:
+        kind, n = self._chain_band
+        return rows >= n if kind == "min" else rows % n == 0
 
     def __getattr__(self, name):
         try:
@@ -112,7 +136,7 @@ class FusedGeluMlpNvfp4(GuardedSeam, torch.nn.Module):
         flat = (hidden.reshape(-1, shape[-1]).to(torch.float16)
                 * self.inv1).contiguous()
         ap, sfa = self._kern.quantize_fp4_sfa_fp16(flat)
-        if self._chain is not None and flat.shape[0] >= self._chain_min_m:
+        if self._chain is not None and self._chain_serves(flat.shape[0]):
             hp, hsfa = self._chain(ap, self.wp1, sfa, self.sfb1, self.b1)
             y = self._gemm_bias(hp, self.wp2, hsfa, self.sfb2, self.b2)
             return y.reshape(*shape[:-1], self._d).to(hidden.dtype)
