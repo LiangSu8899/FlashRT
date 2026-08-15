@@ -40,7 +40,7 @@ def test_loads_only_prefixed_vqvae_weights_strictly(tmp_path):
         num_hidden_layers=1,
         num_attention_heads=4,
         num_key_value_heads=4,
-        vq_config=vq_config,
+        vq_config=vq_config.to_dict(),
         vocabulary_map={},
     )
     config.save_pretrained(tmp_path)
