@@ -15,18 +15,37 @@ acceptance length. gamma drafts come from gamma noise slots
 *sequentially* (each slot's bias conditioned on the previously sampled
 token, anchored at the seed), and the verify window is gamma+1 tokens.
 
+The round is fully captured, following the MTP member's graph families:
+
+- the draft forward is one graph — static context K/V buffers take the
+  block's own keys by ``index_copy_`` at the block positions (the block
+  region ``[start, start+gamma)`` always sits right past the appended
+  context, so one masked SDPA over the static window covers context and
+  block siblings alike), and the serial Markov head runs unrolled on
+  device, so proposing costs zero host syncs;
+- the gamma+1 verify is one graph with the gated-delta state snapshot
+  captured at its head (the MTP draft graph's ``snap_states`` idiom);
+- re-advance is gated-delta-only: the verify pass already produced
+  everything else a rejected round needs — the bonus token is the
+  verify logit at the cut (its prefix rows saw exactly the accepted
+  tokens), and the KV rows for the accepted region were committed by
+  the verify itself (same tokens, same positions, FP8 pages included).
+  The only state a rejection actually loses is the gated-delta
+  recurrence past the cut, so each rejected-prefix length gets a graph
+  that restores the snapshot and re-drives just the gated-delta
+  sublayers over their stashed verify inputs — forty-eight state
+  layers instead of the whole model. A fully-accepted round skips
+  rollback outright: the verify pass committed exactly the accepted
+  stream;
+- the arbiter costs the round's single host sync, same as the MTP loop.
+
 Aux features are the *inputs* of the configured target layers (the
 serving-side capture point for this host family), collected by forward
-pre-hooks that see every loop forward: the prompt pass and each
-accepted-prefix re-advance feed the draft's context cache exactly once
-per position.
-
-The target-side round rides the loop's own machinery: ``_fwd_full`` for
-the verify and the re-advance (offset row mask, in-place cache slots,
-gated-delta continuation via the cache's ``frt_continue`` contract), and
-the GDN state snapshot/restore idiom the MTP member established. Static
-KV slots beyond the accepted position need no cropping — the row mask
-never attends past the current row.
+pre-hooks. Hooks only execute during eager passes and graph capture —
+the tensors they see during the verify capture live in the graph's
+private pool, which every replay rewrites in place, so the captured
+references stay valid round after round and the accepted rows' features
+read straight out of them.
 
 Weights load from the draft checkpoint's single safetensors file; the
 draft shares the target's embedding and lm_head (the draft was trained
@@ -52,7 +71,12 @@ def _rms(x, w, eps=1e-6):
 
 
 class DSparkBlockDraft:
-    """The draft network, functional form over checkpoint tensors."""
+    """The draft network, functional form over checkpoint tensors.
+
+    ``propose_`` is capture-ready: every input rides a persistent device
+    buffer (seed token, block start), every write lands in a persistent
+    buffer (the draft tokens), and no host value is consulted.
+    """
 
     def __init__(self, draft_dir, embed, lm_head, max_len, device="cuda"):
         from safetensors.torch import load_file
@@ -71,6 +95,7 @@ class DSparkBlockDraft:
         self._embed = embed
         self._head = lm_head
         self._dev = device
+        self._max = int(max_len)
 
         t = {k: v.to(device, torch.bfloat16)
              for k, v in load_file(str(d / "model.safetensors")).items()}
@@ -89,19 +114,30 @@ class DSparkBlockDraft:
             max_position_embeddings=cfg["max_position_embeddings"],
             rope_scaling=rp, rope_theta=rp.get("rope_theta", 1e7))
         rot = Qwen3RotaryEmbedding(qc).to(device)
-        pos = torch.arange(max_len, device=device)[None]
+        pos = torch.arange(self._max, device=device)[None]
         cos, sin = rot(torch.empty(1, 1, device=device), pos)
         self._cos = cos[0].to(torch.bfloat16)     # [max_len, hd]
         self._sin = sin[0].to(torch.bfloat16)
 
-        # per-layer context K/V caches (roped keys), grown append-only
-        self._ck = [torch.empty(max_len, self.n_kv, self.hd,
+        # per-layer context K/V (roped keys). Appended rows carry the
+        # fc-projected target features; the block region past ``_len``
+        # holds the propose pass's own keys until the next append
+        # overwrites it — every stale row dies before it is read.
+        self._ck = [torch.zeros(self._max, self.n_kv, self.hd,
                                 device=device, dtype=torch.bfloat16)
                     for _ in range(self.n_layers)]
-        self._cv = [torch.empty(max_len, self.n_kv, self.hd,
+        self._cv = [torch.zeros(self._max, self.n_kv, self.hd,
                                 device=device, dtype=torch.bfloat16)
                     for _ in range(self.n_layers)]
         self._len = 0
+
+        g = self.gamma
+        self._ids = torch.full((g,), self.mask_id, dtype=torch.long,
+                               device=device)
+        self._start = torch.zeros(1, dtype=torch.long, device=device)
+        self._drafts = torch.zeros(g, dtype=torch.long, device=device)
+        self._arg = torch.arange(g, device=device)
+        self._armax = torch.arange(self._max, device=device)
 
     def reset(self):
         self._len = 0
@@ -128,22 +164,30 @@ class DSparkBlockDraft:
             k = self._rope(_rms(k, t[p + "k_norm.weight"]), pos)
             v = (tgt @ t[p + "v_proj.weight"].T).view(
                 n, self.n_kv, self.hd)
-            self._ck[li][self._len:self._len + n] = k
-            self._cv[li][self._len:self._len + n] = v
+            self._ck[li].index_copy_(0, pos, k)
+            self._cv[li].index_copy_(0, pos, v)
         self._len += n
 
     @torch.no_grad()
-    def propose(self, seed_id, start):
-        """One block forward -> gamma draft tokens (serial markov)."""
+    def propose_(self):
+        """One block forward, buffers in, buffers out (capture-ready).
+
+        Reads ``_ids`` (slot 0 = seed) and ``_start``; writes the gamma
+        draft tokens into ``_drafts``. The block's keys land in the
+        context buffers at the block positions, so a single masked SDPA
+        over the static window serves the dual-source attention: every
+        noise slot sees all context and every noise sibling.
+        """
         t = self._t
         g = self.gamma
-        ids = torch.full((g,), self.mask_id, dtype=torch.long,
-                         device=self._dev)
-        ids[0] = seed_id
-        pos = torch.arange(start, start + g, device=self._dev)
-        h = self._embed(ids.unsqueeze(0))[0]          # [g, hidden]
-        L = self._len
-        rep = self.n_q // self.n_kv
+        pos = self._start + self._arg
+        h = self._embed(self._ids.unsqueeze(0))[0]      # [g, hidden]
+        lim = self._start + g
+        # boolean mask keeps SDPA on its fused backend: an additive
+        # float mask demotes the GQA path to materialising math (the
+        # profiler named the expand-clone of the whole context window)
+        m4 = (self._armax < lim).view(1, 1, 1, -1)
+        gqa = self.n_q != self.n_kv
         for li in range(self.n_layers):
             p = f"layers.{li}."
             a = f"{p}self_attn."
@@ -153,16 +197,14 @@ class DSparkBlockDraft:
             kn = (x @ t[a + "k_proj.weight"].T).view(g, self.n_kv, self.hd)
             kn = self._rope(_rms(kn, t[a + "k_norm.weight"]), pos)
             vn = (x @ t[a + "v_proj.weight"].T).view(g, self.n_kv, self.hd)
-            K = torch.cat([self._ck[li][:L], kn], dim=0)
-            V = torch.cat([self._cv[li][:L], vn], dim=0)
-            K = K.repeat_interleave(rep, dim=1)
-            V = V.repeat_interleave(rep, dim=1)
-            # dual-source full attention: every noise slot sees all
-            # context and every noise sibling (bidirectional block)
-            att = torch.einsum("qhd,khd->hqk", q.float(), K.float())
-            att = torch.softmax(att / (self.hd ** 0.5), dim=-1)
-            o = torch.einsum("hqk,khd->qhd", att,
-                             V.float()).to(h.dtype).reshape(g, -1)
+            self._ck[li].index_copy_(0, pos, kn)
+            self._cv[li].index_copy_(0, pos, vn)
+            o = F.scaled_dot_product_attention(
+                q.transpose(0, 1).unsqueeze(0),
+                self._ck[li].transpose(0, 1).unsqueeze(0),
+                self._cv[li].transpose(0, 1).unsqueeze(0),
+                attn_mask=m4, enable_gqa=gqa)
+            o = o.squeeze(0).transpose(0, 1).reshape(g, -1)
             h = h + o @ t[a + "o_proj.weight"].T
             x = _rms(h, t[p + "post_attention_layernorm.weight"])
             m = f"{p}mlp."
@@ -170,21 +212,23 @@ class DSparkBlockDraft:
                      * (x @ t[m + "up_proj.weight"].T)) \
                 @ t[m + "down_proj.weight"].T
         logits = self._head(_rms(h, t["norm.weight"]).unsqueeze(0))[0]
-        # serial markov: each slot biased by the previously sampled token
-        w1, w2 = t["markov_head.markov_w1.weight"], \
-            t["markov_head.markov_w2.weight"]
-        drafts = torch.empty(g, dtype=torch.long, device=self._dev)
-        prev = int(seed_id)
+        # serial markov, unrolled on device: each slot biased by the
+        # previously sampled token, anchored at the seed — no host
+        # round-trips inside the chain. The bias GEMV reads the [vocab,
+        # r] factor once per slot; it stays bf16 (fp32 accumulate) so
+        # the chain reads half the bytes
+        w1 = t["markov_head.markov_w1.weight"]
+        w2 = t["markov_head.markov_w2.weight"]
+        prev = self._ids[0:1]
         for i in range(g):
-            bias = (w1[prev].float() @ w2.float().T)
-            tok = int((logits[i].float() + bias).argmax())
-            drafts[i] = tok
+            bias = w1.index_select(0, prev) @ w2.T
+            tok = (logits[i].float() + bias[0].float()).argmax().view(1)
+            self._drafts[i:i + 1].copy_(tok)
             prev = tok
-        return drafts
 
 
 class DSparkRunner:
-    """Round driver over a built whole-step loop."""
+    """Captured-round driver over a built whole-step loop."""
 
     def __init__(self, loop, draft_dir, model=None):
         self._loop = loop
@@ -198,6 +242,29 @@ class DSparkRunner:
         for slot, li in enumerate(self._draft.taps):
             self._hooks.append(lm_layers[li].register_forward_pre_hook(
                 self._make_hook(slot)))
+        # the gated-delta sublayers and their inputs: the re-advance
+        # graphs re-drive exactly these modules over the rows the
+        # verify pass showed them (input = the decoder layer's normed
+        # hidden, which is what the sublayer consumes again)
+        self._gdn_mods = {}
+        self._gdn_in = {}
+        for i, lyr in enumerate(lm_layers):
+            if i in loop._full_set:
+                continue
+            for _name, mod in lyr.named_children():
+                if hasattr(mod, "conv1d") and hasattr(mod, "A_log"):
+                    self._gdn_mods[i] = mod
+                    self._hooks.append(mod.register_forward_pre_hook(
+                        self._make_gdn_hook(i), with_kwargs=True))
+                    break
+        g = self._draft.gamma
+        dev = self._draft._dev
+        self._vblk = torch.zeros(1, g + 1, dtype=torch.long, device=dev)
+        self._vpos = torch.zeros(g + 1, dtype=torch.long, device=dev)
+        self._ag1 = torch.arange(g + 1, device=dev)
+        self._outbuf = torch.zeros(loop._max, dtype=torch.long,
+                                   device=dev)
+        self._gp = None
         self.last_acceptance = 0.0
 
     def _make_hook(self, slot):
@@ -205,10 +272,111 @@ class DSparkRunner:
             self._tap_in[slot] = args[0]
         return hook
 
-    def _taps_cat(self):
-        d = self._draft
-        return torch.cat([self._tap_in[s][0] for s in
-                          range(len(d.taps))], dim=-1)
+    def _make_gdn_hook(self, idx):
+        def hook(module, args, kwargs):
+            self._gdn_in[idx] = args[0] if args else \
+                kwargs["hidden_states"]
+        return hook
+
+    def _taps_rows(self, taps, rows):
+        return torch.cat([taps[s][0, :rows] for s in
+                          range(len(self._draft.taps))], dim=-1)
+
+    def _capture(self):
+        """Warm every round shape, then capture the graph families.
+
+        Runs once, right after the first prompt pass, when every buffer
+        holds live values. The warmups execute on a side stream (the
+        capture-stream discipline the loop's own capture established);
+        the gated-delta states they advance are rolled back before
+        capture so the first replay starts from the real prompt state.
+        """
+        loop, draft = self._loop, self._draft
+        g = draft.gamma
+        if loop._kv_band is not None:
+            # every round shape's fp8 mask exists before capture — a
+            # lazy fill between warmup and capture flips state mid-graph
+            loop._kv_band.prewarm(range(1, g + 2))
+        # compile-then-capture, the MTP verify recipe: inductor's
+        # elementwise fusion buys the multi-row passes the same third
+        # it buys the plain step. Each round shape specialises once
+        # during warmup; the loop's init already raised the recompile
+        # budget for per-layer specialisation.
+        if loop._use_compile:
+            if getattr(loop, "_fwd_full_c", None) is None:
+                loop._fwd_full_c = torch.compile(loop._fwd_full,
+                                                 dynamic=False)
+            fwd = loop._fwd_full_c
+            if getattr(self, "_propose_c", None) is None:
+                self._propose_c = torch.compile(draft.propose_,
+                                                dynamic=False)
+            prop = self._propose_c
+        else:
+            fwd = loop._fwd_full
+            prop = draft.propose_
+        self._snap = {
+            i: (torch.empty_like(loop.cache.conv_states[i]),
+                torch.empty_like(loop.cache.recurrent_states[i]))
+            for i in loop._gdn_slots()}
+        for i, (cb, rb) in self._snap.items():
+            cb.copy_(loop.cache.conv_states[i])
+            rb.copy_(loop.cache.recurrent_states[i])
+
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            prop()
+            self._vblk[0, 1:].copy_(draft._drafts)
+            fwd(self._vblk, self._vpos)
+            for m in range(1, g + 1):
+                fwd(self._vblk[:, :m], self._vpos[:m])
+        torch.cuda.current_stream().wait_stream(side)
+        for i, (cb, rb) in self._snap.items():
+            loop.cache.conv_states[i].copy_(cb)
+            loop.cache.recurrent_states[i].copy_(rb)
+
+        self._gp = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self._gp):
+            # the verify inputs assemble in-graph: seed and start
+            # already ride draft buffers, so the whole block-and-
+            # positions setup costs zero host launches per round
+            prop()
+            self._vblk[0, 0].copy_(draft._ids[0])
+            self._vblk[0, 1:].copy_(draft._drafts)
+            self._vpos.copy_(self._ag1)
+            self._vpos.add_(draft._start)
+        # the pre-round state snapshot rides at the verify graph's head:
+        # ninety-six host-launched little copies a round otherwise sit
+        # squarely inside the per-round sync window
+        self._gv = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self._gv):
+            for i, (cb, rb) in self._snap.items():
+                cb.copy_(loop.cache.conv_states[i])
+                rb.copy_(loop.cache.recurrent_states[i])
+            self._vlg, self._vhn = fwd(self._vblk, self._vpos)
+        # the verify capture just ran the hooks: these references live
+        # in the verify graph's pool and every replay rewrites them in
+        # place. Saved now — later captures would overwrite the hook
+        # dicts with their own pools.
+        self._vtaps = [self._tap_in[s]
+                       for s in range(len(draft.taps))]
+        gdn_v = dict(self._gdn_in)
+        # gated-delta-only re-advance: restore the snapshot, then
+        # re-drive just the state sublayers over the rows the verify
+        # showed them. Everything else a rejected round needs already
+        # exists — bonus logits sit in the verify output at the cut,
+        # and the accepted region's KV rows were the verify's own
+        # writes (same tokens, same positions).
+        self._ra = {}
+        for m in range(1, g + 1):
+            gr = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(gr):
+                for i, (cb, rb) in self._snap.items():
+                    loop.cache.conv_states[i].copy_(cb)
+                    loop.cache.recurrent_states[i].copy_(rb)
+                for i, mod in self._gdn_mods.items():
+                    mod(gdn_v[i][:, :m], loop.cache, None)
+            self._ra[m] = gr
 
     @torch.no_grad()
     def generate(self, input_ids, max_new_tokens):
@@ -224,51 +392,65 @@ class DSparkRunner:
         loop._rope_delta.zero_()
         if loop._kv_band is not None:
             loop._kv_band.reset()
+        # canonical window, same as the loop's own generate: rows past
+        # the prompt zero before any produced token
+        for i in loop._full:
+            loop.cache.key_cache[i][:, :, L:].zero_()
+            loop.cache.value_cache[i][:, :, L:].zero_()
         logits, _ = loop._fwd_full(input_ids,
                                    torch.arange(L, device=dev))
-        draft.append_ctx(self._taps_cat(),
-                         torch.arange(L, device=dev))
+        draft.append_ctx(
+            self._taps_rows(self._tap_in, L),
+            torch.arange(L, device=dev))
         loop.cache.frt_continue = True
-        seed = int(logits[0, -1].float().argmax())
-        seq = input_ids[0].tolist() + [seed]
+        seed = logits[0, -1].float().argmax().view(1)
+        self._outbuf[0].copy_(seed[0])
+        produced = 1
         start = L
         rounds = 0
         accepted_total = 0
-        while len(seq) - L < max_new_tokens:
-            drafts = draft.propose(seq[start], start)
-            blk = torch.tensor([[seq[start]] + drafts.tolist()],
-                               device=dev)
-            pos = torch.arange(start, start + g + 1, device=dev)
-            conv = {i: loop.cache.conv_states[i].clone()
-                    for i in loop._gdn_slots()}
-            rec = {i: loop.cache.recurrent_states[i].clone()
-                   for i in loop._gdn_slots()}
-            vlog, _ = loop._fwd_full(blk, pos)
-            # 轮特征取自 verify 前向 (快照态下的正确前缀隐层, 与
-            # serving 的 aux 捕获点同语义); re-advance 只养状态
-            vfeats = self._taps_cat().clone()
-            post = vlog[0].float().argmax(-1)
-            match = (blk[0, 1:] == post[:-1]).long()
-            a = int(match.cumprod(0).sum())
-            bonus = int(post[a])
-            for i, t in conv.items():
-                loop.cache.conv_states[i].copy_(t)
-            for i, t in rec.items():
-                loop.cache.recurrent_states[i].copy_(t)
-            rpos = torch.arange(start, start + a + 1, device=dev)
-            loop._fwd_full(blk[:, :a + 1], rpos)
-            draft.append_ctx(vfeats[:a + 1], rpos)
-            seq.extend(blk[0, 1:a + 1].tolist() + [bonus])
-            start += a + 1
-            accepted_total += a + 1
+        if self._gp is None:
+            self._vpos.copy_(self._ag1 + start)
+            draft._ids[0].copy_(seed[0])
+            draft._start.fill_(start)
+            self._vblk[0, 0].copy_(seed[0])
+            self._capture()
+        while produced < max_new_tokens:
+            draft._ids[0].copy_(seed[0])
+            draft._start.fill_(start)
+            self._gp.replay()
+            self._gv.replay()
+            post = self._vlg[0].float().argmax(-1)          # [g+1]
+            match = (self._vblk[0, 1:] == post[:-1]).long()
+            # device-side prefix match: the round's single host sync
+            a = int(match.cumprod(0).sum().item())
+            # the bonus is the verify logit at the cut either way: row
+            # a's prefix saw exactly the accepted tokens
+            bonus = post[a:a + 1]
+            if a < g:
+                # rejection loses only the gated-delta recurrence past
+                # the cut: restore and re-drive the state sublayers
+                self._ra[a + 1].replay()
+            rows = a + 1
+            draft.append_ctx(
+                self._taps_rows(self._vtaps, rows),
+                torch.arange(start, start + rows, device=dev))
+            if a > 0:
+                self._outbuf[produced:produced + a].copy_(
+                    self._vblk[0, 1:a + 1])
+            self._outbuf[produced + a].copy_(bonus[0])
+            seed = bonus
+            produced += rows
+            start += rows
+            accepted_total += rows
             rounds += 1
-            if not hasattr(self, "_round_log"):
-                self._round_log = []
             if rounds <= 40:
-                self._round_log.append(a + 1)
+                self._round_log.append(rows)
         self.last_acceptance = accepted_total / max(rounds, 1)
-        self.last_rounds = getattr(self, "_round_log", None)
-        return torch.tensor([seq[:L + max_new_tokens]], device=dev)
+        self.last_rounds = self._round_log
+        loop.cache.frt_continue = False
+        return torch.cat(
+            [input_ids, self._outbuf[:max_new_tokens].view(1, -1)], dim=1)
 
     def detach(self):
         for h in self._hooks:
