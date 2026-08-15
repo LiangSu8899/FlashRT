@@ -141,9 +141,15 @@ def quantize_on_adopt(model: torch.nn.Module,
     report = AdoptionReport(fmt=fmt)
     if fmt == "linear_proj_nvfp4":
         _adopt_linear_projections(model, report, verbose=verbose)
+        # sibling projections that read the same normed hidden share one
+        # activation quantization (identity-keyed, bit-identical by
+        # construction) — the adopted checkpoint's default execution form
+        from .impls.linear_proj import nvfp4_dynamic as _nv
+        n_shared = _nv.link_shared_producers(model)
         torch.cuda.empty_cache()
         if verbose:
-            print(f"[quantize_on_adopt] {report.summary()}", flush=True)
+            print(f"[quantize_on_adopt] {report.summary()}; "
+                  f"{n_shared} shared-producer groups", flush=True)
         return report
 
     from .impls.moe_experts import nvfp4_dynamic

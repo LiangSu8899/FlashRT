@@ -137,6 +137,69 @@ def _quantize_activation(kern, flat: torch.Tensor):
         flat.to(torch.float16).contiguous())
 
 
+class _ShareCell:
+    """One activation-quantization seat shared by sibling projections.
+
+    Reuse is keyed on tensor *identity*: a sibling consumes the stored
+    quantization only when its input is the very object that produced
+    it, so a fresh activation can never be served a stranger's data —
+    at worst the cell misses and the seam quantizes for itself. Inside
+    one traced graph the identity resolves at trace time, which bakes
+    the single-quantize dataflow into the compiled prefill and the
+    captured decode step alike; in eager it holds per call because the
+    host hands every sibling the same normed hidden.
+
+    Contract: activations must be functional — a caller that mutates a
+    tensor *in place* and feeds the same object again would hit the
+    cell with stale contents. This host family never does (every step's
+    layernorm output is a fresh allocation, and the captured paths
+    re-run the quantize inside the graph), which is why the linking is
+    an explicit opt-in per adopted model rather than ambient behavior.
+    """
+
+    __slots__ = ("x", "a", "sfa")
+
+    def __init__(self):
+        self.x = None
+        self.a = None
+        self.sfa = None
+
+
+#: sibling groups that consume the same activation in this host family:
+#: the attention trio reads the input layernorm's output, the MLP pair
+#: reads the post-attention layernorm's output. down/o are not grouped —
+#: their inputs are their own.
+_SHARE_GROUPS = (
+    ("self_attn", ("q_proj", "k_proj", "v_proj")),
+    ("mlp", ("gate_proj", "up_proj")),
+)
+
+
+def link_shared_producers(root: torch.nn.Module) -> int:
+    """Link sibling NVFP4 seams so each shared activation quantizes once.
+
+    Walks ``root`` for the host family's sibling groups and hands every
+    group one :class:`_ShareCell`. Returns the number of groups linked.
+    Additive and reversible: seams without a cell behave exactly as
+    before, and a group only forms when at least two members are bound.
+    """
+    n_groups = 0
+    for name, mod in root.named_modules():
+        for tag, members in _SHARE_GROUPS:
+            if not name.endswith(tag):
+                continue
+            seams = [getattr(mod, m, None) for m in members]
+            seams = [s for s in seams
+                     if isinstance(s, LinearProjNvfp4Dynamic)]
+            if len(seams) < 2:
+                continue
+            cell = _ShareCell()
+            for s in seams:
+                s._share = cell
+            n_groups += 1
+    return n_groups
+
+
 class LinearProjNvfp4Dynamic(GuardedSeam, torch.nn.Module):
     """Packed-weight projection: FP4 GEMM with runtime activation scales."""
 
@@ -191,9 +254,15 @@ class LinearProjNvfp4Dynamic(GuardedSeam, torch.nn.Module):
         if admitted is not PROCEED:
             return admitted
         shape = x.shape
-        flat = x.reshape(-1, shape[-1])
-        a_packed, a_sfa = _quantize_activation(self._kern, flat)
-        m = flat.shape[0]
+        cell = getattr(self, "_share", None)
+        if cell is not None and cell.x is x:
+            a_packed, a_sfa = cell.a, cell.sfa
+        else:
+            flat = x.reshape(-1, shape[-1])
+            a_packed, a_sfa = _quantize_activation(self._kern, flat)
+            if cell is not None:
+                cell.x, cell.a, cell.sfa = x, a_packed, a_sfa
+        m = a_packed.shape[0]
         if m == 1 and self._gemv is not None:
             y = self._gemv(a_packed, self._w_packed, a_sfa, self._w_sfb)
         elif 2 <= m <= 16 and self._mrows is not None:
