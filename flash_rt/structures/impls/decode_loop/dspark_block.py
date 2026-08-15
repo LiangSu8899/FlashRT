@@ -56,12 +56,47 @@ checkpoint but is not consumed here — the block length stays fixed.
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 
 import torch
 import torch.nn.functional as F
 
 __all__ = ["DSparkBlockDraft", "DSparkRunner"]
+
+
+@torch.library.custom_op("flashrt_native::dspark_draft_attn",
+                         mutates_args=())
+def _draft_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                seqused: torch.Tensor, scale: float) -> torch.Tensor:
+    """Non-causal fa2 over the draft's static context window.
+
+    ``seqused`` is the device-side valid-K length (context + block):
+    the kernel reads it at run time, so the captured launch replays
+    with whatever the round wrote there — no mask, no materialised
+    attention math. q [S, Hq, D]; k/v [max, Hkv, D]."""
+    from flash_rt import flash_rt_fa2 as fa2
+
+    S, Hq, D = q.shape
+    o = torch.empty_like(q)
+    lse = torch.empty(1, Hq, S, device=q.device, dtype=torch.float32)
+    # strides are (batch, token, head) with a unit dim stride — the
+    # production call sites' convention for the vendored fa2 surface
+    mk, hk = k.shape[0], k.shape[1]
+    fa2.fwd_bf16_seqused(
+        q.data_ptr(), k.data_ptr(), v.data_ptr(), o.data_ptr(),
+        lse.data_ptr(), seqused.data_ptr(), 1, S, mk, Hq, hk, D,
+        (S * Hq * D, Hq * D, D),
+        (mk * hk * D, hk * D, D),
+        (mk * hk * D, hk * D, D),
+        (S * Hq * D, Hq * D, D), scale, 0,
+        torch.cuda.current_stream().cuda_stream)
+    return o
+
+
+@_draft_attn.register_fake
+def _(q, k, v, seqused, scale):
+    return torch.empty_like(q)
 
 
 def _rms(x, w, eps=1e-6):
@@ -100,6 +135,41 @@ class DSparkBlockDraft:
         t = {k: v.to(device, torch.bfloat16)
              for k, v in load_file(str(d / "model.safetensors")).items()}
         self._t = t
+        # draft projection precision: the verify pass anchors the
+        # output stream regardless, so acceptance length alone judges
+        # the draft's precision. Measured on the real-source coding
+        # stream: W4A4 costs it (AL 2.93 -> 2.79, net negative
+        # despite the halved weight stream) - the bf16 default
+        # stands, the arms stay for other streams. FP8 (W8A8,
+        # per-tensor scales) is the middle arm.
+        mode = os.environ.get("FRT_DSPARK_DRAFT_QUANT", "bf16")
+        self._proj = {}
+        self._proj8 = {}
+        names = [f"layers.{li}.self_attn.{nm}"
+                 for li in range(self.n_layers)
+                 for nm in ("q_proj", "k_proj", "v_proj", "o_proj")]
+        names += [f"layers.{li}.mlp.{nm}"
+                  for li in range(self.n_layers)
+                  for nm in ("gate_proj", "up_proj", "down_proj")]
+        if mode == "fp8":
+            for nm in names:
+                key = nm + ".weight"
+                w = t[key].float()
+                sw = (w.abs().amax() / 448.0).clamp_min(1e-12)
+                self._proj8[nm] = (
+                    (w / sw).to(torch.float8_e4m3fn).contiguous(),
+                    sw.to(torch.float32))
+                del t[key]
+            torch.cuda.empty_cache()
+        elif mode == "fp4":
+            from ..linear_proj import nvfp4_dynamic
+            for nm in names:
+                key = nm + ".weight"
+                seam, _rel = nvfp4_dynamic.bind_proj_seam(
+                    {"w": t[key]})
+                self._proj[nm] = seam
+                del t[key]
+            torch.cuda.empty_cache()
 
         # the checkpoint's own rope parameters through the host library's
         # rope init - yarn attention scaling included in cos/sin
@@ -138,9 +208,25 @@ class DSparkBlockDraft:
         self._drafts = torch.zeros(g, dtype=torch.long, device=device)
         self._arg = torch.arange(g, device=device)
         self._armax = torch.arange(self._max, device=device)
+        self._seqk = torch.zeros(1, dtype=torch.int32, device=device)
 
     def reset(self):
         self._len = 0
+
+    def _mm(self, x, name):
+        """Projection router: quantized arm when bound, bf16 otherwise."""
+        seam = self._proj.get(name)
+        if seam is not None:
+            return seam(x)
+        w8 = self._proj8.get(name)
+        if w8 is not None:
+            wq, sw = w8
+            sx = (x.float().abs().amax() / 448.0).clamp_min(1e-12)
+            xq = (x.float() / sx).to(torch.float8_e4m3fn)
+            return torch._scaled_mm(
+                xq, wq.t(), scale_a=sx, scale_b=sw,
+                out_dtype=torch.bfloat16)
+        return x @ self._t[name + ".weight"].T
 
     def _rope(self, x, pos):
         # x [S, H, hd]; standard interleaved-half rotation
@@ -159,11 +245,9 @@ class DSparkBlockDraft:
         n = feats.shape[0]
         for li in range(self.n_layers):
             p = f"layers.{li}.self_attn."
-            k = (tgt @ t[p + "k_proj.weight"].T).view(
-                n, self.n_kv, self.hd)
+            k = self._mm(tgt, p + "k_proj").view(n, self.n_kv, self.hd)
             k = self._rope(_rms(k, t[p + "k_norm.weight"]), pos)
-            v = (tgt @ t[p + "v_proj.weight"].T).view(
-                n, self.n_kv, self.hd)
+            v = self._mm(tgt, p + "v_proj").view(n, self.n_kv, self.hd)
             self._ck[li].index_copy_(0, pos, k)
             self._cv[li].index_copy_(0, pos, v)
         self._len += n
@@ -182,35 +266,28 @@ class DSparkBlockDraft:
         g = self.gamma
         pos = self._start + self._arg
         h = self._embed(self._ids.unsqueeze(0))[0]      # [g, hidden]
-        lim = self._start + g
-        # boolean mask keeps SDPA on its fused backend: an additive
-        # float mask demotes the GQA path to materialising math (the
-        # profiler named the expand-clone of the whole context window)
-        m4 = (self._armax < lim).view(1, 1, 1, -1)
-        gqa = self.n_q != self.n_kv
+        # device-side valid-K length: context + this block
+        self._seqk.copy_((self._start + g).to(torch.int32))
+        scale = 1.0 / (self.hd ** 0.5)
         for li in range(self.n_layers):
             p = f"layers.{li}."
             a = f"{p}self_attn."
             x = _rms(h, t[p + "input_layernorm.weight"])
-            q = (x @ t[a + "q_proj.weight"].T).view(g, self.n_q, self.hd)
+            q = self._mm(x, a + "q_proj").view(g, self.n_q, self.hd)
             q = self._rope(_rms(q, t[a + "q_norm.weight"]), pos)
-            kn = (x @ t[a + "k_proj.weight"].T).view(g, self.n_kv, self.hd)
+            kn = self._mm(x, a + "k_proj").view(g, self.n_kv, self.hd)
             kn = self._rope(_rms(kn, t[a + "k_norm.weight"]), pos)
-            vn = (x @ t[a + "v_proj.weight"].T).view(g, self.n_kv, self.hd)
+            vn = self._mm(x, a + "v_proj").view(g, self.n_kv, self.hd)
             self._ck[li].index_copy_(0, pos, kn)
             self._cv[li].index_copy_(0, pos, vn)
-            o = F.scaled_dot_product_attention(
-                q.transpose(0, 1).unsqueeze(0),
-                self._ck[li].transpose(0, 1).unsqueeze(0),
-                self._cv[li].transpose(0, 1).unsqueeze(0),
-                attn_mask=m4, enable_gqa=gqa)
-            o = o.squeeze(0).transpose(0, 1).reshape(g, -1)
-            h = h + o @ t[a + "o_proj.weight"].T
+            o = _draft_attn(q.contiguous(), self._ck[li], self._cv[li],
+                            self._seqk, scale).reshape(g, -1)
+            h = h + self._mm(o, a + "o_proj")
             x = _rms(h, t[p + "post_attention_layernorm.weight"])
             m = f"{p}mlp."
-            h = h + (F.silu(x @ t[m + "gate_proj.weight"].T)
-                     * (x @ t[m + "up_proj.weight"].T)) \
-                @ t[m + "down_proj.weight"].T
+            h = h + self._mm(
+                F.silu(self._mm(x, m + "gate_proj"))
+                * self._mm(x, m + "up_proj"), m + "down_proj")
         logits = self._head(_rms(h, t["norm.weight"]).unsqueeze(0))[0]
         # serial markov, unrolled on device: each slot biased by the
         # previously sampled token, anchored at the seed — no host
