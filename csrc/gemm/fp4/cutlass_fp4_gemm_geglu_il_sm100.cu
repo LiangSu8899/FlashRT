@@ -253,7 +253,12 @@ static int run_geglu_il_hw(
   auto stride_A = cutlass::make_cute_packed_stride(StrideAT{}, {M, K, 1});
   auto stride_B = cutlass::make_cute_packed_stride(StrideBT{}, {N_il, K, 1});
   auto stride_C = cutlass::make_cute_packed_stride(StrideCT{}, {M, N_il, 1});
+  // The compact store node writes the real output itself; the collective's
+  // own D store lands in a buffer nothing reads. Aliasing every row onto
+  // row 0 shrinks that write from M*N_il to a single row, which at encoder
+  // shape is 12.8 MB of pure waste per call.
   auto stride_D = cutlass::make_cute_packed_stride(StrideDT{}, {M, N_il, 1});
+  cute::get<0>(stride_D) = 0;
   auto layout_SFA = CfgT::tile_atom_to_shape_SFA(make_shape(M, N_il, K, 1));
   auto layout_SFB = CfgT::tile_atom_to_shape_SFB(make_shape(M, N_il, K, 1));
 
