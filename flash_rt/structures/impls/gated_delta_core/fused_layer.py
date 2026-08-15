@@ -208,6 +208,25 @@ class FusedGatedDeltaDecodeLayer(GuardedSeam, torch.nn.Module):
                 self._proj_rel = (rel_in, rel_out)
             except ValueError:
                 self._proj_in = self._proj_out = None
+        elif projection_format == "nvfp4_balance":
+            # balanced fold: same FP4 band, with the per-input-channel
+            # balance fitted on calibrated activation amax — the lever
+            # that cut the single-seat tail error 2.5x on this host.
+            # Calibration is a precondition, not a default: a host layer
+            # without the attached amax keeps the BF16 band (counted as
+            # a refusal, never raised), and the amax only ever comes
+            # from calibrate_gdn_channel_amax's real-forward statistics.
+            from ..linear_proj import nvfp4_balance
+            amax = getattr(host, "_frt_gdn_channel_amax", None)
+            if amax is not None:
+                try:
+                    self._proj_in = nvfp4_balance.bind_proj_seam(
+                        {"w": self._packed_w}, channel_amax=amax["in"])
+                    self._proj_out = nvfp4_balance.bind_proj_seam(
+                        {"w": host.out_proj.weight.detach()},
+                        channel_amax=amax["out"])
+                except ValueError:
+                    self._proj_in = self._proj_out = None
         elif projection_format is not None:
             raise ValueError(
                 f"refused: unknown gdn projection format "
@@ -655,3 +674,61 @@ def bind_fused_decode_layer(host, layer_idx: int,
         if guard is not None:
             guard.notes["host_weights"] = "released (one-way)"
     return bound
+
+
+@torch.no_grad()
+def calibrate_gdn_channel_amax(lm, run_once, *, samples: int = 1,
+                               percentile: float = 99.9,
+                               verbose: bool = False) -> int:
+    """Attach calibrated per-input-channel amax to gated-delta hosts.
+
+    The house calibration front door: the structures ``Collector``
+    observes the two projection inputs (``in_proj_qkv``, ``out_proj``)
+    of every gated-delta host layer while ``run_once`` drives a real
+    forward — the statistics only ever come from the host's own data
+    path, never from synthetic tensors. Each observed layer receives
+    ``_frt_gdn_channel_amax = {"in": [K], "out": [K2]}``, which is the
+    precondition the ``nvfp4_balance`` projection format checks at
+    bind. Returns the number of layers calibrated.
+    """
+    from types import SimpleNamespace
+
+    from ...points import Collector, Point
+
+    mods = dict(lm.named_modules())
+    hosts = [(name, mod) for name, mod in mods.items()
+             if hasattr(mod, "conv1d") and hasattr(mod, "A_log")
+             and hasattr(mod, "in_proj_qkv")]
+    points, request = [], {}
+    for name, _mod in hosts:
+        for attr in ("in_proj_qkv", "out_proj"):
+            path = f"{name}.{attr}" if name else attr
+            p = Point("x", path, "input")
+            points.append(p)
+            request[f"{p.path}|{p.name}"] = SimpleNamespace(
+                stat="amax", granularity="channel")
+    collector = Collector(points=points)
+    collector.request = request
+    handles = collector.hooks(lambda path: mods[path])
+    try:
+        for _ in range(max(1, samples)):
+            run_once()
+            collector.end_sample()
+    finally:
+        for h in handles:
+            h.remove()
+    collector.reduce(percentile, verbose=verbose,
+                     label="gdn_channel_amax")
+    calibrated = 0
+    for name, mod in hosts:
+        pin = f"{name}.in_proj_qkv" if name else "in_proj_qkv"
+        pout = f"{name}.out_proj" if name else "out_proj"
+        a_in = collector.channel_amax(pin, "x")
+        a_out = collector.channel_amax(pout, "x")
+        if a_in is None or a_out is None:
+            continue
+        mod._frt_gdn_channel_amax = {
+            "in": torch.as_tensor(a_in, dtype=torch.float32),
+            "out": torch.as_tensor(a_out, dtype=torch.float32)}
+        calibrated += 1
+    return calibrated

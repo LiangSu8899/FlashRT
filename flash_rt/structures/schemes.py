@@ -481,8 +481,32 @@ register("fp8_static", Fp8Static())
 register("fp8_static_keep_outliers", Fp8Static(keep_outliers=20.0))
 register("w8a16_decode", W8A16Decode())
 register("w4a16_decode", W4A16Decode())
+class W4A4BalanceDecode(W4A4Decode):
+    """The W4A4 decode band with the balanced fold on the gated-delta
+    projections.
+
+    Same band, same seams — the difference is the projection format:
+    ``nvfp4_balance`` folds a per-input-channel balance (fitted on
+    calibrated activation amax) into the packed weight, moving
+    quantization error out of the hot channels. Calibration is the
+    caller's precondition: run
+    ``gated_delta_core.fused_layer.calibrate_gdn_channel_amax`` over a
+    real forward first — an uncalibrated layer keeps the BF16 band and
+    is counted, never raised.
+    """
+
+    def __init__(self, release_host_weights: bool = False) -> None:
+        super().__init__(release_host_weights)
+        self.gdn_projection_format = "nvfp4_balance"
+        self.name = ("w4a4_balance_decode_release"
+                     if release_host_weights else "w4a4_balance_decode")
+
+
 register("w4a4_decode", W4A4Decode())
 register("w4a4_decode_release", W4A4Decode(release_host_weights=True))
+register("w4a4_balance_decode", W4A4BalanceDecode())
+register("w4a4_balance_decode_release",
+         W4A4BalanceDecode(release_host_weights=True))
 register("none", NoQuant())
 register("bf16_structural", Bf16Structural())
 register("nvfp4_awq", Nvfp4Awq())
