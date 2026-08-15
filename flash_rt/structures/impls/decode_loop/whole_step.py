@@ -456,6 +456,21 @@ class WholeStepDecodeLoop:
         self._verify_capture = bool(verify_capture)
         return self._mtp
 
+    @torch.no_grad()
+    def enable_dspark(self, draft_dir):
+        """Attach a block-draft (DFlash/DSpark) speculative runner.
+
+        The draft checkpoint's own config supplies the tap layers,
+        block size, and mask token; the runner rides this loop's graph
+        families (captured propose/verify, rollback by stash selection
+        where the build carries the stash kernel). Returns the runner;
+        its ``generate`` replaces ``loop.generate`` for speculative
+        decoding and anchors exactness on this loop's own verify.
+        """
+        from .dspark_block import DSparkRunner
+
+        return DSparkRunner(self, draft_dir)
+
     def _fwd_full(self, tok_ids, pos_t):
         h = self._embed(tok_ids)
         pe = self._rotary(h, pos_t.view(1, -1))

@@ -277,7 +277,10 @@ class FusedGatedDeltaDecodeLayer(GuardedSeam, torch.nn.Module):
         branch is straight-line. Returns False (and arms nothing) when
         the native build does not carry the stash kernel.
         """
-        if _native_stash_op() is None:
+        hub = getattr(self._gda, "gdn_chunk_from_conv_smem_stash_bf16",
+                      None)
+        self._stash_hub = hub
+        if hub is None and _native_stash_op() is None:
             return False
         if not self._chunk_ok or self._chunk_name not in (
                 "gdn_chunk_from_conv_smem_bf16",
@@ -377,10 +380,19 @@ class FusedGatedDeltaDecodeLayer(GuardedSeam, torch.nn.Module):
             core_out = torch.empty(S, self._hv, self._d,
                                    device=mixed.device,
                                    dtype=torch.bfloat16)
-            _native_stash_op()(
-                conv_out.view(S, -1), a_all, b_all, self._neg_exp_a,
-                self._dt_bias, state, core_out.view(S, -1),
-                self._stash_rec, self._hv, self._hk, self._d)
+            hub = getattr(self, "_stash_hub", None)
+            if hub is not None:
+                hub(conv_out.view(S, -1), a_all, b_all,
+                    self._neg_exp_a, self._dt_bias, state,
+                    self._stash_rec, num_v_heads=self._hv,
+                    num_k_heads=self._hk, head_dim=self._d,
+                    out=core_out)
+            else:
+                _native_stash_op()(
+                    conv_out.view(S, -1), a_all, b_all,
+                    self._neg_exp_a, self._dt_bias, state,
+                    core_out.view(S, -1), self._stash_rec, self._hv,
+                    self._hk, self._d)
             return self._prefill_epilogue(
                 hidden_states, cache_params, allp, mixed, core_out,
                 state, cont, old_slot, S)
@@ -430,7 +442,12 @@ class FusedGatedDeltaDecodeLayer(GuardedSeam, torch.nn.Module):
         q16, k16, v48 = gda.lin_split_qkv_gqa_bf16(co)
         q16_l2, k16_l2, q_pack_hv, _k_pack_hk, g_cumsum = \
             gda.gdn_wy_norm_cumsum_pack_qk_bf16(q16, k16, g)
-        big_a = gda.gdn_wy_kkt_b64_bf16(k16_l2, beta, g_cumsum)
+        # the wmma Gram tier replaces the scalar walk where the
+        # installed artifact carries it - same signature, same A
+        # layout, 32.8x on the measured long-prompt term
+        kkt = getattr(gda, "gdn_wy_kkt_b64_mma_bf16", None) \
+            or gda.gdn_wy_kkt_b64_bf16
+        big_a = kkt(k16_l2, beta, g_cumsum)
         # the packaged triangular solve walks its rows serially and is
         # the measured 82% of this chain; the same inverse — semantics
         # pinned numerically: inv(I + strict_tril(A)) — through the

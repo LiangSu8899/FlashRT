@@ -166,7 +166,12 @@ class LinearProjNvfp4Dynamic(GuardedSeam, torch.nn.Module):
         # loads expose — the wide/long-K families take (2,6), the
         # short-K o-class (2,4), tiny-N (4,4); each config's K
         # divisibility is its own gate.
-        mrows = _native_mrows()
+        # hub artifact first (its ops are compile-safe torch ops),
+        # local native build second, tiled GEMM always the floor
+        hub_mrows = getattr(kern, "fp4_w4a4_gemm_warpsplit_mrows_bf16",
+                            None)
+        mrows = hub_mrows if hub_mrows is not None else _native_mrows()
+        self._mrows_hub = hub_mrows is not None
         self._mrows = None
         if mrows is not None and n % 8 == 0:
             if (k >= 8192 or n >= 8192) and k % 128 == 0:
@@ -189,8 +194,12 @@ class LinearProjNvfp4Dynamic(GuardedSeam, torch.nn.Module):
             y = self._gemv(a_packed, self._w_packed, a_sfa, self._w_sfb)
         elif 2 <= m <= 16 and self._mrows is not None:
             w_, s_ = self._mr_cfg
-            y = self._mrows(a_packed, self._w_packed, a_sfa,
-                            self._w_sfb, self._n, self._k, w_, s_)
+            if self._mrows_hub:
+                y = self._mrows(a_packed, self._w_packed, a_sfa,
+                                self._w_sfb, warps=w_, stages=s_)
+            else:
+                y = self._mrows(a_packed, self._w_packed, a_sfa,
+                                self._w_sfb, self._n, self._k, w_, s_)
         else:
             y = self._gemm(a_packed, self._w_packed, a_sfa, self._w_sfb,
                            variant=2)
