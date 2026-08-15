@@ -309,6 +309,8 @@ Wan2.2 TI2V-5B is registered for `(config="wan22_ti2v_5b",
 framework="torch", arch="rtx_sm120")`.
 Chameleon-7B is registered for `(config="chameleon", framework="torch",
 arch in {"rtx_sm87", "thor"})`.
+Hy-Embodied-0.5-VLA is registered for `(config="hyvla",
+framework="torch", arch in {"thor", "rtx_sm87"})`.
 
 ### `_PIPELINE_MAP`
 
