@@ -150,19 +150,19 @@ the final action chunk.
 
 | tier | p50 (ms) | speedup | raw cos | raw min | act cos | act min | gates |
 |---|---|---|---|---|---|---|---|
-| FP8 (reference) | 46.59 | 1.000 | — | — | — | — | — |
-| **NVFP4 (default)** | **31.64** | **1.473** | 0.99904 | 0.99766 | 0.99974 | 0.99944 | PASS |
-| INT4 | 32.39 | 1.441 | 0.99838 | 0.99512 | 0.99961 | 0.99939 | PASS |
-| INT4+RHT | 32.54 | 1.432 | 0.99918 | 0.99742 | 0.99983 | 0.99970 | PASS |
+| FP8 (reference) | 46.62 | 1.000 | — | — | — | — | — |
+| **NVFP4 (default)** | **31.98** | **1.458** | 0.99904 | 0.99766 | 0.99974 | 0.99944 | PASS |
+| INT4 | 32.54 | 1.461 | 0.99838 | 0.99512 | 0.99961 | 0.99939 | PASS |
+| INT4+RHT | 32.60 | 1.452 | 0.99918 | 0.99742 | 0.99983 | 0.99970 | PASS |
 
 **2 views**
 
 | tier | p50 (ms) | speedup | raw cos | raw min | act cos | act min | gates |
 |---|---|---|---|---|---|---|---|
-| FP8 (reference) | 38.45 | 1.000 | — | — | — | — | — |
-| **NVFP4 (default)** | **27.14** | **1.417** | 0.99921 | 0.99803 | 0.99972 | 0.99916 | PASS |
-| INT4 | 27.86 | 1.380 | 0.99879 | 0.99751 | 0.99965 | 0.99928 | PASS |
-| INT4+RHT | 27.97 | 1.380 | 0.99941 | 0.99828 | 0.99977 | 0.99922 | PASS |
+| FP8 (reference) | 38.50 | 1.000 | — | — | — | — | — |
+| **NVFP4 (default)** | **27.25** | **1.413** | 0.99921 | 0.99803 | 0.99972 | 0.99916 | PASS |
+| INT4 | 27.72 | 1.387 | 0.99879 | 0.99751 | 0.99965 | 0.99928 | PASS |
+| INT4+RHT | 27.88 | 1.381 | 0.99941 | 0.99828 | 0.99977 | 0.99922 | PASS |
 
 **1 view** — the accuracy gates do not pass at any fully-quantized tier,
 for reasons that are not implementation defects (§6).
@@ -211,11 +211,11 @@ on the scale. One locked-clock batch at three views:
 
 | tier | p50 (ms) | p95 (ms) | vs FP16 |
 |---|---|---|---|
-| FP16 | 80.202 | 81.028 | 1.000 |
-| FP8 | 46.619 | 49.422 | 1.720 |
-| NVFP4 | **31.977** | 32.054 | **2.508** |
-| INT4 | 32.577 | 32.653 | 2.462 |
-| INT4+RHT | 32.646 | 32.712 | 2.457 |
+| FP16 | 80.230 | 80.605 | 1.000 |
+| FP8 | 47.325 | 49.418 | 1.695 |
+| NVFP4 | **31.842** | 31.893 | **2.520** |
+| INT4 | 32.646 | 32.718 | 2.458 |
+| INT4+RHT | 32.545 | 32.596 | 2.465 |
 
 **At one view even FP8 loses its worst sample**, to 0.99421 — below the
 0.995 gate that the quantized tiers also miss. FP8 differs from FP16 by
@@ -294,7 +294,7 @@ Constructor keyword / bench flag pairs. Defaults are the production tier.
 | `decoder_act_format` / `--decoder-act-format` | `nvfp4` | `e0m3` requires `e0m3` weights |
 | `decoder_rht` / `--decoder-rht` | `False` | per-16 Hadamard rotation; requires `e0m3` activations |
 | `decoder_fused_geglu` / `--decoder-fused-geglu` | `True` | fuse the decoder GeGLU into the gate_up GEMM epilogue (NVFP4 weights only) |
-| `encoder_p1_combiner` / `--encoder-p1-combiner` | `epilogue_hw` | `epilogue_hw` (fused, compact store), `epilogue` (fused, full width — parity with the old path), `lut_native` (separate GEMMs + combiner kernel) |
+| `encoder_p1_combiner` / `--encoder-p1-combiner` | `epilogue_hw_nod` | `epilogue_hw_nod` (fused, compact store, collective D store elided), `epilogue_hw` (fused, compact store), `epilogue` (fused, full width — parity with the old path), `lut_native` (separate GEMMs + combiner kernel) |
 | `use_fp4_encoder_attn_qkv` / `--encoder-attn-qkv-fp4` | `False` | implemented and passing, but that GEMM is not weight-bandwidth-bound, so FP4 only matches FP8 while costing an extra quantize step |
 | `decoder_fused_attn` / `--decoder-fused-attn` | `False` | folds the seqused mask into softmax (bit-identical, one fewer launch). Only the fixed-shape state-prompt path takes the seqused kernels, which this suite does not exercise |
 | `awq_alpha` / `--awq-alpha` | `0.8` | AWQ per-channel scale exponent |
@@ -331,9 +331,13 @@ Headroom is thin and mostly hard floors:
    need a bespoke persistent mainloop to recover.
 2. Decoder AdaRMS (350 × 2.92 µs) and RoPE (180 × 1.58 µs) are at the
    kernel-launch floor.
-3. SigLIP / encoder attention projections in FP4 (est. −0.3 to −0.5 ms)
-   and AWQ for the SigLIP up-projection are the remaining candidates, both
-   gated on accuracy.
+3. The SigLIP attention projections were characterized with L2-sector
+   counters and ruled out: at M=768 they are L2-bandwidth/compute bound
+   (32.4 MB of L2 reads per qkv call at ~1.16 TB/s, with the measured
+   time bracketed between the weight-only and all-DRAM rooflines), so
+   FP4 conversion has no bandwidth dividend and the extra quantize step
+   makes it a net loss. AWQ for the SigLIP up-projection remains the one
+   accuracy-gated candidate.
 
 ### Approaches measured and rejected
 
@@ -346,8 +350,20 @@ Headroom is thin and mostly hard floors:
   KV-split path). Fuse the glue *between* GEMMs, not the GEMMs.
 - **Full-width fused GeGLU epilogue.** The combiner kernel it removes is
   exactly cancelled by the doubled weight streaming of the K-expanded
-  down projection. The half-width compact store is the form that wins,
-  and is the default.
+  down projection. The half-width compact store is the form that wins;
+  with its unread D store elided outright (`epilogue_hw_nod`, a fork of
+  the SM100 epilogue collective with the same `is_destination_supported`
+  guards the SM90 and SM100 ptr-array collectives already carry) it is
+  the default: a five-leg alternating sandwich measures −0.57 ms
+  (32.513/32.550/32.547 vs 31.956/31.967, drift ≤ 0.037 ms). Two
+  measurement caveats worth keeping: the isolated kernel benchmark scored
+  the elision as a regression (one more entry for the tile-selection
+  warning above), and under `nsys --cuda-graph-trace=node` the two
+  variants converge entirely — the win only exists unprofiled, so
+  per-kernel traces cannot attribute it.
+- **No-D-store decoder GeGLU.** The same elision applied to the decoder
+  tile is a wash (the dummy store there is 0.04 MB), so it ships opt-in
+  (`--decoder-fused-geglu-nod`) and stays off by default.
 
 ---
 
