@@ -55,6 +55,56 @@ def _kernel():
     return hub_kernel(KERNEL_DEP["repo"], KERNEL_DEP["version"])
 
 
+@lru_cache(maxsize=1)
+def _native_mrows():
+    """The locally built native extension's small-M warp-split GEMM.
+
+    The 16x8x64 block-scaled MMA atom computes a full 16-row tile, so
+    M<=16 rows cost the same weight stream as one — the spec-verify
+    rows (draft block + 1, and the shorter re-advance prefixes) are
+    the customers. Absence is not a refusal: the tiled GEMM serves
+    every shape correctly, this tier just reads the weights once for
+    all rows where the build carries it.
+
+    The pointer-style native entry registers as a torch custom op
+    (with a fake shim) so the compiled multi-row passes trace through
+    it instead of tripping over the raw stream handle.
+    """
+    try:
+        from flash_rt import flash_rt_kernels as _fk
+    except ImportError:
+        return None
+    fn = getattr(_fk, "fp4_w4a4_mma_sm120_warpsplit_mrows_bf16out",
+                 None)
+    if fn is None:
+        return None
+
+    from torch.library import custom_op
+
+    @custom_op("flashrt_native::warpsplit_mrows", mutates_args=())
+    def _op(a_packed: torch.Tensor, w_packed: torch.Tensor,
+            a_sfa: torch.Tensor, w_sfb: torch.Tensor, n: int, k: int,
+            warps: int, stages: int) -> torch.Tensor:
+        m = a_packed.shape[0]
+        y = torch.empty(m, n, device=a_packed.device,
+                        dtype=torch.bfloat16)
+        rc = fn(a_packed.data_ptr(), w_packed.data_ptr(), y.data_ptr(),
+                m, n, k, a_sfa.data_ptr(), w_sfb.data_ptr(), 1.0,
+                warps, stages,
+                torch.cuda.current_stream().cuda_stream)
+        if rc != 0:
+            raise RuntimeError(
+                f"warpsplit_mrows refused rc={rc} for M={m} N={n} K={k}")
+        return y
+
+    @_op.register_fake
+    def _(a_packed, w_packed, a_sfa, w_sfb, n, k, warps, stages):
+        return a_packed.new_empty((a_packed.shape[0], n),
+                                  dtype=torch.bfloat16)
+
+    return _op
+
+
 def _check(weights: Mapping[str, torch.Tensor]) -> tuple[int, int]:
     w = weights["w"]
     if w.dim() != 2:
@@ -110,6 +160,21 @@ class LinearProjNvfp4Dynamic(GuardedSeam, torch.nn.Module):
         gemv = getattr(kern, "fp4_w4a4_gemv_warpsplit_bf16", None)
         self._gemv = (gemv if gemv is not None
                       and n % 8 == 0 and k % (64 * 4) == 0 else None)
+        # 2<=M<=16 rows route to the native multi-row warp-split tier
+        # where the local build carries it. Per-shape launch config:
+        # deeper stages hide the strided-B latency the extra A-row
+        # loads expose — the wide/long-K families take (2,6), the
+        # short-K o-class (2,4), tiny-N (4,4); each config's K
+        # divisibility is its own gate.
+        mrows = _native_mrows()
+        self._mrows = None
+        if mrows is not None and n % 8 == 0:
+            if (k >= 8192 or n >= 8192) and k % 128 == 0:
+                self._mrows, self._mr_cfg = mrows, (2, 6)
+            elif n <= 2048 and k % 256 == 0:
+                self._mrows, self._mr_cfg = mrows, (4, 4)
+            elif k % 128 == 0:
+                self._mrows, self._mr_cfg = mrows, (2, 4)
         self._frt_arm(dtypes=CAST_OK, device=w_packed.device, k=int(k))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -119,8 +184,13 @@ class LinearProjNvfp4Dynamic(GuardedSeam, torch.nn.Module):
         shape = x.shape
         flat = x.reshape(-1, shape[-1])
         a_packed, a_sfa = _quantize_activation(self._kern, flat)
-        if flat.shape[0] == 1 and self._gemv is not None:
+        m = flat.shape[0]
+        if m == 1 and self._gemv is not None:
             y = self._gemv(a_packed, self._w_packed, a_sfa, self._w_sfb)
+        elif 2 <= m <= 16 and self._mrows is not None:
+            w_, s_ = self._mr_cfg
+            y = self._mrows(a_packed, self._w_packed, a_sfa,
+                            self._w_sfb, self._n, self._k, w_, s_)
         else:
             y = self._gemm(a_packed, self._w_packed, a_sfa, self._w_sfb,
                            variant=2)
