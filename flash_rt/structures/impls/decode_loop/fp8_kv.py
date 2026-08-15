@@ -58,6 +58,14 @@ class Fp8KvBand:
         kern = _kernel()
         self._kern = kern
         self._max = int(max_len)
+        #: set by a loop built with ``prefill_chunk``: routes its prompt
+        #: slices through the GQA-native deep arm. Off by default so
+        #: every established short-window form keeps its exact path.
+        self._deep_prompt = False
+        #: (start, end) of the prompt slice in flight, host ints, set by
+        #: the eager chunked prompt drivers; None outside a slice
+        self._prompt_span = None
+        self._blockmasks = {}
         pages = (self._max + _PAGE - 1) // _PAGE
         # the kernel's max_seq_len speaks in whole pages
         self._max_paged = pages * _PAGE
@@ -149,6 +157,35 @@ class Fp8KvBand:
             max_seq_len=self._max_paged)
         return out.view(1, s, _QH, _HD)
 
+    def prompt_attend(self, q, k, v, scaling):
+        """One prompt slice's attention: offset-causal flex over the
+        static window. The block mask depends only on (slice length,
+        slice start), so a prompt's handful of masks build once and
+        replay across layers, chunks, and repeat runs. The flex entry
+        itself is compiled once — eager flex is the math fallback and
+        materialises the score matrix, the very allocation this arm
+        exists to avoid; the block mask rides as a tensor input, so
+        chunk starts do not retrace."""
+        from torch.nn.attention.flex_attention import (
+            create_block_mask, flex_attention)
+
+        s0, _e = self._prompt_span
+        S = q.shape[2]
+        bm = self._blockmasks.get((S, s0))
+        if bm is None:
+            def causal_off(b, h, qi, ki):
+                return ki <= qi + s0
+
+            bm = create_block_mask(causal_off, 1, 1, S, self._max,
+                                   device=q.device)
+            self._blockmasks[(S, s0)] = bm
+        fx = getattr(self, "_flex_c", None)
+        if fx is None:
+            fx = torch.compile(flex_attention, dynamic=False)
+            self._flex_c = fx
+        return fx(q, k, v, block_mask=bm, scale=scaling,
+                  enable_gqa=True)
+
 
 def _interface(module, q, k, v, attention_mask, scaling=None, **kwargs):
     band = getattr(module, "_frt_fp8_band", None)
@@ -161,6 +198,18 @@ def _interface(module, q, k, v, attention_mask, scaling=None, **kwargs):
             and q.shape[2] <= _XQA_MAX_Q \
             and k.shape[2] == band._max:
         return band.attend(module.layer_idx, q), None
+    if band is not None and getattr(band, "_deep_prompt", False) \
+            and band._prompt_span is not None and q.shape[0] == 1 \
+            and q.shape[2] > _XQA_MAX_Q and k.shape[2] == band._max:
+        # deep-window prompt slice: flex attention over the offset
+        # causal block mask. The host's sdpa interface repeat_kv-expands
+        # 4 KV heads to 24 across the whole window (gigabytes per layer
+        # at 32K+), and masked SDPA with GQA falls to the math backend,
+        # which materialises the [heads, S, window] score matrix — both
+        # were measured as the deep-prompt OOM. Flex reads the same
+        # rows fused, GQA-native, nothing materialised.
+        o = band.prompt_attend(q, k, v, scaling)
+        return o.transpose(1, 2).contiguous(), None
     if attention_mask is None and q.shape[2] > 1 \
             and k.shape[2] > q.shape[2]:
         # maskless prompt rows over the full static window: causal

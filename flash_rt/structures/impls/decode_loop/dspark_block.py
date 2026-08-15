@@ -492,11 +492,38 @@ class DSparkRunner:
         for i in loop._full:
             loop.cache.key_cache[i][:, :, L:].zero_()
             loop.cache.value_cache[i][:, :, L:].zero_()
-        logits, _ = loop._fwd_full(input_ids,
-                                   torch.arange(L, device=dev))
-        draft.append_ctx(
-            self._taps_rows(self._tap_in, L),
-            torch.arange(L, device=dev))
+        ck = getattr(loop, "_prefill_chunk", None)
+        if ck and L > ck:
+            # deep-window prompt: same sliced pass as the loop's own
+            # generate; the tap hooks fire per slice, so the draft's
+            # context features append slice by slice — the features of
+            # a row do not depend on how the prompt was sliced (they
+            # are that row's layer inputs)
+            for s in range(0, L, ck):
+                e = min(s + ck, L)
+                if loop._kv_band is not None:
+                    # the deep flex arm keys its block mask on the
+                    # slice span; host ints, eager path only
+                    loop._kv_band._prompt_span = (s, e)
+                # _fwd, not _fwd_full: the prompt path's head reads the
+                # last row only — the full-rows head is a whole-vocab
+                # [rows, 248K] slab per slice (the measured ~1GB OOM at
+                # depth) and nothing in a prompt slice consumes it. The
+                # tap hooks ride the layers either way.
+                logits = loop._fwd(
+                    input_ids[:, s:e], torch.arange(s, e, device=dev))
+                draft.append_ctx(
+                    self._taps_rows(self._tap_in, e - s),
+                    torch.arange(s, e, device=dev))
+                loop.cache.frt_continue = True
+            if loop._kv_band is not None:
+                loop._kv_band._prompt_span = None
+        else:
+            logits, _ = loop._fwd_full(input_ids,
+                                       torch.arange(L, device=dev))
+            draft.append_ctx(
+                self._taps_rows(self._tap_in, L),
+                torch.arange(L, device=dev))
         loop.cache.frt_continue = True
         seed = logits[0, -1].float().argmax().view(1)
         self._outbuf[0].copy_(seed[0])
