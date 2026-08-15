@@ -180,6 +180,10 @@ class LinearProjNvfp4Dynamic(GuardedSeam, torch.nn.Module):
                 self._mrows, self._mr_cfg = mrows, (4, 4)
             elif k % 128 == 0:
                 self._mrows, self._mr_cfg = mrows, (2, 4)
+        # M>=512 prefill slabs take the cooperative 256-tile tier
+        # where the artifact carries it - wins every measured prefill
+        # family over the base tile (the wrapper owns its workspace)
+        self._m256 = getattr(kern, "nvfp4_gemm_m256_bf16", None)
         self._frt_arm(dtypes=CAST_OK, device=w_packed.device, k=int(k))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -200,6 +204,9 @@ class LinearProjNvfp4Dynamic(GuardedSeam, torch.nn.Module):
             else:
                 y = self._mrows(a_packed, self._w_packed, a_sfa,
                                 self._w_sfb, self._n, self._k, w_, s_)
+        elif m >= 512 and self._m256 is not None:
+            y = self._m256(a_packed, self._w_packed, a_sfa,
+                           self._w_sfb)
         else:
             y = self._gemm(a_packed, self._w_packed, a_sfa, self._w_sfb,
                            variant=2)
