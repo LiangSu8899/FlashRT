@@ -1347,6 +1347,11 @@ else()
   message(STATUS "SM120 NVFP4 W4A16 fp4_w4a4 kernels: SKIPPED (slim build)")
 endif()
 
+# Gated-delta chunk core, per-row state stash arm (spec-verify rollback
+# by selection). Plain CUDA, no CUTLASS dependency, arch-agnostic.
+target_sources(flash_rt_kernels PRIVATE
+  csrc/kernels/gdn_chunk_from_conv_smem_stash.cu)
+
 # Group B — NVFP4 swizzle/quantize helpers. Their bindings are unguarded today
 # (exposed on SM89 but runtime-unreachable: every Python loader self-gates on
 # has_nvfp4()). Gating the sources requires guarding their bindings + includes

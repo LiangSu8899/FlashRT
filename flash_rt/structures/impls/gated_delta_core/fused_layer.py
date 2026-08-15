@@ -44,6 +44,53 @@ FUSED_DEP = {"provider": "hf", "repo": "flashrt/transformer-fused-ops",
 
 
 @lru_cache(maxsize=1)
+def _native_stash_op():
+    """The native per-row-stash arm of the from-conv chunk core.
+
+    Registered lazily as a mutating torch custom op so the compiled
+    and captured spec-verify passes trace through it. Absence of the
+    native build is not a refusal — the plain hub chunk kernel keeps
+    serving, and rejected rounds re-drive the state sublayers instead
+    of selecting a stash row.
+    """
+    global _STASH_OP
+    if _STASH_OP is not None:
+        return _STASH_OP if _STASH_OP is not False else None
+    try:
+        from flash_rt import flash_rt_kernels as _fk
+        fn = getattr(_fk, "gdn_chunk_from_conv_smem_h_stash_bf16", None)
+    except ImportError:
+        fn = None
+    if fn is None:
+        _STASH_OP = False
+        return None
+
+    @torch.library.custom_op(
+        "flashrt_native::gdn_chunk_stash",
+        mutates_args=("state", "out", "stash"))
+    def _op(conv_out: torch.Tensor, a: torch.Tensor, b: torch.Tensor,
+            neg_exp_a: torch.Tensor, dt_bias: torch.Tensor,
+            state: torch.Tensor, out: torch.Tensor,
+            stash: torch.Tensor, num_v_heads: int, num_k_heads: int,
+            head_dim: int) -> None:
+        fn(conv_out.data_ptr(), a.data_ptr(), b.data_ptr(),
+           neg_exp_a.data_ptr(), dt_bias.data_ptr(), state.data_ptr(),
+           out.data_ptr(), stash.data_ptr(), conv_out.shape[0],
+           num_v_heads, num_k_heads, head_dim, a.stride(0), b.stride(0),
+           True, torch.cuda.current_stream().cuda_stream)
+
+    @_op.register_fake
+    def _(conv_out, a, b, neg_exp_a, dt_bias, state, out, stash,
+          num_v_heads, num_k_heads, head_dim):
+        return None
+
+    _STASH_OP = _op
+    return _op
+
+
+_STASH_OP = None
+
+
 def _packages():
     from flash_rt.structures.impls import hub_kernel
 
@@ -221,6 +268,35 @@ class FusedGatedDeltaDecodeLayer(GuardedSeam, torch.nn.Module):
             guard.notes["host_form_calls"] += 1
         return self.host_layer(*args, **kwargs)
 
+    @torch.no_grad()
+    def frt_enable_stash(self, rows, cache_params):
+        """Arm the per-row state stash for spec-verify passes.
+
+        Called eagerly by the speculative runner before any compiled
+        pass traces: the buffers exist up front, so the compiled chunk
+        branch is straight-line. Returns False (and arms nothing) when
+        the native build does not carry the stash kernel.
+        """
+        if _native_stash_op() is None:
+            return False
+        if not self._chunk_ok or self._chunk_name not in (
+                "gdn_chunk_from_conv_smem_bf16",
+                "gdn_chunk_from_conv_smem_h_bf16"):
+            return False
+        dev = self._conv_w.device
+        self._stash_rec = torch.empty(
+            rows, self._hv, self._d, self._d, device=dev,
+            dtype=torch.bfloat16)
+        self._stash_mixed = torch.empty(
+            rows, self._conv_w.shape[0], device=dev,
+            dtype=torch.bfloat16)
+        reg = getattr(cache_params, "frt_stash_layers", None)
+        if reg is None:
+            reg = {}
+            cache_params.frt_stash_layers = reg
+        reg[self._idx] = self
+        return True
+
     def _prefill_chain(self, hidden_states, cache_params):
         """Whole-prompt form: conv chunk + fused gating/split/recurrent.
 
@@ -286,6 +362,25 @@ class FusedGatedDeltaDecodeLayer(GuardedSeam, torch.nn.Module):
             else:
                 core_out = self._wy_core(mixed, a_all, b_all,
                                          conv_state, state, S)
+            return self._prefill_epilogue(
+                hidden_states, cache_params, allp, mixed, core_out,
+                state, cont, old_slot, S)
+        stash_rec = getattr(self, "_stash_rec", None)
+        if stash_rec is not None and S <= stash_rec.shape[0]:
+            # spec-verify arm: same conv update, same chunk recurrence,
+            # plus the per-row state stash a rejected round selects
+            # from instead of re-driving this layer
+            self._stash_mixed[:S].copy_(mixed)
+            conv_out = self._conv.causal_conv1d_update_chunk_parallel_bf16(
+                mixed.view(1, S, -1), self._conv_w, conv_state,
+                self._conv_b, apply_silu=True)
+            core_out = torch.empty(S, self._hv, self._d,
+                                   device=mixed.device,
+                                   dtype=torch.bfloat16)
+            _native_stash_op()(
+                conv_out.view(S, -1), a_all, b_all, self._neg_exp_a,
+                self._dt_bias, state, core_out.view(S, -1),
+                self._stash_rec, self._hv, self._hk, self._d)
             return self._prefill_epilogue(
                 hidden_states, cache_params, allp, mixed, core_out,
                 state, cont, old_slot, S)

@@ -186,6 +186,7 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #include "kernels/fp4_w4a4_mma_sm120.cuh"
 #include "kernels/fp4_w4a4_mma_warpsplit_sm120.cuh"
 #include "kernels/fp4_w4a4_mma_warpsplit_mrows_sm120.cuh"
+#include "kernels/gdn_chunk_from_conv_smem_stash.cuh"
 #include "quantize/fp8_block128_dequant.cuh"
 #ifdef FLASHRT_HAVE_NVFP4_SWIZZLE
 #include "quantize/fp8_block128_to_nvfp4_swizzled.cuh"
@@ -6633,6 +6634,34 @@ graph-replay safe) to fill the SMs on long K. M in 1..16; N%8==0; K%64==0;
 )pbdoc");
 
 #endif
+
+    m.def("gdn_chunk_from_conv_smem_h_stash_bf16",
+        [](uintptr_t conv_out, uintptr_t a, uintptr_t b_, uintptr_t neg_exp_a,
+           uintptr_t dt_bias, uintptr_t state, uintptr_t out, uintptr_t stash,
+           int S, int num_v_heads, int num_k_heads, int head_dim,
+           int a_stride, int b_stride, bool use_qk_l2norm,
+           uintptr_t stream) {
+            flash_rt::gdn::gdn_chunk_from_conv_smem_h_stash_bf16(
+                to_ptr(conv_out), to_ptr(a), to_ptr(b_),
+                reinterpret_cast<const float*>(neg_exp_a),
+                reinterpret_cast<const float*>(dt_bias),
+                to_ptr(state), to_ptr(out), to_ptr(stash), S,
+                num_v_heads, num_k_heads, head_dim, a_stride, b_stride,
+                use_qk_l2norm, to_stream(stream));
+        },
+        py::arg("conv_out"), py::arg("a"), py::arg("b"),
+        py::arg("neg_exp_a"), py::arg("dt_bias"), py::arg("state"),
+        py::arg("out"), py::arg("stash"), py::arg("S"),
+        py::arg("num_v_heads"), py::arg("num_k_heads"),
+        py::arg("head_dim"), py::arg("a_stride"), py::arg("b_stride"),
+        py::arg("use_qk_l2norm") = true, py::arg("stream") = 0,
+        R"pbdoc(
+Gated-delta from-conv chunk core with a per-row state stash (spec verify).
+Identical recurrence and per-row bf16 state requantisation to the plain
+chunk kernel; stash row s additionally records the carried state after row
+s, bit-equal to the final state of a re-advance over rows 0..s. A rejected
+speculative round rolls back by selecting a stash row. head_dim must be 128.
+)pbdoc");
 
 // ─────────────────────────────────────────────────────────────────────
 // SM100 NVFP4 W4A16 GEMM bindings (Thor SM110).

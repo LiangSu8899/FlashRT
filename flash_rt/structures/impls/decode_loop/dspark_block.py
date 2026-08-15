@@ -448,11 +448,29 @@ class DSparkRunner:
         for m in range(1, g + 1):
             gr = torch.cuda.CUDAGraph()
             with torch.cuda.graph(gr):
-                for i, (cb, rb) in self._snap.items():
-                    loop.cache.conv_states[i].copy_(cb)
-                    loop.cache.recurrent_states[i].copy_(rb)
-                for i, mod in self._gdn_mods.items():
-                    mod(gdn_v[i][:, :m], loop.cache, None)
+                if getattr(self, "_stash_ok", False):
+                    # rollback by selection: the verify pass stashed
+                    # the carried state after every row (bit-equal to
+                    # a re-advance ending there), and the conv window
+                    # rebuilds from the snapshot tail plus the stashed
+                    # raw rows — the epilogue's own semantics
+                    for i, mod in self._gdn_mods.items():
+                        rec = loop.cache.recurrent_states[i]
+                        rec.copy_(mod._stash_rec[m - 1].view_as(rec))
+                        cslot = loop.cache.conv_states[i]
+                        kk = cslot.shape[-1]
+                        take = min(kk, m)
+                        if m < kk:
+                            cslot[:, :, :kk - m].copy_(
+                                self._snap[i][0][:, :, m:])
+                        cslot[0, :, kk - take:].copy_(
+                            mod._stash_mixed[m - take:m].t())
+                else:
+                    for i, (cb, rb) in self._snap.items():
+                        loop.cache.conv_states[i].copy_(cb)
+                        loop.cache.recurrent_states[i].copy_(rb)
+                    for i, mod in self._gdn_mods.items():
+                        mod(gdn_v[i][:, :m], loop.cache, None)
             self._ra[m] = gr
 
     @torch.no_grad()
@@ -487,6 +505,15 @@ class DSparkRunner:
         rounds = 0
         accepted_total = 0
         if self._gp is None:
+            # arm the per-row state stash on every gated-delta sublayer
+            # (eagerly, before any compiled pass traces): a rejected
+            # round then rolls back by selecting a stash row instead of
+            # re-driving the sublayers. Falls back to the re-drive form
+            # when the native build lacks the stash kernel.
+            self._stash_ok = bool(self._gdn_mods) and all(
+                getattr(mod, "frt_enable_stash", lambda *_: False)(
+                    g + 1, loop.cache)
+                for mod in self._gdn_mods.values())
             self._vpos.copy_(self._ag1 + start)
             draft._ids[0].copy_(seed[0])
             draft._start.fill_(start)
