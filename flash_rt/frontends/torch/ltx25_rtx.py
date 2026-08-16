@@ -313,16 +313,25 @@ class Ltx25TorchFrontendRtx:
             # transformer (and its capture pools) exist; resolve it against
             # the memory decode will actually see.
             from ltx_pipelines.utils.helpers import tiling_config_for_vae
-            free, _ = torch.cuda.mem_get_info()
+            free, total = torch.cuda.mem_get_info()
             reserved_slack = (torch.cuda.memory_reserved()
                               - torch.cuda.memory_allocated())
             builder = pipe.stage._transformer_builder
-            resident = getattr(builder, "_holder", {}).get("model") is not None
-            # Before the first build the transformer and its capture pools
-            # (~20GB) still have to fit; once resident, most of what the
-            # allocator reports free really is available to decode.
-            headroom = (23 << 30) if not resident else (2 << 30)
-            budget = max(5 << 30, free + reserved_slack - headroom)
+            if getattr(builder, "is_resident", False):
+                # The transformer and its pools are already paid for, so
+                # what the allocator reports free really is decode's.
+                budget = max(5 << 30, free + reserved_slack - (2 << 30))
+            else:
+                # It is not built yet, and its reserve (weights, capture
+                # pools, denoise peak) is measured against the *device*, not
+                # against what happens to be free right now. Free is the
+                # wrong base here because part of that same reserve --- the
+                # VAEs, the upsampler, cached embeddings --- may already be
+                # allocated, and subtracting the reserve from free would
+                # then count it twice. It reads the same on a first run and
+                # collapses the budget on a rebuild after a release, which
+                # is where the difference showed up.
+                budget = max(5 << 30, total - (23 << 30))
             tiling_config = tiling_config_for_vae(
                 self._resolve_paths()["video_vae"],
                 height=height, width=width, num_frames=num_frames,

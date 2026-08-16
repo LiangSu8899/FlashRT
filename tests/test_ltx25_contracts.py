@@ -164,8 +164,11 @@ def test_ffn_swap_routes_by_row_alignment(rows, swapped):
 # residency lease
 # --------------------------------------------------------------------
 
-class _FakeModel:
+class _FakeModel(torch.nn.Module):
+    """Stands in for the built transformer: a module with a dispose."""
+
     def __init__(self):
+        super().__init__()
         self.disposed = 0
 
     def dispose(self):
@@ -312,3 +315,128 @@ def test_release_resident_is_a_no_op_outside_capture_mode():
     stage = types.SimpleNamespace(_transformer_builder=object())
     frontend._pipe = types.SimpleNamespace(stage=stage)
     assert frontend.release_resident() == 0
+
+
+def test_release_detaches_the_swapped_forwards():
+    """Release must take back what the swap attached to the shell.
+
+    The upstream builder caches model shells by structure and reuses them
+    across builds, so a released model is not a collected one: the repacked
+    FP4 weights the swap installed stay reachable through the shell unless
+    the instance-level forward is removed by name.
+    """
+    from flash_rt.models.ltx25._nvfp4_ffn_swap import uninstall_nvfp4_ffn
+
+    class _Shell(torch.nn.Module):
+        def forward(self, x):
+            return x
+
+    shell = _Shell()
+    packed = torch.zeros(8)
+    swapped = lambda x: x                       # noqa: E731 - stands in
+    swapped._flash_rt_keep = (packed,)
+    shell.forward = swapped
+
+    assert uninstall_nvfp4_ffn(shell) == 1
+    assert "forward" not in shell.__dict__, "the class forward must be back"
+    assert uninstall_nvfp4_ffn(shell) == 0, "uninstall is idempotent"
+
+
+def test_release_drops_the_captured_block_loop(monkeypatch):
+    """The capture runner holds a private graph pool; release must drop it.
+
+    Freeing the loaded weights does not: upstream's dispose leaves the shell
+    intact by design, and the runner hangs off the shell as an instance
+    attribute over the class's own method.
+    """
+    from flash_rt.models.ltx25 import _resident_graph
+
+    monkeypatch.setattr(_resident_graph, "_patch_x0_dispose", lambda: None)
+
+    class _Runner:
+        """Stands in for the capture runner and its graphs."""
+
+    class _Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.disposed = 0
+
+        def _process_transformer_blocks(self, *a):
+            return a
+
+        def dispose(self):
+            self.disposed += 1
+
+    model = _Model()
+    runner = _Runner()
+    model._process_transformer_blocks = runner
+
+    class _Builder:
+        def build(self, **kwargs):
+            return model
+
+    builder = _resident_graph.ResidentSwapBuilder(_Builder(), [])
+    builder.build()
+    builder.release()
+
+    assert "_process_transformer_blocks" not in model.__dict__
+    assert callable(model._process_transformer_blocks), (
+        "the class's own block loop must be reachable again")
+    assert model.disposed == 1
+
+
+def test_release_evicts_the_mutated_shell(monkeypatch):
+    """A shell whose parameters were freed must not be handed to a rebuild.
+
+    Upstream caches model shells by structure and reassigns weights onto
+    them, which is only sound while the parameters keep their shapes. The
+    resident FFN swap frees the upstream projections it repacked, so the
+    shell it leaves behind cannot be loaded into -- release evicts it.
+    """
+    from flash_rt.models.ltx25 import _resident_graph
+
+    monkeypatch.setattr(_resident_graph, "_patch_x0_dispose", lambda: None)
+
+    class _Registry:
+        def __init__(self):
+            self.cleared = 0
+
+        def clear(self):
+            self.cleared += 1
+
+    class _Inner:
+        def __init__(self):
+            self.registry = _Registry()
+
+        def build(self, **kwargs):
+            return _FakeModel()
+
+    inner = _Inner()
+    builder = _resident_graph.ResidentSwapBuilder(inner, [])
+    builder.build()
+    builder.release()
+    assert inner.registry.cleared == 1
+    builder.release()
+    assert inner.registry.cleared == 1, "nothing to evict without a lease"
+
+
+def test_shell_eviction_walks_wrapped_builders(monkeypatch):
+    """The stage wraps builders; the registry may be several layers in."""
+    from flash_rt.models.ltx25._resident_graph import _evict_cached_shell
+
+    class _Registry:
+        def __init__(self):
+            self.cleared = 0
+
+        def clear(self):
+            self.cleared += 1
+
+    class _Base:
+        registry = None
+
+    base = _Base()
+    base.registry = _Registry()
+    wrapper = types.SimpleNamespace(_inner=types.SimpleNamespace(_inner=base))
+    assert _evict_cached_shell(wrapper) is True
+    assert base.registry.cleared == 1
+    assert _evict_cached_shell(types.SimpleNamespace(_inner=None)) is False

@@ -32,7 +32,8 @@ import logging
 
 import torch
 
-from flash_rt.models.ltx25._nvfp4_ffn_swap import SwapInstallingBuilder
+from flash_rt.models.ltx25._nvfp4_ffn_swap import (
+    SwapInstallingBuilder, uninstall_nvfp4_ffn)
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,30 @@ def _patch_x0_dispose() -> None:
 
     X0Model.dispose = dispose
     _x0_dispose_patched = True
+
+
+def _evict_cached_shell(builder) -> bool:
+    """Drop the builder's cached model shells. Returns whether one was found.
+
+    The shell cache is upstream's, and reusing a shell is normally right:
+    ``dispose`` frees the weights and the next build reassigns fresh ones
+    onto the same structure. That contract holds only while the shell's
+    parameters keep their shapes, and the resident FFN swap deliberately
+    breaks it -- it releases the upstream projections it has repacked, which
+    leaves zero-sized parameters that the next load cannot copy into. So the
+    shell we mutated is not fit for reuse and is evicted here rather than
+    handed to a build that would fail on it.
+    """
+    seen = set()
+    while builder is not None and id(builder) not in seen:
+        seen.add(id(builder))
+        registry = getattr(builder, "registry", None)
+        clear = getattr(registry, "clear", None)
+        if callable(clear):
+            clear()
+            return True
+        builder = getattr(builder, "_inner", None)
+    return False
 
 
 class ResidentSwapBuilder(SwapInstallingBuilder):
@@ -108,27 +133,36 @@ class ResidentSwapBuilder(SwapInstallingBuilder):
     def release(self) -> int:
         """End the residency lease. Idempotent; returns bytes freed.
 
-        Undoes exactly what ``build`` established, in the reverse order:
-        the resident mark first (so ``X0Model.dispose`` stops skipping this
-        model), then the instance-level ``dispose`` override (so the class's
-        own dispose runs), then the disposal itself. The captured graphs need
-        no separate teardown: the runner is reachable only through the
-        patched block loop on this model, so dropping the model drops the
-        graphs and their pool with it.
+        Undoes what ``build`` established, and dropping the reference is not
+        enough to do it: the upstream builder caches model *shells* by
+        structure and reuses them across builds, so the shell outlives every
+        reference this class holds. Anything attached to the shell therefore
+        has to be detached by name -- the swap's repacked FP4 weights, and
+        the capture runner whose per-shape graphs hold a private memory pool
+        (measured at ~3GB, which is the difference between a second prompt
+        rendering and the host running out of memory). ``dispose`` frees the
+        loaded weights and, by upstream's own contract, leaves the shell.
 
-        A later ``build`` sees an empty holder and builds a fresh resident
-        model, which is what makes a second prompt possible at all.
+        Order: detach what we attached, then let the disposal run, then
+        collect -- the graphs must be unreferenced before the allocator is
+        asked to give their pool back.
         """
         model = self._holder.pop("model", None)
         if model is None:
             return 0
         before = torch.cuda.memory_allocated()
+        uninstall_nvfp4_ffn(model)
+        # The captured block loop is an instance attribute over the class's
+        # own method; removing it drops the runner, its captures, and their
+        # pool. Absent outside capture mode, where this is a no-op.
+        model.__dict__.pop("_process_transformer_blocks", None)
         model._flash_rt_resident = False
         model.__dict__.pop("dispose", None)
         dispose = getattr(model, "dispose", None)
         if callable(dispose):
             dispose()
         del model
+        _evict_cached_shell(self._inner)
         gc.collect()
         torch.cuda.empty_cache()
         freed = before - torch.cuda.memory_allocated()

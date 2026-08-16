@@ -240,6 +240,27 @@ def install_nvfp4_ffn(model: torch.nn.Module, *,
     return count
 
 
+def uninstall_nvfp4_ffn(model: torch.nn.Module) -> int:
+    """Undo :func:`install_nvfp4_ffn`. Returns the number of modules restored.
+
+    Deleting the instance attribute restores the class's own ``forward`` and
+    drops the closure holding the repacked FP4 weights and the shared buffer
+    pool -- which is the only way that memory comes back, because the builder
+    caches model shells by structure and reuses them across builds. Freeing
+    the loaded weights (``dispose``) does not touch anything a swap attached
+    to the shell; this does.
+    """
+    count = 0
+    for module in model.modules():
+        forward = module.__dict__.get("forward")
+        if forward is not None and hasattr(forward, "_flash_rt_keep"):
+            del module.forward
+            count += 1
+    if count:
+        logger.info("[ltx25] restored %d upstream FeedForward modules", count)
+    return count
+
+
 class SwapInstallingBuilder:
     """Model-builder wrapper that installs FlashRT swaps after each build.
 
