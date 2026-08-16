@@ -129,6 +129,15 @@ class AutoPlan:
     #: anything. A seam that cannot be turned off cannot be measured.
     toggles: list[tuple[Callable[[], None], Callable[[], None]]] = field(
         default_factory=list)
+    #: callables that drop an adapter's own hold on the forms it bound.
+    #: Reverting a routed seam puts the host processor back but does not
+    #: free anything: the bound form stays reachable through ``observed``
+    #: and through the very closures that reverted it. That is right while
+    #: the form might still be activated and wrong once it cannot be, and
+    #: the difference is a form's whole working set — at long sequence
+    #: lengths, hundreds of megabytes per site, held for something that
+    #: will never run.
+    releases: list[Callable[[], None]] = field(default_factory=list)
     #: ``flash_rt.core.precision_spec.ModelPrecisionSpec`` for the scales
     #: this plan baked in — the repo's introspection format, not a private
     #: one, so ``plan.precision_spec`` reads like ``rt.precision_spec``
@@ -141,6 +150,22 @@ class AutoPlan:
     def disable_routed(self) -> None:
         for _, off in self.toggles:
             off()
+
+    def release_routed(self) -> None:
+        """Give back routed forms that will not be activated. Idempotent.
+
+        Called when the gate has settled and no routed unit won: the host
+        processors are already back, and what remains is memory held for a
+        form the gate declined. The revert callables stay in place and stay
+        correct — an adapter's release empties its own route list, so those
+        closures survive with nothing left to undo.
+        """
+        self.disable_routed()
+        for release in self.releases:
+            release()
+        self.releases.clear()
+        self.toggles.clear()
+        self.observed.clear()
 
     def abort(self) -> None:
         """Roll back everything this plan touched without an attach.
@@ -1326,6 +1351,7 @@ def auto_swaps(
                         "attention_core_variants", {}).update(
                             extras["attention_variants"])
                 plan.revert.extend(extras.get("revert", ()))
+                plan.releases.extend(extras.get("release", ()))
                 if extras.get("toggle") is not None:
                     plan.toggles.append(extras["toggle"])
                 if update is not None:

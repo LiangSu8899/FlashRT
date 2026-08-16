@@ -527,3 +527,71 @@ def test_the_front_door_takes_attention_forms():
     params = inspect.signature(structures.attach).parameters
     assert any(p.kind is inspect.Parameter.VAR_KEYWORD
                for p in params.values())
+
+
+# --------------------------------------------------------------------
+# a declined form must not keep its working set
+# --------------------------------------------------------------------
+
+def test_release_routed_drops_the_forms_and_keeps_revert_callable():
+    """Reverting a routed seam is not releasing it.
+
+    The host processor goes back either way; what differs is whether the
+    bound form is still reachable. It has to be while the gate might yet
+    activate it, and must not be once the gate has declined -- otherwise an
+    attachment costs more memory than the host it replaced, for a form that
+    never runs.
+    """
+    from flash_rt.structures.autobuild import AutoPlan
+
+    routes = [("module", "original", "routed")]
+    reverted = []
+
+    plan = AutoPlan()
+    plan.observed["site.processor"] = object()
+    plan.toggles.append((lambda: None, lambda: reverted.append("off")))
+    plan.revert.append(lambda: reverted.append("revert"))
+    plan.releases.append(routes.clear)
+
+    plan.release_routed()
+    assert routes == [], "the adapter's own hold must be dropped"
+    assert plan.observed == {} and plan.toggles == []
+    assert reverted == ["off"], "release disables, it does not revert"
+
+    plan.release_routed()          # idempotent
+    assert plan.releases == []
+    for undo in plan.revert:       # still callable, nothing left to undo
+        undo()
+    assert reverted == ["off", "revert"]
+
+
+def test_adapter_publishes_a_release(monkeypatch):
+    """The adapter has to offer the hold it wants dropped."""
+    from flash_rt.structures.adapters import (
+        DiffusersGatedRotaryAttentionAdapter)
+    import flash_rt.structures.adapters.diffusers_gated_rotary_attention \
+        as adapter_module
+
+    class _Core(torch.nn.Module):
+        def forward(self, q, k, v, **kw):
+            return q
+
+    monkeypatch.setattr(adapter_module, "bind_dense_attention_best",
+                        lambda captures, **kw: _Core())
+    module = _attention_module(heads=2)
+    module.processor = _GatedRotaryProcessor()
+    model = torch.nn.Module()
+    model.attn = module
+
+    def forward():
+        module.processor(module, torch.zeros(1, 2, 4))
+
+    _, _, extras = DiffusersGatedRotaryAttentionAdapter()(model, forward)
+    assert extras.get("release"), "no way to give the bound forms back"
+    assert extras.get("observed")
+    for release in extras["release"]:
+        release()
+    # the toggles still work after a release: they close over the list,
+    # not over what was in it
+    enable, disable = extras["toggle"]
+    enable(); disable()

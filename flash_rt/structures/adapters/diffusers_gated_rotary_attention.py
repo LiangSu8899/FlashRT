@@ -227,9 +227,16 @@ class DiffusersGatedRotaryAttentionAdapter:
             for module, original, _ in routes:
                 module.processor = original
 
+        def release() -> None:
+            # Reverting put the host processors back; this gives back the
+            # memory. The closures above keep working afterwards because
+            # they close over this list rather than over its contents.
+            routes.clear()
+
         enable()
         return {}, None, {
             "revert": [disable],
+            "release": [release],
             "observed": observed,
             "toggle": (enable, disable),
             "refused": refused,

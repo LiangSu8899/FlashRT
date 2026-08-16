@@ -485,6 +485,14 @@ def attach(
     if not winners and not routed_winner:
         plan.revert_all()
         say("outcome: whole-host refusal — model left untouched")
+    elif not routed_winner:
+        # Some units won and the routed ones did not. Reverting them put
+        # the host processors back, but the forms themselves were still
+        # reachable — through the plan, for as long as the caller holds it
+        # to detach with. A declined form's working set is not small, so
+        # holding it made an attachment cost more memory than the host it
+        # replaced at exactly the shapes where that matters most.
+        plan.release_routed()
 
     activated = dict(winners)
     if routed_winner:
