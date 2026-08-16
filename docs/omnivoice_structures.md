@@ -28,6 +28,19 @@ codec is included). Per-seam-only adoption (fp4 FFN, fp4 FFN+projections)
 measured ~1.0x: the win lives in the whole-LLM boundary and the schedule,
 not the individual kernels.
 
+### Rejected: CFG steps on the FP4 engine (measured, 32 steps fixed)
+
+The CFG phase (B=2, ~5% of steps at cfg_ratio=0.05) rides the BF16
+engine by design — no quantization drift on the guidance subtraction.
+Moving it onto the FP4 engine via two B=1 graph replays is 2.1x faster
+per step (10.95 ms vs 2x 2.60 ms) but **breaks generation**: same-seed
+tokens match only 0.8% and the output collapses to 0.68 s of audio vs
+3.14 s on the same schedule. The FP4 engine's hidden states differ from
+BF16's by ~2x relative (W4A4 quantization is a different distribution,
+not a perturbation), which the cond-uncond difference amplifies. Rejected
+per AGENTS.md: the 6.3% win is not worth a broken CFG path. A real fix
+needs a B=2 FP4 engine (kernel-side, FlashRT-HF-kernels delivery).
+
 ### The codec (the remaining 12%)
 
 The neural codec decode is compute-bound on fp32 cuDNN convolutions; the
