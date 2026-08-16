@@ -50,6 +50,20 @@ _QKV_ROPE_ADAPTERS: list = []
 _GATED_DELTA_ADAPTERS: list = []
 
 
+class _AttentionOverride:
+    """The caller's own answer to the question a scheme usually answers.
+
+    Adapters read ``attention_forms`` off the scheme; an explicit argument
+    is the same statement made directly, so it arrives the same way rather
+    than through a second parameter every adapter would have to learn.
+    """
+
+    __slots__ = ("attention_forms",)
+
+    def __init__(self, forms):
+        self.attention_forms = tuple(forms)
+
+
 def register_attention_adapter(adapter) -> None:
     """Register a host-family attention adapter (callable)."""
     _ATTENTION_ADAPTERS.append(adapter)
@@ -544,6 +558,7 @@ def auto_swaps(
     percentile: float = 99.9,
     max_samples: int | None = None,
     scheme: str | Any = "auto",
+    attention_forms: Sequence[str] | None = None,
     verbose: bool = False,
     stream_store: Any = None,
 ) -> AutoPlan:
@@ -1269,9 +1284,16 @@ def auto_swaps(
                     # serve its seam is a precision decision and the
                     # scheme is where those are stated
                     if getattr(adapter, "scheme_aware", False):
-                        result = adapter(model, thunks[0],
-                                         prefix_cadence=prefix_cadence,
-                                         scheme=scheme_obj)
+                        # an explicit argument outranks the profile: it is
+                        # the caller answering the same question directly,
+                        # which is how a deployment tunes one seam without
+                        # having to register a scheme for it
+                        result = adapter(
+                            model, thunks[0],
+                            prefix_cadence=prefix_cadence,
+                            scheme=(_AttentionOverride(attention_forms)
+                                    if attention_forms is not None
+                                    else scheme_obj))
                     else:
                         result = adapter(model, thunks[0],
                                          prefix_cadence=prefix_cadence)

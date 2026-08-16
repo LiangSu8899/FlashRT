@@ -382,3 +382,148 @@ def test_a_scheme_without_forms_leaves_the_order_alone(monkeypatch):
     DiffusersGatedRotaryAttentionAdapter()(
         model, forward, scheme=schemes.get("nvfp4_balance"))
     assert seen["prefer"] == ()
+
+
+# --------------------------------------------------------------------
+# the shared staging pool
+# --------------------------------------------------------------------
+
+def test_staging_is_shared_per_shape(monkeypatch):
+    """Seams with the same form and shape must share one scratch set.
+
+    The scratch is the size of Q/K/V at the bound shape, and a transformer
+    reaches this seam once per block: at long sequence lengths, private
+    scratch per seam does not fit on a consumer part at all. It is safe to
+    share because nothing survives a call -- every buffer is written at the
+    top of the forward and read before it returns.
+    """
+    from flash_rt.structures.impls.attention_core import sage2_blackwell as s2
+
+    made = []
+
+    class _Art:
+        def capabilities(self):
+            return {"head_dims": (128,)}
+
+        def allocate_workspace(self, q, k, v, **kw):
+            made.append((tuple(q.shape), kw.get("fp8v")))
+            return object()
+
+    monkeypatch.setattr(s2, "_artifact", lambda: _Art())
+    monkeypatch.setattr(s2, "_STAGING", {})
+
+    a = s2._staging_for((1, 8, 2, 128), (1, 8, 2, 128), torch.bfloat16,
+                        "meta", "pv_fp8", "per_warp")
+    b = s2._staging_for((1, 8, 2, 128), (1, 8, 2, 128), torch.bfloat16,
+                        "meta", "pv_fp8", "per_warp")
+    assert a is b
+    assert len(made) == 1, "the second seam must not allocate again"
+
+
+@pytest.mark.parametrize("differs", [
+    {"q_shape": (2, 8, 2, 128)},
+    {"variant": "pv_fp16"},
+    {"granularity": "per_thread"},
+    {"dtype": torch.float16},
+])
+def test_a_different_form_or_shape_gets_its_own_staging(differs, monkeypatch):
+    """Sharing is keyed, not global: nothing may hand back a buffer of the
+    wrong size, precision, or layout."""
+    from flash_rt.structures.impls.attention_core import sage2_blackwell as s2
+
+    class _Art:
+        def capabilities(self):
+            return {"head_dims": (128,)}
+
+        def allocate_workspace(self, q, k, v, **kw):
+            return object()
+
+    monkeypatch.setattr(s2, "_artifact", lambda: _Art())
+    monkeypatch.setattr(s2, "_STAGING", {})
+
+    base = dict(q_shape=(1, 8, 2, 128), kv_shape=(1, 8, 2, 128),
+                dtype=torch.bfloat16, device="meta", variant="pv_fp8",
+                granularity="per_warp")
+    first = s2._staging_for(**base)
+    second = s2._staging_for(**{**base, **differs,
+                                **({"kv_shape": differs["q_shape"]}
+                                   if "q_shape" in differs else {})})
+    assert first is not second
+
+
+def test_staging_is_not_registered_as_module_state(monkeypatch):
+    """Shared scratch must not appear in a seam's state_dict.
+
+    Registering it would have every bound seam claim the same storage as
+    its own parameter state, which is both wrong and silently divergent
+    once two seams share one pool.
+    """
+    from flash_rt.structures.impls.attention_core import sage2_blackwell as s2
+
+    class _Art:
+        def capabilities(self):
+            return {"head_dims": (128,)}
+
+        def allocate_workspace(self, q, k, v, **kw):
+            return object()
+
+        sage2_prefill_fp8v_bf16_d128 = staticmethod(lambda *a, **k: None)
+        sage2_prefill_f16_bf16_d128 = staticmethod(lambda *a, **k: None)
+
+    monkeypatch.setattr(s2, "_artifact", lambda: _Art())
+    monkeypatch.setattr(s2, "_STAGING", {})
+    core = s2.DenseAttentionSage2((1, 8, 2, 128), (1, 8, 2, 128),
+                                  torch.bfloat16, "meta")
+    assert core.state_dict() == {}
+
+
+def test_an_explicit_argument_outranks_the_profile(monkeypatch):
+    """A caller tuning one seam should not have to register a scheme.
+
+    The override is the same statement the profile makes, so it reaches
+    adapters the same way; what it must not do is silently lose to the
+    profile the caller left at its default.
+    """
+    from flash_rt.structures import autobuild, schemes
+    from flash_rt.structures.adapters import (
+        DiffusersGatedRotaryAttentionAdapter)
+    import flash_rt.structures.adapters.diffusers_gated_rotary_attention \
+        as adapter_module
+
+    override = autobuild._AttentionOverride(["sage3"])
+    assert override.attention_forms == ("sage3",)
+
+    seen = {}
+
+    def fake_bind(captures, *, prefer=()):
+        seen["prefer"] = prefer
+        return None
+
+    monkeypatch.setattr(adapter_module, "bind_dense_attention_best",
+                        fake_bind)
+    module = _attention_module(heads=2)
+    module.processor = _GatedRotaryProcessor()
+    model = torch.nn.Module()
+    model.attn = module
+
+    def forward():
+        module.processor(module, torch.zeros(1, 2, 4))
+
+    DiffusersGatedRotaryAttentionAdapter()(model, forward, scheme=override)
+    assert seen["prefer"] == ("sage3",)
+
+
+def test_the_front_door_takes_attention_forms():
+    """The argument has to exist where a user actually calls in."""
+    import inspect
+
+    from flash_rt import structures
+    from flash_rt.structures import autobuild, frontdoor
+
+    for fn in (frontdoor.attach, autobuild.auto_swaps):
+        assert "attention_forms" in inspect.signature(fn).parameters, fn
+    # the public name is a lazy passthrough; what matters is that it does
+    # not filter the argument out on the way
+    params = inspect.signature(structures.attach).parameters
+    assert any(p.kind is inspect.Parameter.VAR_KEYWORD
+               for p in params.values())

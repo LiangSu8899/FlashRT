@@ -294,6 +294,7 @@ def attach(
     iters: int = 10,
     on_guard_fail: str = "fallback",
     scheme: str | Any = "auto",
+    attention_forms: Sequence[str] | None = None,
     negotiate_fp8: bool = True,
     verbose: bool = True,
 ) -> Plan:
@@ -348,8 +349,8 @@ def attach(
     plan = auto_swaps(model, forward, structures=structures,
                       observations=observations, percentile=percentile,
                       max_samples=max_samples, prefix_cadence=prefix_cadence,
-                      scheme=scheme, negotiate_fp8=negotiate_fp8,
-                      verbose=verbose)
+                      scheme=scheme, attention_forms=attention_forms,
+                      negotiate_fp8=negotiate_fp8, verbose=verbose)
     if not plan.swaps and not plan.toggles:
         plan.revert_all()
         return Plan({}, {}, {"digest": "none", "seams": 0,

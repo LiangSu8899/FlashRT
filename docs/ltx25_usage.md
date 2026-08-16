@@ -156,11 +156,39 @@ binding. Naming a form does not force it: the family still qualifies the
 shape, speed-gates the result, and falls through to the published order when
 the installed package does not serve the site.
 
-### Measured on one transformer block
+To tune one seam without registering a profile, name the forms directly:
 
-Real checkpoint weights, real captured deployment inputs, paired alternating
-timing inside the gate, on a 5090. "Attention" is the gate's verdict for the
-attention family; the projections are the `nvfp4_balance` W4A4 form.
+```python
+plan = structures.attach(model, forward, scheme="nvfp4_balance",
+                         attention_forms=("sage2",))
+```
+
+Either way the answer comes back measured. `plan.report()` prints each
+family's accuracy band and the paired latency it was judged on, and the
+attachment can be reverted exactly, so the way to decide between these is to
+run both and read the two reports rather than to take this table's word for
+it on a different card.
+
+### End to end
+
+What a request costs, wall clock, same prompt and seed, distilled
+single-pass recipe. The baseline is the unmodified host: a 44GB bf16
+checkpoint that does not fit on a 32GB part, so it runs with weight
+offloading, which is what a user of this model on this class of card
+actually starts from.
+
+| Request | Host (offload) | `"nvfp4_balance"` | `"nvfp4_balance_sage"` |
+|---|---|---|---|
+| 768×512×49f | 99.8 s | 6.0 s (16.6×) | **5.7 s (17.5×)**, peak 26.8 GB |
+
+Medians of three warm runs. Frames are inspection-equivalent to the host's
+own output at both settings.
+
+### Where the time goes, one transformer block
+
+The table below is a diagnostic, not the result: it says which family earned
+which part of the request time above. Real checkpoint weights, real captured
+deployment inputs, paired alternating timing inside the gate.
 
 | Site shape | `scheme=` | Block latency | Attention family | Peak memory |
 |---|---|---|---|---|
@@ -189,16 +217,15 @@ are easy to misread, so they are worth stating:
   four sites at S=24576 reach the ceiling of a 32GB part. Pooling those
   workspaces is the open item before that profile is usable at full size.
 
-### Whole-model attach
+### How the whole-model figures were produced
 
-Attaching all 48 blocks and rendering end to end at 768×512×49f: **6.0 s**
-(median of three warm runs) against 99.8 s for the unmodified host with
-weight offloading, peak 29.9 GB. Quality is frame-inspection equivalent. Two
-qualifications on that figure: the blocks are attached one at a time because
-the bf16 checkpoint does not fit resident on a 32GB part, and the
-feed-forward seams are bound explicitly, because `vision_ffn` does not claim
-this host's shape — its projections carry no bias and its norm sits outside
-the seam, both of which the structure's boundary requires.
+Blocks are attached one at a time, because a 44GB bf16 checkpoint is not
+resident on a 32GB part: each block is materialized alone, attached on its
+own real inputs, and its host weights released before the next. The
+feed-forward seams are bound explicitly rather than by discovery, because
+`vision_ffn` does not claim this host's shape — its projections carry no
+bias and its norm sits outside the seam, both of which the structure's
+boundary requires. Whether to widen that boundary is a catalog decision.
 
 ### Kernel availability is the package's own statement
 

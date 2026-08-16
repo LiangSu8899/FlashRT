@@ -30,6 +30,8 @@ Qualification, decided from the artifact and the captures, refusal legible:
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import torch
 
 from .. import hub_kernel
@@ -42,6 +44,44 @@ KERNEL_DEP = {
 }
 
 _VARIANTS = ("pv_fp8", "pv_fp16")
+
+
+class _Staging(NamedTuple):
+    q: torch.Tensor
+    k: torch.Tensor
+    v: torch.Tensor
+    out: torch.Tensor
+    workspace: object
+
+
+#: One staging set and workspace per distinct (shape, dtype, device,
+#: variant, granularity). A transformer reaches this seam once per block
+#: and per attention site, all with the same shapes, and the scratch is
+#: large: at 24576 tokens over 32 heads a single set is about 800MB, so
+#: forty-eight blocks owning their own would not fit on any consumer part.
+#: Sharing is safe because the scratch holds nothing between calls -- it
+#: is filled at the top of every forward and read before returning -- and
+#: because these calls are sequential on one stream by construction: the
+#: host runs its blocks in order. The pool is keyed, never emptied, and
+#: pointer-stable, which is also what a captured graph needs.
+_STAGING: dict[tuple, _Staging] = {}
+
+
+def _staging_for(q_shape, kv_shape, dtype, device, variant, granularity):
+    key = (tuple(q_shape), tuple(kv_shape), dtype,
+           str(torch.device(device)), variant, granularity)
+    staging = _STAGING.get(key)
+    if staging is None:
+        art = _artifact()
+        q = torch.empty(*q_shape, dtype=dtype, device=device)
+        k = torch.empty(*kv_shape, dtype=dtype, device=device)
+        v = torch.empty_like(k)
+        out = torch.empty_like(q)
+        staging = _Staging(q, k, v, out, art.allocate_workspace(
+            q, k, v, fp8v=(variant == "pv_fp8"),
+            qk_quant_granularity=granularity))
+        _STAGING[key] = staging
+    return staging
 
 
 def _artifact():
@@ -99,17 +139,15 @@ class DenseAttentionSage2(GuardedSeam, torch.nn.Module):
         art = _artifact()
         self._fn = (art.sage2_prefill_fp8v_bf16_d128 if variant == "pv_fp8"
                     else art.sage2_prefill_f16_bf16_d128)
-        # NHD staging + caller-owned workspace, one set per bound shape.
-        self.register_buffer("_q_nhd", torch.empty(
-            b, seq_q, heads, head_dim, dtype=dtype, device=device))
-        self.register_buffer("_k_nhd", torch.empty(
-            b, seq_kv, kv_heads, head_dim, dtype=dtype, device=device))
-        self.register_buffer("_v_nhd", torch.empty_like(self._k_nhd))
-        self.register_buffer("_out_nhd", torch.empty_like(self._q_nhd))
-        self._workspace = art.allocate_workspace(
-            self._q_nhd, self._k_nhd, self._v_nhd,
-            fp8v=(variant == "pv_fp8"),
-            qk_quant_granularity=qk_quant_granularity)
+        staging = _staging_for(
+            (b, seq_q, heads, head_dim), (b, seq_kv, kv_heads, head_dim),
+            dtype, device, variant, qk_quant_granularity)
+        # Held as plain attributes, not buffers: this scratch belongs to
+        # the shared pool, and registering it would make every bound seam
+        # claim the same storage in its own state_dict.
+        self._q_nhd, self._k_nhd = staging.q, staging.k
+        self._v_nhd, self._out_nhd = staging.v, staging.out
+        self._workspace = staging.workspace
         self._frt_arm(
             dtypes=(dtype,), device=torch.device(device),
             k=int(head_dim), rows=int(b * heads * seq_q))
