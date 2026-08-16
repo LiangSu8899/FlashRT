@@ -20,6 +20,7 @@ a CUDA graph.
 
 from __future__ import annotations
 
+import importlib
 import logging
 
 import torch
@@ -27,10 +28,11 @@ import torch
 logger = logging.getLogger(__name__)
 
 try:
-    from flash_rt import flash_rt_kernels as fvk
-except ModuleNotFoundError as exc:  # pragma: no cover - built artifact
-    # Same rule as the attention swap: the extension being absent is a
-    # fallback, the extension being broken is a bug and must be visible.
+    fvk = importlib.import_module("flash_rt.flash_rt_kernels")
+except ModuleNotFoundError as exc:
+    # Same rule, and the same reason for going through importlib, as the
+    # attention swap: absent is a fallback, broken is a bug, and the
+    # package's ``__getattr__`` would make both arrive as ImportError.
     if exc.name != "flash_rt.flash_rt_kernels":
         raise
     fvk = None

@@ -10,6 +10,7 @@ The heavy paths (a real pipeline, real kernels, a device) are not
 reachable here and are covered by the model's own benchmark runs.
 """
 
+import importlib
 import sys
 import types
 
@@ -24,21 +25,19 @@ import torch  # noqa: E402
 # import smoke: the package must import with no LTX install, no kernels
 # --------------------------------------------------------------------
 
-def test_model_package_import_is_clean_or_loudly_broken():
-    """The upstream LTX packages are never required to import this one.
+def test_model_package_imports_without_optional_dependencies():
+    """Neither the upstream LTX packages nor a built extension is required.
 
-    The extension is a different case and the distinction is the point: it
-    being *absent* must not stop the import (the swaps fall back), while it
-    being present and unloadable must say so. So this asserts the
-    distinction rather than an outcome, and steps aside on a host whose
-    own build is broken -- there the loud failure is the correct result.
+    Unconditional on purpose. A host with no extension must reach this
+    import (the swaps fall back), and a host whose extension is broken must
+    fail it -- so there is no environment in which skipping is the honest
+    answer, and skipping is how the previous version of this test let an
+    import contract regress unnoticed.
     """
-    try:
-        from flash_rt.models.ltx25 import _attn_swap, _nvfp4_ffn_swap
-    except ImportError as exc:
-        assert getattr(exc, "name", None) != "flash_rt.flash_rt_kernels", (
-            "an absent extension must be a fallback, not an import failure")
-        pytest.skip(f"extension present but not loadable here: {exc}")
+    from flash_rt.models import ltx25
+    from flash_rt.models.ltx25 import _attn_swap, _nvfp4_ffn_swap
+
+    assert ltx25 is not None
     assert isinstance(_attn_swap.fvk_sage2_available(), bool)
     assert isinstance(_nvfp4_ffn_swap.fvk_ffn_available(), bool)
 
@@ -51,18 +50,180 @@ def test_frontend_module_imports_and_declares_its_surface():
         assert callable(getattr(Ltx25TorchFrontendRtx, name)), name
 
 
-def test_config_is_registered_on_the_public_api():
-    import inspect
+# --------------------------------------------------------------------
+# the public API: what the documented entry point actually gives back
+# --------------------------------------------------------------------
 
+def _load_ltx(monkeypatch, **kwargs):
+    """Run ``load_model(config="ltx25")`` against a recording frontend.
+
+    The construction path is the thing under test -- which arguments reach
+    the frontend, and what the caller is handed back -- so everything up to
+    the frontend class is the real code and only the frontend itself is
+    replaced. A checkpoint is never opened.
+    """
     from flash_rt import api
 
-    source = inspect.getsource(api)
-    assert '"ltx25"' in source
+    class _RecordingFrontend:
+        instances = []
+
+        def __init__(self, checkpoint, attention=None, fuse=True,
+                     compile_mode=None, device=None, **rest):
+            self.checkpoint = checkpoint
+            self.attention = attention
+            self.fuse = fuse
+            self.compile_mode = compile_mode
+            self.released = 0
+            self.closed = 0
+            type(self).instances.append(self)
+
+        def release_resident(self):
+            self.released += 1
+            return 7
+
+        def close(self):
+            self.closed += 1
+            return 11
+
+    import flash_rt.hardware as hardware
+
+    _RecordingFrontend.instances = []
+    # load_model resolves the frontend class through this one call, which
+    # is where the real code is interposed: everything before it (config
+    # validation, arch detection, the argument forwarding under test) runs
+    # unchanged.
+    monkeypatch.setattr(hardware, "resolve_pipeline_class",
+                        lambda *a, **k: _RecordingFrontend)
+    monkeypatch.setattr(hardware, "detect_arch", lambda *a, **k: "rtx_sm120")
+    model = api.load_model(checkpoint="unused", config="ltx25", **kwargs)
+    return model, _RecordingFrontend.instances[-1]
+
+
+def test_public_api_accepts_the_ltx_config():
+    """``load_model`` must know the config name it documents."""
+    from flash_rt import api
+
+    with pytest.raises(ValueError, match="Unknown config"):
+        api.load_model(checkpoint="unused", config="no_such_model")
+
+
+def test_public_api_forwards_the_execution_assembly(monkeypatch):
+    """attention/fuse/compile_mode must reach the frontend from load_model.
+
+    Capture mode is the point of this runtime, and a caller who cannot ask
+    for it through the documented entry point does not have it.
+    """
+    model, frontend = _load_ltx(
+        monkeypatch, attention="sage2-fvk", fuse=True,
+        compile_mode="capture")
+    assert frontend.attention == "sage2-fvk"
+    assert frontend.fuse is True
+    assert frontend.compile_mode == "capture"
+    assert model is not None
+
+
+def test_public_api_leaves_frontend_defaults_alone(monkeypatch):
+    """Unset arguments must not be forwarded as None over the defaults."""
+    _, frontend = _load_ltx(monkeypatch)
+    assert frontend.attention is None
+    assert frontend.fuse is True, "the frontend's own default must survive"
+    assert frontend.compile_mode is None
+
+
+def test_public_model_exposes_the_release_surface():
+    """The lifecycle calls the docs show have to exist on what is returned.
+
+    ``load_model`` hands back a wrapper, not the frontend, so a method the
+    documentation tells a caller to use is only real if the wrapper
+    delegates it.
+    """
+    from flash_rt.api import VLAModel
+
+    for name in ("release_resident", "close"):
+        assert callable(getattr(VLAModel, name, None)), name
+
+
+def test_public_model_delegates_release_and_close():
+    from flash_rt.api import VLAModel
+
+    class _Frontend:
+        def __init__(self):
+            self.released = self.closed = 0
+
+        def release_resident(self):
+            self.released += 1
+            return 7
+
+        def close(self):
+            self.closed += 1
+            return 11
+
+    frontend = _Frontend()
+    model = VLAModel(frontend, "torch")
+    assert model.release_resident() == 7
+    assert model.close() == 11
+    assert (frontend.released, frontend.closed) == (1, 1)
+
+
+def test_public_model_release_is_harmless_on_other_frontends():
+    """A frontend that holds nothing answers 0 instead of refusing."""
+    from flash_rt.api import VLAModel
+
+    model = VLAModel(object(), "torch")
+    assert model.release_resident() == 0
+    assert model.close() == 0
 
 
 # --------------------------------------------------------------------
 # optional import: absent is a fallback, broken is a bug
 # --------------------------------------------------------------------
+
+class _RaisingFinder:
+    """Meta-path finder that makes one module name fail on import.
+
+    The swaps import through ``importlib``, so a fake ``__import__`` does
+    not stand in the way: the simulation has to happen in the import
+    machinery itself or it tests nothing. ``exc`` is raised when the name is
+    looked up, which is what an absent (or broken) module does.
+    """
+
+    def __init__(self, name, exc):
+        self.name = name
+        self.exc = exc
+
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == self.name:
+            raise self.exc
+        return None
+
+
+def _reimport(module_name, finder, monkeypatch):
+    """Import ``module_name`` afresh with ``finder`` in the way.
+
+    The simulated module has to leave ``sys.modules`` as well as the module
+    under test: an already-imported extension is returned straight from the
+    cache and no finder is ever consulted, which would quietly turn this
+    into a test of nothing on any host where the extension is built.
+    """
+    monkeypatch.setattr(sys, "meta_path", [finder] + sys.meta_path)
+    for name in [module_name, "flash_rt.models.ltx25", finder.name]:
+        monkeypatch.delitem(sys.modules, name, raising=False)
+    return importlib.import_module(module_name)
+
+
+@pytest.mark.parametrize("module_name", [
+    "flash_rt.models.ltx25._attn_swap",
+    "flash_rt.models.ltx25._nvfp4_ffn_swap",
+])
+def test_absent_extension_is_a_fallback(module_name, monkeypatch):
+    """No extension: the module imports and the swap knows it has none."""
+    finder = _RaisingFinder(
+        "flash_rt.flash_rt_kernels",
+        ModuleNotFoundError("No module named 'flash_rt.flash_rt_kernels'",
+                            name="flash_rt.flash_rt_kernels"))
+    module = _reimport(module_name, finder, monkeypatch)
+    assert module.fvk is None
+
 
 @pytest.mark.parametrize("module_name", [
     "flash_rt.models.ltx25._attn_swap",
@@ -76,39 +237,57 @@ def test_broken_extension_is_not_swallowed_as_absent(module_name, monkeypatch):
     import error -- has to propagate, or a broken build silently runs the
     slow path and reports nothing.
     """
-    real_import = __import__
-
-    def fake_import(name, *args, **kwargs):
-        if name == "flash_rt" and args and "flash_rt_kernels" in (args[2] or ()):
-            raise ImportError("undefined symbol: _Z9brokenABIv")
-        return real_import(name, *args, **kwargs)
-
-    for name in [module_name, "flash_rt.models.ltx25"]:
-        sys.modules.pop(name, None)
-    monkeypatch.setattr("builtins.__import__", fake_import)
+    finder = _RaisingFinder("flash_rt.flash_rt_kernels",
+                            ImportError("undefined symbol: _Z9brokenABIv"))
     with pytest.raises(ImportError, match="undefined symbol"):
-        real_import(module_name, {}, {}, ["*"])
+        _reimport(module_name, finder, monkeypatch)
 
 
 @pytest.mark.parametrize("module_name", [
     "flash_rt.models.ltx25._attn_swap",
     "flash_rt.models.ltx25._nvfp4_ffn_swap",
 ])
-def test_absent_extension_is_a_fallback(module_name, monkeypatch):
-    real_import = __import__
+def test_absent_extension_is_distinguished_from_a_missing_dependency(
+        module_name, monkeypatch):
+    """A *different* module going missing is not this extension's absence.
 
-    def fake_import(name, *args, **kwargs):
-        if name == "flash_rt" and args and "flash_rt_kernels" in (args[2] or ()):
-            raise ModuleNotFoundError(
-                "No module named 'flash_rt.flash_rt_kernels'",
-                name="flash_rt.flash_rt_kernels")
-        return real_import(name, *args, **kwargs)
+    The name check is what separates them: without it, any transitive
+    ModuleNotFoundError raised while loading the extension would be read as
+    "the extension is not built" and quietly fall back.
+    """
+    finder = _RaisingFinder(
+        "flash_rt.flash_rt_kernels",
+        ModuleNotFoundError("No module named 'some_transitive_dep'",
+                            name="some_transitive_dep"))
+    with pytest.raises(ModuleNotFoundError, match="some_transitive_dep"):
+        _reimport(module_name, finder, monkeypatch)
 
-    for name in [module_name, "flash_rt.models.ltx25"]:
-        sys.modules.pop(name, None)
-    monkeypatch.setattr("builtins.__import__", fake_import)
-    module = real_import(module_name, {}, {}, ["*"])
-    assert module.fvk is None
+
+def test_sage_package_probe_falls_back_only_on_absence(monkeypatch):
+    """``auto`` may fall back to SDPA when sageattention is not installed.
+
+    It may not do so when the package is installed and broken: that is an
+    environment fault, and answering it with a quiet slowdown hides it.
+    """
+    from flash_rt.models.ltx25 import _attn_swap
+
+    monkeypatch.setattr(_attn_swap, "fvk_sage2_available", lambda: False)
+
+    absent = _RaisingFinder(
+        "sageattention",
+        ModuleNotFoundError("No module named 'sageattention'",
+                            name="sageattention"))
+    monkeypatch.setattr(sys, "meta_path", [absent] + sys.meta_path)
+    monkeypatch.delitem(sys.modules, "sageattention", raising=False)
+    attn = _attn_swap.make_ltx25_attention("auto")
+    assert attn is None or getattr(attn, "label", "") == "sdpa"
+
+    broken = _RaisingFinder("sageattention",
+                            ImportError("undefined symbol: _Z6brokenv"))
+    monkeypatch.setattr(sys, "meta_path", [broken] + sys.meta_path)
+    monkeypatch.delitem(sys.modules, "sageattention", raising=False)
+    with pytest.raises(ImportError, match="undefined symbol"):
+        _attn_swap.make_ltx25_attention("auto")
 
 
 # --------------------------------------------------------------------

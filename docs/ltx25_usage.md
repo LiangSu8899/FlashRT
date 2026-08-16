@@ -36,11 +36,19 @@ import flash_rt
 pipe = flash_rt.load_model(
     checkpoint="/path/to/LTX-2.5",   # the split pack root
     config="ltx25",
+    attention="sage2-fvk",           # optional; "auto" by default
+    fuse=True,                       # the W4A4 FFN chain, on by default
+    compile_mode="capture",          # eager by default; see below
 )
 pipe.set_prompt("A golden retriever running through a sunny meadow")
 stats = pipe.infer(seed=42, output_path="out.mp4")
 print(stats)
 ```
+
+`attention`, `fuse` and `compile_mode` choose the execution assembly and are
+forwarded to this frontend only; omitting one leaves the frontend's own
+default. The same three are constructor arguments if you build
+`Ltx25TorchFrontendRtx` directly.
 
 `infer` accepts `height`, `width` (multiples of 32), `num_frames`
 (`k*8+1`), `frame_rate`, `seed`, and `output_path` (omit to skip mp4 encode).
@@ -92,7 +100,8 @@ so residency is a lease rather than a permanent state:
   next stage call take a fresh lease. The cost is one transformer rebuild;
   nothing fails and nothing has to be released by hand.
 
-Two explicit entry points, both idempotent:
+Two explicit entry points, both idempotent and both on the object
+`load_model` returns:
 
 ```python
 pipe.release_resident()   # drop the resident transformer and its graphs
@@ -100,8 +109,10 @@ pipe.close()              # the above, plus prompt cache and pipeline
 ```
 
 `release_resident` returns the device bytes it freed (0 outside capture mode,
-which holds no lease). After either call the frontend still works: the next
-`infer` rebuilds what it needs, `close` reloading from the checkpoint.
+which holds no lease; also 0 on models that keep nothing resident, so a
+serving loop can call it without knowing which frontend it has). After either
+call the frontend still works: the next `infer` rebuilds what it needs,
+`close` reloading from the checkpoint.
 VAE decode tiling is sized against the memory that remains once the resident
 transformer is accounted for, so decode does not have to be given a manual
 budget.

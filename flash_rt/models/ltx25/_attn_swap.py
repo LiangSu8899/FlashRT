@@ -27,6 +27,7 @@ Backend choices (``make_ltx25_attention``):
 
 from __future__ import annotations
 
+import importlib
 import logging
 from typing import Optional
 
@@ -36,12 +37,18 @@ import torch.nn.functional as F
 logger = logging.getLogger(__name__)
 
 try:
-    from flash_rt import flash_rt_kernels as fvk
-except ModuleNotFoundError as exc:  # pragma: no cover - built artifact
+    fvk = importlib.import_module("flash_rt.flash_rt_kernels")
+except ModuleNotFoundError as exc:
     # Only the extension's own absence is optional. An undefined symbol, a
     # CUDA ABI mismatch, or a transitive dependency failing to load all
-    # surface as ImportError too, and swallowing those would report a
+    # surface as plain ImportError, and swallowing those would report a
     # broken build as "kernels unavailable" and silently run the fallback.
+    #
+    # The import has to go through importlib for that distinction to exist
+    # at all: ``from flash_rt import flash_rt_kernels`` reaches the
+    # package's PEP 562 ``__getattr__``, which answers an absent extension
+    # with build instructions raised as ImportError -- so the two cases
+    # arrive as the same type and neither can be told from the other.
     if exc.name != "flash_rt.flash_rt_kernels":
         raise
     fvk = None
@@ -209,9 +216,15 @@ def make_ltx25_attention(kind: Optional[str], stream_fn=None):
             kind = "sage2-fvk"
         else:
             try:
-                import sageattention  # noqa: F401
+                importlib.import_module("sageattention")
                 kind = "sage2"
-            except ImportError:
+            except ModuleNotFoundError as exc:
+                # The package not being installed is a reason to fall back.
+                # The package being installed and failing to load is not:
+                # that is a broken environment, and answering it with SDPA
+                # would hide the breakage behind a quiet slowdown.
+                if exc.name != "sageattention":
+                    raise
                 kind = "sdpa"
 
     if kind == "sage2-fvk":
