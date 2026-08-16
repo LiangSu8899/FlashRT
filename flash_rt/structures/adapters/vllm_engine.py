@@ -373,6 +373,27 @@ def install_load_hook(*, on_attached=None, allow_spawn=False,
     import importlib
     import os
 
+    # Find the runners before changing anything: "there is no host here"
+    # is the more fundamental refusal, and a caller without vLLM should
+    # hear that rather than a lecture about start methods. Nothing is
+    # mutated until both questions have been answered.
+    found = []
+    for modname in ("vllm.v1.worker.gpu.model_runner",
+                    "vllm.v1.worker.gpu_model_runner",
+                    "vllm.v2.worker.gpu_model_runner"):
+        try:
+            module = importlib.import_module(modname)
+        except ImportError:
+            continue
+        runner = getattr(module, "GPUModelRunner", None)
+        if runner is None or not hasattr(runner, "load_model"):
+            continue
+        found.append((modname, runner))
+    if not found:
+        raise RuntimeError(
+            "refused: no vLLM model runner found to hook; the engine "
+            "layout is outside this adapter's profile")
+
     lost = None if allow_spawn else _patch_would_not_survive()
     if lost is not None:
         raise RuntimeError(
@@ -389,16 +410,7 @@ def install_load_hook(*, on_attached=None, allow_spawn=False,
 
     os.environ.setdefault("VLLM_DISABLE_COMPILE_CACHE", "1")
     patched = []
-    for modname in ("vllm.v1.worker.gpu.model_runner",
-                    "vllm.v1.worker.gpu_model_runner",
-                    "vllm.v2.worker.gpu_model_runner"):
-        try:
-            module = importlib.import_module(modname)
-        except ImportError:
-            continue
-        runner = getattr(module, "GPUModelRunner", None)
-        if runner is None or not hasattr(runner, "load_model"):
-            continue
+    for modname, runner in found:
         orig = runner.load_model
 
         def load_model(self, *a, __orig=orig, **kw):
@@ -409,8 +421,4 @@ def install_load_hook(*, on_attached=None, allow_spawn=False,
                 on_attached(handle)
         runner.load_model = load_model
         patched.append(modname)
-    if not patched:
-        raise RuntimeError(
-            "refused: no vLLM model runner found to hook; the engine "
-            "layout is outside this adapter's profile")
     return patched
