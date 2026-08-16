@@ -142,35 +142,52 @@ Nothing here is LTX-specific: the attention seam is recognised by the
 processor contract (separate query/key rotary boundaries, per-head gating),
 not by a model or class name.
 
+`scheme=` selects the precision profile, and two are relevant here:
+
+| scheme | what it quantizes |
+|---|---|
+| `"nvfp4_balance"` | the projection GEMMs (W4A4); attention keeps the family's precision-first order |
+| `"nvfp4_balance_sage"` | the same, and allows the quantized attention forms to be weighed first |
+
+The split is deliberate. A quantized attention form trades a bounded error
+for speed, so it is a precision decision like any other and arrives through
+the profile a deployment selected — never through a device check or a host
+binding. Naming a form does not force it: the family still qualifies the
+shape, speed-gates the result, and falls through to the published order when
+the installed package does not serve the site.
+
 ### Measured on one transformer block
 
 Real checkpoint weights, real captured deployment inputs, paired alternating
 timing inside the gate, on a 5090. "Attention" is the gate's verdict for the
 attention family; the projections are the `nvfp4_balance` W4A4 form.
 
-| Site shape | Configuration | Block latency | Attention family | Peak memory |
+| Site shape | `scheme=` | Block latency | Attention family | Peak memory |
 |---|---|---|---|---|
-| S=24576 (1536×1024×121f) | host | 134.3 ms | — | 12.2 GB |
-| | attach, default order | 117.1 ms (1.15×) | bound, declined at 1.006× | 8.2 GB |
-| | attach, sage2 preferred | **90.1 ms (1.49×)** | activated, 1.257× | at the 32GB ceiling |
-| S=2688 (768×512×49f) | host | 10.3 ms | — | 2.3 GB |
-| | attach, default order | 8.2 ms (1.25×) | declined | 1.7 GB |
-| | attach, sage2 preferred | 8.0 ms (1.28×) | activated | 4.8 GB |
+| S=24576 (1536×1024×121f) | host, unattached | 134.3 ms | — | 12.2 GB |
+| | `"nvfp4_balance"` | 117.1 ms (1.15×) | BF16 form bound, declined at 1.006× | 8.2 GB |
+| | `"nvfp4_balance_sage"` | **89.8 ms (1.49×)** | activated, 1.259× | at the 32GB ceiling |
+| S=2688 (768×512×49f) | host, unattached | 10.2 ms | — | 2.3 GB |
+| | `"nvfp4_balance"` | 8.2 ms (1.25×) | declined | 1.7 GB |
+| | `"nvfp4_balance_sage"` | 8.0 ms (1.28×) | activated, 1.022× | 4.7 GB |
 
 Matched-forward cosine against the host's own output is 0.99999 in every row,
-and `detach` restores it bit-exactly (max-abs 0.0). Two results are worth
-reading carefully rather than skipping:
+and `detach` restores it bit-exactly (max-abs 0.0). Three things in that table
+are easy to misread, so they are worth stating:
 
-- **The default order does not use the quantized attention forms.** They trade
-  a bounded numerical error for speed, which is a deployment decision, so a
-  caller asks for one explicitly. Without that, the family's BF16 form binds,
-  and at these shapes the net-win gate measures it at 1.006× and keeps the
-  host's attention — the projections carry the whole win.
-- **Peak memory falls when the projections are quantized** (12.2 → 8.2 GB) and
-  rises when quantized attention is preferred, because each attention site
-  owns its staging and quantization workspace. At S=24576 across four sites
-  that reaches the ceiling of a 32GB part; pooling those workspaces is the
-  open item before this configuration is usable at full size.
+- **A block ratio is not a kernel ratio.** The same attention that measures
+  2.34× on its own (45.9 → 19.6 ms at S=24576) shows up as 1.259× for the
+  attention unit, because the unit is judged against the whole block. The
+  27 ms it saves is the same 27 ms in both numbers.
+- **The projections-only profile leaves the BF16 attention form bound and
+  declined.** That form measures 46.1 ms against the host's 45.9 ms here, so
+  the gate is right to keep the host path; nothing about the quantized forms
+  is being judged in that row.
+- **Peak memory moves in both directions.** Quantizing the projections takes
+  it from 12.2 to 8.2 GB. Preferring quantized attention gives some back,
+  because each attention site owns its staging and quantization workspace:
+  four sites at S=24576 reach the ceiling of a 32GB part. Pooling those
+  workspaces is the open item before that profile is usable at full size.
 
 ### Whole-model attach
 

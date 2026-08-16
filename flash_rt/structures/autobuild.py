@@ -1263,8 +1263,18 @@ def auto_swaps(
                     # sample entry, where that callable takes a sample —
                     # the whole point of normalising the three ways in was
                     # that nothing downstream should see the difference
-                    result = adapter(model, thunks[0],
-                                     prefix_cadence=prefix_cadence)
+                    # same convention as the gated-delta adapters: an
+                    # adapter that declares scheme awareness receives the
+                    # active scheme, because which executable form may
+                    # serve its seam is a precision decision and the
+                    # scheme is where those are stated
+                    if getattr(adapter, "scheme_aware", False):
+                        result = adapter(model, thunks[0],
+                                         prefix_cadence=prefix_cadence,
+                                         scheme=scheme_obj)
+                    else:
+                        result = adapter(model, thunks[0],
+                                         prefix_cadence=prefix_cadence)
                 except (ValueError, RuntimeError) as refusal:
                     plan.notes.setdefault("refused", []).append(
                         ("attention_core", str(refusal)[:200]))

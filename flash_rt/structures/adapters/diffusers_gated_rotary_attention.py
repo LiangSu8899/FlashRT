@@ -147,20 +147,25 @@ class _FlashRTGatedRotaryAttnProcessor:
 class DiffusersGatedRotaryAttentionAdapter:
     """Route gated dual-rotary Diffusers processors through the family.
 
-    ``prefer`` is passed through to the family binder unchanged and is
-    empty by default: which executable form serves this seam is the
-    family's decision, and preferring a quantized one is a deployment
-    decision that belongs to whoever assembled this adapter, not to the
-    adapter itself.
+    Which executable form serves the seam is the family's decision, and
+    preferring a quantized one is a precision decision -- so it arrives
+    from the active scheme's ``attention_forms``, the same way the
+    gated-delta adapter reads its projection format. ``prefer`` is the
+    direct form of the same choice for a caller assembling this adapter
+    by hand; the scheme wins when both are given, because the scheme is
+    what the deployment selected.
     """
 
     __name__ = "diffusers_gated_rotary_attention"
+    scheme_aware = True
 
     def __init__(self, prefer=()):
         self.prefer = tuple(prefer)
 
-    def __call__(self, model, forward, *, prefix_cadence: bool = False):
+    def __call__(self, model, forward, *, prefix_cadence: bool = False,
+                 scheme=None):
         del prefix_cadence
+        prefer = tuple(getattr(scheme, "attention_forms", ()) or self.prefer)
         sites = []
         for path, module in model.named_modules():
             processor = getattr(module, "processor", None)
@@ -193,7 +198,7 @@ class DiffusersGatedRotaryAttentionAdapter:
                 ))
                 continue
             try:
-                core = bind_dense_attention_best(rows, prefer=self.prefer)
+                core = bind_dense_attention_best(rows, prefer=prefer)
             except ValueError as exc:
                 refused.append((f"{path}.processor", str(exc)[:160]))
                 continue
