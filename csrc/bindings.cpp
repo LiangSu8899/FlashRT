@@ -186,7 +186,13 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #include "kernels/fp4_w4a4_mma_sm120.cuh"
 #include "kernels/fp4_w4a4_mma_warpsplit_sm120.cuh"
 #include "kernels/fp4_w4a4_mma_warpsplit_mrows_sm120.cuh"
+#include "kernels/fp4_w4a4_mma_warpsplit_ilv_sm120.cuh"
+#include "kernels/fp4_w4a4_mma_warpsplit_ilv_mrows_sm120.cuh"
 #include "kernels/gdn_chunk_from_conv_smem_stash.cuh"
+#include "kernels/silu_mul_quantize_fp4_sfa_bf16.cuh"
+#include "kernels/batched_unit_ltri_inv64.cuh"
+#include "kernels/rms_norm_quantize_fp4_sfa_bf16.cuh"
+#include "kernels/gdn_wy_norm_cumsum_pack_qk_v2.cuh"
 #include "quantize/fp8_block128_dequant.cuh"
 #ifdef FLASHRT_HAVE_NVFP4_SWIZZLE
 #include "quantize/fp8_block128_to_nvfp4_swizzled.cuh"
@@ -6633,7 +6639,128 @@ graph-replay safe) to fill the SMs on long K. M in 1..16; N%8==0; K%64==0;
 (K/64)%warps==0; warps in {2,4,8}; stages in {3,4,6}.
 )pbdoc");
 
+    m.def("fp4_w4a4_mma_sm120_warpsplit_ilv_bf16out",
+        [](uintptr_t A, uintptr_t B, uintptr_t D, int N, int K, uintptr_t SFA,
+           uintptr_t SFB, float alpha, int warps, int stages,
+           uintptr_t stream) -> int {
+            return flash_rt::gemm::fp4_w4a4_mma_sm120_warpsplit_ilv_bf16out(
+                to_ptr(A), to_ptr(B), to_ptr(D), N, K, to_ptr(SFA),
+                to_ptr(SFB), alpha, warps, stages, to_stream(stream));
+        },
+        py::arg("A"), py::arg("B"), py::arg("D"), py::arg("N"), py::arg("K"),
+        py::arg("SFA"), py::arg("SFB"), py::arg("alpha") = 1.0f,
+        py::arg("warps") = 4, py::arg("stages") = 4, py::arg("stream") = 0,
+        R"pbdoc(
+NVFP4 W4A4 warp-split-K M=1 GEMV over the interleaved B layout (SM120).
+B must come from fp4_w4a4_repack_b_ilv_sm120 (bind-time repack): each
+8-column group's K-tiles interleave so the block's global reads are fully
+contiguous. Bit-exact vs the dense warp-split GEMV (identical reduction
+order). N%8==0; K%64==0; (K/64)%warps==0; warps in {2,4,8}; stages {3,4,6}.
+)pbdoc");
+
+    m.def("fp4_w4a4_mma_sm120_warpsplit_ilv_mrows_bf16out",
+        [](uintptr_t A, uintptr_t B, uintptr_t D, int M, int N, int K,
+           uintptr_t SFA, uintptr_t SFB, float alpha, int warps, int stages,
+           uintptr_t stream) -> int {
+            return flash_rt::gemm::
+                fp4_w4a4_mma_sm120_warpsplit_ilv_mrows_bf16out(
+                    to_ptr(A), to_ptr(B), to_ptr(D), M, N, K, to_ptr(SFA),
+                    to_ptr(SFB), alpha, warps, stages, to_stream(stream));
+        },
+        py::arg("A"), py::arg("B"), py::arg("D"), py::arg("M"), py::arg("N"),
+        py::arg("K"), py::arg("SFA"), py::arg("SFB"), py::arg("alpha") = 1.0f,
+        py::arg("warps") = 4, py::arg("stages") = 4, py::arg("stream") = 0,
+        R"pbdoc(
+NVFP4 W4A4 small-M (M<=16) warp-split-K GEMM over the interleaved B layout
+(SM120). Shares the repacked B with the M=1 interleaved entry; bit-exact per
+row vs it (identical reduction order). M in 1..16; N%8==0; K%64==0;
+(K/64)%warps==0; warps in {2,4,8}; stages in {3,4,6}.
+)pbdoc");
+
+    m.def("fp4_w4a4_repack_b_ilv_sm120",
+        [](uintptr_t B_packed, uintptr_t B_ilv, int N, int K,
+           uintptr_t stream) -> int {
+            return flash_rt::gemm::fp4_w4a4_repack_b_ilv_sm120(
+                to_ptr(B_packed), to_ptr(B_ilv), N, K, to_stream(stream));
+        },
+        py::arg("B_packed"), py::arg("B_ilv"), py::arg("N"), py::arg("K"),
+        py::arg("stream") = 0,
+        R"pbdoc(
+Bind-time repack: dense packed B (N, K/2 bytes row-major) -> interleaved
+[N/8 groups][K/64 tiles][8 cols x 32B] layout for the warpsplit_ilv entries.
+dst byte size equals src (N*K/2). Pure byte permutation on stream.
+)pbdoc");
+
 #endif
+
+    m.def("silu_mul_quantize_fp4_sfa_bf16",
+        [](uintptr_t merged, uintptr_t packed, uintptr_t sfa, int N, int H,
+           uintptr_t stream) -> int {
+            return flash_rt::fp4::silu_mul_quantize_fp4_sfa_bf16(
+                to_ptr(merged), to_ptr(packed), to_ptr(sfa), N, H,
+                to_stream(stream));
+        },
+        py::arg("merged"), py::arg("packed"), py::arg("sfa"), py::arg("N"),
+        py::arg("H"), py::arg("stream") = 0,
+        R"pbdoc(
+Fused SwiGLU activation + NVFP4 quantize producer. merged: bf16 (N, 2H)
+row-major, halves ordered [gate|up], H%16==0. Emits packed (N, H/2 bytes)
++ SFA in the 128x64-atom layout ((N+127)/128 * (H+63)/64 * 512 bytes).
+silu·mul in fp32 rounded through bf16, then the production quantize path
+verbatim - bit-exact vs the split (mul kernel -> quantize kernel) chain.
+)pbdoc");
+
+    m.def("batched_unit_ltri_inv64_f32",
+        [](uintptr_t A, uintptr_t X, int B, uintptr_t stream) -> int {
+            return flash_rt::kernels::batched_unit_ltri_inv64_f32(
+                to_ptr(A), to_ptr(X), B, to_stream(stream));
+        },
+        py::arg("A"), py::arg("X"), py::arg("B"), py::arg("stream") = 0,
+        R"pbdoc(
+Batched 64x64 unit-lower-triangular inverse, fp32: X = inv(I +
+strict_tril(A)). A, X: (B, 64, 64) row-major; only A's strict lower
+triangle is read. Column-independent forward substitution - the same
+recurrence class as the batched cuBLAS solve it replaces.
+)pbdoc");
+
+    m.def("rms_norm_quantize_fp4_sfa_bf16",
+        [](uintptr_t x, uintptr_t w, float eps, uintptr_t normed,
+           uintptr_t packed, uintptr_t sfa, int N, int D,
+           uintptr_t stream) -> int {
+            return flash_rt::fp4::rms_norm_quantize_fp4_sfa_bf16(
+                to_ptr(x), to_ptr(w), eps, to_ptr(normed), to_ptr(packed),
+                to_ptr(sfa), N, D, to_stream(stream));
+        },
+        py::arg("x"), py::arg("w"), py::arg("eps"), py::arg("normed"),
+        py::arg("packed"), py::arg("sfa"), py::arg("N"), py::arg("D"),
+        py::arg("stream") = 0,
+        R"pbdoc(
+Fused (1+w)-form RMSNorm + NVFP4 quantize producer. x: bf16 (N, D);
+w: bf16 (D) residual-form weight (kernel applies 1+w). Emits the normed
+bf16 rows AND their packed FP4 (N, D/2 bytes) + SFA (128x64-atom layout)
+off one read of x - the norm the host computes, plus the quantization
+its bound consumers would each redo. D%16==0, D<=8192.
+)pbdoc");
+
+    m.def("gdn_wy_norm_cumsum_pack_qk_v2_bf16",
+        [](uintptr_t q16, uintptr_t k16, uintptr_t g, uintptr_t q16_l2,
+           uintptr_t k16_l2, uintptr_t q_pack_hv, uintptr_t k_pack_hk,
+           uintptr_t g_cumsum, int S, uintptr_t stream) -> int {
+            return flash_rt::kernels::gdn_wy_norm_cumsum_pack_qk_v2_bf16(
+                to_ptr(q16), to_ptr(k16), to_ptr(g), to_ptr(q16_l2),
+                to_ptr(k16_l2), to_ptr(q_pack_hv), to_ptr(k_pack_hk),
+                to_ptr(g_cumsum), S, to_stream(stream));
+        },
+        py::arg("q16"), py::arg("k16"), py::arg("g"), py::arg("q16_l2"),
+        py::arg("k16_l2"), py::arg("q_pack_hv"), py::arg("k_pack_hk"),
+        py::arg("g_cumsum"), py::arg("S"), py::arg("stream") = 0,
+        R"pbdoc(
+WY-chain q/k L2-norm + pack + per-chunk gate cumsum for the fixed
+16/48/128/64 family, v2 launch plan: the norm/pack math transcribed
+verbatim from the packaged fast arm, the gate cumsum parallelized over
+the independent (chunk, head) pairs with the packaged serial order kept
+inside each chunk - bit-exact against the packaged pair.
+)pbdoc");
 
     m.def("gdn_chunk_from_conv_smem_h_stash_bf16",
         [](uintptr_t conv_out, uintptr_t a, uintptr_t b_, uintptr_t neg_exp_a,
