@@ -12,11 +12,37 @@ Skipped where FA2 is not built, since that is a target property rather than a
 failure.
 """
 
+from pathlib import Path
+
 import pytest
 import torch
 import torch.nn.functional as F
 
 NQ, NKV, HD = 16, 2, 256
+
+
+def test_causal_wrapper_respects_slim_hdim_matrix():
+    """Python and native adapters must use the same macro-gated dispatch.
+
+    Thor builds only hdim=256. An older Python-only branch referenced the
+    hdim=128 templates unconditionally, so the module linked but failed to
+    import with an undefined symbol.
+    """
+    source = (
+        Path(__file__).parents[1]
+        / "csrc/attention/fa2_wrapper_causal.cu"
+    ).read_text()
+    bf16_body = source.split(
+        'extern "C" void fvk_attention_fa2_fwd_bf16_causal(', 1
+    )[1].split("#else  // !FA2_HAS_BF16", 1)[0]
+
+    assert "FLASHRT_FA2_NATIVE_BUILD" not in bf16_body
+    for head_dim in (128, 256):
+        guard = (
+            "#if defined(FA2_HAS_BF16) && "
+            f"defined(FA2_HAS_HDIM_{head_dim})"
+        )
+        assert bf16_body.count(guard) == 2
 
 
 def _fwd():
