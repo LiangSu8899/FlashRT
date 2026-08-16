@@ -18,6 +18,7 @@ already importable in the environment.
 
 from __future__ import annotations
 
+import gc
 import logging
 import os
 import pathlib
@@ -221,7 +222,12 @@ class Ltx25TorchFrontendRtx:
                 pipe.stage = pipe.stage.with_builder(ResidentSwapBuilder(
                     pipe.stage._transformer_builder,
                     [functools.partial(install_nvfp4_ffn, free_upstream=True)]))
-                pipe.prompt_encoder = CachingPromptEncoder(pipe.prompt_encoder)
+                # A prompt the cache does not hold needs the text encoder,
+                # which does not fit beside the resident transformer: the
+                # encoder ends the residency lease before it runs, and the
+                # stage's next build takes a fresh one.
+                pipe.prompt_encoder = CachingPromptEncoder(
+                    pipe.prompt_encoder, on_miss=self.release_resident)
             else:
                 pipe.stage = pipe.stage.with_builder(SwapInstallingBuilder(
                     pipe.stage._transformer_builder, [install_nvfp4_ffn]))
@@ -237,6 +243,45 @@ class Ltx25TorchFrontendRtx:
     def set_prompt(self, prompt: str, **_: Any) -> None:
         self.prompt = prompt
         self._load_pipe()
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+    def release_resident(self) -> int:
+        """Release the resident transformer and its captured graphs.
+
+        Idempotent, and returns the device bytes freed. Only capture mode
+        holds a residency lease; every other mode disposes the transformer
+        after each stage, so there is nothing here to release and this
+        returns 0. The pipeline stays usable either way: the next call
+        builds a transformer again.
+        """
+        pipe = self._pipe
+        if pipe is None:
+            return 0
+        builder = getattr(pipe.stage, "_transformer_builder", None)
+        release = getattr(builder, "release", None)
+        return release() if callable(release) else 0
+
+    def close(self) -> int:
+        """Release everything this frontend holds. Idempotent.
+
+        The resident transformer and its graphs, the cached prompt
+        embeddings, and the pipeline itself. A later ``set_prompt`` or
+        ``infer`` reloads from the checkpoint, so this is a release, not a
+        teardown of the object.
+        """
+        freed = self.release_resident()
+        pipe = self._pipe
+        if pipe is not None:
+            cache = getattr(pipe, "prompt_encoder", None)
+            clear = getattr(cache, "clear", None)
+            if callable(clear):
+                clear()
+        self._pipe = None
+        gc.collect()
+        torch.cuda.empty_cache()
+        return freed
 
     @torch.inference_mode()
     def infer(

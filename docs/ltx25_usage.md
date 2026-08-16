@@ -3,8 +3,10 @@
 FlashRT integration of the official [LTX-2](https://github.com/Lightricks/LTX-2)
 `ltx-pipelines` two-stage distilled pipeline, with FlashRT compute swaps.
 
-Status: attention backend swap shipped; fused NVFP4 epilogues and CUDA graph
-capture over the transformer loop are in progress on this branch.
+Three compute swaps ship here: the attention backend, the W4A4 NVFP4 FFN
+chain, and — behind `compile_mode="capture"` — a resident transformer that
+makes whole-loop CUDA-graph capture possible on one GPU. Measured warm
+denoise at 1536×1024×121f: 23.9s upstream eager, 11.7s with all three.
 
 ## Requirements
 
@@ -57,6 +59,52 @@ Selected by the `attention=` constructor argument or `FLASH_RT_LTX25_ATTN`:
 
 Audio-branch attention (head_dim 64, ~1k tokens) always runs SDPA: measured on
 5090, the quantized paths lose to SDPA at that shape.
+
+## FFN chain and compilation
+
+`fuse=True` (default) replaces each transformer block's feed-forward with the
+W4A4 NVFP4 chain: three launches (quantize, fused GEMM+bias+GELU emitting
+FP4, GEMM) where upstream runs six. The chain accepts only 128-aligned row
+counts — CUTLASS declines the rest and returns without writing an output, so
+unaligned calls (the ~126-token audio branch) stay on the upstream module
+rather than reading an unwritten buffer.
+
+`compile_mode` selects the execution assembly:
+
+| value | assembly |
+|---|---|
+| `None` (default) | eager |
+| `"default"` | per-block `torch.compile`, sequence-length specialized |
+| `"capture"` | per-block compile plus whole-loop CUDA-graph capture |
+
+Capture requires the transformer to stay resident, which the swap builder
+arranges; the memory contract that follows is below.
+
+## Memory and lifecycle (capture mode)
+
+The resident transformer holds ≈14GB. The text encoder loads ≈26GB for the
+length of one prompt encode, and the two do not fit together on a 32GB part,
+so residency is a lease rather than a permanent state:
+
+- a prompt whose embeddings are already cached keeps the resident model and
+  skips the encoder entirely;
+- a prompt that is not cached ends the lease first, encodes, and lets the
+  next stage call take a fresh lease. The cost is one transformer rebuild;
+  nothing fails and nothing has to be released by hand.
+
+Two explicit entry points, both idempotent:
+
+```python
+pipe.release_resident()   # drop the resident transformer and its graphs
+pipe.close()              # the above, plus prompt cache and pipeline
+```
+
+`release_resident` returns the device bytes it freed (0 outside capture mode,
+which holds no lease). After either call the frontend still works: the next
+`infer` rebuilds what it needs, `close` reloading from the checkpoint.
+VAE decode tiling is sized against the memory that remains once the resident
+transformer is accounted for, so decode does not have to be given a manual
+budget.
 
 Measured on 5090 at 1536×1024×121f (median, video self-attention site,
 S=24576): SDPA-cudnn 42.4ms, sage2 17.4ms, sage3 13.0ms. End-to-end stage-2

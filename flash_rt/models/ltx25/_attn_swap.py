@@ -37,7 +37,13 @@ logger = logging.getLogger(__name__)
 
 try:
     from flash_rt import flash_rt_kernels as fvk
-except ImportError:  # pragma: no cover - kernels are part of the wheel
+except ModuleNotFoundError as exc:  # pragma: no cover - built artifact
+    # Only the extension's own absence is optional. An undefined symbol, a
+    # CUDA ABI mismatch, or a transitive dependency failing to load all
+    # surface as ImportError too, and swallowing those would report a
+    # broken build as "kernels unavailable" and silently run the fallback.
+    if exc.name != "flash_rt.flash_rt_kernels":
+        raise
     fvk = None
 
 _REQUIRED_SYMS = (

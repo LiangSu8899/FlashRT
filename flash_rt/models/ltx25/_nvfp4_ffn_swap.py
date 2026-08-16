@@ -28,7 +28,11 @@ logger = logging.getLogger(__name__)
 
 try:
     from flash_rt import flash_rt_kernels as fvk
-except ImportError:  # pragma: no cover
+except ModuleNotFoundError as exc:  # pragma: no cover - built artifact
+    # Same rule as the attention swap: the extension being absent is a
+    # fallback, the extension being broken is a bug and must be visible.
+    if exc.name != "flash_rt.flash_rt_kernels":
+        raise
     fvk = None
 
 _REQUIRED = (
@@ -41,6 +45,19 @@ _REQUIRED = (
 
 def fvk_ffn_available() -> bool:
     return fvk is not None and all(hasattr(fvk, s) for s in _REQUIRED)
+
+
+def rows_are_swappable(rows: int) -> bool:
+    """Whether the fused chain will accept a call of this row count.
+
+    The CUTLASS chain reports a validation failure for row counts that are
+    not 128-aligned and returns *without writing its output*, so a call that
+    reached it anyway would leave the caller reading whatever the buffer
+    held. The predicate lives here, named, because two places have to agree
+    on it: the forward that routes the call and the installer that decides
+    whether upstream weights can be freed.
+    """
+    return rows % 128 == 0
 
 
 def _swizzled_sf_bytes(rows: int, cols: int) -> int:
@@ -155,8 +172,8 @@ def _make_ffn_forward(ff: torch.nn.Module, buffers: _FfnBuffers,
         shape = x.shape
         x2 = x.reshape(-1, shape[-1])
         m = x2.shape[0]
-        if m % 128 != 0:
-            # The CUTLASS chain rejects unaligned M (can_implement status 11)
+        if not rows_are_swappable(m):
+            # The chain rejects unaligned M (can_implement status 11)
             # without writing the output; e.g. the ~126-token audio branch.
             # Those calls are negligible work -- keep them on upstream.
             if freed:
