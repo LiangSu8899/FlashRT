@@ -179,10 +179,27 @@ actually starts from.
 
 | Request | Host (offload) | `"nvfp4_balance"` | `"nvfp4_balance_sage"` |
 |---|---|---|---|
-| 768×512×49f | 99.8 s | 6.0 s (16.6×) | **5.7 s (17.5×)**, peak 26.8 GB |
+| 768×512×49f | 99.8 s | 6.0 s (16.6×), peak 29.9 GB | **5.7 s (17.5×)**, peak 26.8 GB |
+| 1536×1024×121f | 181.6 s | **87.9 s (2.07×)**, peak 28.0 GB | does not fit, see below |
 
-Medians of three warm runs. Frames are inspection-equivalent to the host's
-own output at both settings.
+Medians of three warm runs, eager. Frames are inspection-equivalent to the
+host's own output.
+
+The full-size row is the honest one to read closely. Attaching all 48 blocks
+succeeds and each block's gate measures 1.48×, but the assembled pipeline
+sits close to the limit of a 32GB part: 23.9 GB resident before the request
+begins, 28.0 GB at peak, and video-VAE tiling is needed for decode to have
+room at all. Three things account for the distance between 2.07× here and
+what the same hardware reaches with a hand-assembled configuration:
+
+- this measurement is eager, with no compilation of the block stack;
+- the quantized attention profile does not fit at this size yet — the
+  per-shape staging pool costs about 3 GB on top, which the assembly step
+  runs out of;
+- the audio feed-forward stays at host precision throughout, 3.0 GB across
+  the model, because its 126-row calls sit outside the fused chain's
+  128-row alignment and the seam declines them rather than produce an
+  unwritten output.
 
 ### Where the time goes, one transformer block
 
