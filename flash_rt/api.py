@@ -223,6 +223,28 @@ class VLAModel:
                 "This frontend does not expose infer().")
         return self._pipe.infer(*args, **kwargs)
 
+    def release_resident(self) -> int:
+        """Release device memory a frontend holds between calls.
+
+        Returns the bytes freed. A frontend that keeps nothing resident
+        answers 0 rather than refusing: "nothing to release" is a true
+        answer to this question, and a caller writing a serving loop should
+        not have to know which frontends hold weights across calls to be
+        able to ask.
+        """
+        release = getattr(self._pipe, "release_resident", None)
+        return release() if callable(release) else 0
+
+    def close(self) -> int:
+        """Release everything the frontend holds. Idempotent.
+
+        Frontends that implement it stay usable afterwards: the next call
+        reloads what it needs. Frontends that do not implement it hold
+        nothing to release, so this is 0 and the model is unchanged.
+        """
+        close = getattr(self._pipe, "close", None)
+        return close() if callable(close) else 0
+
     def calibrate(
         self,
         observations,
@@ -331,7 +353,10 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                max_tokens=512,
                encoder_p1_combiner=None,
                encoder_down_variant=7,
-               decoder_gate_up_variant=10):
+               decoder_gate_up_variant=10,
+               attention=None,
+               fuse=None,
+               compile_mode=None):
     """Load a FlashRT model.
 
     Args:
@@ -351,7 +376,9 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             after first load. Only affects JAX.
         config: model config name: "pi05", "pi0", "groot", "groot_n17",
             "pi0fast", "motus", "wan22_ti2v_5b", "cosmos3_video",
-            "cosmos3_edge".
+            "cosmos3_edge", "ltx25".
+            "ltx25" is the LTX-2.5 22B distilled audio+video generator:
+            drive it with set_prompt(...) + infer(...), not predict().
             "cosmos3_video" is a non-VLA text2video denoise model: drive it with
             set_prompt(ref=<reference dump>) + infer(...), not predict().
             "cosmos3_edge" is the official Cosmos Framework Thor baseline
@@ -535,12 +562,13 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                 "Supported: pi0, pi05, llm, mllm")
     elif config not in ("pi05", "groot", "groot_n17", "pi0", "pi0fast",
                       "motus", "wan22_ti2v_5b", "cosmos3_video",
-                      "cosmos3_edge", "nexn2", "qwen36_moe", "hyvla"):
+                      "cosmos3_edge", "nexn2", "qwen36_moe", "hyvla",
+                      "ltx25"):
         raise ValueError(
             f"Unknown config: {config}. "
             f"Supported: pi05, groot, groot_n17, pi0, pi0fast, motus, "
             f"wan22_ti2v_5b, cosmos3_video, cosmos3_edge, nexn2, "
-            f"qwen36_moe, hyvla")
+            f"qwen36_moe, hyvla, ltx25")
     if framework not in ("torch", "jax", "jetson_pi"):
         raise ValueError(
             f"Unknown framework: {framework}. Supported: torch, jax, jetson_pi")
@@ -924,6 +952,18 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
     elif config == "wan22_ti2v_5b":
         if "autotune" in sig.parameters:
             kwargs["autotune"] = autotune
+    elif config == "ltx25":
+        # The execution assembly is the decision a caller of this model has
+        # to make, so it belongs in the signature rather than in an
+        # environment variable: which attention backend, whether the fused
+        # FFN chain is installed, and whether the denoise loop is compiled
+        # and captured. Each is forwarded only when the frontend declares
+        # it, and only when the caller asked -- leaving the frontend's own
+        # defaults in place otherwise.
+        for name, value in (("attention", attention), ("fuse", fuse),
+                            ("compile_mode", compile_mode)):
+            if value is not None and name in sig.parameters:
+                kwargs[name] = value
     elif config == "hyvla":
         # The routed FP4 tier must reach the frontend explicitly; the
         # generic kwarg set never forwards use_fp4.

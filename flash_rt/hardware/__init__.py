@@ -135,6 +135,10 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
     ("wan22_ti2v_5b", "torch", "rtx_sm120"):
         ("flash_rt.frontends.torch.wan22_rtx", "Wan22TorchFrontendRtx"),
 
+    # ── LTX-2.5 22B distilled audio+video (RTX SM120 only) ──
+    ("ltx25", "torch", "rtx_sm120"):
+        ("flash_rt.frontends.torch.ltx25_rtx", "Ltx25TorchFrontendRtx"),
+
     # ── Cosmos3-Nano text2video FP8 denoise (RTX SM120 only) ──
     ("cosmos3_video", "torch", "rtx_sm120"):
         ("flash_rt.frontends.torch.cosmos3_video_rtx", "Cosmos3VideoTorchFrontendRtx"),
