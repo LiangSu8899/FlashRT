@@ -643,8 +643,8 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         raise NotImplementedError(
             "config='qwen36_moe' is a text LLM and is not served through "
             "load_model's VLA wrapper. Construct it directly:\n"
-            "    from flash_rt.frontends.torch.qwen36_moe_rtx import "
-            "Qwen36MoeTextFrontendRtx\n"
+            "    from flash_rt.frontends.torch.qwen36_moe import "
+            "Qwen36MoeTextFrontend\n"
             "See docs/qwen36_moe_usage.md.")
 
     # Refuse before the frontend import: a frontend that imports the
