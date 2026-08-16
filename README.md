@@ -734,11 +734,15 @@ kernel hub at bind time. It is *not* enough for the native
 them without a build produces a refusal that names the cmake line rather
 than a missing-module traceback. Build them with the section below.
 
-To attach the layer inside a serving engine — vLLM or SGLang, without
-forking either — see **[`docs/serving_engines.md`](docs/serving_engines.md)**:
-the four-line integration, why it hooks the loader rather than the model,
-the batch band and its knob, air-gapped kernel staging, and what each
-refusal means.
+Start at **[`docs/hosts.md`](docs/hosts.md)**: which door your host takes,
+how to tell a seated run from a refused one from a door that never fired,
+how to read a refusal, and what has actually been measured where.
+
+To attach inside a serving engine — vLLM or SGLang, without forking
+either — see **[`docs/serving_engines.md`](docs/serving_engines.md)**: the
+four-line integration, why it hooks the loader rather than the model, the
+start-method trap that makes the hook silently do nothing, the batch band
+and its knob, air-gapped kernel staging, and what each refusal means.
 
 Three boundaries are worth knowing before you start, because each one
 produces a refusal that looks like a bug and is not:

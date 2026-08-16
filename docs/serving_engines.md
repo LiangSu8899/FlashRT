@@ -72,6 +72,56 @@ Three engine facts, each of which cost a debugging session:
   registered at import. A plain `if rows > N` freezes at trace time and
   the arm that looks enabled is dead code.
 
+### Call it before anything touches CUDA
+
+This is the one trap that costs a debugging session, because it fails
+without raising anything.
+
+The engine **forks** its worker by default, which is what carries the
+patch into the process that loads the model. But it switches to
+**spawning** one the moment CUDA is already initialized in your process —
+and a spawned worker re-imports the engine from scratch, so the patch
+simply is not there. Checking free memory, calling
+`torch.cuda.is_available()`, setting a device, a warm-up, or importing
+any library that initializes CUDA is enough to flip it.
+
+```python
+import torch
+torch.cuda.mem_get_info()          # ← now the worker will be spawned
+vllm_engine.install_load_hook()    # patches this process, which is not
+llm = LLM(model=...)               #   the one that loads the model
+```
+
+Nothing raises. `install_load_hook()` really did patch, so it does not
+report "no vLLM model runner found"; the callback just never fires, and
+the run comes out at baseline speed. It reads exactly like "this layer
+does nothing".
+
+`install_load_hook()` refuses this state rather than let it happen
+silently. If you have a reason to proceed anyway, pass
+`allow_spawn=True`. Two ways out:
+
+- call `install_load_hook()` before anything touches CUDA, or
+- run the engine in this process with `VLLM_ENABLE_V1_MULTIPROCESSING=0`,
+  which is independent of initialization order.
+
+**Verify rather than assume.** The seats are in if and only if this line
+appeared:
+
+```
+[structures.vllm] 144 seats (5 head slabs), 0 refused
+```
+
+For a test or a service that should not start unaccelerated, assert it:
+
+```python
+llm = LLM(model=...)
+assert vllm_engine.attached(), "the hook never fired"
+```
+
+`strict=True` does not help here — it governs what happens when seats
+refuse, and in this failure attach never runs at all.
+
 ### Reading what happened
 
 ```
@@ -199,6 +249,35 @@ or correctness drift that arrived with a rebuild:
 ```bash
 export FRT_KERNEL_REV_<REPO_NAME_UPPERCASED_WITH_UNDERSCORES>=<revision>
 ```
+
+### Coverage is per package *and per version*, which is where it bites
+
+A package having a build for your architecture is not the same as the
+version being resolved having one. A repository whose newest revision
+covers aarch64 can have an older one that does not, and a request that
+resolves to the older revision refuses on that architecture with
+
+```
+CPU (x86_64) does not match system CPU (aarch64)
+```
+
+This has a specific consequence worth knowing before you read a
+disappointing number: on a routed-MoE host it is the **expert bank**
+seats that carry the concurrency gain, so if that one package resolves
+to a build without your architecture, every expert seat refuses while
+the dense seats attach normally. The run is correct and the log says
+`N seats, 40 refused` — but the batch-16 gain is most of what is gone.
+
+So read the refusal count, not just the speedup:
+
+```python
+handle.notes["refused"]        # (site, reason) per seat that declined
+impls.unavailable_report()     # per package: repo, version, error, detail
+```
+
+A large refused count concentrated on one seam family is a coverage
+report, not a mystery. Pin a revision that has your architecture with
+`FRT_KERNEL_REV_*`, or stage it and point at it with `LOCAL_KERNELS`.
 
 ---
 
