@@ -18,6 +18,8 @@ Before opening a PR:
    - New model integration: [`docs/adding_new_model.md`](docs/adding_new_model.md)
    - Kernel catalog: [`docs/kernel_catalog.md`](docs/kernel_catalog.md)
    - Calibration contract: [`docs/calibration.md`](docs/calibration.md)
+   - Structures contributions and self-review:
+     [`docs/structure_contributing.md`](docs/structure_contributing.md)
 2. Build the extension modules locally.
 3. Run the smallest test set that covers your change.
 4. Include the exact GPU, CUDA, command lines, and latency/precision numbers
@@ -362,6 +364,9 @@ Open the pull request from:
 
 Before requesting review:
 
+- For changes under `flash_rt/structures/`, complete the dedicated
+  [`structures contribution and PR self-review`](docs/structure_contributing.md)
+  checklist.
 - Read the full public review standard in
   [`docs/pr_review_checklist.md`](docs/pr_review_checklist.md) for the
   long-term maintenance rules reviewers will apply.
