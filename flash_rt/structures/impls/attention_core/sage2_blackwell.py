@@ -131,38 +131,55 @@ class DenseAttentionSage2(GuardedSeam, torch.nn.Module):
         return self._out_nhd.transpose(1, 2)
 
 
-def bind_sage2_dense_attention(captures, *, variant: str = "pv_fp8",
-                               qk_quant_granularity: str = "per_warp"):
-    """Bind the sage2 dense form from one real capture set, or refuse.
+def bind_dense_attention(captures, *, variant: str = "pv_fp8",
+                         qk_quant_granularity: str = "per_warp"):
+    """Bind one stateless dense sage2 core from repeated host captures.
 
-    ``captures`` follows the family convention: an object carrying
-    ``q_shape``, ``kv_shape``, ``dtype``, ``device``, and optionally
-    ``allowed_ranges`` / ``mask``. Returns ``None`` (with the reason as an
-    attribute on the function, mirroring the family's refusal trail) when
-    the site is outside this form's envelope.
+    ``captures`` is the family's own convention -- a sequence of per-call
+    dicts holding ``q``, ``key``, ``value`` and ``mask`` in host layout --
+    so this form qualifies a site the same way its BF16 siblings do:
+    the shape, dtype and mask must not move across the calibration call,
+    an unsupported shape returns ``None`` for the caller to keep its own
+    path, and a device the package does not serve raises so the family
+    binder can record it and move to the next rung.
     """
-    def refuse(reason: str):
-        bind_sage2_dense_attention.last_refusal = reason
+    if not captures:
+        raise ValueError("attention_core sage2: no captures")
+    first = captures[0]
+    query, key, value = first["q"], first["key"], first["value"]
+    if first.get("mask") is not None:
+        # No packed-KV plan transfers here: the quantizers consume dense
+        # NHD, so a masked site is not this form's, and saying so is what
+        # keeps the host's own attention on it.
         return None
-
-    mask = getattr(captures, "mask", None)
-    ranges = tuple(getattr(captures, "allowed_ranges", ()) or ())
-    if mask is not None or ranges:
-        return refuse("masked/packed sites are not claimed by sage2")
-    b, heads, seq_q, head_dim = captures.q_shape
-    try:
-        dims = supported_head_dims()
-    except (ValueError, OSError, RuntimeError) as exc:
-        return refuse(f"artifact unavailable: {exc}")
-    if head_dim not in dims:
-        return refuse(
-            f"head_dim {head_dim} outside artifact envelope {dims}")
-    if captures.dtype != torch.bfloat16:
-        return refuse(f"dtype {captures.dtype} outside envelope (bf16)")
-    try:
-        return DenseAttentionSage2(
-            captures.q_shape, captures.kv_shape, captures.dtype,
-            captures.device, variant=variant,
-            qk_quant_granularity=qk_quant_granularity)
-    except (ValueError, RuntimeError) as exc:
-        return refuse(str(exc))
+    if query.shape[-1] not in supported_head_dims():
+        return None
+    if tuple(key.shape) != tuple(value.shape):
+        return None
+    if key.shape[0] != query.shape[0] or key.shape[1] != query.shape[1]:
+        # A grouped-query site is a shape this form does not claim, which
+        # is an answer the caller acts on by keeping its own attention --
+        # not an error. The constructor still raises on it, because
+        # reaching it with such a shape would be this module's bug.
+        return None
+    expected = (tuple(query.shape), tuple(key.shape), tuple(value.shape),
+                query.dtype, key.dtype, value.dtype)
+    for capture in captures[1:]:
+        got = (tuple(capture["q"].shape), tuple(capture["key"].shape),
+               tuple(capture["value"].shape), capture["q"].dtype,
+               capture["key"].dtype, capture["value"].dtype)
+        if got != expected:
+            raise ValueError(
+                "attention_core sage2: shape or dtype moved within one "
+                f"calibration call: {expected} -> {got}")
+        if capture.get("mask") is not None:
+            raise ValueError(
+                "attention_core sage2: a mask appeared within one "
+                "calibration call")
+    if not (query.dtype == key.dtype == value.dtype):
+        raise ValueError("attention_core sage2: Q/K/V dtypes differ")
+    if query.dtype != torch.bfloat16:
+        return None
+    return DenseAttentionSage2(
+        query.shape, key.shape, query.dtype, query.device,
+        variant=variant, qk_quant_granularity=qk_quant_granularity)

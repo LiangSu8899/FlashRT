@@ -145,9 +145,19 @@ class _FlashRTGatedRotaryAttnProcessor:
 
 
 class DiffusersGatedRotaryAttentionAdapter:
-    """Route gated dual-rotary Diffusers processors through the family."""
+    """Route gated dual-rotary Diffusers processors through the family.
+
+    ``prefer`` is passed through to the family binder unchanged and is
+    empty by default: which executable form serves this seam is the
+    family's decision, and preferring a quantized one is a deployment
+    decision that belongs to whoever assembled this adapter, not to the
+    adapter itself.
+    """
 
     __name__ = "diffusers_gated_rotary_attention"
+
+    def __init__(self, prefer=()):
+        self.prefer = tuple(prefer)
 
     def __call__(self, model, forward, *, prefix_cadence: bool = False):
         del prefix_cadence
@@ -183,7 +193,7 @@ class DiffusersGatedRotaryAttentionAdapter:
                 ))
                 continue
             try:
-                core = bind_dense_attention_best(rows)
+                core = bind_dense_attention_best(rows, prefer=self.prefer)
             except ValueError as exc:
                 refused.append((f"{path}.processor", str(exc)[:160]))
                 continue

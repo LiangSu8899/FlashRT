@@ -121,39 +121,44 @@ class DenseAttentionSage3(GuardedSeam, torch.nn.Module):
         return out.transpose(1, 2)
 
 
-def bind_sage3_dense_attention(captures):
-    """Bind the sage3 dense form from one real capture set, or refuse.
+def bind_dense_attention(captures):
+    """Bind one stateless dense sage3 core from repeated host captures.
 
-    ``captures`` follows the family convention: an object carrying
-    ``q_shape``, ``kv_shape``, ``dtype``, ``device``, and optionally
-    ``allowed_ranges`` / ``mask``. Returns ``None`` (with the reason as an
-    attribute on the function, mirroring the family's refusal trail) when
-    the site is outside this form's envelope.
+    Same family convention as its siblings -- a sequence of per-call dicts
+    in host layout -- and the same division of answers: ``None`` for a site
+    this form does not claim, an exception when the calibration itself is
+    inconsistent or the package will not serve the device.
+
+    This form claims less than the INT8 one. The artifact's attention is
+    self-attention, so a cross-attention site (K/V shaped differently from
+    Q) is not its shape, and neither is a GQA site.
     """
-    def refuse(reason: str):
-        bind_sage3_dense_attention.last_refusal = reason
+    if not captures:
+        raise ValueError("attention_core sage3: no captures")
+    first = captures[0]
+    query, key, value = first["q"], first["key"], first["value"]
+    if first.get("mask") is not None:
         return None
-
-    mask = getattr(captures, "mask", None)
-    ranges = tuple(getattr(captures, "allowed_ranges", ()) or ())
-    if mask is not None or ranges:
-        return refuse("masked/packed sites are not claimed by sage3")
-    if tuple(captures.kv_shape) != tuple(captures.q_shape):
-        return refuse(
-            "self-attention form: Q and KV shapes differ at this site")
-    b, heads, seq_q, head_dim = captures.q_shape
-    try:
-        dims = supported_head_dims()
-    except (ValueError, OSError, RuntimeError) as exc:
-        return refuse(f"artifact unavailable: {exc}")
-    if head_dim not in dims:
-        return refuse(
-            f"head_dim {head_dim} outside artifact envelope {dims}")
-    if captures.dtype != torch.bfloat16:
-        return refuse(f"dtype {captures.dtype} outside envelope (bf16)")
-    try:
-        return DenseAttentionSage3(
-            captures.q_shape, captures.kv_shape, captures.dtype,
-            captures.device)
-    except (ValueError, RuntimeError) as exc:
-        return refuse(str(exc))
+    if query.shape[-1] not in supported_head_dims():
+        return None
+    if tuple(key.shape) != tuple(query.shape) or \
+            tuple(value.shape) != tuple(query.shape):
+        return None
+    expected = (tuple(query.shape), query.dtype, key.dtype, value.dtype)
+    for capture in captures[1:]:
+        got = (tuple(capture["q"].shape), capture["q"].dtype,
+               capture["key"].dtype, capture["value"].dtype)
+        if got != expected:
+            raise ValueError(
+                "attention_core sage3: shape or dtype moved within one "
+                f"calibration call: {expected} -> {got}")
+        if capture.get("mask") is not None:
+            raise ValueError(
+                "attention_core sage3: a mask appeared within one "
+                "calibration call")
+    if not (query.dtype == key.dtype == value.dtype):
+        raise ValueError("attention_core sage3: Q/K/V dtypes differ")
+    if query.dtype != torch.bfloat16:
+        return None
+    return DenseAttentionSage3(
+        query.shape, key.shape, query.dtype, query.device)

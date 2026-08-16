@@ -121,3 +121,72 @@ Measured on 5090 at 1536×1024×121f (median, video self-attention site,
 S=24576): SDPA-cudnn 42.4ms, sage2 17.4ms, sage3 13.0ms. End-to-end stage-2
 denoise per step: 5.11s (SDPA) → 3.84s (sage2), with output quality equivalent
 under matched-input single-forward cosine and frame inspection.
+
+## The same model through the structures layer
+
+The runtime above drives the official pipeline. The transformer is also
+reachable as an ordinary Diffusers host, where the structures layer attaches
+to it without a model-specific path:
+
+```python
+from flash_rt import structures
+
+plan = structures.attach(model, forward, scheme="nvfp4_balance")
+print(plan.report())          # bound seams, gate results, ledger
+plan.detach()                 # restores the host exactly
+```
+
+`attach` discovers the seams, calibrates on one real forward, gates accuracy
+and latency per family, and keeps the host path wherever a gate declines.
+Nothing here is LTX-specific: the attention seam is recognised by the
+processor contract (separate query/key rotary boundaries, per-head gating),
+not by a model or class name.
+
+### Measured on one transformer block
+
+Real checkpoint weights, real captured deployment inputs, paired alternating
+timing inside the gate, on a 5090. "Attention" is the gate's verdict for the
+attention family; the projections are the `nvfp4_balance` W4A4 form.
+
+| Site shape | Configuration | Block latency | Attention family | Peak memory |
+|---|---|---|---|---|
+| S=24576 (1536×1024×121f) | host | 134.3 ms | — | 12.2 GB |
+| | attach, default order | 117.1 ms (1.15×) | bound, declined at 1.006× | 8.2 GB |
+| | attach, sage2 preferred | **90.1 ms (1.49×)** | activated, 1.257× | at the 32GB ceiling |
+| S=2688 (768×512×49f) | host | 10.3 ms | — | 2.3 GB |
+| | attach, default order | 8.2 ms (1.25×) | declined | 1.7 GB |
+| | attach, sage2 preferred | 8.0 ms (1.28×) | activated | 4.8 GB |
+
+Matched-forward cosine against the host's own output is 0.99999 in every row,
+and `detach` restores it bit-exactly (max-abs 0.0). Two results are worth
+reading carefully rather than skipping:
+
+- **The default order does not use the quantized attention forms.** They trade
+  a bounded numerical error for speed, which is a deployment decision, so a
+  caller asks for one explicitly. Without that, the family's BF16 form binds,
+  and at these shapes the net-win gate measures it at 1.006× and keeps the
+  host's attention — the projections carry the whole win.
+- **Peak memory falls when the projections are quantized** (12.2 → 8.2 GB) and
+  rises when quantized attention is preferred, because each attention site
+  owns its staging and quantization workspace. At S=24576 across four sites
+  that reaches the ceiling of a 32GB part; pooling those workspaces is the
+  open item before this configuration is usable at full size.
+
+### Whole-model attach
+
+Attaching all 48 blocks and rendering end to end at 768×512×49f: **6.0 s**
+(median of three warm runs) against 99.8 s for the unmodified host with
+weight offloading, peak 29.9 GB. Quality is frame-inspection equivalent. Two
+qualifications on that figure: the blocks are attached one at a time because
+the bf16 checkpoint does not fit resident on a 32GB part, and the
+feed-forward seams are bound explicitly, because `vision_ffn` does not claim
+this host's shape — its projections carry no bias and its norm sits outside
+the seam, both of which the structure's boundary requires.
+
+### Kernel availability is the package's own statement
+
+The forms read their envelope from the installed artifact. The sage3 package
+publishes head_dim 128 only in its CUDA 13 builds; on a CUDA 12.8 host it
+advertises head_dim 64, so a 128-wide site is refused there and the ladder
+falls through — visible on the refusal trail rather than as a silent
+slowdown. Nothing in this repository keeps a second table of that.
