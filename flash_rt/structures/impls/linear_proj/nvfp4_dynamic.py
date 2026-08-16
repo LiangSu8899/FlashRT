@@ -24,6 +24,7 @@ transform, not a reversible attachment.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping
 from functools import lru_cache
 
@@ -223,6 +224,22 @@ class LinearProjNvfp4Dynamic(GuardedSeam, torch.nn.Module):
         gemv = getattr(kern, "fp4_w4a4_gemv_warpsplit_bf16", None)
         self._gemv = (gemv if gemv is not None
                       and n % 8 == 0 and k % (64 * 4) == 0 else None)
+        # measured per-shape launch config (512MB-rotation protocol,
+        # bench_v1_sweep): small-N underfilled shapes want max warps
+        # (+29%), long-K reads take (8,3) (+4%), the widest tall rows
+        # edge to (2,3); everything else stays the entry default (4,4).
+        # Each pick honors the kernel's (K/64)%warps==0 contract.
+        kt = k // 64
+        if os.environ.get("FRT_GEMV_CFG", "1") == "0":
+            self._gemv_cfg = (4, 4)
+        elif n <= 2048 and kt % 8 == 0:
+            self._gemv_cfg = (8, 4)
+        elif k >= 16384 and kt % 8 == 0:
+            self._gemv_cfg = (8, 3)
+        elif n >= 17000 and kt % 2 == 0:
+            self._gemv_cfg = (2, 3)
+        else:
+            self._gemv_cfg = (4, 4)
         # 2<=M<=16 rows route to the native multi-row warp-split tier
         # where the local build carries it. Per-shape launch config:
         # deeper stages hide the strided-B latency the extra A-row
@@ -262,9 +279,24 @@ class LinearProjNvfp4Dynamic(GuardedSeam, torch.nn.Module):
             a_packed, a_sfa = _quantize_activation(self._kern, flat)
             if cell is not None:
                 cell.x, cell.a, cell.sfa = x, a_packed, a_sfa
+        y = self._mm_packed(a_packed, a_sfa)
+        return y.reshape(*shape[:-1], self._n).type_as(x)
+
+    def _mm_packed(self, a_packed: torch.Tensor,
+                   a_sfa: torch.Tensor) -> torch.Tensor:
+        """Tier-dispatched matmul over a pre-quantized activation.
+
+        The same dispatch the seam's own forward uses, exposed so a
+        producer that already holds the packed activation (a fused
+        silu-mul epilogue, a sibling seam's shared quantization) can
+        feed the weights without a decode round-trip through BF16.
+        Returns the (m, n) BF16 product with bias applied.
+        """
         m = a_packed.shape[0]
         if m == 1 and self._gemv is not None:
-            y = self._gemv(a_packed, self._w_packed, a_sfa, self._w_sfb)
+            gw, gs = self._gemv_cfg
+            y = self._gemv(a_packed, self._w_packed, a_sfa, self._w_sfb,
+                           warps=gw, stages=gs)
         elif 2 <= m <= 16 and self._mrows is not None:
             w_, s_ = self._mr_cfg
             if self._mrows_hub:
@@ -281,7 +313,7 @@ class LinearProjNvfp4Dynamic(GuardedSeam, torch.nn.Module):
                            variant=2)
         if self._bias is not None:
             y = y + self._bias
-        return y.reshape(*shape[:-1], self._n).type_as(x)
+        return y
 
 
 @torch.no_grad()
