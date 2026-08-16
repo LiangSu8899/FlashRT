@@ -74,7 +74,10 @@ provisional; do not encode the first host as a universal abstraction.
 - Recognition uses slots, shapes, dataflow relations, and forward contracts;
   model IDs and concrete class-name allowlists are not discovery evidence.
 - Resolve, detach, cast, pack, and smoke-test at bind time. The installed
-  forward must contain no loader call or Python-side hot-path bookkeeping.
+  forward must contain no resolution: no loader call, symbol lookup,
+  capability probe, or plan construction. A route decided at bind and read
+  per call, such as a declared shape band or an already-chosen variant, is not
+  bookkeeping; it is the form that was bound.
 - Use the shared Hub loader. Symbol presence is a capability hint, not proof
   that a shape, dtype, layout, or architecture is qualified.
 - Route unsupported cases through an explicit refusal or declared host
@@ -128,6 +131,8 @@ Scope
 
 Contracts and failure modes
 - [ ] Discovery is structural, with positive and negative cases.
+- [ ] No catalog spec bytes changed, or the change carries a version bump with
+      its coexistence window and re-qualification note.
 - [ ] Hardware capability comes from the kernel package; this change adds no
       duplicate architecture table.
 - [ ] Unsupported or missing capability refuses clearly or takes a declared
@@ -173,6 +178,8 @@ present:
   evidence;
 - a structure definition contains hardware routing or a binding selects a
   kernel package;
+- a catalog `structure.yaml` is edited without a version decision: any byte
+  change alters `spec_digest` and orphans every receipt that cites it;
 - unsupported behavior silently degrades, or success can be explained by host
   fallback;
 - calibration, precision selection, diagnostics, or receipts are duplicated;
