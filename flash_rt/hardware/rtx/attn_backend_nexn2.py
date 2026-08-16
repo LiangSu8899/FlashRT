@@ -27,6 +27,18 @@ Decode contract (q_seq=1):
 from __future__ import annotations
 
 
+def _load_optional_fa2():
+    """Load FA2, treating only this module's absence as optional."""
+    import importlib
+
+    try:
+        return importlib.import_module("flash_rt.flash_rt_fa2")
+    except ModuleNotFoundError as exc:
+        if exc.name != "flash_rt.flash_rt_fa2":
+            raise
+        return None
+
+
 class RtxFlashAttnBackendNexn2:
     """Nex-N2-mini full-attention backend (BF16 attention math).
 
@@ -121,6 +133,7 @@ class RtxFlashAttnBackendNexn2:
         # was recorded through the reference path, decline it.
         # FLASHRT_NEXN2_DECODE_FA2 overrides either way.
         import os as _os
+        _env_override = "FLASHRT_NEXN2_DECODE_FA2" in _os.environ
         if use_fa2 is None:
             _cap = torch.cuda.get_device_capability()
             _default = "0" if _cap == (11, 0) else "1"
@@ -128,14 +141,16 @@ class RtxFlashAttnBackendNexn2:
                 "FLASHRT_NEXN2_DECODE_FA2", _default) != "0"
         else:
             want_fa2 = bool(use_fa2)
-        try:
-            from flash_rt import flash_rt_fa2 as _fa2
-        except ImportError:
-            self._fa2 = None
-            self._fa2_fwd = None
-        else:
-            self._fa2 = _fa2 if want_fa2 else None
-            self._fa2_fwd = _fa2.fwd_bf16 if want_fa2 else None
+        self._require_fa2 = bool(
+            use_fa2 is True or (_env_override and want_fa2))
+        _fa2 = _load_optional_fa2()
+        if want_fa2 and _fa2 is None and self._require_fa2:
+            raise RuntimeError(
+                "FA2 was explicitly requested, but flash_rt.flash_rt_fa2 "
+                "is not installed. Build the FA2 module or disable the "
+                "explicit FA2 request.")
+        self._fa2 = _fa2 if want_fa2 else None
+        self._fa2_fwd = _fa2.fwd_bf16 if self._fa2 is not None else None
         self._num_sms = torch.cuda.get_device_properties(
             torch.cuda.current_device()
         ).multi_processor_count
@@ -179,7 +194,16 @@ class RtxFlashAttnBackendNexn2:
             self._launch_fa2(0, q_seq, kv_seq, 0,
                              1.0 / (self.HEAD_DIM ** 0.5))
             torch.cuda.synchronize()
-        except Exception:                                    # noqa: BLE001
+        except Exception as exc:                             # noqa: BLE001
+            if self._require_fa2:
+                raise RuntimeError(
+                    "FA2 was explicitly requested, but its runtime probe "
+                    "failed.") from exc
+            import warnings
+
+            warnings.warn(
+                "FA2 runtime probe failed; using the SDPA attention "
+                f"fallback: {exc!r}", RuntimeWarning, stacklevel=2)
             return False
         produced = self.O_buf[:, :q_seq].float().clone()
 
@@ -190,14 +214,27 @@ class RtxFlashAttnBackendNexn2:
             q.transpose(1, 2).float(), kr.transpose(1, 2).float(),
             vr.transpose(1, 2).float()).transpose(1, 2)
         if not torch.isfinite(produced).all():
-            return False
-        reference = expected.norm().clamp_min(1e-6)
-        return bool(
-            ((produced - expected).norm() / reference).item() < 0.05)
+            usable = False
+        else:
+            reference = expected.norm().clamp_min(1e-6)
+            usable = bool(
+                ((produced - expected).norm() / reference).item() < 0.05)
+        if not usable:
+            message = (
+                "FA2 runtime probe produced invalid or mismatched output.")
+            if self._require_fa2:
+                raise RuntimeError(message)
+            import warnings
+
+            warnings.warn(
+                message + " Using the SDPA attention fallback.",
+                RuntimeWarning, stacklevel=2)
+        return usable
 
     def _sdpa(self, layer_idx: int, q_seq: int, kv_seq: int,
               softmax_scale: float) -> None:
-        """Reference attention, for a device the vendored kernel refuses."""
+        """Bottom-right causal reference for a rejected/absent FA2 kernel."""
+        import torch
         import torch.nn.functional as F
 
         # BF16 throughout. The cache is bf16, so upcasting it materialises the
@@ -213,17 +250,29 @@ class RtxFlashAttnBackendNexn2:
         # GQA does the same thing without the copy. fp32 either way, so the
         # numerics are untouched -- this path seeds a token-exact decode.
         groups = self.NUM_Q_HEADS // self.NUM_KV_HEADS
+        if q_seq > kv_seq:
+            raise ValueError(
+                f"q_seq={q_seq} cannot exceed kv_seq={kv_seq} for causal "
+                "attention")
+        mask = None
+        if 1 < q_seq < kv_seq:
+            q_positions = torch.arange(
+                kv_seq - q_seq, kv_seq, device=q.device).unsqueeze(1)
+            mask = torch.arange(
+                kv_seq, device=q.device).unsqueeze(0) <= q_positions
         try:
             out = F.scaled_dot_product_attention(
                 q, k.transpose(1, 2), v.transpose(1, 2),
-                is_causal=q_seq > 1, scale=softmax_scale, enable_gqa=True,
+                attn_mask=mask, is_causal=q_seq == kv_seq and q_seq > 1,
+                scale=softmax_scale, enable_gqa=True,
             ).transpose(1, 2)
         except TypeError:                       # torch without native GQA
             out = F.scaled_dot_product_attention(
                 q,
                 k.repeat_interleave(groups, dim=2).transpose(1, 2),
                 v.repeat_interleave(groups, dim=2).transpose(1, 2),
-                is_causal=q_seq > 1, scale=softmax_scale,
+                attn_mask=mask, is_causal=q_seq == kv_seq and q_seq > 1,
+                scale=softmax_scale,
             ).transpose(1, 2)
         self.O_buf[:, :q_seq].copy_(out.to(self.O_buf.dtype))
 

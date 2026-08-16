@@ -48,13 +48,108 @@ def test_causal_wrapper_respects_slim_hdim_matrix():
 def _fwd():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for the FA2 shape test")
-    try:
-        import flash_rt.frontends.torch._nexn2_rtx_forward as fwd
-    except Exception as exc:                # pragma: no cover - environmental
-        pytest.skip(f"frontend not importable: {exc}")
+    import flash_rt.frontends.torch._nexn2_rtx_forward as fwd
     if fwd._get_fa2() is None:
         pytest.skip("FA2 is not built for this target")
     return fwd
+
+
+def test_optional_fa2_import_only_swallows_its_own_absence(monkeypatch):
+    import importlib
+    import flash_rt.frontends.torch._nexn2_rtx_forward as fwd
+
+    fwd._FA2_MOD = None
+
+    def absent(name):
+        raise ModuleNotFoundError(name=name)
+
+    monkeypatch.setattr(importlib, "import_module", absent)
+    assert fwd._get_fa2() is None
+
+    fwd._FA2_MOD = None
+
+    def broken(_name):
+        raise ImportError("undefined symbol: run_mha_fwd")
+
+    monkeypatch.setattr(importlib, "import_module", broken)
+    with pytest.raises(ImportError, match="undefined symbol"):
+        fwd._get_fa2()
+
+
+def test_backend_optional_import_propagates_link_errors(monkeypatch):
+    import importlib
+    from flash_rt.hardware.rtx.attn_backend_nexn2 import _load_optional_fa2
+
+    def broken(_name):
+        raise ImportError("undefined symbol: run_mha_fwd")
+
+    monkeypatch.setattr(importlib, "import_module", broken)
+    with pytest.raises(ImportError, match="undefined symbol"):
+        _load_optional_fa2()
+
+
+def _backend_with_failed_probe():
+    from flash_rt.hardware.rtx.attn_backend_nexn2 import (
+        RtxFlashAttnBackendNexn2,
+    )
+
+    backend = RtxFlashAttnBackendNexn2.__new__(RtxFlashAttnBackendNexn2)
+    backend.Q_buf = torch.empty(1, 1, 16, 256, dtype=torch.bfloat16)
+    backend.K_cache = torch.empty(1, 8, 2, 256, dtype=torch.bfloat16)
+    backend.V_cache = torch.empty_like(backend.K_cache)
+    backend.O_buf = torch.empty_like(backend.Q_buf)
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("probe launch failed")
+
+    backend._launch_fa2 = fail
+    return backend
+
+
+def test_probe_failure_warns_before_automatic_fallback():
+    backend = _backend_with_failed_probe()
+    backend._require_fa2 = False
+    with pytest.warns(RuntimeWarning, match="SDPA attention fallback"):
+        assert backend._probe_fa2() is False
+
+
+def test_probe_failure_is_fatal_when_fa2_is_explicit():
+    backend = _backend_with_failed_probe()
+    backend._require_fa2 = True
+    with pytest.raises(RuntimeError, match="explicitly requested"):
+        backend._probe_fa2()
+
+
+def test_sdpa_fallback_uses_bottom_right_causal_window():
+    from flash_rt.hardware.rtx.attn_backend_nexn2 import (
+        RtxFlashAttnBackendNexn2,
+    )
+
+    q_seq, kv_seq = 3, 7
+    generator = torch.Generator().manual_seed(19)
+    backend = RtxFlashAttnBackendNexn2.__new__(RtxFlashAttnBackendNexn2)
+    backend.Q_buf = torch.randn(
+        1, q_seq, 16, 256, generator=generator, dtype=torch.bfloat16)
+    backend.K_cache = torch.randn(
+        1, kv_seq, 2, 256, generator=generator, dtype=torch.bfloat16)
+    backend.V_cache = torch.randn_like(backend.K_cache)
+    backend.O_buf = torch.empty_like(backend.Q_buf)
+
+    scale = 256 ** -0.5
+    backend._sdpa(0, q_seq, kv_seq, scale)
+    produced = backend.O_buf.float()
+
+    q = backend.Q_buf.transpose(1, 2).float()
+    k = backend.K_cache.repeat_interleave(8, dim=2).transpose(1, 2).float()
+    v = backend.V_cache.repeat_interleave(8, dim=2).transpose(1, 2).float()
+    scores = (q @ k.transpose(-1, -2)) * scale
+    q_positions = torch.arange(kv_seq - q_seq, kv_seq).unsqueeze(1)
+    mask = torch.arange(kv_seq).unsqueeze(0) <= q_positions
+    expected = (scores.masked_fill(~mask, float("-inf")).softmax(-1)
+                @ v).transpose(1, 2)
+    relative = ((produced - expected).norm()
+                / expected.norm().clamp_min(1e-6)).item()
+    assert relative < 5e-3
 
 
 def _reference(q, k, v, dev):

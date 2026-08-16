@@ -777,9 +777,13 @@ def _get_fa2():
     """
     global _FA2_MOD
     if _FA2_MOD is None:
+        import importlib
+
         try:
-            from flash_rt import flash_rt_fa2 as _m
-        except ImportError:
+            _m = importlib.import_module("flash_rt.flash_rt_fa2")
+        except ModuleNotFoundError as exc:
+            if exc.name != "flash_rt.flash_rt_fa2":
+                raise
             _FA2_MOD = False
         else:
             _FA2_MOD = _m
@@ -809,7 +813,12 @@ def _fa2_usable(device):
     try:
         produced = _fa2_causal_attn(q, k, v, device, _probe=True).float()
         torch.cuda.synchronize(device)
-    except Exception:                                        # noqa: BLE001
+    except Exception as exc:                                 # noqa: BLE001
+        import warnings
+
+        warnings.warn(
+            "Qwen3.6 FA2 causal probe failed; falling back to bottom-right "
+            f"SDPA attention: {exc!r}", RuntimeWarning, stacklevel=2)
         _FA2_USABLE = False
         return False
     expected = _sdpa_causal_attn(q, k, v, device).float()
@@ -817,6 +826,13 @@ def _fa2_usable(device):
         torch.isfinite(produced).all()
         and ((produced - expected).norm()
              / expected.norm().clamp_min(1e-6)).item() < 0.05)
+    if not _FA2_USABLE:
+        import warnings
+
+        warnings.warn(
+            "Qwen3.6 FA2 causal probe produced invalid or mismatched output; "
+            "falling back to bottom-right SDPA attention.",
+            RuntimeWarning, stacklevel=2)
     return _FA2_USABLE
 
 
