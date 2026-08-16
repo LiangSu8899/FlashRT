@@ -51,7 +51,10 @@ def _native_silu_mul():
         h = two_h // 2
         packed = torch.empty(m, h // 2, device=merged.device,
                              dtype=torch.uint8)
-        sfa = torch.empty(
+        # zero-filled: a partial 128-row scale atom leaves tail rows
+        # unwritten, and run-to-run garbage there is a nondeterminism
+        # channel for any consumer that loads whole atoms
+        sfa = torch.zeros(
             ((m + 127) // 128) * ((h + 63) // 64) * 512,
             device=merged.device, dtype=torch.uint8)
         rc = fn(merged.data_ptr(), packed.data_ptr(), sfa.data_ptr(),
