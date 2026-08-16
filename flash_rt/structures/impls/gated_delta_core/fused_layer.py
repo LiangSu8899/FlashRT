@@ -44,6 +44,176 @@ FUSED_DEP = {"provider": "hf", "repo": "flashrt/transformer-fused-ops",
 
 
 @lru_cache(maxsize=1)
+def _native_ltri_inv():
+    """The native batched 64x64 unit-lower-triangular inverse.
+
+    Same forward-substitution recurrence class as the batched cuBLAS
+    solve it replaces (fp32 error band matches), with the identity/
+    tril preparation folded in — the eye/expand/tril materializations
+    disappear with the solve. Registered as a torch custom op with a
+    fake so the compiled prefill traces through it. Absence is not a
+    refusal: the cuBLAS solve path keeps serving.
+    """
+    try:
+        from flash_rt import flash_rt_kernels as _fk
+    except ImportError:
+        return None
+    fn = getattr(_fk, "batched_unit_ltri_inv64_f32", None)
+    if fn is None:
+        return None
+
+    from torch.library import custom_op
+
+    @custom_op("flashrt_native::unit_ltri_inv64", mutates_args=())
+    def _op(big_a: torch.Tensor) -> torch.Tensor:
+        flat = big_a.reshape(-1, 64, 64).contiguous()
+        x = torch.empty_like(flat)
+        rc = fn(flat.data_ptr(), x.data_ptr(), flat.shape[0],
+                torch.cuda.current_stream().cuda_stream)
+        if rc != 0:
+            raise RuntimeError(
+                f"unit_ltri_inv64 refused rc={rc} for "
+                f"B={flat.shape[0]}")
+        return x.reshape(big_a.shape)
+
+    @_op.register_fake
+    def _(big_a):
+        return torch.empty_like(big_a)
+
+    return _op
+
+
+import os as _os
+
+_NCP_ON = _os.environ.get("FRT_WY_NCP_V2", "1") != "0"
+
+
+@lru_cache(maxsize=1)
+def _native_conv_steps_gqa():
+    """The step-batched conv1d update with GQA split outputs.
+
+    The packaged chunk-parallel conv reads every input element K times
+    from DRAM (one token per thread); this arm rolls the taps through
+    registers over 8 consecutive tokens with the packaged tap order and
+    fma chain — bit-exact — and writes the q/k/v splits directly.
+    Fixed 2048/2048/6144, K=4 family only.
+    """
+    try:
+        from flash_rt import flash_rt_kernels as _fk
+    except ImportError:
+        return None
+    fn = getattr(_fk, "causal_conv1d_update_steps_gqa_bf16", None)
+    if fn is None:
+        return None
+
+    from torch.library import custom_op
+
+    @custom_op("flashrt_native::conv1d_steps_gqa", mutates_args=())
+    def _op(x: torch.Tensor, w: torch.Tensor, bias: torch.Tensor,
+            state: torch.Tensor) -> list[torch.Tensor]:
+        # bias is required: the Optional-tensor marshalling was
+        # measured to corrupt the following pointer operands; a
+        # bias-free host passes an explicit zeros row (acc starts at
+        # 0.0 either way - bit-identical to the null-bias path)
+        s = x.shape[0]
+        q16 = torch.empty((s, 16, 128), device=x.device,
+                          dtype=torch.bfloat16)
+        k16 = torch.empty((s, 16, 128), device=x.device,
+                          dtype=torch.bfloat16)
+        v48 = torch.empty((s, 48, 128), device=x.device,
+                          dtype=torch.bfloat16)
+        rc = fn(x.data_ptr(), w.data_ptr(), bias.data_ptr(),
+                state.data_ptr(), q16.data_ptr(), k16.data_ptr(),
+                v48.data_ptr(), s, True,
+                torch.cuda.current_stream().cuda_stream)
+        if rc != 0:
+            raise RuntimeError(f"conv1d_steps_gqa refused rc={rc}")
+        return [q16, k16, v48]
+
+    @_op.register_fake
+    def _(x, w, bias, state):
+        s = x.shape[0]
+        return [x.new_empty((s, 16, 128)), x.new_empty((s, 16, 128)),
+                x.new_empty((s, 48, 128))]
+
+    return _op
+
+
+@lru_cache(maxsize=1)
+def _native_norm_cumsum_pack():
+    """The native v2 launch of the WY norm/pack + gate-cumsum pair.
+
+    Math transcribed verbatim from the packaged fast arm; the gate
+    cumsum is parallelized over the independent (chunk, head) pairs
+    (the packaged kernel walks the whole prompt from one 64-thread
+    block). Bit-exact against the packaged pair. Fixed 16/48/128/64
+    family only — absence or another family keeps the packaged op.
+    """
+    try:
+        from flash_rt import flash_rt_kernels as _fk
+    except ImportError:
+        return None
+    fn = getattr(_fk, "gdn_wy_norm_cumsum_pack_qk_v2_bf16", None)
+    if fn is None:
+        return None
+
+    from torch.library import custom_op
+
+    @custom_op("flashrt_native::gdn_wy_ncp_v2", mutates_args=())
+    def _op(q16: torch.Tensor, k16: torch.Tensor,
+            g: torch.Tensor) -> list[torch.Tensor]:
+        s = q16.shape[0]
+        c = (s + 63) // 64
+        q16_l2 = torch.empty_like(q16)
+        k16_l2 = torch.empty_like(k16)
+        q_pack_hv = torch.empty((c, 48, 64, 128), device=q16.device,
+                                dtype=q16.dtype)
+        k_pack_hk = torch.empty((c, 16, 64, 128), device=q16.device,
+                                dtype=q16.dtype)
+        g_cumsum = torch.empty_like(g)
+        rc = fn(q16.data_ptr(), k16.data_ptr(), g.data_ptr(),
+                q16_l2.data_ptr(), k16_l2.data_ptr(),
+                q_pack_hv.data_ptr(), k_pack_hk.data_ptr(),
+                g_cumsum.data_ptr(), s,
+                torch.cuda.current_stream().cuda_stream)
+        if rc != 0:
+            raise RuntimeError(f"gdn_wy_ncp_v2 refused rc={rc} S={s}")
+        return [q16_l2, k16_l2, q_pack_hv, k_pack_hk, g_cumsum]
+
+    @_op.register_fake
+    def _(q16, k16, g):
+        s = q16.shape[0]
+        c = (s + 63) // 64
+        return [torch.empty_like(q16), torch.empty_like(k16),
+                q16.new_empty((c, 48, 64, 128)),
+                q16.new_empty((c, 16, 64, 128)),
+                torch.empty_like(g)]
+
+    def _entry(q16, k16, g):
+        if (q16.shape[1:] != (16, 128)
+                or g.shape[-1] != 48):
+            return None
+        return _op(q16.contiguous(), k16.contiguous(), g.contiguous())
+
+    return _entry
+
+
+def _wy_ai_inverse(big_a: torch.Tensor) -> torch.Tensor:
+    """inv(I + strict_tril(A)) for the WY chain, batched 64x64 fp32."""
+    import os
+    if (big_a.dtype is torch.float32
+            and big_a.shape[-2:] == (64, 64)
+            and os.environ.get("FRT_TRSM_NATIVE", "1") != "0"):
+        inv = _native_ltri_inv()
+        if inv is not None:
+            return inv(big_a)
+    eye = torch.eye(64, device=big_a.device,
+                    dtype=big_a.dtype).expand_as(big_a).contiguous()
+    return torch.linalg.solve_triangular(
+        eye + torch.tril(big_a, -1), eye, upper=False)
+
+
+@lru_cache(maxsize=1)
 def _native_stash_op():
     """The native per-row-stash arm of the from-conv chunk core.
 
@@ -186,6 +356,11 @@ class FusedGatedDeltaDecodeLayer(GuardedSeam, torch.nn.Module):
         self._conv_w = host.conv1d.weight.detach().squeeze(1).contiguous()
         self._conv_b = (host.conv1d.bias.detach().contiguous()
                         if host.conv1d.bias is not None else None)
+        # dense bias operand for the step-batched conv arm (required
+        # tensor; zeros reproduce the null-bias accumulator exactly)
+        self._conv_b_dense = (self._conv_b if self._conv_b is not None
+                              else torch.zeros_like(self._conv_w[:, 0])
+                              .contiguous())
         self._neg_exp_a = (-host.A_log.detach().float().exp()).contiguous()
         self._dt_bias = host.dt_bias.detach().float().contiguous()
         self._eps = float(getattr(host.norm, "variance_epsilon",
@@ -333,9 +508,13 @@ class FusedGatedDeltaDecodeLayer(GuardedSeam, torch.nn.Module):
         """
         host = self.host_layer
         S = hidden_states.shape[1]
-        x = hidden_states.view(S, -1)
-        allp = (self._proj_in(x) if self._proj_in is not None
-                else torch.nn.functional.linear(x, self._packed_w))
+        # hand the seam the caller's tensor, not a view of it: an
+        # upstream producer that pre-quantized this activation keys the
+        # handoff on tensor identity, and a .view here would break it
+        allp = (self._proj_in(hidden_states).view(S, -1)
+                if self._proj_in is not None
+                else torch.nn.functional.linear(
+                    hidden_states.view(S, -1), self._packed_w))
         (q0, q1), (z0, z1), (b0, b1), (a0, a1) = self._splits
         mixed = allp[:, q0:q1].contiguous()
         a_all = allp[:, a0:a1].contiguous()
@@ -449,32 +628,58 @@ class FusedGatedDeltaDecodeLayer(GuardedSeam, torch.nn.Module):
         fallback core pays.
         """
         gda = self._gda
-        conv_out = self._conv.causal_conv1d_update_chunk_parallel_bf16(
-            mixed.view(1, S, -1), self._conv_w, conv_state,
-            self._conv_b, apply_silu=True)
-        co = conv_out.view(S, -1)
+        # the GQA conv variant writes the q/k/v splits directly (same
+        # channel mapping and tap order as conv -> lin_split, bit-exact)
+        # and saves the full-width conv_out round trip; the head-generic
+        # arm keeps the plain conv + host-side slicing
+        conv_gqa = (None if self._wy_h
+                    or _os.environ.get("FRT_CONV_GQA", "1") == "0"
+                    else getattr(
+            self._conv, "causal_conv1d_update_chunk_parallel_gqa_bf16",
+            None))
+        if conv_gqa is None:
+            conv_out = self._conv.causal_conv1d_update_chunk_parallel_bf16(
+                mixed.view(1, S, -1), self._conv_w, conv_state,
+                self._conv_b, apply_silu=True)
+            co = conv_out.view(S, -1)
         g, beta = self._gate_fn(
             a_all.view(S, self._hv), b_all.view(S, self._hv),
             self._neg_exp_a, self._dt_bias)
         if self._wy_h:
             return self._wy_core_h(gda, co, g, beta, state, S)
-        q16, k16, v48 = gda.lin_split_qkv_gqa_bf16(co)
-        q16_l2, k16_l2, q_pack_hv, _k_pack_hk, g_cumsum = \
-            gda.gdn_wy_norm_cumsum_pack_qk_bf16(q16, k16, g)
+        if conv_gqa is not None:
+            steps = _native_conv_steps_gqa()
+            if steps is not None and mixed.shape[-1] == 10240:
+                q16, k16, v48 = steps(
+                    mixed.view(S, -1), self._conv_w.view(-1, 4),
+                    self._conv_b_dense, conv_state.view(-1, 3))
+            else:
+                q16, k16, v48 = conv_gqa(
+                    mixed.view(1, S, -1), self._conv_w, conv_state,
+                    self._conv_b, apply_silu=True)
+                q16 = q16.view(S, 16, 128)
+                k16 = k16.view(S, 16, 128)
+                v48 = v48.view(S, 48, 128)
+        else:
+            q16, k16, v48 = gda.lin_split_qkv_gqa_bf16(co)
+        ncp = _native_norm_cumsum_pack() if _NCP_ON else None
+        packed_qk = ncp(q16, k16, g) if ncp is not None else None
+        if packed_qk is not None:
+            q16_l2, k16_l2, q_pack_hv, _k_pack_hk, g_cumsum = packed_qk
+        else:
+            q16_l2, k16_l2, q_pack_hv, _k_pack_hk, g_cumsum = \
+                gda.gdn_wy_norm_cumsum_pack_qk_bf16(q16, k16, g)
         # the wmma Gram tier replaces the scalar walk where the
         # installed artifact carries it - same signature, same A
         # layout, 32.8x on the measured long-prompt term
         kkt = getattr(gda, "gdn_wy_kkt_b64_mma_bf16", None) \
             or gda.gdn_wy_kkt_b64_bf16
         big_a = kkt(k16_l2, beta, g_cumsum)
-        # the packaged triangular solve walks its rows serially and is
-        # the measured 82% of this chain; the same inverse — semantics
-        # pinned numerically: inv(I + strict_tril(A)) — through the
-        # batched cuBLAS solve runs ~40x faster and stays deterministic
-        eye = torch.eye(64, device=big_a.device,
-                        dtype=big_a.dtype).expand_as(big_a).contiguous()
-        ai = torch.linalg.solve_triangular(
-            eye + torch.tril(big_a, -1), eye, upper=False).contiguous()
+        # inv(I + strict_tril(A)): the native fused inverse where the
+        # build carries it (same fp32 forward-substitution recurrence
+        # as the batched cuBLAS solve, eye/tril prep folded in), the
+        # cuBLAS solve otherwise
+        ai = _wy_ai_inverse(big_a).contiguous()
         ai_pack = gda.gdn_wy_cast_ai_f32_to_bf16(ai, S)
         w_pack, u_pack = gda.gdn_wy_recompute_wu_b64_mma_fla_bf16(
             k16_l2, v48, beta, g_cumsum, ai_pack)
@@ -500,10 +705,7 @@ class FusedGatedDeltaDecodeLayer(GuardedSeam, torch.nn.Module):
         q_l2, k_l2, q_pack_hv, _k_pack_hk, g_cumsum = \
             gda.gdn_wy_norm_cumsum_pack_qk_h_bf16(q, k, g, **hp)
         big_a = gda.gdn_wy_kkt_b64_h_bf16(k_l2, beta, g_cumsum, **hp)
-        eye = torch.eye(64, device=big_a.device,
-                        dtype=big_a.dtype).expand_as(big_a).contiguous()
-        ai = torch.linalg.solve_triangular(
-            eye + torch.tril(big_a, -1), eye, upper=False).contiguous()
+        ai = _wy_ai_inverse(big_a).contiguous()
         ai_pack = gda.gdn_wy_cast_ai_h_f32_to_bf16(
             ai, S, num_v_heads=self._hv)
         w_pack, u_pack = gda.gdn_wy_recompute_wu_b64_mma_fla_h_bf16(
@@ -579,9 +781,11 @@ class FusedGatedDeltaDecodeLayer(GuardedSeam, torch.nn.Module):
 
     def _decode_one(self, hidden_states, cache_params):
         host = self.host_layer
-        x = hidden_states.view(1, -1)
-        allp = (self._proj_in(x) if self._proj_in is not None
-                else torch.nn.functional.linear(x, self._packed_w))
+        # same identity-preserving handoff as the prefill chain
+        allp = (self._proj_in(hidden_states).view(1, -1)
+                if self._proj_in is not None
+                else torch.nn.functional.linear(
+                    hidden_states.view(1, -1), self._packed_w))
         # column slices of a single-row output stay contiguous
         (q0, q1), (z0, z1), (b0, b1), (a0, a1) = self._splits
         mixed = allp[:, q0:q1]
