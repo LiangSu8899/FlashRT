@@ -193,6 +193,7 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #include "kernels/batched_unit_ltri_inv64.cuh"
 #include "kernels/rms_norm_quantize_fp4_sfa_bf16.cuh"
 #include "kernels/gdn_wy_norm_cumsum_pack_qk_v2.cuh"
+#include "kernels/causal_conv1d_update_steps_gqa_bf16.cuh"
 #include "quantize/fp8_block128_dequant.cuh"
 #ifdef FLASHRT_HAVE_NVFP4_SWIZZLE
 #include "quantize/fp8_block128_to_nvfp4_swizzled.cuh"
@@ -6760,6 +6761,27 @@ WY-chain q/k L2-norm + pack + per-chunk gate cumsum for the fixed
 verbatim from the packaged fast arm, the gate cumsum parallelized over
 the independent (chunk, head) pairs with the packaged serial order kept
 inside each chunk - bit-exact against the packaged pair.
+)pbdoc");
+
+    m.def("causal_conv1d_update_steps_gqa_bf16",
+        [](uintptr_t x, uintptr_t w, uintptr_t bias, uintptr_t state,
+           uintptr_t q16, uintptr_t k16, uintptr_t v48, int S,
+           bool apply_silu, uintptr_t stream) -> int {
+            return flash_rt::kernels::causal_conv1d_update_steps_gqa_bf16(
+                to_ptr(x), to_ptr(w), to_ptr(bias), to_ptr(state),
+                to_ptr(q16), to_ptr(k16), to_ptr(v48), S, apply_silu,
+                to_stream(stream));
+        },
+        py::arg("x"), py::arg("w"), py::arg("bias"), py::arg("state"),
+        py::arg("q16"), py::arg("k16"), py::arg("v48"), py::arg("S"),
+        py::arg("apply_silu") = true, py::arg("stream") = 0,
+        R"pbdoc(
+Chunk-parallel causal conv1d update (K=4, the 2048/2048/6144 q/k/v
+channel family) with per-thread step batching and GQA split outputs.
+Taps roll through registers - (STEPS+3)/STEPS read amplification
+instead of 4x - with the packaged kernel's tap order and fma chain,
+bit-exact. x: (S, 10240); w: (10240, 4); state: (10240, 3) last raw
+inputs; q16/k16: (S, 2048), v48: (S, 6144), silu applied.
 )pbdoc");
 
     m.def("gdn_chunk_from_conv_smem_h_stash_bf16",

@@ -1374,6 +1374,10 @@ target_sources(flash_rt_kernels PRIVATE
 target_sources(flash_rt_kernels PRIVATE
   csrc/kernels/gdn_wy_norm_cumsum_pack_qk_v2.cu)
 
+# Causal conv1d update with per-thread step batching + GQA split.
+target_sources(flash_rt_kernels PRIVATE
+  csrc/kernels/causal_conv1d_update_steps_gqa_bf16.cu)
+
 # Gated-delta chunk core, per-row state stash arm (spec-verify rollback
 # by selection). Plain CUDA, no CUTLASS dependency, arch-agnostic.
 target_sources(flash_rt_kernels PRIVATE
