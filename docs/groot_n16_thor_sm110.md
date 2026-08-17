@@ -316,7 +316,7 @@ obs ──> preprocess（apply_state 直连 + 线程池图像变换）          
 - 新 kernel：`csrc/fused_fp4/{dit_norm_fp4_sfa,silu_mul_fp4_sfa_bf16}.{cu,cuh}`、
   `csrc/gemm/fp4/cutlass_fp4_gemm_bias_bf16_sm100.{cu,cuh}`、
   `csrc/quantize/quantize_fp4_sfa_bf16.{cu,cuh}`、`csrc/fp4_bindings.cpp`
-- 权重转换：`tools/convert_groot_n16_hf_checkpoint.py`
+- 权重转换（开发调试工具，不含于本 PR）：前端已内置完整的 HF→FlashRT layout 变换（transpose、QKV fuse），直接加载 HF 原始 safetensors 即可推理。离线审计脚本 `convert_groot_n16_hf_checkpoint.py` 仅用于 parity 对拍时定位 weight mapping 问题。
 - 文档：本文 + `docs/groot_transformers5_weight_corruption.md`
 
 **配套文档（独立主题）**：

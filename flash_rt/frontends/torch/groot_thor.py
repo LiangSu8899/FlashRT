@@ -859,17 +859,22 @@ class GrootTorchFrontendThor:
 
     @staticmethod
     def _resolve_eagle_dir() -> pathlib.Path:
-        """Locate the Eagle-Block2A-2B-v2 remote-code directory."""
+        """Locate the Eagle-Block2A-2B-v2 remote-code directory.
+
+        The HF modules cache stores only .py files (no config.json), so we
+        use modeling_siglip2.py as the marker.
+        """
         override = os.environ.get("FLASHRT_N16_EAGLE_DIR")
         if override:
             p = pathlib.Path(override)
-            if (p / "config.json").exists():
+            if (p / "modeling_siglip2.py").exists() or (p / "config.json").exists():
                 return p
             raise RuntimeError(
-                f"FLASHRT_N16_EAGLE_DIR={override} has no config.json")
+                f"FLASHRT_N16_EAGLE_DIR={override} has neither "
+                "modeling_siglip2.py nor config.json")
         cache = pathlib.Path.home() / ".cache/huggingface/modules/transformers_modules"
         for cand in sorted(cache.glob(
-                "Eagle_hyphen_Block2A_hyphen_2B_hyphen_v2/*/config.json")):
+                "Eagle_hyphen_Block2A_hyphen_2B_hyphen_v2/*/modeling_siglip2.py")):
             return cand.parent
         raise RuntimeError(
             "Eagle-Block2A-2B-v2 remote code not found. Load the GR00T N1.6 "
@@ -879,25 +884,26 @@ class GrootTorchFrontendThor:
     def _setup_torch_siglip(self):
         """Parity mode: HF-native Siglip2VisionModel (bf16) from the Eagle
         remote code, weights from the checkpoint state dict."""
-        import glob as _glob
         import importlib.util as _ilu
         import json as _json
         eagle_dir = self._resolve_eagle_dir()
-        cfg = _json.load(open(eagle_dir / "config.json"))
-        mod_path = None
-        for cand in _glob.glob(str(eagle_dir / "modeling_siglip2.py")) + \
-                _glob.glob(str(pathlib.Path.home() /
-                           ".cache/huggingface/modules/transformers_modules/"
-                           "Eagle_hyphen_Block2A_hyphen_2B_hyphen_v2/*/"
-                           "modeling_siglip2.py")):
-            mod_path = cand
-            break
-        if mod_path is None:
-            raise RuntimeError("modeling_siglip2.py not found for parity SigLIP")
-        spec = _ilu.spec_from_file_location("eagle_siglip2_parity", mod_path)
+        mod_path = eagle_dir / "modeling_siglip2.py"
+        if not mod_path.exists():
+            raise RuntimeError(
+                f"modeling_siglip2.py not found in {eagle_dir}")
+        spec = _ilu.spec_from_file_location("eagle_siglip2_parity", str(mod_path))
         mod = _ilu.module_from_spec(spec)
         spec.loader.exec_module(mod)
-        vc = dict(cfg["vision_config"])
+        cfg_json = eagle_dir / "config.json"
+        if cfg_json.exists():
+            vc = dict(_json.load(open(cfg_json))["vision_config"])
+        else:
+            vc = dict(
+                hidden_size=self.D_sig, num_attention_heads=self.NH_sig,
+                num_hidden_layers=self.L_sig, intermediate_size=self.H_sig,
+                image_size=252, patch_size=14, hidden_act="gelu_pytorch_tanh",
+                layer_norm_eps=1e-6, attention_dropout=0.0, dropout=0.0,
+            )
         vc.pop("_attn_implementation_autoset", None)
         model = mod.Siglip2VisionModel(mod.Siglip2VisionConfig(**vc))
         model = model.to(torch.bfloat16).cuda().eval()
@@ -965,8 +971,20 @@ class GrootTorchFrontendThor:
         import json as _json
         from transformers import Qwen3Config, Qwen3Model
         eagle_dir = self._resolve_eagle_dir()
-        cfg = _json.load(open(eagle_dir / "config.json"))
-        tc = dict(cfg.get("text_config", cfg))
+        cfg_json = eagle_dir / "config.json"
+        if cfg_json.exists():
+            tc = dict(_json.load(open(cfg_json)).get("text_config", {}))
+        else:
+            tc = {}
+        if not tc:
+            tc = dict(
+                hidden_size=self.D_llm, num_attention_heads=self.NHQ,
+                num_key_value_heads=self.NHKV, head_dim=self.HD_llm,
+                intermediate_size=self.H_llm, hidden_act="silu",
+                max_position_embeddings=4096, rms_norm_eps=1e-6,
+                rope_theta=1000000.0, use_sliding_window=False,
+                vocab_size=151680,
+            )
         tc["num_hidden_layers"] = 16  # checkpoint is truncated
         tc["_attn_implementation"] = "sdpa"
         config = Qwen3Config(**tc)
