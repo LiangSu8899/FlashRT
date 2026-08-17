@@ -13,6 +13,7 @@ tensor: at worst a consumer misses the cell and quantizes for itself.
 
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 
 import torch
@@ -79,6 +80,7 @@ class RMSNormQuantFp4Producer(torch.nn.Module):
         self._op = _native_norm_quant()
         self._eps = float(getattr(host_norm, "variance_epsilon",
                                   getattr(host_norm, "eps", 1e-6)))
+        self._min_m = int(os.environ.get("FRT_NORM_QUANT_MIN_M", "64"))
         # a detached copy keeps autograd out of the custom op: the
         # host weight is a Parameter, and a traced graph that sees it
         # demands a backward formula this producer does not carry
@@ -89,11 +91,11 @@ class RMSNormQuantFp4Producer(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self._op is None or x.dtype is not torch.bfloat16:
             return self.host_norm(x)
-        # measured M-dispatch: at decode widths the host norm folds
-        # into the surrounding elementwise graph and the shared group
-        # quantize is cheaper than this producer's standalone launch;
-        # the fused pass pays from prompt-slab widths up
-        if x.numel() // x.shape[-1] < 64:
+        # measured M-dispatch: a host norm the compiler folded into
+        # its neighbours can beat this producer's standalone launch at
+        # narrow widths, so the band where the fused pass pays is
+        # measured per host rather than assumed
+        if x.numel() // x.shape[-1] < self._min_m:
             return self.host_norm(x)
         # inference producer: detach severs the autograd edge a
         # Parameter-derived input would otherwise demand a backward
