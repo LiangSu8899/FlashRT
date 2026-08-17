@@ -208,6 +208,30 @@ def hub_kernel(repo: str, version: str):
     os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "60")
 
     key = (repo, version)
+    slug = re.sub(r"[^A-Za-z0-9]", "_", repo).upper()
+    var_dir = os.environ.get("FRT_KERNEL_DIR_" + slug)
+    if var_dir and key not in _LOADED:
+        # filesystem-direct load for hosts whose process cannot reach
+        # the hub at all (air-gapped serving containers): the variant
+        # directory is the package — importing it here is exactly what
+        # the resolver would do after its network walk, minus the walk.
+        # The arch check below still runs; a wrong variant refuses the
+        # same way a resolved one would.
+        import importlib.util
+        import sys as _sys
+        init = os.path.join(var_dir, "__init__.py")
+        if not os.path.isfile(init):
+            raise KernelUnavailable(
+                f"kernel package {repo!r}: FRT_KERNEL_DIR_{slug} does "
+                f"not point at a build variant (no __init__.py in "
+                f"{var_dir!r})")
+        mod_name = "_frt_kernel_" + slug.lower()
+        spec = importlib.util.spec_from_file_location(
+            mod_name, init, submodule_search_locations=[var_dir])
+        mod = importlib.util.module_from_spec(spec)
+        _sys.modules[mod_name] = mod
+        spec.loader.exec_module(mod)
+        _LOADED[key] = mod
     if key in _UNRESOLVED:
         prior = _UNRESOLVED[key]
         raise KernelUnavailable(
