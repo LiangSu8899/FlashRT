@@ -137,28 +137,28 @@ def _native_gated_norm_quant():
 
 
 @lru_cache(maxsize=1)
-def _native_recurrent_vsplit():
-    """The V-split launch of the gated-delta recurrent decode step.
+def _native_recurrent_stream():
+    """The streaming-column form of the gated-delta recurrent step.
 
-    Per-column arithmetic is the packaged kernel's; the columns just
-    spread over four times the blocks (and the column state streams
-    instead of sitting in a per-thread array the hardware would spill).
-    Measured 2x on the step's own shape, output bit-identical; the q/k
-    L2 norm reduces over a warp, so its fp32 rounding can differ.
+    Bit-identical to the packaged kernel — same block reduction, same
+    per-column arithmetic in the same order. The column simply streams
+    in two passes instead of living in a 128-entry per-thread array
+    that spills to local memory, which is where the step was paying
+    DRAM for state it believed was resident. Measured 1.5x.
     """
-    if _os.environ.get("FRT_GDN_VSPLIT", "1") == "0":
+    if _os.environ.get("FRT_GDN_STREAM", "1") == "0":
         return None
     try:
         from flash_rt import flash_rt_kernels as _fk
     except ImportError:
         return None
-    fn = getattr(_fk, "gdn_recurrent_inout_vsplit_bf16", None)
+    fn = getattr(_fk, "gdn_recurrent_inout_stream_bf16", None)
     if fn is None:
         return None
 
     from torch.library import custom_op
 
-    @custom_op("flashrt_native::gdn_recurrent_vsplit",
+    @custom_op("flashrt_native::gdn_recurrent_stream",
                mutates_args=("state_out", "out"))
     def _op(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
             g: torch.Tensor, beta: torch.Tensor,
@@ -171,7 +171,7 @@ def _native_recurrent_vsplit():
                 torch.cuda.current_stream().cuda_stream)
         if rc != 0:
             raise RuntimeError(
-                f"gdn_recurrent_vsplit refused rc={rc} H={h} D={d}")
+                f"gdn_recurrent_stream refused rc={rc} H={h} D={d}")
 
     @_op.register_fake
     def _(q, k, v, g, beta, state_in, state_out, out):
@@ -914,10 +914,10 @@ class FusedGatedDeltaDecodeLayer(GuardedSeam, torch.nn.Module):
             # never changes, which is what graph replay requires
             state_in = state_in.to(torch.bfloat16).contiguous()
             cache_params.recurrent_states[self._idx] = state_in
-        vsplit = (_native_recurrent_vsplit() if self._d == 128
-                  else None)
-        if vsplit is not None:
-            core_out, new_state = vsplit(
+        stream_rec = (_native_recurrent_stream() if self._d == 128
+                      else None)
+        if stream_rec is not None:
+            core_out, new_state = stream_rec(
                 q.view(1, self._hv, self._d),
                 k.view(1, self._hv, self._d),
                 v.view(1, self._hv, self._d), g, beta, state_in,

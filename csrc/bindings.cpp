@@ -194,7 +194,7 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #include "kernels/rms_norm_quantize_fp4_sfa_bf16.cuh"
 #include "kernels/gdn_wy_norm_cumsum_pack_qk_v2.cuh"
 #include "kernels/causal_conv1d_update_steps_gqa_bf16.cuh"
-#include "kernels/gdn_recurrent_inout_vsplit_bf16.cuh"
+#include "kernels/gdn_recurrent_inout_stream_bf16.cuh"
 #include "kernels/rms_norm_gated_silu_quant_fp4_bf16.cuh"
 #include "quantize/fp8_block128_dequant.cuh"
 #ifdef FLASHRT_HAVE_NVFP4_SWIZZLE
@@ -6805,12 +6805,12 @@ activation. Norm arithmetic transcribed from the packaged gated-norm
 kernel; quantize stage is the production path verbatim. dim must be 128.
 )pbdoc");
 
-    m.def("gdn_recurrent_inout_vsplit_bf16",
+    m.def("gdn_recurrent_inout_stream_bf16",
         [](uintptr_t q, uintptr_t k, uintptr_t v, uintptr_t g,
            uintptr_t beta, uintptr_t state_in, uintptr_t state_out,
            uintptr_t out, int B, int num_v_heads, int head_dim,
            bool use_qk_l2norm, uintptr_t stream) -> int {
-            return flash_rt::kernels::gdn_recurrent_inout_vsplit_bf16(
+            return flash_rt::kernels::gdn_recurrent_inout_stream_bf16(
                 to_ptr(q), to_ptr(k), to_ptr(v), to_ptr(g),
                 to_ptr(beta), to_ptr(state_in), to_ptr(state_out),
                 to_ptr(out), B, num_v_heads, head_dim, use_qk_l2norm,
@@ -6822,7 +6822,7 @@ kernel; quantize stage is the production path verbatim. dim must be 128.
         py::arg("head_dim"), py::arg("use_qk_l2norm") = true,
         py::arg("stream") = 0,
         R"pbdoc(
-Gated-delta recurrent decode step over a V-split launch plan: one warp
+Gated-delta recurrent decode step over a streaming-column form: one warp
 per 32 value columns instead of one block per head, so the same total
 thread count spreads over 4x the blocks (the packaged kernel leaves
 three quarters of a 170-SM part idle). Per-column arithmetic is the

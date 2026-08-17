@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Gated-delta recurrent decode step, V-split launch plan. See header.
-#include "kernels/gdn_recurrent_inout_vsplit_bf16.cuh"
+// Gated-delta recurrent decode step, streaming-column form. See header.
+#include "kernels/gdn_recurrent_inout_stream_bf16.cuh"
 
 #include <cuda_bf16.h>
 
@@ -10,17 +10,34 @@ namespace kernels {
 namespace {
 
 constexpr int kHD = 128;
-constexpr int kCols = 32;          // value columns per block (one warp)
 constexpr float kEps = 1e-6f;
 
-__device__ __forceinline__ float warp_sum(float v) {
+// the packaged kernel's block reduction, transcribed: splitting the
+// value columns across smaller blocks would reduce the q/k norms over
+// a warp instead, and that changes their fp32 summation order. The
+// measured win is not in the split — it is in not spilling the state
+// column — so the block width stays 128 and the result stays bitwise
+__device__ __forceinline__ float block_reduce_sum(float val,
+                                                  float* smem) {
   #pragma unroll
   for (int off = 16; off > 0; off >>= 1)
-    v += __shfl_xor_sync(0xffffffffu, v, off);
-  return v;
+    val += __shfl_xor_sync(0xffffffffu, val, off);
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  if (lane == 0) smem[warp] = val;
+  __syncthreads();
+  if (warp == 0) {
+    val = (lane < (kHD / 32)) ? smem[lane] : 0.0f;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+      val += __shfl_xor_sync(0xffffffffu, val, off);
+    if (lane == 0) smem[0] = val;
+  }
+  __syncthreads();
+  return smem[0];
 }
 
-__global__ void recurrent_vsplit_kernel(
+__global__ void recurrent_stream_kernel(
     const __nv_bfloat16* __restrict__ q_in,
     const __nv_bfloat16* __restrict__ k_in,
     const __nv_bfloat16* __restrict__ v_in,
@@ -31,54 +48,35 @@ __global__ void recurrent_vsplit_kernel(
     __nv_bfloat16* __restrict__ out_,
     int num_v_heads, bool use_qk_l2norm) {
   const int h = blockIdx.x;
-  const int vb = blockIdx.y;            // which 32-column slice
-  const int lane = threadIdx.x;         // 0..31
-  const int t = vb * kCols + lane;      // this thread's value column
+  const int b = blockIdx.y;
+  const int t = threadIdx.x;            // this thread's value column
+  if (t >= kHD) return;
 
-  const size_t hv_off = ((size_t)blockIdx.z * num_v_heads + h) * kHD;
+  const size_t hv_off = ((size_t)b * num_v_heads + h) * kHD;
 
-  // q/k stage in registers: each lane owns 4 of the 128 entries, and
-  // the L2 norms reduce across the warp
-  float qs[4], ks[4];
-  #pragma unroll
-  for (int j = 0; j < 4; ++j) {
-    const int i = j * kCols + lane;
-    qs[j] = static_cast<float>(q_in[hv_off + i]);
-    ks[j] = static_cast<float>(k_in[hv_off + i]);
-  }
+  __shared__ float smem[2 * kHD + 32];
+  float* sq = smem;
+  float* sk = smem + kHD;
+  float* scratch = smem + 2 * kHD;
+  sq[t] = static_cast<float>(q_in[hv_off + t]);
+  sk[t] = static_cast<float>(k_in[hv_off + t]);
+  __syncthreads();
+
   if (use_qk_l2norm) {
-    float q_sq = 0.f, k_sq = 0.f;
-    #pragma unroll
-    for (int j = 0; j < 4; ++j) {
-      q_sq += qs[j] * qs[j];
-      k_sq += ks[j] * ks[j];
-    }
-    const float q_inv = rsqrtf(warp_sum(q_sq) + kEps);
-    const float k_inv = rsqrtf(warp_sum(k_sq) + kEps);
-    #pragma unroll
-    for (int j = 0; j < 4; ++j) {
-      qs[j] *= q_inv;
-      ks[j] *= k_inv;
-    }
+    float q_sq = block_reduce_sum(sq[t] * sq[t], scratch);
+    __syncthreads();
+    float k_sq = block_reduce_sum(sk[t] * sk[t], scratch);
+    sq[t] *= rsqrtf(q_sq + kEps);
+    sk[t] *= rsqrtf(k_sq + kEps);
+    __syncthreads();
   }
-  const float qscale = rsqrtf(static_cast<float>(kHD));
-  #pragma unroll
-  for (int j = 0; j < 4; ++j) qs[j] *= qscale;
-
-  // broadcast the staged vectors so every lane sees all 128 entries
-  // in the packaged kernel's index order
-  __shared__ float sq[kHD], sk[kHD];
-  #pragma unroll
-  for (int j = 0; j < 4; ++j) {
-    sq[j * kCols + lane] = qs[j];
-    sk[j * kCols + lane] = ks[j];
-  }
-  __syncwarp();
+  sq[t] *= rsqrtf(static_cast<float>(kHD));
+  __syncthreads();
 
   const float g_t =
-      __expf(static_cast<float>(g_in[blockIdx.z * num_v_heads + h]));
+      __expf(static_cast<float>(g_in[b * num_v_heads + h]));
   const float beta_t =
-      static_cast<float>(beta_in[blockIdx.z * num_v_heads + h]);
+      static_cast<float>(beta_in[b * num_v_heads + h]);
 
   // Two streaming passes rather than a 128-entry per-thread array.
   // That array is 128 registers on top of everything else, past what
@@ -117,7 +115,7 @@ __global__ void recurrent_vsplit_kernel(
 
 }  // namespace
 
-int gdn_recurrent_inout_vsplit_bf16(
+int gdn_recurrent_inout_stream_bf16(
     const void* q, const void* k, const void* v, const void* g,
     const void* beta, const void* state_in, void* state_out, void* out,
     int B, int num_v_heads, int head_dim, bool use_qk_l2norm,
@@ -125,8 +123,8 @@ int gdn_recurrent_inout_vsplit_bf16(
   if (!q || !k || !v || !g || !beta || !state_in || !state_out || !out)
     return 1;
   if (head_dim != kHD || B <= 0 || num_v_heads <= 0) return 2;
-  dim3 grid(num_v_heads, kHD / kCols, B);
-  recurrent_vsplit_kernel<<<grid, kCols, 0, stream>>>(
+  dim3 grid(num_v_heads, B);
+  recurrent_stream_kernel<<<grid, kHD, 0, stream>>>(
       reinterpret_cast<const __nv_bfloat16*>(q),
       reinterpret_cast<const __nv_bfloat16*>(k),
       reinterpret_cast<const __nv_bfloat16*>(v),
