@@ -144,6 +144,36 @@ def _check_arch(repo: str, module) -> None:
 #: refusal path must not manufacture that error on retry)
 _LOADED: dict[tuple[str, str], object] = {}
 
+#: highest version tag the resolution fallback searches downward from.
+#: Only an upper bound for the walk — a repo that has not published
+#: that many releases simply misses those revisions and continues.
+_TAG_SEARCH_TOP = 32
+
+
+def _newest_loadable(get_kernel, repo, version, kw, first=None):
+    """The newest release at or above ``version``'s floor that loads.
+
+    ``first`` is an optional resolution to try before the walk (the
+    pre-semver library's repo default, which is usually right and
+    costs nothing to attempt).
+    """
+    if first is not None:
+        try:
+            return first()
+        except FileNotFoundError as no_variant:
+            if "build variants" not in str(no_variant):
+                raise
+    floor = re.match(r"^\s*>=\s*v?(\d+)", str(version))
+    lo = int(floor.group(1)) if floor else 1
+    last = None
+    for major in range(_TAG_SEARCH_TOP, lo - 1, -1):
+        try:
+            return get_kernel(repo, revision=f"v{major}", **kw)
+        except Exception as e:  # noqa: BLE001 — try the next tag
+            last = e
+    raise last if last is not None else RuntimeError(
+        f"no loadable release for {repo!r} at {version}")
+
 
 @lru_cache(maxsize=None)
 def hub_kernel(repo: str, version: str):
@@ -166,31 +196,32 @@ def hub_kernel(repo: str, version: str):
                 # the trust gate arrived with newer kernels; our own
                 # first-party artifacts are the explicit trust set
                 _kw["trust_remote_code"] = True
-            try:
+            if rev:
+                _LOADED[key] = get_kernel(repo, revision=rev, **_kw)
+            else:
                 try:
-                    _LOADED[key] = (get_kernel(repo, revision=rev,
-                                               **_kw)
-                                    if rev
-                                    else get_kernel(repo,
-                                                    version=version,
-                                                    **_kw))
-                except ValueError as ve:
-                    # newer kernels resolve an exact integer version
-                    # where older ones accepted a range string; the
-                    # range's floor is the same request in both bands
-                    m = re.match(r"^\s*>=\s*v?(\d+)", str(version))
-                    if not (m and "available versions" in str(ve)):
-                        raise
-                    _LOADED[key] = get_kernel(
-                        repo, version=int(m.group(1)), **_kw)
-            except TypeError:
-                # kernels<0.13 — the band transformers pins — has no
-                # semver resolution kwarg; the default revision is
-                # exactly what that library resolved before semver
-                # tags existed. Widest-band compat: 0.12 through 0.16
-                # serve the same call site.
-                _LOADED[key] = (get_kernel(repo, revision=rev) if rev
-                                else get_kernel(repo))  # pre-semver band
+                    _LOADED[key] = get_kernel(repo, version=version,
+                                              **_kw)
+                except TypeError:
+                    # kernels<0.13 — the band transformers pins — has
+                    # no semver kwarg; it resolves the repo default
+                    _LOADED[key] = _newest_loadable(
+                        get_kernel, repo, version, _kw,
+                        first=lambda: get_kernel(repo))
+                except (ValueError, FileNotFoundError):
+                    # Two ways a version range fails to land on a
+                    # usable artifact, both routine: the newer library
+                    # resolves only an exact major (a range string is
+                    # rejected outright), and any resolved release may
+                    # have no build for this host's torch/CUDA pair —
+                    # publishers add variants release by release, so a
+                    # newer release can drop a pair an older one
+                    # carried. Both are answered the same way: take
+                    # the newest release at or above the floor that
+                    # this host can actually load. That is what the
+                    # range in the dependency spec asks for.
+                    _LOADED[key] = _newest_loadable(
+                        get_kernel, repo, version, _kw)
         except (OSError, RuntimeError, ValueError) as unavailable:
             _record_unavailable(repo, version, unavailable)
             raise KernelUnavailable(

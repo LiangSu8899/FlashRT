@@ -35,8 +35,12 @@ import torch
 
 from ...guard import CAST_OK, PROCEED, GuardedSeam
 
+#: a range, not a pin: the resolver picks the newest release whose
+#: build matrix covers the caller's torch/CUDA pair, and the entries
+#: this structure calls have been stable since 3. Pinning the newest
+#: release strands any host whose variant that release did not build.
 GDA_DEP = {"provider": "hf", "repo": "flashrt/gated-delta-attention",
-           "version": ">=5"}
+           "version": ">=3"}
 CONV_DEP = {"provider": "hf", "repo": "flashrt/causal-conv1d-state",
             "version": ">=1"}
 FUSED_DEP = {"provider": "hf", "repo": "flashrt/transformer-fused-ops",
@@ -86,6 +90,100 @@ def _native_ltri_inv():
 import os as _os
 
 _NCP_ON = _os.environ.get("FRT_WY_NCP_V2", "1") != "0"
+
+
+@lru_cache(maxsize=1)
+def _native_gated_norm_quant():
+    """The gated norm that also emits its consumer's NVFP4 input.
+
+    The output projection is the norm's only consumer and quantizes
+    what it receives; the quantizer's blocks tile a head's lanes
+    exactly, so the whole step fits in the block that produced the
+    row. Measured bit-identical (normed, packed and scales alike)
+    against the packaged norm followed by the production quantize,
+    at 2.9x of the pair.
+    """
+    if _os.environ.get("FRT_GDN_NORMQUANT", "1") == "0":
+        return None
+    try:
+        from flash_rt import flash_rt_kernels as _fk
+    except ImportError:
+        return None
+    fn = getattr(_fk, "rms_norm_gated_silu_quant_fp4_bf16", None)
+    if fn is None:
+        return None
+
+    from torch.library import custom_op
+
+    @custom_op("flashrt_native::gated_norm_quant",
+               mutates_args=("out", "packed", "sfa"))
+    def _op(x: torch.Tensor, gate: torch.Tensor, weight: torch.Tensor,
+            out: torch.Tensor, packed: torch.Tensor, sfa: torch.Tensor,
+            eps: float) -> None:
+        m, d = int(x.shape[0]), int(x.shape[1])
+        rc = fn(x.data_ptr(), gate.data_ptr(), weight.data_ptr(),
+                out.data_ptr(), packed.data_ptr(), sfa.data_ptr(),
+                m, d, float(eps),
+                torch.cuda.current_stream().cuda_stream)
+        if rc != 0:
+            raise RuntimeError(
+                f"gated_norm_quant refused rc={rc} M={m} D={d}")
+
+    @_op.register_fake
+    def _(x, gate, weight, out, packed, sfa, eps):
+        return None
+
+    return _op
+
+
+@lru_cache(maxsize=1)
+def _native_recurrent_vsplit():
+    """The V-split launch of the gated-delta recurrent decode step.
+
+    Per-column arithmetic is the packaged kernel's; the columns just
+    spread over four times the blocks (and the column state streams
+    instead of sitting in a per-thread array the hardware would spill).
+    Measured 2x on the step's own shape, output bit-identical; the q/k
+    L2 norm reduces over a warp, so its fp32 rounding can differ.
+    """
+    if _os.environ.get("FRT_GDN_VSPLIT", "1") == "0":
+        return None
+    try:
+        from flash_rt import flash_rt_kernels as _fk
+    except ImportError:
+        return None
+    fn = getattr(_fk, "gdn_recurrent_inout_vsplit_bf16", None)
+    if fn is None:
+        return None
+
+    from torch.library import custom_op
+
+    @custom_op("flashrt_native::gdn_recurrent_vsplit",
+               mutates_args=("state_out", "out"))
+    def _op(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+            g: torch.Tensor, beta: torch.Tensor,
+            state_in: torch.Tensor, state_out: torch.Tensor,
+            out: torch.Tensor) -> None:
+        h, d = int(q.shape[1]), int(q.shape[2])
+        rc = fn(q.data_ptr(), k.data_ptr(), v.data_ptr(), g.data_ptr(),
+                beta.data_ptr(), state_in.data_ptr(),
+                state_out.data_ptr(), out.data_ptr(), 1, h, d, True,
+                torch.cuda.current_stream().cuda_stream)
+        if rc != 0:
+            raise RuntimeError(
+                f"gdn_recurrent_vsplit refused rc={rc} H={h} D={d}")
+
+    @_op.register_fake
+    def _(q, k, v, g, beta, state_in, state_out, out):
+        return None
+
+    def _entry(q, k, v, g, beta, state_in, state_out, out):
+        _op(q.contiguous(), k.contiguous(), v.contiguous(),
+            g.contiguous(), beta.contiguous(), state_in, state_out,
+            out)
+        return out, state_out
+
+    return _entry
 
 
 @lru_cache(maxsize=1)
@@ -410,6 +508,8 @@ class FusedGatedDeltaDecodeLayer(GuardedSeam, torch.nn.Module):
                                     device=dev, dtype=torch.bfloat16)
         self._core_out = torch.empty(1, self._hv, self._d, device=dev,
                                      dtype=torch.bfloat16)
+        self._gn_packed = self._gn_sfa = self._gn_normed = None
+        self._norm_w = None
         # prefill chain needs the chunk entries; their absence is not a
         # bind refusal — prompts simply keep the host form
         self._chunk_ok = (
@@ -814,15 +914,42 @@ class FusedGatedDeltaDecodeLayer(GuardedSeam, torch.nn.Module):
             # never changes, which is what graph replay requires
             state_in = state_in.to(torch.bfloat16).contiguous()
             cache_params.recurrent_states[self._idx] = state_in
-        core_out, new_state = self._gda.gated_delta_recurrent_inout_bf16(
-            q.view(1, self._hv, self._d), k.view(1, self._hv, self._d),
-            v.view(1, self._hv, self._d), g, beta,
-            state_in, use_qk_l2norm=True,
-            state_out=self._state_a, out=self._core_out)
+        vsplit = (_native_recurrent_vsplit() if self._d == 128
+                  else None)
+        if vsplit is not None:
+            core_out, new_state = vsplit(
+                q.view(1, self._hv, self._d),
+                k.view(1, self._hv, self._d),
+                v.view(1, self._hv, self._d), g, beta, state_in,
+                self._state_a, self._core_out)
+        else:
+            core_out, new_state = \
+                self._gda.gated_delta_recurrent_inout_bf16(
+                    q.view(1, self._hv, self._d),
+                    k.view(1, self._hv, self._d),
+                    v.view(1, self._hv, self._d), g, beta,
+                    state_in, use_qk_l2norm=True,
+                    state_out=self._state_a, out=self._core_out)
         # scratch -> slot copy keeps the slot pointer stable; the core
         # cannot write the slot it is reading within the same step
         state_in.copy_(new_state)
 
+        gnq = (_native_gated_norm_quant()
+               if self._proj_out is not None
+               and self._d == 128 else None)
+        if gnq is not None:
+            # the norm hands the projection packed rows directly: its
+            # only consumer would otherwise re-read the row to
+            # quantize it, one launch per layer
+            if self._gn_packed is None:
+                self._arm_gated_norm_quant()
+            gnq(core_out.view(self._hv, self._d),
+                z.view(self._hv, self._d), self._norm_w,
+                self._gn_normed, self._gn_packed, self._gn_sfa,
+                self._eps)
+            out = self._proj_out._mm_packed(self._gn_packed,
+                                            self._gn_sfa)
+            return out.view(1, 1, -1).to(hidden_states.dtype)
         normed = self._fused.rms_norm_gated_silu_bf16(
             core_out.view(self._hv, self._d), z.view(self._hv, self._d),
             host.norm.weight, eps=self._eps)
@@ -831,6 +958,25 @@ class FusedGatedDeltaDecodeLayer(GuardedSeam, torch.nn.Module):
                else torch.nn.functional.linear(flat_norm,
                                                host.out_proj.weight))
         return out.view(1, 1, -1).to(hidden_states.dtype)
+
+    @torch.no_grad()
+    def _arm_gated_norm_quant(self):
+        """Stable buffers for the fused gated-norm producer.
+
+        Allocated once, before any capture: the graph records these
+        addresses, and the norm weight is copied detached so the op
+        never sits on an autograd edge."""
+        host = self.host_layer
+        dev = self._conv_w.device
+        n = self._hv * self._d
+        self._norm_w = host.norm.weight.detach().to(
+            dev, torch.bfloat16).contiguous().clone()
+        self._gn_normed = torch.empty(self._hv, self._d, device=dev,
+                                      dtype=torch.bfloat16)
+        self._gn_packed = torch.empty(1, n // 2, device=dev,
+                                      dtype=torch.uint8)
+        self._gn_sfa = torch.zeros(((n + 63) // 64) * 512, device=dev,
+                                   dtype=torch.uint8)
 
 
 @torch.no_grad()
