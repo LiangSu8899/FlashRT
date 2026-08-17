@@ -634,6 +634,11 @@ def attach_verify_attention(*, verbose: bool = True) -> dict | None:
         m = attn_metadata
         take = (
             m is not None
+            # no fused output quant on the seat path
+            and not any(a is not None for a in args)
+            and kwargs.get("output_scale") is None
+            and kwargs.get("output_block_scale") is None
+            and hasattr(self, "do_kv_cache_update")
             and getattr(m, "num_decode_tokens", 1) == 0
             and getattr(m, "num_prefills", 0) == 1
             and getattr(m, "causal", False)
@@ -672,6 +677,13 @@ def attach_verify_attention(*, verbose: bool = True) -> dict | None:
                     raise LookupError("plan counts not stashed yet")
                 n_pages, last = meta_np
                 qs = int(m.num_actual_tokens)
+                # the host forward is also the cache writer: the new
+                # tokens' K/V must land in the paged pool before any
+                # attention (this step reads them, every later step
+                # reads them as prefix) — skipping it corrupts the
+                # sequence forever, not just this call
+                self.do_kv_cache_update(layer, key, value, kv_cache,
+                                        m.slot_mapping)
                 seq = (n_pages - 1) * 32 + last
                 if n_pages <= 0 or not (0 < last <= 32) or seq < qs:
                     raise ValueError("verify plan out of shape")
