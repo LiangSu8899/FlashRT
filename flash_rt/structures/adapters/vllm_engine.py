@@ -197,6 +197,42 @@ class _ProjSeat(nn.Module):
         return self.seam(x), None
 
 
+class _FusedMlpSeat(nn.Module):
+    """Stands where the host's SwiGLU MLP stood.
+
+    The host's own dataflow is ``gate_up -> SiLU·mul -> down``, and it
+    already merges gate and up into one projection — so once both
+    projections carry seats, the activation between them is the only
+    step that still round-trips through BF16 and re-quantizes for the
+    down projection. This seat runs the merged projection through its
+    seam, collapses activation + quantization into the fused producer,
+    and hands the packed rows straight to the down seam. Anything the
+    host did around that (an expert gate) is kept by delegating to the
+    retained module for the parts this seat does not own.
+    """
+
+    def __init__(self, host, gate_up_seam, down_seam, silu_mul):
+        super().__init__()
+        self.host_mlp = host
+        self.gate_up_seam = gate_up_seam
+        self.down_seam = down_seam
+        self._silu_mul = silu_mul
+
+    def forward(self, x):
+        shape = x.shape
+        flat = x.reshape(-1, shape[-1])
+        a_packed, a_sfa = _linear._quantize_activation(
+            self.gate_up_seam._kern, flat)
+        merged = self.gate_up_seam._mm_packed(a_packed, a_sfa)
+        p2, s2 = self._silu_mul(merged.contiguous())
+        out = self.down_seam._mm_packed(p2, s2)
+        out = out.reshape(*shape[:-1], self.down_seam._n).type_as(x)
+        gate = getattr(self.host_mlp, "expert_gate", None)
+        if gate is not None:
+            out = torch.sigmoid(gate(x)[0]) * out
+        return out
+
+
 class _MoESeat(nn.Module):
     """Stands where the fused-MoE module stood: routing here, bank in
     the seam, the host's own shared-expert module added back (it owned
@@ -278,49 +314,27 @@ def _is_projection(module) -> bool:
             and hasattr(module, "quant_method"))
 
 
-def _park_untraceable_tiers(seam) -> list[str]:
-    """Drop the seam's optional tiers that cannot trace on fake tensors.
+def _park_m_threshold_tiers(seam) -> list[str]:
+    """Park the tiers whose selection depends on the row count.
 
-    The engine compiles seam forwards under a fake mode, so an entry
-    without a fake impl raises there and takes the whole graph with it.
-    Rather than name the offenders (they move with the installed
-    artifact — a hub release that adds the missing fakes should light
-    the tiers up with no code change), this traces each optional tier
-    once under a fake mode and parks only what actually fails.
+    This engine compiles a seam forward once per shape *range* and
+    replays it without re-evaluating shape guards, so the row count a
+    trace observed is not the row count a replay carries. A Python-level
+    ``if m >= N`` therefore bakes in whichever side the tracing sample
+    took and then runs it for every M — measured as a hard refusal from
+    the M256 tier at engine start. The two tiers that carry an M
+    threshold (the large-M cooperative tile, the small-M multi-row arm)
+    are parked here; the M=1 GEMV stays because this host's decode
+    graphs are captured at fixed batch sizes, and the tiled GEMM serves
+    every other M correctly. A capability parked, never a refusal.
     """
-    from torch._subclasses.fake_tensor import FakeTensorMode
-
     parked = []
-    k = int(seam._k)
-
-    def _traces(call) -> bool:
-        try:
-            with FakeTensorMode(allow_non_fake_inputs=True):
-                call()
-            return True
-        except Exception:
-            return False
-
     if getattr(seam, "_m256", None) is not None:
-        m = 512
-        a = torch.empty(m, k // 2, device="cuda", dtype=torch.uint8)
-        sfa = torch.empty(((m + 127) // 128) * ((k + 63) // 64) * 512,
-                          device="cuda", dtype=torch.uint8)
-        if not _traces(lambda: seam._m256(a, seam._w_packed, sfa,
-                                          seam._w_sfb)):
-            seam._m256 = None
-            parked.append("m256")
-    if getattr(seam, "_mrows", None) is not None and seam._mrows_hub:
-        m = 8
-        a = torch.empty(m, k // 2, device="cuda", dtype=torch.uint8)
-        sfa = torch.empty(((m + 127) // 128) * ((k + 63) // 64) * 512,
-                          device="cuda", dtype=torch.uint8)
-        w_, s_ = seam._mr_cfg
-        if not _traces(lambda: seam._mrows(a, seam._w_packed, sfa,
-                                           seam._w_sfb, warps=w_,
-                                           stages=s_)):
-            seam._mrows = None
-            parked.append("mrows")
+        seam._m256 = None
+        parked.append("m256")
+    if getattr(seam, "_mrows", None) is not None:
+        seam._mrows = None
+        parked.append("mrows")
     return parked
 
 
@@ -363,7 +377,8 @@ class _NoSeats:
 
 
 def attach_engine(model, *, seats=DENSE_SEAT_SUFFIXES, experts=True,
-                  head=True, use_gemv=None, verbose=True, strict=False):
+                  head=True, use_gemv=None, verbose=True, strict=False,
+                  fused_mlp=True):
     """Seat a vLLM model: dense projections, expert banks, LM head.
 
     Call between weight load and the engine's first trace (see
@@ -386,6 +401,7 @@ def attach_engine(model, *, seats=DENSE_SEAT_SUFFIXES, experts=True,
     reverts: list = []
     refused: list = []
     parked_tiers: dict[str, int] = {}
+    fused_mlps = 0
     modules = dict(model.named_modules())
 
     # dense projections, smallest first: on tight cards early frees
@@ -414,17 +430,29 @@ def attach_engine(model, *, seats=DENSE_SEAT_SUFFIXES, experts=True,
             if float(cos) < 0.98:
                 raise ValueError(
                     f"bind probe cos {float(cos):.4f} < 0.98")
-            # the engine traces seam forwards with Meta tensors, so a
-            # tier whose entry carries no fake impl dies at trace time.
-            # Which tiers those are is a property of the installed
-            # artifact, not a constant: park by measuring it — trace
-            # each optional tier under a fake mode and keep the ones
-            # that survive. A capability parked, never a refusal.
-            for tier in _park_untraceable_tiers(seam):
+            for tier in _park_m_threshold_tiers(seam):
                 parked_tiers[tier] = parked_tiers.get(tier, 0) + 1
             swaps[name] = _ProjSeat(seam)
         except Exception as e:
             refused.append((name, repr(e)[:120]))
+
+    if fused_mlp:
+        from ..impls.decoder_ffn import nvfp4_fused as _ffn
+
+        silu_mul = _ffn._native_silu_mul()
+        if silu_mul is not None:
+            for name, mod in modules.items():
+                gu = swaps.get(f"{name}.gate_up_proj")
+                dn = swaps.get(f"{name}.down_proj")
+                if gu is None or dn is None:
+                    continue
+                if not hasattr(mod, "act_fn"):
+                    continue
+                swaps[name] = _FusedMlpSeat(mod, gu.seam, dn.seam,
+                                            silu_mul)
+                swaps.pop(f"{name}.gate_up_proj")
+                swaps.pop(f"{name}.down_proj")
+                fused_mlps += 1
 
     if experts:
         impl = (_experts_w4a4 if use_gemv else _experts_w4a16)
@@ -495,11 +523,13 @@ def attach_engine(model, *, seats=DENSE_SEAT_SUFFIXES, experts=True,
         parked = (", parked " + ", ".join(
             f"{t}x{n}" for t, n in sorted(parked_tiers.items()))
             if parked_tiers else "")
+        fused = f", {fused_mlps} fused MLPs" if fused_mlps else ""
         print(f"[structures.vllm] {len(swaps)} seats "
               f"({head_slabs} head slabs), {len(refused)} refused"
-              f"{parked}", flush=True)
+              f"{parked}{fused}", flush=True)
     handle.notes = {"refused": refused, "head_slabs": head_slabs,
-                    "parked_tiers": parked_tiers}
+                    "parked_tiers": parked_tiers,
+                    "fused_mlps": fused_mlps}
     return handle
 
 

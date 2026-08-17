@@ -293,6 +293,18 @@ class LinearProjNvfp4Dynamic(GuardedSeam, torch.nn.Module):
         Returns the (m, n) BF16 product with bias applied.
         """
         m = a_packed.shape[0]
+        if not isinstance(m, int):
+            # a symbolic row count: the host is tracing this call for a
+            # *range* of M, so a Python-level tier branch would bake in
+            # whichever side the tracing sample happened to take and
+            # then run it for every replayed M. The tiled GEMM serves
+            # every M correctly, so the range-compiled path takes it and
+            # the specialized ones (concrete M at capture) keep theirs.
+            y = self._gemm(a_packed, self._w_packed, a_sfa, self._w_sfb,
+                           variant=2)
+            if self._bias is not None:
+                y = y + self._bias
+            return y
         if m == 1 and self._gemv is not None:
             gw, gs = self._gemv_cfg
             y = self._gemv(a_packed, self._w_packed, a_sfa, self._w_sfb,
