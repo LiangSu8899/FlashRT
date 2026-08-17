@@ -36,7 +36,7 @@ import torch
 from ...guard import CAST_OK, PROCEED, GuardedSeam
 
 GDA_DEP = {"provider": "hf", "repo": "flashrt/gated-delta-attention",
-           "version": ">=3"}
+           "version": ">=5"}
 CONV_DEP = {"provider": "hf", "repo": "flashrt/causal-conv1d-state",
             "version": ">=1"}
 FUSED_DEP = {"provider": "hf", "repo": "flashrt/transformer-fused-ops",

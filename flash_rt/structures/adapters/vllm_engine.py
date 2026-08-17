@@ -75,6 +75,117 @@ def _(hidden, router_logits, top_idx, top_w, idx):
     return torch.empty_like(hidden)
 
 
+_E2M1_LUT = None
+_SRC_INDEX = None
+
+#: engine fused-projection composition, in the engine's own concat
+#: order (the split sites in its forwards are the receipts)
+_FUSE = {
+    "in_proj_qkvz": ("in_proj_qkv", "in_proj_z"),
+    "qkv_proj": ("q_proj", "k_proj", "v_proj"),
+    "gate_up_proj": ("gate_proj", "up_proj"),
+    "in_proj_ba": ("in_proj_b", "in_proj_a"),
+}
+
+
+def _source_ckpt_weight(seat_name):
+    """Full-precision rows for a seat, read from ``FRT_SOURCE_CKPT``.
+
+    ``seat_name`` is the engine module path; the checkpoint key drops
+    the engine's leading ``language_model.`` and prefixes ``model.``.
+    Fused engine projections concat their checkpoint constituents in
+    the engine's own order. Returns None when the env is unset or the
+    key cannot be resolved — the caller falls through to pack-specific
+    dequant, and its bind probe stays the last word either way.
+    """
+    import json
+    import os
+
+    root = os.environ.get("FRT_SOURCE_CKPT")
+    if not root or not seat_name:
+        return None
+    global _SRC_INDEX
+    if _SRC_INDEX is None:
+        from safetensors import safe_open
+        idx = json.load(open(os.path.join(
+            root, "model.safetensors.index.json")))
+        _SRC_INDEX = (idx["weight_map"], {}, root, safe_open)
+    wmap, handles, root, safe_open = _SRC_INDEX
+
+    def read(key):
+        fn = wmap.get(key)
+        if fn is None:
+            return None
+        if fn not in handles:
+            handles[fn] = safe_open(os.path.join(root, fn),
+                                    framework="pt", device="cpu")
+        return handles[fn].get_tensor(key)
+
+    cands = [seat_name]
+    if seat_name.startswith("language_model.model."):
+        cands.append("model.language_model."
+                     + seat_name[len("language_model.model."):])
+    if seat_name.startswith("model."):
+        cands.append("model.language_model."
+                     + seat_name[len("model."):])
+    cands.append("model." + seat_name)
+    for path in cands:
+        leaf = path.rsplit(".", 1)[-1]
+        parts = _FUSE.get(leaf)
+        if parts is None:
+            t = read(path + ".weight")
+            if t is not None:
+                return t.to("cuda", torch.bfloat16)
+            continue
+        base = path.rsplit(".", 1)[0]
+        pieces = [read(f"{base}.{p}.weight") for p in parts]
+        if all(p is not None for p in pieces):
+            return torch.cat(
+                [p.to("cuda", torch.bfloat16) for p in pieces],
+                dim=0).contiguous()
+    return None
+
+
+def _projection_weight(mod) -> torch.Tensor:
+    """The projection's dense rows, whatever the checkpoint stored.
+
+    A bf16/fp16 weight is the rows. A uint8 weight is a modelopt NVFP4
+    pack (e2m1 nibble pairs + fp8 block-16 scales + a global scalar):
+    dequantize it here so the seam re-grids from real values. Nibble
+    order inside the byte is resolved by the caller's bind probe — this
+    helper emits the low-nibble-first convention, and a probe failure
+    is a refusal, never silent garbage.
+    """
+    w = mod.weight.data
+    if w.dtype in (torch.bfloat16, torch.float16, torch.float32):
+        return w
+    src = _source_ckpt_weight(getattr(mod, "_frt_seat_name", None))
+    if src is not None:
+        # a quantized runtime weight, but the caller pointed
+        # FRT_SOURCE_CKPT at the full-precision checkpoint: re-grid
+        # from the real rows (the adopt door's own discipline) instead
+        # of dequantizing whatever runtime pack the engine chose
+        return src
+    if w.dtype is not torch.uint8:
+        raise ValueError(f"unrecognised weight dtype {w.dtype}")
+    global _E2M1_LUT
+    if _E2M1_LUT is None:
+        _E2M1_LUT = torch.tensor(
+            [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+             -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+            device=w.device, dtype=torch.float32)
+    ws = mod.weight_scale.data.to(torch.float32)      # [N, K/16]
+    ws2 = getattr(mod, "weight_scale_2", None)
+    g = (float(ws2.data.reshape(-1)[0]) if ws2 is not None else 1.0)
+    n = w.shape[0]
+    lo = (w & 0xF).long()
+    hi = (w >> 4).long()
+    codes = torch.stack([lo, hi], dim=-1).reshape(n, -1)
+    vals = _E2M1_LUT[codes]                            # [N, K]
+    scale = ws.repeat_interleave(16, dim=1) * g
+    return (vals * scale).to(torch.bfloat16).contiguous()
+
+
 class _ProjSeat(nn.Module):
     """Preserves the engine's ``(out, bias)`` projection contract."""
 
@@ -167,6 +278,52 @@ def _is_projection(module) -> bool:
             and hasattr(module, "quant_method"))
 
 
+def _park_untraceable_tiers(seam) -> list[str]:
+    """Drop the seam's optional tiers that cannot trace on fake tensors.
+
+    The engine compiles seam forwards under a fake mode, so an entry
+    without a fake impl raises there and takes the whole graph with it.
+    Rather than name the offenders (they move with the installed
+    artifact — a hub release that adds the missing fakes should light
+    the tiers up with no code change), this traces each optional tier
+    once under a fake mode and parks only what actually fails.
+    """
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    parked = []
+    k = int(seam._k)
+
+    def _traces(call) -> bool:
+        try:
+            with FakeTensorMode(allow_non_fake_inputs=True):
+                call()
+            return True
+        except Exception:
+            return False
+
+    if getattr(seam, "_m256", None) is not None:
+        m = 512
+        a = torch.empty(m, k // 2, device="cuda", dtype=torch.uint8)
+        sfa = torch.empty(((m + 127) // 128) * ((k + 63) // 64) * 512,
+                          device="cuda", dtype=torch.uint8)
+        if not _traces(lambda: seam._m256(a, seam._w_packed, sfa,
+                                          seam._w_sfb)):
+            seam._m256 = None
+            parked.append("m256")
+    if getattr(seam, "_mrows", None) is not None and seam._mrows_hub:
+        m = 8
+        a = torch.empty(m, k // 2, device="cuda", dtype=torch.uint8)
+        sfa = torch.empty(((m + 127) // 128) * ((k + 63) // 64) * 512,
+                          device="cuda", dtype=torch.uint8)
+        w_, s_ = seam._mr_cfg
+        if not _traces(lambda: seam._mrows(a, seam._w_packed, sfa,
+                                           seam._w_sfb, warps=w_,
+                                           stages=s_)):
+            seam._mrows = None
+            parked.append("mrows")
+    return parked
+
+
 def _expert_holder(module):
     for _, child in module.named_modules():
         if torch.is_tensor(getattr(child, "w13_weight", None)):
@@ -228,6 +385,7 @@ def attach_engine(model, *, seats=DENSE_SEAT_SUFFIXES, experts=True,
     swaps: dict[str, nn.Module] = {}
     reverts: list = []
     refused: list = []
+    parked_tiers: dict[str, int] = {}
     modules = dict(model.named_modules())
 
     # dense projections, smallest first: on tight cards early frees
@@ -237,7 +395,33 @@ def attach_engine(model, *, seats=DENSE_SEAT_SUFFIXES, experts=True,
     targets.sort(key=lambda t: t[1].weight.numel())
     for name, mod in targets:
         try:
-            seam, _ = _linear.bind_proj_seam({"w": mod.weight.data})
+            mod._frt_seat_name = name
+            w_bind = _projection_weight(mod)
+            seam, _ = _linear.bind_proj_seam({"w": w_bind})
+            # bind acceptance: the seam must reproduce the host module
+            # on a live probe — this is what catches a wrong weight
+            # layout (a packed checkpoint mistaken for dense rows) at
+            # bind time instead of as garbage tokens later
+            probe = torch.randn(4, w_bind.shape[1], device="cuda",
+                                dtype=torch.bfloat16)
+            with torch.no_grad():
+                host_out = mod(probe)
+                host_out = (host_out[0] if isinstance(host_out, tuple)
+                            else host_out)
+                cos = torch.nn.functional.cosine_similarity(
+                    seam(probe).float().reshape(-1),
+                    host_out.float().reshape(-1), dim=0)
+            if float(cos) < 0.98:
+                raise ValueError(
+                    f"bind probe cos {float(cos):.4f} < 0.98")
+            # the engine traces seam forwards with Meta tensors, so a
+            # tier whose entry carries no fake impl dies at trace time.
+            # Which tiers those are is a property of the installed
+            # artifact, not a constant: park by measuring it — trace
+            # each optional tier under a fake mode and keep the ones
+            # that survive. A capability parked, never a refusal.
+            for tier in _park_untraceable_tiers(seam):
+                parked_tiers[tier] = parked_tiers.get(tier, 0) + 1
             swaps[name] = _ProjSeat(seam)
         except Exception as e:
             refused.append((name, repr(e)[:120]))
@@ -308,10 +492,14 @@ def attach_engine(model, *, seats=DENSE_SEAT_SUFFIXES, experts=True,
         return handle
     handle = _swap.attach(model, swaps, revert=reverts)
     if verbose:
+        parked = (", parked " + ", ".join(
+            f"{t}x{n}" for t, n in sorted(parked_tiers.items()))
+            if parked_tiers else "")
         print(f"[structures.vllm] {len(swaps)} seats "
-              f"({head_slabs} head slabs), {len(refused)} refused",
-              flush=True)
-    handle.notes = {"refused": refused, "head_slabs": head_slabs}
+              f"({head_slabs} head slabs), {len(refused)} refused"
+              f"{parked}", flush=True)
+    handle.notes = {"refused": refused, "head_slabs": head_slabs,
+                    "parked_tiers": parked_tiers}
     return handle
 
 
