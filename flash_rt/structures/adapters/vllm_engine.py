@@ -369,6 +369,13 @@ class _ProjSeat(nn.Module):
     def __init__(self, seam, host=None):
         super().__init__()
         self.seam = seam
+        # the engine's linear layers carry a return_bias switch, and a
+        # call site built for return_bias=False receives a bare tensor
+        # — handing it the tuple anyway detonates at the next op, at
+        # trace time, far from here
+        object.__setattr__(
+            self, "_frt_tuple_out",
+            getattr(host, "return_bias", True) is not False)
         if host is not None:
             object.__setattr__(self, "_frt_host", host)
 
@@ -382,7 +389,8 @@ class _ProjSeat(nn.Module):
             return getattr(host, name)
 
     def forward(self, x, *args, **kwargs):
-        return self.seam(x), None
+        y = self.seam(x)
+        return (y, None) if self._frt_tuple_out else y
 
 
 class _FusedMlpSeat(nn.Module):
@@ -534,6 +542,194 @@ def _expert_holder(module):
     return None
 
 
+#: install-once state for the verify-attention seat; keyed data that
+#: the wrapped ``forward`` reads on every call lives here so a second
+#: ``attach_verify_attention`` call is a no-op rather than a re-wrap.
+_XQA_STATE: dict[str, Any] = {}
+
+
+def attach_verify_attention(*, verbose: bool = True) -> dict | None:
+    """Route spec-verify attention through the paged BF16-Q/FP8-KV XQA
+    kernel; host FlashInfer keeps everything else.
+
+    A speculative verify step is a handful of query rows against the
+    whole paged cache, and the host runs it on its chunked-prefill
+    kernel — at long context the most off-roofline structure in the
+    decode chain. This seat wraps the FlashInfer backend's ``forward``
+    and takes only calls whose metadata is exactly a verify batch
+    (single request, no decode rows, causal, fp8 cache) on a layer
+    geometry the kernel supports; anything else, and any error inside
+    the seat's own path, falls through to the host untouched.
+
+    Two engine facts carried here so callers do not rediscover them:
+
+    - The kv-cache tensor arriving at ``forward`` is a permuted view.
+      Flattening it (``reshape``/``flatten``) silently copies the whole
+      pool per call; the zero-copy road is ``as_strided`` claims over
+      the raw storage, where the view's own stride metadata *is* the
+      address walk (page/token/head strides read off the view, V half
+      at ``+head_dim``).
+    - The prefill wrapper's ``_paged_kv_indices_buf`` is the kernel's
+      page table verbatim: kernel pages equal engine blocks, so prefix
+      reuse and non-contiguous block runs need no translation and no
+      contiguity guard.
+    """
+    if _XQA_STATE.get("installed"):
+        return _XQA_STATE
+    try:
+        import vllm.v1.attention.backends.flashinfer as fi
+    except Exception as e:  # noqa: BLE001 — host without this backend
+        if verbose:
+            print(f"[flash_rt] verify-attention seat refused: "
+                  f"no FlashInfer backend ({e!r})")
+        return None
+    from ..impls import hub_kernel
+    try:
+        kx = hub_kernel("flashrt/fp8-kv-attention", "4")
+    except Exception as e:  # noqa: BLE001 — no build for this host
+        if verbose:
+            print(f"[flash_rt] verify-attention seat refused: {e!r}")
+        return None
+    page = getattr(kx, "PAGE_SIZE", None)
+    if page != 32:
+        if verbose:
+            print(f"[flash_rt] verify-attention seat refused: kernel "
+                  f"page size {page} != engine block size 32")
+        return None
+    supported = {tuple(c) for c in getattr(kx, "SUPPORTED_CONFIGS", ())}
+
+    st = _XQA_STATE
+    st.update(installed=True, kernel=kx, taken=0, fell_through=0,
+              masks={}, sems=None, scratch=None, sl=None, sl_val=-1)
+    orig = fi.FlashInferImpl.forward
+    fp8 = torch.float8_e4m3fn
+
+    def _stash_plan(wrap):
+        # The page count and last-page length the forward needs are on
+        # the device buffers, and reading them there is a host sync —
+        # sixteen of those per verify step erase the kernel's win by
+        # stalling the launch pipeline. The builder hands ``plan`` the
+        # same values as CPU tensors, so a wrap of ``plan`` stashes
+        # them as plain ints and the forward path never syncs.
+        orig_plan = wrap.plan
+
+        def plan(*a, **kw):
+            try:
+                ind = kw.get("paged_kv_indptr")
+                lpl = kw.get("paged_kv_last_page_len")
+                if (ind is not None and lpl is not None
+                        and not ind.is_cuda and ind.numel() == 2):
+                    wrap._frt_plan_np = (int(ind[1]), int(lpl[0]))
+                else:
+                    wrap._frt_plan_np = None
+            except Exception:  # noqa: BLE001
+                wrap._frt_plan_np = None
+            return orig_plan(*a, **kw)
+
+        wrap.plan = plan
+        wrap._frt_plan_hooked = True
+
+    def forward(self, layer, query, key, value, kv_cache, attn_metadata,
+                output, *args, **kwargs):
+        m = attn_metadata
+        take = (
+            m is not None
+            and getattr(m, "num_decode_tokens", 1) == 0
+            and getattr(m, "num_prefills", 0) == 1
+            and getattr(m, "causal", False)
+            and 2 <= getattr(m, "num_actual_tokens", 0) <= 32
+            and m.prefill is not None
+            and query.dim() == 3
+            and query.dtype == torch.bfloat16
+            and kv_cache.dim() == 4
+            and (query.shape[1], kv_cache.shape[1],
+                 query.shape[2]) in supported
+            and kv_cache.shape[2] == 32
+            and kv_cache.shape[3] == 2 * query.shape[2]
+            and getattr(self, "sinks", None) is None
+            and getattr(self, "window_left", -1) == -1
+            and not getattr(self, "logits_soft_cap", None)
+            and abs(self.scale - query.shape[2] ** -0.5) < 1e-9
+            and layer._k_scale_float == layer._v_scale_float
+            # capture bakes this call's shapes (page count, seq) into
+            # the replayed graph while the Python that refreshes them
+            # never runs again — the seat serves eager calls only
+            and not torch.cuda.is_current_stream_capturing()
+        )
+        if take:
+            try:
+                wrap = m.prefill.wrapper
+                idx = getattr(wrap, "_paged_kv_indices_buf", None)
+                if idx is None:
+                    raise LookupError("wrapper plan buffers absent")
+                meta_np = getattr(wrap, "_frt_plan_np", None)
+                if meta_np is None:
+                    # first sighting of this wrapper: hook its plan so
+                    # every later step has the counts sync-free; this
+                    # step goes to the host
+                    if not getattr(wrap, "_frt_plan_hooked", False):
+                        _stash_plan(wrap)
+                    raise LookupError("plan counts not stashed yet")
+                n_pages, last = meta_np
+                qs = int(m.num_actual_tokens)
+                seq = (n_pages - 1) * 32 + last
+                if n_pages <= 0 or not (0 < last <= 32) or seq < qs:
+                    raise ValueError("verify plan out of shape")
+                nq, hd = query.shape[1], query.shape[2]
+                kh = kv_cache.shape[1]
+                kv8 = (kv_cache if kv_cache.dtype == fp8
+                       else kv_cache.view(fp8))
+                elems = 32 * kh * hd
+
+                def claim(off):
+                    return kv8.as_strided(
+                        (n_pages, 32, kh, hd),
+                        (elems, kh * hd, hd, 1), storage_offset=off)
+
+                mask = st["masks"].get(qs)
+                if mask is None:
+                    mask = kx.causal_spec_mask(qs, device=query.device)
+                    st["masks"][qs] = mask
+                if st["sems"] is None:
+                    st["sems"], st["scratch"] = kx.allocate_workspace(
+                        q_seq=32, num_q_heads=nq, num_kv_heads=kh,
+                        device=query.device)
+                    st["sl"] = torch.zeros(
+                        1, 1, device=query.device, dtype=torch.int32)
+                if st["sl_val"] != seq:
+                    st["sl"].fill_(seq)
+                    st["sl_val"] = seq
+                kx.ops.xqa_bf16_fp8kv(
+                    query[:qs], claim(0), claim(hd),
+                    idx[:n_pages].view(1, -1), st["sl"], mask,
+                    output[:qs], st["sems"], st["scratch"],
+                    n_pages * 32, 1.0, float(layer._k_scale_float),
+                    # PDL off: with dependent launch the next layer's
+                    # call can overlap this one, and the workspace
+                    # (semaphores, split scratch) is shared state
+                    False, 0,
+                    int(kv_cache.stride(0)), int(kv_cache.stride(2)),
+                    int(kv_cache.stride(1)))
+                st["taken"] += 1
+                if st["taken"] == 1 or st["taken"] % 2000 == 0:
+                    print(f"[flash_rt] verify-attention xqa "
+                          f"taken={st['taken']} "
+                          f"fell_through={st['fell_through']}",
+                          flush=True)
+                return output
+            except Exception:  # noqa: BLE001 — host path must survive
+                st["fell_through"] += 1
+        return orig(self, layer, query, key, value, kv_cache,
+                    attn_metadata, output, *args, **kwargs)
+
+    fi.FlashInferImpl.forward = forward
+    st["revert"] = lambda: setattr(fi.FlashInferImpl, "forward", orig)
+    if verbose:
+        print("[flash_rt] verify-attention seat installed "
+              "(fp8-kv-attention v4, page 32)")
+    return st
+
+
 class _NoSeats:
     """The handle shape for a host where nothing could be seated.
 
@@ -591,6 +787,12 @@ def attach_engine(model, *, seats=DENSE_SEAT_SUFFIXES, experts=True,
     swaps: dict[str, nn.Module] = {}
     reverts: list = []
     refused: list = []
+    # opt-in verify-attention seat: a backend-level wrap, independent of
+    # the module seats below, reverted with the same handle
+    if os.environ.get("FRT_ATTN_XQA") == "1":
+        xst = attach_verify_attention(verbose=verbose)
+        if xst is not None and "revert" in xst:
+            reverts.append(xst["revert"])
     parked_tiers: dict[str, int] = {}
     fused_mlps = 0
     staged = 0
@@ -619,6 +821,35 @@ def attach_engine(model, *, seats=DENSE_SEAT_SUFFIXES, experts=True,
                    if n.endswith("lm_head")
                    and isinstance(getattr(m, "weight", None), torch.Tensor)),
                   None)
+        # a head the checkpoint already packed as NVFP4 can be adopted
+        # zero-copy — but the seam's row tiers quantize activations to
+        # FP4, and the head is the logits family: measured on real
+        # streams, A4 logits moved speculative acceptance well outside
+        # the noise band while the kernel win was microseconds. The
+        # host's own W4A16 head is both exact-class and near its
+        # weight-stream floor, so adoption is explicit opt-in only.
+        if (lm is not None and adopt_pack
+                and os.environ.get("FRT_HEAD_W4A4") == "1"
+                and precision in ("mirror", "auto")
+                and _host_precision(lm) == "nvfp4"):
+            try:
+                lm._frt_seat_name = "lm_head"
+                seam = _adopt_nvfp4_pack(lm)
+                if seam is not None:
+                    orig_method = lm.quant_method
+                    lm.quant_method = _SlabbedHeadMethod(
+                        [seam], orig_method)
+                    reverts.append(
+                        lambda lm=lm, m=orig_method: setattr(
+                            lm, "quant_method", m))
+                    head_slabs = 1
+                    adopted += 1
+                    _arm_runtime_dispatch(seam)
+                    lm = None          # claimed; skip the W8 slab path
+            except Exception as e:  # noqa: BLE001 — W8 path may still work
+                if verbose:
+                    print(f"[structures.vllm] lm_head adopt fell back: "
+                          f"{repr(e)[:160]}", flush=True)
         if lm is not None:
             try:
                 from ..impls.linear_proj import w8a16_static as _w8
@@ -918,7 +1149,7 @@ def _draft_ckpt_rename(name: str) -> str:
 
 
 def install_load_hook(*, on_attached=None, seat_draft=True,
-                      **attach_kwargs):
+                      draft_precision=None, **attach_kwargs):
     """Patch every importable vLLM model-runner so :func:`attach_engine`
     runs after weights load and before the engine's first trace. Set
     ``VLLM_DISABLE_COMPILE_CACHE=1``: the engine's compile cache key
@@ -958,6 +1189,16 @@ def install_load_hook(*, on_attached=None, seat_draft=True,
                 kw2["head"] = False        # the draft shares the target's
                 kw2["ckpt_rename"] = _draft_ckpt_rename
                 kw2["tag"] = "draft"
+                # a draft the checkpoint left in BF16 contributes no
+                # seats under the adopt tiers; an explicit draft
+                # precision re-grids it (proposal quality is the only
+                # exposure — the target still judges every token — and
+                # the caller gates it on measured acceptance)
+                if draft_precision:
+                    kw2["precision"] = draft_precision
+                    kw2["seats"] = tuple(
+                        kw2.get("seats", DENSE_SEAT_SUFFIXES)
+                    ) + ("model.fc",)
                 try:
                     dh = attach_engine(draft, **kw2)
                     # one detach undoes both models: the draft handle's
