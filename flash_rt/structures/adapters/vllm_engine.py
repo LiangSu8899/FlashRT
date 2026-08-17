@@ -319,7 +319,17 @@ def _adopt_nvfp4_pack(mod):
     for attr in ("weight_global_scale", "weight_scale_2"):
         v = getattr(mod, attr, None)
         if v is not None:
-            gs = float(v.data.reshape(-1)[0])
+            flat = v.data.reshape(-1).float()
+            if flat.numel() > 1 and not bool(
+                    (flat == flat[0]).all()):
+                # a merged projection may carry one global factor per
+                # constituent; a single alpha can only stand in for
+                # them when they agree, and pretending otherwise would
+                # scale one half by the other's factor
+                raise ValueError(
+                    "per-part global scales differ; cannot adopt "
+                    "under one alpha")
+            gs = float(flat[0])
             break
     n, k = w.shape[0], w.shape[1] * 2
     return _linear.bind_proj_seam_packed(
@@ -348,11 +358,28 @@ def _bind_fp8_seam(mod, w, rows_hint):
 
 
 class _ProjSeat(nn.Module):
-    """Preserves the engine's ``(out, bias)`` projection contract."""
+    """Preserves the engine's ``(out, bias)`` projection contract.
 
-    def __init__(self, seam):
+    Attribute reads fall through to the replaced module: an engine that
+    planned a fusion around this projection reads its scale attributes
+    off the module object itself, and a seat that answers only
+    ``forward`` turns that read into a startup crash far from here.
+    """
+
+    def __init__(self, seam, host=None):
         super().__init__()
         self.seam = seam
+        if host is not None:
+            object.__setattr__(self, "_frt_host", host)
+
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            host = self.__dict__.get("_frt_host")
+            if host is None:
+                raise
+            return getattr(host, name)
 
     def forward(self, x, *args, **kwargs):
         return self.seam(x), None
@@ -715,7 +742,7 @@ def attach_engine(model, *, seats=DENSE_SEAT_SUFFIXES, experts=True,
             if kind == "nvfp4":
                 _arm_runtime_dispatch(seam)
             kinds[kind] = kinds.get(kind, 0) + 1
-            swaps[name] = _ProjSeat(seam)
+            swaps[name] = _ProjSeat(seam, host=mod)
             if consume and kind == "nvfp4" and not seam_shares_host:
                 # nvfp4 only: the FP8 seam retains the host module for
                 # its own fallback form, and releasing rows it may still
