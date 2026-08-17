@@ -144,6 +144,10 @@ def _check_arch(repo: str, module) -> None:
 #: refusal path must not manufacture that error on retry)
 _LOADED: dict[tuple[str, str], object] = {}
 
+#: packages this host cannot resolve, by the same key. Absence is as
+#: cacheable as presence and far more expensive to re-establish.
+_UNRESOLVED: dict[tuple[str, str], BaseException] = {}
+
 #: highest version tag the resolution fallback searches downward from.
 #: Only an upper bound for the walk — a repo that has not published
 #: that many releases simply misses those revisions and continues.
@@ -193,7 +197,22 @@ def _newest_loadable(get_kernel, repo, version, kw, first=None,
 def hub_kernel(repo: str, version: str):
     from kernels import get_kernel
 
+    # A repo with no build variant for this host resolves by walking
+    # releases, and every step of that walk is a network round trip. Left
+    # unbounded those trips can hang far longer than the absence they are
+    # establishing is worth — a serving engine calling this during model
+    # load stalls with no output at all. Bound them so "this host has no
+    # variant" arrives as a refusal in seconds. Defaults only: a caller
+    # that set its own timeout meant it.
+    os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "10")
+    os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "60")
+
     key = (repo, version)
+    if key in _UNRESOLVED:
+        prior = _UNRESOLVED[key]
+        raise KernelUnavailable(
+            f"kernel package {repo!r} ({version}) is unavailable on "
+            f"this host: {type(prior).__name__}: {prior}") from prior
     if key not in _LOADED:
         # author pin for artifact bisection: an exact hub revision
         # outranks version resolution for this repo only. A perf or
@@ -242,6 +261,13 @@ def hub_kernel(repo: str, version: str):
                             else None))
         except (OSError, RuntimeError, ValueError) as unavailable:
             _record_unavailable(repo, version, unavailable)
+            # remember the absence, not just the presence: resolution
+            # walks releases over the network, and a caller binding a
+            # whole model asks for the same package once per seat. Without
+            # this, one unpublished build variant costs that walk hundreds
+            # of times over — the failure is a property of this host, and
+            # it cannot change inside one process.
+            _UNRESOLVED[key] = unavailable
             raise KernelUnavailable(
                 f"kernel package {repo!r} ({version}) is unavailable on "
                 f"this host: {type(unavailable).__name__}: "
