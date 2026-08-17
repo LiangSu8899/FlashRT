@@ -194,6 +194,8 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #include "kernels/rms_norm_quantize_fp4_sfa_bf16.cuh"
 #include "kernels/gdn_wy_norm_cumsum_pack_qk_v2.cuh"
 #include "kernels/causal_conv1d_update_steps_gqa_bf16.cuh"
+#include "kernels/gdn_recurrent_inout_vsplit_bf16.cuh"
+#include "kernels/rms_norm_gated_silu_quant_fp4_bf16.cuh"
 #include "quantize/fp8_block128_dequant.cuh"
 #ifdef FLASHRT_HAVE_NVFP4_SWIZZLE
 #include "quantize/fp8_block128_to_nvfp4_swizzled.cuh"
@@ -6782,6 +6784,51 @@ Taps roll through registers - (STEPS+3)/STEPS read amplification
 instead of 4x - with the packaged kernel's tap order and fma chain,
 bit-exact. x: (S, 10240); w: (10240, 4); state: (10240, 3) last raw
 inputs; q16/k16: (S, 2048), v48: (S, 6144), silu applied.
+)pbdoc");
+
+    m.def("rms_norm_gated_silu_quant_fp4_bf16",
+        [](uintptr_t x, uintptr_t gate, uintptr_t weight, uintptr_t out,
+           uintptr_t packed, uintptr_t sfa, int M, int dim, float eps,
+           uintptr_t stream) -> int {
+            return flash_rt::kernels::rms_norm_gated_silu_quant_fp4_bf16(
+                to_ptr(x), to_ptr(gate), to_ptr(weight), to_ptr(out),
+                to_ptr(packed), to_ptr(sfa), M, dim, eps,
+                to_stream(stream));
+        },
+        py::arg("x"), py::arg("gate"), py::arg("weight"),
+        py::arg("out"), py::arg("packed"), py::arg("sfa"), py::arg("M"),
+        py::arg("dim"), py::arg("eps") = 1e-6f, py::arg("stream") = 0,
+        R"pbdoc(
+Fused RMSNorm + weight + silu(gate) that also emits the row's NVFP4
+packed bytes and SFA, read by the output projection as one (1, M*128)
+activation. Norm arithmetic transcribed from the packaged gated-norm
+kernel; quantize stage is the production path verbatim. dim must be 128.
+)pbdoc");
+
+    m.def("gdn_recurrent_inout_vsplit_bf16",
+        [](uintptr_t q, uintptr_t k, uintptr_t v, uintptr_t g,
+           uintptr_t beta, uintptr_t state_in, uintptr_t state_out,
+           uintptr_t out, int B, int num_v_heads, int head_dim,
+           bool use_qk_l2norm, uintptr_t stream) -> int {
+            return flash_rt::kernels::gdn_recurrent_inout_vsplit_bf16(
+                to_ptr(q), to_ptr(k), to_ptr(v), to_ptr(g),
+                to_ptr(beta), to_ptr(state_in), to_ptr(state_out),
+                to_ptr(out), B, num_v_heads, head_dim, use_qk_l2norm,
+                to_stream(stream));
+        },
+        py::arg("q"), py::arg("k"), py::arg("v"), py::arg("g"),
+        py::arg("beta"), py::arg("state_in"), py::arg("state_out"),
+        py::arg("out"), py::arg("B"), py::arg("num_v_heads"),
+        py::arg("head_dim"), py::arg("use_qk_l2norm") = true,
+        py::arg("stream") = 0,
+        R"pbdoc(
+Gated-delta recurrent decode step over a V-split launch plan: one warp
+per 32 value columns instead of one block per head, so the same total
+thread count spreads over 4x the blocks (the packaged kernel leaves
+three quarters of a 170-SM part idle). Per-column arithmetic is the
+packaged kernel's, unchanged; the q/k L2 norm reduces over a warp
+rather than a 128-thread block, so its fp32 rounding may differ.
+head_dim must be 128.
 )pbdoc");
 
     m.def("gdn_chunk_from_conv_smem_h_stash_bf16",

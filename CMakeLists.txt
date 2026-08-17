@@ -1378,6 +1378,14 @@ target_sources(flash_rt_kernels PRIVATE
 target_sources(flash_rt_kernels PRIVATE
   csrc/kernels/causal_conv1d_update_steps_gqa_bf16.cu)
 
+# Gated-delta recurrent decode step, V-split launch plan.
+target_sources(flash_rt_kernels PRIVATE
+  csrc/kernels/gdn_recurrent_inout_vsplit_bf16.cu)
+
+# Gated norm that also emits its consumer's NVFP4 input.
+target_sources(flash_rt_kernels PRIVATE
+  csrc/kernels/rms_norm_gated_silu_quant_fp4_bf16.cu)
+
 # Gated-delta chunk core, per-row state stash arm (spec-verify rollback
 # by selection). Plain CUDA, no CUTLASS dependency, arch-agnostic.
 target_sources(flash_rt_kernels PRIVATE
