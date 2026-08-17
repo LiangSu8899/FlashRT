@@ -105,6 +105,20 @@ def _native_gated_norm_quant():
     """
     if _os.environ.get("FRT_GDN_NORMQUANT", "1") == "0":
         return None
+    # hub artifact first: its entry is a torch op with a fake, so a
+    # host that compiles this call traces it unaided and a process
+    # that cannot load our native extension still gets the producer
+    from flash_rt.structures.impls import hub_kernel
+    try:
+        hub = hub_kernel(FUSED_DEP["repo"], FUSED_DEP["version"])
+    except Exception:  # noqa: BLE001 — absence is not a refusal
+        hub = None
+    hub_fn = getattr(hub, "rms_norm_gated_silu_quant_fp4_bf16", None)
+    if hub_fn is not None:
+        def _hub_entry(x, gate, weight, out, packed, sfa, eps):
+            hub_fn(x, gate, weight, eps=eps, out=out, packed=packed,
+                   sfa=sfa)
+        return _hub_entry
     try:
         from flash_rt import flash_rt_kernels as _fk
     except ImportError:
@@ -148,6 +162,18 @@ def _native_recurrent_stream():
     """
     if _os.environ.get("FRT_GDN_STREAM", "1") == "0":
         return None
+    from flash_rt.structures.impls import hub_kernel
+    try:
+        hub = hub_kernel(GDA_DEP["repo"], GDA_DEP["version"])
+    except Exception:  # noqa: BLE001 — absence is not a refusal
+        hub = None
+    hub_fn = getattr(hub, "gdn_recurrent_inout_stream_bf16", None)
+    if hub_fn is not None:
+        def _hub_entry(q, k, v, g, beta, state_in, state_out, out):
+            return hub_fn(q, k, v, g, beta, state_in,
+                          use_qk_l2norm=True, state_out=state_out,
+                          out=out)
+        return _hub_entry
     try:
         from flash_rt import flash_rt_kernels as _fk
     except ImportError:

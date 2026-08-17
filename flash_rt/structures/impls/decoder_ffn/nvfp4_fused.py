@@ -26,15 +26,33 @@ from ...guard import CAST_OK, PROCEED, GuardedSeam
 from ..linear_proj.nvfp4_dynamic import (LinearProjNvfp4Dynamic,
                                          _quantize_activation)
 
+FUSED_DEP = {"provider": "hf", "repo": "flashrt/fp4-fused-ops",
+             "version": ">=1"}
+
+
 @lru_cache(maxsize=1)
 def _native_silu_mul():
-    """The local build's fused SwiGLU + NVFP4 quantize producer.
+    """The fused SwiGLU + NVFP4 quantize producer.
 
     Bit-exact against the split (elementwise mul kernel -> production
     quantize kernel) chain by construction, so adopting it moves no
-    numerics. Registered as a torch custom op with a fake so the
-    compiled prefill and the captured decode step trace through it.
+    numerics.
+
+    Hub artifact first: its entry is already a torch op with a fake, so
+    a host that compiles this call traces it without help, and a host
+    process that cannot load our native extension (a serving engine on
+    a different torch/CUDA pair) still gets the fused producer. The
+    local build follows, wrapped as a custom op for the same reason.
     """
+    from flash_rt.structures.impls import hub_kernel
+
+    try:
+        hub = hub_kernel(FUSED_DEP["repo"], FUSED_DEP["version"])
+    except Exception:  # noqa: BLE001 — absence is not a refusal
+        hub = None
+    hub_fn = getattr(hub, "silu_mul_quantize_fp4_sfa_bf16", None)
+    if hub_fn is not None:
+        return lambda merged: hub_fn(merged)
     try:
         from flash_rt import flash_rt_kernels as _fk
     except ImportError:
