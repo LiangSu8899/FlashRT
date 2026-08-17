@@ -150,10 +150,16 @@ _LOADED: dict[tuple[str, str], object] = {}
 _TAG_SEARCH_TOP = 32
 
 
-def _newest_loadable(get_kernel, repo, version, kw, first=None):
+def _newest_loadable(get_kernel, repo, version, kw, first=None,
+                     reported=None):
     """The newest release at or above ``version``'s floor that loads.
 
-    ``first`` is an optional resolution to try before the walk (the
+    A resolver that only accepts an exact major still reports which
+    majors exist when it rejects a range, so the published set comes
+    from that report rather than a blind walk; ``_TAG_SEARCH_TOP`` is
+    only the fallback ceiling for a resolver that says nothing.
+
+    ``first`` is an optional resolution to try before the search (the
     pre-semver library's repo default, which is usually right and
     costs nothing to attempt).
     """
@@ -165,7 +171,15 @@ def _newest_loadable(get_kernel, repo, version, kw, first=None):
                 raise
     floor = re.match(r"^\s*>=\s*v?(\d+)", str(version))
     lo = int(floor.group(1)) if floor else 1
+    published = sorted(
+        {int(n) for n in re.findall(r"\d+", reported or "")
+         if int(n) >= lo}, reverse=True) if reported else []
     last = None
+    for major in published:
+        try:
+            return get_kernel(repo, version=major, **kw)
+        except Exception as e:  # noqa: BLE001 — try the next release
+            last = e
     for major in range(_TAG_SEARCH_TOP, lo - 1, -1):
         try:
             return get_kernel(repo, revision=f"v{major}", **kw)
@@ -208,7 +222,7 @@ def hub_kernel(repo: str, version: str):
                     _LOADED[key] = _newest_loadable(
                         get_kernel, repo, version, _kw,
                         first=lambda: get_kernel(repo))
-                except (ValueError, FileNotFoundError):
+                except (ValueError, FileNotFoundError) as unresolved:
                     # Two ways a version range fails to land on a
                     # usable artifact, both routine: the newer library
                     # resolves only an exact major (a range string is
@@ -221,7 +235,11 @@ def hub_kernel(repo: str, version: str):
                     # this host can actually load. That is what the
                     # range in the dependency spec asks for.
                     _LOADED[key] = _newest_loadable(
-                        get_kernel, repo, version, _kw)
+                        get_kernel, repo, version, _kw,
+                        reported=(str(unresolved).split(
+                            "available versions:")[-1]
+                            if "available versions:" in str(unresolved)
+                            else None))
         except (OSError, RuntimeError, ValueError) as unavailable:
             _record_unavailable(repo, version, unavailable)
             raise KernelUnavailable(
