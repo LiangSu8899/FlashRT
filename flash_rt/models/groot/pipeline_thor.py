@@ -597,9 +597,6 @@ class CKernelQwen3:
             fvk.gpu_strided_copy_fp16(self.b_qkv.data_ptr(), self.b_attn.data_ptr(), Se, NHKV*HD, self.QKV, NHQ*HD+NHKV*HD, s)
             fvk.gpu_repeat_interleave_heads(self.b_k.data_ptr(), self.b_k_exp.data_ptr(), Se, NHKV, HD, NHQ//NHKV, s)
             fvk.gpu_repeat_interleave_heads(self.b_attn.data_ptr(), self.b_v_exp.data_ptr(), Se, NHKV, HD, NHQ//NHKV, s)
-            if getattr(self, '_dbg', None) is not None:
-                self._dbg.append(('k', self.b_k.clone()))
-                self._dbg.append(('v', self.b_attn.clone()))
             fvk.gpu_fill_neginf_fp16(self.b_logits.data_ptr(), self.b_logits.nelement(), s)
             if self.attn is not None:
                 self.attn.run("qwen3", i, q_seq=Se, stream=s)
@@ -607,8 +604,6 @@ class CKernelQwen3:
                 fvk.attention_mha_fp16(self.ctx, self.b_q.data_ptr(), self.b_k_exp.data_ptr(), self.b_v_exp.data_ptr(),
                                         self.b_logits.data_ptr(), self.b_o.data_ptr(), Se, Se, NHQ, HD, 1.0/math.sqrt(HD), s)
             self.gemm.fp16_nn(self.b_o.data_ptr(), w['o_w'].data_ptr(), self.b_xn.data_ptr(), Se, D, D, s)
-            if getattr(self, '_dbg', None) is not None:
-                self._dbg.append(('o', self.b_xn.clone()))
             fvk.residual_add_fp16(self.b_x.data_ptr(), self.b_xn.data_ptr(), Se * D, s)
             fvk.rms_norm_fp16(self.b_x.data_ptr(), w['ln2_w'].data_ptr(), self.b_xn.data_ptr(), Se, D, 1e-6, s)
             if self.use_fp8:
@@ -633,9 +628,6 @@ class CKernelQwen3:
                 self.gemm.fp16_nn(self.b_gu.data_ptr(), w['down_fp16'].data_ptr(),
                                   self.b_down.data_ptr(), Se, D, H, s)
             fvk.residual_add_fp16(self.b_x.data_ptr(), self.b_down.data_ptr(), Se * D, s)
-            if getattr(self, '_dbg', None) is not None:
-                self._dbg.append(('ff', self.b_down.clone()))
-                self._dbg.append(('x', self.b_x.clone()))
         fvk.rms_norm_fp16(self.b_x.data_ptr(), self.final_norm_w.data_ptr(), self.b_xn.data_ptr(), Se, D, 1e-6, s)
         return self.b_xn
 
@@ -899,36 +891,23 @@ class CKernelDiTHead:
         fvk.gpu_cast_fp32_to_fp16(self.b_actions.data_ptr(), self.b_actions_fp16.data_ptr(), T*self.action_dim, s)
         self._fp16_gemm(self.b_actions_fp16.data_ptr(), self.ae_w1.data_ptr(), self.b_a_emb.data_ptr(), T, D, self.action_dim, s)
         fvk.add_bias_fp16(self.b_a_emb.data_ptr(), self.ae_b1.data_ptr(), T, D, s)
-        if getattr(self, '_dbg', None) is not None:
-            self._dbg.append(('ae1', self.b_a_emb.clone()))
         # gpu_copy is a raw memcpy: it cannot place (T,D) rows into the first
         # D columns of a (T,2D) buffer (row stride differs). Use concat2_bf16.
         fvk.concat2_bf16(self.b_a_emb.data_ptr(),
                          self.action_time_embeds[step].data_ptr(),
                          self.b_concat.data_ptr(), T, D, D, s)
-        if getattr(self, '_dbg', None) is not None:
-            self._dbg.append(('concat', self.b_concat.clone()))
         self._fp16_gemm(self.b_concat.data_ptr(), self.ae_w2.data_ptr(), self.b_enc_h.data_ptr(), T, D, 2*D, s)
         fvk.add_bias_fp16(self.b_enc_h.data_ptr(), self.ae_b2.data_ptr(), T, D, s)
         fvk.silu_inplace_fp16(self.b_enc_h.data_ptr(), T*D, s)
-        if getattr(self, '_dbg', None) is not None:
-            self._dbg.append(('ae2', self.b_enc_h.clone()))
         self._fp16_gemm(self.b_enc_h.data_ptr(), self.ae_w3.data_ptr(), self.b_a_emb.data_ptr(), T, D, D, s)
         fvk.add_bias_fp16(self.b_a_emb.data_ptr(), self.ae_b3.data_ptr(), T, D, s)
-        if getattr(self, '_dbg', None) is not None:
-            self._dbg.append(('ae3', self.b_a_emb.clone()))
-            self._dbg.append(('tau', self.action_time_embeds[step].clone()))
         fvk.residual_add_fp16(self.b_a_emb.data_ptr(), self.pos_emb[:T].data_ptr(), T*D, s)
         fvk.gpu_copy(self.b_hidden.data_ptr(), self.b_state_feat.data_ptr(), D*2, s)
         fvk.gpu_copy(self.b_hidden.data_ptr()+D*2, self.b_a_emb.data_ptr(), T*D*2, s)
-        if getattr(self, '_dbg', None) is not None:
-            self._dbg.append(('h0', self.b_hidden.clone()))
         for l in range(self.L):
             is_self = (l % 2 == 1); w = self.dit[l]
             fvk.ada_layer_norm_fp16(self.b_hidden.data_ptr(), self.ada_scales[step,l].data_ptr(),
                                      self.ada_shifts[step,l].data_ptr(), self.b_h_norm.data_ptr(), Sa, D, 1e-5, s)
-            if getattr(self, '_dbg', None) is not None:
-                self._dbg.append(('ada', self.b_h_norm.clone()))
             as_qkv_ptr = self._dit_act_scales_dev.data_ptr() + (l * 3 + 0) * 4
             as_up_ptr  = self._dit_act_scales_dev.data_ptr() + (l * 3 + 1) * 4
             as_dn_ptr  = self._dit_act_scales_dev.data_ptr() + (l * 3 + 2) * 4
@@ -971,8 +950,6 @@ class CKernelDiTHead:
                                            self.b_attn_logits_cross.data_ptr(), self.b_attn_out.data_ptr(), Sa, kv_seq, NH, HD, 1.0/math.sqrt(HD), s)
             self._fp16_gemm(self.b_attn_out.data_ptr(), w['o_w'].data_ptr(), self.b_o.data_ptr(), Sa, D, D, s)
             fvk.add_bias_fp16(self.b_o.data_ptr(), w['o_b'].data_ptr(), Sa, D, s)
-            if getattr(self, '_dbg', None) is not None:
-                self._dbg.append(('attn_o', self.b_o.clone()))
             fvk.residual_add_fp16(self.b_hidden.data_ptr(), self.b_o.data_ptr(), Sa*D, s)
             fvk.layer_norm_no_affine_fp16(self.b_hidden.data_ptr(), self.b_h_norm.data_ptr(), Sa, D, 1e-5, s)
             if self.use_fp8:
@@ -991,8 +968,6 @@ class CKernelDiTHead:
                 self._fp16_gemm(self.b_ff_h.data_ptr(), w['ff_dn_fp16'].data_ptr(), self.b_ff_out.data_ptr(), Sa, D, H, s)
                 fvk.add_bias_fp16(self.b_ff_out.data_ptr(), w['ff_dn_b'].data_ptr(), Sa, D, s)
             fvk.residual_add_fp16(self.b_hidden.data_ptr(), self.b_ff_out.data_ptr(), Sa*D, s)
-            if getattr(self, '_dbg', None) is not None:
-                self._dbg.append(self.b_hidden.clone())
         fvk.ada_layer_norm_fp16(self.b_hidden.data_ptr(), self.out_scales[step].data_ptr(),
                                  self.out_shifts[step].data_ptr(), self.b_h_norm.data_ptr(), Sa, D, 1e-6, s)
         self._fp16_gemm(self.b_h_norm.data_ptr(), self.proj_out_2_w.data_ptr(), self.b_model_out.data_ptr(), Sa, 1024, D, s)
