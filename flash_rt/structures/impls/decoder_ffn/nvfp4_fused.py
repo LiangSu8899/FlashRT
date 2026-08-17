@@ -52,7 +52,22 @@ def _native_silu_mul():
         hub = None
     hub_fn = getattr(hub, "silu_mul_quantize_fp4_sfa_bf16", None)
     if hub_fn is not None:
-        return lambda merged: hub_fn(merged)
+        def _hub_entry(merged):
+            # allocate the outputs here rather than letting the wrapper
+            # size them: its size helper is a custom op without a fake,
+            # so a host tracing this call on Meta tensors dies inside
+            # it. The layout is the packaged quantizer's own and stated
+            # in its contract, so computing it here is reading the
+            # contract, not guessing at it.
+            m, two_h = merged.shape
+            h = two_h // 2
+            packed = merged.new_empty((m, h // 2), dtype=torch.uint8)
+            sfa = merged.new_zeros(
+                (((m + 127) // 128) * ((h + 63) // 64) * 512,),
+                dtype=torch.uint8)
+            return hub_fn(merged, packed=packed, sfa=sfa)
+
+        return _hub_entry
     try:
         from flash_rt import flash_rt_kernels as _fk
     except ImportError:

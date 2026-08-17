@@ -138,6 +138,101 @@ def _quantize_activation(kern, flat: torch.Tensor):
         flat.to(torch.float16).contiguous())
 
 
+#: seams whose tier dispatch runs at call time, by index. A host that
+#: compiles one graph for a whole range of row counts cannot carry a
+#: Python-level tier branch (it would freeze the tracing sample's
+#: choice), so those seams register here and dispatch inside a custom
+#: op instead: the trace sees one opaque call, and the branch runs on
+#: the shape the call actually receives — at capture, that is the size
+#: being captured; outside a capture, it is the live batch.
+_RT_SEATS: dict[int, object] = {}
+
+
+def register_runtime_dispatch(seam) -> int:
+    """Give ``seam`` a call-time dispatching entry; returns its index."""
+    idx = len(_RT_SEATS)
+    _RT_SEATS[idx] = seam
+    seam._rt_idx = idx
+    return idx
+
+
+# Registered at import, never on first use: schema inference inside a
+# traced region graph-breaks the host's compiled forward, and the first
+# call of a lazily registered op lands exactly there.
+@torch.library.custom_op("flash_rt_structures::nvfp4_linear_rt",
+                         mutates_args=())
+def _nvfp4_linear_rt(a_packed: torch.Tensor, a_sfa: torch.Tensor,
+                     idx: int) -> torch.Tensor:
+    return _RT_SEATS[idx]._mm_packed_impl(a_packed, a_sfa)
+
+
+@_nvfp4_linear_rt.register_fake
+def _(a_packed, a_sfa, idx):
+    return a_packed.new_empty((a_packed.shape[0], _RT_SEATS[idx]._n),
+                              dtype=torch.bfloat16)
+
+
+def _runtime_dispatch():
+    return _nvfp4_linear_rt
+
+
+#: opt-in census of which tier each call actually lands in, keyed by
+#: (row count, tier). Dispatch is data-dependent and lives inside a
+#: custom op, so a host's own profile attributes every tier to the same
+#: opaque call — reading the choice off the kernel names is exactly
+#: what this makes unnecessary.
+_TIER_CENSUS: dict | None = ({} if os.environ.get("FRT_TIER_CENSUS")
+                             else None)
+
+#: whether an adopted pack's per-tensor factor rides each tier's alpha
+#: instead of a separate pass over the result. The routes are equivalent
+#: (2.3e-3 apart at the seam, both the same distance from BF16), and on
+#: real input streams a speculative host's acceptance length is
+#: indifferent between them — each numeric path lands somewhere in a
+#: ±0.2 content-dependent band around the host's own, with no
+#: systematically better draw. On degenerate repeated-sentence prompts
+#: the same choice swings acceptance 14%, which is a fact about that
+#: protocol, not about the numerics: never judge this switch (or any
+#: speculative A/B) on synthetic repetition. Folding is the default
+#: because it is free — the separate pass costs ~10ms of 2K TTFT.
+_ALPHA_FOLD = os.environ.get("FRT_NVFP4_ALPHA_FOLD", "1") != "0"
+
+
+def _tier_census_note(seam, m) -> None:
+    if not isinstance(m, int):
+        tier = "sym->gemm"
+    elif m == 1 and seam._gemv is not None:
+        tier = "gemv"
+    elif 2 <= m <= 16 and seam._mrows is not None:
+        tier = "mrows"
+    elif m >= 512 and seam._m256 is not None:
+        tier = "m256"
+    else:
+        tier = "gemm"
+    key = (m if isinstance(m, int) else -1, tier)
+    _TIER_CENSUS[key] = _TIER_CENSUS.get(key, 0) + 1
+
+
+def tier_census() -> dict:
+    """The census so far, or an empty mapping when it is not armed."""
+    return dict(_TIER_CENSUS or {})
+
+
+if _TIER_CENSUS is not None:
+    import atexit
+
+    @atexit.register
+    def _dump_tier_census():
+        # printed from whichever process ran the seams: on a serving
+        # host that is the engine worker, not the caller
+        rows = sorted(_TIER_CENSUS.items(), key=lambda kv: -kv[1])
+        print("[linear_proj.nvfp4] tier census (M, tier): calls",
+              flush=True)
+        for (m, tier), n in rows:
+            print(f"[linear_proj.nvfp4]   M={m:<6} {tier:<10} {n}",
+                  flush=True)
+
+
 class _ShareCell:
     """One activation-quantization seat shared by sibling projections.
 
@@ -206,13 +301,22 @@ class LinearProjNvfp4Dynamic(GuardedSeam, torch.nn.Module):
 
     _frt_can_fallback = False
 
-    def __init__(self, w_packed, w_sfb, bias, n, k):
+    def __init__(self, w_packed, w_sfb, bias, n, k, global_scale=None):
         super().__init__()
         self.register_buffer("_w_packed", w_packed)
         self.register_buffer("_w_sfb", w_sfb)
         self._bias = bias
         self._n = n
         self._k = k
+        #: a per-tensor factor sitting outside the block scales. Weights
+        #: this seam packs itself fold everything into the block scale
+        #: and leave this None; weights adopted from a checkpoint that
+        #: stores a separate global scale carry it here rather than
+        #: having the block scales rescaled to absorb it — rescaling
+        #: would re-round every E4M3 scale and put a lossy step into
+        #: what is otherwise a pure relayout.
+        self._w_gs = (None if global_scale is None
+                      else float(global_scale))
         kern = _kernel()
         self._kern = kern
         self._gemm = kern.fp4_w4a16_linear_bf16
@@ -284,6 +388,18 @@ class LinearProjNvfp4Dynamic(GuardedSeam, torch.nn.Module):
 
     def _mm_packed(self, a_packed: torch.Tensor,
                    a_sfa: torch.Tensor) -> torch.Tensor:
+        """Tier-dispatched matmul, through the runtime op when armed."""
+        if getattr(self, "_rt_idx", None) is not None:
+            # armed for a host that reuses one compiled graph across row
+            # counts: whether this trace shows a symbolic M or a
+            # specialized one, the branch it records is not the branch
+            # the replay needs, so every call goes through the op whose
+            # body runs on the shape actually received
+            return _runtime_dispatch()(a_packed, a_sfa, self._rt_idx)
+        return self._mm_packed_impl(a_packed, a_sfa)
+
+    def _mm_packed_impl(self, a_packed: torch.Tensor,
+                        a_sfa: torch.Tensor) -> torch.Tensor:
         """Tier-dispatched matmul over a pre-quantized activation.
 
         The same dispatch the seam's own forward uses, exposed so a
@@ -293,14 +409,24 @@ class LinearProjNvfp4Dynamic(GuardedSeam, torch.nn.Module):
         Returns the (m, n) BF16 product with bias applied.
         """
         m = a_packed.shape[0]
+        if _TIER_CENSUS is not None:
+            _tier_census_note(self, m)
+        # every tier's entry takes the output scale as its own alpha, so
+        # an adopted checkpoint's per-tensor factor rides the epilogue
+        # that is already writing the result. Applying it afterwards
+        # instead costs a full-size read-modify-write per projection —
+        # invisible at M=1, and the whole prefill regression at M=2048.
+        al = 1.0 if (self._w_gs is None or not _ALPHA_FOLD) else self._w_gs
         if not isinstance(m, int):
-            # a symbolic row count: the host is tracing this call for a
-            # *range* of M, so a Python-level tier branch would bake in
-            # whichever side the tracing sample happened to take and
-            # then run it for every replayed M. The tiled GEMM serves
-            # every M correctly, so the range-compiled path takes it and
-            # the specialized ones (concrete M at capture) keep theirs.
+            # a symbolic row count with no runtime op armed: a tier
+            # branch here would freeze the tracing sample's choice, and
+            # the tiled GEMM is the one tier that serves every M
+            # this branch returns before the shared epilogue below, so
+            # it always folds — the switch exists to A/B the dispatched
+            # tiers, and leaving a path that drops the factor entirely
+            # would be a bug wearing an experiment's clothes
             y = self._gemm(a_packed, self._w_packed, a_sfa, self._w_sfb,
+                           1.0 if self._w_gs is None else self._w_gs,
                            variant=2)
             if self._bias is not None:
                 y = y + self._bias
@@ -308,24 +434,80 @@ class LinearProjNvfp4Dynamic(GuardedSeam, torch.nn.Module):
         if m == 1 and self._gemv is not None:
             gw, gs = self._gemv_cfg
             y = self._gemv(a_packed, self._w_packed, a_sfa, self._w_sfb,
-                           warps=gw, stages=gs)
+                           alpha=al, warps=gw, stages=gs)
         elif 2 <= m <= 16 and self._mrows is not None:
             w_, s_ = self._mr_cfg
             if self._mrows_hub:
                 y = self._mrows(a_packed, self._w_packed, a_sfa,
-                                self._w_sfb, warps=w_, stages=s_)
+                                self._w_sfb, alpha=al, warps=w_,
+                                stages=s_)
             else:
+                # the local native op fixes alpha at 1.0 in its schema;
+                # scaling after it is the only route on that build
                 y = self._mrows(a_packed, self._w_packed, a_sfa,
                                 self._w_sfb, self._n, self._k, w_, s_)
+                if self._w_gs is not None and _ALPHA_FOLD:
+                    y = y * self._w_gs
         elif m >= 512 and self._m256 is not None:
             y = self._m256(a_packed, self._w_packed, a_sfa,
-                           self._w_sfb)
+                           self._w_sfb, alpha=al)
         else:
             y = self._gemm(a_packed, self._w_packed, a_sfa, self._w_sfb,
-                           variant=2)
+                           al, variant=2)
+        if self._w_gs is not None and not _ALPHA_FOLD:
+            y = y * self._w_gs
         if self._bias is not None:
             y = y + self._bias
         return y
+
+
+@torch.no_grad()
+def bind_proj_seam_packed(
+    w_packed: torch.Tensor,
+    w_sfb: torch.Tensor,
+    n: int,
+    k: int,
+    *,
+    global_scale=None,
+    bias: torch.Tensor | None = None,
+) -> LinearProjNvfp4Dynamic:
+    """Adopt a projection that is *already* NVFP4, without re-gridding.
+
+    The regridding entry (:func:`bind_proj_seam`) exists for a host
+    holding dense rows. A host holding a packed checkpoint does not need
+    it, and should not pay it: dequantizing someone else's grid and
+    quantizing it again with ours replaces their calibration with our
+    packer's rounding, which is a change of model wearing the costume of
+    an acceleration. The block-scale layout is the only thing that
+    differs between the two conventions, and a relayout is a
+    permutation — it loses nothing.
+
+    ``w_packed`` is ``[N, K/2]`` E2M1 nibble pairs; ``w_sfb`` is the
+    block scales already in this kernel's atom layout; ``global_scale``
+    is the checkpoint's per-tensor factor, applied at the output.
+    Tensors are adopted by reference: the caller's copy *is* the seam's,
+    so seating a whole model costs no additional weight memory.
+    """
+    if w_packed.dtype is not torch.uint8:
+        raise ValueError(
+            f"packed weight must be uint8 nibble pairs, got "
+            f"{w_packed.dtype}")
+    if w_packed.shape != (n, k // 2):
+        raise ValueError(
+            f"packed weight {tuple(w_packed.shape)} does not match "
+            f"N={n} K={k} (expected {(n, k // 2)})")
+    bound = LinearProjNvfp4Dynamic(
+        w_packed, w_sfb.view(torch.uint8).reshape(-1),
+        (None if bias is None else bias.detach().to(torch.bfloat16)),
+        n, k, global_scale=global_scale)
+    probe = bound(torch.zeros(1, k, device=w_packed.device,
+                              dtype=torch.bfloat16))
+    if probe.shape != (1, n) or not torch.isfinite(probe).all():
+        raise ValueError(
+            f"refused: nvfp4 pack-adopt smoke produced shape "
+            f"{tuple(probe.shape)}, finite="
+            f"{bool(torch.isfinite(probe).all())}")
+    return bound
 
 
 @torch.no_grad()
