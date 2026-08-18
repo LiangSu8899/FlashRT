@@ -512,6 +512,40 @@ class _SlabbedHeadMethod:
         return getattr(self.orig, name)
 
 
+class _MarlinHeadMethod:
+    """The checkpoint's own W4A16 head, re-laid for small M.
+
+    Same NVFP4 grid, same dequantized values — only the storage layout
+    changes (bind-time Marlin repack) so the verify-step logits calls
+    (M ≤ 16) leave the host's tiled kernel for one built for that band.
+    The logits family keeps its precision class; anything outside the
+    band, and any capture pass, goes to the host method untouched.
+    """
+
+    def __init__(self, kernel, packs, rows, orig):
+        self.kernel = kernel
+        self.packs = packs           # (weight, scale, global, lock)
+        self.rows = rows             # vocabulary rows of the output
+        self.orig = orig
+
+    def apply(self, layer, x, bias=None):
+        if (1 <= x.shape[0] <= 16 and x.dtype == torch.bfloat16
+                and x.dim() == 2
+                and not torch.cuda.is_current_stream_capturing()):
+            wm, wsm, wgs, lock = self.packs
+            out = torch.empty(x.shape[0], self.rows,
+                              dtype=x.dtype, device=x.device)
+            self.kernel.nvfp4_w4a16_marlin_bf16(
+                x, wm, wsm, wgs, workspace=lock, out=out)
+            if bias is not None:
+                out = out + bias
+            return out
+        return self.orig.apply(layer, x, bias)
+
+    def __getattr__(self, name):
+        return getattr(self.orig, name)
+
+
 def _is_projection(module) -> bool:
     w = getattr(module, "weight", None)
     return (isinstance(w, torch.Tensor) and w.dim() == 2
@@ -862,6 +896,78 @@ def attach_engine(model, *, seats=DENSE_SEAT_SUFFIXES, experts=True,
                 if verbose:
                     print(f"[structures.vllm] lm_head adopt fell back: "
                           f"{repr(e)[:160]}", flush=True)
+        # the checkpoint's own W4A16 head re-laid for small M: identical
+        # NVFP4 grid and dequant values, Marlin layout, so verify-step
+        # logits calls run a kernel built for M<=16 instead of the tiled
+        # path. Precision class unchanged — default on, env to disable.
+        if (lm is not None and adopt_pack
+                and os.environ.get("FRT_HEAD_MARLIN", "1") == "1"
+                and precision in ("mirror", "auto")):
+            try:
+                kxg = _linear._kernel()
+                w = getattr(lm, "weight", None)
+                ws = getattr(lm, "weight_scale", None)
+                # modelopt spells the per-tensor scale two ways across
+                # its linear methods
+                ws2 = getattr(lm, "weight_scale_2", None)
+                if ws2 is None:
+                    ws2 = getattr(lm, "weight_global_scale", None)
+                if (hasattr(kxg, "adopt_nvfp4_w4a16_marlin")
+                        and isinstance(w, torch.Tensor) and w.dim() == 2
+                        and w.dtype == torch.uint8
+                        and isinstance(ws, torch.Tensor) and ws.dim() == 2
+                        and ws.shape[0] == w.shape[0]
+                        and isinstance(ws2, torch.Tensor)
+                        and ws2.numel() == 1):
+                    packs = kxg.adopt_nvfp4_w4a16_marlin(
+                        w.contiguous(),
+                        ws.view(torch.float8_e4m3fn).contiguous(),
+                        ws2.float().reshape(()))
+                    orig_method = lm.quant_method
+                    mh = _MarlinHeadMethod(kxg, packs, w.shape[0],
+                                           orig_method)
+                    # bind receipt: the relaid pack must reproduce the
+                    # checkpoint's own dequantized rows. The host's
+                    # apply is not the reference — its activation
+                    # quantization adds noise of its own (measured cos
+                    # ~0.92 on an exact relay); the E2M1 table decode
+                    # of a row slice is the ground truth.
+                    rows_p = 4096
+                    tbl = torch.tensor(
+                        [0, .5, 1, 1.5, 2, 3, 4, 6,
+                         -0., -.5, -1, -1.5, -2, -3, -4, -6],
+                        device=w.device)
+                    pw = w[:rows_p].to(torch.int32)
+                    q = torch.stack([tbl[pw & 0xF], tbl[pw >> 4]],
+                                    dim=-1).reshape(rows_p, -1)
+                    sc = (ws.view(torch.float8_e4m3fn)[:rows_p].float()
+                          .repeat_interleave(16, dim=1))
+                    wd = q * sc * float(ws2)
+                    xp = torch.randn(8, w.shape[1] * 2, device=w.device,
+                                     dtype=torch.bfloat16)
+                    ours = mh.apply(lm, xp)[:, :rows_p].float()
+                    ref = xp.float() @ wd.T
+                    cos = torch.nn.functional.cosine_similarity(
+                        ours.reshape(-1), ref.reshape(-1), dim=0).item()
+                    del pw, q, sc, wd, ref, xp
+                    if cos < 0.999:
+                        raise RuntimeError(
+                            f"marlin head probe cos {cos:.6f} vs "
+                            f"checkpoint dequant")
+                    lm.quant_method = mh
+                    reverts.append(
+                        lambda lm=lm, m=orig_method: setattr(
+                            lm, "quant_method", m))
+                    head_slabs = 1
+                    adopted += 1
+                    if verbose:
+                        print(f"[structures.vllm] lm_head marlin relay: "
+                              f"probe cos {cos:.6f}", flush=True)
+                    lm = None      # claimed; skip the W8 slab path
+            except Exception as e:  # noqa: BLE001 — host head still fine
+                if verbose:
+                    print(f"[structures.vllm] lm_head marlin fell back: "
+                          f"{repr(e)[:160]}", flush=True)
         if lm is not None:
             try:
                 from ..impls.linear_proj import w8a16_static as _w8
@@ -904,7 +1010,8 @@ def attach_engine(model, *, seats=DENSE_SEAT_SUFFIXES, experts=True,
             mod._frt_seat_name = (ckpt_rename(name) if ckpt_rename
                                   else name)
             kind = (_host_precision(mod)
-                    if precision in ("mirror", "auto") else "nvfp4")
+                    if precision in ("mirror", "auto")
+                    else "w8" if precision == "w8" else "nvfp4")
             if precision == "auto" and kind == "fp8":
                 # the auto tier's one opinion: a W8 position is carried
                 # to W4 (the measured arbitrage: smaller weight stream,
@@ -945,6 +1052,12 @@ def attach_engine(model, *, seats=DENSE_SEAT_SUFFIXES, experts=True,
                 w_bind = _projection_weight(mod)
                 if kind == "fp8":
                     seam = _bind_fp8_seam(mod, w_bind, rows_hint)
+                elif kind == "w8":
+                    # the logits-family middle tier: half the weight
+                    # stream of BF16 at a fraction of W4's rounding —
+                    # the draft-precision experiment band
+                    from ..impls.linear_proj import w8a16_static as _w8s
+                    seam = _w8s.bind_proj_seam({"w": w_bind})
                 else:
                     seam, pack_rel = _linear.bind_proj_seam(
                         {"w": w_bind})
