@@ -120,6 +120,14 @@ little headroom for long-prefill activation transients (measured OOM
 at 200K with utilization-based sizing); an explicit KV budget with
 1.5 GB+ left free is the configuration that survives.
 
+The same effect on SGLang (DSpark serving, identical memory
+fraction): the stock server's pool is **34,659** tokens — a 60K
+request is refused outright — while the attached server's pool is
+**87,128** (2.51x) and an 80K real-prompt request decodes at
+**210.8 tok/s** (AL 4.49). The multiplier is the released weight
+memory; the absolute ceilings differ because SGLang's hybrid-state
+cache and draft KV cost more per token than vLLM's pools.
+
 ### Judging protocol (what the receipts require)
 
 - Speculative arms drift to different greedy continuations per arm, and
