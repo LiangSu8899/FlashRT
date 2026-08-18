@@ -5,27 +5,26 @@ engine — no fork, no model conversion, one hook installed before the
 engine loads weights. Everything below is a measured configuration:
 each command is the exact form its receipts were produced with.
 
-> **Scope disclaimer — read first.** The vLLM/SGLang configurations
-> measured here are **not an exhaustive tuning of either engine**, and
-> none of the numbers should be read as a community performance
-> comparison. The baseline arms use each engine's documented serving
-> recipe for this model plus the minimum settings our protocol needed;
-> both engines have many knobs we did not sweep — the "maximum
-> context" figures in particular reflect the engines' default memory
-> accounting under these settings and may move under other
-> configurations. What this document and the adapters demonstrate is a
-> **hot-pluggable, stackable optimization path**: what becomes
-> possible when the structures layer attaches to an engine *as
-> configured*, with everything reverting to the untouched host on
-> detach or refusal.
+> **How to read these numbers — a fairness note, not a benchmark
+> claim.** The vLLM/SGLang configurations measured here are **not an
+> exhaustive tuning of either engine**, so none of the numbers should
+> be read as a community performance comparison. The baseline arms
+> use each engine's documented serving recipe for this model plus the
+> minimum settings the protocol needed; both engines have many knobs
+> outside my sweep — the "maximum context" figures in particular
+> reflect the engines' default memory accounting under these settings
+> and may move under other configurations. What this document and the
+> adapters demonstrate is a **hot-pluggable, stackable optimization
+> path**: what becomes possible when the structures layer attaches to
+> an engine *as configured*, with everything reverting to the
+> untouched host on detach or refusal.
 >
-> We are grateful to the vLLM and SGLang teams — these adapters exist
-> because both engines are excellent hosts, and everything here runs
-> *through* their serving stacks, not around them. If a configuration
-> we did not cover serves these workloads better (several knobs on
-> both engines were outside our sweep), we would genuinely like to
-> hear about it and will update the numbers; the tuning attempts we
-> did make are recorded below so they can be checked and improved on.
+> This line is a single-author project, and it exists because vLLM
+> and SGLang are excellent hosts — everything here runs *through*
+> their serving stacks, not around them. If a configuration I did not
+> cover serves these workloads better, I would genuinely like to hear
+> about it and will update the numbers; the tuning attempts I did
+> make are recorded below so they can be checked and improved on.
 
 ## Requirements
 
@@ -160,8 +159,8 @@ draft `unquant`, `mamba-radix-cache-strategy extra_buffer`):
 | 60K request | **refused** (exceeds pool) | **147.7 tok/s** (AL 3.05) |
 | 80K request | refused | **210.8 tok/s** (AL 4.49) |
 
-We tried to tune the stock arm higher before writing this table, and
-record the sweep so it can be checked and improved on:
+The stock arm was tuned before this table was written; the sweep is
+recorded so it can be checked and improved on:
 
 | stock configuration attempted | pool (tokens) | long request |
 |---|---|---|
