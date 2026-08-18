@@ -5,9 +5,49 @@ engine — no fork, no model conversion, one hook installed before the
 engine loads weights. Everything below is a measured configuration:
 each command is the exact form its receipts were produced with.
 
-Hardware/software baseline for the numbers quoted here: one RTX 5090
-(32 GB), vLLM 0.27.x, SGLang 0.5.x, a mixed-precision NVFP4/FP8
-checkpoint of a hybrid-attention 27B model, real code/text prompts.
+## Requirements
+
+These determine whether the seats bind at all — check them before
+anything else.
+
+**Hardware**
+- An SM120 GPU (RTX 5090 class). The W4A4 GEMV, small-M Marlin, and
+  paged FP8-KV attention tiers are `sm120a` builds; on other
+  architectures those seats refuse cleanly and the host runs its own
+  kernels (the adapter never blocks engine startup).
+- The receipts below are from a single 32 GB card, `max_num_seqs=1`
+  (single-stream serving). Batch>1 is untested on this line.
+
+**Software**
+- vLLM **0.27.x** (the adapter patches `GPUModelRunner.load_model` and
+  reads the FlashInfer backend's metadata layout of that series).
+- SGLang **0.5.x** with the FlashInfer attention backend, run from its
+  official container image.
+- torch **2.13 + cu130**: the published kernel build variant consumed
+  here is `torch213-cxx11-cu130-x86_64-linux`. A different torch/CUDA
+  pair needs the matching build variant on the hub (or mounted via
+  `FRT_KERNEL_DIR_*`, see the SGLang section).
+- `kernels` (huggingface) library for hub resolution on the vLLM host.
+  Air-gapped SGLang containers skip it entirely through
+  `FRT_KERNEL_DIR_*`.
+
+**Model / checkpoint**
+- Measured host: **Qwen3.8-27B** (Qwen3.5 backbone: 48 gated-delta +
+  16 full-attention layers), served from a **ModelOpt mixed-precision
+  checkpoint** — NVFP4-packed projections (uint8 nibble pairs + FP8
+  block-16 scales + a per-tensor global scale), FP8 rows on the
+  gated-delta projections, a W4A16 head, and FP8 KV cache
+  (`kv_cache_dtype fp8_e4m3` resolved from the checkpoint config).
+- The `auto`/`mirror` tiers *adopt* these packs, so this checkpoint
+  family is what they expect; a dense BF16 checkpoint works through
+  the re-grid tiers (`nvfp4`, `w8`) instead.
+- Speculative arms: vLLM MTP (`method qwen3_5_mtp`,
+  `num_speculative_tokens=6` — measured optimum for this model; K≥7
+  loses throughput at every context) / SGLang DSpark with its
+  published draft model.
+
+Real code/text prompts throughout — repeated/synthetic prompts
+inflate speculative acceptance and void any spec-arm number.
 
 ## vLLM
 
