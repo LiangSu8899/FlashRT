@@ -1299,6 +1299,17 @@ def install_load_hook(*, on_attached=None, seat_draft=True,
 
         def load_model(self, *a, __orig=orig, **kw):
             __orig(self, *a, **kw)
+            # A speculative engine judges drafts against target logits,
+            # and vLLM's MTP draft shares the target's lm_head. The
+            # Marlin head relay changes the target's head numerics
+            # only, so draft and target stop agreeing at the head —
+            # measured as a systematic acceptance drop (paired over
+            # ten prompts, lower on all ten). Under spec decode the
+            # relay steps aside unless the caller forces it.
+            _spec = getattr(getattr(self, "vllm_config", None),
+                            "speculative_config", None)
+            if _spec is not None and "FRT_HEAD_MARLIN" not in os.environ:
+                os.environ["FRT_HEAD_MARLIN"] = "0"
             handle = attach_engine(self.model, **attach_kwargs)
             # A speculative engine is two models, and its throughput is
             # the product of acceptance and step rate. Seating only the
