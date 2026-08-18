@@ -5,6 +5,20 @@ engine — no fork, no model conversion, one hook installed before the
 engine loads weights. Everything below is a measured configuration:
 each command is the exact form its receipts were produced with.
 
+> **Scope disclaimer — read first.** The vLLM/SGLang configurations
+> measured here are **not an exhaustive tuning of either engine**, and
+> none of the numbers should be read as a community performance
+> comparison. The baseline arms use each engine's documented serving
+> recipe for this model plus the minimum settings our protocol needed;
+> both engines have many knobs we did not sweep — the "maximum
+> context" figures in particular reflect the engines' default memory
+> accounting under these settings and may move under other
+> configurations. What this document and the adapters demonstrate is a
+> **hot-pluggable, stackable optimization path**: what becomes
+> possible when the structures layer attaches to an engine *as
+> configured*, with everything reverting to the untouched host on
+> detach or refusal.
+
 ## Requirements
 
 These determine whether the seats bind at all — check them before
@@ -32,12 +46,19 @@ anything else.
   `FRT_KERNEL_DIR_*`.
 
 **Model / checkpoint**
-- Measured host: **Qwen3.8-27B** (Qwen3.5 backbone: 48 gated-delta +
-  16 full-attention layers), served from a **ModelOpt mixed-precision
-  checkpoint** — NVFP4-packed projections (uint8 nibble pairs + FP8
-  block-16 scales + a per-tensor global scale), FP8 rows on the
-  gated-delta projections, a W4A16 head, and FP8 KV cache
+- Measured host: **`RadixArk/Qwen3.8-27B-NVFP4`** (Hugging Face) — the
+  NVIDIA Model Optimizer mixed-precision quantization of
+  [`Qwen/Qwen3.8-27B`](https://huggingface.co/Qwen/Qwen3.8-27B)
+  (Qwen3.5 backbone: 48 gated-delta + 16 full-attention layers).
+  Format the adopt tiers read: NVFP4-packed projections (uint8 nibble
+  pairs + FP8 block-16 scales + a per-tensor global scale), FP8 rows
+  on the gated-delta projections, a W4A16 head, and FP8 KV cache
   (`kv_cache_dtype fp8_e4m3` resolved from the checkpoint config).
+- Speculative draft for SGLang:
+  **`RadixArk/Qwen3.8-27B-DSpark`** (Hugging Face) — the DSpark
+  speculator for this model family, served with SGLang's
+  `--speculative-algorithm DSPARK`. vLLM's MTP path needs no separate
+  download (the MTP head ships inside the target checkpoint).
 - The `auto`/`mirror` tiers *adopt* these packs, so this checkpoint
   family is what they expect; a dense BF16 checkpoint works through
   the re-grid tiers (`nvfp4`, `w8`) instead.
@@ -121,12 +142,21 @@ at 200K with utilization-based sizing); an explicit KV budget with
 1.5 GB+ left free is the configuration that survives.
 
 The same effect on SGLang (DSpark serving, identical memory
-fraction): the stock server's pool is **34,659** tokens — a 60K
-request is refused outright — while the attached server's pool is
-**87,128** (2.51x) and an 80K real-prompt request decodes at
-**210.8 tok/s** (AL 4.49). The multiplier is the released weight
-memory; the absolute ceilings differ because SGLang's hybrid-state
-cache and draft KV cost more per token than vLLM's pools.
+fraction, real code prompts):
+
+| context | stock server | attached server |
+|---|---|---|
+| KV pool (`max_total_num_tokens`) | 34,659 | **87,128 (2.51x)** |
+| 32K decode | 205.4 tok/s | 200.6 tok/s |
+| 60K request | **refused** (exceeds pool) | **147.7 tok/s** (AL 3.05) |
+| 80K request | refused | **210.8 tok/s** (AL 4.49) |
+
+The multiplier is the released weight memory; the absolute ceilings
+differ from vLLM's because SGLang's hybrid-state cache and draft KV
+price each token higher. Decode at the new lengths rides
+acceptance-length content variance like every speculative number in
+this document — the receipt is that the band exists at full speed at
+all, where the stock server refuses the request.
 
 ### Judging protocol (what the receipts require)
 
