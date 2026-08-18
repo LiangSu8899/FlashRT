@@ -18,6 +18,14 @@ each command is the exact form its receipts were produced with.
 > possible when the structures layer attaches to an engine *as
 > configured*, with everything reverting to the untouched host on
 > detach or refusal.
+>
+> We are grateful to the vLLM and SGLang teams — these adapters exist
+> because both engines are excellent hosts, and everything here runs
+> *through* their serving stacks, not around them. If a configuration
+> we did not cover serves these workloads better (several knobs on
+> both engines were outside our sweep), we would genuinely like to
+> hear about it and will update the numbers; the tuning attempts we
+> did make are recorded below so they can be checked and improved on.
 
 ## Requirements
 
@@ -152,15 +160,25 @@ draft `unquant`, `mamba-radix-cache-strategy extra_buffer`):
 | 60K request | **refused** (exceeds pool) | **147.7 tok/s** (AL 3.05) |
 | 80K request | refused | **210.8 tok/s** (AL 4.49) |
 
-We did try to tune the stock arm higher before writing this table:
-raising the memory fraction to 0.95 grows the paper pool to 55,822
-tokens, but a 48K request then fails server-side at both prefill
-chunk sizes we tried — the extra fraction is exactly the runtime
-headroom the request needed (the attached arm cannot boot at 0.95
-either; 0.92 is the stable envelope for both). Trimming CUDA-graph
-allocations, shrinking `context-length`, and widening
-`mamba-track-interval` did not move the pool; the hybrid line's
-2.25 GB intermediate state cache is insensitive to all three. Higher
+We tried to tune the stock arm higher before writing this table, and
+record the sweep so it can be checked and improved on:
+
+| stock configuration attempted | pool (tokens) | long request |
+|---|---|---|
+| mem 0.85 (runner default) | — | refuses to boot with the draft |
+| mem 0.92 + draft card's flags | 32,661–34,659 | 32K serves; 60K refused |
+| + CUDA-graph trim (decode bs cap, no prefill graphs) | 32,661 | unchanged |
+| + `context-length` 147456 | 55,822* | — |
+| + `mamba-track-interval` 1024 | 55,334* | — |
+| mem 0.95 | 55,334* | **48K fails server-side** (chunk 2048 and 1024) |
+| mem 0.97 | — | fails during graph capture |
+
+\* paper pool only: at 0.95 the added fraction is exactly the
+runtime headroom long prefills need, and the attached arm cannot
+boot there either — **0.92 is the stable envelope for both arms**,
+which is what the comparison table uses. The hybrid line's 2.25 GB
+intermediate state cache is insensitive to the graph, context-length,
+and track-interval knobs. Higher
 single-server context figures published for this model family come
 from multi-GPU serving (the model card's own recipe is `tp-size 4`,
 which divides weight memory per GPU); on one 32 GB card, within the
