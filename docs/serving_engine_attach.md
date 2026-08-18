@@ -141,22 +141,35 @@ little headroom for long-prefill activation transients (measured OOM
 at 200K with utilization-based sizing); an explicit KV budget with
 1.5 GB+ left free is the configuration that survives.
 
-The same effect on SGLang (DSpark serving, identical memory
-fraction, real code prompts):
+The same effect on SGLang (DSpark serving, real code prompts; both
+arms carry the draft model card's own flags — `dspark-block-size 7`,
+draft `unquant`, `mamba-radix-cache-strategy extra_buffer`):
 
-| context | stock server | attached server |
+| context | stock server (mem 0.92) | attached server (mem 0.92) |
 |---|---|---|
 | KV pool (`max_total_num_tokens`) | 34,659 | **87,128 (2.51x)** |
 | 32K decode | 205.4 tok/s | 200.6 tok/s |
 | 60K request | **refused** (exceeds pool) | **147.7 tok/s** (AL 3.05) |
 | 80K request | refused | **210.8 tok/s** (AL 4.49) |
 
-The multiplier is the released weight memory; the absolute ceilings
-differ from vLLM's because SGLang's hybrid-state cache and draft KV
-price each token higher. Decode at the new lengths rides
-acceptance-length content variance like every speculative number in
-this document — the receipt is that the band exists at full speed at
-all, where the stock server refuses the request.
+We did try to tune the stock arm higher before writing this table:
+raising the memory fraction to 0.95 grows the paper pool to 55,822
+tokens, but a 48K request then fails server-side at both prefill
+chunk sizes we tried — the extra fraction is exactly the runtime
+headroom the request needed (the attached arm cannot boot at 0.95
+either; 0.92 is the stable envelope for both). Trimming CUDA-graph
+allocations, shrinking `context-length`, and widening
+`mamba-track-interval` did not move the pool; the hybrid line's
+2.25 GB intermediate state cache is insensitive to all three. Higher
+single-server context figures published for this model family come
+from multi-GPU serving (the model card's own recipe is `tp-size 4`,
+which divides weight memory per GPU); on one 32 GB card, within the
+envelope we covered, the released weight memory is the working lever
+— and it multiplies the stock pool by ~2.5x. Decode at the new
+lengths rides acceptance-length content variance like every
+speculative number in this document; the receipt is that the band
+exists at full speed at all, where the stock server refuses the
+request.
 
 ### Judging protocol (what the receipts require)
 
