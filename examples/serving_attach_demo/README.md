@@ -46,3 +46,33 @@ continuations with TTFT around 120 ms.
 The same attach also serves shorter contexts faster than the stock
 boot (see the guide's tables) — the demo's closing line: nothing was
 converted, nothing forked; detach and the host is untouched.
+
+
+## Scene 4 — the context race (the watchable cut)
+
+A single growing conversation instead of one giant prompt: each turn
+appends the next slice of the codebase and asks for the running
+summary to be updated. With prefix caching on, every turn prefills
+only its increment — the pace stays conversational (~2 s a turn at
+the start), and the context meter just climbs.
+
+```bash
+# arm A: the best context the stock server can boot (~102K here)
+MODEL=<ckpt> ./serve_stock_race.sh
+python race.py --arm stock --corpus <some-repo>
+
+# arm B: the attached server at the native 262144
+MODEL=<ckpt> FRT_REPO=<flashrt-checkout> ./serve_attached_race.sh
+python race.py --arm attach --corpus <some-repo>
+```
+
+The stock arm walks its meter up and dies at its ceiling with the
+server's own 400 in the table — that row is the money shot. The
+attached arm walks the same turns past it to the native maximum. One
+32 GB card cannot hold two copies of the weights, so the arms are
+recorded separately and cut side by side; the client prints the same
+table either way, so the timelines align turn for turn.
+
+The race form runs without speculative decode (this vLLM series
+disables prefix caching under it); the one-shot scenes above carry
+the speculative form and its speed numbers.
