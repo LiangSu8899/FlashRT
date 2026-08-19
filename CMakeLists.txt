@@ -1347,6 +1347,50 @@ else()
   message(STATUS "SM120 NVFP4 W4A16 fp4_w4a4 kernels: SKIPPED (slim build)")
 endif()
 
+# Group A addition — interleaved-B warp-split tiers (bind-time repacked B;
+# same arch gate and binding guard as the dense warp-split family above).
+if(NOT FLASHRT_SLIM_BUILD OR GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121")
+  target_sources(flash_rt_kernels PRIVATE
+    csrc/kernels/fp4_w4a4_mma_warpsplit_ilv_sm120.cu
+    csrc/kernels/fp4_w4a4_mma_warpsplit_ilv_mrows_sm120.cu)
+endif()
+
+# Fused SwiGLU + NVFP4 quantize producer (plain CUDA elementwise, no
+# CUTLASS dependency; quantize stage transcribed from the production
+# bf16 quantize kernel).
+target_sources(flash_rt_kernels PRIVATE
+  csrc/kernels/silu_mul_quantize_fp4_sfa_bf16.cu)
+
+# Batched 64x64 unit-lower-triangular inverse for the gated-delta WY
+# chain (plain CUDA, arch-agnostic).
+target_sources(flash_rt_kernels PRIVATE
+  csrc/kernels/batched_unit_ltri_inv64.cu)
+
+# Fused (1+w)-form RMSNorm + NVFP4 quantize producer (plain CUDA).
+target_sources(flash_rt_kernels PRIVATE
+  csrc/kernels/rms_norm_quantize_fp4_sfa_bf16.cu)
+
+# WY-chain norm/pack + chunk-parallel gate cumsum, v2 launch plan.
+target_sources(flash_rt_kernels PRIVATE
+  csrc/kernels/gdn_wy_norm_cumsum_pack_qk_v2.cu)
+
+# Causal conv1d update with per-thread step batching + GQA split.
+target_sources(flash_rt_kernels PRIVATE
+  csrc/kernels/causal_conv1d_update_steps_gqa_bf16.cu)
+
+# Gated-delta recurrent decode step, streaming-column form.
+target_sources(flash_rt_kernels PRIVATE
+  csrc/kernels/gdn_recurrent_inout_stream_bf16.cu)
+
+# Gated norm that also emits its consumer's NVFP4 input.
+target_sources(flash_rt_kernels PRIVATE
+  csrc/kernels/rms_norm_gated_silu_quant_fp4_bf16.cu)
+
+# Gated-delta chunk core, per-row state stash arm (spec-verify rollback
+# by selection). Plain CUDA, no CUTLASS dependency, arch-agnostic.
+target_sources(flash_rt_kernels PRIVATE
+  csrc/kernels/gdn_chunk_from_conv_smem_stash.cu)
+
 # Group B — NVFP4 swizzle/quantize helpers. Their bindings are unguarded today
 # (exposed on SM89 but runtime-unreachable: every Python loader self-gates on
 # has_nvfp4()). Gating the sources requires guarding their bindings + includes

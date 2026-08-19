@@ -182,8 +182,13 @@ class FusedLinearProj(GuardedSeam, torch.nn.Module):
             return y.reshape(*shape[:-1], y.shape[-1])
         flat = flat.to(torch.bfloat16).contiguous()
         if self.form == "no_bias":
-            self._quantize(flat, self._chan, self._input_scale, out=x_fp8)
-            y = self._gemm(x_fp8, self._w_fp8, self._input_scale,
+            # bind the return, not the buffer: on the traced path the
+            # persistent out-buffer is None and the quantize's returned
+            # tensor is the only handle to the result — feeding the
+            # buffer forward hands the GEMM a None
+            x_q = self._quantize(flat, self._chan, self._input_scale,
+                                 out=x_fp8)
+            y = self._gemm(x_q, self._w_fp8, self._input_scale,
                            self._weight_scale, out=out)
         else:
             y = self._fn(flat, self._w_fp8, self._bias, self._input_scale,

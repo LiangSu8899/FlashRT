@@ -159,9 +159,25 @@ def _patch_runner():
         orig(self, *a, **kw)
         seats = tuple(s for s in os.environ.get(_SEATS_VAR, "").split(",")
                       if s) or DENSE_SEAT_SUFFIXES
+        precision = os.environ.get("FRT_SGLANG_PRECISION")
         try:
-            attach_engine(self.model, seats=seats,
-                          release=os.environ.get("FRT_SGLANG_RELEASE") == "1")
+            if precision:
+                # this engine's layers share vLLM's module lineage down
+                # to the quant-method attribute names, so the precision
+                # tiers assemble here unchanged: positions already in a
+                # seam's width adopt the host's own tensors, and the
+                # auto tier's W8->W4 carry sources from the host's FP8
+                # rows. The engine-specific part of this adapter stays
+                # what it was: the process-boundary carrier.
+                from .vllm_engine import attach_engine as _tiered
+                _tiered(self.model, seats=seats, precision=precision,
+                        head=False, tag="sglang",
+                        consume=os.environ.get(
+                            "FRT_SGLANG_RELEASE") == "1")
+            else:
+                attach_engine(
+                    self.model, seats=seats,
+                    release=os.environ.get("FRT_SGLANG_RELEASE") == "1")
         except Exception as e:
             print(f"[structures.sglang] attach refused: {e!r}", flush=True)
     mr.ModelRunner.load_model = load_model

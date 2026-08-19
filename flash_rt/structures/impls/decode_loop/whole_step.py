@@ -95,11 +95,17 @@ class WholeStepDecodeLoop:
     """Compiled, graph-captured greedy decode over the attached model."""
 
     def __init__(self, model, *, max_len, compile_step=True,
-                 compile_prefill=True, kv_band=None):
+                 compile_prefill=True, kv_band=None, prefill_chunk=None):
         lm = _find_stack(model)
         self._model = model
         self._lm = lm
         self._compile_prefill = bool(compile_prefill)
+        #: deep-window prompt form: slices of this many rows drive the
+        #: same offset-mask forward, gated-delta state carrying across
+        #: slices through the continuation branch the verify batches
+        #: already exercise. Bounds the prompt-pass transients to one
+        #: slice — what admits 16K+ windows on this card's budget.
+        self._prefill_chunk = int(prefill_chunk) if prefill_chunk else None
         head = getattr(model, "lm_head", None)
         if head is None:
             raise ValueError("refused: host carries no lm_head")
@@ -145,6 +151,10 @@ class WholeStepDecodeLoop:
                 raise ValueError(
                     "refused: fp8 kv band serves the kernel's v1 head "
                     "profile (24/4/256); this host keeps BF16 KV")
+            if self._prefill_chunk:
+                # deep-window prompt slices take the GQA-native SDPA
+                # arm; established short-window forms keep their path
+                self._kv_band._deep_prompt = True
         elif kv_band is not None:
             raise ValueError(f"refused: unknown kv band {kv_band!r}")
         # no quadratic causal table: the decode mask is one static row
@@ -260,8 +270,26 @@ class WholeStepDecodeLoop:
             self.cache.key_cache[i][:, :, L:].zero_()
             self.cache.value_cache[i][:, :, L:].zero_()
         pf = self._aot_pf or self._prefill_callable()
-        logits = pf(input_ids,
-                    torch.arange(L, device=input_ids.device))
+        ck = self._prefill_chunk
+        if ck and L > ck:
+            # sliced prompt pass. Not bitwise-identical to the one-shot
+            # form: two runs of the FP4 pipeline decorrelate at low
+            # mantissa bits and the quantization grid amplifies them
+            # (measured: chunked-vs-oneshot logits cos ~= the arbiter
+            # band squared — two independent samples of the same
+            # quantization ball). The equivalence contract is the
+            # arbiter gate plus continuation identity, not bit equality.
+            dev = input_ids.device
+            logits = None
+            for s in range(0, L, ck):
+                e = min(s + ck, L)
+                logits = pf(input_ids[:, s:e],
+                            torch.arange(s, e, device=dev))
+                self.cache.frt_continue = True
+            self.cache.frt_continue = False
+        else:
+            logits = pf(input_ids,
+                        torch.arange(L, device=input_ids.device))
         self._cur.copy_(logits.float().argmax(-1))
         self._pos.fill_(L)
         toks = [self._cur.clone()]
@@ -455,6 +483,21 @@ class WholeStepDecodeLoop:
         self._default_k = int(default_k)
         self._verify_capture = bool(verify_capture)
         return self._mtp
+
+    @torch.no_grad()
+    def enable_dspark(self, draft_dir):
+        """Attach a block-draft (DFlash/DSpark) speculative runner.
+
+        The draft checkpoint's own config supplies the tap layers,
+        block size, and mask token; the runner rides this loop's graph
+        families (captured propose/verify, rollback by stash selection
+        where the build carries the stash kernel). Returns the runner;
+        its ``generate`` replaces ``loop.generate`` for speculative
+        decoding and anchors exactness on this loop's own verify.
+        """
+        from .dspark_block import DSparkRunner
+
+        return DSparkRunner(self, draft_dir)
 
     def _fwd_full(self, tok_ids, pos_t):
         h = self._embed(tok_ids)
@@ -844,9 +887,11 @@ class _PrefillVehicle(torch.nn.Module):
 
 
 def build_decode_loop(model, *, max_len, compile_step=True,
-                      compile_prefill=True, kv_band=None):
+                      compile_prefill=True, kv_band=None,
+                      prefill_chunk=None):
     """Build the whole-loop form over whatever is attached to ``model``."""
     return WholeStepDecodeLoop(model, max_len=max_len,
                                compile_step=compile_step,
                                compile_prefill=compile_prefill,
-                               kv_band=kv_band)
+                               kv_band=kv_band,
+                               prefill_chunk=prefill_chunk)

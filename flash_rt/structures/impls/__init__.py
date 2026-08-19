@@ -144,12 +144,99 @@ def _check_arch(repo: str, module) -> None:
 #: refusal path must not manufacture that error on retry)
 _LOADED: dict[tuple[str, str], object] = {}
 
+#: packages this host cannot resolve, by the same key. Absence is as
+#: cacheable as presence and far more expensive to re-establish.
+_UNRESOLVED: dict[tuple[str, str], BaseException] = {}
+
+#: highest version tag the resolution fallback searches downward from.
+#: Only an upper bound for the walk — a repo that has not published
+#: that many releases simply misses those revisions and continues.
+_TAG_SEARCH_TOP = 32
+
+
+def _newest_loadable(get_kernel, repo, version, kw, first=None,
+                     reported=None):
+    """The newest release at or above ``version``'s floor that loads.
+
+    A resolver that only accepts an exact major still reports which
+    majors exist when it rejects a range, so the published set comes
+    from that report rather than a blind walk; ``_TAG_SEARCH_TOP`` is
+    only the fallback ceiling for a resolver that says nothing.
+
+    ``first`` is an optional resolution to try before the search (the
+    pre-semver library's repo default, which is usually right and
+    costs nothing to attempt).
+    """
+    if first is not None:
+        try:
+            return first()
+        except FileNotFoundError as no_variant:
+            if "build variants" not in str(no_variant):
+                raise
+    floor = re.match(r"^\s*>=\s*v?(\d+)", str(version))
+    lo = int(floor.group(1)) if floor else 1
+    published = sorted(
+        {int(n) for n in re.findall(r"\d+", reported or "")
+         if int(n) >= lo}, reverse=True) if reported else []
+    last = None
+    for major in published:
+        try:
+            return get_kernel(repo, version=major, **kw)
+        except Exception as e:  # noqa: BLE001 — try the next release
+            last = e
+    for major in range(_TAG_SEARCH_TOP, lo - 1, -1):
+        try:
+            return get_kernel(repo, revision=f"v{major}", **kw)
+        except Exception as e:  # noqa: BLE001 — try the next tag
+            last = e
+    raise last if last is not None else RuntimeError(
+        f"no loadable release for {repo!r} at {version}")
+
 
 @lru_cache(maxsize=None)
 def hub_kernel(repo: str, version: str):
     from kernels import get_kernel
 
+    # A repo with no build variant for this host resolves by walking
+    # releases, and every step of that walk is a network round trip. Left
+    # unbounded those trips can hang far longer than the absence they are
+    # establishing is worth — a serving engine calling this during model
+    # load stalls with no output at all. Bound them so "this host has no
+    # variant" arrives as a refusal in seconds. Defaults only: a caller
+    # that set its own timeout meant it.
+    os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "10")
+    os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "60")
+
     key = (repo, version)
+    slug = re.sub(r"[^A-Za-z0-9]", "_", repo).upper()
+    var_dir = os.environ.get("FRT_KERNEL_DIR_" + slug)
+    if var_dir and key not in _LOADED:
+        # filesystem-direct load for hosts whose process cannot reach
+        # the hub at all (air-gapped serving containers): the variant
+        # directory is the package — importing it here is exactly what
+        # the resolver would do after its network walk, minus the walk.
+        # The arch check below still runs; a wrong variant refuses the
+        # same way a resolved one would.
+        import importlib.util
+        import sys as _sys
+        init = os.path.join(var_dir, "__init__.py")
+        if not os.path.isfile(init):
+            raise KernelUnavailable(
+                f"kernel package {repo!r}: FRT_KERNEL_DIR_{slug} does "
+                f"not point at a build variant (no __init__.py in "
+                f"{var_dir!r})")
+        mod_name = "_frt_kernel_" + slug.lower()
+        spec = importlib.util.spec_from_file_location(
+            mod_name, init, submodule_search_locations=[var_dir])
+        mod = importlib.util.module_from_spec(spec)
+        _sys.modules[mod_name] = mod
+        spec.loader.exec_module(mod)
+        _LOADED[key] = mod
+    if key in _UNRESOLVED:
+        prior = _UNRESOLVED[key]
+        raise KernelUnavailable(
+            f"kernel package {repo!r} ({version}) is unavailable on "
+            f"this host: {type(prior).__name__}: {prior}") from prior
     if key not in _LOADED:
         # author pin for artifact bisection: an exact hub revision
         # outranks version resolution for this repo only. A perf or
@@ -166,33 +253,45 @@ def hub_kernel(repo: str, version: str):
                 # the trust gate arrived with newer kernels; our own
                 # first-party artifacts are the explicit trust set
                 _kw["trust_remote_code"] = True
-            try:
+            if rev:
+                _LOADED[key] = get_kernel(repo, revision=rev, **_kw)
+            else:
                 try:
-                    _LOADED[key] = (get_kernel(repo, revision=rev,
-                                               **_kw)
-                                    if rev
-                                    else get_kernel(repo,
-                                                    version=version,
-                                                    **_kw))
-                except ValueError as ve:
-                    # newer kernels resolve an exact integer version
-                    # where older ones accepted a range string; the
-                    # range's floor is the same request in both bands
-                    m = re.match(r"^\s*>=\s*v?(\d+)", str(version))
-                    if not (m and "available versions" in str(ve)):
-                        raise
-                    _LOADED[key] = get_kernel(
-                        repo, version=int(m.group(1)), **_kw)
-            except TypeError:
-                # kernels<0.13 — the band transformers pins — has no
-                # semver resolution kwarg; the default revision is
-                # exactly what that library resolved before semver
-                # tags existed. Widest-band compat: 0.12 through 0.16
-                # serve the same call site.
-                _LOADED[key] = (get_kernel(repo, revision=rev) if rev
-                                else get_kernel(repo))  # pre-semver band
+                    _LOADED[key] = get_kernel(repo, version=version,
+                                              **_kw)
+                except TypeError:
+                    # kernels<0.13 — the band transformers pins — has
+                    # no semver kwarg; it resolves the repo default
+                    _LOADED[key] = _newest_loadable(
+                        get_kernel, repo, version, _kw,
+                        first=lambda: get_kernel(repo))
+                except (ValueError, FileNotFoundError) as unresolved:
+                    # Two ways a version range fails to land on a
+                    # usable artifact, both routine: the newer library
+                    # resolves only an exact major (a range string is
+                    # rejected outright), and any resolved release may
+                    # have no build for this host's torch/CUDA pair —
+                    # publishers add variants release by release, so a
+                    # newer release can drop a pair an older one
+                    # carried. Both are answered the same way: take
+                    # the newest release at or above the floor that
+                    # this host can actually load. That is what the
+                    # range in the dependency spec asks for.
+                    _LOADED[key] = _newest_loadable(
+                        get_kernel, repo, version, _kw,
+                        reported=(str(unresolved).split(
+                            "available versions:")[-1]
+                            if "available versions:" in str(unresolved)
+                            else None))
         except (OSError, RuntimeError, ValueError) as unavailable:
             _record_unavailable(repo, version, unavailable)
+            # remember the absence, not just the presence: resolution
+            # walks releases over the network, and a caller binding a
+            # whole model asks for the same package once per seat. Without
+            # this, one unpublished build variant costs that walk hundreds
+            # of times over — the failure is a property of this host, and
+            # it cannot change inside one process.
+            _UNRESOLVED[key] = unavailable
             raise KernelUnavailable(
                 f"kernel package {repo!r} ({version}) is unavailable on "
                 f"this host: {type(unavailable).__name__}: "

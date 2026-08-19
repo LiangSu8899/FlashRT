@@ -75,15 +75,358 @@ def _(hidden, router_logits, top_idx, top_w, idx):
     return torch.empty_like(hidden)
 
 
-class _ProjSeat(nn.Module):
-    """Preserves the engine's ``(out, bias)`` projection contract."""
+_E2M1_LUT = None
+_SRC_INDEX = None
 
-    def __init__(self, seam):
+#: engine fused-projection composition, in the engine's own concat
+#: order (the split sites in its forwards are the receipts)
+_FUSE = {
+    "in_proj_qkvz": ("in_proj_qkv", "in_proj_z"),
+    "qkv_proj": ("q_proj", "k_proj", "v_proj"),
+    "gate_up_proj": ("gate_proj", "up_proj"),
+    "in_proj_ba": ("in_proj_b", "in_proj_a"),
+}
+
+
+def _source_ckpt_weight(seat_name):
+    """Full-precision rows for a seat, read from ``FRT_SOURCE_CKPT``.
+
+    ``seat_name`` is the engine module path; the checkpoint key drops
+    the engine's leading ``language_model.`` and prefixes ``model.``.
+    Fused engine projections concat their checkpoint constituents in
+    the engine's own order. Returns None when the env is unset or the
+    key cannot be resolved — the caller falls through to pack-specific
+    dequant, and its bind probe stays the last word either way.
+    """
+    import json
+    import os
+
+    root = os.environ.get("FRT_SOURCE_CKPT")
+    if not root or not seat_name:
+        return None
+    global _SRC_INDEX
+    if _SRC_INDEX is None:
+        from safetensors import safe_open
+        idx = json.load(open(os.path.join(
+            root, "model.safetensors.index.json")))
+        _SRC_INDEX = (idx["weight_map"], {}, root, safe_open)
+    wmap, handles, root, safe_open = _SRC_INDEX
+
+    def read(key):
+        fn = wmap.get(key)
+        if fn is None:
+            return None
+        if fn not in handles:
+            handles[fn] = safe_open(os.path.join(root, fn),
+                                    framework="pt", device="cpu")
+        return handles[fn].get_tensor(key)
+
+    cands = [seat_name]
+    if seat_name.startswith("language_model.model."):
+        cands.append("model.language_model."
+                     + seat_name[len("language_model.model."):])
+    if seat_name.startswith("model."):
+        cands.append("model.language_model."
+                     + seat_name[len("model."):])
+    cands.append("model." + seat_name)
+    for path in cands:
+        leaf = path.rsplit(".", 1)[-1]
+        parts = _FUSE.get(leaf)
+        if parts is None:
+            t = read(path + ".weight")
+            if t is not None:
+                return t.to("cuda", torch.bfloat16)
+            continue
+        base = path.rsplit(".", 1)[0]
+        pieces = [read(f"{base}.{p}.weight") for p in parts]
+        if all(p is not None for p in pieces):
+            return torch.cat(
+                [p.to("cuda", torch.bfloat16) for p in pieces],
+                dim=0).contiguous()
+    return None
+
+
+#: FP8 weight dtypes a checkpoint may store a projection in
+_FP8_DTYPES = tuple(
+    d for d in (getattr(torch, "float8_e4m3fn", None),
+                getattr(torch, "float8_e5m2", None)) if d is not None)
+
+
+def _host_precision(mod) -> str:
+    """Which precision the *checkpoint* put this projection in.
+
+    A mixed-precision checkpoint is a per-projection decision that was
+    made with calibration data — attention projections held at FP8 while
+    the FFN goes to NVFP4, a draft head excluded from quantization
+    entirely. Seating every position at the adapter's favourite width
+    overrides that decision silently: the weight stream shrinks, the
+    step gets faster, and the accuracy it cost shows up somewhere no
+    throughput number looks. Read the choice off what the host is
+    actually holding rather than off module names, which is the same
+    discipline the rest of this adapter uses for seam recognition.
+    """
+    w = getattr(mod, "weight", None)
+    if w is None:
+        return "none"
+    dt = w.data.dtype
+    if dt is torch.uint8:
+        return "nvfp4"
+    if dt in _FP8_DTYPES:
+        return "fp8"
+    return "unquantized"
+
+
+def _projection_weight(mod) -> torch.Tensor:
+    """The projection's dense rows, whatever the checkpoint stored.
+
+    A bf16/fp16 weight is the rows. A uint8 weight is a modelopt NVFP4
+    pack (e2m1 nibble pairs + fp8 block-16 scales + a global scalar):
+    dequantize it here so the seam re-grids from real values. Nibble
+    order inside the byte is resolved by the caller's bind probe — this
+    helper emits the low-nibble-first convention, and a probe failure
+    is a refusal, never silent garbage.
+    """
+    w = mod.weight.data
+    if w.dtype in (torch.bfloat16, torch.float16, torch.float32):
+        return w
+    if w.dtype in _FP8_DTYPES:
+        # an FP8 host needs no source checkpoint: every FP8 code is
+        # exact in BF16, so the host's own tensors are the rows —
+        # dequantization here loses nothing. The engine stores this
+        # weight transposed ([K, N], its cutlass B), so orientation
+        # comes from the layer's declaration, same as the adopt path.
+        ws = getattr(mod, "weight_scale", None)
+        if ws is None:
+            raise ValueError("fp8 weight without weight_scale")
+        n = int(getattr(mod, "output_size_per_partition", 0) or 0)
+        k = int(getattr(mod, "input_size_per_partition", 0) or 0)
+        rows = w.to(torch.float32) * ws.data.reshape(-1)[0].float()
+        if n and k and tuple(w.shape) == (k, n):
+            rows = rows.t()
+        return rows.to(torch.bfloat16).contiguous()
+    src = _source_ckpt_weight(getattr(mod, "_frt_seat_name", None))
+    if src is not None:
+        # a quantized runtime weight, but the caller pointed
+        # FRT_SOURCE_CKPT at the full-precision checkpoint: re-grid
+        # from the real rows (the adopt door's own discipline) instead
+        # of dequantizing whatever runtime pack the engine chose
+        return src
+    if w.dtype is not torch.uint8:
+        raise ValueError(f"unrecognised weight dtype {w.dtype}")
+    global _E2M1_LUT
+    if _E2M1_LUT is None:
+        _E2M1_LUT = torch.tensor(
+            [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+             -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+            device=w.device, dtype=torch.float32)
+    ws = mod.weight_scale.data.to(torch.float32)      # [N, K/16]
+    ws2 = getattr(mod, "weight_scale_2", None)
+    g = (float(ws2.data.reshape(-1)[0]) if ws2 is not None else 1.0)
+    n = w.shape[0]
+    lo = (w & 0xF).long()
+    hi = (w >> 4).long()
+    codes = torch.stack([lo, hi], dim=-1).reshape(n, -1)
+    vals = _E2M1_LUT[codes]                            # [N, K]
+    scale = ws.repeat_interleave(16, dim=1) * g
+    return (vals * scale).to(torch.bfloat16).contiguous()
+
+
+def _adopt_fp8_pack(mod, rows_hint):
+    """A seat on the host's own FP8 tensors, or None.
+
+    Same hot-plug contract as the NVFP4 adopt: the engine already holds
+    the weight as ``float8_e4m3fn`` with the checkpoint's calibrated
+    per-tensor scales, and that per-tensor W8A8 scheme is exactly what
+    ``fp8_static`` executes — so the seat adopts the storage by
+    reference and changes only which kernel reads it. No dequantize, no
+    re-quantize, no second copy on the card.
+    """
+    from ..impls.linear_proj import fp8_static as _fp8
+
+    w = getattr(mod, "weight", None)
+    ws = getattr(mod, "weight_scale", None)
+    xs = getattr(mod, "input_scale", None)
+    if w is None or ws is None or xs is None:
+        return None
+    if w.data.dtype not in _FP8_DTYPES:
+        return None
+    # the engine stores this weight transposed — [K, N], a column-major
+    # B for its cutlass entry — so the projection's dims must come from
+    # the layer's own declaration, not the storage order
+    n = int(getattr(mod, "output_size_per_partition", 0) or 0)
+    k = int(getattr(mod, "input_size_per_partition", 0) or 0)
+    if not n or not k:
+        return None
+    for name, dim in (("K", k), ("N", n)):
+        lo = _fp8.SUPPORT[name]["min"]
+        hi = _fp8.SUPPORT[name]["max"]
+        if not lo <= dim <= hi:
+            raise ValueError(
+                f"fp8 adopt: {name}={dim} outside support envelope")
+    if tuple(w.data.shape) == (k, n):
+        # one transposed copy, then the original storage goes: after
+        # seating, this seam is the weight's only consumer, so total
+        # memory is unchanged and the transient peak is one projection.
+        # The host module keeps a [K, N] *view* of the new storage —
+        # same logical content, so detach still reads correct values.
+        w_nk = w.data.t().contiguous()
+        mod.weight.data = w_nk.t()
+    elif tuple(w.data.shape) == (n, k):
+        w_nk = w.data
+    else:
+        raise ValueError(
+            f"fp8 adopt: storage {tuple(w.data.shape)} matches neither "
+            f"orientation of N={n} K={k}")
+    ms = sorted(int(m) for m in rows_hint)
+    form = _fp8._form_for(None, "bf16",
+                          float(ms[len(ms) // 2]) * n * k)
+    # the form bands were measured against a BF16-Linear host; against
+    # an engine whose FP8 path fuses its own quantize they are not
+    # gospel, so an explicit override stays available for A/B
+    form = os.environ.get("FRT_FP8_FORM", form)
+    bias = torch.zeros(n, device=w_nk.device, dtype=torch.bfloat16)
+    return _fp8.FusedLinearProj(
+        w_nk, bias,
+        xs.data.reshape(-1)[:1].to(torch.float32),
+        ws.data.reshape(-1)[:1].to(torch.float32),
+        original=None, form=form)
+
+
+def _adopt_nvfp4_pack(mod):
+    """Build a seam on the host's own packed weights, or return None.
+
+    This is the hot-plug form: the engine already holds NVFP4, so the
+    seat changes which kernel reads it and nothing else. Numerics stay
+    the checkpoint's — which for a speculative host means acceptance
+    stays the checkpoint's too, and every millisecond the seat saves is
+    kept rather than paid back as a lower accept rate.
+
+    Returns None when this host's pack is not in a shape the seam can
+    adopt, so the caller falls back to regridding and the difference is
+    a reported choice rather than a silent one.
+    """
+    w = getattr(mod, "weight", None)
+    ws = getattr(mod, "weight_scale", None)
+    if w is None or ws is None or w.data.dtype is not torch.uint8:
+        return None
+    w = w.data
+    # the engine's own kernel may pad the packed columns for its tile
+    # shape; those columns are not part of the projection
+    pad = int(getattr(mod, "weights_padding_cols", 0) or 0)
+    if pad:
+        w = w[:, :w.shape[1] - pad]
+    gs = None
+    for attr in ("weight_global_scale", "weight_scale_2"):
+        v = getattr(mod, attr, None)
+        if v is not None:
+            flat = v.data.reshape(-1).float()
+            if flat.numel() > 1 and not bool(
+                    (flat == flat[0]).all()):
+                # a merged projection may carry one global factor per
+                # constituent; a single alpha can only stand in for
+                # them when they agree, and pretending otherwise would
+                # scale one half by the other's factor
+                raise ValueError(
+                    "per-part global scales differ; cannot adopt "
+                    "under one alpha")
+            gs = float(flat[0])
+            break
+    n, k = w.shape[0], w.shape[1] * 2
+    return _linear.bind_proj_seam_packed(
+        w.contiguous() if pad else w, ws.data, n, k, global_scale=gs)
+
+
+def _bind_fp8_seam(mod, w, rows_hint):
+    """An FP8 seat for a projection the checkpoint quantized to FP8.
+
+    The input scale is the checkpoint's own calibrated one where the
+    host carries it; a projection whose activations the checkpoint
+    scaled dynamically has none, and the amax of its bind probe would be
+    a statistic invented here rather than one measured on data, so that
+    case is refused instead of guessed.
+    """
+    from ..impls.linear_proj import fp8_static as _fp8
+
+    s = getattr(mod, "input_scale", None)
+    if s is None:
+        raise ValueError(
+            "FP8 seat needs the checkpoint's calibrated input scale; "
+            "this projection carries none")
+    return _fp8.bind_proj_seam(
+        {"w": w}, input_scale=float(s.data.reshape(-1)[0]),
+        row_profile=list(rows_hint), original=mod)
+
+
+class _ProjSeat(nn.Module):
+    """Preserves the engine's ``(out, bias)`` projection contract.
+
+    Attribute reads fall through to the replaced module: an engine that
+    planned a fusion around this projection reads its scale attributes
+    off the module object itself, and a seat that answers only
+    ``forward`` turns that read into a startup crash far from here.
+    """
+
+    def __init__(self, seam, host=None):
         super().__init__()
         self.seam = seam
+        # the engine's linear layers carry a return_bias switch, and a
+        # call site built for return_bias=False receives a bare tensor
+        # — handing it the tuple anyway detonates at the next op, at
+        # trace time, far from here
+        object.__setattr__(
+            self, "_frt_tuple_out",
+            getattr(host, "return_bias", True) is not False)
+        if host is not None:
+            object.__setattr__(self, "_frt_host", host)
+
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            host = self.__dict__.get("_frt_host")
+            if host is None:
+                raise
+            return getattr(host, name)
 
     def forward(self, x, *args, **kwargs):
-        return self.seam(x), None
+        y = self.seam(x)
+        return (y, None) if self._frt_tuple_out else y
+
+
+class _FusedMlpSeat(nn.Module):
+    """Stands where the host's SwiGLU MLP stood.
+
+    The host's own dataflow is ``gate_up -> SiLU·mul -> down``, and it
+    already merges gate and up into one projection — so once both
+    projections carry seats, the activation between them is the only
+    step that still round-trips through BF16 and re-quantizes for the
+    down projection. This seat runs the merged projection through its
+    seam, collapses activation + quantization into the fused producer,
+    and hands the packed rows straight to the down seam. Anything the
+    host did around that (an expert gate) is kept by delegating to the
+    retained module for the parts this seat does not own.
+    """
+
+    def __init__(self, host, gate_up_seam, down_seam, silu_mul):
+        super().__init__()
+        self.host_mlp = host
+        self.gate_up_seam = gate_up_seam
+        self.down_seam = down_seam
+        self._silu_mul = silu_mul
+
+    def forward(self, x):
+        shape = x.shape
+        flat = x.reshape(-1, shape[-1])
+        a_packed, a_sfa = _linear._quantize_activation(
+            self.gate_up_seam._kern, flat)
+        merged = self.gate_up_seam._mm_packed(a_packed, a_sfa)
+        p2, s2 = self._silu_mul(merged.contiguous())
+        out = self.down_seam._mm_packed(p2, s2)
+        out = out.reshape(*shape[:-1], self.down_seam._n).type_as(x)
+        gate = getattr(self.host_mlp, "expert_gate", None)
+        if gate is not None:
+            out = torch.sigmoid(gate(x)[0]) * out
+        return out
 
 
 class _MoESeat(nn.Module):
@@ -144,7 +487,14 @@ class _MoESeat(nn.Module):
 
 class _SlabbedHeadMethod:
     """Stands in for the LM head's quant method: the engine computes
-    logits through ``quant_method.apply``, never module forward."""
+    logits through ``quant_method.apply``, never module forward.
+
+    The vocabulary projection stays weight-only INT8 rather than joining
+    the FP4 band: it is the logits family, where the decision on this
+    model line has been W8 from the start. One seam covers the whole
+    vocabulary when the entry's row support reaches it; otherwise the
+    rows split into slabs and concatenate.
+    """
 
     def __init__(self, seams, orig):
         self.seams = seams
@@ -152,10 +502,45 @@ class _SlabbedHeadMethod:
 
     def apply(self, layer, x, bias=None):
         xb = x.to(torch.bfloat16)
-        y = torch.cat([s(xb) for s in self.seams], dim=-1)
+        y = (self.seams[0](xb) if len(self.seams) == 1
+             else torch.cat([s(xb) for s in self.seams], dim=-1))
         if bias is not None:
             y = y + bias
         return y.to(x.dtype)
+
+    def __getattr__(self, name):
+        return getattr(self.orig, name)
+
+
+class _MarlinHeadMethod:
+    """The checkpoint's own W4A16 head, re-laid for small M.
+
+    Same NVFP4 grid, same dequantized values — only the storage layout
+    changes (bind-time Marlin repack) so the verify-step logits calls
+    (M ≤ 16) leave the host's tiled kernel for one built for that band.
+    The logits family keeps its precision class; anything outside the
+    band, and any capture pass, goes to the host method untouched.
+    """
+
+    def __init__(self, kernel, packs, rows, orig):
+        self.kernel = kernel
+        self.packs = packs           # (weight, scale, global, lock)
+        self.rows = rows             # vocabulary rows of the output
+        self.orig = orig
+
+    def apply(self, layer, x, bias=None):
+        if (1 <= x.shape[0] <= 16 and x.dtype == torch.bfloat16
+                and x.dim() == 2
+                and not torch.cuda.is_current_stream_capturing()):
+            wm, wsm, wgs, lock = self.packs
+            out = torch.empty(x.shape[0], self.rows,
+                              dtype=x.dtype, device=x.device)
+            self.kernel.nvfp4_w4a16_marlin_bf16(
+                x, wm, wsm, wgs, workspace=lock, out=out)
+            if bias is not None:
+                out = out + bias
+            return out
+        return self.orig.apply(layer, x, bias)
 
     def __getattr__(self, name):
         return getattr(self.orig, name)
@@ -167,11 +552,228 @@ def _is_projection(module) -> bool:
             and hasattr(module, "quant_method"))
 
 
+def _arm_runtime_dispatch(seam) -> None:
+    """Move this seam's tier dispatch to call time.
+
+    This engine compiles a seam forward once per shape *range* and
+    replays it without re-evaluating shape guards, so the row count a
+    trace observed is not the row count a replay carries: a Python-level
+    ``if m >= N`` freezes the tracing sample's choice and then runs it
+    for every M (measured as a hard refusal from the M256 tier at engine
+    start, and — quieter and more expensive — as every decode row taking
+    the tiled GEMM instead of the GEMV). Registering the seam for
+    runtime dispatch puts the branch inside a custom op, so the trace
+    sees one opaque call and the tier is chosen on the shape the call
+    actually receives. Every tier stays available.
+    """
+    _linear.register_runtime_dispatch(seam)
+
+
 def _expert_holder(module):
     for _, child in module.named_modules():
         if torch.is_tensor(getattr(child, "w13_weight", None)):
             return child
     return None
+
+
+#: install-once state for the verify-attention seat; keyed data that
+#: the wrapped ``forward`` reads on every call lives here so a second
+#: ``attach_verify_attention`` call is a no-op rather than a re-wrap.
+_XQA_STATE: dict[str, Any] = {}
+
+
+def attach_verify_attention(*, verbose: bool = True) -> dict | None:
+    """Route spec-verify attention through the paged BF16-Q/FP8-KV XQA
+    kernel; host FlashInfer keeps everything else.
+
+    A speculative verify step is a handful of query rows against the
+    whole paged cache, and the host runs it on its chunked-prefill
+    kernel — at long context the most off-roofline structure in the
+    decode chain. This seat wraps the FlashInfer backend's ``forward``
+    and takes only calls whose metadata is exactly a verify batch
+    (single request, no decode rows, causal, fp8 cache) on a layer
+    geometry the kernel supports; anything else, and any error inside
+    the seat's own path, falls through to the host untouched.
+
+    Two engine facts carried here so callers do not rediscover them:
+
+    - The kv-cache tensor arriving at ``forward`` is a permuted view.
+      Flattening it (``reshape``/``flatten``) silently copies the whole
+      pool per call; the zero-copy road is ``as_strided`` claims over
+      the raw storage, where the view's own stride metadata *is* the
+      address walk (page/token/head strides read off the view, V half
+      at ``+head_dim``).
+    - The prefill wrapper's ``_paged_kv_indices_buf`` is the kernel's
+      page table verbatim: kernel pages equal engine blocks, so prefix
+      reuse and non-contiguous block runs need no translation and no
+      contiguity guard.
+    """
+    if _XQA_STATE.get("installed"):
+        return _XQA_STATE
+    try:
+        import vllm.v1.attention.backends.flashinfer as fi
+    except Exception as e:  # noqa: BLE001 — host without this backend
+        if verbose:
+            print(f"[flash_rt] verify-attention seat refused: "
+                  f"no FlashInfer backend ({e!r})")
+        return None
+    from ..impls import hub_kernel
+    try:
+        kx = hub_kernel("flashrt/fp8-kv-attention", "4")
+    except Exception as e:  # noqa: BLE001 — no build for this host
+        if verbose:
+            print(f"[flash_rt] verify-attention seat refused: {e!r}")
+        return None
+    page = getattr(kx, "PAGE_SIZE", None)
+    if page != 32:
+        if verbose:
+            print(f"[flash_rt] verify-attention seat refused: kernel "
+                  f"page size {page} != engine block size 32")
+        return None
+    supported = {tuple(c) for c in getattr(kx, "SUPPORTED_CONFIGS", ())}
+
+    st = _XQA_STATE
+    st.update(installed=True, kernel=kx, taken=0, fell_through=0,
+              masks={}, sems=None, scratch=None, sl=None, sl_val=-1)
+    orig = fi.FlashInferImpl.forward
+    fp8 = torch.float8_e4m3fn
+
+    def _stash_plan(wrap):
+        # The page count and last-page length the forward needs are on
+        # the device buffers, and reading them there is a host sync —
+        # sixteen of those per verify step erase the kernel's win by
+        # stalling the launch pipeline. The builder hands ``plan`` the
+        # same values as CPU tensors, so a wrap of ``plan`` stashes
+        # them as plain ints and the forward path never syncs.
+        orig_plan = wrap.plan
+
+        def plan(*a, **kw):
+            try:
+                ind = kw.get("paged_kv_indptr")
+                lpl = kw.get("paged_kv_last_page_len")
+                if (ind is not None and lpl is not None
+                        and not ind.is_cuda and ind.numel() == 2):
+                    wrap._frt_plan_np = (int(ind[1]), int(lpl[0]))
+                else:
+                    wrap._frt_plan_np = None
+            except Exception:  # noqa: BLE001
+                wrap._frt_plan_np = None
+            return orig_plan(*a, **kw)
+
+        wrap.plan = plan
+        wrap._frt_plan_hooked = True
+
+    def forward(self, layer, query, key, value, kv_cache, attn_metadata,
+                output, *args, **kwargs):
+        m = attn_metadata
+        take = (
+            m is not None
+            # no fused output quant on the seat path
+            and not any(a is not None for a in args)
+            and kwargs.get("output_scale") is None
+            and kwargs.get("output_block_scale") is None
+            and hasattr(self, "do_kv_cache_update")
+            and getattr(m, "num_decode_tokens", 1) == 0
+            and getattr(m, "num_prefills", 0) == 1
+            and getattr(m, "causal", False)
+            and 2 <= getattr(m, "num_actual_tokens", 0) <= 32
+            and m.prefill is not None
+            and query.dim() == 3
+            and query.dtype == torch.bfloat16
+            and kv_cache.dim() == 4
+            and (query.shape[1], kv_cache.shape[1],
+                 query.shape[2]) in supported
+            and kv_cache.shape[2] == 32
+            and kv_cache.shape[3] == 2 * query.shape[2]
+            and getattr(self, "sinks", None) is None
+            and getattr(self, "window_left", -1) == -1
+            and not getattr(self, "logits_soft_cap", None)
+            and abs(self.scale - query.shape[2] ** -0.5) < 1e-9
+            and layer._k_scale_float == layer._v_scale_float
+            # capture bakes this call's shapes (page count, seq) into
+            # the replayed graph while the Python that refreshes them
+            # never runs again — the seat serves eager calls only
+            and not torch.cuda.is_current_stream_capturing()
+        )
+        if take:
+            try:
+                wrap = m.prefill.wrapper
+                idx = getattr(wrap, "_paged_kv_indices_buf", None)
+                if idx is None:
+                    raise LookupError("wrapper plan buffers absent")
+                meta_np = getattr(wrap, "_frt_plan_np", None)
+                if meta_np is None:
+                    # first sighting of this wrapper: hook its plan so
+                    # every later step has the counts sync-free; this
+                    # step goes to the host
+                    if not getattr(wrap, "_frt_plan_hooked", False):
+                        _stash_plan(wrap)
+                    raise LookupError("plan counts not stashed yet")
+                n_pages, last = meta_np
+                qs = int(m.num_actual_tokens)
+                # the host forward is also the cache writer: the new
+                # tokens' K/V must land in the paged pool before any
+                # attention (this step reads them, every later step
+                # reads them as prefix) — skipping it corrupts the
+                # sequence forever, not just this call
+                self.do_kv_cache_update(layer, key, value, kv_cache,
+                                        m.slot_mapping)
+                seq = (n_pages - 1) * 32 + last
+                if n_pages <= 0 or not (0 < last <= 32) or seq < qs:
+                    raise ValueError("verify plan out of shape")
+                nq, hd = query.shape[1], query.shape[2]
+                kh = kv_cache.shape[1]
+                kv8 = (kv_cache if kv_cache.dtype == fp8
+                       else kv_cache.view(fp8))
+                elems = 32 * kh * hd
+
+                def claim(off):
+                    return kv8.as_strided(
+                        (n_pages, 32, kh, hd),
+                        (elems, kh * hd, hd, 1), storage_offset=off)
+
+                mask = st["masks"].get(qs)
+                if mask is None:
+                    mask = kx.causal_spec_mask(qs, device=query.device)
+                    st["masks"][qs] = mask
+                if st["sems"] is None:
+                    st["sems"], st["scratch"] = kx.allocate_workspace(
+                        q_seq=32, num_q_heads=nq, num_kv_heads=kh,
+                        device=query.device)
+                    st["sl"] = torch.zeros(
+                        1, 1, device=query.device, dtype=torch.int32)
+                if st["sl_val"] != seq:
+                    st["sl"].fill_(seq)
+                    st["sl_val"] = seq
+                kx.ops.xqa_bf16_fp8kv(
+                    query[:qs], claim(0), claim(hd),
+                    idx[:n_pages].view(1, -1), st["sl"], mask,
+                    output[:qs], st["sems"], st["scratch"],
+                    n_pages * 32, 1.0, float(layer._k_scale_float),
+                    # PDL off: with dependent launch the next layer's
+                    # call can overlap this one, and the workspace
+                    # (semaphores, split scratch) is shared state
+                    False, 0,
+                    int(kv_cache.stride(0)), int(kv_cache.stride(2)),
+                    int(kv_cache.stride(1)))
+                st["taken"] += 1
+                if st["taken"] == 1 or st["taken"] % 2000 == 0:
+                    print(f"[flash_rt] verify-attention xqa "
+                          f"taken={st['taken']} "
+                          f"fell_through={st['fell_through']}",
+                          flush=True)
+                return output
+            except Exception:  # noqa: BLE001 — host path must survive
+                st["fell_through"] += 1
+        return orig(self, layer, query, key, value, kv_cache,
+                    attn_metadata, output, *args, **kwargs)
+
+    fi.FlashInferImpl.forward = forward
+    st["revert"] = lambda: setattr(fi.FlashInferImpl, "forward", orig)
+    if verbose:
+        print("[flash_rt] verify-attention seat installed "
+              "(fp8-kv-attention v4, page 32)")
+    return st
 
 
 class _NoSeats:
@@ -206,7 +808,10 @@ class _NoSeats:
 
 
 def attach_engine(model, *, seats=DENSE_SEAT_SUFFIXES, experts=True,
-                  head=True, use_gemv=None, verbose=True, strict=False):
+                  head=True, use_gemv=None, verbose=True, strict=False,
+                  fused_mlp=True, consume=False, ckpt_rename=None,
+                  tag="model", precision="nvfp4", rows_hint=(1, 8),
+                  adopt_pack=True):
     """Seat a vLLM model: dense projections, expert banks, LM head.
 
     Call between weight load and the engine's first trace (see
@@ -228,7 +833,172 @@ def attach_engine(model, *, seats=DENSE_SEAT_SUFFIXES, experts=True,
     swaps: dict[str, nn.Module] = {}
     reverts: list = []
     refused: list = []
+    # opt-in verify-attention seat: a backend-level wrap, independent of
+    # the module seats below, reverted with the same handle
+    if os.environ.get("FRT_ATTN_XQA") == "1":
+        xst = attach_verify_attention(verbose=verbose)
+        if xst is not None and "revert" in xst:
+            reverts.append(xst["revert"])
+    parked_tiers: dict[str, int] = {}
+    fused_mlps = 0
+    staged = 0
+    probe_cos: list[tuple[float, str]] = []
+    #: the packer's own pack-and-unpack relative L2, which ``bind_proj_seam``
+    #: returns and callers have been discarding. It is the grid's quality
+    #: with no activation and no host in the way — the one number that
+    #: says whether a seat reproduces the checkpoint's precision or
+    #: quietly lowers it.
+    pack_rels: list[float] = []
+    kinds: dict[str, int] = {}
+    adopted = 0
+    requant = 0
+    skipped: list[str] = []
     modules = dict(model.named_modules())
+
+    # The head binds first. Its quantize needs an fp32 transient the
+    # width of the vocabulary, and by the time the dense seats are in
+    # place this process holds both the engine's original weights and
+    # the seats' packed copies — the transient is exactly what is no
+    # longer there. Bound first, it runs while the engine's weights are
+    # the only thing resident.
+    head_slabs = 0
+    if head:
+        lm = next((m for n, m in modules.items()
+                   if n.endswith("lm_head")
+                   and isinstance(getattr(m, "weight", None), torch.Tensor)),
+                  None)
+        # a head the checkpoint already packed as NVFP4 can be adopted
+        # zero-copy — but the seam's row tiers quantize activations to
+        # FP4, and the head is the logits family: measured on real
+        # streams, A4 logits moved speculative acceptance well outside
+        # the noise band while the kernel win was microseconds. The
+        # host's own W4A16 head is both exact-class and near its
+        # weight-stream floor, so adoption is explicit opt-in only.
+        if (lm is not None and adopt_pack
+                and os.environ.get("FRT_HEAD_W4A4") == "1"
+                and precision in ("mirror", "auto")
+                and _host_precision(lm) == "nvfp4"):
+            try:
+                lm._frt_seat_name = "lm_head"
+                seam = _adopt_nvfp4_pack(lm)
+                if seam is not None:
+                    orig_method = lm.quant_method
+                    lm.quant_method = _SlabbedHeadMethod(
+                        [seam], orig_method)
+                    reverts.append(
+                        lambda lm=lm, m=orig_method: setattr(
+                            lm, "quant_method", m))
+                    head_slabs = 1
+                    adopted += 1
+                    _arm_runtime_dispatch(seam)
+                    lm = None          # claimed; skip the W8 slab path
+            except Exception as e:  # noqa: BLE001 — W8 path may still work
+                if verbose:
+                    print(f"[structures.vllm] lm_head adopt fell back: "
+                          f"{repr(e)[:160]}", flush=True)
+        # the checkpoint's own W4A16 head re-laid for small M: identical
+        # NVFP4 grid and dequant values, Marlin layout, so verify-step
+        # logits calls run a kernel built for M<=16 instead of the tiled
+        # path. Precision class unchanged — default on, env to disable.
+        if (lm is not None and adopt_pack
+                and os.environ.get("FRT_HEAD_MARLIN", "1") == "1"
+                and precision in ("mirror", "auto")):
+            try:
+                kxg = _linear._kernel()
+                w = getattr(lm, "weight", None)
+                ws = getattr(lm, "weight_scale", None)
+                # modelopt spells the per-tensor scale two ways across
+                # its linear methods
+                ws2 = getattr(lm, "weight_scale_2", None)
+                if ws2 is None:
+                    ws2 = getattr(lm, "weight_global_scale", None)
+                if (hasattr(kxg, "adopt_nvfp4_w4a16_marlin")
+                        and isinstance(w, torch.Tensor) and w.dim() == 2
+                        and w.dtype == torch.uint8
+                        and isinstance(ws, torch.Tensor) and ws.dim() == 2
+                        and ws.shape[0] == w.shape[0]
+                        and isinstance(ws2, torch.Tensor)
+                        and ws2.numel() == 1):
+                    packs = kxg.adopt_nvfp4_w4a16_marlin(
+                        w.contiguous(),
+                        ws.view(torch.float8_e4m3fn).contiguous(),
+                        ws2.float().reshape(()))
+                    orig_method = lm.quant_method
+                    mh = _MarlinHeadMethod(kxg, packs, w.shape[0],
+                                           orig_method)
+                    # bind receipt: the relaid pack must reproduce the
+                    # checkpoint's own dequantized rows. The host's
+                    # apply is not the reference — its activation
+                    # quantization adds noise of its own (measured cos
+                    # ~0.92 on an exact relay); the E2M1 table decode
+                    # of a row slice is the ground truth.
+                    rows_p = 4096
+                    tbl = torch.tensor(
+                        [0, .5, 1, 1.5, 2, 3, 4, 6,
+                         -0., -.5, -1, -1.5, -2, -3, -4, -6],
+                        device=w.device)
+                    pw = w[:rows_p].to(torch.int32)
+                    q = torch.stack([tbl[pw & 0xF], tbl[pw >> 4]],
+                                    dim=-1).reshape(rows_p, -1)
+                    sc = (ws.view(torch.float8_e4m3fn)[:rows_p].float()
+                          .repeat_interleave(16, dim=1))
+                    wd = q * sc * float(ws2)
+                    xp = torch.randn(8, w.shape[1] * 2, device=w.device,
+                                     dtype=torch.bfloat16)
+                    ours = mh.apply(lm, xp)[:, :rows_p].float()
+                    ref = xp.float() @ wd.T
+                    cos = torch.nn.functional.cosine_similarity(
+                        ours.reshape(-1), ref.reshape(-1), dim=0).item()
+                    del pw, q, sc, wd, ref, xp
+                    if cos < 0.999:
+                        raise RuntimeError(
+                            f"marlin head probe cos {cos:.6f} vs "
+                            f"checkpoint dequant")
+                    lm.quant_method = mh
+                    reverts.append(
+                        lambda lm=lm, m=orig_method: setattr(
+                            lm, "quant_method", m))
+                    head_slabs = 1
+                    adopted += 1
+                    if verbose:
+                        print(f"[structures.vllm] lm_head marlin relay: "
+                              f"probe cos {cos:.6f}", flush=True)
+                    lm = None      # claimed; skip the W8 slab path
+            except Exception as e:  # noqa: BLE001 — host head still fine
+                if verbose:
+                    print(f"[structures.vllm] lm_head marlin fell back: "
+                          f"{repr(e)[:160]}", flush=True)
+        if lm is not None:
+            try:
+                from ..impls.linear_proj import w8a16_static as _w8
+                rows = lm.weight.shape[0]
+                # name it so a quantized runtime head can be re-gridded
+                # from the checkpoint's own rows rather than unpacked
+                lm._frt_seat_name = "lm_head"
+                w = _projection_weight(lm)
+                # slabs, even where the entry's row support would take
+                # the whole vocabulary in one bind: the engine has
+                # already claimed its memory fraction by this point, so
+                # the transient a whole-vocabulary quantize needs is
+                # exactly what is not there. Four slabs put the peak
+                # inside what the engine leaves behind.
+                cap = min(_w8.SUPPORT["N"]["max"], -(-rows // 4))
+                slab = -(-cap // 64) * 64
+                seams = [_w8.bind_proj_seam({"w": w[lo:lo + slab]})
+                         for lo in range(0, rows, slab)]
+                orig_method = lm.quant_method
+                lm.quant_method = _SlabbedHeadMethod(seams, orig_method)
+                reverts.append(
+                    lambda lm=lm, m=orig_method: setattr(
+                        lm, "quant_method", m))
+                head_slabs = len(seams)
+            except Exception as e:
+                refused.append(("lm_head", repr(e)[:200]))
+                if verbose:
+                    print(f"[structures.vllm] lm_head refused: "
+                          f"{repr(e)[:200]}", flush=True)
+
+
 
     # dense projections, smallest first: on tight cards early frees
     # make room for the big binds
@@ -237,10 +1007,158 @@ def attach_engine(model, *, seats=DENSE_SEAT_SUFFIXES, experts=True,
     targets.sort(key=lambda t: t[1].weight.numel())
     for name, mod in targets:
         try:
-            seam, _ = _linear.bind_proj_seam({"w": mod.weight.data})
-            swaps[name] = _ProjSeat(seam)
+            mod._frt_seat_name = (ckpt_rename(name) if ckpt_rename
+                                  else name)
+            kind = (_host_precision(mod)
+                    if precision in ("mirror", "auto")
+                    else "w8" if precision == "w8" else "nvfp4")
+            if precision == "auto" and kind == "fp8":
+                # the auto tier's one opinion: a W8 position is carried
+                # to W4 (the measured arbitrage: smaller weight stream,
+                # acceptance unmoved on real streams), sourced from the
+                # host's own FP8 rows — no external checkpoint. This is
+                # a precision change and the tier says so in its report.
+                kind = "nvfp4"
+                requant += 1
+            if kind == "unquantized":
+                # the checkpoint held this projection out of its own
+                # quantization; a seat here is not an acceleration of
+                # the host's decision, it is a replacement of it
+                skipped.append(name)
+                continue
+            seam, seam_shares_host, k_in = None, False, None
+            if kind == "fp8" and adopt_pack:
+                seam = _adopt_fp8_pack(mod, rows_hint)
+                if seam is not None:
+                    adopted += 1
+                    seam_shares_host = True
+                    # the engine stores FP8 as [K, N] (its cutlass B),
+                    # so neither storage axis can be assumed; the seam's
+                    # own [N, K] weight is the one orientation-safe place
+                    # to read the projection's input width
+                    k_in = int(seam._w_fp8.shape[1])
+            if kind == "nvfp4" and adopt_pack:
+                # try the host's own pack first: regridding is for a
+                # host holding dense rows, and paying it here would
+                # substitute our packer's rounding for the checkpoint's
+                seam = _adopt_nvfp4_pack(mod)
+                if seam is not None:
+                    adopted += 1
+                    # the seam holds the engine's own tensors, so the
+                    # engine's copy is the seam's copy: releasing it
+                    # would release the weights the seat executes
+                    seam_shares_host = True
+            if seam is None:
+                w_bind = _projection_weight(mod)
+                if kind == "fp8":
+                    seam = _bind_fp8_seam(mod, w_bind, rows_hint)
+                elif kind == "w8":
+                    # the logits-family middle tier: half the weight
+                    # stream of BF16 at a fraction of W4's rounding —
+                    # the draft-precision experiment band
+                    from ..impls.linear_proj import w8a16_static as _w8s
+                    seam = _w8s.bind_proj_seam({"w": w_bind})
+                else:
+                    seam, pack_rel = _linear.bind_proj_seam(
+                        {"w": w_bind})
+                    pack_rels.append(pack_rel)
+                k_in = w_bind.shape[1]
+            elif k_in is None:
+                # the probe width is the projection's K, and the adopt
+                # path has no dense rows to read it off — the NVFP4 host
+                # holds packed bytes, whose second dim is K/2. A probe
+                # built at that width fails inside the *host's* forward,
+                # which reads as the seam being rejected when nothing
+                # about the seam was tested at all.
+                k_in = int(seam._k)
+            # bind acceptance: the seam must reproduce the host module
+            # on a live probe — this is what catches a wrong weight
+            # layout (a packed checkpoint mistaken for dense rows) at
+            # bind time instead of as garbage tokens later
+            probe = torch.randn(4, k_in, device="cuda",
+                                dtype=torch.bfloat16)
+            with torch.no_grad():
+                host_out = mod(probe)
+                host_out = (host_out[0] if isinstance(host_out, tuple)
+                            else host_out)
+                cos = torch.nn.functional.cosine_similarity(
+                    seam(probe).float().reshape(-1),
+                    host_out.float().reshape(-1), dim=0)
+            if float(cos) < 0.98:
+                raise ValueError(
+                    f"bind probe cos {float(cos):.4f} < 0.98")
+            # the threshold is an admission gate, not a verdict: a tree
+            # of seats all sitting just above it is a different model
+            # from one sitting at 0.9999, and only the distribution says
+            # which this is
+            probe_cos.append((float(cos), name))
+            # the dense rows were only ever the seam's input; holding
+            # them across the next bind doubles the transient peak
+            del probe, host_out
+            if kind == "nvfp4":
+                _arm_runtime_dispatch(seam)
+            kinds[kind] = kinds.get(kind, 0) + 1
+            swaps[name] = _ProjSeat(seam, host=mod)
+            if consume and kind == "nvfp4" and not seam_shares_host:
+                # nvfp4 only: the FP8 seam retains the host module for
+                # its own fallback form, and releasing rows it may still
+                # execute would turn a fallback into a device mismatch.
+                # Release the engine's copy of these rows now, not after
+                # the whole tree is seated: the seat owns the packed
+                # form from here on, and holding both copies is exactly
+                # what makes the *next* bind fail. Staged to host memory
+                # so the handle's restore path still has them.
+                dev = mod.weight.data.device
+                cpu_rows = mod.weight.data.to("cpu")
+                # the revert closure may capture only the host copy: a
+                # default argument holding the device tensor pins the
+                # very allocation this is releasing, and the release
+                # then measures as a no-op.
+                mod.weight.data = cpu_rows
+                reverts.append(
+                    lambda m=mod, w=cpu_rows, d=dev: setattr(
+                        m.weight, "data", w.to(d)))
+                del cpu_rows
+                staged += 1
+                if staged % 16 == 0:
+                    torch.cuda.empty_cache()
+                if verbose and staged % 48 == 0:
+                    free_b, _ = torch.cuda.mem_get_info()
+                    print(f"[structures.vllm] staged {staged} seats, "
+                          f"{free_b / 2**30:.2f} GiB free", flush=True)
         except Exception as e:
-            refused.append((name, repr(e)[:120]))
+            # a bare exception type carries no diagnosis; the first few
+            # refusals keep their frames so "refused" names a line
+            if len(refused) < 3:
+                import traceback
+                refused.append((name, repr(e)[:80] + " | "
+                                + traceback.format_exc()[-1600:]))
+            else:
+                refused.append((name, repr(e)[:120]))
+
+    if fused_mlp:
+        from ..impls.decoder_ffn import nvfp4_fused as _ffn
+
+        silu_mul = _ffn._native_silu_mul()
+        if silu_mul is not None:
+            for name, mod in modules.items():
+                gu = swaps.get(f"{name}.gate_up_proj")
+                dn = swaps.get(f"{name}.down_proj")
+                if gu is None or dn is None:
+                    continue
+                if not hasattr(mod, "act_fn"):
+                    continue
+                # the fused producer emits packed FP4 for the down seam:
+                # a pair the checkpoint put in different widths has no
+                # such handoff
+                if not all(isinstance(s.seam, _linear.LinearProjNvfp4Dynamic)
+                           for s in (gu, dn)):
+                    continue
+                swaps[name] = _FusedMlpSeat(mod, gu.seam, dn.seam,
+                                            silu_mul)
+                swaps.pop(f"{name}.gate_up_proj")
+                swaps.pop(f"{name}.down_proj")
+                fused_mlps += 1
 
     if experts:
         impl = (_experts_w4a4 if use_gemv else _experts_w4a16)
@@ -267,29 +1185,6 @@ def attach_engine(model, *, seats=DENSE_SEAT_SUFFIXES, experts=True,
             except Exception as e:
                 refused.append((name, repr(e)[:120]))
 
-    head_slabs = 0
-    if head:
-        lm = next((m for n, m in modules.items()
-                   if n.endswith("lm_head")
-                   and isinstance(getattr(m, "weight", None), torch.Tensor)),
-                  None)
-        if lm is not None:
-            try:
-                rows = lm.weight.shape[0]
-                slab = -(-rows // 4) // 64 * 64
-                seams = [
-                    _linear.bind_proj_seam(
-                        {"w": lm.weight.data[lo:lo + slab]})[0]
-                    for lo in range(0, rows, slab)]
-                orig_method = lm.quant_method
-                lm.quant_method = _SlabbedHeadMethod(seams, orig_method)
-                reverts.append(
-                    lambda lm=lm, m=orig_method: setattr(
-                        lm, "quant_method", m))
-                head_slabs = len(seams)
-            except Exception as e:
-                refused.append(("lm_head", repr(e)[:120]))
-
     model.eval()
     if not swaps:
         if strict:
@@ -307,15 +1202,79 @@ def attach_engine(model, *, seats=DENSE_SEAT_SUFFIXES, experts=True,
         handle.notes["refused"] = refused
         return handle
     handle = _swap.attach(model, swaps, revert=reverts)
+    if consume:
+        # Until this runs the engine's own weights and the seats' packed
+        # copies are both resident, and on a card sized for the model
+        # alone that doubling is what makes the later binds fail — the
+        # measured refusals were 80 MiB allocations against a full card.
+        # Consuming moves each replaced module's truth to the weight
+        # store; fallback and detach survive as restore-from-store.
+        freed = handle.consume().get("freed_bytes", 0)
+        if verbose:
+            print(f"[structures.vllm] consumed host weights: "
+                  f"{freed / 2**30:.2f} GiB freed", flush=True)
     if verbose:
-        print(f"[structures.vllm] {len(swaps)} seats "
-              f"({head_slabs} head slabs), {len(refused)} refused",
-              flush=True)
-    handle.notes = {"refused": refused, "head_slabs": head_slabs}
+        parked = ""
+        fused = f", {fused_mlps} fused MLPs" if fused_mlps else ""
+        by = (", ".join(f"{k}x{v}" for k, v in sorted(kinds.items()))
+              if precision == "mirror" else "")
+        skip = (f", {len(skipped)} left unquantized (checkpoint's own "
+                f"exclusion)" if skipped else "")
+        print(f"[structures.vllm] {tag}: {len(swaps)} seats "
+              f"({head_slabs} head slabs), {len(refused)} refused"
+              f"{parked}{fused}"
+              f"{(' [' + by + ']') if by else ''}{skip}", flush=True)
+        if adopted:
+            print(f"[structures.vllm] {tag}: {adopted} seats adopted "
+                  f"the host's own pack (no regrid, no extra weight "
+                  f"memory)", flush=True)
+        if requant:
+            print(f"[structures.vllm] {tag}: {requant} seats carried "
+                  f"W8->W4 (auto tier: precision change, task-level "
+                  f"validation is the caller's gate)", flush=True)
+        if pack_rels:
+            pr = sorted(pack_rels)
+            print(f"[structures.vllm] {tag}: pack relL2 median "
+                  f"{pr[len(pr) // 2]:.5f}, worst {pr[-1]:.5f}",
+                  flush=True)
+        if probe_cos:
+            cs = sorted(probe_cos)
+            print(f"[structures.vllm] {tag}: bind cos min "
+                  f"{cs[0][0]:.5f} ({cs[0][1].rsplit('.', 2)[-2:] and '.'.join(cs[0][1].split('.')[-3:])}), "
+                  f"p10 {cs[len(cs) // 10][0]:.5f}, "
+                  f"median {cs[len(cs) // 2][0]:.5f}", flush=True)
+        seen = set()
+        for nm, why in refused:
+            key = why[:60]
+            if key in seen:
+                continue
+            seen.add(key)
+            print(f"[structures.vllm]   refused {nm}: {why[:1800]}",
+                  flush=True)
+    handle.notes = {"refused": refused, "head_slabs": head_slabs,
+                    "parked_tiers": parked_tiers,
+                    "fused_mlps": fused_mlps}
     return handle
 
 
-def install_load_hook(*, on_attached=None, **attach_kwargs):
+def _draft_ckpt_rename(name: str) -> str:
+    """Draft module path -> its key in the full-precision checkpoint.
+
+    The proposer holds its own model, so its paths restart at ``model.``
+    and collide with the target's layer 0 — a source lookup on the raw
+    path silently reads the *target's* rows, and only the bind probe
+    stands between that and a wrong seat. The checkpoint files the draft
+    under its own ``mtp.`` subtree; naming it that way is what makes the
+    lookup mean what it says.
+    """
+    for lead in ("model.model.", "model."):
+        if name.startswith(lead):
+            return "mtp." + name[len(lead):]
+    return "mtp." + name
+
+
+def install_load_hook(*, on_attached=None, seat_draft=True,
+                      draft_precision=None, **attach_kwargs):
     """Patch every importable vLLM model-runner so :func:`attach_engine`
     runs after weights load and before the engine's first trace. Set
     ``VLLM_DISABLE_COMPILE_CACHE=1``: the engine's compile cache key
@@ -340,7 +1299,51 @@ def install_load_hook(*, on_attached=None, **attach_kwargs):
 
         def load_model(self, *a, __orig=orig, **kw):
             __orig(self, *a, **kw)
+            # A speculative engine judges drafts against target logits,
+            # and vLLM's MTP draft shares the target's lm_head. The
+            # Marlin head relay changes the target's head numerics
+            # only, so draft and target stop agreeing at the head —
+            # measured as a systematic acceptance drop (paired over
+            # ten prompts, lower on all ten). Under spec decode the
+            # relay steps aside unless the caller forces it.
+            _spec = getattr(getattr(self, "vllm_config", None),
+                            "speculative_config", None)
+            if _spec is not None and "FRT_HEAD_MARLIN" not in os.environ:
+                os.environ["FRT_HEAD_MARLIN"] = "0"
             handle = attach_engine(self.model, **attach_kwargs)
+            # A speculative engine is two models, and its throughput is
+            # the product of acceptance and step rate. Seating only the
+            # target re-grids one side of the agreement test: the draft
+            # still proposes from the checkpoint's own grid, the target
+            # now judges from ours, and the measured cost is acceptance
+            # — a loss no kernel win can pay back. The draft's seats are
+            # bound from the same source rows for that reason first, and
+            # for its own speed second.
+            draft = getattr(getattr(self, "drafter", None), "model", None)
+            if draft is not None and isinstance(draft, nn.Module) and seat_draft:
+                kw2 = dict(attach_kwargs)
+                kw2["head"] = False        # the draft shares the target's
+                kw2["ckpt_rename"] = _draft_ckpt_rename
+                kw2["tag"] = "draft"
+                # a draft the checkpoint left in BF16 contributes no
+                # seats under the adopt tiers; an explicit draft
+                # precision re-grids it (proposal quality is the only
+                # exposure — the target still judges every token — and
+                # the caller gates it on measured acceptance)
+                if draft_precision:
+                    kw2["precision"] = draft_precision
+                    kw2["seats"] = tuple(
+                        kw2.get("seats", DENSE_SEAT_SUFFIXES)
+                    ) + ("model.fc",)
+                try:
+                    dh = attach_engine(draft, **kw2)
+                    # one detach undoes both models: the draft handle's
+                    # undo list rides on the target's
+                    handle._revert.append(dh.detach)
+                except Exception as e:  # noqa: BLE001
+                    if attach_kwargs.get("verbose", True):
+                        print(f"[structures.vllm] draft not seated: "
+                              f"{repr(e)[:160]}", flush=True)
             if on_attached is not None:
                 on_attached(handle)
         runner.load_model = load_model

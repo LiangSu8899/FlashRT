@@ -95,3 +95,57 @@ def test_matrix_counts_only_passing_digest_receipts(tmp_path):
     assert "gated_delta_core: 2 host(s) — meets" in text
     assert "decode_loop: 1 host(s) — single-host" in text
     assert "HostC" not in text and "HostD" not in text
+
+
+class _GdnLayer(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv1d = torch.nn.Conv1d(8, 8, 4)
+        self.A_log = torch.nn.Parameter(torch.zeros(4))
+        self.in_proj_qkv = torch.nn.Linear(64, 128, bias=False)
+
+
+class _DenseHost(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embed = torch.nn.Embedding(100, 64)
+        self.q_proj = torch.nn.Linear(64, 128, bias=False)
+        self.gdn = _GdnLayer()
+        self.head = torch.nn.Linear(64, 100, bias=False)
+
+
+def test_gated_delta_profile_is_recognised_structurally():
+    from flash_rt.structures.quantize_on_adopt import (
+        _is_gated_delta_layer)
+
+    assert _is_gated_delta_layer(_GdnLayer())
+    assert not _is_gated_delta_layer(torch.nn.Linear(8, 8))
+
+
+def test_linear_adoption_skips_owned_families_and_releases(monkeypatch):
+    from flash_rt.structures.impls.linear_proj import nvfp4_dynamic
+
+    bound_paths = []
+
+    def stub(weights):
+        bound_paths.append(tuple(weights["w"].shape))
+        return torch.nn.Identity(), 0.1
+
+    monkeypatch.setattr(nvfp4_dynamic, "bind_proj_seam", stub)
+    host = _DenseHost()
+    report = quantize_on_adopt(host, "linear_proj_nvfp4")
+    # only the plain projection binds; the state layer's projection is
+    # the gated_delta_core scheme's to pack, the vocabulary projection
+    # is a logits-family decision, and the retired dense weight is gone
+    assert report.replaced == ["q_proj"]
+    assert bound_paths == [(128, 64)]
+    assert report.retained == {"head": "vocabulary projection"}
+    assert isinstance(host.q_proj, torch.nn.Identity)
+    assert isinstance(host.gdn.in_proj_qkv, torch.nn.Linear)
+    assert host.gdn.in_proj_qkv.weight is not None
+
+
+def test_projectionless_tree_is_a_named_refusal():
+    tree = torch.nn.Sequential(torch.nn.ReLU())
+    with pytest.raises(ValueError, match="no dense projections"):
+        quantize_on_adopt(tree, "linear_proj_nvfp4")

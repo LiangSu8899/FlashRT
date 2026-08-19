@@ -186,6 +186,16 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #include "kernels/fp4_w4a4_mma_sm120.cuh"
 #include "kernels/fp4_w4a4_mma_warpsplit_sm120.cuh"
 #include "kernels/fp4_w4a4_mma_warpsplit_mrows_sm120.cuh"
+#include "kernels/fp4_w4a4_mma_warpsplit_ilv_sm120.cuh"
+#include "kernels/fp4_w4a4_mma_warpsplit_ilv_mrows_sm120.cuh"
+#include "kernels/gdn_chunk_from_conv_smem_stash.cuh"
+#include "kernels/silu_mul_quantize_fp4_sfa_bf16.cuh"
+#include "kernels/batched_unit_ltri_inv64.cuh"
+#include "kernels/rms_norm_quantize_fp4_sfa_bf16.cuh"
+#include "kernels/gdn_wy_norm_cumsum_pack_qk_v2.cuh"
+#include "kernels/causal_conv1d_update_steps_gqa_bf16.cuh"
+#include "kernels/gdn_recurrent_inout_stream_bf16.cuh"
+#include "kernels/rms_norm_gated_silu_quant_fp4_bf16.cuh"
 #include "quantize/fp8_block128_dequant.cuh"
 #ifdef FLASHRT_HAVE_NVFP4_SWIZZLE
 #include "quantize/fp8_block128_to_nvfp4_swizzled.cuh"
@@ -6632,7 +6642,222 @@ graph-replay safe) to fill the SMs on long K. M in 1..16; N%8==0; K%64==0;
 (K/64)%warps==0; warps in {2,4,8}; stages in {3,4,6}.
 )pbdoc");
 
+    m.def("fp4_w4a4_mma_sm120_warpsplit_ilv_bf16out",
+        [](uintptr_t A, uintptr_t B, uintptr_t D, int N, int K, uintptr_t SFA,
+           uintptr_t SFB, float alpha, int warps, int stages,
+           uintptr_t stream) -> int {
+            return flash_rt::gemm::fp4_w4a4_mma_sm120_warpsplit_ilv_bf16out(
+                to_ptr(A), to_ptr(B), to_ptr(D), N, K, to_ptr(SFA),
+                to_ptr(SFB), alpha, warps, stages, to_stream(stream));
+        },
+        py::arg("A"), py::arg("B"), py::arg("D"), py::arg("N"), py::arg("K"),
+        py::arg("SFA"), py::arg("SFB"), py::arg("alpha") = 1.0f,
+        py::arg("warps") = 4, py::arg("stages") = 4, py::arg("stream") = 0,
+        R"pbdoc(
+NVFP4 W4A4 warp-split-K M=1 GEMV over the interleaved B layout (SM120).
+B must come from fp4_w4a4_repack_b_ilv_sm120 (bind-time repack): each
+8-column group's K-tiles interleave so the block's global reads are fully
+contiguous. Bit-exact vs the dense warp-split GEMV (identical reduction
+order). N%8==0; K%64==0; (K/64)%warps==0; warps in {2,4,8}; stages {3,4,6}.
+)pbdoc");
+
+    m.def("fp4_w4a4_mma_sm120_warpsplit_ilv_mrows_bf16out",
+        [](uintptr_t A, uintptr_t B, uintptr_t D, int M, int N, int K,
+           uintptr_t SFA, uintptr_t SFB, float alpha, int warps, int stages,
+           uintptr_t stream) -> int {
+            return flash_rt::gemm::
+                fp4_w4a4_mma_sm120_warpsplit_ilv_mrows_bf16out(
+                    to_ptr(A), to_ptr(B), to_ptr(D), M, N, K, to_ptr(SFA),
+                    to_ptr(SFB), alpha, warps, stages, to_stream(stream));
+        },
+        py::arg("A"), py::arg("B"), py::arg("D"), py::arg("M"), py::arg("N"),
+        py::arg("K"), py::arg("SFA"), py::arg("SFB"), py::arg("alpha") = 1.0f,
+        py::arg("warps") = 4, py::arg("stages") = 4, py::arg("stream") = 0,
+        R"pbdoc(
+NVFP4 W4A4 small-M (M<=16) warp-split-K GEMM over the interleaved B layout
+(SM120). Shares the repacked B with the M=1 interleaved entry; bit-exact per
+row vs it (identical reduction order). M in 1..16; N%8==0; K%64==0;
+(K/64)%warps==0; warps in {2,4,8}; stages in {3,4,6}.
+)pbdoc");
+
+    m.def("fp4_w4a4_repack_b_ilv_sm120",
+        [](uintptr_t B_packed, uintptr_t B_ilv, int N, int K,
+           uintptr_t stream) -> int {
+            return flash_rt::gemm::fp4_w4a4_repack_b_ilv_sm120(
+                to_ptr(B_packed), to_ptr(B_ilv), N, K, to_stream(stream));
+        },
+        py::arg("B_packed"), py::arg("B_ilv"), py::arg("N"), py::arg("K"),
+        py::arg("stream") = 0,
+        R"pbdoc(
+Bind-time repack: dense packed B (N, K/2 bytes row-major) -> interleaved
+[N/8 groups][K/64 tiles][8 cols x 32B] layout for the warpsplit_ilv entries.
+dst byte size equals src (N*K/2). Pure byte permutation on stream.
+)pbdoc");
+
 #endif
+
+    m.def("silu_mul_quantize_fp4_sfa_bf16",
+        [](uintptr_t merged, uintptr_t packed, uintptr_t sfa, int N, int H,
+           uintptr_t stream) -> int {
+            return flash_rt::fp4::silu_mul_quantize_fp4_sfa_bf16(
+                to_ptr(merged), to_ptr(packed), to_ptr(sfa), N, H,
+                to_stream(stream));
+        },
+        py::arg("merged"), py::arg("packed"), py::arg("sfa"), py::arg("N"),
+        py::arg("H"), py::arg("stream") = 0,
+        R"pbdoc(
+Fused SwiGLU activation + NVFP4 quantize producer. merged: bf16 (N, 2H)
+row-major, halves ordered [gate|up], H%16==0. Emits packed (N, H/2 bytes)
++ SFA in the 128x64-atom layout ((N+127)/128 * (H+63)/64 * 512 bytes).
+silu·mul in fp32 rounded through bf16, then the production quantize path
+verbatim - bit-exact vs the split (mul kernel -> quantize kernel) chain.
+)pbdoc");
+
+    m.def("batched_unit_ltri_inv64_f32",
+        [](uintptr_t A, uintptr_t X, int B, uintptr_t stream) -> int {
+            return flash_rt::kernels::batched_unit_ltri_inv64_f32(
+                to_ptr(A), to_ptr(X), B, to_stream(stream));
+        },
+        py::arg("A"), py::arg("X"), py::arg("B"), py::arg("stream") = 0,
+        R"pbdoc(
+Batched 64x64 unit-lower-triangular inverse, fp32: X = inv(I +
+strict_tril(A)). A, X: (B, 64, 64) row-major; only A's strict lower
+triangle is read. Column-independent forward substitution - the same
+recurrence class as the batched cuBLAS solve it replaces.
+)pbdoc");
+
+    m.def("rms_norm_quantize_fp4_sfa_bf16",
+        [](uintptr_t x, uintptr_t w, float eps, uintptr_t normed,
+           uintptr_t packed, uintptr_t sfa, int N, int D,
+           uintptr_t stream) -> int {
+            return flash_rt::fp4::rms_norm_quantize_fp4_sfa_bf16(
+                to_ptr(x), to_ptr(w), eps, to_ptr(normed), to_ptr(packed),
+                to_ptr(sfa), N, D, to_stream(stream));
+        },
+        py::arg("x"), py::arg("w"), py::arg("eps"), py::arg("normed"),
+        py::arg("packed"), py::arg("sfa"), py::arg("N"), py::arg("D"),
+        py::arg("stream") = 0,
+        R"pbdoc(
+Fused (1+w)-form RMSNorm + NVFP4 quantize producer. x: bf16 (N, D);
+w: bf16 (D) residual-form weight (kernel applies 1+w). Emits the normed
+bf16 rows AND their packed FP4 (N, D/2 bytes) + SFA (128x64-atom layout)
+off one read of x - the norm the host computes, plus the quantization
+its bound consumers would each redo. D%16==0, D<=8192.
+)pbdoc");
+
+    m.def("gdn_wy_norm_cumsum_pack_qk_v2_bf16",
+        [](uintptr_t q16, uintptr_t k16, uintptr_t g, uintptr_t q16_l2,
+           uintptr_t k16_l2, uintptr_t q_pack_hv, uintptr_t k_pack_hk,
+           uintptr_t g_cumsum, int S, uintptr_t stream) -> int {
+            return flash_rt::kernels::gdn_wy_norm_cumsum_pack_qk_v2_bf16(
+                to_ptr(q16), to_ptr(k16), to_ptr(g), to_ptr(q16_l2),
+                to_ptr(k16_l2), to_ptr(q_pack_hv), to_ptr(k_pack_hk),
+                to_ptr(g_cumsum), S, to_stream(stream));
+        },
+        py::arg("q16"), py::arg("k16"), py::arg("g"), py::arg("q16_l2"),
+        py::arg("k16_l2"), py::arg("q_pack_hv"), py::arg("k_pack_hk"),
+        py::arg("g_cumsum"), py::arg("S"), py::arg("stream") = 0,
+        R"pbdoc(
+WY-chain q/k L2-norm + pack + per-chunk gate cumsum for the fixed
+16/48/128/64 family, v2 launch plan: the norm/pack math transcribed
+verbatim from the packaged fast arm, the gate cumsum parallelized over
+the independent (chunk, head) pairs with the packaged serial order kept
+inside each chunk - bit-exact against the packaged pair.
+)pbdoc");
+
+    m.def("causal_conv1d_update_steps_gqa_bf16",
+        [](uintptr_t x, uintptr_t w, uintptr_t bias, uintptr_t state,
+           uintptr_t q16, uintptr_t k16, uintptr_t v48, int S,
+           bool apply_silu, uintptr_t stream) -> int {
+            return flash_rt::kernels::causal_conv1d_update_steps_gqa_bf16(
+                to_ptr(x), to_ptr(w), to_ptr(bias), to_ptr(state),
+                to_ptr(q16), to_ptr(k16), to_ptr(v48), S, apply_silu,
+                to_stream(stream));
+        },
+        py::arg("x"), py::arg("w"), py::arg("bias"), py::arg("state"),
+        py::arg("q16"), py::arg("k16"), py::arg("v48"), py::arg("S"),
+        py::arg("apply_silu") = true, py::arg("stream") = 0,
+        R"pbdoc(
+Chunk-parallel causal conv1d update (K=4, the 2048/2048/6144 q/k/v
+channel family) with per-thread step batching and GQA split outputs.
+Taps roll through registers - (STEPS+3)/STEPS read amplification
+instead of 4x - with the packaged kernel's tap order and fma chain,
+bit-exact. x: (S, 10240); w: (10240, 4); state: (10240, 3) last raw
+inputs; q16/k16: (S, 2048), v48: (S, 6144), silu applied.
+)pbdoc");
+
+    m.def("rms_norm_gated_silu_quant_fp4_bf16",
+        [](uintptr_t x, uintptr_t gate, uintptr_t weight, uintptr_t out,
+           uintptr_t packed, uintptr_t sfa, int M, int dim, float eps,
+           uintptr_t stream) -> int {
+            return flash_rt::kernels::rms_norm_gated_silu_quant_fp4_bf16(
+                to_ptr(x), to_ptr(gate), to_ptr(weight), to_ptr(out),
+                to_ptr(packed), to_ptr(sfa), M, dim, eps,
+                to_stream(stream));
+        },
+        py::arg("x"), py::arg("gate"), py::arg("weight"),
+        py::arg("out"), py::arg("packed"), py::arg("sfa"), py::arg("M"),
+        py::arg("dim"), py::arg("eps") = 1e-6f, py::arg("stream") = 0,
+        R"pbdoc(
+Fused RMSNorm + weight + silu(gate) that also emits the row's NVFP4
+packed bytes and SFA, read by the output projection as one (1, M*128)
+activation. Norm arithmetic transcribed from the packaged gated-norm
+kernel; quantize stage is the production path verbatim. dim must be 128.
+)pbdoc");
+
+    m.def("gdn_recurrent_inout_stream_bf16",
+        [](uintptr_t q, uintptr_t k, uintptr_t v, uintptr_t g,
+           uintptr_t beta, uintptr_t state_in, uintptr_t state_out,
+           uintptr_t out, int B, int num_v_heads, int head_dim,
+           bool use_qk_l2norm, uintptr_t stream) -> int {
+            return flash_rt::kernels::gdn_recurrent_inout_stream_bf16(
+                to_ptr(q), to_ptr(k), to_ptr(v), to_ptr(g),
+                to_ptr(beta), to_ptr(state_in), to_ptr(state_out),
+                to_ptr(out), B, num_v_heads, head_dim, use_qk_l2norm,
+                to_stream(stream));
+        },
+        py::arg("q"), py::arg("k"), py::arg("v"), py::arg("g"),
+        py::arg("beta"), py::arg("state_in"), py::arg("state_out"),
+        py::arg("out"), py::arg("B"), py::arg("num_v_heads"),
+        py::arg("head_dim"), py::arg("use_qk_l2norm") = true,
+        py::arg("stream") = 0,
+        R"pbdoc(
+Gated-delta recurrent decode step over a streaming-column form: one warp
+per 32 value columns instead of one block per head, so the same total
+thread count spreads over 4x the blocks (the packaged kernel leaves
+three quarters of a 170-SM part idle). Per-column arithmetic is the
+packaged kernel's, unchanged; the q/k L2 norm reduces over a warp
+rather than a 128-thread block, so its fp32 rounding may differ.
+head_dim must be 128.
+)pbdoc");
+
+    m.def("gdn_chunk_from_conv_smem_h_stash_bf16",
+        [](uintptr_t conv_out, uintptr_t a, uintptr_t b_, uintptr_t neg_exp_a,
+           uintptr_t dt_bias, uintptr_t state, uintptr_t out, uintptr_t stash,
+           int S, int num_v_heads, int num_k_heads, int head_dim,
+           int a_stride, int b_stride, bool use_qk_l2norm,
+           uintptr_t stream) {
+            flash_rt::gdn::gdn_chunk_from_conv_smem_h_stash_bf16(
+                to_ptr(conv_out), to_ptr(a), to_ptr(b_),
+                reinterpret_cast<const float*>(neg_exp_a),
+                reinterpret_cast<const float*>(dt_bias),
+                to_ptr(state), to_ptr(out), to_ptr(stash), S,
+                num_v_heads, num_k_heads, head_dim, a_stride, b_stride,
+                use_qk_l2norm, to_stream(stream));
+        },
+        py::arg("conv_out"), py::arg("a"), py::arg("b"),
+        py::arg("neg_exp_a"), py::arg("dt_bias"), py::arg("state"),
+        py::arg("out"), py::arg("stash"), py::arg("S"),
+        py::arg("num_v_heads"), py::arg("num_k_heads"),
+        py::arg("head_dim"), py::arg("a_stride"), py::arg("b_stride"),
+        py::arg("use_qk_l2norm") = true, py::arg("stream") = 0,
+        R"pbdoc(
+Gated-delta from-conv chunk core with a per-row state stash (spec verify).
+Identical recurrence and per-row bf16 state requantisation to the plain
+chunk kernel; stash row s additionally records the carried state after row
+s, bit-equal to the final state of a re-advance over rows 0..s. A rejected
+speculative round rolls back by selecting a stash row. head_dim must be 128.
+)pbdoc");
 
 // ─────────────────────────────────────────────────────────────────────
 // SM100 NVFP4 W4A16 GEMM bindings (Thor SM110).

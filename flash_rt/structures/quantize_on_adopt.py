@@ -8,6 +8,23 @@ a sparse-MoE expert bank. Quantizing that family once, at load time,
 into structure impls brings the whole model into card budget while the
 attention, norms, and router stay in the host's own precision.
 
+The second format serves the dense sibling of that situation: a
+full-precision checkpoint whose weight mass sits in ordinary 2-D linear
+projections (attention q/k/v/o and MLP gate/up/down). Each projection
+packs to the Hub NVFP4 layout through the same seam binder the
+pre-quantized door uses, so both doors produce the same executable
+form and everything downstream of adoption is shared. Two families are
+deliberately not adopted here, each because it carries its own door:
+projections living inside a gated-delta state layer (recognised by the
+``conv1d`` + ``A_log`` profile) belong to the ``gated_delta_core``
+scheme, which packs them together with the fused layer and owns their
+release semantics; and a vocabulary projection (a Linear whose shape
+mirrors an embedding in the same tree) is logits-family precision — a
+separate, explicit binder decision, never a bulk-adoption side effect.
+Scope is the module tree you hand in: pass the language stack, not the
+whole multimodal shell, when towers outside it should keep their own
+precision.
+
 The calling convention matches the sibling door: the model is expected
 CPU-resident straight from its loader; each expert bank streams through
 the GPU in slabs as it packs, so peak footprint is the dense checkpoint
@@ -31,7 +48,7 @@ from .prequantized import AdoptionReport
 
 __all__ = ["quantize_on_adopt"]
 
-_FORMATS = ("moe_experts_nvfp4",)
+_FORMATS = ("moe_experts_nvfp4", "linear_proj_nvfp4")
 
 
 def _is_moe_expert_bank(module: torch.nn.Module) -> bool:
@@ -48,6 +65,68 @@ def _is_moe_expert_bank(module: torch.nn.Module) -> bool:
             and gu.shape[1] == 2 * dn.shape[2])
 
 
+def _is_gated_delta_layer(module: torch.nn.Module) -> bool:
+    """The state-layer profile (``conv1d`` + ``A_log``): its projections
+    are packed by the ``gated_delta_core`` scheme together with the
+    fused layer, never adopted piecemeal here."""
+    return hasattr(module, "conv1d") and hasattr(module, "A_log")
+
+
+def _vocab_signatures(model: torch.nn.Module) -> set:
+    """Shapes of every embedding in the tree: a Linear mirroring one is
+    a vocabulary projection (logits family), refused by this door."""
+    return {(m.num_embeddings, m.embedding_dim)
+            for m in model.modules()
+            if isinstance(m, torch.nn.Embedding)}
+
+
+def _adopt_linear_projections(model: torch.nn.Module,
+                              report, *, verbose: bool) -> None:
+    from .impls.linear_proj import nvfp4_dynamic
+
+    vocab_sigs = _vocab_signatures(model)
+    for name, module in list(model.named_modules()):
+        if _is_gated_delta_layer(module):
+            continue
+        for child_name, child in list(module.named_children()):
+            if not isinstance(child, torch.nn.Linear):
+                continue
+            w = getattr(child, "weight", None)
+            if (w is None or w.dim() != 2
+                    or not w.is_floating_point()
+                    or hasattr(child, "weight_packed")):
+                continue
+            path = f"{name}.{child_name}" if name else child_name
+            if tuple(w.shape) in vocab_sigs:
+                report.retained[path] = "vocabulary projection"
+                continue
+            bias = getattr(child, "bias", None)
+            try:
+                bound, rel = nvfp4_dynamic.bind_proj_seam(
+                    {"w": w.detach(),
+                     "b": None if bias is None else bias.detach()})
+            except ValueError as exc:
+                report.retained[path] = str(exc)
+                if verbose:
+                    print(f"[quantize_on_adopt] {path}: retained "
+                          f"({str(exc)[:80]})", flush=True)
+                continue
+            # release the dense projection before moving on: the
+            # streaming bind is only slab-peak if retired weights go
+            child.weight = None
+            setattr(module, child_name, bound)
+            report.replaced.append(path)
+            report.conversion_rel_l2[path] = rel
+            if verbose:
+                print(f"[quantize_on_adopt] {path}: relL2={rel:.4f}",
+                      flush=True)
+    if not report.replaced:
+        raise ValueError(
+            "no dense projections found: this tree carries nothing "
+            "linear_proj_nvfp4 adopts (all out of profile, or already "
+            "packed)")
+
+
 @torch.no_grad()
 def quantize_on_adopt(model: torch.nn.Module,
                       fmt: str = "moe_experts_nvfp4", *,
@@ -59,9 +138,22 @@ def quantize_on_adopt(model: torch.nn.Module,
             f"unknown quantize-on-adopt format {fmt!r}; supported: "
             f"{', '.join(_FORMATS)}")
 
+    report = AdoptionReport(fmt=fmt)
+    if fmt == "linear_proj_nvfp4":
+        _adopt_linear_projections(model, report, verbose=verbose)
+        # sibling projections that read the same normed hidden share one
+        # activation quantization (identity-keyed, bit-identical by
+        # construction) — the adopted checkpoint's default execution form
+        from .impls.linear_proj import nvfp4_dynamic as _nv
+        n_shared = _nv.link_shared_producers(model)
+        torch.cuda.empty_cache()
+        if verbose:
+            print(f"[quantize_on_adopt] {report.summary()}; "
+                  f"{n_shared} shared-producer groups", flush=True)
+        return report
+
     from .impls.moe_experts import nvfp4_dynamic
 
-    report = AdoptionReport(fmt=fmt)
     for name, module in list(model.named_modules()):
         for child_name, child in list(module.named_children()):
             if not _is_moe_expert_bank(child):
