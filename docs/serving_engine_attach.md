@@ -99,6 +99,47 @@ The hook patches the model runner's `load_model` and attaches between
 weight load and the engine's first trace — the only window where a
 compiled vLLM host accepts a module swap.
 
+### Stock CLI serving (`vllm serve`), zero code changes
+
+A stock OpenAI-compatible server attaches the same way SGLang does:
+a `sitecustomize.py` rides `PYTHONPATH` into the server's processes
+and installs the load hook when its env gate is set.
+
+```python
+# <hook-dir>/sitecustomize.py
+import os
+if os.environ.get("FRT_VLLM_ATTACH") == "1":
+    import sys
+    p = os.environ.get("FRT_VLLM_STRUCTURES_PATH")
+    if p and p not in sys.path:
+        sys.path.insert(0, p)
+    from flash_rt.structures.adapters import vllm_engine
+    vllm_engine.install_load_hook(
+        seats=vllm_engine.DENSE_SEAT_SUFFIXES,
+        precision=os.environ.get("FRT_VLLM_PRECISION", "auto"),
+        consume=os.environ.get("FRT_VLLM_CONSUME", "1") == "1",
+        seat_draft=False,
+        head=os.environ.get("FRT_VLLM_HEAD", "1") == "1",
+        fused_mlp=True)
+```
+
+```bash
+PYTHONPATH=<hook-dir> FRT_VLLM_ATTACH=1 FRT_VLLM_STRUCTURES_PATH=<this-repo> vllm serve <model> --trust-remote-code ...
+```
+
+Measured on the running server (OpenAI completions API, MTP K=6, 2K
+real prompts, same client and boots back to back):
+
+| | stock serve | attached serve |
+|---|---|---|
+| code decode-only | 195.6 tok/s | **210.2 (+7.5%)** |
+| text decode-only | 129.3 tok/s | **141.0 (+9.0%)** |
+| TTFT | ~141 ms | **~123 ms (−13%)** |
+
+The spec-decode head rule applies unchanged (the server carries a
+speculative config, so the Marlin head relay stands aside on its
+own).
+
 ### Precision tiers
 
 | `precision=` | behavior |
