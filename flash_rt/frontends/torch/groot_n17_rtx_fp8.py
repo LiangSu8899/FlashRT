@@ -113,8 +113,16 @@ class _GrootN17FP8BackboneMixin:
             self._vit_cos.float(), self._vit_sin.float(),
             num_views=self._num_vit_views)
         out_ds = cal.calibrate_deepstack(self, out_vit["deepstack_taps"])
+        llm_in = aux["llm_input_embeds"].to(device).float()
+        if getattr(self, "_own_visual_merge", False):
+            # the bundle is text-only in this mode, and activation scales read
+            # off text-only rows would under-range every LLM GEMM, so put the
+            # visual rows back exactly as the kernel path will build them
+            llm_in = llm_in.clone()
+            llm_in[0][self._visual_pos_masks] = self._merge_visual_tokens(
+                out_vit["vit_final"]).float()
         out_llm = cal.calibrate_llm(
-            self, aux["llm_input_embeds"].to(device).float(),
+            self, llm_in,
             self._mrope_cos.float(), self._mrope_sin.float(),
             self._visual_pos_masks, out_ds["features"])
         out_vlsa = cal.calibrate_vlsa(self, out_llm["llm_final"])
@@ -160,6 +168,64 @@ class _GrootN17FP8BackboneMixin:
             warnings.warn(f"set_prompt warmup failed (non-fatal): {e!r}")
         self.latency_records.clear()
 
+    def adopt_visual_merge(self) -> None:
+        """Produce the visual rows of the LLM input here instead of taking them.
+
+        ``aux["llm_input_embeds"]`` normally arrives with the host's vision
+        tower already merged into the visual token rows, so a control loop
+        would have to run that tower again on every frame just to refresh
+        them — the one part of the observation that actually changes. The
+        final patch merger ships in the same checkpoint and is already loaded
+        (``_merger_*``), and this pipeline runs the full 24-layer ViT anyway
+        to tap DeepStack, so the rows can be produced right here.
+
+        After this call the bundle only has to carry a *text-only*
+        ``llm_input_embeds`` — constant for a fixed prompt — and fresh
+        ``pixel_features``. Off by default: it changes what the bundle is
+        expected to contain.
+        """
+        from flash_rt.models.groot_n17.calibration import _dequant_fp8
+
+        if getattr(self, "_own_visual_merge", False):
+            return
+        for attr in ("_merger_norm_w", "_merger_norm_b", "_merger_fc1_w",
+                     "_merger_fc1_b", "_merger_fc2_w", "_merger_fc2_b"):
+            if not hasattr(self, attr):
+                raise RuntimeError(
+                    f"adopt_visual_merge() needs {attr}; this checkpoint did "
+                    "not load the ViT final merger")
+        dev = self.device
+        # The merger is two small GEMMs on the merged visual tokens (a few
+        # GFLOP); dequantising once and running them in fp16 keeps the FP8
+        # kernel path untouched.
+        self._merger_fc1_fp16 = _dequant_fp8(
+            self._merger_fc1_w, self._merger_alpha[0]).to(dev).float()
+        self._merger_fc2_fp16 = _dequant_fp8(
+            self._merger_fc2_w, self._merger_alpha[1]).to(dev).float()
+        self._merger_fc1_b_f = self._merger_fc1_b.to(dev).float()
+        self._merger_fc2_b_f = self._merger_fc2_b.to(dev).float()
+        self._merger_norm_w_f = self._merger_norm_w.to(dev).float()
+        self._merger_norm_b_f = self._merger_norm_b.to(dev).float()
+        self._own_visual_merge = True
+
+    def _merge_visual_tokens(self, vit_final: "torch.Tensor") -> "torch.Tensor":
+        """ViT final hidden (Sv, 1024) → merged visual rows (Sv/4, 2048).
+
+        Unlike the DeepStack mergers, which normalise after the 4:1 spatial
+        merge, this one normalises the ViT hidden width first and only then
+        folds four tokens into one: LayerNorm(1024) → reshape(-1, 4096) →
+        fc1 (+bias, +GELU tanh) → fc2.
+        """
+        d = self._merger_norm_w_f.shape[0]
+        xn = torch.nn.functional.layer_norm(
+            vit_final.reshape(-1, d).float(), (d,),
+            self._merger_norm_w_f, self._merger_norm_b_f, eps=1e-6)
+        fc1 = torch.nn.functional.gelu(
+            xn.reshape(-1, self._merger_fc1_fp16.shape[0])
+            @ self._merger_fc1_fp16 + self._merger_fc1_b_f,
+            approximate="tanh")
+        return (fc1 @ self._merger_fc2_fp16 + self._merger_fc2_b_f).half()
+
     def refresh_observation(self, aux: dict) -> None:
         """Re-run the backbone for a new observation, keeping everything else.
 
@@ -182,7 +248,35 @@ class _GrootN17FP8BackboneMixin:
             raise ValueError(
                 f"refresh_observation() got {se} prompt tokens, the pipeline "
                 f"was built for {self.Se}; construct a new frontend instead")
-        self._backbone_features = self._run_kernel_backbone_fp8(aux).half()
+        plan = getattr(self, "_kbb_plan", None)
+        if plan is not None and plan["Se"] == se and plan["Sv"] == self._S_vit:
+            self._backbone_features = self._replay_kernel_backbone_fp8(aux).half()
+        else:
+            self._backbone_features = self._run_kernel_backbone_fp8(aux).half()
+
+        # The action head does not read the backbone directly: it reads the
+        # cross-attention K/V derived from it, which set_prompt computed once
+        # because a prompt-shaped pipeline never had a second observation.
+        # Without this the head keeps answering about the first frame — the
+        # policy still moves, driven by state alone, and never sees the scene.
+        if hasattr(self, "_ck_bb_src"):
+            self._ck_bb_src.copy_(
+                self._backbone_features.reshape(self.Se, 2048).half())
+            self._cross_kv_fwd(0)
+        else:
+            self._setup_cross_kv_kernel()
+        # On RTX the attention backend keeps its own padded cross slots and is
+        # handed a copy when it is built — a prompt-change path, which is the
+        # only refresh the pipeline ever needed. Publish the new K/V into
+        # those slots here too, in place, so the captured DiT graph keeps its
+        # pointers and still answers about the current frame.
+        attn = getattr(self, "_dit_attn", None)
+        if attn is not None and hasattr(attn, "dit_cross_K"):
+            for j, (k_src, v_src) in enumerate(
+                    zip(self._dit_cross_K, self._dit_cross_V)):
+                dst_k, dst_v = attn.dit_cross_K[j], attn.dit_cross_V[j]
+                dst_k.view(dst_k.shape[0], -1)[:k_src.shape[0]].copy_(k_src)
+                dst_v.view(dst_v.shape[0], -1)[:v_src.shape[0]].copy_(v_src)
 
     # ── FP8 kernel backbone: ViT → DeepStack → LLM → vlln → VL-self-attn ──
     def _run_kernel_backbone_fp8(self, aux: dict) -> "torch.Tensor":
@@ -225,6 +319,13 @@ class _GrootN17FP8BackboneMixin:
             num_vit_views=nv, vit_seq=Sv, llm_seq=Se, vl_self_attn_seq=Se,
             device=dev)
         self._kbb_attn = attn
+        # Everything below is a function of the token layout, not of the
+        # pixels: buffers, per-layer weight pointer tables, weight-scale
+        # scalars. A control loop calls this once per frame, so record it and
+        # let refresh_observation replay just the copies and the kernels.
+        plan = {"Sv": Sv, "Se": Se, "keep": keep, "attn": attn,
+                "gemm": gemm, "fvk": fvkm}
+        self._kbb_plan = plan
 
         # ═══ ViT (24L) ═══
         vit_h = buf(Sv, 1024)
@@ -278,11 +379,13 @@ class _GrootN17FP8BackboneMixin:
             return cb
         dcap = [mk_cb(l) for l in tap_layers]
 
-        P.qwen3vl_vit_forward(
-            gemm=gemm, fvk=fvkm, bufs=vit_bufs, weights=vw, scales_dev=vit_scales,
+        plan["vit"] = dict(
+            bufs=vit_bufs, weights=vw, scales_dev=vit_scales,
             dims={"S": Sv, "D": 1024, "NH": 16, "HD": 64,
                   "ff_inner": 4096, "Sper_view": Sv // nv},
-            attn=attn, deepstack_taps=tap_layers, deepstack_capture=dcap)
+            deepstack_taps=tap_layers, deepstack_capture=dcap)
+        plan["vit_h"] = vit_h
+        P.qwen3vl_vit_forward(gemm=gemm, fvk=fvkm, attn=attn, **plan["vit"])
 
         # ═══ DeepStack (3 mergers) ═══
         Nout = Sv // 4
@@ -300,8 +403,7 @@ class _GrootN17FP8BackboneMixin:
             dsw["fc2_ws"].append(wsc(self._dsm_alpha[j * 2 + 1]))
         ds_scales = {"act_fc1": adv(self._dsm_act_fc1_dev),
                      "act_fc2": adv(self._dsm_act_fc2_dev)}
-        P.deepstack_merge_forward(
-            gemm=gemm, fvk=fvkm,
+        plan["ds"] = dict(
             bufs={"in": [tap_bufs[l].data_ptr() for l in tap_layers],
                   "ln_out": buf(Nout, 4096).data_ptr(),
                   "fp8_scratch": buf8(Nout, 4096).data_ptr(),
@@ -309,18 +411,29 @@ class _GrootN17FP8BackboneMixin:
                   "out": [t.data_ptr() for t in ds_out]},
             weights=dsw, scales_dev=ds_scales,
             dims={"Nin": Sv, "Din": 1024, "Nout": Nout, "Dmid": 4096, "Dout": 2048})
+        P.deepstack_merge_forward(gemm=gemm, fvk=fvkm, **plan["ds"])
 
         # DeepStack inject buffers (S, D) — zero except visual positions.
         mask = self._visual_pos_masks
         inject = [0] * 16
+        inject_bufs = []
         for j in range(3):
             ib = K(torch.zeros(Se, 2048, dtype=_FP16, device=dev))
             ib[mask] = ds_out[j]
             inject[j] = ib.data_ptr()
+            inject_bufs.append(ib)
+        plan["inject_bufs"] = inject_bufs
+        plan["ds_out"] = ds_out
+        plan["mask"] = mask
 
         # ═══ LLM (16L, causal, GQA) ═══
         llm_h = buf(Se, 2048)
         llm_h.copy_(aux["llm_input_embeds"].to(dev).half().reshape(Se, 2048))
+        if getattr(self, "_own_visual_merge", False):
+            # vit_h carries the ViT's final hidden states (the pipeline keeps
+            # the residual in place), so the visual rows can be written here
+            # and the bundle only had to supply the text ones.
+            llm_h[mask] = self._merge_visual_tokens(vit_h)
         lw = {k: [] for k in (
             "in_ln_w", "post_ln_w", "q_norm_w", "k_norm_w", "q_w", "k_w",
             "v_w", "o_w", "gate_w", "up_w", "down_w",
@@ -364,19 +477,21 @@ class _GrootN17FP8BackboneMixin:
             "gate_out": buf(Se, 6144).data_ptr(),
             "up_out": buf(Se, 6144).data_ptr(),
             "gu_fp8": buf8(Se, 6144).data_ptr()}
-        P.qwen3vl_llm_forward(
-            gemm=gemm, fvk=fvkm, bufs=llm_bufs, weights=lw, scales_dev=llm_scales,
-            dims={"S": Se, "D": 2048, "NHQ": 16, "NHKV": 8, "HD": 128, "FF": 6144},
-            attn=attn)
+        plan["llm"] = dict(
+            bufs=llm_bufs, weights=lw, scales_dev=llm_scales,
+            dims={"S": Se, "D": 2048, "NHQ": 16, "NHKV": 8, "HD": 128, "FF": 6144})
+        plan["llm_h"] = llm_h
+        P.qwen3vl_llm_forward(gemm=gemm, fvk=fvkm, attn=attn, **plan["llm"])
 
         # ═══ vlln + VL self-attn (4L) ═══
         vlsa_h = buf(Se, 2048)
-        P.vlln_forward(
-            gemm=gemm, fvk=fvkm,
+        plan["vlln"] = dict(
             bufs={"x": llm_h.data_ptr(), "out": vlsa_h.data_ptr()},
             weights={"vlln_w": self._vlln_w.data_ptr(),
                      "vlln_b": self._vlln_b.data_ptr()},
             dims={"S": Se, "D": 2048})
+        plan["vlsa_h"] = vlsa_h
+        P.vlln_forward(gemm=gemm, fvk=fvkm, **plan["vlln"])
         vsw = {k: [] for k in (
             "norm1_w", "norm1_b", "norm3_w", "norm3_b", "q_w", "q_b",
             "k_w", "k_b", "v_w", "v_b", "o_w", "o_b", "fc1_w", "fc1_b",
@@ -407,18 +522,47 @@ class _GrootN17FP8BackboneMixin:
         vlsa_scales = {
             "act_qkv": adv(self._vlsa_act_qkv_dev), "act_o": adv(self._vlsa_act_o_dev),
             "act_fc1": adv(self._vlsa_act_fc1_dev), "act_fc2": adv(self._vlsa_act_fc2_dev)}
-        P.vl_self_attn_forward(
-            gemm=gemm, fvk=fvkm,
+        plan["vlsa"] = dict(
             bufs={"h": vlsa_h.data_ptr(), "xn": buf(Se, 2048).data_ptr(),
                   "xn_fp8": buf8(Se, 2048).data_ptr(),
                   "o_proj_out": buf(Se, 2048).data_ptr(),
                   "fc1_out": buf(Se, 8192).data_ptr(),
                   "fc1_fp8": buf8(Se, 8192).data_ptr()},
             weights=vsw, scales_dev=vlsa_scales,
-            dims={"T": Se, "D": 2048, "NH": 32, "HD": 64, "ff_inner": 8192},
-            attn=attn)
+            dims={"T": Se, "D": 2048, "NH": 32, "HD": 64, "ff_inner": 8192})
+        P.vl_self_attn_forward(gemm=gemm, fvk=fvkm, attn=attn, **plan["vlsa"])
         torch.cuda.synchronize()
         return vlsa_h.unsqueeze(0)
+
+    def _replay_kernel_backbone_fp8(self, aux: dict) -> "torch.Tensor":
+        """Re-run the recorded backbone plan on a new observation.
+
+        Only two things differ between frames: the patch features entering the
+        ViT and the prompt embeddings entering the LLM. Everything else was
+        recorded by ``_run_kernel_backbone_fp8`` on the first pass.
+        """
+        from flash_rt.models.groot_n17 import pipeline_rtx_fp8 as P
+
+        plan = self._kbb_plan
+        gemm, fvkm, attn = plan["gemm"], plan["fvk"], plan["attn"]
+        dev, Sv, Se = self.device, plan["Sv"], plan["Se"]
+
+        plan["vit_h"].copy_(
+            aux["pixel_features"].to(dev).half().reshape(Sv, 1024))
+        P.qwen3vl_vit_forward(gemm=gemm, fvk=fvkm, attn=attn, **plan["vit"])
+        P.deepstack_merge_forward(gemm=gemm, fvk=fvkm, **plan["ds"])
+        mask, ds_out = plan["mask"], plan["ds_out"]
+        for j, ib in enumerate(plan["inject_bufs"]):
+            ib[mask] = ds_out[j]
+        llm_h = plan["llm_h"]
+        llm_h.copy_(aux["llm_input_embeds"].to(dev).half().reshape(Se, 2048))
+        if getattr(self, "_own_visual_merge", False):
+            llm_h[mask] = self._merge_visual_tokens(plan["vit_h"])
+        P.qwen3vl_llm_forward(gemm=gemm, fvk=fvkm, attn=attn, **plan["llm"])
+        P.vlln_forward(gemm=gemm, fvk=fvkm, **plan["vlln"])
+        P.vl_self_attn_forward(gemm=gemm, fvk=fvkm, attn=attn, **plan["vlsa"])
+        torch.cuda.synchronize()
+        return plan["vlsa_h"].unsqueeze(0)
 
 
 class GrootN17TorchFrontendRtxFP8(_GrootN17FP8BackboneMixin, GrootN17TorchFrontendRtx):
