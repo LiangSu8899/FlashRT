@@ -160,6 +160,30 @@ class _GrootN17FP8BackboneMixin:
             warnings.warn(f"set_prompt warmup failed (non-fatal): {e!r}")
         self.latency_records.clear()
 
+    def refresh_observation(self, aux: dict) -> None:
+        """Re-run the backbone for a new observation, keeping everything else.
+
+        ``set_prompt`` builds the prompt-shaped pipeline once — the graphs, the
+        activation scales and the DiT buffers all depend on the token layout,
+        not on pixel values. A control loop hands the policy new camera frames
+        every step at the same layout, so it needs the feature pass alone:
+        this recomputes ``_backbone_features`` in place and leaves the captured
+        DiT graphs untouched.
+
+        Raises if called before ``set_prompt``, and if the new bundle changes
+        the token layout the pipeline was built for (that needs a new frontend).
+        """
+        if not hasattr(self, "_backbone_features"):
+            raise RuntimeError(
+                "refresh_observation() before set_prompt(); the prompt-shaped "
+                "pipeline has not been built yet")
+        se = int(aux["llm_input_embeds"].shape[1])
+        if se != self.Se:
+            raise ValueError(
+                f"refresh_observation() got {se} prompt tokens, the pipeline "
+                f"was built for {self.Se}; construct a new frontend instead")
+        self._backbone_features = self._run_kernel_backbone_fp8(aux).half()
+
     # ── FP8 kernel backbone: ViT → DeepStack → LLM → vlln → VL-self-attn ──
     def _run_kernel_backbone_fp8(self, aux: dict) -> "torch.Tensor":
         import flash_rt.flash_rt_kernels as fvk
