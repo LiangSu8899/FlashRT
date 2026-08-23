@@ -81,8 +81,8 @@ class GrootTorchFrontendThor:
     """GROOT N1.6 inference pipeline on Thor SM110."""
 
     def __init__(self, checkpoint, num_views=2, autotune=3,
-                 embodiment_tag="new_embodiment", use_fp8=False,
-                 image_size=252, parity=True):
+                 embodiment_tag="new_embodiment", use_fp8=True,
+                 image_size=224, parity=False):
         """Initialize GROOT pipeline.
 
         Args:
@@ -94,6 +94,8 @@ class GrootTorchFrontendThor:
                 224 = 16x16 patches (legacy); 252 = 18x18 patches, the
                 GR00T N1.6 training/eval resolution (HF processor chain
                 LetterBoxPad -> 256 -> 0.95 crop -> 252).
+            parity: opt into the HF-native BF16 backbone and DiT. The default
+                keeps the pre-existing fully-kernelized execution path.
         """
         if embodiment_tag not in EMBODIMENT_TAG_TO_INDEX:
             raise ValueError(
@@ -857,29 +859,29 @@ class GrootTorchFrontendThor:
             * (math.log(10000.0) / hd))
         self._dit_tw = w
 
-    @staticmethod
-    def _resolve_eagle_dir() -> pathlib.Path:
+    def _resolve_eagle_dir(self) -> pathlib.Path:
         """Locate the Eagle-Block2A-2B-v2 remote-code directory.
 
-        The HF modules cache stores only .py files (no config.json), so we
-        use modeling_siglip2.py as the marker.
+        Only checkpoint-local code or an explicitly selected checkout is
+        accepted. Selecting a cache directory by sort order is not
+        reproducible when several revisions are installed.
         """
         override = os.environ.get("FLASHRT_N16_EAGLE_DIR")
         if override:
             p = pathlib.Path(override)
-            if (p / "modeling_siglip2.py").exists() or (p / "config.json").exists():
+            if (p / "modeling_siglip2.py").is_file():
                 return p
             raise RuntimeError(
-                f"FLASHRT_N16_EAGLE_DIR={override} has neither "
-                "modeling_siglip2.py nor config.json")
-        cache = pathlib.Path.home() / ".cache/huggingface/modules/transformers_modules"
-        for cand in sorted(cache.glob(
-                "Eagle_hyphen_Block2A_hyphen_2B_hyphen_v2/*/modeling_siglip2.py")):
-            return cand.parent
+                f"FLASHRT_N16_EAGLE_DIR={override} has no modeling_siglip2.py")
+        for candidate in (
+                self._checkpoint_path,
+                self._checkpoint_path / "Eagle-Block2A-2B-v2"):
+            if (candidate / "modeling_siglip2.py").is_file():
+                return candidate
         raise RuntimeError(
-            "Eagle-Block2A-2B-v2 remote code not found. Load the GR00T N1.6 "
-            "model once with transformers (AutoModel.from_pretrained) to "
-            "populate the HF cache, or set FLASHRT_N16_EAGLE_DIR.")
+            "Eagle-Block2A-2B-v2 remote code was not found in the checkpoint. "
+            "Set FLASHRT_N16_EAGLE_DIR to an explicitly pinned checkout; "
+            "FlashRT does not select an arbitrary Hugging Face cache revision.")
 
     def _setup_torch_siglip(self):
         """Parity mode: HF-native Siglip2VisionModel (bf16) from the Eagle
@@ -931,7 +933,7 @@ class GrootTorchFrontendThor:
         (2026-08-14). FLASHRT_N16_FA4=0 forces sdpa; a missing FA4 runtime
         falls back silently. Must run before the encoder graph is captured.
         """
-        if os.environ.get("FLASHRT_N16_FA4", "1") == "0":
+        if os.environ.get("FLASHRT_N16_FA4", "0") != "1":
             return
         try:
             from flash_rt.hardware.thor import fa4_backend
@@ -1010,7 +1012,7 @@ class GrootTorchFrontendThor:
         and the residual stream is updated in place. Weight traffic drops
         2.85 GB -> ~0.8 GB per inference.
         """
-        if os.environ.get("FLASHRT_N16_QWEN3_FP4", "1") != "1":
+        if os.environ.get("FLASHRT_N16_QWEN3_FP4", "0") != "1":
             return
         if getattr(self, "_qwen3_fp4_done", False):
             return
@@ -1177,7 +1179,7 @@ class GrootTorchFrontendThor:
         logger.info("Qwen3 NVFP4 fused-epilogue tier enabled (16 layers)")
 
     def _setup_siglip_fp4(self):
-        """FLASHRT_N16_SIGLIP_FP4 (default on): NVFP4 fused-epilogue encoder.
+        """FLASHRT_N16_SIGLIP_FP4=1: NVFP4 fused-epilogue encoder.
 
         Every layer runs the kernel chain: LN->fp4 producer (affine LayerNorm
         expressed as AdaLN with scale=w-1, shift=b), q/k/v bias GEMMs into
@@ -1188,7 +1190,7 @@ class GrootTorchFrontendThor:
         0.038 (vs 0.023 bf16) — the vision-quality trade is simulation-gated;
         set FLASHRT_N16_SIGLIP_FP4=0 to revert to bf16.
         """
-        if os.environ.get("FLASHRT_N16_SIGLIP_FP4", "1") != "1":
+        if os.environ.get("FLASHRT_N16_SIGLIP_FP4", "0") != "1":
             return
         if getattr(self, "_siglip_fp4_done", False):
             return
@@ -1404,7 +1406,7 @@ class GrootTorchFrontendThor:
         # cos 0.999994 / maxd 0.012 (2026-08-14). Weight tables are static
         # and survive graph re-captures.
         self._dit_use_fp4 = False
-        if os.environ.get("FLASHRT_N16_DIT_FP4", "1") == "1":
+        if os.environ.get("FLASHRT_N16_DIT_FP4", "0") == "1":
             try:
                 import flash_rt.flash_rt_fp4 as _f4
             except ImportError:
@@ -1900,6 +1902,7 @@ class GrootTorchFrontendThor:
         stale_exact = ("_siglip_graph", "_qwen3_graph", "_dit_graph",
                        "_attn", "_vision_features", "_unit_scale",
                        "_qwen3_torch_graph", "_siglip_torch_graph",
+                       "_qwen3_fp4_done", "_siglip_fp4_done",
                        # DiT static buffers/indexes depend on Se/masks and
                        # must be rebuilt on prompt-switch re-capture.
                        "_dit_in_state", "_dit_in_kvt", "_dit_in_kvi",
@@ -1929,11 +1932,6 @@ class GrootTorchFrontendThor:
                 When supplied (e.g. from the serving aux builder, which
                 reproduces HF exactly), these ids are used verbatim.
         """
-        if getattr(self, '_graphs_built', False):
-            raise RuntimeError(
-                "set_prompt() after the pipeline is built is not supported; "
-                "construct a new GrootTorchFrontendThor instance for a new prompt")
-
         # Image special-token ids (fixed for the Eagle vocab).
         self._img_token_id = 151669   # <IMG_CONTEXT>
         self._img_start_id = 151670   # <img>
@@ -1952,7 +1950,6 @@ class GrootTorchFrontendThor:
                     # Local GROOT code Eagle dir
                     str(pathlib.Path(__file__).parent.parent.parent.parent.parent /
                         "GR00T" / "Isaac-GR00T" / "gr00t" / "model" / "modules" / "nvidia" / "Eagle-Block2A-2B-v2"),
-                    "nvidia/Eagle-Block2A-2B-v2",  # HF hub (fallback)
                 ]:
                     try:
                         self._tokenizer = AutoTokenizer.from_pretrained(tok_path, trust_remote_code=True)
@@ -1968,7 +1965,16 @@ class GrootTorchFrontendThor:
             full_ids = text_ids + [self._img_start_id] + [self._img_token_id] * S_img + [self._img_end_id]
             text_count = len(text_ids)
 
+        input_id_values = tuple(full_ids)
+        if getattr(self, '_graphs_built', False):
+            if input_id_values == getattr(self, '_input_id_values', None):
+                self._prompt_text = prompt
+                return
+            logger.info("Prompt changed after graph capture; resetting graph runtime")
+            self.reset_graph_runtime()
+
         self._input_ids = torch.tensor([full_ids], dtype=torch.long, device='cuda')
+        self._input_id_values = input_id_values
         self._text_len = text_count
         self._Se = len(full_ids)
         self._prompt_text = prompt
@@ -2761,8 +2767,9 @@ class GrootTorchFrontendThor:
         ae_concat = torch.empty(T, 2*D, dtype=fp16, device='cuda')
         self._gemm.fp16_nn(actions_fp16.data_ptr(), dit.ae_w1.data_ptr(), a_emb_out.data_ptr(), T, D, dit.action_dim, 0)
         fvk.add_bias_fp16(a_emb_out.data_ptr(), dit.ae_b1.data_ptr(), T, D, 0)
-        fvk.gpu_copy(ae_concat.data_ptr(), a_emb_out.data_ptr(), T*D*2, 0)
-        fvk.gpu_copy(ae_concat.data_ptr()+T*D*2, dit.action_time_embeds[0].data_ptr(), T*D*2, 0)
+        fvk.concat2_bf16(a_emb_out.data_ptr(),
+                         dit.action_time_embeds[0].data_ptr(),
+                         ae_concat.data_ptr(), T, D, D, 0)
         enc_h = torch.empty(T, D, dtype=fp16, device='cuda')
         self._gemm.fp16_nn(ae_concat.data_ptr(), dit.ae_w2.data_ptr(), enc_h.data_ptr(), T, D, 2*D, 0)
         fvk.add_bias_fp16(enc_h.data_ptr(), dit.ae_b2.data_ptr(), T, D, 0)

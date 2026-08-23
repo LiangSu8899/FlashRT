@@ -312,7 +312,9 @@ extern "C" void flash_rt_awq_quant_fp8_static_fp16(
 #include "quantize/bf16_quant_fp8_ncdhw_to_ndhwc.cuh"
 #endif
 #include "quantize/qkv_split_norm_rope_bf16.cuh"
+#ifdef FLASHRT_HAVE_THOR_VLA_KERNELS
 #include "kernels/qk_norm_rope_rotate_half_bf16.cuh"
+#endif
 #include "attention/fmha_dispatch.h"
 #ifdef ENABLE_MOTUS_SAGE2_RAW
 #include "attention/sage2/sage2_attn_raw.cuh"
@@ -1801,6 +1803,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
        py::arg("eps") = 1e-5f, py::arg("stream") = 0);
 #endif  // FLASHRT_ENABLE_CHAMELEON
 
+#ifdef FLASHRT_HAVE_THOR_VLA_KERNELS
     m.def("qk_norm_rope_rotate_half_bf16",
           [](uintptr_t x, uintptr_t w, uintptr_t cos_t, uintptr_t sin_t,
              int S, int NH, int HD, float eps, uintptr_t stream) -> int {
@@ -1810,6 +1813,7 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     }, py::arg("x"), py::arg("w"), py::arg("cos_table"), py::arg("sin_table"),
        py::arg("S"), py::arg("NH"), py::arg("HD"), py::arg("eps") = 1e-6f,
        py::arg("stream") = 0);
+#endif  // FLASHRT_HAVE_THOR_VLA_KERNELS
 
     m.def("gate_mul_residual_fp16",
           [](uintptr_t residual, uintptr_t x, uintptr_t gate,

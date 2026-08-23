@@ -162,7 +162,7 @@ HF 实际行为不同；叠加若干实现 bug。全部修复集中在
 - **FA4（FlashAttention-4 CuTe-DSL，`flash_rt/hardware/thor/fa4_backend.py`）用于
   SigLIP**：SigLIP 本就是 cross-view full attention（648 token 单序列），FA4
   causal=False 为 sdpa 精确替换；encoder graph 10.3→9.0 ms，动作 cos 1.000000。
-  开关 `FLASHRT_N16_FA4`（默认开，缺失自动回退）。
+  开关 `FLASHRT_N16_FA4=1`（显式开启，缺失自动回退）。
 - **FA4 不用于 DiT/Qwen3**：小 seq（51/208）下 FA4 0.042–0.394 ms ≫ sdpa 0.013–0.015 ms。
 - **NVFP4（W4A4 CUTLASS）用于 DiT**：block GEMM 走
   `quantize_fp4_dynamic_sfa_fp16` + `cutlass_fp4_sq_fp16`（per-16 block scale、动态激活
@@ -193,7 +193,7 @@ DiT 链每层仅 8 kernel（无层间逐元素流量）：**DiT 36.6→15.7 ms**
 
 ### 6.5 全 kernel 化三轮（37.5 → 28.5 ms）
 
-- **第一轮 — Qwen3 融合**（`FLASHRT_N16_QWEN3_FP4`，生产已启用）：16 层全部
+- **第一轮 — Qwen3 融合**（`FLASHRT_N16_QWEN3_FP4=1`，显式 fast profile）：16 层全部
   q/k/v/o/gate/up/down 走 W4A4 融合 GEMM（residual 原地更新）。
   - 新写两个 bf16 输入 producer kernel（`csrc/fused_fp4/`，与 torch 两步链 **bit 一致**）：
     `rms_norm_weight_fp4_sfa_bf16`（加权 RMSNorm→fp4 直出）、
@@ -204,7 +204,7 @@ DiT 链每层仅 8 kernel（无层间逐元素流量）：**DiT 36.6→15.7 ms**
   - **fused GQA attention**：torch `enable_gqa` 会退回非融合 math 路径（每层 2 个
     fp16 GEMM + 显式 softmax）；改 `repeat_interleave` 展开 KV 走融合后端：−2.0 ms。
   - Qwen3 12.7→5.0 ms；vs HF cos 0.999986。
-- **第二轮 — SigLIP encoder fp4**（`FLASHRT_N16_SIGLIP_FP4`，默认开）：LN producer
+- **第二轮 — SigLIP encoder fp4**（`FLASHRT_N16_SIGLIP_FP4=1`，显式 fast profile）：LN producer
   用 scale=w−1/shift=b 表达 affine；q/k/v 分离 GEMM 写连续缓冲直喂 FA4；o/ffn 残差进
   epilogue；fc1 N 与 fc2 K 4304→4352 pad（pad 维全零端到端无贡献）。encoder 9.0→6.9 ms。
   全开时动作精度不降（vs HF cos 0.999988）。
@@ -236,7 +236,7 @@ DiT 链每层仅 8 kernel（无层间逐元素流量）：**DiT 36.6→15.7 ms**
 
 ## 7. 最终架构与配置
 
-### 7.1 数据流（parity + 三层 NVFP4 + FA4，生产默认）
+### 7.1 数据流（parity + 三层 NVFP4 + FA4，显式 fast profile）
 
 ```
 obs ──> preprocess（apply_state 直连 + 线程池图像变换）           ~2.8 ms
@@ -253,18 +253,18 @@ obs ──> preprocess（apply_state 直连 + 线程池图像变换）          
 
 | 开关 | 默认 | 作用 |
 |---|---|---|
-| `FLASHRT_N16_DIT_FP4` | 生产开 | DiT NVFP4 融合链 |
-| `FLASHRT_N16_QWEN3_FP4` | 生产开 | Qwen3 NVFP4 融合层（含 fused norm/rope/GQA） |
-| `FLASHRT_N16_SIGLIP_FP4` | 开 | SigLIP encoder fp4 层 |
-| `FLASHRT_N16_FA4` | 开 | SigLIP FA4 注意力（缺失自动回退） |
+| `FLASHRT_N16_DIT_FP4` | 关 | DiT NVFP4 融合链；设为 `1` 开启 |
+| `FLASHRT_N16_QWEN3_FP4` | 关 | Qwen3 NVFP4 融合层（含 fused norm/rope/GQA）；设为 `1` 开启 |
+| `FLASHRT_N16_SIGLIP_FP4` | 关 | SigLIP encoder fp4 层；设为 `1` 开启 |
+| `FLASHRT_N16_FA4` | 关 | SigLIP FA4 注意力；设为 `1` 开启，缺失时回退 |
 | `FLASHRT_N16_DIT_STEPS` | 4 | flow-matching 步数（**生产勿改**，减步伤行为） |
-| `--no-fp8` / `parity` | 生产开 | HF 原生 parity 通路（非 legacy kernel 快路径） |
+| `parity` | 关 | HF 原生 parity 通路（非 legacy kernel 快路径）；直接构造 frontend 时显式开启 |
 
 精度汇总（去归一化动作 vs HF eager）：
 
 | 配置 | cos | maxd |
 |---|---|---|
-| 全开（生产） | 0.999933 | 0.059 |
+| 全开（显式 fast profile） | 0.999933 | 0.059 |
 | Qwen3 fp4 单独 | 0.999986 | 0.023 |
 | DiT fp4 单独 | 0.999995 | 0.012 |
 
