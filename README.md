@@ -8,7 +8,7 @@
 
 <p align="center">
   | <a href="https://arxiv.org/abs/2606.20537"><b>Paper</b></a>
-  | <a href="https://github.com/LiangSu8899/FlashRT-HF-kernels"><b>HF Kernels</b></a>
+  | <a href="https://github.com/flashrt-project/FlashRT-HF-kernels"><b>HF Kernels</b></a>
   | <a href="https://github.com/LiangSu8899/FlashRT-Nexus"><b>Nexus</b></a> |
 </p>
 
@@ -56,7 +56,7 @@ See [Supported Models](#supported-models), [Hardware Support](#hardware-support)
 - **Jul 2026** — **Cosmos3-Edge on Jetson AGX Thor** reaches **6.60x** no-cache AV denoise speedup; its NVFP4 Reasoner decodes text/image/video at **104.3 / 112.6 / 108.7 tok/s**. The earlier **Cosmos3-Nano RTX 5090** path reaches **4.8 s E2E** with FP8 for a 480p, 49-frame, 10-step workload. See [Cosmos3-Edge](docs/cosmos3_edge_thor.md) and [Cosmos3-Nano](docs/cosmos3_video_usage.md).
 - **Jul 2026** — **Native C++ PI0.5** now owns checkpoint loading, preprocessing, graph capture, FP8 calibration, and action postprocessing behind `frt_model_runtime_v1`. [FlashRT Nexus](https://github.com/LiangSu8899/FlashRT-Nexus) adopts that ABI for embedded robot loops, HTTP serving, and execution-state capsules.
 - **Jun 2026** — **Qwen3-VL-8B on RTX 5090** adds an NVFP4 language stack, FP8 ViT, whole-prefill CUDA Graph, image/multi-image/video inputs, **~100 ms** full-resolution TTFT, and **~150 tok/s** decode. At 0.5 MP, TTFT is **~32 ms**. See [Qwen3-VL RTX 5090](docs/qwen3_vl_nvfp4.md).
-- **Jun 2026** — **FlashRT HF Kernels** are published through the Hugging Face Kernel Hub under the `flashrt` namespace. See [source packages](https://github.com/LiangSu8899/FlashRT-HF-kernels) and [huggingface.co/flashrt](https://huggingface.co/flashrt).
+- **Jun 2026** — **FlashRT HF Kernels** are published through the Hugging Face Kernel Hub under the `flashrt` namespace. See [source packages](https://github.com/flashrt-project/FlashRT-HF-kernels) and [huggingface.co/flashrt](https://huggingface.co/flashrt).
 
 <details>
 <summary><strong>More</strong></summary>
@@ -77,6 +77,135 @@ See [Supported Models](#supported-models), [Hardware Support](#hardware-support)
 - **May 2026** — Thanks to [@gugudeshubao](https://github.com/gugudeshubao) for the Pi0.5 Jetson AGX Orin INT8 port, kernels, frame-cache inference, deployment guide, and benchmarks; thanks to [@strayberry](https://github.com/strayberry) for Orin BF16 validation. See [Orin deployment](docs/deployment_orin.md).
 
 </details>
+
+---
+
+## Demos
+
+Each film is one checkpoint executed several ways, side by side on **one wall
+clock**, each pane advancing at the rate it was actually measured at. The GIFs
+below are sped up to fit the page; the [real-time recordings](https://github.com/flashrt-project/FlashRT-assets/tree/main/demo/mp4) and the
+[full walkthrough](https://huggingface.co/spaces/liangsu9988/fast-kernels-are-not-fast-pipelines) play one second per second.
+
+### VLA
+
+**π0.5 on a Jetson AGX Thor.** LIBERO-spatial task 1, one flow-matching sample
+held fixed. Two hosts as their authors ship them, then the same model
+accelerated two ways. Per-decision latency **266.0 / 303.6 → 36.1 → 29.2 ms**,
+3.8 Hz to **34.2 Hz** of policy decisions; the task finishes in **6.0 s**
+instead of 23.5 s, and all four arms complete it.
+
+<img src="https://github.com/flashrt-project/FlashRT-assets/raw/main/demo/gif/thor_pi05.gif" alt="thor_pi05" width="100%">
+
+<sub>2× playback. <a href="https://github.com/flashrt-project/FlashRT-assets/blob/main/demo/mp4/thor_pi05.mp4">Real-time recording</a>.</sub>
+
+<details>
+<summary><strong>More VLA films</strong> — one checkpoint four ways, and the same checkpoint on two hosts</summary>
+
+**π0.5 · RTX 5090 — four ways of executing one checkpoint.** The host as
+shipped, the same host compiled, the same host with structures attached, and
+the hand-written FlashRT pipeline. **107.5 → 58.9 → 25.6 → 21.6 ms**, i.e.
+9.3 → 46.5 Hz. Same task, same initial state in every pane.
+
+<img src="https://github.com/flashrt-project/FlashRT-assets/raw/main/demo/gif/pi05_race.gif" alt="pi05_race" width="100%">
+
+<sub>1.5× playback. <a href="https://github.com/flashrt-project/FlashRT-assets/blob/main/demo/mp4/pi05_race.mp4">Real-time recording</a>.</sub>
+
+**GR00T N1.7 · RTX 5090.** LIBERO-10 task 4, two camera views.
+**44.4 → 25.4 → 17.8 → 15.8 ms**, 22.5 → 63.1 Hz.
+
+<img src="https://github.com/flashrt-project/FlashRT-assets/raw/main/demo/gif/groot_race.gif" alt="groot_race" width="100%">
+
+<sub>3× playback. <a href="https://github.com/flashrt-project/FlashRT-assets/blob/main/demo/mp4/groot_race.mp4">Real-time recording</a>.</sub>
+
+**GR00T N1.7 · Jetson AGX Thor.** The same checkpoint and one flow-matching
+sample shared by all four panes. **109.5 / 154.2 → 28.4 → 28.1 ms** — the
+explicit structure book and the hand-written pipeline land 0.25 ms apart.
+
+<img src="https://github.com/flashrt-project/FlashRT-assets/raw/main/demo/gif/thor_groot.gif" alt="thor_groot" width="100%">
+
+<sub>5× playback. <a href="https://github.com/flashrt-project/FlashRT-assets/blob/main/demo/mp4/thor_groot.mp4">Real-time recording</a>.</sub>
+
+**π0.5 under two independent hosts.** LeRobot **107.5 → 25.6 ms**, OpenPI
+**41.7 → 28.8 ms**. Two hosts that start 2.58× apart end within 12% of each
+other; each is measured against the form its own authors ship.
+
+<img src="https://github.com/flashrt-project/FlashRT-assets/raw/main/demo/gif/pi05_cross.gif" alt="pi05_cross" width="100%">
+
+<sub>1.5× playback. <a href="https://github.com/flashrt-project/FlashRT-assets/blob/main/demo/mp4/pi05_cross.mp4">Real-time recording</a>.</sub>
+
+**GR00T N1.7 under Isaac-GR00T and the LeRobot port.** One NVIDIA checkpoint,
+two hosts: **44.4 → 17.8 ms** and **41.8 → 18.6 ms**. The two hosts agree to a
+cosine of 0.999995 on the one decision both made from a byte-identical
+observation.
+
+<img src="https://github.com/flashrt-project/FlashRT-assets/raw/main/demo/gif/groot_cross.gif" alt="groot_cross" width="100%">
+
+<sub>3× playback. <a href="https://github.com/flashrt-project/FlashRT-assets/blob/main/demo/mp4/groot_cross.mp4">Real-time recording</a>.</sub>
+
+</details>
+
+### VLM
+
+**Qwen3-VL-8B on the unedited `transformers` host.** One image, one prompt,
+greedy. Three arms: the host as shipped, the host compiled with a static cache,
+and the host with structures attached. Decode **65.6 → 82.9 → 145.7 tok/s**,
+**1.76×** over the host's own compiled form; TTFT ~30 ms in all three. 180
+seats, no host edit.
+
+<img src="https://github.com/flashrt-project/FlashRT-assets/raw/main/demo/gif/qwen3vl.gif" alt="qwen3vl" width="100%">
+
+<sub>1× playback. <a href="https://github.com/flashrt-project/FlashRT-assets/blob/main/demo/mp4/qwen3vl.mp4">Real-time recording</a>.</sub>
+
+### LLM
+
+**Qwen3.6-35B-A3B on one 32 GB card.** 67 GB of BF16 weights do not fit;
+`quantize_on_adopt` regrids the expert banks before the model reaches the
+device (22.3 GiB resident) and the model runs. Decode **51.6 → 203.5 → 284.9
+tok/s**, the third pane being the checkpoint's own draft head at 3.43 tokens
+accepted per round — shown on the prompt where it wins, dropped on the one
+where it does not.
+
+<img src="https://github.com/flashrt-project/FlashRT-assets/raw/main/demo/gif/qwen36.gif" alt="qwen36" width="100%">
+
+<sub>1× playback. <a href="https://github.com/flashrt-project/FlashRT-assets/blob/main/demo/mp4/qwen36.mp4">Real-time recording</a>.</sub>
+
+<details>
+<summary><strong>More LLM films</strong> — inside vLLM and SGLang, and under concurrency</summary>
+
+**Inside two serving engines.** Qwen3-8B, single stream, 144 seats bound by a
+hook that fires after the engine loads and before its first trace. vLLM
+**99.1 → 145.3 tok/s**, SGLang **101.2 → 203.0 tok/s**, TTFT falls in both.
+Neither engine is forked: each keeps its scheduler, its memory planner and its
+own graph, and the seats go inside that.
+
+<img src="https://github.com/flashrt-project/FlashRT-assets/raw/main/demo/gif/engines.gif" alt="engines" width="100%">
+
+<sub>1× playback. <a href="https://github.com/flashrt-project/FlashRT-assets/blob/main/demo/mp4/engines.mp4">Real-time recording</a>.</sub>
+
+**The same engine under load.** vLLM on a Jetson AGX Thor at 1, 4, 8 and 16
+concurrent requests. Aggregate throughput **38.4 → 77.4**, **77.5 → 182.8**,
+**98.9 → 245.5**, **211.4 → 302.1 tok/s**.
+
+<img src="https://github.com/flashrt-project/FlashRT-assets/raw/main/demo/gif/thor_concurrency.gif" alt="thor_concurrency" width="100%">
+
+<sub>3.5× playback. <a href="https://github.com/flashrt-project/FlashRT-assets/blob/main/demo/mp4/thor_concurrency.mp4">Real-time recording</a>.</sub>
+
+</details>
+
+### Video
+
+**Wan2.2 TI2V-5B — one clip, four ways of making it.** 480×480, 33 frames, 20
+denoise steps, one prompt and one seed, all four arms in one process against
+one baseline. **6.48 → 5.23 → 2.11 → 1.68 s**; per transformer call
+**162.2 → 41.8 ms**. The third arm runs 4-bit on every call whose own per-step
+score holds the band and hands the rest to FP8 — 171 calls at four bits, 50 at
+eight, decided per call by measurement. Every pane plays its own clip at the
+end.
+
+<img src="https://github.com/flashrt-project/FlashRT-assets/raw/main/demo/gif/wan22.gif" alt="wan22" width="100%">
+
+<sub>1× playback. <a href="https://github.com/flashrt-project/FlashRT-assets/blob/main/demo/mp4/wan22.mp4">Real-time recording</a>.</sub>
 
 ---
 
@@ -336,7 +465,7 @@ First call: ~3 s (calibration + CUDA Graph capture). Every subsequent call: 44 m
 | **Run Wan2.2 TI2V-5B official-pipeline baseline** | [`docs/wan22_usage.md`](docs/wan22_usage.md) |
 | **Run Cosmos3-Edge AV inverse dynamics or Reasoner on Jetson AGX Thor** | [`docs/cosmos3_edge_thor.md`](docs/cosmos3_edge_thor.md) — SM110 build, official AV baseline, optimized denoise, Reasoner text/image/video usage, correctness checks, and benchmarks |
 | **Run Cosmos3-Nano text-to-video on RTX 5090** | [`docs/cosmos3_video_usage.md`](docs/cosmos3_video_usage.md) — SM120 build, BF16/FP8 denoise, quality metrics, and benchmark workflow |
-| **Use FlashRT kernels through Hugging Face Kernel Hub** | [`LiangSu8899/FlashRT-HF-kernels`](https://github.com/LiangSu8899/FlashRT-HF-kernels) · [`huggingface.co/flashrt`](https://huggingface.co/flashrt) |
+| **Use FlashRT kernels through Hugging Face Kernel Hub** | [`flashrt-project/FlashRT-HF-kernels`](https://github.com/flashrt-project/FlashRT-HF-kernels) · [`huggingface.co/flashrt`](https://huggingface.co/flashrt) |
 | **Deploy the Python-free PI0.5 C++ pipeline** | [`docs/pi05_native_cpp.md`](docs/pi05_native_cpp.md) — build, configure, calibrate, and execute · [`docs/pi05_native_calibration.md`](docs/pi05_native_calibration.md) — FP8 artifacts · [`docs/model_runtime_api.md`](docs/model_runtime_api.md) — stable C ABI |
 | **Integrate FlashRT with Nexus** | [`FlashRT-Nexus`](https://github.com/LiangSu8899/FlashRT-Nexus) — embedded and HTTP deployment over `frt_model_runtime_v1` · [`docs/runtime_contract.md`](docs/runtime_contract.md) — FlashRT-side contract |
 | **Run VLA inference asynchronously** | [`docs/vlash.md`](docs/vlash.md) — projected-state VLASh · [`docs/rtc_temporal_fusion.md`](docs/rtc_temporal_fusion.md) — overlapping chunk fusion · [`docs/rtc_lite_design.md`](docs/rtc_lite_design.md) — legacy chunk runner |
@@ -1074,7 +1203,7 @@ Expected: `P50: ~44 ms (23 Hz)` on Thor.
 - **Qwen3.6-27B NVFP4** — [Qwen3.6 usage](docs/qwen36_nvfp4.md), [parameter reference](docs/qwen36_usage.md), [serving](serving/qwen36_agent/README.md)
 - **Qwen3-8B NVFP4** — [Qwen3-8B usage](docs/qwen3_8b_nvfp4.md), [OpenAI server example](examples/qwen3_openai_server.py)
 - **BAGEL world-model path** — research preview; see [kernel catalog](docs/kernel_catalog.md) and [adding a model](docs/adding_new_model.md)
-- **Reusable HF kernel packages** — [LiangSu8899/FlashRT-HF-kernels](https://github.com/LiangSu8899/FlashRT-HF-kernels), [huggingface.co/flashrt](https://huggingface.co/flashrt)
+- **Reusable HF kernel packages** — [flashrt-project/FlashRT-HF-kernels](https://github.com/flashrt-project/FlashRT-HF-kernels), [huggingface.co/flashrt](https://huggingface.co/flashrt)
 
 ---
 
