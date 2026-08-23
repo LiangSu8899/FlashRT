@@ -106,6 +106,14 @@ class GrootTorchFrontendThor:
         self._num_views = num_views
         self._autotune = autotune
         self.use_fp8 = bool(use_fp8)
+        if parity and self.use_fp8:
+            raise ValueError(
+                "parity=True requires use_fp8=False; mixing the FP8 backbone "
+                "with the HF-native DiT is not a supported precision profile")
+        if parity and image_size != 252:
+            raise ValueError(
+                "parity=True requires image_size=252 to match the GR00T "
+                "N1.6 evaluation preprocessing contract")
         # Working dtype of the vision/LLM feature path: FP8 mode keeps the
         # legacy fp16 buffers; parity mode stays bf16 end-to-end to match HF.
         self._bd = (torch.float16 if (self.use_fp8 or not parity)
@@ -3230,12 +3238,13 @@ class GrootTorchFrontendThor:
 
         # Extract bf16 action-head weights for the HF-faithful torch DiT
         # path (must happen while _full_sd is alive).
-        self._setup_torch_dit()
-        if not self.use_fp8 and not hasattr(self, "_torch_qwen3"):
+        if self.parity:
+            self._setup_torch_dit()
+        if self.parity and not hasattr(self, "_torch_qwen3"):
             self._setup_torch_qwen3()
-        if not self.use_fp8:
+        if self.parity:
             self._setup_qwen3_fp4()
-        if not self.use_fp8 and not hasattr(self, "_torch_siglip"):
+        if self.parity and not hasattr(self, "_torch_siglip"):
             self._setup_torch_siglip()
             # Static NaFlex window meta (shapes fixed per image_size):
             # needed by the capture-time eager encoder run before 6c.

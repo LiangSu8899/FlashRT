@@ -38,6 +38,8 @@ def test_n16_new_precision_tiers_are_opt_in():
 
     assert 'embodiment_tag="new_embodiment", use_fp8=True,' in source
     assert "image_size=224, parity=False" in source
+    assert "parity=True requires use_fp8=False" in source
+    assert "parity=True requires image_size=252" in source
     for name in (
         "FLASHRT_N16_FA4",
         "FLASHRT_N16_QWEN3_FP4",
@@ -45,6 +47,12 @@ def test_n16_new_precision_tiers_are_opt_in():
         "FLASHRT_N16_DIT_FP4",
     ):
         assert f'os.environ.get("{name}", "0")' in source
+
+    capture_start = source.index("    def _capture_all_graphs(")
+    capture = source[capture_start:]
+    assert "if self.parity:\n            self._setup_torch_dit()" in capture
+    assert 'if self.parity and not hasattr(self, "_torch_qwen3")' in capture
+    assert 'if self.parity and not hasattr(self, "_torch_siglip")' in capture
 
 
 def test_prompt_switch_and_calibration_follow_runtime_layout_contracts():
