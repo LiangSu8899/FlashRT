@@ -34,42 +34,48 @@ Existing inference tooling is shaped for different workloads — TensorRT for ta
 - **PyTorch and JAX frontends** share one kernel binary, equivalent results (cosine ≥ 0.999)
 - **Plugin model registration** — add a new VLA via one frontend file + a declarative `WEIGHT_SPEC`, no fork required
 - **LIBERO benchmark integration** out of the box; ~6 minutes from `git clone` to first inference
+- **FlashRT Structures** — attach the kernel catalog onto an **unmodified** PyTorch host, no fork and no edit to its source; works on `lerobot`, Isaac-GR00T, `openpi`, `transformers`, `diffusers`, and inside vLLM / SGLang
+
+```python
+from flash_rt import structures
+
+plan = structures.attach(model, forward)   # discover → calibrate → gate → activate
+print(structures.explain(plan))            # bound / routed / kept-at-host / refused, with reasons
+
+loop = structures.decode_loop(model, max_len=4096)      # serving door
+out  = loop.generate(input_ids, max_new_tokens=256)
+```
+
+Structures: [reference](docs/structures.md) · [explicit pipeline examples](examples/structure_pipeline/README.md) · [walkthrough with films](https://huggingface.co/spaces/liangsu9988/fast-kernels-are-not-fast-pipelines)
 
 See [Supported Models](#supported-models), [Hardware Support](#hardware-support), and [Benchmark](#benchmark) for the current map.
 
 ## News
 
-<details open>
-<summary><strong>July 2026</strong> - Cosmos3, native C++, async runtimes, and multimodal pipelines</summary>
-
-- **Cosmos3-Edge on Jetson AGX Thor** reaches **6.60x** no-cache AV denoise speedup; its NVFP4 Reasoner decodes text/image/video at **104.3 / 112.6 / 108.7 tok/s**. The earlier **Cosmos3-Nano RTX 5090** path reaches **4.8 s E2E** with FP8 for a 480p, 49-frame, 10-step workload. See [Cosmos3-Edge](docs/cosmos3_edge_thor.md) and [Cosmos3-Nano](docs/cosmos3_video_usage.md).
-- **Native C++ PI0.5** now owns checkpoint loading, preprocessing, graph capture, FP8 calibration, and action postprocessing behind `frt_model_runtime_v1`. [FlashRT Nexus](https://github.com/LiangSu8899/FlashRT-Nexus) adopts that ABI for embedded robot loops, HTTP serving, and execution-state capsules.
-- Thanks to [@chenping9999](https://github.com/chenping9999) for the [MiniMax-Remover FP8/NVFP4 pipeline](docs/minimax_remover_usage.md), including fused transformer and VAE kernels.
-- Thanks to [@diantoudedianshan](https://github.com/diantoudedianshan) for [RTC temporal fusion](docs/rtc_temporal_fusion.md) and the [VLASh projected-state asynchronous runner](docs/vlash.md).
-- Thanks to [@heiheiha798](https://github.com/heiheiha798) for Qwen3-VL SM89 FP8 decode optimization for 8B/2B, bounded graph caches, and GROOT N1.7 SM89 graph fixes. See [Qwen3-VL SM89](docs/qwen3_vl_fp8_sm89.md).
-- Thanks to [@strayberry](https://github.com/strayberry) for the Qwen3-VL Jetson Orin BF16 frontend.
-</details>
+- **Aug 2026** — **FlashRT Structures** ships: the kernel catalog attaches to an *unmodified* PyTorch host — `lerobot`, Isaac-GR00T, `openpi`, `transformers`, `diffusers`, and inside vLLM / SGLang — with no fork and no edit to the host. Measured on VLA, VLM, LLM and video models across RTX 5090 and Jetson AGX Thor. See [Structures](docs/structures.md), [explicit pipeline examples](examples/structure_pipeline/README.md), and the [walkthrough with films](https://huggingface.co/spaces/liangsu9988/fast-kernels-are-not-fast-pipelines).
+- **Jul 2026** — **Cosmos3-Edge on Jetson AGX Thor** reaches **6.60x** no-cache AV denoise speedup; its NVFP4 Reasoner decodes text/image/video at **104.3 / 112.6 / 108.7 tok/s**. The earlier **Cosmos3-Nano RTX 5090** path reaches **4.8 s E2E** with FP8 for a 480p, 49-frame, 10-step workload. See [Cosmos3-Edge](docs/cosmos3_edge_thor.md) and [Cosmos3-Nano](docs/cosmos3_video_usage.md).
+- **Jul 2026** — **Native C++ PI0.5** now owns checkpoint loading, preprocessing, graph capture, FP8 calibration, and action postprocessing behind `frt_model_runtime_v1`. [FlashRT Nexus](https://github.com/LiangSu8899/FlashRT-Nexus) adopts that ABI for embedded robot loops, HTTP serving, and execution-state capsules.
+- **Jun 2026** — **Qwen3-VL-8B on RTX 5090** adds an NVFP4 language stack, FP8 ViT, whole-prefill CUDA Graph, image/multi-image/video inputs, **~100 ms** full-resolution TTFT, and **~150 tok/s** decode. At 0.5 MP, TTFT is **~32 ms**. See [Qwen3-VL RTX 5090](docs/qwen3_vl_nvfp4.md).
+- **Jun 2026** — **FlashRT HF Kernels** are published through the Hugging Face Kernel Hub under the `flashrt` namespace. See [source packages](https://github.com/LiangSu8899/FlashRT-HF-kernels) and [huggingface.co/flashrt](https://huggingface.co/flashrt).
 
 <details>
-<summary><strong>June 2026</strong> - Qwen3-VL, audio, HF Kernels, and expanded hardware validation</summary>
+<summary><strong>More</strong></summary>
 
-- **Qwen3-VL-8B on RTX 5090** adds an NVFP4 language stack, FP8 ViT, whole-prefill CUDA Graph, image/multi-image/video inputs, **~100 ms** full-resolution TTFT, and **~150 tok/s** decode. At 0.5 MP, TTFT is **~32 ms**. See [Qwen3-VL RTX 5090](docs/qwen3_vl_nvfp4.md).
-- **Higgs Audio v3 TTS-4B** adds a kernelized FP8/BF16 decode path, streaming-friendly generation, and FastAPI serving. See [usage](docs/higgs_audio_v3.md#3-quickstart), [performance](docs/higgs_audio_v3.md#performance), and [serving](serving/higgs_audio_agent/README.md).
-- **FlashRT HF Kernels** are published through the Hugging Face Kernel Hub under the `flashrt` namespace. See [source packages](https://github.com/LiangSu8899/FlashRT-HF-kernels) and [huggingface.co/flashrt](https://huggingface.co/flashrt).
-- Thanks to [@shideqin](https://github.com/shideqin) for the OmniVoice BF16/FP4 acceleration backend, Python pipeline, quickstart, and serving agent. See [OmniVoice serving](serving/omnivoice_agent/README.md).
-- Thanks to [@xym808](https://github.com/xym808) for the [MelBandRoformer FP8 audio source-separation pipeline](docs/melband_roformer_usage.md), measured at **3.1x** over PyTorch on RTX 5060 Ti.
-- Thanks to [@heiheiha798](https://github.com/heiheiha798) for validated GROOT N1.7 SM89 routing, Pi0.5 JAX FP4 validation on Thor, and deployment build isolation.
-- The native `serving/` and runtime contracts were introduced for OpenAI-compatible LLM/audio hosts and robot execution-state hosts. See [serving](serving/README.md), [runtime architecture](docs/architecture.md), and [model-runtime API](docs/model_runtime_api.md).
-</details>
+- **Jul 2026** — Thanks to [@chenping9999](https://github.com/chenping9999) for the [MiniMax-Remover FP8/NVFP4 pipeline](docs/minimax_remover_usage.md), including fused transformer and VAE kernels.
+- **Jul 2026** — Thanks to [@diantoudedianshan](https://github.com/diantoudedianshan) for [RTC temporal fusion](docs/rtc_temporal_fusion.md) and the [VLASh projected-state asynchronous runner](docs/vlash.md).
+- **Jul 2026** — Thanks to [@heiheiha798](https://github.com/heiheiha798) for Qwen3-VL SM89 FP8 decode optimization for 8B/2B, bounded graph caches, and GROOT N1.7 SM89 graph fixes. See [Qwen3-VL SM89](docs/qwen3_vl_fp8_sm89.md).
+- **Jul 2026** — Thanks to [@strayberry](https://github.com/strayberry) for the Qwen3-VL Jetson Orin BF16 frontend.
+- **Jun 2026** — **Higgs Audio v3 TTS-4B** adds a kernelized FP8/BF16 decode path, streaming-friendly generation, and FastAPI serving. See [usage](docs/higgs_audio_v3.md#3-quickstart), [performance](docs/higgs_audio_v3.md#performance), and [serving](serving/higgs_audio_agent/README.md).
+- **Jun 2026** — The native `serving/` and runtime contracts were introduced for OpenAI-compatible LLM/audio hosts and robot execution-state hosts. See [serving](serving/README.md), [runtime architecture](docs/architecture.md), and [model-runtime API](docs/model_runtime_api.md).
+- **Jun 2026** — Thanks to [@shideqin](https://github.com/shideqin) for the OmniVoice BF16/FP4 acceleration backend, Python pipeline, quickstart, and serving agent. See [OmniVoice serving](serving/omnivoice_agent/README.md).
+- **Jun 2026** — Thanks to [@xym808](https://github.com/xym808) for the [MelBandRoformer FP8 audio source-separation pipeline](docs/melband_roformer_usage.md), measured at **3.1x** over PyTorch on RTX 5060 Ti.
+- **Jun 2026** — Thanks to [@heiheiha798](https://github.com/heiheiha798) for validated GROOT N1.7 SM89 routing, Pi0.5 JAX FP4 validation on Thor, and deployment build isolation.
+- **May 2026** — **Qwen3.6-27B NVFP4** supports 256 K context on one RTX 5090, OpenAI-compatible serving, FP8-KV long-context verify, and **145 tok/s** warm decode at 256 K. See [Qwen3.6 NVFP4](docs/qwen36_nvfp4.md).
+- **May 2026** — **Qwen3-8B NVFP4** text serving reaches **9.1 ms TTFT at P=64** and **150 tok/s** warm decode on RTX 5090. See [Qwen3-8B NVFP4](docs/qwen3_8b_nvfp4.md).
+- **May 2026** — **Wan2.2 TI2V-5B**, **LingBot-VLA**, and the **Motus RTX beta** were added. See [Wan2.2](docs/wan22_usage.md), [LingBot](docs/lingbot_usage.md), and [Motus](docs/motus_usage_beta.md).
+- **May 2026** — Thanks to [@cuihengrui35](https://github.com/cuihengrui35) for RTX 5060 Ti Pi0.5 results (**41.4 ms / ~24 Hz**, LIBERO Spatial **344/350**) and [@wangerforcs](https://github.com/wangerforcs) for NVIDIA L40 results (**26.6 ms / 38 Hz**).
+- **May 2026** — Thanks to [@gugudeshubao](https://github.com/gugudeshubao) for the Pi0.5 Jetson AGX Orin INT8 port, kernels, frame-cache inference, deployment guide, and benchmarks; thanks to [@strayberry](https://github.com/strayberry) for Orin BF16 validation. See [Orin deployment](docs/deployment_orin.md).
 
-<details>
-<summary><strong>May 2026</strong> - LLM serving, video policies, and community hardware ports</summary>
-
-- **Qwen3.6-27B NVFP4** supports 256 K context on one RTX 5090, OpenAI-compatible serving, FP8-KV long-context verify, and **145 tok/s** warm decode at 256 K. See [Qwen3.6 NVFP4](docs/qwen36_nvfp4.md).
-- **Qwen3-8B NVFP4** text serving reaches **9.1 ms TTFT at P=64** and **150 tok/s** warm decode on RTX 5090. See [Qwen3-8B NVFP4](docs/qwen3_8b_nvfp4.md).
-- **Wan2.2 TI2V-5B**, **LingBot-VLA**, and the **Motus RTX beta** were added. See [Wan2.2](docs/wan22_usage.md), [LingBot](docs/lingbot_usage.md), and [Motus](docs/motus_usage_beta.md).
-- Thanks to [@cuihengrui35](https://github.com/cuihengrui35) for RTX 5060 Ti Pi0.5 results (**41.4 ms / ~24 Hz**, LIBERO Spatial **344/350**) and [@wangerforcs](https://github.com/wangerforcs) for NVIDIA L40 results (**26.6 ms / 38 Hz**).
-- Thanks to [@gugudeshubao](https://github.com/gugudeshubao) for the Pi0.5 Jetson AGX Orin INT8 port, kernels, frame-cache inference, deployment guide, and benchmarks; thanks to [@strayberry](https://github.com/strayberry) for Orin BF16 validation. See [Orin deployment](docs/deployment_orin.md).
 </details>
 
 ---
@@ -1044,122 +1050,6 @@ python examples/quickstart.py \
 ```
 
 Expected: `P50: ~44 ms (23 Hz)` on Thor.
-
----
-
-## Architecture
-
-FlashRT is layered so that **framework-specific IO** (safetensors / Orbax),
-**declarative weight loading**, **framework-agnostic compute** (pointer-only
-pipelines), and **hardware-dispatched attention kernels** each live in their
-own module. Adding a new model touches at most one file per layer; adding a
-new GPU target touches only `hardware/`.
-
-```
-flash_rt/
-├── api.py                     ← Public API: load_model() + VLAModel.predict()
-│
-├── hardware/                  ← Hardware-dispatch + attention protocol
-│   ├── __init__.py            ←   detect_arch() + _PIPELINE_MAP
-│   ├── backend.py             ←   AttentionBackend protocol + SiteSpec
-│   ├── thor/                  ←   Thor SM110 (Jetson AGX Thor)
-│   │   ├── attn_backend.py        ← ThorFlashAttnBackend (Pi0.5/Pi0)
-│   │   ├── attn_backend_groot.py  ← ThorGrootAttnBackend (GROOT Qwen3+DiT)
-│   │   └── shared_primitives.py   ← SigLIP/Encoder/Decoder primitives + calibrate
-│   └── rtx/                   ←   RTX SM120/SM89 (RTX 5090 / 4090)
-│
-├── executors/                 ← Declarative WEIGHT_SPEC framework (stage 7)
-│   ├── weight_loader.py       ←   Item / LayerBlock / ModelWeightSpec + runner
-│   ├── torch_weights.py       ←   SafetensorsSource + FusedQKV/FusedGateUp
-│   └── jax_weights.py         ←   OrbaxDictSource + CudaBufferFlat
-│
-├── models/                    ← Framework-agnostic pipeline forwards
-│   ├── pi05/pipeline.py       ←   Pi0.5 RTX pipeline class
-│   ├── pi0/pipeline.py        ←   Pi0 decoder_forward (Thor+RTX)
-│   ├── pi0fast/pipeline.py    ←   Pi0-FAST prefill + AR decode (runtime fork)
-│   └── groot/                 ←   GROOT DiT + embodiments
-│       ├── pipeline.py            ← RTX GROOT
-│       ├── pipeline_thor.py       ← Thor GROOT (CKernelQwen3, CKernelDiTHead)
-│       └── embodiments.py         ← per-embodiment state/action heads
-│
-├── frontends/                 ← Per-framework weight loading + CUDA Graph + infer
-│   ├── torch/
-│   │   ├── pi05_thor.py       ←   Pi0.5 Thor (PyTorch + safetensors)
-│   │   ├── pi0_thor.py        ←   Pi0 Thor
-│   │   ├── groot_thor.py      ←   GROOT Thor
-│   │   ├── pi0fast.py         ←   Pi0-FAST (Thor+RTX runtime fork)
-│   │   ├── pi05.py, groot.py  ←   RTX variants
-│   │   └── _*_thor_spec.py    ←   Declarative WEIGHT_SPEC per model
-│   └── jax/
-│       ├── pi05_thor.py       ←   Pi0.5 Thor (JAX + Orbax)
-│       ├── pi0_thor.py        ←   Pi0 Thor
-│       ├── pi0fast.py         ←   Pi0-FAST
-│       └── _*_thor_spec.py    ←   Declarative WEIGHT_SPEC per model
-│
-├── core/                      ← Shared infrastructure
-│   ├── cuda_buffer.py         ←   CudaBuffer (cudaMalloc wrapper, JAX bridge)
-│   ├── cuda_graph.py          ←   CUDA Graph capture helpers
-│   ├── thor_frontend_utils.py ←   quant_fp8, interleave_qk, embed_prompt
-│   ├── quant/calibrator.py    ←   FP8 calibration cache (save/load)
-│   └── weights/               ←   loader.py, weight_cache, transformer
-│
-├── flash_rt/configs/         ← Per-model YAML configs (pi05.yaml, etc.)
-└── flash_rt_kernels.*.so     ← 93 CUDA kernels (pybind11 — built from csrc/)
-
-csrc/                       ← C++/CUDA source (compiled once, .so kept in repo)
-├── kernels/                ← norm, activation, rope, quantize, fusion
-├── gemm/                   ← cuBLASLt FP8 + CUTLASS FP8 helpers
-├── attention/              ← CUTLASS FMHA (strided, per-view)
-└── bindings.cpp            ← pybind11 → flash_rt_kernels.so
-
-docs/                       ← Documentation
-├── stable_api.md           ← Public API + naming convention
-├── adding_new_model.md     ← End-to-end guide for adapting a new VLA model
-├── calibration.md          ← FP8 weight/activation scale mechanics
-├── kernel_fusion.md        ← 93 kernel reference + fusion patterns
-├── optimization-details.md ← Pi0.5 44ms vs Myelin 70ms breakdown
-└── plugin_model_template.md ← External-plugin model registration
-
-tests/                      ← Precision + unit tests
-├── test_all_models_precision.py   ← End-to-end cos + P50 sweep (4 models)
-├── test_weight_loader.py           ← WEIGHT_SPEC protocols + composites
-├── test_thor_attn_backend.py       ← Pi0.5/Pi0 AttentionBackend contract
-├── test_thor_groot_attn_backend.py ← GROOT AttentionBackend contract
-└── test_pi0fast_precision.py       ← Pi0-FAST AR decode precision
-
-examples/
-├── quickstart.py           ← 3-line usage demo
-└── thor/eval_libero.py     ← LIBERO benchmark
-```
-
-### Key Design Principles
-
-1. **Pipeline forward receives only int pointers** — no torch, no jax, no
-   framework imports. Safe for CUDA Graph capture.
-2. **Weight loading is declarative** — each model exports a
-   `ModelWeightSpec` (composition of `LayerBlock`s + `Item`s). The
-   `WeightLoader` runner executes it over a framework-specific source
-   (safetensors for torch, Orbax `engine_w` dict for jax). Adding a new
-   Paligemma-family model is a ~60-line spec file plus optional composites.
-3. **Attention is protocolized** — `AttentionBackend.run(site=..., layer_idx=..., ...)`
-   dispatches across `fmha_strided_full` (SigLIP),
-   `attention_qkv_fp16` (GQA), `attention_qkv_fp16_state_masked`
-   (Pi0-style), and `attention_mha_fp16` (GROOT) without model code
-   knowing which kernel fires.
-4. **Hardware-dispatched via `_PIPELINE_MAP`** — `(config, framework, arch)
-   → (module, class)` is the single source of truth for which frontend
-   loads on Thor SM110 vs RTX SM120 vs RTX SM89. External plugins can
-   mutate the map at import time (see
-   [`docs/plugin_model_template.md`](docs/plugin_model_template.md)).
-5. **Calibration framework-agnostic + cached** — FP8 activation scales
-   are computed once per `(checkpoint, seq_len)` pair, cached to
-   `~/.flash_rt/calibration/`, then baked as host-scalar alphas
-   (`act_scale × weight_scale`) into every CUDA Graph capture. See
-   [`docs/calibration.md`](docs/calibration.md).
-6. **CUDA Graph captures the entire forward** — Python loop unrolled at
-   capture time, zero overhead at replay. All intermediate buffers must
-   be pre-allocated in `_load_weights`; no dynamic allocation inside
-   forward (see [`docs/kernel_fusion.md`](docs/kernel_fusion.md) §6).
 
 ---
 
