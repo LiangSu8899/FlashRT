@@ -44,4 +44,4 @@ internal-tests/
 internal-docs/
 notes/
 third_party/cutlass
-*.pt
+/artifacts/omega_e0m3/*.pt

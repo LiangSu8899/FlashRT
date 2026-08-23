@@ -33,12 +33,16 @@ Usage:
   python tools/check_omega_e0m3_layer.py \
       --pack packs_hf/pi05_long/quantized.pt --mode kernel \
       --layer paligemma_with_expert.gemma_expert.model.layers.0.mlp.down_proj
+  python tools/check_omega_e0m3_layer.py \
+      --pack /tmp/fixture_pack.pt --artifact /tmp/fixture_e0m3.pt \
+      --mode kernel --min-artifact-cos 0.98
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
+from collections.abc import Mapping
 
 import torch
 
@@ -58,6 +62,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", default="",
                    help="torch device for reference/emulation math "
                         "(default: cuda in kernel mode, cpu in emulate mode)")
+    p.add_argument("--artifact",
+                   help="converted omega_e0m3_v1 artifact; in kernel mode, "
+                        "use its packed/SFB weight directly instead of re-quantizing")
+    p.add_argument("--min-artifact-cos", type=float, default=0.98,
+                   help="minimum artifact-vs-fp16 global cosine (default: 0.98)")
     return p.parse_args()
 
 
@@ -162,13 +171,84 @@ def e0m3_kernel_gemm(a_fp16: torch.Tensor, b_fp16: torch.Tensor,
     return d
 
 
+def validate_artifact(artifact: Mapping, layer: str, n: int, k: int,
+                      fvk_fp4) -> tuple[Mapping, Mapping]:
+    if not isinstance(artifact, Mapping) or artifact.get("format") != "omega_e0m3_v1":
+        raise ValueError("artifact format must be 'omega_e0m3_v1'")
+    if artifact.get("schema_version") != 1:
+        raise ValueError(
+            f"artifact schema_version must be 1, got {artifact.get('schema_version')!r}")
+    weights = artifact.get("weights")
+    aux = artifact.get("aux")
+    if not isinstance(weights, Mapping) or not isinstance(aux, Mapping):
+        raise ValueError("artifact weights and aux must be mappings")
+    selected = artifact.get("selected_layers")
+    count = artifact.get("selected_record_count")
+    if not isinstance(selected, list) or count != len(selected):
+        raise ValueError("artifact selected layer metadata is inconsistent")
+    if set(selected) != set(weights) or set(selected) != set(aux):
+        raise ValueError("artifact weights/aux do not cover every selected layer")
+    if layer not in weights or layer not in aux:
+        raise ValueError(f"artifact does not contain layer {layer!r}")
+    entry = weights[layer]
+    aux_entry = aux[layer]
+    if not isinstance(entry, Mapping) or not isinstance(aux_entry, Mapping):
+        raise ValueError(f"artifact layer {layer!r} entries must be mappings")
+    if entry.get("N") != n or entry.get("K") != k:
+        raise ValueError(
+            f"artifact layer shape mismatch: expected N={n}, K={k}, got "
+            f"N={entry.get('N')!r}, K={entry.get('K')!r}")
+    packed = entry.get("packed")
+    sfb = entry.get("sfb")
+    if not isinstance(packed, torch.Tensor) or packed.dtype != torch.uint8 \
+            or tuple(packed.shape) != (n, k // 2):
+        raise ValueError(
+            f"artifact packed must be uint8 shape ({n},{k // 2})")
+    expected_sfb = fvk_fp4.sfa_size_bytes(n, k, True)
+    if not isinstance(sfb, torch.Tensor) or sfb.dtype != torch.uint8 \
+            or sfb.numel() != expected_sfb:
+        raise ValueError(
+            f"artifact sfb must be uint8 with {expected_sfb} bytes")
+    fold = artifact.get("fold")
+    if fold not in {"none", "mean", "actnorm"} or aux_entry.get("fold") != fold:
+        raise ValueError("artifact fold metadata is missing or inconsistent")
+    return entry, aux_entry
+
+
+def e0m3_artifact_gemm(a_fp16: torch.Tensor, entry: Mapping,
+                       fvk_fp4, *, alpha: float = 1.0) -> torch.Tensor:
+    """Quantize A, then consume artifact packed/SFB without re-quantizing B."""
+    a_fp16 = a_fp16.contiguous()
+    m, k = a_fp16.shape
+    n = int(entry["N"])
+    a_packed = torch.empty(m, k // 2, dtype=torch.uint8, device="cuda")
+    a_sfa = torch.zeros(fvk_fp4.sfa_size_bytes(m, k, False),
+                        dtype=torch.uint8, device="cuda")
+    rc = fvk_fp4.quantize_e0m3_dynamic_sfa_fp16(
+        a_fp16.data_ptr(), a_packed.data_ptr(), a_sfa.data_ptr(),
+        m, k, False, 0)
+    if rc != 0:
+        raise RuntimeError(f"A quantize failed rc={rc}")
+    b_packed = entry["packed"].to(device="cuda", non_blocking=False).contiguous()
+    b_sfb = entry["sfb"].to(device="cuda", non_blocking=False).contiguous()
+    d = torch.empty(m, n, dtype=torch.float16, device="cuda")
+    rc = fvk_fp4.cutlass_fp4_gemm_e0m3w(
+        a_packed.data_ptr(), a_sfa.data_ptr(),
+        b_packed.data_ptr(), b_sfb.data_ptr(), d.data_ptr(),
+        m, n, k, alpha, 0.0, 0, 0)
+    if rc != 0:
+        raise RuntimeError(f"artifact cutlass_fp4_gemm_e0m3w failed rc={rc:#x}")
+    torch.cuda.synchronize()
+    return d
+
+
 # ────────────────────────────────────────────────────────────────────
 def cosine_stats(a: torch.Tensor, b: torch.Tensor) -> tuple:
     """(global cos, per-row cos mean, per-row cos min), fp32 inputs."""
     a = a.float()
     b = b.float()
-    glob = torch.dot(a.flatten(), b.flatten()) / (
-        a.norm() * b.norm()).item()
+    glob = (torch.dot(a.flatten(), b.flatten()) / (
+        a.norm() * b.norm())).item()
     per = torch.nn.functional.cosine_similarity(a, b, dim=-1)
     return glob, per.mean().item(), per.min().item()
 
@@ -181,6 +261,9 @@ def report(tag: str, a: torch.Tensor, b: torch.Tensor) -> None:
 
 def main() -> int:
     args = parse_args()
+    if args.artifact and args.mode != "kernel":
+        print("error: --artifact requires --mode kernel", file=sys.stderr)
+        return 2
     pack = torch.load(args.pack, map_location="cpu", weights_only=True)
     if args.layer not in pack:
         print(f"error: layer '{args.layer}' not in pack", file=sys.stderr)
@@ -243,6 +326,40 @@ def main() -> int:
             print("error: flash_rt_fp4 not importable — run on Thor",
                   file=sys.stderr)
             return 2
+        if args.artifact:
+            artifact = torch.load(
+                args.artifact, map_location="cpu", weights_only=True)
+            try:
+                entry, aux_entry = validate_artifact(
+                    artifact, args.layer, out_f, in_f, fvk_fp4)
+            except ValueError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 2
+            fold = artifact["fold"]
+            if fold == "none":
+                artifact_input, alpha = x2, 1.0
+            elif fold == "mean":
+                artifact_input, alpha = (x2.float() / s_t).half(), 1.0
+            else:
+                static = aux_entry.get("act_scale_static")
+                alpha = aux_entry.get("act_out_scale")
+                if not isinstance(static, torch.Tensor) \
+                        or tuple(static.shape) != (in_f,) or not isinstance(alpha, float):
+                    print("error: invalid actnorm metadata", file=sys.stderr)
+                    return 2
+                artifact_input = (x2.float() / static.to(x2.device)).half()
+            y_artifact = e0m3_artifact_gemm(
+                artifact_input, entry, fvk_fp4, alpha=alpha).float()
+            artifact_cos = cosine_stats(y_artifact, y_fp)[0]
+            print("\nconverted artifact round-trip:")
+            report(f"artifact ({fold}) vs omega", y_artifact, y_omega)
+            report(f"artifact ({fold}) vs fp", y_artifact, y_fp)
+            if artifact_cos < args.min_artifact_cos:
+                print(
+                    f"error: artifact cosine {artifact_cos:.6f} is below "
+                    f"{args.min_artifact_cos:.6f}", file=sys.stderr)
+                return 1
+            return 0
         y_s0 = e0m3_kernel_gemm(x2, w.half(), fvk_fp4).float()
         y_s1 = e0m3_kernel_gemm((x2.float() / s_t).half(),
                                 (w * s_mean).half(), fvk_fp4).float()

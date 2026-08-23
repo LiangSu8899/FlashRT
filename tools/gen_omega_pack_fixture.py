@@ -7,8 +7,8 @@ real 4.8GB Omega-QVLA pack:
     python tools/gen_omega_pack_fixture.py --out /tmp/fixture_pack.pt
     python tools/convert_omega_pack_e0m3.py --pack /tmp/fixture_pack.pt \
         --out /tmp/fixture_e0m3.pt --fold none --keep-fp16        # Thor
-    python tools/check_omega_e0m3_consumer.py --reference fp16 \
-        --artifact /tmp/fixture_e0m3.pt
+    python tools/check_omega_e0m3_layer.py --pack /tmp/fixture_pack.pt \
+        --artifact /tmp/fixture_e0m3.pt --mode kernel             # Thor
 
 Design notes (what makes the fixture a real test and not a toy):
 
