@@ -91,7 +91,8 @@ bool ggml_cuda_flashrt_should_fuse_vis_qkv_pad(
 void ggml_cuda_flashrt_vis_qkv_pad(ggml_backend_cuda_context & ctx,
         const ggml_tensor * mm_q, const ggml_tensor * add_q, ggml_tensor * pad_q,
         const ggml_tensor * mm_k, const ggml_tensor * add_k, ggml_tensor * pad_k,
-        const ggml_tensor * mm_v, const ggml_tensor * add_v, ggml_tensor * pad_v);
+        const ggml_tensor * mm_v, const ggml_tensor * add_v, ggml_tensor * pad_v,
+        ggml_tensor * k_cast, ggml_tensor * v_cast);
 
 // GEMM + optional bias + residual add fused into one epilogue.
 bool ggml_cuda_flashrt_should_fuse_mm_res(const ggml_tensor * mm, const ggml_tensor * bias_add,

@@ -8,6 +8,7 @@
 // (GGML_CUDA_FLASHRT_PUBLIC_DIR); no vendored copies.
 #include "gemm/fp4/cutlass_fp4_gemm_geglu_il_sm100.cuh"
 #include "gemm/fp4/cutlass_fp4_gemm_siglip_ffn_f32out_sm100.cuh"
+#include "gemm/fp4/cutlass_fp4_gemm_bias_f32b_f16out_sm100.cuh"
 
 #include <mutex>
 #include <unordered_map>
@@ -1157,7 +1158,8 @@ bool ggml_cuda_flashrt_should_fuse_vis_qkv_pad(
 void ggml_cuda_flashrt_vis_qkv_pad(ggml_backend_cuda_context & ctx,
         const ggml_tensor * mm_q, const ggml_tensor * add_q, ggml_tensor * pad_q,
         const ggml_tensor * mm_k, const ggml_tensor * add_k, ggml_tensor * pad_k,
-        const ggml_tensor * mm_v, const ggml_tensor * add_v, ggml_tensor * pad_v) {
+        const ggml_tensor * mm_v, const ggml_tensor * add_v, ggml_tensor * pad_v,
+        ggml_tensor * k_cast, ggml_tensor * v_cast) {
     cudaStream_t stream = ctx.stream();
 
     const ggml_tensor * src1 = mm_q->src[1];
@@ -1185,17 +1187,26 @@ void ggml_cuda_flashrt_vis_qkv_pad(ggml_backend_cuda_context & ctx,
         q_sf     = a_sf.get();
     }
 
-    const ggml_tensor * legs[3][3] = {
-        { mm_q, add_q, pad_q },
-        { mm_k, add_k, pad_k },
-        { mm_v, add_v, pad_v },
+    // K/V may go straight to their f16 cast tensors (single rounding from
+    // the fp32 accumulator, bitwise equal to f32-out + cast); Q stays f32.
+    const ggml_tensor * legs[3][4] = {
+        { mm_q, add_q, pad_q, nullptr },
+        { mm_k, add_k, pad_k, k_cast },
+        { mm_v, add_v, pad_v, v_cast },
     };
     for (auto & leg : legs) {
         const grouppad_weight * w = get_repacked_grouppad(
             leg[0]->src[0], leg[1]->src[1], group_in, group_out, n_groups, stream);
-        const int rc = flash_rt::fp4::gemm_bias_f32out(
-            q_packed, q_sf, w->packed, w->sf, w->bias,
-            (float *) leg[2]->data, M, N_pad, K, stream);
+        int rc;
+        if (leg[3] != nullptr) {
+            rc = flash_rt::fp4::gemm_bias_f16out(
+                q_packed, q_sf, w->packed, w->sf, w->bias,
+                leg[3]->data, M, N_pad, K, stream);
+        } else {
+            rc = flash_rt::fp4::gemm_bias_f32out(
+                q_packed, q_sf, w->packed, w->sf, w->bias,
+                (float *) leg[2]->data, M, N_pad, K, stream);
+        }
         if (rc != 0) {
             GGML_ABORT("flashrt: vis qkv padded gemm failed (M=%d N=%d K=%d rc=%d)", M, N_pad, K, rc);
         }
