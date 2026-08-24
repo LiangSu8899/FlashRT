@@ -89,6 +89,16 @@ int repack_weight_concat3(const void * b0, int N0, const void * b1, int N1,
 
 // Fused QKV post: RoPE+f16-store K, f16-store V (into the persistent KV
 // suffix), RoPE+scale Q (f32 out) from the fused GEMM's [M, Nk+Nv+Nq] rows.
+// Variant with optional f32 K/V row outputs (for graphs whose rope'd K / V
+// feed additional consumers, e.g. persistent-KV stores at the graph tail).
+int qkv_post_full(const float * qkv_cat, float * q_out, void * k_out_f16, void * v_out_f16,
+                  float * k_f32_out, float * v_f32_out,
+                  const int32_t * pos, const float * freq_factors,
+                  int M, int Nk, int Nv, int Nq, int head_dim, int n_dims,
+                  float freq_scale, float ext_factor, float attn_factor,
+                  float corr_low, float corr_high, float theta_scale, float q_scale,
+                  cudaStream_t stream);
+
 int qkv_post(const float * qkv_cat, float * q_out, void * k_out_f16, void * v_out_f16,
              const int32_t * pos, const float * freq_factors,
              int M, int Nk, int Nv, int Nq, int head_dim, int n_dims,

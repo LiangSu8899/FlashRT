@@ -104,6 +104,20 @@ bool ggml_cuda_flashrt_should_fuse_gated_res(const ggml_tensor * view, const ggm
 void ggml_cuda_flashrt_gated_residual(ggml_backend_cuda_context & ctx, const ggml_tensor * view,
                                       const ggml_tensor * mul, ggml_tensor * add);
 
+// Prefill fused QKV window: q mm->reshape->rope->scale, k mm->reshape->rope->
+// pad, v mm->reshape->pad, each pad permuted+copied into a padded f16 tensor
+// of token rows. One fused GEMM + qkv_post + pad-row zeroing.
+bool ggml_cuda_flashrt_should_fuse_qkv_prefill(
+        const ggml_tensor * q_mm, const ggml_tensor * q_rope, const ggml_tensor * q_scale,
+        const ggml_tensor * k_mm, const ggml_tensor * k_rope, const ggml_tensor * k_pad,
+        const ggml_tensor * v_mm, const ggml_tensor * v_pad,
+        const ggml_tensor * k_cpy, const ggml_tensor * v_cpy);
+void ggml_cuda_flashrt_qkv_prefill(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * q_mm, const ggml_tensor * q_rope, ggml_tensor * q_scale,
+        const ggml_tensor * k_mm, const ggml_tensor * k_rope,
+        const ggml_tensor * v_mm,
+        ggml_tensor * k_cpy, ggml_tensor * v_cpy);
+
 // {RMS_NORM, MUL(w), ADD(mul, norm)} -> rms_norm(x)*(1+w) in one kernel.
 // The execute returns false (run unfused) only when its zero-vector cache
 // cannot allocate during graph capture.

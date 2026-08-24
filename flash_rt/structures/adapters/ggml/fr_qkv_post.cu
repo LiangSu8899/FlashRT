@@ -42,6 +42,8 @@ __global__ void kernel_qkv_post(const float * __restrict__ qkv,   // [M, Nk+Nv+N
                                 float * __restrict__ q_out,       // [M, Nq] f32 (head-major rows)
                                 __half * __restrict__ k_out,      // suffix rows, head_dim per token
                                 __half * __restrict__ v_out,
+                                float * __restrict__ k_f32_out,   // nullable: rope'd K as f32 rows
+                                float * __restrict__ v_f32_out,   // nullable: V as f32 rows
                                 const int32_t * __restrict__ pos,
                                 const float * __restrict__ freq_factors, // nullable
                                 int Nk, int Nv, int Nq,
@@ -57,9 +59,12 @@ __global__ void kernel_qkv_post(const float * __restrict__ qkv,   // [M, Nk+Nv+N
 
     const int p = pos[t];
 
-    // V: plain f16 copy
+    // V: plain f16 copy (and optionally the f32 row for downstream readers)
     for (int d = threadIdx.x; d < Nv; d += blockDim.x) {
         v_out[(int64_t) t * Nv + d] = __float2half(vrow[d]);
+        if (v_f32_out != nullptr) {
+            v_f32_out[(int64_t) t * Nv + d] = vrow[d];
+        }
     }
 
     // K: rope one head (Nk == head_dim)
@@ -68,6 +73,10 @@ __global__ void kernel_qkv_post(const float * __restrict__ qkv,   // [M, Nk+Nv+N
         if (i0 >= n_dims) {
             k_out[(int64_t) t * Nk + n_dims + (i0 - n_dims)]     = __float2half(krow[n_dims + (i0 - n_dims)]);
             k_out[(int64_t) t * Nk + n_dims + (i0 - n_dims) + 1] = __float2half(krow[n_dims + (i0 - n_dims) + 1]);
+            if (k_f32_out != nullptr) {
+                k_f32_out[(int64_t) t * Nk + n_dims + (i0 - n_dims)]     = krow[n_dims + (i0 - n_dims)];
+                k_f32_out[(int64_t) t * Nk + n_dims + (i0 - n_dims) + 1] = krow[n_dims + (i0 - n_dims) + 1];
+            }
             continue;
         }
         const float theta_base  = p * powf(theta_scale, i0 / 2.0f);
@@ -77,8 +86,14 @@ __global__ void kernel_qkv_post(const float * __restrict__ qkv,   // [M, Nk+Nv+N
                       i0, ext_factor, attn_factor, cos_t, sin_t);
         const float x0 = krow[i0 / 2];
         const float x1 = krow[i0 / 2 + n_dims / 2];
-        k_out[(int64_t) t * Nk + i0 / 2]              = __float2half(x0 * cos_t - x1 * sin_t);
-        k_out[(int64_t) t * Nk + i0 / 2 + n_dims / 2] = __float2half(x0 * sin_t + x1 * cos_t);
+        const float k0 = x0 * cos_t - x1 * sin_t;
+        const float k1 = x0 * sin_t + x1 * cos_t;
+        k_out[(int64_t) t * Nk + i0 / 2]              = __float2half(k0);
+        k_out[(int64_t) t * Nk + i0 / 2 + n_dims / 2] = __float2half(k1);
+        if (k_f32_out != nullptr) {
+            k_f32_out[(int64_t) t * Nk + i0 / 2]              = k0;
+            k_f32_out[(int64_t) t * Nk + i0 / 2 + n_dims / 2] = k1;
+        }
     }
 
     // Q: rope + scale per head
@@ -107,19 +122,33 @@ __global__ void kernel_qkv_post(const float * __restrict__ qkv,   // [M, Nk+Nv+N
 
 } // namespace
 
+int qkv_post_full(const float * qkv_cat, float * q_out, void * k_out_f16, void * v_out_f16,
+                  float * k_f32_out, float * v_f32_out,
+                  const int32_t * pos, const float * freq_factors,
+                  int M, int Nk, int Nv, int Nq, int head_dim, int n_dims,
+                  float freq_scale, float ext_factor, float attn_factor,
+                  float corr_low, float corr_high, float theta_scale, float q_scale,
+                  cudaStream_t stream) {
+    if (n_dims % 2 != 0 || Nk != head_dim || Nq % head_dim != 0) return -1;
+    kernel_qkv_post<<<M, 256, 0, stream>>>(
+        qkv_cat, q_out, (__half *) k_out_f16, (__half *) v_out_f16,
+        k_f32_out, v_f32_out,
+        pos, freq_factors, Nk, Nv, Nq, head_dim, n_dims,
+        freq_scale, ext_factor, attn_factor, corr_low, corr_high, theta_scale, q_scale);
+    const cudaError_t e = cudaGetLastError();
+    return (e == cudaSuccess) ? 0 : -static_cast<int>(e);
+}
+
 int qkv_post(const float * qkv_cat, float * q_out, void * k_out_f16, void * v_out_f16,
              const int32_t * pos, const float * freq_factors,
              int M, int Nk, int Nv, int Nq, int head_dim, int n_dims,
              float freq_scale, float ext_factor, float attn_factor,
              float corr_low, float corr_high, float theta_scale, float q_scale,
              cudaStream_t stream) {
-    if (n_dims % 2 != 0 || Nk != head_dim || Nq % head_dim != 0) return -1;
-    kernel_qkv_post<<<M, 256, 0, stream>>>(
-        qkv_cat, q_out, (__half *) k_out_f16, (__half *) v_out_f16,
-        pos, freq_factors, Nk, Nv, Nq, head_dim, n_dims,
-        freq_scale, ext_factor, attn_factor, corr_low, corr_high, theta_scale, q_scale);
-    const cudaError_t e = cudaGetLastError();
-    return (e == cudaSuccess) ? 0 : -static_cast<int>(e);
+    return qkv_post_full(qkv_cat, q_out, k_out_f16, v_out_f16, nullptr, nullptr,
+                         pos, freq_factors, M, Nk, Nv, Nq, head_dim, n_dims,
+                         freq_scale, ext_factor, attn_factor, corr_low, corr_high,
+                         theta_scale, q_scale, stream);
 }
 
 } // namespace ggml_cuda_flashrt

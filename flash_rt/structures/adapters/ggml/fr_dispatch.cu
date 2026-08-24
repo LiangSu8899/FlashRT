@@ -1309,6 +1309,166 @@ bool ggml_cuda_flashrt_mm_res(ggml_backend_cuda_context & ctx, const ggml_tensor
     return true;
 }
 
+// ── Prefill fused QKV: {q mm→reshape→rope→scale, k mm→reshape→rope→pad,
+//    v mm→reshape→pad, permute→cpy ×2} ─────────────────────────────────────
+// Same fused GEMM + qkv_post as the decode window, but K/V land in per-eval
+// padded f16 tensors (token rows of head_dim, KV length padded to the FA KQ
+// stride) instead of the persistent KV suffix; the pad rows are zeroed to
+// match the graph's PAD semantics (the FA mask multiplies them out, but
+// garbage f16 there would poison the softmax with inf/nan).
+bool ggml_cuda_flashrt_should_fuse_qkv_prefill(
+        const ggml_tensor * q_mm, const ggml_tensor * q_rope, const ggml_tensor * q_scale,
+        const ggml_tensor * k_mm, const ggml_tensor * k_rope, const ggml_tensor * k_pad,
+        const ggml_tensor * v_mm, const ggml_tensor * v_pad,
+        const ggml_tensor * k_cpy, const ggml_tensor * v_cpy) {
+    static const bool disabled = getenv("GGML_FLASHRT_NO_QKV_PREFILL") != nullptr;
+    if (disabled) {
+        return false;
+    }
+    const ggml_tensor * src1 = q_mm->src[1];
+    if (k_mm->src[1] != src1 || v_mm->src[1] != src1) {
+        return false;
+    }
+    const ggml_tensor * wq = q_mm->src[0];
+    const ggml_tensor * wk = k_mm->src[0];
+    const ggml_tensor * wv = v_mm->src[0];
+    if (!ggml_cuda_flashrt_should_use(wq, src1, q_mm) ||
+        !ggml_cuda_flashrt_should_use(wk, src1, k_mm) ||
+        !ggml_cuda_flashrt_should_use(wv, src1, v_mm) ||
+        wk->ne[0] != wv->ne[0] || wk->ne[0] != wq->ne[0]) {
+        return false;
+    }
+    const int64_t head_dim = wk->ne[1];
+    if (wv->ne[1] != head_dim || wq->ne[1] % head_dim != 0) {
+        return false;
+    }
+    // Q: mm -> reshape [hd, n_head, M] -> rope -> scale (contiguous f32 out)
+    if (q_rope->src[0]->op != GGML_OP_RESHAPE || q_rope->src[0]->src[0] != q_mm ||
+        q_rope->src[0]->ne[0] != head_dim ||
+        q_scale->src[0] != q_rope || !ggml_is_contiguous(q_scale) ||
+        q_scale->type != GGML_TYPE_F32) {
+        return false;
+    }
+    // K: mm -> reshape [hd, 1, M] -> rope -> pad along the token dim
+    if (k_rope->src[0]->op != GGML_OP_RESHAPE || k_rope->src[0]->src[0] != k_mm ||
+        k_rope->src[0]->ne[0] != head_dim || k_rope->src[0]->ne[1] != 1) {
+        return false;
+    }
+    const int64_t M   = k_rope->src[0]->ne[2];
+    const int64_t kvp = k_pad->ne[2];
+    if (k_pad->src[0] != k_rope || k_pad->ne[0] != head_dim || k_pad->ne[1] != 1 ||
+        kvp < M) {
+        return false;
+    }
+    // V: mm -> reshape -> pad, same geometry
+    if (v_pad->src[0] == nullptr || v_pad->src[0]->op != GGML_OP_RESHAPE ||
+        v_pad->src[0]->src[0] != v_mm || v_pad->src[0]->ne[0] != head_dim ||
+        v_pad->src[0]->ne[1] != 1 || v_pad->src[0]->ne[2] != M ||
+        v_pad->ne[0] != head_dim || v_pad->ne[1] != 1 || v_pad->ne[2] != kvp) {
+        return false;
+    }
+    // both copies materialize [hd, kvp] f16 token rows
+    for (const ggml_tensor * cpy : { k_cpy, v_cpy }) {
+        if (cpy->type != GGML_TYPE_F16 || !ggml_is_contiguous(cpy) ||
+            cpy->ne[0] != head_dim || cpy->ne[1] != kvp || cpy->ne[2] != 1 ||
+            cpy->nb[1] != head_dim * sizeof(uint16_t)) {
+            return false;
+        }
+    }
+    // ropes share positions, freq factors and parameters; NEOX math only
+    if (k_rope->src[1] != q_rope->src[1] || k_rope->src[2] != q_rope->src[2] ||
+        memcmp(k_rope->op_params, q_rope->op_params, sizeof(k_rope->op_params)) != 0) {
+        return false;
+    }
+    const int mode = ((const int32_t *) k_rope->op_params)[2];
+    if (mode != GGML_ROPE_TYPE_NEOX) {
+        return false;
+    }
+    return true;
+}
+
+void ggml_cuda_flashrt_qkv_prefill(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * q_mm, const ggml_tensor * q_rope, ggml_tensor * q_scale,
+        const ggml_tensor * k_mm, const ggml_tensor * k_rope,
+        const ggml_tensor * v_mm,
+        ggml_tensor * k_cpy, ggml_tensor * v_cpy) {
+    const ggml_tensor * src1 = q_mm->src[1];
+    const ggml_tensor * wq = q_mm->src[0];
+    const ggml_tensor * wk = k_mm->src[0];
+    const ggml_tensor * wv = v_mm->src[0];
+
+    const int K  = (int) wk->ne[0];
+    const int Nk = (int) wk->ne[1];
+    const int Nv = (int) wv->ne[1];
+    const int Nq = (int) wq->ne[1];
+    const int M  = (int) ggml_nrows(src1);
+    const int head_dim = Nk;
+    const int kvp = (int) k_cpy->ne[1];
+
+    cudaStream_t stream = ctx.stream();
+
+    const repacked_weight * w = get_repacked_qkv(wk, wv, wq, stream);
+
+    const void * q_packed = nullptr;
+    const void * q_sf     = nullptr;
+    ggml_cuda_pool_alloc<uint8_t> a_packed(ctx.pool());
+    ggml_cuda_pool_alloc<uint8_t> a_sf    (ctx.pool());
+    int rc = 0;
+    if (!get_quantized_act(src1, M, K, &q_packed, &q_sf, stream)) {
+        a_packed.alloc(ggml_cuda_flashrt::packed_bytes(M, K));
+        a_sf.alloc(ggml_cuda_flashrt::sf_bytes(M, K));
+        rc = ggml_cuda_flashrt::quantize_act_f32((const float *) src1->data, a_packed.get(), a_sf.get(), M, K, stream);
+        q_packed = a_packed.get();
+        q_sf     = a_sf.get();
+    }
+
+    const int N_tot = Nk + Nv + Nq;
+    ggml_cuda_pool_alloc<float> qkv_cat(ctx.pool(), (int64_t) M * N_tot);
+
+    if (rc == 0) {
+        rc = ggml_cuda_flashrt::gemm_f32out(q_packed, q_sf, w->packed, w->sf,
+                                            qkv_cat.get(), M, N_tot, K, 1.0f, false, stream);
+    }
+    if (rc == 0 && kvp > M) {
+        // zero the pad rows once per eval; qkv_post then fills rows [0, M)
+        const size_t row_bytes = (size_t) head_dim * sizeof(uint16_t);
+        cudaMemsetAsync((char *) k_cpy->data + (size_t) M * row_bytes, 0, (size_t) (kvp - M) * row_bytes, stream);
+        cudaMemsetAsync((char *) v_cpy->data + (size_t) M * row_bytes, 0, (size_t) (kvp - M) * row_bytes, stream);
+    }
+    if (rc == 0) {
+        const int32_t * op = (const int32_t *) k_rope->op_params;
+        const int   n_dims     = op[1];
+        const int   n_ctx_orig = op[4];
+        float freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow;
+        memcpy(&freq_base,   op +  5, sizeof(float));
+        memcpy(&freq_scale,  op +  6, sizeof(float));
+        memcpy(&ext_factor,  op +  7, sizeof(float));
+        memcpy(&attn_factor, op +  8, sizeof(float));
+        memcpy(&beta_fast,   op +  9, sizeof(float));
+        memcpy(&beta_slow,   op + 10, sizeof(float));
+        float corr_dims[2];
+        ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, corr_dims);
+        const float theta_scale = powf(freq_base, -2.0f / n_dims);
+        const float scale_f = ggml_get_op_params_f32(q_scale, 0);
+
+        const ggml_tensor * ff = k_rope->src[2];
+        // the rope'd K and plain V rows also land in their graph tensors'
+        // f32 buffers, feeding the graph-tail persistent-KV store copies
+        rc = ggml_cuda_flashrt::qkv_post_full(
+            qkv_cat.get(), (float *) q_scale->data,
+            k_cpy->data, v_cpy->data,
+            (float *) k_rope->data, (float *) v_mm->data,
+            (const int32_t *) k_rope->src[1]->data,
+            ff != nullptr ? (const float *) ff->data : nullptr,
+            M, Nk, Nv, Nq, head_dim, n_dims,
+            freq_scale, ext_factor, attn_factor,
+            corr_dims[0], corr_dims[1], theta_scale, scale_f, stream);
+    }
+    if (rc != 0) {
+        GGML_ABORT("flashrt: fused prefill qkv failed (M=%d N=%d K=%d rc=%d)", M, N_tot, K, rc);
+    }
+}
+
 // ── Gemma-style norm fold: {RMS_NORM, MUL(w), ADD(mul, norm)} ────────────────
 // out = rms_norm(x)*w + rms_norm(x) == rms_norm(x)*(1 + w): the adaLN
 // modulate kernel with scale = w and shift = 0. ggml's own fused rms_norm
