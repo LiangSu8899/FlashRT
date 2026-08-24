@@ -21,3 +21,12 @@ Layout:
 
 Host-side integration (fuse-hook call sites, graph construction changes,
 build wiring) lives in the host tree and points its build at this directory.
+
+Qualification (`qualification/`): the pipeline binding
+`bindings/jetson_pi_edge_pi05.yaml` maps the host's hot path onto catalog
+structures under the complete-hot-path contract, and
+`qualification/run_qualification.py` gates it — manifest validation and
+structure-version pins offline, plus an opt-in on-device gate comparing the
+steady-state action chunk against a stored golden (exact by default; the
+adapter is bitwise deterministic across processes after warmup). A catalog
+version bump or any numeric change in the fused windows turns a gate red.
