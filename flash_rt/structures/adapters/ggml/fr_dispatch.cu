@@ -1309,6 +1309,63 @@ bool ggml_cuda_flashrt_mm_res(ggml_backend_cuda_context & ctx, const ggml_tensor
     return true;
 }
 
+// ── Gemma-style norm fold: {RMS_NORM, MUL(w), ADD(mul, norm)} ────────────────
+// out = rms_norm(x)*w + rms_norm(x) == rms_norm(x)*(1 + w): the adaLN
+// modulate kernel with scale = w and shift = 0. ggml's own fused rms_norm
+// cannot express this form (the add operand is the norm output itself, which
+// no longer exists once the chain is fused), so it never fires on it.
+bool ggml_cuda_flashrt_should_fuse_rms_gemma(const ggml_tensor * rms, const ggml_tensor * mul,
+                                             const ggml_tensor * add) {
+    static const bool disabled = getenv("GGML_FLASHRT_NO_RMS_GEMMA") != nullptr;
+    if (disabled) {
+        return false;
+    }
+    const ggml_tensor * x = rms->src[0];
+    if (rms->type != GGML_TYPE_F32 || x == nullptr || x->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(rms) || !ggml_is_contiguous(x) || rms->ne[3] != 1) {
+        return false;
+    }
+    if (mul->src[0] != rms) {
+        return false;
+    }
+    const ggml_tensor * w = mul->src[1];
+    if (w == nullptr || w->type != GGML_TYPE_F32 || !ggml_is_contiguous(w) ||
+        w->ne[0] != rms->ne[0] || ggml_nrows(w) != 1) {
+        return false;
+    }
+    if (!((add->src[0] == mul && add->src[1] == rms) ||
+          (add->src[0] == rms && add->src[1] == mul))) {
+        return false;
+    }
+    if (add->type != GGML_TYPE_F32 || !ggml_is_contiguous(add) ||
+        !ggml_are_same_shape(add, rms)) {
+        return false;
+    }
+    return true;
+}
+
+bool ggml_cuda_flashrt_rms_gemma(ggml_backend_cuda_context & ctx, const ggml_tensor * rms,
+                                 const ggml_tensor * mul, ggml_tensor * add) {
+    const ggml_tensor * x = rms->src[0];
+    const int M = (int) ggml_nrows(x);
+    const int C = (int) x->ne[0];
+    float eps;
+    memcpy(&eps, rms->op_params, sizeof(float));
+    cudaStream_t stream = ctx.stream();
+
+    const void * zeros = get_zero_bias(C, stream);
+    if (zeros == nullptr) {
+        return false; // zero-vector alloc during capture: run unfused
+    }
+    const int rc = ggml_cuda_flashrt::ada_rms_mod((const float *) x->data, (const float *) mul->src[1]->data,
+                               (const float *) zeros, (float *) add->data, M, C, eps,
+                               /*with_rms=*/true, stream);
+    if (rc != 0) {
+        GGML_ABORT("flashrt: rms_gemma fused kernel failed (M=%d C=%d rc=%d)", M, C, rc);
+    }
+    return true;
+}
+
 void ggml_cuda_flashrt_begin_eval() {
     g_eval_id++;
 }

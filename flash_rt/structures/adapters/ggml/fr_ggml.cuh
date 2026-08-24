@@ -103,3 +103,11 @@ bool ggml_cuda_flashrt_should_fuse_gated_res(const ggml_tensor * view, const ggm
                                              const ggml_tensor * mul, const ggml_tensor * add);
 void ggml_cuda_flashrt_gated_residual(ggml_backend_cuda_context & ctx, const ggml_tensor * view,
                                       const ggml_tensor * mul, ggml_tensor * add);
+
+// {RMS_NORM, MUL(w), ADD(mul, norm)} -> rms_norm(x)*(1+w) in one kernel.
+// The execute returns false (run unfused) only when its zero-vector cache
+// cannot allocate during graph capture.
+bool ggml_cuda_flashrt_should_fuse_rms_gemma(const ggml_tensor * rms, const ggml_tensor * mul,
+                                             const ggml_tensor * add);
+bool ggml_cuda_flashrt_rms_gemma(ggml_backend_cuda_context & ctx, const ggml_tensor * rms,
+                                 const ggml_tensor * mul, ggml_tensor * add);
