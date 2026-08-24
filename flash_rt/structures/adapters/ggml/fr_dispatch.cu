@@ -1480,6 +1480,94 @@ void ggml_cuda_flashrt_qkv_prefill(ggml_backend_cuda_context & ctx,
     }
 }
 
+// ── Decomposed tiny-M decode attention ──────────────────────────────────────
+// FLASH_ATTN_EXT with q_tokens <= 16, single f16 KV head of token rows, an
+// f16 mask and no ALiBi/softcap runs as QK-GEMM + masked softmax + PV-GEMM
+// (see fr_decode_attn.cu). Faster than the stream-k fattn + fixup pair at
+// these shapes.
+bool ggml_cuda_flashrt_should_fuse_dec_attn(const ggml_tensor * fa) {
+    static const bool disabled = getenv("GGML_FLASHRT_NO_DEC_ATTN") != nullptr;
+    if (disabled) {
+        return false;
+    }
+    const ggml_tensor * q    = fa->src[0];
+    const ggml_tensor * k    = fa->src[1];
+    const ggml_tensor * v    = fa->src[2];
+    const ggml_tensor * mask = fa->src[3];
+    if (q == nullptr || k == nullptr || v == nullptr || mask == nullptr ||
+        fa->src[4] != nullptr) {  // no attention sinks
+        return false;
+    }
+    const int64_t hd     = q->ne[0];
+    const int64_t n_tok  = q->ne[1];
+    const int64_t n_head = q->ne[2];
+    const int64_t n_kv   = k->ne[1];
+    if (q->type != GGML_TYPE_F32 || n_tok > 16 || q->ne[3] != 1 ||
+        hd % 2 != 0 || n_head < 1) {
+        return false;
+    }
+    for (const ggml_tensor * kv : { k, v }) {
+        if (kv->type != GGML_TYPE_F16 || kv->ne[0] != hd || kv->ne[2] != 1 ||
+            kv->ne[3] != 1 || kv->nb[0] != sizeof(uint16_t) ||
+            (int64_t) kv->nb[1] != hd * (int64_t) sizeof(uint16_t)) {
+            return false;
+        }
+    }
+    if (v->ne[1] != n_kv) {
+        return false;
+    }
+    if (mask->type != GGML_TYPE_F16 || mask->ne[0] < n_kv || mask->ne[1] < n_tok) {
+        return false;
+    }
+    if (fa->type != GGML_TYPE_F32 || fa->ne[0] != hd || fa->ne[1] != n_head ||
+        fa->ne[2] != n_tok || fa->nb[0] != sizeof(float) ||
+        (int64_t) fa->nb[1] != hd * (int64_t) sizeof(float)) {
+        return false;
+    }
+    float max_bias, softcap;
+    memcpy(&max_bias, (const float *) fa->op_params + 1, sizeof(float));
+    memcpy(&softcap,  (const float *) fa->op_params + 2, sizeof(float));
+    if (max_bias != 0.0f || softcap != 0.0f) {
+        return false;
+    }
+    return true;
+}
+
+void ggml_cuda_flashrt_dec_attn(ggml_backend_cuda_context & ctx, ggml_tensor * fa) {
+    const ggml_tensor * q    = fa->src[0];
+    const ggml_tensor * k    = fa->src[1];
+    const ggml_tensor * v    = fa->src[2];
+    const ggml_tensor * mask = fa->src[3];
+    const int hd     = (int) q->ne[0];
+    const int n_tok  = (int) q->ne[1];
+    const int n_head = (int) q->ne[2];
+    const int n_kv   = (int) k->ne[1];
+    float scale;
+    memcpy(&scale, (const float *) fa->op_params + 0, sizeof(float));
+    cudaStream_t stream = ctx.stream();
+
+    const int64_t R = (int64_t) n_head * n_tok;
+    ggml_cuda_pool_alloc<uint8_t> q16   (ctx.pool(), R * hd * sizeof(uint16_t));
+    ggml_cuda_pool_alloc<uint8_t> scores(ctx.pool(), R * n_kv * sizeof(uint16_t));
+
+    const int rc = ggml_cuda_flashrt::decode_attn_decomposed(
+        (void *) ctx.cublas_handle(),
+        (const float *) q->data,
+        (int64_t) (q->nb[0] / sizeof(float)),
+        (int64_t) (q->nb[1] / sizeof(float)),
+        (int64_t) (q->nb[2] / sizeof(float)),
+        k->data, v->data,
+        mask->data, (int64_t) (mask->nb[1] / sizeof(uint16_t)),
+        (float *) fa->data,
+        (int64_t) (fa->nb[2] / sizeof(float)),
+        (int64_t) (fa->nb[1] / sizeof(float)),
+        q16.get(), scores.get(),
+        hd, n_tok, n_head, n_kv, scale, stream);
+    if (rc != 0) {
+        GGML_ABORT("flashrt: decomposed decode attention failed (tok=%d kv=%d rc=%d)", n_tok, n_kv, rc);
+    }
+}
+
 // ── Gemma-style norm fold: {RMS_NORM, MUL(w), ADD(mul, norm)} ────────────────
 // out = rms_norm(x)*w + rms_norm(x) == rms_norm(x)*(1 + w): the adaLN
 // modulate kernel with scale = w and shift = 0. ggml's own fused rms_norm

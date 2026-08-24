@@ -105,6 +105,12 @@ bool ggml_cuda_flashrt_should_fuse_gated_res(const ggml_tensor * view, const ggm
 void ggml_cuda_flashrt_gated_residual(ggml_backend_cuda_context & ctx, const ggml_tensor * view,
                                       const ggml_tensor * mul, ggml_tensor * add);
 
+// Decomposed tiny-M decode attention: replaces a FLASH_ATTN_EXT node with
+// QK-GEMM + masked softmax + PV-GEMM for q_tokens <= 16 over a single f16
+// KV head of token rows.
+bool ggml_cuda_flashrt_should_fuse_dec_attn(const ggml_tensor * fa);
+void ggml_cuda_flashrt_dec_attn(ggml_backend_cuda_context & ctx, ggml_tensor * fa);
+
 // Prefill fused QKV window: q mm->reshape->rope->scale, k mm->reshape->rope->
 // pad, v mm->reshape->pad, each pad permuted+copied into a padded f16 tensor
 // of token rows. One fused GEMM + qkv_post + pad-row zeroing.

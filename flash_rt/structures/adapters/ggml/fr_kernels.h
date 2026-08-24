@@ -130,6 +130,20 @@ int layer_norm_affine_quant(const float * x, const float * w, const float * b,
 int layer_norm_affine(const float * x, const float * w, const float * b,
                       float * out, int M, int C, float eps, cudaStream_t stream);
 
+// Decomposed tiny-M attention: batched QK^T (f16, GQA heads share the
+// stride-0 K operand) + masked softmax + batched PV with fp32 output
+// written directly in the [hd, n_head, n_tok] layout via strided C.
+// q strides are in elements; workspaces: q16 [n_head*n_tok, hd] f16,
+// scores [n_head*n_tok, n_kv] f16. cublas_handle is a cublasHandle_t.
+int decode_attn_decomposed(void * cublas_handle,
+                           const float * q, int64_t q_sd, int64_t q_stok, int64_t q_shead,
+                           const void * k_f16_rows, const void * v_f16_rows,
+                           const void * mask_f16, int64_t mask_stride,
+                           float * dst, int64_t dst_stok, int64_t dst_shead,
+                           void * q16_ws, void * scores_ws,
+                           int hd, int n_tok, int n_head, int n_kv,
+                           float scale, cudaStream_t stream);
+
 // out[i] = a[i] + b[i] for n fp32 elements.
 int vec_add_f32(const float * a, const float * b, float * out, int n, cudaStream_t stream);
 
