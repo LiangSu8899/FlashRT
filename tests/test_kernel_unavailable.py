@@ -49,6 +49,7 @@ def test_arch_refusal_uses_the_same_type(monkeypatch):
 
     monkeypatch.setattr("kernels.get_kernel", lambda *a, **k: Module())
     monkeypatch.setattr(impls, "_declared_archs", lambda module: ["9.0"])
+    monkeypatch.setattr(impls, "_rocm_runtime", lambda: False)
     monkeypatch.setattr(impls, "_device_cc", lambda: (11, 0))
 
     with pytest.raises(impls.KernelUnavailable) as caught:
@@ -57,6 +58,38 @@ def test_arch_refusal_uses_the_same_type(monkeypatch):
 
     impls.hub_kernel.cache_clear()
     impls._LOADED.clear()
+
+
+def test_formal_variant_directory_bypasses_client_resolution(
+        monkeypatch, tmp_path):
+    variant = tmp_path / "variant"
+    variant.mkdir()
+    (variant / "__init__.py").write_text("VALUE = 'formal-variant'\n")
+    monkeypatch.setenv("FRT_KERNEL_DIR_TEST_DIRECT", str(variant))
+    monkeypatch.setattr(
+        "kernels.get_kernel",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("client resolution must not run")),
+    )
+    impls.hub_kernel.cache_clear()
+    impls._LOADED.pop(("test/direct", ">=1"), None)
+
+    module = impls.hub_kernel("test/direct", ">=1")
+
+    assert module.VALUE == "formal-variant"
+    impls._LOADED.pop(("test/direct", ">=1"), None)
+    impls.hub_kernel.cache_clear()
+
+
+def test_variant_directory_must_be_a_package(monkeypatch, tmp_path):
+    monkeypatch.setenv("FRT_KERNEL_DIR_TEST_BAD_DIRECT", str(tmp_path))
+    impls.hub_kernel.cache_clear()
+    impls._LOADED.pop(("test/bad-direct", ">=1"), None)
+
+    with pytest.raises(impls.KernelUnavailable, match="no __init__.py"):
+        impls.hub_kernel("test/bad-direct", ">=1")
+
+    impls.hub_kernel.cache_clear()
 
 
 def test_the_run_keeps_going_but_the_failure_is_on_the_record(monkeypatch):

@@ -1,8 +1,8 @@
-"""The hardware line: the package's own arch declaration is the truth.
+"""The hardware line: the package's own backend/arch declaration is truth.
 
-A Hub kernel package ships ``metadata.json`` naming the CUDA archs it
-was built for; the shared loader reads that declaration and refuses a
-device outside it with a message a person can act on — before the
+A Hub kernel package ships ``metadata.json`` naming the backend and archs it
+was built for; the shared loader reads that declaration and refuses a device
+outside either with a message a person can act on — before the
 kernel produces an unrelated-looking runtime error. The structures
 layer keeps no arch table of its own: hardware support is maintained on
 the kernels side, and absence of a declaration loads as before.
@@ -31,12 +31,75 @@ def test_declared_archs_read_from_package_metadata(tmp_path):
         {"backend": {"type": "cuda", "archs": ["12.0a", "12.1"]}},
     )
     assert impls._declared_archs(mod) == ["12.0a", "12.1"]
+    assert impls._declared_backend(mod) == "cuda"
 
 
 def test_missing_metadata_means_no_declaration(tmp_path):
     assert impls._declared_archs(_fake_module(tmp_path)) is None
     mod = _fake_module(tmp_path, {"backend": {}})
     assert impls._declared_archs(mod) is None
+    assert impls._declared_backend(mod) is None
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "gfx950",
+        "gfx950:sramecc+:xnack-",
+        "GFX950:SRAMECC+:XNACK-",
+    ],
+)
+def test_rocm_device_arch_strips_feature_suffixes(monkeypatch, raw):
+    import torch
+
+    props = types.SimpleNamespace(gcnArchName=raw)
+    monkeypatch.setattr(impls, "_rocm_runtime", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda *_: props)
+    assert impls._device_rocm_arch() == "gfx950"
+
+
+def test_compatible_rocm_arch_declaration_passes(tmp_path, monkeypatch):
+    mod = _fake_module(
+        tmp_path,
+        {"backend": {"type": "rocm", "archs": ["gfx942", "gfx950"]}},
+    )
+    monkeypatch.setattr(impls, "_rocm_runtime", lambda: True)
+    monkeypatch.setattr(impls, "_device_rocm_arch", lambda: "gfx950")
+    impls._check_arch("kernels-community/aiter-flash-attn-ck", mod)
+
+
+def test_incompatible_rocm_arch_gets_a_clean_refusal(tmp_path, monkeypatch):
+    mod = _fake_module(
+        tmp_path,
+        {"backend": {"type": "rocm", "archs": ["gfx942"]}},
+    )
+    monkeypatch.setattr(impls, "_rocm_runtime", lambda: True)
+    monkeypatch.setattr(impls, "_device_rocm_arch", lambda: "gfx950")
+    with pytest.raises(ValueError, match="device is rocm gfx950"):
+        impls._check_arch("flashrt/x", mod)
+
+
+@pytest.mark.parametrize(
+    ("package_backend", "runtime_rocm", "message"),
+    [
+        ("cuda", True, "device is rocm gfx950"),
+        ("rocm", False, "device is cuda sm 12.0"),
+    ],
+)
+def test_backend_mismatch_gets_a_clean_refusal(
+        tmp_path, monkeypatch, package_backend, runtime_rocm, message):
+    arch = "gfx950" if package_backend == "rocm" else "12.0a"
+    mod = _fake_module(
+        tmp_path,
+        {"backend": {"type": package_backend, "archs": [arch]}},
+    )
+    monkeypatch.setattr(impls, "_rocm_runtime", lambda: runtime_rocm)
+    monkeypatch.setattr(impls, "_device_rocm_arch", lambda: "gfx950")
+    monkeypatch.setattr(impls, "_device_cc", lambda: (12, 0))
+    with pytest.raises(ValueError, match=message):
+        impls._check_arch("flashrt/x", mod)
 
 
 @pytest.mark.parametrize(
@@ -56,6 +119,7 @@ def test_compatible_cuda_arch_declarations_pass(
         tmp_path,
         {"backend": {"type": "cuda", "archs": archs}},
     )
+    monkeypatch.setattr(impls, "_rocm_runtime", lambda: False)
     monkeypatch.setattr(impls, "_device_cc", lambda: device_cc)
     impls._check_arch("flashrt/x", mod)
 
@@ -77,6 +141,7 @@ def test_incompatible_cuda_arch_gets_a_clean_refusal(
         tmp_path,
         {"backend": {"type": "cuda", "archs": archs}},
     )
+    monkeypatch.setattr(impls, "_rocm_runtime", lambda: False)
     monkeypatch.setattr(impls, "_device_cc", lambda: device_cc)
     with pytest.raises(ValueError, match="refused"):
         impls._check_arch("flashrt/x", mod)
@@ -89,11 +154,13 @@ def test_no_cuda_device_defers_to_the_bind_path(tmp_path, monkeypatch):
         tmp_path,
         {"backend": {"type": "cuda", "archs": ["12.0a"]}},
     )
+    monkeypatch.setattr(impls, "_rocm_runtime", lambda: False)
     monkeypatch.setattr(impls, "_device_cc", lambda: None)
     impls._check_arch("flashrt/x", mod)
 
 
 def test_undeclared_package_is_not_refused(tmp_path, monkeypatch):
+    monkeypatch.setattr(impls, "_rocm_runtime", lambda: False)
     monkeypatch.setattr(impls, "_device_cc", lambda: (8, 0))
     impls._check_arch("flashrt/x", _fake_module(tmp_path))
 
@@ -115,6 +182,7 @@ def test_refusal_does_not_reload_the_package(monkeypatch, tmp_path):
     import kernels
 
     monkeypatch.setattr(kernels, "get_kernel", fake_get_kernel)
+    monkeypatch.setattr(impls, "_rocm_runtime", lambda: False)
     monkeypatch.setattr(impls, "_device_cc", lambda: (8, 9))
     impls._LOADED.pop(("test/arch-refused", ">=1"), None)
     impls.hub_kernel.cache_clear()

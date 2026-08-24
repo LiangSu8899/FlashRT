@@ -6,18 +6,18 @@ depend on the same kernel repo must share one loaded module — a second
 ops and torch.library raises.
 
 The loader also checks the package's own hardware declaration. A Hub
-kernel package ships ``metadata.json`` with the CUDA archs it was built
-for; that file is maintained on the kernels side and is the single
+kernel package ships ``metadata.json`` with the backend and archs it was
+built for; that file is maintained on the kernels side and is the single
 source of truth for hardware support — this layer reads it, it does not
-keep a second table. A device outside the declared archs gets a clean
-refusal here, before the kernel produces an unrelated-looking runtime
-error; the refusal is caught by the binder and recorded in the plan
-notes like any other. A package without metadata is loaded as before —
+keep a second table. A device outside the declared backend or archs gets
+a clean refusal here, before the kernel produces an unrelated-looking
+runtime error; the refusal is caught by the binder and recorded in the
+plan notes like any other. A package without metadata is loaded as before —
 absence of a declaration is not evidence of incompatibility.
 """
 
-import os
 import json
+import os
 import pathlib
 import re
 from functools import lru_cache
@@ -30,6 +30,40 @@ def _device_cc() -> tuple[int, int] | None:
     if not torch.cuda.is_available():
         return None
     return torch.cuda.get_device_capability()
+
+
+def _rocm_runtime() -> bool:
+    """Whether this torch build uses HIP rather than CUDA."""
+    import torch
+
+    return bool(getattr(torch.version, "hip", None))
+
+
+_ROCM_ARCH = re.compile(r"^(gfx[0-9a-f]+)(?::.*)?$", re.IGNORECASE)
+
+
+def _device_rocm_arch() -> str | None:
+    """GCN architecture of the current HIP device, without feature suffixes."""
+    import torch
+
+    if not _rocm_runtime() or not torch.cuda.is_available():
+        return None
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    raw = getattr(props, "gcnArchName", None)
+    match = _ROCM_ARCH.fullmatch(str(raw or ""))
+    return match.group(1).lower() if match is not None else None
+
+
+def _declared_backend(module) -> str | None:
+    """The package's own ``backend.type`` declaration, if present."""
+    try:
+        meta = pathlib.Path(module.__file__).parent / "metadata.json"
+        if not meta.is_file():
+            return None
+        backend = json.loads(meta.read_text()).get("backend", {}).get("type")
+        return str(backend).lower() if backend else None
+    except (OSError, ValueError, AttributeError):
+        return None
 
 
 def _declared_archs(module) -> list[str] | None:
@@ -121,15 +155,43 @@ def _record_unavailable(repo: str, version: str, cause: BaseException):
 
 def _check_arch(repo: str, module) -> None:
     archs = _declared_archs(module)
-    if archs is None:
+    backend = _declared_backend(module)
+    if archs is None and backend is None:
         return
+    if _rocm_runtime():
+        gfx = _device_rocm_arch()
+        if gfx is None:
+            # no usable HIP device: binding fails later at weight transfer;
+            # the arch check has nothing truthful to compare
+            return
+        if backend not in (None, "rocm"):
+            refusal = KernelUnavailable(
+                f"refused: kernel package {repo!r} declares backend "
+                f"{backend!r} archs {archs}, device is rocm {gfx}")
+            _record_unavailable(repo, "declared-archs", refusal)
+            raise refusal
+        if archs is None or any(str(a).lower() == gfx for a in archs):
+            return
+        refusal = KernelUnavailable(
+            f"refused: kernel package {repo!r} declares backend 'rocm' "
+            f"archs {archs}, device is rocm {gfx}")
+        _record_unavailable(repo, "declared-archs", refusal)
+        raise refusal
+
     cc = _device_cc()
     if cc is None:
         # no CUDA device: binding fails later at weight transfer anyway;
         # the arch check has nothing truthful to say here
         return
+    if backend not in (None, "cuda"):
+        want = f"{cc[0]}.{cc[1]}"
+        refusal = KernelUnavailable(
+            f"refused: kernel package {repo!r} declares backend "
+            f"{backend!r} archs {archs}, device is cuda sm {want}")
+        _record_unavailable(repo, "declared-archs", refusal)
+        raise refusal
     want = f"{cc[0]}.{cc[1]}"
-    if any(_cuda_arch_supports_device(a, cc) for a in archs):
+    if archs is None or any(_cuda_arch_supports_device(a, cc) for a in archs):
         return
     refusal = KernelUnavailable(
         f"refused: kernel package {repo!r} declares archs {archs}, "
@@ -167,6 +229,28 @@ def hub_kernel(repo: str, version: str):
             f"    pip install 'flash-rt[hub]'") from absent
 
     key = (repo, version)
+    slug = re.sub(r"[^A-Za-z0-9]", "_", repo).upper()
+    var_dir = os.environ.get("FRT_KERNEL_DIR_" + slug)
+    if var_dir and key not in _LOADED:
+        # Filesystem-direct variant loading was delivered upstream in
+        # e8f8e938. The directory remains a formally built package variant;
+        # this bypasses only client/network resolution, not metadata checks.
+        import importlib.util
+        import sys as _sys
+
+        init = os.path.join(var_dir, "__init__.py")
+        if not os.path.isfile(init):
+            raise KernelUnavailable(
+                f"kernel package {repo!r}: FRT_KERNEL_DIR_{slug} does "
+                f"not point at a build variant (no __init__.py in "
+                f"{var_dir!r})")
+        mod_name = "_frt_kernel_" + slug.lower()
+        spec = importlib.util.spec_from_file_location(
+            mod_name, init, submodule_search_locations=[var_dir])
+        module = importlib.util.module_from_spec(spec)
+        _sys.modules[mod_name] = module
+        spec.loader.exec_module(module)
+        _LOADED[key] = module
     if key not in _LOADED:
         # author pin for artifact bisection: an exact hub revision
         # outranks version resolution for this repo only. A perf or
