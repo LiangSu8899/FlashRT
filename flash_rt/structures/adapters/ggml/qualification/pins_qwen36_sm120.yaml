@@ -29,6 +29,7 @@ gates:
     spec_text_check: required         # greedy spec output must be coherent text, never judged by tps alone
   perf:
     tg128_full_tier_bench: 377.8      # llama-bench r=5, full-tier env
+    tg128_default_bench: 368.0        # llama-bench r=5, zero-env default (safe tier)
     spec_full_tier_median: 444.6      # 4-prompt server battery, greedy 384 tok, LLAMA_GRAPH_SLOTS=6 -bs
     spec_safe_tier_median: 433.3
     stock_reference: 283.07           # same-machine stock @95b8e33
