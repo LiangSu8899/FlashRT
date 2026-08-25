@@ -23,6 +23,11 @@
 #include "vecdotq.cuh"
 #include "convert.cuh"
 
+// Heavy math comes from csrc (single source; the adapter only translates):
+// the M-rows activation quantizer and the warp-split-K W4A4 GEMV.
+#include "../../../../csrc/quantize/f32_act_to_nvfp4_swizzled_mrows_sm120.cuh"
+#include "../../../../csrc/kernels/fp4_w4a4_mma_warpsplit_mrows_f32out_sm120.cuh"
+
 // Model-specific constants come from the binding (single source:
 // flash_rt/structures/bindings/llamacpp_qwen36_35b_sm120.yaml); regenerate
 // the header with tools/gen_binding_header.py after editing the binding.
@@ -44,204 +49,41 @@ namespace frt {
 
 // ---------------- activation quantize (f32 row -> NVFP4 + swizzled SFA) ---
 
+// device vocabulary of this window file, backed by the csrc single source
 __device__ __forceinline__ int sfa_offset_128x64(int row, int k, int dim) {
-    const int row_block    = row >> 7;
-    const int row_in_block = row & 127;
-    const int k_block      = k >> 6;
-    const int k_in_block   = k & 63;
-    const int k_blocks     = (dim + 63) >> 6;
-    return row_block * k_blocks * 512 + k_block * 512 +
-        (row_in_block & 31) * 16 + (row_in_block >> 5) * 4 +
-        (k_in_block >> 4);
+    return flash_rt::quantize::nvfp4_sfa_offset_128x64(row, k, dim);
 }
-
 __device__ __forceinline__ uint8_t fp32_to_e2m1(float x) {
-    uint8_t sign = (x < 0.f) ? 0x8u : 0x0u;
-    float ax = fabsf(x);
-    uint8_t mant;
-    if      (ax <= 0.25f) mant = 0u;
-    else if (ax <= 0.75f) mant = 1u;
-    else if (ax <= 1.25f) mant = 2u;
-    else if (ax <= 1.75f) mant = 3u;
-    else if (ax <= 2.5f)  mant = 4u;
-    else if (ax <= 3.5f)  mant = 5u;
-    else if (ax <= 5.0f)  mant = 6u;
-    else                  mant = 7u;
-    return sign | mant;
+    return flash_rt::quantize::nvfp4_act_f32_to_e2m1(x);
 }
-
-// quantize a f32 row of length D into packed e2m1 + SFA (device body, callable
-// from any single participating block). row selects the SFA atom-layout row and
-// the packed output row (row-major, D/16 uint2 per row).
 template <int THREADS>
 __device__ __forceinline__ void quant_act_fp4_f32_body(
-        const float * __restrict__ x,
-        uint2 * __restrict__ dst_packed,
-        uint8_t * __restrict__ dst_sfa,
-        int D, int row = 0) {
-    const int n_blocks = D / 16;
-    uint2 * dst_row = dst_packed + (size_t) row * n_blocks;
-    for (int b = threadIdx.x; b < n_blocks; b += THREADS) {
-        float vals[16];
-        float amax = 0.f;
-#pragma unroll
-        for (int i = 0; i < 16; ++i) {
-            vals[i] = x[b * 16 + i];
-            const float a = fabsf(vals[i]);
-            if (a > amax) amax = a;
-        }
-        float desired = amax / 6.f;
-        if (desired < 1e-12f) desired = 1e-12f;
-        __nv_fp8_e4m3 bs_q = __nv_fp8_e4m3(fmaxf(desired, 0.f));
-        const float bs_dq = static_cast<float>(bs_q);
-        dst_sfa[sfa_offset_128x64(row, b * 16, D)] = *reinterpret_cast<uint8_t *>(&bs_q);
-        const float inv_bs = 1.f / bs_dq;
-        uint2 out;
-        uint8_t * ob = reinterpret_cast<uint8_t *>(&out);
-#pragma unroll
-        for (int p = 0; p < 8; ++p) {
-            const uint8_t lo = fp32_to_e2m1(vals[2 * p]     * inv_bs);
-            const uint8_t hi = fp32_to_e2m1(vals[2 * p + 1] * inv_bs);
-            ob[p] = static_cast<uint8_t>(lo | (hi << 4));
-        }
-        dst_row[b] = out;
-    }
+        const float * __restrict__ x, uint2 * __restrict__ dst_packed,
+        uint8_t * __restrict__ dst_sfa, int D, int row = 0) {
+    flash_rt::quantize::f32_act_to_nvfp4_row<THREADS>(x, dst_packed, dst_sfa, D, row);
 }
 
-// MT is compile-time: a runtime token count in the hot path costs measurable
-// time even at M=1 (handoff §5.2), so callers dispatch through FRT_M_DISPATCH.
-template <int THREADS, int MT = 1>
-__global__ void quant_act_fp4_f32(
-        const float * __restrict__ x,
-        uint2 * __restrict__ dst_packed,
-        uint8_t * __restrict__ dst_sfa,
-        int D, int64_t x_srow = 0) {
-    ggml_cuda_pdl_lc(); ggml_cuda_pdl_sync();
-#pragma unroll
-    for (int r = blockIdx.x; r < MT; r += gridDim.x)   // launch with grid = MT
-        quant_act_fp4_f32_body<THREADS>(x + (size_t) r * x_srow, dst_packed, dst_sfa, D, r);
+#ifdef GGML_CUDA_USE_PDL
+constexpr bool frt_launch_pdl = true;
+#else
+constexpr bool frt_launch_pdl = false;
+#endif
+
+// standalone M-rows activation quantize through the csrc entry
+static void frt_quant_act_launch(const float * x, void * dst_packed, void * dst_sfa,
+        int D, int M, int64_t x_srow, cudaStream_t stream) {
+    const int rc = flash_rt::quantize::f32_act_to_nvfp4_swizzled_mrows(
+        x, dst_packed, dst_sfa, D, M, (long long) x_srow, frt_launch_pdl, stream);
+    if (rc != 0) fprintf(stderr, "frt: quant_act launch failed (%d)\n", rc);
 }
 
-// switch a runtime M in [1,4] onto a compile-time MT inside __VA_ARGS__.
 #define FRT_M_DISPATCH(M, ...) do { switch (M) { \
     case 1: { constexpr int MT = 1; __VA_ARGS__; } break; \
     case 2: { constexpr int MT = 2; __VA_ARGS__; } break; \
     case 3: { constexpr int MT = 3; __VA_ARGS__; } break; \
     default:{ constexpr int MT = 4; __VA_ARGS__; } break; } } while (0)
 
-// ---------------- warp-split-K NVFP4 W4A4 M=1 GEMV (f32 out) ---------------
-
-#if defined(__CUDA_ARCH_FEAT_SM120_ALL) || !defined(__CUDA_ARCH__)
-#define FRT_SM120A_OK 1
-#endif
-
-using AtomType = cute::SM120::BLOCKSCALED::SM120_16x8x64_TN_VS<
-    cutlass::float_e2m1_t, cutlass::float_e2m1_t, float,
-    cutlass::float_ue4m3_t, 16>;
-
-__device__ __forceinline__ uint32_t fa(const uint8_t * s, int t0, int t1, int r) {
-    int ro = ((r & 1) ? (t1 + 8) : t1) * 32;
-    return *reinterpret_cast<const uint32_t *>(s + ro + t0 * 4 + ((r >> 1) & 1) * 16);
-}
-__device__ __forceinline__ uint32_t fb(const uint8_t * s, int t0, int t1, int r) {
-    return *reinterpret_cast<const uint32_t *>(s + t1 * 32 + t0 * 4 + r * 16);
-}
-__device__ __forceinline__ uint32_t fsa(const uint8_t * p, int u) {
-    return *reinterpret_cast<const uint32_t *>(p + u * 4);
-}
-__device__ __forceinline__ void cpa(uint8_t * d, const uint8_t * s) {
-    uint32_t i = __cvta_generic_to_shared(d);
-    asm volatile("cp.async.ca.shared.global.L2::128B [%0], [%1], 4;\n" :: "r"(i), "l"(s));
-}
-__device__ __forceinline__ void commit() { asm volatile("cp.async.commit_group;\n" ::); }
-template <int N> __device__ __forceinline__ void waitg() {
-    asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
-}
-
-template <int STAGES, int WARPS, int MT = 1>
-__global__ void warpsplit_kernel_f32out(
-        const uint8_t * __restrict__ A, const uint8_t * __restrict__ B,
-        const uint8_t * __restrict__ SFA, const uint8_t * __restrict__ SFB,
-        float * __restrict__ D, float alpha, int N, int K) {
-    constexpr int M = MT;
-#if defined(FRT_SM120A_OK)
-    ggml_cuda_pdl_lc(); ggml_cuda_pdl_sync();
-    __shared__ uint8_t sA[WARPS][STAGES][16 * 32];
-    __shared__ uint8_t sSFA[WARPS][STAGES][16 * 4];
-    __shared__ uint8_t sB[WARPS][STAGES][8 * 32];
-    __shared__ uint8_t sSFB[WARPS][STAGES][8 * 4];
-    __shared__ float s_red[WARPS][4 * 8];
-
-    int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
-    int my_n = blockIdx.x * 8;
-    const int KI = K / 64, KIw = KI / WARPS;
-    const int kt0 = warp * KIw;
-    const int KH = K / 2, ncs = (K / 16 + 3) / 4;
-    int t0 = lane & 3, t1 = lane >> 2, sau = (lane & 1) * 8 + (lane >> 2), sbu = lane >> 2;
-    float c0 = 0, c1 = 0, c2 = 0, c3 = 0;
-
-    uint8_t (*mA)[16 * 32] = sA[warp];
-    uint8_t (*mSFA)[16 * 4] = sSFA[warp];
-    uint8_t (*mB)[8 * 32] = sB[warp];
-    uint8_t (*mSFB)[8 * 4] = sSFB[warp];
-
-    if (lane >= 1 && lane < 16) {
-#pragma unroll
-        for (int st = 0; st < STAGES; ++st) {
-            int4 * av = reinterpret_cast<int4 *>(mA[st]); int4 z{0, 0, 0, 0};
-            av[lane * 2] = z; av[lane * 2 + 1] = z;
-        }
-        if (lane < 4) for (int st = 0; st < STAGES; ++st)
-            for (int i = 4 + lane; i < 64; i += 4) mSFA[st][i] = 0;
-    }
-    __syncwarp();   // M>1: row-1 cp.async below must not race the zero-init
-    auto ld = [&](int bf, int kt) {
-        int bo = kt * 32;
-        if (lane < 8) cpa(mA[bf] + lane * 4, A + bo + lane * 4);
-        if (lane == 0) cpa(mSFA[bf], SFA + kt * 512);
-#pragma unroll
-        for (int rr = 1; rr < MT; ++rr) {   // extra token rows: act tile + atom-layout scales (row r -> +r*16)
-            if (lane < 8) cpa(mA[bf] + rr * 32 + lane * 4, A + (size_t) rr * KH + bo + lane * 4);
-            if (lane == 0) cpa(mSFA[bf] + rr * 4, SFA + kt * 512 + rr * 16);
-        }
-        for (int c = 0; c < 2; ++c) { int ch = lane + c * 32, col = ch >> 3, off = ch & 7;
-            cpa(mB[bf] + ch * 4, B + (size_t)(my_n + col) * KH + bo + off * 4); }
-        if (lane < 8) { int col = my_n + lane, rb = col >> 7, ri = col & 127;
-            int si = rb * ncs + kt, ib = (ri & 31) * 16 + ((ri >> 5) & 3) * 4;
-            cpa(mSFB[bf] + lane * 4, SFB + (size_t)si * 512 + ib); }
-    };
-#pragma unroll
-    for (int st = 0; st < STAGES - 1; ++st) { if (st < KIw) ld(st, kt0 + st); commit(); }
-    for (int j = 0; j < KIw; ++j) {
-        int cb = j % STAGES, jp = j + STAGES - 1;
-        if (jp < KIw) ld(jp % STAGES, kt0 + jp);
-        commit(); waitg<STAGES - 1>(); __syncwarp();
-        uint32_t a0 = fa(mA[cb], t0, t1, 0), a1 = fa(mA[cb], t0, t1, 1);
-        uint32_t a2 = fa(mA[cb], t0, t1, 2), a3 = fa(mA[cb], t0, t1, 3);
-        uint32_t b0 = fb(mB[cb], t0, t1, 0), b1 = fb(mB[cb], t0, t1, 1);
-        uint32_t sfa_v = fsa(mSFA[cb], sau), sfb_v = fsa(mSFB[cb], sbu);
-        float d0, d1, d2, d3;
-        AtomType::fma(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1, c0, c1, c2, c3, sfa_v, sfb_v);
-        c0 = d0; c1 = d1; c2 = d2; c3 = d3;
-    }
-    // m16n8 C fragment: {c0,c1} hold row (lane>>2) -> token t lives in lanes 4t..4t+3.
-    int q = lane >> 2, r = lane & 3;
-    if (q < M) { s_red[warp][q * 8 + r * 2] = c0; s_red[warp][q * 8 + r * 2 + 1] = c1; }
-    __syncthreads();
-    if (warp == 0 && lane < 8) {
-        int col = my_n + lane;
-        if (col < N) {
-#pragma unroll
-            for (int t = 0; t < MT; ++t) {
-                float acc = 0.f;
-#pragma unroll
-                for (int w = 0; w < WARPS; ++w) acc += s_red[w][t * 8 + lane];
-                D[(size_t) t * N + col] = acc * alpha;
-            }
-        }
-    }
-#endif // FRT_SM120A_OK
-}
+// ---------------- warp-split-K NVFP4 W4A4 GEMV (csrc single source) --------
 
 // runtime (STAGES, WARPS) selection for the region GEMVs: FRT_WS_CFG=s<S>w<W>
 // (default s4w2). K/64 must be divisible by W.
@@ -253,28 +95,15 @@ static void frt_ws_launch(const uint8_t * A, const uint8_t * B,
         const char * e = getenv("FRT_WS_CFG");
         env_cfg = 0;
         if (e) {
-            int s = 0, w = 0;
-            if (sscanf(e, "s%dw%d", &s, &w) == 2) env_cfg = s * 10 + w;
+            int sc = 0, w = 0;
+            if (sscanf(e, "s%dw%d", &sc, &w) == 2) env_cfg = sc * 10 + w;
         }
     }
-    const int cfg = env_cfg ? env_cfg : def_cfg;
-    dim3 grid(N / 8);
-#define FRT_WS_CASE(S, W) do { \
-        auto kf = M == 1 ? warpsplit_kernel_f32out<S, W, 1> : M == 2 ? warpsplit_kernel_f32out<S, W, 2> : \
-                  M == 3 ? warpsplit_kernel_f32out<S, W, 3> : warpsplit_kernel_f32out<S, W, 4>; \
-        ggml_cuda_kernel_launch(kf, ggml_cuda_kernel_launch_params(grid, dim3(W * 32), 0, stream), A, B, SFA, SFB, D, alpha, N, K); \
-    } while (0)
-    switch (cfg) {
-        case 34: FRT_WS_CASE(3, 4); break;
-        case 44: FRT_WS_CASE(4, 4); break;
-        case 64: FRT_WS_CASE(6, 4); break;
-        case 38: FRT_WS_CASE(3, 8); break;
-        case 48: FRT_WS_CASE(4, 8); break;
-        case 32: FRT_WS_CASE(3, 2); break;
-        case 62: FRT_WS_CASE(6, 2); break;
-        default: FRT_WS_CASE(4, 2); break;
-    }
-#undef FRT_WS_CASE
+    const int cfg = env_cfg ? env_cfg : (def_cfg ? def_cfg : 42);
+    const int rc = flash_rt::gemm::fp4_w4a4_mma_sm120_warpsplit_mrows_f32out(
+        A, B, D, M, N, K, SFA, SFB, alpha, /*warps=*/cfg % 10, /*stages=*/cfg / 10,
+        frt_launch_pdl, stream);
+    if (rc != 0) fprintf(stderr, "frt: warpsplit launch failed (%d, cfg=%d)\n", rc, cfg);
 }
 
 // ---------------- W4A16 matvec (NVFP4 weight x f32 act, f32 out) ----------
@@ -567,8 +396,7 @@ static bool frt_region_serve(ggml_backend_cuda_context & ctx, int kind, int laye
     const int64_t key = ((int64_t) kind << 32) | layer;
     cudaStream_t stream = ctx.stream();
     if (leader) {
-        FRT_M_DISPATCH(M, ggml_cuda_kernel_launch((frt::quant_act_fp4_f32<256, MT>), ggml_cuda_kernel_launch_params(dim3(M), dim3(256), 0, stream),
-            (const float *) src1->data, (uint2 *) g_reg.d_apack, g_reg.d_sfa, (int) r.K, (int64_t) r.K));
+        frt_quant_act_launch((const float *) src1->data, g_reg.d_apack, g_reg.d_sfa, (int) r.K, M, (int64_t) r.K, stream);
         frt::frt_ws_launch(g_reg.d_apack, r.d_packed, g_reg.d_sfa, r.d_sf,
             g_reg.d_staging, r.alpha, (int) r.N, (int) r.K, M, stream);
         g_reg.leader_src = src1->data;
@@ -1474,8 +1302,7 @@ bool ggml_cuda_frt_gdn_try_impl(ggml_backend_cuda_context & ctx, ggml_cgraph * c
             frt::g_reg.d_staging);
     } else {
         if (M != 1) return false;   // W4A4 a/b staging fallback stays M=1
-        ggml_cuda_kernel_launch((frt::quant_act_fp4_f32<256, 1>), ggml_cuda_kernel_launch_params(dim3(1), dim3(256), 0, stream),
-            (const float *) qkv_mm->src[1]->data, (uint2 *) frt::g_reg.d_apack, frt::g_reg.d_sfa, (int) reg.K, (int64_t) 0);
+        frt::frt_quant_act_launch((const float *) qkv_mm->src[1]->data, frt::g_reg.d_apack, frt::g_reg.d_sfa, (int) reg.K, 1, 0, stream);
     }
     const int gemv_n = (ab_ok || norm_anchor) ? 12288 : (int) reg.N;   // ab rows owned by K0 when on
     frt::frt_ws_launch(frt::g_reg.d_apack, reg.d_packed, frt::g_reg.d_sfa, reg.d_sf,
@@ -2713,8 +2540,7 @@ bool ggml_cuda_frt_head_mul_mat(ggml_backend_cuda_context & ctx,
         return true;
     }
 
-    FRT_M_DISPATCH(M, ggml_cuda_kernel_launch((frt::quant_act_fp4_f32<256, MT>), ggml_cuda_kernel_launch_params(dim3(M), dim3(256), 0, stream),
-        x, (uint2 *) frt::g_head.d_apack, frt::g_head.d_sfa, (int) frt::g_head.K, (int64_t) K));
+    frt::frt_quant_act_launch(x, frt::g_head.d_apack, frt::g_head.d_sfa, (int) frt::g_head.K, M, (int64_t) K, stream);
 
     frt::frt_ws_launch(frt::g_head.d_apack, frt::g_head.d_packed, frt::g_head.d_sfa, frt::g_head.d_sf,
         out, frt::g_head.alpha, (int) N, (int) K, M, stream, 44);   // head: s4w4 wins (+6 t/s)
