@@ -23,6 +23,11 @@
 #include "vecdotq.cuh"
 #include "convert.cuh"
 
+// Model-specific constants come from the binding (single source:
+// flash_rt/structures/bindings/llamacpp_qwen36_35b_sm120.yaml); regenerate
+// the header with tools/gen_binding_header.py after editing the binding.
+#include "fr_binding_qwen36_35b_sm120.h"
+
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_fp4.h>
@@ -488,9 +493,12 @@ static bool frt_regions_load(void) {
     const char * path = getenv("FRT_REGIONS_PACK");
     if (!path && frt_online_on()) {
         // online repack: per-region weight buffers arrive from the pre-capture
-        // hook; only the shared serve buffers are sized here (known target
-        // shapes: kind0 12352x2048, kind1 9216x2048).
-        const int64_t maxN = 12352, maxK = 2048;
+        // hook; only the shared serve buffers are sized here, from the binding.
+        int64_t maxN = 0, maxK = 0;
+        for (int kind = 0; kind < frt_binding::n_region_kinds; ++kind) {
+            maxN = std::max<int64_t>(maxN, frt_binding::region_n[kind]);
+            maxK = std::max<int64_t>(maxK, frt_binding::region_k[kind]);
+        }
         CUDA_CHECK(cudaMalloc(&g_reg.d_staging, 4 * maxN * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&g_reg.d_conv_out, 4 * 8192 * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&g_reg.d_attn_buf, 4 * 4096 * sizeof(float)));
@@ -585,24 +593,22 @@ static bool frt_regions_mul_mat(ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     if (!frt_regions_load()) return false;
     int layer = -1; char rest[64] = {0};
-    if (sscanf(src0->name, "blk.%d.%63s", &layer, rest) != 2 || layer < 0 || layer >= 64) return false;
-    if (g_reg.inproj_on) {
-        if (strcmp(rest, "attn_qkv.weight") == 0) return frt_region_serve(ctx, 0, layer, true,     0, 8192, src1, dst);
-        if (strcmp(rest, "attn_gate.weight") == 0) return frt_region_serve(ctx, 0, layer, false, 8192, 4096, src1, dst);
-        if (strcmp(rest, "ssm_alpha.weight") == 0) return frt_region_serve(ctx, 0, layer, false, 12288, 32, src1, dst);
-        if (strcmp(rest, "ssm_beta.weight") == 0)  return frt_region_serve(ctx, 0, layer, false, 12288 + 32, 32, src1, dst);
-    }
-    if (g_reg.attn_on) {
-        if (strcmp(rest, "attn_q.weight") == 0) return frt_region_serve(ctx, 1, layer, true,     0, 8192, src1, dst);
-        if (strcmp(rest, "attn_k.weight") == 0) return frt_region_serve(ctx, 1, layer, false, 8192, 512, src1, dst);
-        if (strcmp(rest, "attn_v.weight") == 0) return frt_region_serve(ctx, 1, layer, false, 8704, 512, src1, dst);
+    if (sscanf(src0->name, "blk.%d.%63s", &layer, rest) != 2 || layer < 0 || layer >= frt_binding::layer_scan_max) return false;
+    for (int kind = 0; kind < frt_binding::n_region_kinds; ++kind) {
+        if (kind == 0 && !g_reg.inproj_on) continue;
+        if (kind == 1 && !g_reg.attn_on) continue;
+        for (int m = 0; m < frt_binding::region_n_members[kind]; ++m) {
+            const auto & mem = frt_binding::region_members[kind][m];
+            if (strcmp(rest, mem.name) == 0)
+                return frt_region_serve(ctx, kind, layer, mem.leader, mem.off, mem.rows, src1, dst);
+        }
     }
     if (g_reg.shexp_on) {
         if (strcmp(rest, "ffn_gate_shexp.weight") == 0) return frt_region_serve(ctx, 2, layer, true,   0, 512, src1, dst);
         if (strcmp(rest, "ffn_up_shexp.weight") == 0)   return frt_region_serve(ctx, 2, layer, false, 512, 512, src1, dst);
     }
     if (g_reg.outproj_on) {
-        if (strcmp(rest, "ssm_out.weight") == 0 || strcmp(rest, "attn_output.weight") == 0)
+        if (strcmp(rest, frt_binding::out_proj_names[0]) == 0 || strcmp(rest, frt_binding::out_proj_names[1]) == 0)
             return frt_region_serve(ctx, 4, layer, true, 0, 2048, src1, dst);
     }
     return false;
@@ -914,42 +920,40 @@ static void frt_online_prepare(ggml_backend_cuda_context & ctx, const ggml_cgrap
     if (all_done) return;
     if (!frt_regions_load() && !getenv("FRT_HEAD_SWAP") && !getenv("FRT_HEAD_DRAFT")) { all_done = true; return; }
 
-    static const char * k0_names[4] = { "attn_qkv.weight", "attn_gate.weight", "ssm_alpha.weight", "ssm_beta.weight" };
-    static const int64_t k0_rows[4] = { 8192, 4096, 32, 32 };
-    static const char * k1_names[3] = { "attn_q.weight", "attn_k.weight", "attn_v.weight" };
-    static const int64_t k1_rows[3] = { 8192, 512, 512 };
-
-    const ggml_tensor * mem[2][64][4] = {};
+    using namespace frt_binding;
+    const ggml_tensor * mem[n_region_kinds][64][region_max_members] = {};
     const ggml_tensor * head_w = nullptr;
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * n = cgraph->nodes[i];
         if (n->op != GGML_OP_MUL_MAT || !n->src[0]) continue;
         const ggml_tensor * w = n->src[0];
-        if (strcmp(w->name, "output.weight") == 0 && w->type != GGML_TYPE_Q8_0 && w->ne[0] == 2048) {
+        if (strcmp(w->name, head_name) == 0 && w->type != GGML_TYPE_Q8_0 && w->ne[0] == d_model) {
             head_w = w;
             continue;
         }
         int layer = -1; char rest[64] = {0};
-        if (sscanf(w->name, "blk.%d.%63s", &layer, rest) != 2 || layer < 0 || layer >= 64) continue;
-        for (int m = 0; m < 4; ++m) if (strcmp(rest, k0_names[m]) == 0 && w->ne[1] == k0_rows[m]) mem[0][layer][m] = w;
-        for (int m = 0; m < 3; ++m) if (strcmp(rest, k1_names[m]) == 0 && w->ne[1] == k1_rows[m]) mem[1][layer][m] = w;
+        if (sscanf(w->name, "blk.%d.%63s", &layer, rest) != 2 || layer < 0 || layer >= layer_scan_max) continue;
+        for (int kind = 0; kind < n_region_kinds; ++kind)
+            for (int m = 0; m < region_n_members[kind]; ++m)
+                if (strcmp(rest, region_members[kind][m].name) == 0 && w->ne[1] == region_members[kind][m].rows)
+                    mem[kind][layer][m] = w;
     }
 
     cudaStream_t stream = ctx.stream();
-    int built_k0 = 0, built_k1 = 0;
-    for (int kind = 0; kind < 2; ++kind) {
+    int built[n_region_kinds] = {};
+    for (int kind = 0; kind < n_region_kinds; ++kind) {
         if (kind == 0 && !g_reg.inproj_on) continue;
         if (kind == 1 && !g_reg.attn_on) continue;
-        const int n_mem = kind == 0 ? 4 : 3;
-        const int64_t N = kind == 0 ? 12352 : 9216, K = 2048;
-        for (int layer = 0; layer < 64; ++layer) {
+        const int n_mem = region_n_members[kind];
+        const int64_t N = region_n[kind], K = region_k[kind];
+        for (int layer = 0; layer < layer_scan_max; ++layer) {
             frt_region & r = g_reg.regions[kind][layer];
-            if (r.N != 0) { (kind == 0 ? built_k0 : built_k1)++; continue; }
+            if (r.N != 0) { built[kind]++; continue; }
             bool have = true;
             for (int m = 0; m < n_mem; ++m) have = have && mem[kind][layer][m] != nullptr;
             if (!have) continue;
-            frt_repack_src srcs[4];
-            for (int m = 0; m < n_mem; ++m) srcs[m] = { mem[kind][layer][m], kind == 0 ? k0_rows[m] : k1_rows[m] };
+            frt_repack_src srcs[region_max_members];
+            for (int m = 0; m < n_mem; ++m) srcs[m] = { mem[kind][layer][m], region_members[kind][m].rows };
             const size_t pkb = (size_t) N * K / 2;
             const size_t sfb = (size_t) ((N + 127) / 128) * ((K + 63) / 64) * 512;
             CUDA_CHECK(cudaMalloc(&r.d_packed, pkb));
@@ -963,7 +967,7 @@ static void frt_online_prepare(ggml_backend_cuda_context & ctx, const ggml_cgrap
             }
             r.alpha = alpha; r.K = K; r.N = N;   // N last: serve fires only on complete regions
             frt_repack_check_region(kind, layer, r);
-            (kind == 0 ? built_k0 : built_k1)++;
+            built[kind]++;
         }
     }
 
@@ -992,11 +996,14 @@ static void frt_online_prepare(ggml_backend_cuda_context & ctx, const ggml_cgrap
     }
 
     const bool head_pending = (getenv("FRT_HEAD_SWAP") || getenv("FRT_HEAD_DRAFT")) && !g_head.ok;
-    const bool k0_pending = g_reg.inproj_on && built_k0 < 30;
-    const bool k1_pending = g_reg.attn_on && built_k1 < 10;
-    if (!head_pending && !k0_pending && !k1_pending) {
+    bool region_pending = false;
+    for (int kind = 0; kind < n_region_kinds; ++kind) {
+        const bool on = (kind == 0 && g_reg.inproj_on) || (kind == 1 && g_reg.attn_on);
+        region_pending = region_pending || (on && built[kind] < region_layers[kind]);
+    }
+    if (!head_pending && !region_pending) {
         fprintf(stderr, "frt-repack: online repack complete (kind0=%d kind1=%d head=%d)\n",
-                built_k0, built_k1, (int) g_head.ok);
+                built[0], built[1], (int) g_head.ok);
         all_done = true;
     }
 }
@@ -1010,6 +1017,11 @@ static void frt_online_prepare(ggml_backend_cuda_context & ctx, const ggml_cgrap
 // updated in place: 1R+1W instead of the graph's multi-copy dance.
 
 namespace gdn {
+
+// model dims from the binding (single source; kernels are compile-time
+// specialized to these)
+constexpr int CONV_ROW = frt_binding::gdn_conv_cache_row;   // conv cache slot stride (floats)
+constexpr int STATE_SZ = frt_binding::gdn_state_size;       // recurrent state slot size (floats)
 
 __device__ __forceinline__ float frt_silu(float x)     { return x / (1.0f + expf(-x)); }
 
@@ -1048,7 +1060,7 @@ __global__ void frt_gdn_conv_silu(
     ggml_cuda_pdl_lc(); ggml_cuda_pdl_sync();
     const int ch = blockIdx.x * 256 + threadIdx.x;
     if (ch >= 8192) return;
-    float * cs = r_base + (size_t) (*r_slot) * 24576 + (size_t) ch * 3;
+    float * cs = r_base + (size_t) (*r_slot) * CONV_ROW + (size_t) ch * 3;
     const float * w = conv_w + (size_t) ch * 4;
     float s0 = cs[0], s1 = cs[1], s2 = cs[2];
     float * const snaps[4] = { snap0, snap1, snap2, snap3 };
@@ -1217,7 +1229,7 @@ __global__ void frt_gdn_cell_part(
     }
     const float scale = 0.088388347648318447f;
 
-    float * S = s_base + (size_t) (*s_slot) * 524288 + (size_t) h * 16384;
+    float * S = s_base + (size_t) (*s_slot) * STATE_SZ + (size_t) h * 16384;
 
     for (int cc = 0; cc < 4; ++cc) {
         const int c = cg * 16 + warp * 4 + cc;
@@ -1304,10 +1316,10 @@ bool ggml_cuda_frt_gdn_try_impl(ggml_backend_cuda_context & ctx, ggml_cgraph * c
     static int nf_mode = -1;
     if (nf_mode < 0) { const char * m = getenv("FRT_GDN_NORMFOLD"); nf_mode = (m && m[0] == '1') ? 1 : 0; }
     bool norm_anchor = false;
-    if (nf_mode && n0->op == GGML_OP_RMS_NORM && n0->ne[0] == 2048 && n0->ne[1] == 1) {
+    if (nf_mode && n0->op == GGML_OP_RMS_NORM && n0->ne[0] == frt_binding::d_model && n0->ne[1] == 1) {
         norm_anchor = true;   // must find attn_norm MUL + GDN members below
     } else if (n0->op == GGML_OP_RMS_NORM) { return false;
-    } else if (n0->op != GGML_OP_GET_ROWS || n0->ne[0] != 24576 ||
+    } else if (n0->op != GGML_OP_GET_ROWS || n0->ne[0] != gdn::CONV_ROW ||
         strncmp(n0->name, "conv_states", 11) != 0) return false;
 
     // scan forward for the span members
@@ -1353,9 +1365,9 @@ bool ggml_cuda_frt_gdn_try_impl(ggml_backend_cuda_context & ctx, ggml_cgraph * c
             case GGML_OP_GET_ROWS:
                 // first hit = the slot read; a second single-row one is the
                 // checkpoint save (we replay it ourselves); anything else -> stock.
-                if (n->ne[1] == 1 && n->ne[0] == 24576)  { if (!gr_r) gr_r = n; else if (!ck_r_gr) ck_r_gr = n; else return false; }
-                else if (n->ne[1] == 1 && n->ne[0] == 524288) { if (!gr_s) gr_s = n; else if (!ck_s_gr) ck_s_gr = n; else return false; }
-                else if (ggml_nelements(n) != 0 && (n->ne[0] == 24576 || n->ne[0] == 524288)) return false;
+                if (n->ne[1] == 1 && n->ne[0] == gdn::CONV_ROW)  { if (!gr_r) gr_r = n; else if (!ck_r_gr) ck_r_gr = n; else return false; }
+                else if (n->ne[1] == 1 && n->ne[0] == gdn::STATE_SZ) { if (!gr_s) gr_s = n; else if (!ck_s_gr) ck_s_gr = n; else return false; }
+                else if (ggml_nelements(n) != 0 && (n->ne[0] == gdn::CONV_ROW || n->ne[0] == gdn::STATE_SZ)) return false;
                 break;
             case GGML_OP_SCALE:
                 if (ggml_nelements(n) != 0) return false;   // reset machinery active -> fall back
@@ -1369,7 +1381,7 @@ bool ggml_cuda_frt_gdn_try_impl(ggml_backend_cuda_context & ctx, ggml_cgraph * c
                     n->src[0]->ne[0] == 3 && n->src[0]->ne[1] == 8192) {
                     if (n_conv_cpy >= 4) return false;
                     conv_cpy[n_conv_cpy++] = n;
-                } else if (n->ne[0] == 524288 && n->src[0] && n->src[0]->op == GGML_OP_VIEW &&
+                } else if (n->ne[0] == gdn::STATE_SZ && n->src[0] && n->src[0]->op == GGML_OP_VIEW &&
                            gdn && n->src[0]->src[0] == gdn) {
                     if (state_cpy) return false;
                     state_cpy = n;
@@ -1395,7 +1407,7 @@ bool ggml_cuda_frt_gdn_try_impl(ggml_backend_cuda_context & ctx, ggml_cgraph * c
         !normw_mul || !add_dtb || !mul_A || !gr_r || !gr_s || !final_rs) return false;
     if (norm_anchor && (!norm_mul || qkv_mm->src[1] != norm_mul)) return false;
     frt::frt_region & reg = frt::g_reg.regions[0][layer];
-    if (reg.N != 12352) return false;
+    if (reg.N != frt_binding::region_n[0]) return false;
     if (gdn->src[0]->ne[0] != 128 || gdn->src[0]->ne[1] != 16 || gdn->src[2]->ne[1] != 32) return false;
     const int M = (int) qkv_mm->src[1]->ne[1];   // decode M=1; spec verify M = 1 + n_draft
     if (M < 1 || M > 4 || !ggml_is_contiguous(qkv_mm->src[1])) return false;
@@ -1430,13 +1442,13 @@ bool ggml_cuda_frt_gdn_try_impl(ggml_backend_cuda_context & ctx, ggml_cgraph * c
     cudaStream_t stream = ctx.stream();
     // 0) checkpoint saves (pre-update snapshot of the current slot), if due
     if (ck_r_cpy)
-        ggml_cuda_kernel_launch(gdn::frt_gdn_ckpt_copy, ggml_cuda_kernel_launch_params(dim3(24576 / 256), dim3(256), 0, stream),
+        ggml_cuda_kernel_launch(gdn::frt_gdn_ckpt_copy, ggml_cuda_kernel_launch_params(dim3(gdn::CONV_ROW / 256), dim3(256), 0, stream),
             (const float *) ck_r_gr->src[0]->data, (const int32_t *) ck_r_gr->src[1]->data,
-            (int64_t) 24576, (float *) ck_r_cpy->src[1]->data, 24576);
+            (int64_t) gdn::CONV_ROW, (float *) ck_r_cpy->src[1]->data, gdn::CONV_ROW);
     if (ck_s_cpy)
-        ggml_cuda_kernel_launch(gdn::frt_gdn_ckpt_copy, ggml_cuda_kernel_launch_params(dim3(524288 / 256), dim3(256), 0, stream),
+        ggml_cuda_kernel_launch(gdn::frt_gdn_ckpt_copy, ggml_cuda_kernel_launch_params(dim3(gdn::STATE_SZ / 256), dim3(256), 0, stream),
             (const float *) ck_s_gr->src[0]->data, (const int32_t *) ck_s_gr->src[1]->data,
-            (int64_t) 524288, (float *) ck_s_cpy->src[1]->data, 524288);
+            (int64_t) gdn::STATE_SZ, (float *) ck_s_cpy->src[1]->data, gdn::STATE_SZ);
     // 1) act quant (+ F32 a/b gate rows; FRT_GDN_AB=0 falls back to W4A4 rows),
     //    then fused in_proj GEMV into staging
     static int ab_f32 = -1;
@@ -2354,7 +2366,7 @@ static bool frt_outproj_native_try(ggml_backend_cuda_context & ctx, ggml_cgraph 
 
     cudaStream_t stream = ctx.stream();
     const block_q8_1 * y_q8 = d_actq8b;
-    if (frt::g_reg.ok && frt::g_reg.outq8_node == (const void *) act && K == 4096) {
+    if (frt::g_reg.ok && frt::g_reg.outq8_node == (const void *) act && K == frt_binding::out_proj_k) {
         y_q8 = frt::g_reg.d_outq8;         // GDN epilogue already staged the q8 act
         frt::g_reg.outq8_node = nullptr;
     } else {
@@ -2673,7 +2685,7 @@ bool ggml_cuda_frt_head_mul_mat(ggml_backend_cuda_context & ctx,
         if (cap != cudaStreamCaptureStatusNone) return false;
     }
     if (!frt::frt_head_load()) return false;
-    if (strcmp(src0->name, "output.weight") != 0) return false;
+    if (strcmp(src0->name, frt_binding::head_name) != 0) return false;
     if (frt::g_head.draft_only && src0->type != GGML_TYPE_Q8_0) return false;
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
     const int M = (int) src1->ne[1];   // spec verify asks for logits at M = 1 + n_draft rows
