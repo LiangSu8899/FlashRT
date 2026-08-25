@@ -1,0 +1,23 @@
+# Structure versions the SM120/Qwen3.6 windows were written against, plus
+# the target's shipping gates. The families marked proposed are carried by
+# this target until they are formalized in the catalog; their pin is the
+# adapter file itself (fr_win_qwen36_sm120.cu revision).
+binding: llamacpp_qwen36_35b_sm120
+pins:
+  llm_decode_pipeline: 1
+  format_native_gemv: 1   # proposed family (warp-split-K NVFP4 GEMV, M<=4)
+  moe_expert_span: 1      # proposed family (format-native K-quant MoE)
+  gdn_cell: 1             # proposed family (recurrent cell span, snapshot/checkpoint discipline)
+
+# Shipping gates (re-established after every adapter or host change; the
+# numbers are the 2026-08-25 migration baseline on RTX 5090):
+gates:
+  quality:
+    ppl_24ch_ub1_safe_tier: 6.1106    # must stay bit-identical (wikitext, -ub 1 -c 512 --chunks 24)
+    moefuse_selftest: pass            # FRT_MOEFUSE_SELFTEST=1 duplicated-token bit-exact replay
+    spec_text_check: required         # greedy spec output must be coherent text, never judged by tps alone
+  perf:
+    tg128_full_tier_bench: 377.8      # llama-bench r=5, full-tier env
+    spec_full_tier_median: 444.6      # 4-prompt server battery, greedy 384 tok, LLAMA_GRAPH_SLOTS=6 -bs
+    spec_safe_tier_median: 433.3
+    stock_reference: 283.07           # same-machine stock @95b8e33

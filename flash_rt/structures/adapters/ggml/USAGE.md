@@ -75,3 +75,25 @@ kernels are invisible to nsys while CUDA graphs replay).
 Every window degrades gracefully: when its predicate does not match (or
 its switch is set) the nodes run on stock ggml kernels, so the switches
 bisect regressions window by window.
+
+## SM120 / Qwen3.6 target
+
+Build a llama.cpp tree against this checkout:
+
+```bash
+cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 \
+  -DGGML_CUDA_FLASHRT_SM120=ON -DGGML_CUDA_FLASHRT_PUBLIC_DIR=<FlashRT checkout> \
+  -DCMAKE_CUDA_FLAGS="-I<cutlass>/include -gencode=arch=compute_120a,code=sm_120a"
+```
+
+The target's windows are opt-in per mechanism (historic `FRT_*` switches;
+unset = off). Safe-tier set: `FRT_INPROJ_SWAP=1 FRT_ATTNQKV_SWAP=1
+FRT_GDN_SWAP=1 FRT_MOEGLUE_SWAP=1 FRT_MOEFUSE_SWAP=1 FRT_MOEFUSE_SHEXP=1
+FRT_OUTNATIVE_SWAP=1 FRT_REGIONS_PACK=<pack>`; full tier adds
+`FRT_HEAD_SWAP=1 FRT_HEAD_PACK=<pack>`. Speculative serving adds
+`FRT_HEAD_DRAFT=1` (safe tier: FP4-serve only the draft's head copy) and the
+host-side `LLAMA_GRAPH_SLOTS=6` + `--backend-sampling`. FP4 weights currently
+come from side-band packs; replacing them with the in-process repack cache is
+the next step for this target. Diagnostics: `FRT_STATS=1`,
+`FRT_MOEFUSE_DBG=<n>`, `FRT_MOEFUSE_SELFTEST=1`, `FRT_DUMP_GRAPH=1` +
+`FRT_DUMP_M=<m>` (+ `FRT_DUMP_PATH`).

@@ -1,0 +1,86 @@
+binding: llamacpp_qwen36_35b_sm120
+structure: llm_decode_pipeline
+
+# Host: stock llama.cpp (upstream master lineage) running Qwen3.6-35B-A3B
+# UD-Q4_K_M on RTX 5090 (SM120) with the native ggml adapter
+# (flash_rt/structures/adapters/ggml/fr_win_qwen36_sm120.cu). Structure
+# regions execute as fused subgraph windows matched inside ggml-cuda's
+# graph evaluation. Two quality tiers share one binary: the safe tier keeps
+# the target head and all matched math bit-comparable to stock (24-chunk
+# PPL receipt), the full tier adds the NVFP4 lm-head swap.
+
+stages:
+  prefill:
+    seam: "llama_decode prompt processing (stock kernels; adapter windows are decode-shaped and stay out)"
+    capture: none
+  decode:
+    seam: "llama_decode token generation, M in [1,4] (speculative verify batches)"
+    capture: cuda_graphs_keyed
+  spec_draft:
+    seam: "MTP draft chain (single trained head, 3 chained drafts/step) + M=4 h-extraction eval"
+    capture: cuda_graphs_keyed
+
+cadences:
+  token: [decode]
+  spec_step: [decode, spec_draft]
+
+coverage:
+  contract: hot_path_takeover
+  hot_path:
+    - gdn_in_proj_region
+    - attn_qkv_region
+    - gdn_cell_span
+    - moe_expert_span
+    - moe_router
+    - out_proj
+    - lm_head
+    - spec_draft_serving
+  segments:
+    - name: gdn_in_proj_region
+      stage: decode
+      classification: structure
+      seam: "fused-region NVFP4 W4A4 GEMV serving qkv|z|a|b members from one staging pass (30 GDN layers)"
+      structures: [format_native_gemv]   # proposed family: warp-split-K blockscale MMA GEMV, M<=4
+    - name: attn_qkv_region
+      stage: decode
+      classification: structure
+      seam: "attention qkv fused region, same GEMV (10 attention layers)"
+      structures: [format_native_gemv]
+    - name: gdn_cell_span
+      stage: decode
+      classification: structure
+      seam: "conv + gated-delta-net + epilogue span -> 4 launches; M>1 writes per-token state/conv snapshots and replays checkpoint saves (rollback discipline, DEVELOPMENT.md)"
+      structures: [gdn_cell]             # proposed family
+    - name: moe_expert_span
+      stage: decode
+      classification: structure
+      seam: "K0 quant+meta / K1 gate|up|GLU / K2 down+combine over ggml-native K-quant blocks (bit-exact q8_1 activation clone), shared expert folded, M<=4"
+      structures: [moe_expert_span]      # proposed family: format-native MoE
+    - name: moe_router
+      stage: decode
+      classification: structure
+      seam: "fused gate GEMV + exact topk replication; default-on only for M>=2 (host's own fusion is M=1-only)"
+      structures: [format_native_gemv]
+    - name: out_proj
+      stage: decode
+      classification: structure
+      seam: "ssm_out/attn_output Q8_0 GEMV + residual, consumes the GDN epilogue's q8 handoff"
+      structures: [format_native_gemv]
+    - name: lm_head
+      stage: decode
+      classification: structure
+      seam: "full tier: NVFP4 W4A4 head swap (M<=4 in one pass); safe tier: stock Q6_K mmvq (measured ~91% BW, left alone)"
+      structures: [format_native_gemv]
+    - name: spec_draft_serving
+      stage: spec_draft
+      classification: structure
+      seam: "draft-side head serving: the draft GGUF's Q8_0 lm-head copy is served from the FP4 pack (spec acceptance-only, output distribution unchanged); draft MTP layer's Q8_0 experts consume the same MoE span"
+      structures: [format_native_gemv, moe_expert_span]
+    - name: host_graph_slots
+      stage: spec_draft
+      classification: host_stage
+      seam: "host-tree change (llama-context): per-shape graph slots keyed (n_tokens, gtype, has_embd), each slot owning its scheduler; plus target-side backend sampling (-bs)"
+
+hosts:
+  llamacpp_dev_sm120:
+    versions: "upstream 95b8e33 + FlashRT hook guards (GGML_CUDA_FLASHRT_SM120)"
