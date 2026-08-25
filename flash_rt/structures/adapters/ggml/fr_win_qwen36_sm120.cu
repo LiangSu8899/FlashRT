@@ -21,6 +21,7 @@
 
 #include "common.cuh"
 #include "vecdotq.cuh"
+#include "convert.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -28,6 +29,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 
 #include "cute/arch/mma_sm120.hpp"
@@ -469,6 +471,8 @@ struct frt_region_state {
 
 static frt_region_state g_reg;
 
+static bool frt_online_on(void);   // defined with the in-process repack section
+
 static bool frt_regions_load(void) {
     if (g_reg.tried) return g_reg.ok;
     g_reg.tried = true;
@@ -482,6 +486,24 @@ static bool frt_regions_load(void) {
     g_reg.outproj_on = d && d[0] == '1';
     if (!g_reg.inproj_on && !g_reg.attn_on && !g_reg.shexp_on && !g_reg.outproj_on) return false;
     const char * path = getenv("FRT_REGIONS_PACK");
+    if (!path && frt_online_on()) {
+        // online repack: per-region weight buffers arrive from the pre-capture
+        // hook; only the shared serve buffers are sized here (known target
+        // shapes: kind0 12352x2048, kind1 9216x2048).
+        const int64_t maxN = 12352, maxK = 2048;
+        CUDA_CHECK(cudaMalloc(&g_reg.d_staging, 4 * maxN * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&g_reg.d_conv_out, 4 * 8192 * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&g_reg.d_attn_buf, 4 * 4096 * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&g_reg.d_scalar, sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&g_reg.d_outq8, 4 * 128 * sizeof(block_q8_1)));
+        CUDA_CHECK(cudaMalloc(&g_reg.d_apack, 2 * maxK));
+        CUDA_CHECK(cudaMalloc(&g_reg.d_sfa, 128 * (maxK / 16)));
+        CUDA_CHECK(cudaMemset(g_reg.d_sfa, 0, 128 * (maxK / 16)));
+        fprintf(stderr, "frt-regions: online repack mode (inproj=%d attnqkv=%d)\n",
+                (int) g_reg.inproj_on, (int) g_reg.attn_on);
+        g_reg.ok = true;
+        return true;
+    }
     if (!path) { fprintf(stderr, "frt-regions: FRT_REGIONS_PACK missing\n"); return false; }
     FILE * f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "frt-regions: cannot open %s\n", path); return false; }
@@ -617,6 +639,10 @@ static bool frt_head_load(void) {
     if (!sw_on && !dr_on) return false;
     g_head.draft_only = !sw_on;
     const char * path = getenv("FRT_HEAD_PACK");
+    if (!path && frt_online_on()) {
+        g_head.tried = false;   // built by the pre-capture repack hook
+        return g_head.ok;
+    }
     if (!path) { fprintf(stderr, "frt-head: FRT_HEAD_SWAP/FRT_HEAD_DRAFT set but FRT_HEAD_PACK missing\n"); return false; }
     FILE * f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "frt-head: cannot open %s\n", path); return false; }
@@ -644,6 +670,335 @@ static bool frt_head_load(void) {
             (long long) g_head.N, (long long) g_head.K, (double) g_head.alpha);
     g_head.ok = true;
     return true;
+}
+
+// ---- in-process weight repack (FRT_ONLINE_REPACK=1) -----------------------
+// Replaces the side-band pack files: region/head FP4 wire buffers are built
+// on first sight of the weight tensors in an evaluated graph, before any
+// CUDA graph capture (called from the pre-capture hook in ggml-cuda.cu).
+// The pipeline reproduces the offline packer bit-for-bit: ggml dequant ->
+// bf16 (RNE) -> global amax -> global_scale = amax/2688 -> per-16 ue4m3-ceil
+// block scales -> e2m1 nibbles + Sm1xx atom-layout SF bytes.
+// FRT_REPACK_CHECK=1 memcmp-validates against the pack files when both are
+// given.
+
+__device__ __forceinline__ uint8_t frt_ue4m3_ceil(float v) {
+    if (v <= 0.0f) return 0;
+    if (v > 240.0f) return 0xFE;
+    uint32_t bits = __float_as_uint(v);
+    int float_exp = ((bits >> 23) & 0xFF) - 127;
+    uint32_t frac = bits & 0x7FFFFF;
+    int ue_exp = float_exp + 7;
+    if (ue_exp <= 0) {
+        float scaled = v * 512.0f;
+        int m = (int) ceilf(scaled);
+        if (m > 7) return (1 << 3) | 0;
+        if (m < 1) m = 1;
+        return (uint8_t) m;
+    }
+    if (ue_exp >= 15) return 0xFE;
+    int m = (int) (frac >> 20);
+    if (frac & 0xFFFFF) m++;
+    if (m >= 8) { m = 0; ue_exp++; }
+    if (ue_exp >= 15) return 0xFE;
+    return (uint8_t) ((ue_exp << 3) | m);
+}
+
+__device__ __forceinline__ float frt_ue4m3_f32(uint8_t v) {
+    int e = (v >> 3) & 0xF;
+    int m = v & 0x7;
+    if (e == 0) return ldexpf((float) m / 8.0f, -6);
+    return ldexpf(1.0f + (float) m / 8.0f, e - 7);
+}
+
+// e2m1 with the offline packer's strict-< boundaries (the activation
+// quantizer above uses <=; at exact tie values the codes differ, so weight
+// repack must use this one to stay byte-identical with the pack files).
+__device__ __forceinline__ uint8_t frt_e2m1_weight(float v) {
+    uint8_t sign = (v < 0.0f) ? 0x8u : 0x0u;
+    float a = fabsf(v);
+    uint8_t mag;
+    if      (a < 0.25f)  mag = 0;
+    else if (a < 0.75f)  mag = 1;
+    else if (a < 1.25f)  mag = 2;
+    else if (a < 1.75f)  mag = 3;
+    else if (a < 2.5f)   mag = 4;
+    else if (a < 3.5f)   mag = 5;
+    else if (a < 5.0f)   mag = 6;
+    else                 mag = 7;
+    return sign | mag;
+}
+
+__global__ void frt_w_amax_bf16(const __nv_bfloat16 * __restrict__ w, float * __restrict__ gmax, int N, int K) {
+    const int row = blockIdx.x;
+    if (row >= N) return;
+    const size_t off = (size_t) row * K;
+    float tm = 0.f;
+    for (int c = threadIdx.x; c < K; c += blockDim.x) {
+        const float a = fabsf(__bfloat162float(w[off + c]));
+        if (a > tm) tm = a;
+    }
+    __shared__ float smem[32];
+    const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) tm = fmaxf(tm, __shfl_xor_sync(0xffffffffu, tm, o));
+    if (lane == 0) smem[wid] = tm;
+    __syncthreads();
+    if (wid == 0) {
+        const int nw = (blockDim.x + 31) >> 5;
+        tm = (lane < nw) ? smem[lane] : 0.f;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) tm = fmaxf(tm, __shfl_xor_sync(0xffffffffu, tm, o));
+        if (lane == 0) atomicMax(reinterpret_cast<int *>(gmax), __float_as_int(tm));
+    }
+}
+
+__global__ void frt_w_gscale(const float * gmax, float * gs) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        const float a = *gmax;
+        *gs = (a > 0.f) ? (a / 2688.f) : 1.f;
+    }
+}
+
+// rows [0, n_rows) of w correspond to absolute output rows row_base + r.
+__global__ void frt_w_pass2_bf16(const __nv_bfloat16 * __restrict__ w, const float * __restrict__ gs_ptr,
+        uint8_t * __restrict__ packed, uint8_t * __restrict__ sf_swz,
+        int n_rows, int K, int row_base, int n_col_super) {
+    const int r = blockIdx.x;
+    if (r >= n_rows) return;
+    const float gscale = *gs_ptr;
+    const float inv_g = (gscale > 0.f) ? (1.f / gscale) : 0.f;
+    const int row = row_base + r;
+    const size_t in_off  = (size_t) r * K;
+    const size_t out_off = (size_t) row * (K / 2);
+    const int rb = row / 128, ri = row % 128;
+    const int nbr = K / 16;
+    for (int b = threadIdx.x; b < nbr; b += blockDim.x) {
+        const int col0 = b * 16;
+        float v[16];
+        float bmax = 0.f;
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            v[i] = __bfloat162float(w[in_off + col0 + i]);
+            const float a = fabsf(v[i]);
+            if (a > bmax) bmax = a;
+        }
+        const uint8_t sf_byte = frt_ue4m3_ceil((bmax / 6.f) * inv_g);
+        const float bs = frt_ue4m3_f32(sf_byte) * gscale;
+        const float inv_bs = (bs > 0.f) ? (1.f / bs) : 0.f;
+        uint8_t * prow = packed + out_off;
+#pragma unroll
+        for (int i = 0; i < 16; i += 2) {
+            const uint8_t lo = frt_e2m1_weight(v[i]     * inv_bs);
+            const uint8_t hi = frt_e2m1_weight(v[i + 1] * inv_bs);
+            prow[(col0 + i) >> 1] = (uint8_t) ((hi << 4) | (lo & 0x0F));
+        }
+        const int cb = b / 4, ci = b % 4;
+        sf_swz[(rb * n_col_super + cb) * 512 + (ri % 32) * 16 + (ri / 32) * 4 + ci] = sf_byte;
+    }
+}
+
+static bool frt_online_on(void) {
+    static int on = -1;
+    if (on < 0) { const char * s = getenv("FRT_ONLINE_REPACK"); on = (s && s[0] == '1') ? 1 : 0; }
+    return on == 1;
+}
+
+// One source tensor contributing `rows` rows to an [N, K] concat target.
+struct frt_repack_src { const ggml_tensor * t; int64_t rows; };
+
+// Build packed+SF (+alpha) for a row-concatenation of ggml tensors. Eager
+// only (allocates, synchronizes); chunked so even the 248320-row head needs
+// a bounded bf16 staging buffer.
+static bool frt_repack_build(const frt_repack_src * srcs, int n_src, int64_t N, int64_t K,
+        uint8_t * d_packed, uint8_t * d_sf, float * out_alpha, cudaStream_t stream) {
+    const int64_t CHUNK = 8192;
+    static __nv_bfloat16 * d_stage = nullptr;
+    static float * d_scr = nullptr;   // [amax, gscale]
+    if (!d_stage) CUDA_CHECK(cudaMalloc(&d_stage, CHUNK * K * sizeof(__nv_bfloat16)));
+    if (!d_scr)   CUDA_CHECK(cudaMalloc(&d_scr, 2 * sizeof(float)));
+    const int n_col_super = ((int) (K / 16) + 3) / 4;
+    CUDA_CHECK(cudaMemsetAsync(d_scr, 0, sizeof(float), stream));
+    for (int pass = 0; pass < 2; ++pass) {   // 0 = amax, 1 = quantize
+        int64_t row_base = 0;
+        for (int s = 0; s < n_src; ++s) {
+            const ggml_tensor * t = srcs[s].t;
+            const to_bf16_cuda_t conv = ggml_get_to_bf16_cuda(t->type);
+            if (conv == nullptr) return false;
+            const size_t row_bytes = ggml_row_size(t->type, K);
+            for (int64_t r0 = 0; r0 < srcs[s].rows; r0 += CHUNK) {
+                const int64_t rows = std::min(CHUNK, srcs[s].rows - r0);
+                conv((const char *) t->data + r0 * row_bytes, d_stage, rows * K, stream);
+                if (pass == 0) {
+                    frt_w_amax_bf16<<<dim3((unsigned) rows), dim3(256), 0, stream>>>(d_stage, d_scr, (int) rows, (int) K);
+                } else {
+                    frt_w_pass2_bf16<<<dim3((unsigned) rows), dim3(256), 0, stream>>>(d_stage, d_scr + 1,
+                        d_packed, d_sf, (int) rows, (int) K, (int) (row_base + r0), n_col_super);
+                }
+            }
+            row_base += srcs[s].rows;
+        }
+        if (pass == 0) frt_w_gscale<<<1, 1, 0, stream>>>(d_scr, d_scr + 1);
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaMemcpy(out_alpha, d_scr + 1, sizeof(float), cudaMemcpyDeviceToHost));
+    return *out_alpha != 0.0f;
+}
+
+// FRT_REPACK_CHECK=1: byte-compare an online-built region against the pack
+// file entry it replaces (pack path from FRT_REGIONS_PACK/FRT_HEAD_PACK).
+static void frt_repack_check_region(int kind, int layer, const frt_region & r) {
+    static int check = -1;
+    if (check < 0) { const char * c = getenv("FRT_REPACK_CHECK"); check = (c && c[0] == '1') ? 1 : 0; }
+    if (!check) return;
+    const char * path = (kind == 5) ? getenv("FRT_HEAD_PACK_REF") : getenv("FRT_REGIONS_PACK_REF");
+    if (!path) return;
+    const size_t pkb = (size_t) r.N * r.K / 2;
+    const size_t sfb = (size_t) ((r.N + 127) / 128) * ((r.K + 63) / 64) * 512;
+    std::vector<uint8_t> ref(pkb > sfb ? pkb : sfb), got(pkb > sfb ? pkb : sfb);
+    FILE * f = fopen(path, "rb");
+    if (!f) return;
+    bool found = false;
+    double ref_alpha = 0.0;
+    if (kind == 5) {   // head pack: single entry
+        int64_t hdr[4];
+        if (fread(hdr, 8, 4, f) == 4 && hdr[1] == r.N && hdr[2] == r.K) {
+            memcpy(&ref_alpha, &hdr[3], 8);
+            found = fread(ref.data(), 1, pkb, f) == pkb;
+            std::vector<uint8_t> sfref(sfb);
+            if (found && fread(sfref.data(), 1, sfb, f) == sfb) {
+                CUDA_CHECK(cudaMemcpy(got.data(), r.d_packed, pkb, cudaMemcpyDeviceToHost));
+                const bool pk_ok = memcmp(got.data(), ref.data(), pkb) == 0;
+                CUDA_CHECK(cudaMemcpy(got.data(), r.d_sf, sfb, cudaMemcpyDeviceToHost));
+                const bool sf_ok = memcmp(got.data(), sfref.data(), sfb) == 0;
+                fprintf(stderr, "frt-repack-check head: packed=%s sf=%s alpha %.9g vs %.9g\n",
+                        pk_ok ? "OK" : "MISMATCH", sf_ok ? "OK" : "MISMATCH", (double) r.alpha, ref_alpha);
+            }
+        }
+        fclose(f);
+        return;
+    }
+    int64_t hdr[2];
+    if (fread(hdr, 8, 2, f) != 2) { fclose(f); return; }
+    for (int64_t e = 0; e < hdr[1]; ++e) {
+        int64_t el, ek, en, ekk, epkb, esfb; double ea;
+        if (fread(&el, 8, 1, f) != 1) break;
+        if (fread(&ek, 8, 1, f) != 1 || fread(&en, 8, 1, f) != 1 || fread(&ekk, 8, 1, f) != 1 ||
+            fread(&ea, 8, 1, f) != 1 || fread(&epkb, 8, 1, f) != 1 || fread(&esfb, 8, 1, f) != 1) break;
+        if (el == layer && ek == kind) {
+            found = (epkb == (int64_t) pkb && esfb == (int64_t) sfb);
+            if (found) {
+                if (fread(ref.data(), 1, pkb, f) != pkb) break;
+                CUDA_CHECK(cudaMemcpy(got.data(), r.d_packed, pkb, cudaMemcpyDeviceToHost));
+                const bool pk_ok = memcmp(got.data(), ref.data(), pkb) == 0;
+                if (fread(ref.data(), 1, sfb, f) != sfb) break;
+                CUDA_CHECK(cudaMemcpy(got.data(), r.d_sf, sfb, cudaMemcpyDeviceToHost));
+                const bool sf_ok = memcmp(got.data(), ref.data(), sfb) == 0;
+                fprintf(stderr, "frt-repack-check kind%d layer%d: packed=%s sf=%s alpha %.9g vs %.9g\n",
+                        kind, layer, pk_ok ? "OK" : "MISMATCH", sf_ok ? "OK" : "MISMATCH", (double) r.alpha, ea);
+            }
+            break;
+        }
+        fseek(f, epkb + esfb, SEEK_CUR);
+    }
+    fclose(f);
+    if (!found) fprintf(stderr, "frt-repack-check kind%d layer%d: no reference entry\n", kind, layer);
+}
+
+// Pre-capture hook body: scan the graph for region/head weight tensors and
+// build any missing online buffers. Eager only — the caller guarantees no
+// CUDA graph capture is in flight.
+static void frt_online_prepare(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph) {
+    if (!frt_online_on()) return;
+    static bool all_done = false;
+    if (all_done) return;
+    if (!frt_regions_load() && !getenv("FRT_HEAD_SWAP") && !getenv("FRT_HEAD_DRAFT")) { all_done = true; return; }
+
+    static const char * k0_names[4] = { "attn_qkv.weight", "attn_gate.weight", "ssm_alpha.weight", "ssm_beta.weight" };
+    static const int64_t k0_rows[4] = { 8192, 4096, 32, 32 };
+    static const char * k1_names[3] = { "attn_q.weight", "attn_k.weight", "attn_v.weight" };
+    static const int64_t k1_rows[3] = { 8192, 512, 512 };
+
+    const ggml_tensor * mem[2][64][4] = {};
+    const ggml_tensor * head_w = nullptr;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * n = cgraph->nodes[i];
+        if (n->op != GGML_OP_MUL_MAT || !n->src[0]) continue;
+        const ggml_tensor * w = n->src[0];
+        if (strcmp(w->name, "output.weight") == 0 && w->type != GGML_TYPE_Q8_0 && w->ne[0] == 2048) {
+            head_w = w;
+            continue;
+        }
+        int layer = -1; char rest[64] = {0};
+        if (sscanf(w->name, "blk.%d.%63s", &layer, rest) != 2 || layer < 0 || layer >= 64) continue;
+        for (int m = 0; m < 4; ++m) if (strcmp(rest, k0_names[m]) == 0 && w->ne[1] == k0_rows[m]) mem[0][layer][m] = w;
+        for (int m = 0; m < 3; ++m) if (strcmp(rest, k1_names[m]) == 0 && w->ne[1] == k1_rows[m]) mem[1][layer][m] = w;
+    }
+
+    cudaStream_t stream = ctx.stream();
+    int built_k0 = 0, built_k1 = 0;
+    for (int kind = 0; kind < 2; ++kind) {
+        if (kind == 0 && !g_reg.inproj_on) continue;
+        if (kind == 1 && !g_reg.attn_on) continue;
+        const int n_mem = kind == 0 ? 4 : 3;
+        const int64_t N = kind == 0 ? 12352 : 9216, K = 2048;
+        for (int layer = 0; layer < 64; ++layer) {
+            frt_region & r = g_reg.regions[kind][layer];
+            if (r.N != 0) { (kind == 0 ? built_k0 : built_k1)++; continue; }
+            bool have = true;
+            for (int m = 0; m < n_mem; ++m) have = have && mem[kind][layer][m] != nullptr;
+            if (!have) continue;
+            frt_repack_src srcs[4];
+            for (int m = 0; m < n_mem; ++m) srcs[m] = { mem[kind][layer][m], kind == 0 ? k0_rows[m] : k1_rows[m] };
+            const size_t pkb = (size_t) N * K / 2;
+            const size_t sfb = (size_t) ((N + 127) / 128) * ((K + 63) / 64) * 512;
+            CUDA_CHECK(cudaMalloc(&r.d_packed, pkb));
+            CUDA_CHECK(cudaMalloc(&r.d_sf, sfb));
+            float alpha = 0.f;
+            if (!frt_repack_build(srcs, n_mem, N, K, r.d_packed, r.d_sf, &alpha, stream)) {
+                fprintf(stderr, "frt-repack: kind%d layer%d FAILED\n", kind, layer);
+                cudaFree(r.d_packed); cudaFree(r.d_sf);
+                r.d_packed = nullptr; r.d_sf = nullptr;
+                continue;
+            }
+            r.alpha = alpha; r.K = K; r.N = N;   // N last: serve fires only on complete regions
+            frt_repack_check_region(kind, layer, r);
+            (kind == 0 ? built_k0 : built_k1)++;
+        }
+    }
+
+    if (head_w && !g_head.ok && (getenv("FRT_HEAD_SWAP") || getenv("FRT_HEAD_DRAFT"))) {
+        const int64_t N = head_w->ne[1], K = head_w->ne[0];
+        const size_t pkb = (size_t) N * K / 2;
+        const size_t sfb = (size_t) ((N + 127) / 128) * ((K + 63) / 64) * 512;
+        CUDA_CHECK(cudaMalloc(&g_head.d_packed, pkb));
+        CUDA_CHECK(cudaMalloc(&g_head.d_sf, sfb));
+        float alpha = 0.f;
+        frt_repack_src src = { head_w, N };
+        if (frt_repack_build(&src, 1, N, K, g_head.d_packed, g_head.d_sf, &alpha, stream)) {
+            g_head.N = N; g_head.K = K; g_head.alpha = alpha;
+            CUDA_CHECK(cudaMalloc(&g_head.d_apack, 4 * (K / 2)));
+            CUDA_CHECK(cudaMalloc(&g_head.d_sfa, 128 * (K / 16)));
+            CUDA_CHECK(cudaMemset(g_head.d_sfa, 0, 128 * (K / 16)));
+            frt_init_ue4m3_lut();
+            frt_region hr; hr.N = N; hr.K = K; hr.alpha = alpha; hr.d_packed = g_head.d_packed; hr.d_sf = g_head.d_sf;
+            frt_repack_check_region(5, 0, hr);
+            fprintf(stderr, "frt-repack: head online N=%lld K=%lld alpha=%g\n", (long long) N, (long long) K, (double) alpha);
+            g_head.ok = true;
+        } else {
+            cudaFree(g_head.d_packed); cudaFree(g_head.d_sf);
+            g_head.d_packed = nullptr; g_head.d_sf = nullptr;
+        }
+    }
+
+    const bool head_pending = (getenv("FRT_HEAD_SWAP") || getenv("FRT_HEAD_DRAFT")) && !g_head.ok;
+    const bool k0_pending = g_reg.inproj_on && built_k0 < 30;
+    const bool k1_pending = g_reg.attn_on && built_k1 < 10;
+    if (!head_pending && !k0_pending && !k1_pending) {
+        fprintf(stderr, "frt-repack: online repack complete (kind0=%d kind1=%d head=%d)\n",
+                built_k0, built_k1, (int) g_head.ok);
+        all_done = true;
+    }
 }
 
 } // namespace frt
@@ -2352,4 +2707,11 @@ bool ggml_cuda_frt_head_mul_mat(ggml_backend_cuda_context & ctx,
     frt::frt_ws_launch(frt::g_head.d_apack, frt::g_head.d_packed, frt::g_head.d_sfa, frt::g_head.d_sf,
         out, frt::g_head.alpha, (int) N, (int) K, M, stream, 44);   // head: s4w4 wins (+6 t/s)
     return true;
+}
+
+// Pre-capture hook: called at the start of every backend graph evaluation,
+// before any CUDA graph capture can begin. Builds online-repacked weight
+// buffers (FRT_ONLINE_REPACK=1) so no allocation ever happens mid-capture.
+void ggml_cuda_frt_prepare(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph) {
+    frt::frt_online_prepare(ctx, cgraph);
 }

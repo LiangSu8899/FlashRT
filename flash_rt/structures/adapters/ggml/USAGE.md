@@ -92,8 +92,16 @@ FRT_GDN_SWAP=1 FRT_MOEGLUE_SWAP=1 FRT_MOEFUSE_SWAP=1 FRT_MOEFUSE_SHEXP=1
 FRT_OUTNATIVE_SWAP=1 FRT_REGIONS_PACK=<pack>`; full tier adds
 `FRT_HEAD_SWAP=1 FRT_HEAD_PACK=<pack>`. Speculative serving adds
 `FRT_HEAD_DRAFT=1` (safe tier: FP4-serve only the draft's head copy) and the
-host-side `LLAMA_GRAPH_SLOTS=6` + `--backend-sampling`. FP4 weights currently
-come from side-band packs; replacing them with the in-process repack cache is
-the next step for this target. Diagnostics: `FRT_STATS=1`,
-`FRT_MOEFUSE_DBG=<n>`, `FRT_MOEFUSE_SELFTEST=1`, `FRT_DUMP_GRAPH=1` +
-`FRT_DUMP_M=<m>` (+ `FRT_DUMP_PATH`).
+host-side `LLAMA_GRAPH_SLOTS=6` + `--backend-sampling`.
+
+FP4 region weights repack **in-process** with `FRT_ONLINE_REPACK=1` (leave
+`FRT_REGIONS_PACK` unset): the pre-capture hook dequantizes the GGUF members
+on device and rebuilds the wire format byte-identically to the offline packer
+(validated by `FRT_REPACK_CHECK=1` with `FRT_REGIONS_PACK_REF=<file>`). The
+lm-head is the exception: the shipped head pack is quantized from the BF16
+checkpoint (the GGUF only holds Q6_K), and the BF16-sourced pack drafts and
+scores measurably better than an online Q6_K-sourced rebuild — keep
+`FRT_HEAD_PACK` for the head (both tiers); the online head build is a
+fallback only. Diagnostics: `FRT_STATS=1`, `FRT_MOEFUSE_DBG=<n>`,
+`FRT_MOEFUSE_SELFTEST=1`, `FRT_DUMP_GRAPH=1` + `FRT_DUMP_M=<m>`
+(+ `FRT_DUMP_PATH`).
