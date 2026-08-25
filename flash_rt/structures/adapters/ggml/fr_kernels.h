@@ -130,11 +130,13 @@ int layer_norm_affine_quant(const float * x, const float * w, const float * b,
 int layer_norm_affine(const float * x, const float * w, const float * b,
                       float * out, int M, int C, float eps, cudaStream_t stream);
 
-// Decomposed tiny-M attention: batched QK^T (f16, GQA heads share the
-// stride-0 K operand) + masked softmax + batched PV with fp32 output
-// written directly in the [hd, n_head, n_tok] layout via strided C.
-// q strides are in elements; workspaces: q16 [n_head*n_tok, hd] f16,
-// scores [n_head*n_tok, n_kv] f16. cublas_handle is a cublasHandle_t.
+// Decomposed tiny-M attention: one QK^T GEMM over all n_head*n_tok query
+// rows (f16, the GQA heads share the single K operand) + masked softmax +
+// one PV GEMM whose fp32 output is the dense [hd, n_head, n_tok] dst
+// (rows ordered t-major so the store is contiguous; requires
+// dst_shead == hd and dst_stok == hd*n_head). q strides are in elements;
+// workspaces: q16 [n_tok*n_head, hd] f16, scores [n_tok*n_head, n_kv]
+// f16. cublas_handle is a cublasHandle_t.
 int decode_attn_decomposed(void * cublas_handle,
                            const float * q, int64_t q_sd, int64_t q_stok, int64_t q_shead,
                            const void * k_f16_rows, const void * v_f16_rows,

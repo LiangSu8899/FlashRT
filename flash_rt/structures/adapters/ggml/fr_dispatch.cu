@@ -1521,7 +1521,9 @@ bool ggml_cuda_flashrt_should_fuse_dec_attn(const ggml_tensor * fa) {
     }
     if (fa->type != GGML_TYPE_F32 || fa->ne[0] != hd || fa->ne[1] != n_head ||
         fa->ne[2] != n_tok || fa->nb[0] != sizeof(float) ||
-        (int64_t) fa->nb[1] != hd * (int64_t) sizeof(float)) {
+        (int64_t) fa->nb[1] != hd * (int64_t) sizeof(float) ||
+        // the PV GEMM stores its result as one dense column-block
+        (int64_t) fa->nb[2] != hd * n_head * (int64_t) sizeof(float)) {
         return false;
     }
     float max_bias, softcap;
