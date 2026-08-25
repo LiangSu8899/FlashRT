@@ -156,4 +156,13 @@ int decode_attn_decomposed(void * cublas_handle,
 // out[i] = a[i] + b[i] for n fp32 elements.
 int vec_add_f32(const float * a, const float * b, float * out, int n, cudaStream_t stream);
 
+// Batched f32->f16 row copies: for each pair p, dst[p][r*hd + i] =
+// (half) src[p][r*hd + i] over n_rows rows of hd elements. One launch
+// replaces up to FR_CPY_ROWS_MAX individual copy kernels (the persistent
+// encoder-KV stores at the prefill graph tail). Rounding matches ggml's
+// f32->f16 cpy exactly.
+#define FR_CPY_ROWS_MAX 40
+int cpy_rows_f32_f16(const float * const * srcs, void * const * dsts, int n_pairs,
+                     int hd, int n_rows, cudaStream_t stream);
+
 } // namespace ggml_cuda_flashrt

@@ -413,4 +413,46 @@ int repack_weight(const void * ggml_blocks, void * dst_packed, void * dst_sf,
     return (e == cudaSuccess) ? 0 : -static_cast<int>(e);
 }
 
+namespace {
+
+struct cpy_rows_pair {
+    const float * src;
+    __half      * dst;
+};
+
+struct cpy_rows_args {
+    cpy_rows_pair pairs[FR_CPY_ROWS_MAX];
+};
+
+// one y-slice of rows per pair; conversion identical to ggml's f32->f16 cpy
+__global__ void kernel_cpy_rows_f32_f16(cpy_rows_args args, int hd, int n_rows) {
+    const cpy_rows_pair p = args.pairs[blockIdx.x];
+    for (int r = blockIdx.y; r < n_rows; r += gridDim.y) {
+        const float * s = p.src + (int64_t) r * hd;
+        __half      * d = p.dst + (int64_t) r * hd;
+        for (int i = threadIdx.x; i < hd; i += blockDim.x) {
+            d[i] = __float2half(s[i]);
+        }
+    }
+}
+
+} // namespace
+
+int cpy_rows_f32_f16(const float * const * srcs, void * const * dsts, int n_pairs,
+                     int hd, int n_rows, cudaStream_t stream) {
+    if (n_pairs < 1 || n_pairs > FR_CPY_ROWS_MAX) {
+        return -1;
+    }
+    cpy_rows_args args;
+    for (int i = 0; i < n_pairs; ++i) {
+        args.pairs[i].src = srcs[i];
+        args.pairs[i].dst = (__half *) dsts[i];
+    }
+    const int rows_y = n_rows < 64 ? n_rows : 64;
+    dim3 grid(n_pairs, rows_y);
+    kernel_cpy_rows_f32_f16<<<grid, 128, 0, stream>>>(args, hd, n_rows);
+    const cudaError_t e = cudaGetLastError();
+    return (e == cudaSuccess) ? 0 : -static_cast<int>(e);
+}
+
 } // namespace ggml_cuda_flashrt

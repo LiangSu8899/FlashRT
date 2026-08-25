@@ -1621,6 +1621,64 @@ void ggml_cuda_flashrt_dec_attn(ggml_backend_cuda_context & ctx, ggml_tensor * f
     }
 }
 
+// ── Batched persistent-KV tail copies ───────────────────────────────────────
+// The prefill graph ends with one f32->f16 row-copy per layer and KV tensor
+// into the persistent encoder-KV buffers. Each is a tiny kernel; a run of
+// them batches into a single launch with identical rounding.
+bool ggml_cuda_flashrt_kv_tail_cpy_ok(const ggml_tensor * cpy, int64_t * hd, int64_t * n_rows) {
+    static const bool disabled = getenv("GGML_FLASHRT_NO_KV_TAIL") != nullptr;
+    if (disabled) {
+        return false;
+    }
+    const ggml_tensor * src = cpy->src[0];
+    if (cpy->op != GGML_OP_CPY || src == nullptr || cpy->src[1] == nullptr) {
+        return false;
+    }
+    if (src->type != GGML_TYPE_F32 || cpy->type != GGML_TYPE_F16 ||
+        cpy->src[1]->type != GGML_TYPE_F16) {
+        return false;
+    }
+    const int64_t d = src->ne[0];
+    const int64_t r = src->ne[2];
+    if (src->ne[1] != 1 || src->ne[3] != 1 || d % 2 != 0 ||
+        cpy->ne[0] != d || cpy->ne[1] != 1 || cpy->ne[2] != r || cpy->ne[3] != 1) {
+        return false;
+    }
+    // contiguous rows on both sides (row stride == hd elements)
+    if (src->nb[0] != sizeof(float) || (int64_t) src->nb[2] != d * (int64_t) sizeof(float) ||
+        cpy->nb[0] != sizeof(uint16_t) || (int64_t) cpy->nb[2] != d * (int64_t) sizeof(uint16_t)) {
+        return false;
+    }
+    if (*hd == 0) {
+        *hd     = d;
+        *n_rows = r;
+    } else if (*hd != d || *n_rows != r) {
+        return false;
+    }
+    return true;
+}
+
+bool ggml_cuda_flashrt_kv_tail_cpy(ggml_backend_cuda_context & ctx, ggml_tensor ** cpys, int n) {
+    if (n < 1 || n > FR_CPY_ROWS_MAX) {
+        return false;
+    }
+    const float * srcs[FR_CPY_ROWS_MAX];
+    void        * dsts[FR_CPY_ROWS_MAX];
+    for (int i = 0; i < n; ++i) {
+        srcs[i] = (const float *) cpys[i]->src[0]->data;
+        dsts[i] = cpys[i]->data;
+    }
+    const int64_t hd     = cpys[0]->ne[0];
+    const int64_t n_rows = cpys[0]->ne[2];
+    const int rc = ggml_cuda_flashrt::cpy_rows_f32_f16(
+        srcs, dsts, n, (int) hd, (int) n_rows, ctx.stream());
+    if (rc != 0) {
+        GGML_ABORT("flashrt: batched kv tail copy failed (n=%d hd=%lld rows=%lld rc=%d)",
+                   n, (long long) hd, (long long) n_rows, rc);
+    }
+    return true;
+}
+
 // ── Gemma-style norm fold: {RMS_NORM, MUL(w), ADD(mul, norm)} ────────────────
 // out = rms_norm(x)*w + rms_norm(x) == rms_norm(x)*(1 + w): the adaLN
 // modulate kernel with scale = w and shift = 0. ggml's own fused rms_norm

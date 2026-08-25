@@ -125,6 +125,14 @@ void ggml_cuda_flashrt_qkv_prefill(ggml_backend_cuda_context & ctx,
         const ggml_tensor * v_mm,
         ggml_tensor * k_cpy, ggml_tensor * v_cpy);
 
+// Run of terminal f32->f16 row-copy CPY nodes (the persistent encoder-KV
+// stores at the prefill graph tail) batched into one kernel launch. A node
+// qualifies when it copies [hd, 1, n_rows] contiguous f32 rows into
+// contiguous f16 rows and nothing reads the copy back inside the graph;
+// all nodes of one batch share hd and n_rows.
+bool ggml_cuda_flashrt_kv_tail_cpy_ok(const ggml_tensor * cpy, int64_t * hd, int64_t * n_rows);
+bool ggml_cuda_flashrt_kv_tail_cpy(ggml_backend_cuda_context & ctx, ggml_tensor ** cpys, int n);
+
 // {RMS_NORM, MUL(w), ADD(mul, norm)} -> rms_norm(x)*(1+w) in one kernel.
 // The execute returns false (run unfused) only when its zero-vector cache
 // cannot allocate during graph capture.
