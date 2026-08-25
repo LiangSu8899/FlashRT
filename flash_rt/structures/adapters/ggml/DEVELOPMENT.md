@@ -111,3 +111,38 @@ belong in `csrc/` or the structures catalog so every host adapter
 inherits them; this directory only translates. Nothing here may be
 copy-pasted into a host tree, and the host integration must stay behind
 its own opt-in build flag so stock builds are unaffected.
+
+## SM120 target: additional invariants (LLM decode, speculative)
+
+Learned on the Qwen3.6-35B window set; they generalize to any stateful or
+speculative host integration.
+
+- **Host launch overlap is a capability, not a constant.** llama.cpp's CUDA
+  backend overlaps every launch through programmatic dependent launch
+  (sm90+); on such a host every adapter kernel must join the chain (device
+  trigger/sync + the launch attribute) or it stalls the pipeline — and once
+  the chain holds, pure launch-count reduction has near-zero marginal value,
+  so fusions must win on memory round-trips, byte reduction, or batch size.
+  On hosts without PDL the same fusions re-rank. Treat PDL as a per-target
+  capability flag (the csrc entries take a `pdl` bool).
+- **Runtime dimensions out of hot loops.** A token-batch count as a kernel
+  argument instead of a template parameter costs measurable time even when
+  the value is 1; heavier instantiations degrade more. Dispatch runtime M
+  onto compile-time specializations at the launch boundary.
+- **Speculative verify batches are a correctness regime, not a batch size.**
+  Stateful regions (recurrent state, conv windows) must write per-token
+  snapshots and leave the source slot pristine so the host can roll back to
+  any accepted position; in-place update produces degenerate output with
+  *inflated* acceptance and throughput, and perplexity-style gates do not
+  cover the speculative graphs at all. Judge on end-to-end text plus a
+  duplicated-token bit-exact replay across batch variants.
+- **Zero-sized graph nodes can become real.** Checkpoint save nodes sit in
+  the host graph at zero size on most steps and materialize on checkpoint
+  steps; a region that silently skips them corrupts rollback invisibly.
+  Replay them inside the region or decline the whole span.
+- **A second model shares the host's name scheme.** The speculative draft
+  model's tensors reuse the target's naming at shifted layer indices and can
+  collide with window/pack shapes; anything swept in from the draft model is
+  an acceptance-only substitution (never output-visible), but it is a
+  separate judgment — gate it explicitly instead of letting shape
+  coincidence decide.

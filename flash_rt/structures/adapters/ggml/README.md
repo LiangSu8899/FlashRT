@@ -70,3 +70,19 @@ Numerics: the adapter is bitwise deterministic across processes after
 warmup; changes are gated by an exact e2e action golden plus a
 real-observation parity protocol against an f16 reference (see
 TESTING.md).
+
+## Second target: RTX 5090 (SM120) + Qwen3.6-35B-A3B
+
+`fr_win_qwen36_sm120.cu` carries the adapter's second (arch, model-family)
+target: an LLM decode window set for the Qwen3.6 hybrid (GDN + attention,
+256-expert MoE, MTP speculative decode) on SM120, consuming ggml's native
+K-quant weights in place plus NVFP4 W4A4 fused regions. It follows the same
+two-half discipline with one deliberate difference: its MoE/out-proj/router
+kernels reproduce ggml's mmvq numerics through ggml's own `vec_dot_*_q8_1`
+device functions (bit-exact q8_1 activation clone), so those kernels live in
+the ggml-facing half by construction. Windows are M<=4 aware (speculative
+verify batches) and carry the recurrent-state snapshot/checkpoint discipline
+documented in DEVELOPMENT.md.
+
+Binding: `flash_rt/structures/bindings/llamacpp_qwen36_35b_sm120.yaml`;
+gates: `qualification/pins_qwen36_sm120.yaml`.
