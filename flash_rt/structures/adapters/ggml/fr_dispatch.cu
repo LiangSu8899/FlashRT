@@ -1830,6 +1830,102 @@ void ggml_cuda_flashrt_vit_fa4_depad(ggml_backend_cuda_context & ctx, ggml_tenso
 #endif // GGML_CUDA_FLASHRT_FA4
 }
 
+// ── pi0.5 prefill self-attention via the AOT FA4 module ────────────────────
+// FLASH_ATTN_EXT with head_dim 256, one f16 KV head of contiguous token
+// rows and an f16 mask. The pi0.5 prefill is a prefix-LM: full attention
+// with a row-uniform pad-only mask, and the real KV length equals the
+// query count (self-attention), so slicing the padded KV to S reproduces
+// the mask exactly. The shape gate (hd 256, S >= 64, padded KV) is
+// specific to that graph; GGML_FLASHRT_NO_PREFILL_FA4 disables the window.
+bool ggml_cuda_flashrt_should_fuse_prefill_fa4(const ggml_tensor * fa, ggml_backend_cuda_context & ctx) {
+#ifndef GGML_CUDA_FLASHRT_FA4
+    GGML_UNUSED(fa); GGML_UNUSED(ctx);
+    return false;
+#else
+    static const bool disabled = getenv("GGML_FLASHRT_NO_PREFILL_FA4") != nullptr;
+    if (disabled) {
+        return false;
+    }
+    const ggml_tensor * q    = fa->src[0];
+    const ggml_tensor * k    = fa->src[1];
+    const ggml_tensor * v    = fa->src[2];
+    const ggml_tensor * mask = fa->src[3];
+    if (q == nullptr || k == nullptr || v == nullptr || mask == nullptr ||
+        fa->src[4] != nullptr) {
+        return false;
+    }
+    const int64_t hd = q->ne[0];
+    const int64_t S  = q->ne[1];
+    const int64_t H  = q->ne[2];
+    if (hd != 256 || S < 64 || H < 2 || q->ne[3] != 1 || q->type != GGML_TYPE_F32) {
+        return false;
+    }
+    // Q: permuted view over the dense (S, H, D) f32 buffer
+    if (q->nb[0] != sizeof(float) ||
+        (int64_t) q->nb[2] != hd * (int64_t) sizeof(float) ||
+        (int64_t) q->nb[1] != hd * H * (int64_t) sizeof(float)) {
+        return false;
+    }
+    // K/V: one head of contiguous f16 token rows, padded to a multiple of
+    // 256 covering exactly S (the pi0.5 prefill padding scheme)
+    const int64_t SK = k->ne[1];
+    if (SK < S || SK % 256 != 0 || SK - S >= 256) {
+        return false;
+    }
+    for (const ggml_tensor * kv : { k, v }) {
+        if (kv->type != GGML_TYPE_F16 || kv->ne[0] != hd || kv->ne[1] != SK ||
+            kv->ne[2] != 1 || kv->ne[3] != 1 ||
+            kv->nb[0] != sizeof(uint16_t) ||
+            (int64_t) kv->nb[1] != hd * (int64_t) sizeof(uint16_t)) {
+            return false;
+        }
+    }
+    if (mask->type != GGML_TYPE_F16 || mask->ne[0] < SK || mask->ne[1] < S) {
+        return false;
+    }
+    // dst: contiguous [hd, H, S] f32 — the same dense linear layout
+    if (fa->type != GGML_TYPE_F32 || fa->ne[0] != hd || fa->ne[1] != H ||
+        fa->ne[2] != S || fa->ne[3] != 1 || fa->nb[0] != sizeof(float) ||
+        (int64_t) fa->nb[1] != hd * (int64_t) sizeof(float) ||
+        (int64_t) fa->nb[2] != hd * H * (int64_t) sizeof(float)) {
+        return false;
+    }
+    float max_bias, softcap;
+    memcpy(&max_bias, (const float *) fa->op_params + 1, sizeof(float));
+    memcpy(&softcap,  (const float *) fa->op_params + 2, sizeof(float));
+    if (max_bias != 0.0f || softcap != 0.0f) {
+        return false;
+    }
+    return ggml_cuda_flashrt::fa4_vit_ensure_loaded(ctx.stream()) == 0;
+#endif // GGML_CUDA_FLASHRT_FA4
+}
+
+void ggml_cuda_flashrt_prefill_fa4(ggml_backend_cuda_context & ctx, ggml_tensor * fa) {
+#ifndef GGML_CUDA_FLASHRT_FA4
+    GGML_UNUSED(ctx); GGML_UNUSED(fa);
+    GGML_ABORT("flashrt: FA4 prefill attention not built");
+#else
+    const ggml_tensor * q = fa->src[0];
+    const int S = (int) q->ne[1];
+    const int H = (int) q->ne[2];
+    const int D = (int) q->ne[0];
+    float scale;
+    memcpy(&scale, (const float *) fa->op_params + 0, sizeof(float));
+
+    const int64_t n = (int64_t) S * H * D;
+    ggml_cuda_pool_alloc<uint8_t> q16(ctx.pool(), n * sizeof(uint16_t));
+    ggml_cuda_pool_alloc<uint8_t> o16(ctx.pool(), n * sizeof(uint16_t));
+
+    const int rc = ggml_cuda_flashrt::fa4_prefill_attention(
+        (const float *) q->data, fa->src[1]->data, fa->src[2]->data,
+        (float *) fa->data, q16.get(), o16.get(),
+        S, H, D, scale, ctx.stream());
+    if (rc != 0) {
+        GGML_ABORT("flashrt: FA4 prefill attention failed (S=%d H=%d rc=%d)", S, H, rc);
+    }
+#endif // GGML_CUDA_FLASHRT_FA4
+}
+
 // ── Gemma-style norm fold: {RMS_NORM, MUL(w), ADD(mul, norm)} ────────────────
 // out = rms_norm(x)*w + rms_norm(x) == rms_norm(x)*(1 + w): the adaLN
 // modulate kernel with scale = w and shift = 0. ggml's own fused rms_norm

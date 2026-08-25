@@ -127,6 +127,13 @@ bool ggml_cuda_flashrt_should_fuse_vit_fa4_depad(const ggml_tensor * fa, const g
 void ggml_cuda_flashrt_vit_fa4_depad(ggml_backend_cuda_context & ctx, ggml_tensor * fa,
                                      const ggml_tensor * view, ggml_tensor * cont);
 
+// pi0.5 prefill self-attention (head_dim 256, GQA 1 KV head, full
+// attention with a row-uniform pad mask) through the second AOT FA4
+// module. The window assumes the prefix-LM mask semantics of the pi0.5
+// prefill graph (see the dispatch-side checks).
+bool ggml_cuda_flashrt_should_fuse_prefill_fa4(const ggml_tensor * fa, ggml_backend_cuda_context & ctx);
+void ggml_cuda_flashrt_prefill_fa4(ggml_backend_cuda_context & ctx, ggml_tensor * fa);
+
 // Prefill fused QKV window: q mm->reshape->rope->scale, k mm->reshape->rope->
 // pad, v mm->reshape->pad, each pad permuted+copied into a padded f16 tensor
 // of token rows. One fused GEMM + qkv_post + pad-row zeroing.

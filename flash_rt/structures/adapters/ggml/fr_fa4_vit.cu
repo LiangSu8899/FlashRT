@@ -15,6 +15,7 @@
 #include "fr_kernels.h"
 
 #include "fa4_aot/fa4_siglip_fwd.h"
+#include "fa4_aot/fa4_prefill_fwd.h"
 
 #include <cuda_fp16.h>
 
@@ -56,6 +57,9 @@ __global__ void kernel_f16_to_f32_depad(const __half * __restrict__ src,
 fa4_siglip_fwd_Kernel_Module_t g_fa4_module;
 bool g_fa4_loaded = false;
 
+fa4_prefill_fwd_Kernel_Module_t g_fa4p_module;
+bool g_fa4p_loaded = false;
+
 } // namespace
 
 // Loads the AOT module once; must not run during CUDA graph capture (the
@@ -70,12 +74,65 @@ int fa4_vit_ensure_loaded(cudaStream_t stream) {
         return -1;
     }
     fa4_siglip_fwd_Kernel_Module_Load(&g_fa4_module);
-    const cudaError_t e = cudaGetLastError();
+    cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         return -static_cast<int>(e);
     }
     g_fa4_loaded = true;
+    fa4_prefill_fwd_Kernel_Module_Load(&g_fa4p_module);
+    e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        return -static_cast<int>(e);
+    }
+    g_fa4p_loaded = true;
     return 0;
+}
+
+// Full (non-causal) self-attention for the pi0.5 prefill: hd-256 GQA FA4.
+// q_f32/dst_f32 dense (1, S, H, D); k16/v16 are the first S contiguous
+// [D]-rows of the (possibly padded) f16 KV buffers, one KV head.
+// The padded tail rows are simply outside the dynamic shape, which is
+// exactly the graph's row-uniform pad mask.
+int fa4_prefill_attention(const float * q_f32, const void * k16, const void * v16,
+                          float * dst_f32, void * q16_ws, void * o16_ws,
+                          int S, int H, int D, float scale,
+                          cudaStream_t stream) {
+    if (!g_fa4p_loaded) {
+        return -1;
+    }
+    const int64_t n = (int64_t) S * H * D;
+    const int threads = 256;
+    const int64_t blocks = (n + threads - 1) / threads;
+
+    kernel_f32_to_f16_dense<<<(unsigned) blocks, threads, 0, stream>>>(
+        q_f32, (__half *) q16_ws, n);
+
+    auto fill_q = [&](void * data, auto * t, int heads) {
+        t->data = data;
+        t->dynamic_shapes[0] = 1;
+        t->dynamic_shapes[1] = S;
+        t->dynamic_shapes[2] = heads;
+        t->dynamic_shapes[3] = D;
+        t->dynamic_strides[0] = (int64_t) S * heads * D;
+        t->dynamic_strides[1] = (int64_t) heads * D;
+        t->dynamic_strides[2] = D;
+    };
+    fa4_prefill_fwd_Tensor_mQ_t tq; fill_q(q16_ws, &tq, H);
+    fa4_prefill_fwd_Tensor_mK_t tk; fill_q(const_cast<void *>(k16), &tk, 1);
+    fa4_prefill_fwd_Tensor_mV_t tv; fill_q(const_cast<void *>(v16), &tv, 1);
+    fa4_prefill_fwd_Tensor_mO_t to; fill_q(o16_ws, &to, H);
+
+    const int32_t rc = cute_dsl_fa4_prefill_fwd_wrapper(
+        &g_fa4p_module, &tq, &tk, &tv, &to, scale, stream);
+    if (rc != 0) {
+        return -1000 - rc;
+    }
+
+    kernel_f16_to_f32_dense<<<(unsigned) blocks, threads, 0, stream>>>(
+        (const __half *) o16_ws, dst_f32, n);
+
+    const cudaError_t e2 = cudaGetLastError();
+    return (e2 == cudaSuccess) ? 0 : -static_cast<int>(e2);
 }
 
 // q_f32: dense (B,S,H,D); k16/v16: dense f16 same layout. When d_out == D

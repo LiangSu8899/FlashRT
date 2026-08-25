@@ -168,6 +168,15 @@ int fa4_vit_attention(const float * q_f32, const void * k16, const void * v16,
                       int B, int S, int H, int D, float scale,
                       cudaStream_t stream);
 
+// Full (non-causal) self-attention for the pi0.5 prefill via a second AOT
+// FA4 module (head_dim 256, GQA with one KV head). k16/v16 are the first S
+// contiguous rows of the padded f16 KV buffers; the pad rows lie outside
+// the dynamic shape, which reproduces the row-uniform pad mask exactly.
+int fa4_prefill_attention(const float * q_f32, const void * k16, const void * v16,
+                          float * dst_f32, void * q16_ws, void * o16_ws,
+                          int S, int H, int D, float scale,
+                          cudaStream_t stream);
+
 // Batched f32->f16 row copies: for each pair p, dst[p][r*hd + i] =
 // (half) src[p][r*hd + i] over n_rows rows of hd elements. One launch
 // replaces up to FR_CPY_ROWS_MAX individual copy kernels (the persistent

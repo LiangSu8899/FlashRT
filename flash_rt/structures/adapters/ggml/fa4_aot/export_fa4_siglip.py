@@ -51,6 +51,7 @@ def _compile_no_ffi(*args, **kwargs):
 ifw.cute.compile = _compile_no_ffi
 ifw._flash_attn_fwd.compile_cache.clear()
 
+# vision attention: padded head_dim 80, MHA
 NV, SQ, NH, HD = 2, 256, 16, 80
 q = torch.zeros(NV, SQ, NH, HD, dtype=torch.float16, device="cuda")
 k = torch.zeros_like(q)
@@ -61,4 +62,19 @@ torch.cuda.synchronize()
 
 assert _holder, "FA4 compile did not run"
 _holder[0].export_to_c(str(_HERE), "fa4_siglip_fwd")
-print("exported:", sorted(p.name for p in _HERE.glob("fa4_siglip_fwd.*")))
+
+# prefill self-attention: head_dim 256, GQA with one KV head
+_holder.clear()
+ifw._flash_attn_fwd.compile_cache.clear()
+B, SQ2, HQ, HK, HD2 = 1, 559, 8, 1, 256
+q2 = torch.zeros(B, SQ2, HQ, HD2, dtype=torch.float16, device="cuda")
+k2 = torch.zeros(B, SQ2, HK, HD2, dtype=torch.float16, device="cuda")
+v2 = torch.zeros_like(k2)
+out2 = torch.empty_like(q2)
+fwd(q2, k2, v2, softmax_scale=HD2 ** -0.5, causal=False,
+    num_splits=1, pack_gqa=True, out=out2)
+torch.cuda.synchronize()
+
+assert _holder, "FA4 prefill compile did not run"
+_holder[0].export_to_c(str(_HERE), "fa4_prefill_fwd")
+print("exported:", sorted(p.name for p in _HERE.glob("fa4_*_fwd.*")))
