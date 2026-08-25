@@ -1679,6 +1679,96 @@ bool ggml_cuda_flashrt_kv_tail_cpy(ggml_backend_cuda_context & ctx, ggml_tensor 
     return true;
 }
 
+// ── SigLIP vision attention via the AOT FlashAttention-4 module ─────────────
+// FLASH_ATTN_EXT with head_dim 80, no mask, f32 Q and f16 K/V whose padded
+// buffers all share the dense (B, S, H, D) linear layout. Runs as a dense
+// f32->f16 Q convert + the FA4 forward + a dense f16->f32 output convert.
+bool ggml_cuda_flashrt_should_fuse_vit_fa4(const ggml_tensor * fa, ggml_backend_cuda_context & ctx) {
+#ifndef GGML_CUDA_FLASHRT_FA4
+    GGML_UNUSED(fa); GGML_UNUSED(ctx);
+    return false;
+#else
+    static const bool disabled = getenv("GGML_FLASHRT_NO_VIT_FA4") != nullptr;
+    if (disabled) {
+        return false;
+    }
+    const ggml_tensor * q = fa->src[0];
+    const ggml_tensor * k = fa->src[1];
+    const ggml_tensor * v = fa->src[2];
+    if (q == nullptr || k == nullptr || v == nullptr ||
+        fa->src[3] != nullptr || fa->src[4] != nullptr) {  // no mask, no sinks
+        return false;
+    }
+    const int64_t hd = q->ne[0];
+    const int64_t S  = q->ne[1];
+    const int64_t H  = q->ne[2];
+    const int64_t B  = q->ne[3];
+    if (hd != 80 || S < 32 || H < 1 || B < 1 || q->type != GGML_TYPE_F32) {
+        return false;
+    }
+    // Q: permuted view over the dense (B, S, H, D) f32 buffer
+    if (q->nb[0] != sizeof(float) ||
+        (int64_t) q->nb[2] != hd * (int64_t) sizeof(float) ||
+        (int64_t) q->nb[1] != hd * H * (int64_t) sizeof(float) ||
+        (int64_t) q->nb[3] != hd * H * S * (int64_t) sizeof(float)) {
+        return false;
+    }
+    for (const ggml_tensor * kv : { k, v }) {
+        if (kv->type != GGML_TYPE_F16 || kv->ne[0] != hd || kv->ne[1] != S ||
+            kv->ne[2] != H || kv->ne[3] != B ||
+            kv->nb[0] != sizeof(uint16_t) ||
+            (int64_t) kv->nb[2] != hd * (int64_t) sizeof(uint16_t) ||
+            (int64_t) kv->nb[1] != hd * H * (int64_t) sizeof(uint16_t) ||
+            (int64_t) kv->nb[3] != hd * H * S * (int64_t) sizeof(uint16_t)) {
+            return false;
+        }
+    }
+    // dst: contiguous [hd, H, S, B] f32 — the same linear layout
+    if (fa->type != GGML_TYPE_F32 || fa->ne[0] != hd || fa->ne[1] != H ||
+        fa->ne[2] != S || fa->ne[3] != B || fa->nb[0] != sizeof(float) ||
+        (int64_t) fa->nb[1] != hd * (int64_t) sizeof(float) ||
+        (int64_t) fa->nb[2] != hd * H * (int64_t) sizeof(float) ||
+        (int64_t) fa->nb[3] != hd * H * S * (int64_t) sizeof(float)) {
+        return false;
+    }
+    float max_bias, softcap;
+    memcpy(&max_bias, (const float *) fa->op_params + 1, sizeof(float));
+    memcpy(&softcap,  (const float *) fa->op_params + 2, sizeof(float));
+    if (max_bias != 0.0f || softcap != 0.0f) {
+        return false;
+    }
+    // module load must happen outside CUDA graph capture; fall back until then
+    return ggml_cuda_flashrt::fa4_vit_ensure_loaded(ctx.stream()) == 0;
+#endif // GGML_CUDA_FLASHRT_FA4
+}
+
+void ggml_cuda_flashrt_vit_fa4(ggml_backend_cuda_context & ctx, ggml_tensor * fa) {
+#ifndef GGML_CUDA_FLASHRT_FA4
+    GGML_UNUSED(ctx); GGML_UNUSED(fa);
+    GGML_ABORT("flashrt: FA4 vision attention not built");
+#else
+    const ggml_tensor * q = fa->src[0];
+    const int B = (int) q->ne[3];
+    const int S = (int) q->ne[1];
+    const int H = (int) q->ne[2];
+    const int D = (int) q->ne[0];
+    float scale;
+    memcpy(&scale, (const float *) fa->op_params + 0, sizeof(float));
+
+    const int64_t n = (int64_t) B * S * H * D;
+    ggml_cuda_pool_alloc<uint8_t> q16(ctx.pool(), n * sizeof(uint16_t));
+    ggml_cuda_pool_alloc<uint8_t> o16(ctx.pool(), n * sizeof(uint16_t));
+
+    const int rc = ggml_cuda_flashrt::fa4_vit_attention(
+        (const float *) q->data, fa->src[1]->data, fa->src[2]->data,
+        (float *) fa->data, q16.get(), o16.get(),
+        B, S, H, D, scale, ctx.stream());
+    if (rc != 0) {
+        GGML_ABORT("flashrt: FA4 vision attention failed (B=%d S=%d H=%d rc=%d)", B, S, H, rc);
+    }
+#endif // GGML_CUDA_FLASHRT_FA4
+}
+
 // ── Gemma-style norm fold: {RMS_NORM, MUL(w), ADD(mul, norm)} ────────────────
 // out = rms_norm(x)*w + rms_norm(x) == rms_norm(x)*(1 + w): the adaLN
 // modulate kernel with scale = w and shift = 0. ggml's own fused rms_norm
@@ -1738,4 +1828,9 @@ bool ggml_cuda_flashrt_rms_gemma(ggml_backend_cuda_context & ctx, const ggml_ten
 
 void ggml_cuda_flashrt_begin_eval() {
     g_eval_id++;
+#ifdef GGML_CUDA_FLASHRT_FA4
+    // begin_eval runs before any CUDA graph capture starts, so the AOT
+    // module load never has to race a capturing first evaluation
+    ggml_cuda_flashrt::fa4_vit_ensure_loaded(nullptr);
+#endif // GGML_CUDA_FLASHRT_FA4
 }

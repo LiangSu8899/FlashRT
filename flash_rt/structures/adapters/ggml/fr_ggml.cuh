@@ -111,6 +111,13 @@ void ggml_cuda_flashrt_gated_residual(ggml_backend_cuda_context & ctx, const ggm
 bool ggml_cuda_flashrt_should_fuse_dec_attn(const ggml_tensor * fa);
 void ggml_cuda_flashrt_dec_attn(ggml_backend_cuda_context & ctx, ggml_tensor * fa);
 
+// SigLIP vision attention through the AOT FlashAttention-4 module
+// (head_dim 80, no mask). Only available when the adapter was built with
+// the fa4_aot artifacts; the first use loads the module (falls back if
+// that first use happens during CUDA graph capture).
+bool ggml_cuda_flashrt_should_fuse_vit_fa4(const ggml_tensor * fa, ggml_backend_cuda_context & ctx);
+void ggml_cuda_flashrt_vit_fa4(ggml_backend_cuda_context & ctx, ggml_tensor * fa);
+
 // Prefill fused QKV window: q mm->reshape->rope->scale, k mm->reshape->rope->
 // pad, v mm->reshape->pad, each pad permuted+copied into a padded f16 tensor
 // of token rows. One fused GEMM + qkv_post + pad-row zeroing.

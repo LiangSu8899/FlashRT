@@ -156,6 +156,16 @@ int decode_attn_decomposed(void * cublas_handle,
 // out[i] = a[i] + b[i] for n fp32 elements.
 int vec_add_f32(const float * a, const float * b, float * out, int n, cudaStream_t stream);
 
+// AOT FlashAttention-4 for the SigLIP vision attention (head_dim 80).
+// ensure_loaded loads the vendored module once (fails during CUDA graph
+// capture: fall back). attention runs f32->f16 Q convert + FA4 + f16->f32
+// output convert; all tensors dense (B,S,H,D) as one linear buffer.
+int fa4_vit_ensure_loaded(cudaStream_t stream);
+int fa4_vit_attention(const float * q_f32, const void * k16, const void * v16,
+                      float * dst_f32, void * q16_ws, void * o16_ws,
+                      int B, int S, int H, int D, float scale,
+                      cudaStream_t stream);
+
 // Batched f32->f16 row copies: for each pair p, dst[p][r*hd + i] =
 // (half) src[p][r*hd + i] over n_rows rows of hd elements. One launch
 // replaces up to FR_CPY_ROWS_MAX individual copy kernels (the persistent
