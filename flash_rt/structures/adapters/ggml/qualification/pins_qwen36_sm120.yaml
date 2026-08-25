@@ -28,8 +28,21 @@ gates:
     repack_check: byte_identical      # FRT_REPACK_CHECK=1 vs the offline packs (regions)
     spec_text_check: required         # greedy spec output must be coherent text, never judged by tps alone
   perf:
-    tg128_full_tier_bench: 377.8      # llama-bench r=5, full-tier env
+    tg128_full_tier_bench: 377.8      # llama-bench r=5, full-tier env (BF16 head pack)
     tg128_default_bench: 368.0        # llama-bench r=5, zero-env default (safe tier)
     spec_full_tier_median: 444.6      # 4-prompt server battery, greedy 384 tok, LLAMA_GRAPH_SLOTS=6 -bs
     spec_safe_tier_median: 433.3
     stock_reference: 283.07           # same-machine stock @95b8e33
+
+# FlashRT-edition artifact (unsloth body + NVFP4-from-BF16 head, built with
+# tools/splice_nvfp4_head.py; no side-band packs, zero-env):
+artifact_spliced:
+  quality:
+    ppl_24ch_stock_floor: 6.1192      # head weight cost over the plain body's 6.0055
+    ppl_24ch_default: 6.2290          # beats the pack-served full tier's 6.2889
+  perf:
+    tg128_default: 377.7              # equals the pack-served full tier
+    spec_default_median: 439.4        # 2-prompt battery + text verified
+  judged_negative:
+    head_native_gemv: "FRT_HEAD_NATIVE: +0 speed (stock nvfp4 mmvq already
+      reads the 4.5bpw head), -1.1% ppl from the fp4 activation — archive"

@@ -165,5 +165,5 @@ coverage:
       seam: "host-tree change (llama-context): per-shape graph slots keyed (n_tokens, gtype, has_embd), each owning its scheduler"
 
 hosts:
-  llamacpp_dev_sm120:
+  llamacpp_sm120:
     versions: "upstream 95b8e33 + FlashRT hook guards (GGML_CUDA_FLASHRT_SM120)"

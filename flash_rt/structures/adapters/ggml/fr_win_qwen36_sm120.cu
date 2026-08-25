@@ -499,7 +499,12 @@ static bool frt_head_load(void) {
     const char * sw = getenv("FRT_HEAD_SWAP");
     const bool sw_on = frt_layer_enabled() && sw && sw[0] == '1';   // full tier: opt-in (quality)
     const bool dr_on = frt_window_on("FRT_HEAD_DRAFT", "GGML_FLASHRT_NO_HEAD_DRAFT");
-    if (!sw_on && !dr_on) return false;
+    // opt-in: serving an NVFP4-typed head through the fp4-activation GEMV
+    // costs a measured perplexity increment over stock's q8_1-activation mmvq
+    // on the same weights, so it is a quality trade like the full-tier swap.
+    const char * nat = getenv("FRT_HEAD_NATIVE");
+    const bool nat_on = frt_layer_enabled() && nat && nat[0] == '1';
+    if (!sw_on && !dr_on && !nat_on) return false;
     g_head.draft_only = !sw_on;
     const char * path = getenv("FRT_HEAD_PACK");
     if (!path && frt_online_on()) {
@@ -659,6 +664,45 @@ __global__ void frt_w_pass2_bf16(const __nv_bfloat16 * __restrict__ w, const flo
         const int cb = b / 4, ci = b % 4;
         sf_swz[(rb * n_col_super + cb) * 512 + (ri % 32) * 16 + (ri / 32) * 4 + ci] = sf_byte;
     }
+}
+
+// ggml GGML_TYPE_NVFP4 weight -> GEMV wire format, pure shuffle (no
+// requantization): block_nvfp4 is 36 B / 64 elems = d[4] e4m3 sub-scales +
+// qs[32] split-nibble codes (sub s at qs[s*8+j]: elem j low nibble, elem
+// 8+j high). ggml's doubled e2m1 table and halved ue4m3 decode cancel, so
+// the scale bytes pass through unmodified and the GEMV runs with alpha = 1.
+// One thread per 16-element sub-block.
+__global__ void frt_w_nvfp4_shuffle(
+        const uint8_t * __restrict__ src, uint8_t * __restrict__ packed,
+        uint8_t * __restrict__ sf_swz, int n_rows, int K, int row_base) {
+    const int64_t idx = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t subs_per_row = K / 16;
+    if (idx >= (int64_t) n_rows * subs_per_row) return;
+    const int r    = (int) (idx / subs_per_row);
+    const int sub  = (int) (idx % subs_per_row);
+    const int blk  = sub >> 2, s = sub & 3;
+    const uint8_t * b = src + ((size_t) r * (K / 64) + blk) * 36;
+    const uint8_t * qs = b + 4 + s * 8;
+    const int row = row_base + r;
+    uint8_t * out = packed + (size_t) row * (K / 2) + (size_t) sub * 8;
+#pragma unroll
+    for (int p = 0; p < 4; ++p)
+        out[p] = (uint8_t) ((qs[2 * p] & 0x0F) | ((qs[2 * p + 1] & 0x0F) << 4));
+#pragma unroll
+    for (int p = 0; p < 4; ++p)
+        out[4 + p] = (uint8_t) ((qs[2 * p] >> 4) | ((qs[2 * p + 1] >> 4) << 4));
+    sf_swz[sfa_offset_128x64(row, sub * 16, K)] = b[s];
+}
+
+// build wire buffers for an NVFP4-typed ggml tensor (shuffle only, alpha=1)
+static bool frt_repack_shuffle_nvfp4(const ggml_tensor * t, int64_t N, int64_t K,
+        uint8_t * d_packed, uint8_t * d_sf, cudaStream_t stream) {
+    const int64_t total = N * (K / 16);
+    const int64_t blocks = (total + 255) / 256;
+    frt_w_nvfp4_shuffle<<<dim3((unsigned) blocks), dim3(256), 0, stream>>>(
+        (const uint8_t *) t->data, d_packed, d_sf, (int) N, (int) K, 0);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    return true;
 }
 
 static bool frt_online_on(void) {
@@ -861,15 +905,28 @@ static void frt_online_prepare(ggml_backend_cuda_context & ctx, const ggml_cgrap
     // draft-only serving builds lazily: only once a draft model is actually
     // loaded (its Q8_0 head copy shows up in a graph), so plain runs never
     // spend VRAM on a head pack that would never serve.
-    if (head_w && !g_head.ok && (head_full || (head_draft && saw_draft_head))) {
+    const char * hnat = getenv("FRT_HEAD_NATIVE");
+    const bool head_native = head_w && head_w->type == GGML_TYPE_NVFP4 &&
+        frt_layer_enabled() && hnat && hnat[0] == '1';
+    if (head_w && !g_head.ok && (head_full || head_native || (head_draft && saw_draft_head))) {
         const int64_t N = head_w->ne[1], K = head_w->ne[0];
         const size_t pkb = (size_t) N * K / 2;
         const size_t sfb = (size_t) ((N + 127) / 128) * ((K + 63) / 64) * 512;
         CUDA_CHECK(cudaMalloc(&g_head.d_packed, pkb));
         CUDA_CHECK(cudaMalloc(&g_head.d_sf, sfb));
         float alpha = 0.f;
-        frt_repack_src src = { head_w, N };
-        if (frt_repack_build(&src, 1, N, K, g_head.d_packed, g_head.d_sf, &alpha, stream)) {
+        bool built;
+        if (head_w->type == GGML_TYPE_NVFP4) {
+            // FlashRT-edition GGUF: the head is already NVFP4 (quantized from
+            // the BF16 checkpoint by llama-quantize) — wire it up by shuffle,
+            // no requantization, alpha = 1.
+            built = frt_repack_shuffle_nvfp4(head_w, N, K, g_head.d_packed, g_head.d_sf, stream);
+            alpha = 1.0f;
+        } else {
+            frt_repack_src src = { head_w, N };
+            built = frt_repack_build(&src, 1, N, K, g_head.d_packed, g_head.d_sf, &alpha, stream);
+        }
+        if (built) {
             g_head.N = N; g_head.K = K; g_head.alpha = alpha;
             CUDA_CHECK(cudaMalloc(&g_head.d_apack, 4 * (K / 2)));
             CUDA_CHECK(cudaMalloc(&g_head.d_sfa, 128 * (K / 16)));
@@ -885,7 +942,7 @@ static void frt_online_prepare(ggml_backend_cuda_context & ctx, const ggml_cgrap
         }
     }
 
-    const bool head_pending = (head_full || (head_draft && saw_draft_head)) && !g_head.ok;
+    const bool head_pending = (head_full || head_native || (head_draft && saw_draft_head)) && !g_head.ok;
     bool region_pending = false;
     for (int kind = 0; kind < n_region_kinds; ++kind) {
         const bool on = (kind == 0 && g_reg.inproj_on) || (kind == 1 && g_reg.attn_on);
@@ -2579,7 +2636,14 @@ bool ggml_cuda_frt_head_mul_mat(ggml_backend_cuda_context & ctx,
     }
     if (!frt::frt_head_load()) return false;
     if (strcmp(src0->name, frt_binding::head_name) != 0) return false;
-    if (frt::g_head.draft_only && src0->type != GGML_TYPE_Q8_0) return false;
+    // without the full-tier swap, serve only the spec draft's Q8_0 head copy
+    // and an NVFP4-typed main head (FlashRT-edition GGUF: same values as
+    // stock would dequantize, so the takeover is quality-neutral)
+    if (frt::g_head.draft_only && src0->type != GGML_TYPE_Q8_0) {
+        static int nat = -1;
+        if (nat < 0) { const char * e = getenv("FRT_HEAD_NATIVE"); nat = (e && e[0] == '1') ? 1 : 0; }
+        if (!(nat == 1 && src0->type == GGML_TYPE_NVFP4)) return false;
+    }
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
     const int M = (int) src1->ne[1];   // spec verify asks for logits at M = 1 + n_draft rows
     if (M < 1 || M > 4 || src1->ne[2] != 1 || src1->ne[3] != 1) return false;

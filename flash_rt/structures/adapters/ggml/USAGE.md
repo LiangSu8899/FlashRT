@@ -106,6 +106,15 @@ qkv projections; judged flat, off by default); archive windows
 `FRT_GDN_NORMFOLD`) stay opt-in. Recommended host-side flags for
 speculative decode: `LLAMA_GRAPH_SLOTS=6` + `--backend-sampling`.
 
+**Model artifacts** (sm120 target): the safe tier runs any stock GGUF
+as-is. The speed tier is itself just a GGUF — the FlashRT edition splices
+an NVFP4 lm-head (quantized from the BF16 checkpoint via
+`llama-quantize --output-tensor-type NVFP4` on a bf16 conversion) into the
+shipping body with `tools/splice_nvfp4_head.py`; no side-band packs, no
+environment. Do not requantize the whole body from scratch for this: the
+FP4 regions inherit the source tensors' quantization quality, so the best
+shipping body stays the best base.
+
 FP4 region weights repack **in-process by default** (set `FRT_REGIONS_PACK`
 to use an offline pack instead): the pre-capture hook dequantizes the GGUF
 members on device and rebuilds the wire format byte-identically to the
