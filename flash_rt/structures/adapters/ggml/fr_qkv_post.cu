@@ -40,6 +40,7 @@ __device__ void qkv_rope_yarn(const float theta_extrap, const float freq_scale,
 // one block per token; threads cover the K/Q rope pairs and the V copy
 __global__ void kernel_qkv_post(const float * __restrict__ qkv,   // [M, Nk+Nv+Nq]
                                 float * __restrict__ q_out,       // [M, Nq] f32 (head-major rows)
+                                __half * __restrict__ q16_out,    // nullable: same values as f16
                                 __half * __restrict__ k_out,      // suffix rows, head_dim per token
                                 __half * __restrict__ v_out,
                                 float * __restrict__ k_f32_out,   // nullable: rope'd K as f32 rows
@@ -102,10 +103,18 @@ __global__ void kernel_qkv_post(const float * __restrict__ qkv,   // [M, Nk+Nv+N
         const int h  = hp / (head_dim / 2);
         const int i0 = 2 * (hp % (head_dim / 2));
         const float * qh = qrow + (int64_t) h * head_dim;
-        float * oh = q_out + (int64_t) t * Nq + (int64_t) h * head_dim;
+        float  * oh   = q_out + (int64_t) t * Nq + (int64_t) h * head_dim;
+        __half * oh16 = q16_out != nullptr
+                      ? q16_out + (int64_t) t * Nq + (int64_t) h * head_dim : nullptr;
         if (i0 >= n_dims) {
-            oh[n_dims + (i0 - n_dims)]     = qh[n_dims + (i0 - n_dims)] * q_scale;
-            oh[n_dims + (i0 - n_dims) + 1] = qh[n_dims + (i0 - n_dims) + 1] * q_scale;
+            const float v0 = qh[n_dims + (i0 - n_dims)]     * q_scale;
+            const float v1 = qh[n_dims + (i0 - n_dims) + 1] * q_scale;
+            oh[n_dims + (i0 - n_dims)]     = v0;
+            oh[n_dims + (i0 - n_dims) + 1] = v1;
+            if (oh16 != nullptr) {
+                oh16[n_dims + (i0 - n_dims)]     = __float2half(v0);
+                oh16[n_dims + (i0 - n_dims) + 1] = __float2half(v1);
+            }
             continue;
         }
         const float theta_base  = p * powf(theta_scale, i0 / 2.0f);
@@ -115,14 +124,21 @@ __global__ void kernel_qkv_post(const float * __restrict__ qkv,   // [M, Nk+Nv+N
                       i0, ext_factor, attn_factor, cos_t, sin_t);
         const float x0 = qh[i0 / 2];
         const float x1 = qh[i0 / 2 + n_dims / 2];
-        oh[i0 / 2]              = (x0 * cos_t - x1 * sin_t) * q_scale;
-        oh[i0 / 2 + n_dims / 2] = (x0 * sin_t + x1 * cos_t) * q_scale;
+        const float v0 = (x0 * cos_t - x1 * sin_t) * q_scale;
+        const float v1 = (x0 * sin_t + x1 * cos_t) * q_scale;
+        oh[i0 / 2]              = v0;
+        oh[i0 / 2 + n_dims / 2] = v1;
+        if (oh16 != nullptr) {
+            oh16[i0 / 2]              = __float2half(v0);
+            oh16[i0 / 2 + n_dims / 2] = __float2half(v1);
+        }
     }
 }
 
 } // namespace
 
-int qkv_post_full(const float * qkv_cat, float * q_out, void * k_out_f16, void * v_out_f16,
+int qkv_post_full(const float * qkv_cat, float * q_out, void * q16_out,
+                  void * k_out_f16, void * v_out_f16,
                   float * k_f32_out, float * v_f32_out,
                   const int32_t * pos, const float * freq_factors,
                   int M, int Nk, int Nv, int Nq, int head_dim, int n_dims,
@@ -131,7 +147,7 @@ int qkv_post_full(const float * qkv_cat, float * q_out, void * k_out_f16, void *
                   cudaStream_t stream) {
     if (n_dims % 2 != 0 || Nk != head_dim || Nq % head_dim != 0) return -1;
     kernel_qkv_post<<<M, 256, 0, stream>>>(
-        qkv_cat, q_out, (__half *) k_out_f16, (__half *) v_out_f16,
+        qkv_cat, q_out, (__half *) q16_out, (__half *) k_out_f16, (__half *) v_out_f16,
         k_f32_out, v_f32_out,
         pos, freq_factors, Nk, Nv, Nq, head_dim, n_dims,
         freq_scale, ext_factor, attn_factor, corr_low, corr_high, theta_scale, q_scale);
@@ -139,13 +155,14 @@ int qkv_post_full(const float * qkv_cat, float * q_out, void * k_out_f16, void *
     return (e == cudaSuccess) ? 0 : -static_cast<int>(e);
 }
 
-int qkv_post(const float * qkv_cat, float * q_out, void * k_out_f16, void * v_out_f16,
+int qkv_post(const float * qkv_cat, float * q_out, void * q16_out,
+             void * k_out_f16, void * v_out_f16,
              const int32_t * pos, const float * freq_factors,
              int M, int Nk, int Nv, int Nq, int head_dim, int n_dims,
              float freq_scale, float ext_factor, float attn_factor,
              float corr_low, float corr_high, float theta_scale, float q_scale,
              cudaStream_t stream) {
-    return qkv_post_full(qkv_cat, q_out, k_out_f16, v_out_f16, nullptr, nullptr,
+    return qkv_post_full(qkv_cat, q_out, q16_out, k_out_f16, v_out_f16, nullptr, nullptr,
                          pos, freq_factors, M, Nk, Nv, Nq, head_dim, n_dims,
                          freq_scale, ext_factor, attn_factor, corr_low, corr_high,
                          theta_scale, q_scale, stream);

@@ -214,6 +214,37 @@ bool reserve_quantized_act(const ggml_tensor * out_tensor, int M, int K,
     return true;
 }
 
+// One-shot f16 Q handoff from the fused decode QKV window to the decomposed
+// decode attention: qkv_post writes the rope'd+scaled Q rows as f16 in the
+// t-major gather order, and the next attention window consumes them instead
+// of running its own gather kernel. A single grow-only slot suffices (the
+// producer and consumer alternate strictly within each layer); the key is
+// cleared on consumption so a recycled activation address can never alias a
+// stale entry.
+struct q16_slot {
+    const void * key = nullptr;   // data pointer of the Q tensor written for
+    uint64_t eval_id = 0;
+    void * buf = nullptr;
+    size_t cap = 0;
+};
+q16_slot g_q16;
+
+void * reserve_q16(const void * qdata, size_t bytes, cudaStream_t stream) {
+    if (bytes > g_q16.cap) {
+        cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+        cudaStreamIsCapturing(stream, &cap);
+        if (cap != cudaStreamCaptureStatusNone) {
+            return nullptr;
+        }
+        if (g_q16.buf != nullptr) { cudaFree(g_q16.buf); }
+        CUDA_CHECK(cudaMalloc(&g_q16.buf, bytes));
+        g_q16.cap = bytes;
+    }
+    g_q16.key     = qdata;
+    g_q16.eval_id = g_eval_id;
+    return g_q16.buf;
+}
+
 // Grow-only device buffer for the never-written D of the no-D-store GeGLU
 // variants (the host-side TMA descriptor still needs a valid allocation).
 void * get_dummy_d(size_t bytes) {
@@ -1011,8 +1042,10 @@ void ggml_cuda_flashrt_qkv(ggml_backend_cuda_context & ctx,
         const float scale_f = ggml_get_op_params_f32(q_scale, 0);
 
         const ggml_tensor * ff = k_rope->src[2];
+        void * q16 = reserve_q16(q_scale->data,
+                                 (size_t) M * Nq * sizeof(uint16_t), stream);
         rc = ggml_cuda_flashrt::qkv_post(
-            qkv_cat.get(), (float *) q_scale->data,
+            qkv_cat.get(), (float *) q_scale->data, q16,
             k_cpy->src[1]->data, v_cpy->src[1]->data,
             (const int32_t *) k_rope->src[1]->data,
             ff != nullptr ? (const float *) ff->data : nullptr,
@@ -1466,7 +1499,8 @@ void ggml_cuda_flashrt_qkv_prefill(ggml_backend_cuda_context & ctx,
         // the rope'd K and plain V rows also land in their graph tensors'
         // f32 buffers, feeding the graph-tail persistent-KV store copies
         rc = ggml_cuda_flashrt::qkv_post_full(
-            qkv_cat.get(), (float *) q_scale->data,
+            // no f16 Q handoff on the prefill path (flash attention reads f32 Q)
+            qkv_cat.get(), (float *) q_scale->data, nullptr,
             k_cpy->data, v_cpy->data,
             (float *) k_rope->data, (float *) v_mm->data,
             (const int32_t *) k_rope->src[1]->data,
@@ -1549,8 +1583,25 @@ void ggml_cuda_flashrt_dec_attn(ggml_backend_cuda_context & ctx, ggml_tensor * f
     cudaStream_t stream = ctx.stream();
 
     const int64_t R = (int64_t) n_head * n_tok;
-    ggml_cuda_pool_alloc<uint8_t> q16   (ctx.pool(), R * hd * sizeof(uint16_t));
     ggml_cuda_pool_alloc<uint8_t> scores(ctx.pool(), R * n_kv * sizeof(uint16_t));
+
+    // consume the f16 Q rows the fused QKV window handed off (one-shot);
+    // they are valid only when the Q view is the dense t-major layout the
+    // handoff was written in
+    const bool q16_hit = g_q16.key != nullptr && g_q16.key == q->data &&
+        g_q16.eval_id == g_eval_id &&
+        q->nb[0] == sizeof(float) &&
+        (int64_t) q->nb[2] == (int64_t) hd * sizeof(float) &&
+        (int64_t) q->nb[1] == (int64_t) hd * n_head * sizeof(float);
+    ggml_cuda_pool_alloc<uint8_t> q16;
+    void * q16p;
+    if (q16_hit) {
+        q16p = g_q16.buf;
+        g_q16.key = nullptr;
+    } else {
+        q16.alloc(ctx.pool(), R * hd * sizeof(uint16_t));
+        q16p = q16.get();
+    }
 
     const int rc = ggml_cuda_flashrt::decode_attn_decomposed(
         (void *) ctx.cublas_handle(),
@@ -1563,7 +1614,7 @@ void ggml_cuda_flashrt_dec_attn(ggml_backend_cuda_context & ctx, ggml_tensor * f
         (float *) fa->data,
         (int64_t) (fa->nb[2] / sizeof(float)),
         (int64_t) (fa->nb[1] / sizeof(float)),
-        q16.get(), scores.get(),
+        q16p, q16_hit ? 1 : 0, scores.get(),
         hd, n_tok, n_head, n_kv, scale, stream);
     if (rc != 0) {
         GGML_ABORT("flashrt: decomposed decode attention failed (tok=%d kv=%d rc=%d)", n_tok, n_kv, rc);

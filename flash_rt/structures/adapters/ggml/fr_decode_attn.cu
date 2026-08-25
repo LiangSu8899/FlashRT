@@ -113,7 +113,7 @@ int decode_attn_decomposed(void * cublas_handle,
                            const void * v_f16_rows,   // [n_kv, hd] f16 rows
                            const void * mask_f16, int64_t mask_stride,
                            float * dst, int64_t dst_stok, int64_t dst_shead,
-                           void * q16_ws, void * scores_ws,
+                           void * q16_ws, int q16_ready, void * scores_ws,
                            int hd, int n_tok, int n_head, int n_kv,
                            float scale, cudaStream_t stream) {
     // the contiguous PV store below requires the [hd, n_head, n_tok] dst
@@ -124,8 +124,10 @@ int decode_attn_decomposed(void * cublas_handle,
     cublasHandle_t handle = (cublasHandle_t) cublas_handle;
     const int R = n_head * n_tok;
 
-    kernel_q_gather_f16<<<R, 128, 0, stream>>>(
-        q, (__half *) q16_ws, hd, n_head, q_sd, q_stok, q_shead);
+    if (!q16_ready) {
+        kernel_q_gather_f16<<<R, 128, 0, stream>>>(
+            q, (__half *) q16_ws, hd, n_head, q_sd, q_stok, q_shead);
+    }
 
     cublasSetStream(handle, stream);
     // scores_col[n_kv, R] = K_col^T [n_kv, hd] x Q16_col [hd, R]

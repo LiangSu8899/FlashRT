@@ -89,9 +89,13 @@ int repack_weight_concat3(const void * b0, int N0, const void * b1, int N1,
 
 // Fused QKV post: RoPE+f16-store K, f16-store V (into the persistent KV
 // suffix), RoPE+scale Q (f32 out) from the fused GEMM's [M, Nk+Nv+Nq] rows.
-// Variant with optional f32 K/V row outputs (for graphs whose rope'd K / V
-// feed additional consumers, e.g. persistent-KV stores at the graph tail).
-int qkv_post_full(const float * qkv_cat, float * q_out, void * k_out_f16, void * v_out_f16,
+// q16_out (nullable) additionally stores the Q rows as f16 in the same
+// [M, Nq] layout, which is the t-major gather order the decomposed decode
+// attention consumes. Variant with optional f32 K/V row outputs (for
+// graphs whose rope'd K / V feed additional consumers, e.g. persistent-KV
+// stores at the graph tail).
+int qkv_post_full(const float * qkv_cat, float * q_out, void * q16_out,
+                  void * k_out_f16, void * v_out_f16,
                   float * k_f32_out, float * v_f32_out,
                   const int32_t * pos, const float * freq_factors,
                   int M, int Nk, int Nv, int Nq, int head_dim, int n_dims,
@@ -99,7 +103,8 @@ int qkv_post_full(const float * qkv_cat, float * q_out, void * k_out_f16, void *
                   float corr_low, float corr_high, float theta_scale, float q_scale,
                   cudaStream_t stream);
 
-int qkv_post(const float * qkv_cat, float * q_out, void * k_out_f16, void * v_out_f16,
+int qkv_post(const float * qkv_cat, float * q_out, void * q16_out,
+             void * k_out_f16, void * v_out_f16,
              const int32_t * pos, const float * freq_factors,
              int M, int Nk, int Nv, int Nq, int head_dim, int n_dims,
              float freq_scale, float ext_factor, float attn_factor,
@@ -136,13 +141,15 @@ int layer_norm_affine(const float * x, const float * w, const float * b,
 // (rows ordered t-major so the store is contiguous; requires
 // dst_shead == hd and dst_stok == hd*n_head). q strides are in elements;
 // workspaces: q16 [n_tok*n_head, hd] f16, scores [n_tok*n_head, n_kv]
-// f16. cublas_handle is a cublasHandle_t.
+// f16. When q16_ready is nonzero, q16_ws already holds the gathered f16 Q
+// rows (produced upstream, e.g. by qkv_post) and the gather kernel is
+// skipped. cublas_handle is a cublasHandle_t.
 int decode_attn_decomposed(void * cublas_handle,
                            const float * q, int64_t q_sd, int64_t q_stok, int64_t q_shead,
                            const void * k_f16_rows, const void * v_f16_rows,
                            const void * mask_f16, int64_t mask_stride,
                            float * dst, int64_t dst_stok, int64_t dst_shead,
-                           void * q16_ws, void * scores_ws,
+                           void * q16_ws, int q16_ready, void * scores_ws,
                            int hd, int n_tok, int n_head, int n_kv,
                            float scale, cudaStream_t stream);
 
