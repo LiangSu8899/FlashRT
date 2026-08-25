@@ -43,4 +43,3 @@ training/_runs/**
 internal-tests/
 internal-docs/
 notes/
-third_party/cutlass
