@@ -1,0 +1,91 @@
+structure: moe_expert_ffn
+version: 1
+description: >
+  Sparse mixture-of-experts feed-forward block: route x[M,D] over E experts,
+  gather the top-k expert gate/up/down triples, activation(gate) * up per
+  expert, down projection, routing-weighted combine, plus an optional
+  always-on shared expert whose output is sigmoid-gated by its own scalar
+  projection. The routing decision (softmax/top-k/renorm) is part of the
+  boundary under the fused variant so a host whose own router fusion only
+  covers part of the batch space can hand the whole block over; under the
+  external variant the block consumes precomputed ids/weights. Per-token
+  expert sets are independent, so token batches (speculative verify, M > 1)
+  are first-class: the executable form must not assume M == 1.
+
+reference:
+  module: moe_expert_ffn.reference
+  entrypoint: moe_expert_ffn_ref
+
+boundary:
+  symbolic_dims: [M, D, F, E, K_top]
+  inputs:
+    - {name: x, dims: [M, D], dtype: "@binding"}
+    - {name: expert_ids, dims: [M, K_top], dtype: int32, optional: true}     # external routing
+    - {name: expert_weights, dims: [M, K_top], dtype: "@binding", optional: true}
+    - {name: residual, dims: [M, D], dtype: "@binding", optional: true}
+  outputs:
+    - {name: y, dims: [M, D], dtype: "@binding"}
+
+weights:
+  - {slot: w_router, dims: [D, E], optional: true}       # fused routing only
+  - {slot: w_gate_exps, dims: [E, D, F]}
+  - {slot: w_up_exps, dims: [E, D, F]}
+  - {slot: w_down_exps, dims: [E, F, D]}
+  - {slot: w_gate_shexp, dims: [D, F_sh], optional: true}
+  - {slot: w_up_shexp, dims: [D, F_sh], optional: true}
+  - {slot: w_down_shexp, dims: [F_sh, D], optional: true}
+  - {slot: w_gate_inp_shexp, dims: [D], optional: true}  # sigmoid gate scalar
+
+variants:
+  routing: [external, fused]           # fused = router GEMM + exact top-k in-boundary
+  topk_norm: [softmax_topk_clamp_renorm]  # Qwen3.x convention: softmax over E,
+                                       # iterative top-k with lower-index
+                                       # tie-break, clamp, renormalize
+  shared_expert: [none, sigmoid_gated]
+  activation: [silu]
+  weight_consumption: [dequant_gemm, format_native]
+                                       # format_native = expert weights are
+                                       # consumed in the host's storage
+                                       # format (e.g. GGUF K-quant blocks
+                                       # through the host's own vec_dot
+                                       # device functions, activations
+                                       # cloned bit-exactly into the host's
+                                       # q8 convention) — no repack, no
+                                       # dequant materialization
+  batch: [m1, m_le_4]
+
+calibration:
+  points: [x]
+
+gates:
+  parity:
+    metrics: [cosine, max_abs, p99_abs]
+    data: real_distribution
+  latency:
+    baselines: [host_fused_moe, unfused_chain, vendor]
+    rule: net_positive_including_boundary
+    per_shape: true
+  qualification:
+    routing_is_exact: true             # fused routing must replicate the
+                                       # host's tie-break and normalization
+                                       # bit-for-bit, adjudicated on logits
+    per_token_expert_sets_independent: true
+
+qualification:
+  - "expert_ids/expert_weights rows may be strided views of a sort output;
+     the row stride is part of the boundary, never assumed dense"
+  - "the format_native form must reproduce the host's activation-quant
+     convention exactly (adjudicated by a duplicated-token bit-exact replay
+     across batch variants: an M=2 batch of identical tokens must reproduce
+     the M=1 result bit-for-bit in every row)"
+  - "the combine (weighted sum + shared expert + residual) is part of the
+     boundary; outputs may alias dead routing inputs under the host's graph
+     allocator, so inputs the kernel still needs must be snapshotted before
+     the first output write"
+
+evidence:
+  - "Qwen3.6-35B-A3B (E=256, K_top=8, shared expert) on RTX 5090: 3-kernel
+     span over GGUF Q4_K/Q5_K/Q6_K expert weights, shared-expert folding
+     +21.6 tok/s, whole-span takeover net +2.2 at M=1 after PDL alignment;
+     M<=4 speculative verify batches served by the same span"
+  - "same span serves the Q8_0 expert weights of the model's MTP draft layer"

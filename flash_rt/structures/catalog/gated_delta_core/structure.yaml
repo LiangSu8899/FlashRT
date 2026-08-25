@@ -1,5 +1,5 @@
 structure: gated_delta_core
-version: 1
+version: 2
 description: >
   Stateful Gated DeltaNet recurrence over Q/K/V, log-decay and update
   strength. The structure owns the recurrent state transition and exposes the
@@ -27,8 +27,21 @@ weights: []
 
 variants:
   phase: [decode_recurrent, sequence_scan, wy_chunk]
-  state_update: [in_place, explicit_output]
+  state_update: [in_place, explicit_output, snapshot_per_token]
+                # snapshot_per_token: token batches (speculative verify,
+                # S = 1 + n_draft) write one state snapshot per token and
+                # leave the source state slot pristine, so the host can
+                # roll back to any accepted position; in-place update under
+                # a rollback-capable host is a correctness bug whose
+                # symptoms (degenerate text, inflated acceptance) evade
+                # perplexity-style gates — adjudicate on end-to-end text
   qk_norm: [l2_in_kernel, host]
+  checkpoint: [none, replay_in_region]
+                # replay_in_region: the host graph's normally zero-sized
+                # checkpoint save nodes become real on checkpoint steps and
+                # must be replayed inside the region (or the whole region
+                # must decline); silently dropping them corrupts rollback
+                # in ways invisible until a rollback occurs
 
 calibration:
   points: []
@@ -53,6 +66,11 @@ qualification:
      produce a final state accepted by the next invocation"
 
 evidence:
+  - "Qwen3.6-35B-A3B decode on RTX 5090 (ggml adapter sm120 target): whole
+     cell span (conv + recurrence + gated norm + epilogue) as 4 launches,
+     register-resident state, M<=4 verify batches under snapshot_per_token
+     + replay_in_region; bit-exact duplicated-token replay across batch
+     variants is the acceptance gate"
   - "Qwen3.6/Qwen3.5 hybrid decoder: 48 of 64 layers carry this state"
   - "Nex-N2 hybrid decoder uses the same recurrent and WY chunk boundary at
      H=32 while Qwen3.6 uses H=48"

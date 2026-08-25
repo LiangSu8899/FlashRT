@@ -1,13 +1,23 @@
 # Structure versions the SM120/Qwen3.6 windows were written against, plus
-# the target's shipping gates. The families marked proposed are carried by
-# this target until they are formalized in the catalog; their pin is the
-# adapter file itself (fr_win_qwen36_sm120.cu revision).
+# the target's shipping gates.
 binding: llamacpp_qwen36_35b_sm120
 pins:
-  llm_decode_pipeline: 1
-  format_native_gemv: 1   # proposed family (warp-split-K NVFP4 GEMV, M<=4)
-  moe_expert_span: 1      # proposed family (format-native K-quant MoE)
-  gdn_cell: 1             # proposed family (recurrent cell span, snapshot/checkpoint discipline)
+  autoregressive_decode_pipeline: 3   # v3 adds the optional spec_draft stage
+  gated_delta_core: 2                 # v2 adds snapshot_per_token / replay_in_region
+  moe_expert_ffn: 1                   # new family introduced by this target
+  qkv_pack: 1
+  linear_proj: 1
+
+# Variant values this target uses that are NOT yet in the pinned families
+# (deliberately deferred: qkv_pack and linear_proj are pinned at v1 by the
+# Thor/pi0.5 binding, and a version bump turns its qualification RED; the
+# additions land in a follow-up catalog change coordinated with that line):
+#   qkv_pack.in_dtype     += fp4_block_scaled   (NVFP4 W4A4 leaf pack)
+#   linear_proj.in_dtype  += q8_native          (host-convention q8_1 act,
+#                                                K-quant weights in place)
+proposed_variants:
+  qkv_pack: {in_dtype: fp4_block_scaled}
+  linear_proj: {in_dtype: q8_native}
 
 # Shipping gates (re-established after every adapter or host change; the
 # numbers are the 2026-08-25 migration baseline on RTX 5090):
@@ -15,6 +25,7 @@ gates:
   quality:
     ppl_24ch_ub1_safe_tier: 6.1106    # must stay bit-identical (wikitext, -ub 1 -c 512 --chunks 24)
     moefuse_selftest: pass            # FRT_MOEFUSE_SELFTEST=1 duplicated-token bit-exact replay
+    repack_check: byte_identical      # FRT_REPACK_CHECK=1 vs the offline packs (regions)
     spec_text_check: required         # greedy spec output must be coherent text, never judged by tps alone
   perf:
     tg128_full_tier_bench: 377.8      # llama-bench r=5, full-tier env
