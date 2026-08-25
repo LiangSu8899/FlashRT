@@ -118,6 +118,15 @@ void ggml_cuda_flashrt_dec_attn(ggml_backend_cuda_context & ctx, ggml_tensor * f
 bool ggml_cuda_flashrt_should_fuse_vit_fa4(const ggml_tensor * fa, ggml_backend_cuda_context & ctx);
 void ggml_cuda_flashrt_vit_fa4(ggml_backend_cuda_context & ctx, ggml_tensor * fa);
 
+// Variant that also absorbs the {VIEW (head de-pad), CONT} pair that
+// follows the vision FA node: the FA4 output converts straight into the
+// CONT's packed [(H*d), S, B] f32 destination, skipping the padded f32
+// store and the strided copy.
+bool ggml_cuda_flashrt_should_fuse_vit_fa4_depad(const ggml_tensor * fa, const ggml_tensor * view,
+                                                 const ggml_tensor * cont, ggml_backend_cuda_context & ctx);
+void ggml_cuda_flashrt_vit_fa4_depad(ggml_backend_cuda_context & ctx, ggml_tensor * fa,
+                                     const ggml_tensor * view, ggml_tensor * cont);
+
 // Prefill fused QKV window: q mm->reshape->rope->scale, k mm->reshape->rope->
 // pad, v mm->reshape->pad, each pad permuted+copied into a padded f16 tensor
 // of token rows. One fused GEMM + qkv_post + pad-row zeroing.

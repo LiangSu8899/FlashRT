@@ -38,6 +38,21 @@ __global__ void kernel_f16_to_f32_dense(const __half * __restrict__ src,
     }
 }
 
+// convert dropping the head padding: one block per (b, s) token; src rows
+// are H heads of D elements, dst rows are H packed slices of D2 (< D)
+__global__ void kernel_f16_to_f32_depad(const __half * __restrict__ src,
+                                        float * __restrict__ dst,
+                                        int H, int D, int D2) {
+    const int64_t row = blockIdx.x;
+    const __half * s = src + row * (int64_t) H * D;
+    float * d = dst + row * (int64_t) H * D2;
+    for (int t = threadIdx.x; t < H * D2; t += blockDim.x) {
+        const int h = t / D2;
+        const int e = t - h * D2;
+        d[t] = __half2float(s[(int64_t) h * D + e]);
+    }
+}
+
 fa4_siglip_fwd_Kernel_Module_t g_fa4_module;
 bool g_fa4_loaded = false;
 
@@ -63,10 +78,12 @@ int fa4_vit_ensure_loaded(cudaStream_t stream) {
     return 0;
 }
 
-// q_f32: dense (B,S,H,D); k16/v16: dense f16 same layout; dst_f32 dense.
+// q_f32: dense (B,S,H,D); k16/v16: dense f16 same layout. When d_out == D
+// dst_f32 is the dense padded layout; when d_out < D the head padding is
+// dropped and dst_f32 is the packed [(H*d_out), S, B] contiguous tensor.
 // q16_ws / o16_ws: workspaces of B*S*H*D halves.
 int fa4_vit_attention(const float * q_f32, const void * k16, const void * v16,
-                      float * dst_f32, void * q16_ws, void * o16_ws,
+                      float * dst_f32, int d_out, void * q16_ws, void * o16_ws,
                       int B, int S, int H, int D, float scale,
                       cudaStream_t stream) {
     if (!g_fa4_loaded) {
@@ -100,8 +117,13 @@ int fa4_vit_attention(const float * q_f32, const void * k16, const void * v16,
         return -1000 - rc;
     }
 
-    kernel_f16_to_f32_dense<<<(unsigned) blocks, threads, 0, stream>>>(
-        (const __half *) o16_ws, dst_f32, n);
+    if (d_out == D) {
+        kernel_f16_to_f32_dense<<<(unsigned) blocks, threads, 0, stream>>>(
+            (const __half *) o16_ws, dst_f32, n);
+    } else {
+        kernel_f16_to_f32_depad<<<(unsigned) ((int64_t) B * S), threads, 0, stream>>>(
+            (const __half *) o16_ws, dst_f32, H, D, d_out);
+    }
 
     const cudaError_t e = cudaGetLastError();
     return (e == cudaSuccess) ? 0 : -static_cast<int>(e);

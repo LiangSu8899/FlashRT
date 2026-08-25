@@ -1761,10 +1761,71 @@ void ggml_cuda_flashrt_vit_fa4(ggml_backend_cuda_context & ctx, ggml_tensor * fa
 
     const int rc = ggml_cuda_flashrt::fa4_vit_attention(
         (const float *) q->data, fa->src[1]->data, fa->src[2]->data,
-        (float *) fa->data, q16.get(), o16.get(),
+        (float *) fa->data, D, q16.get(), o16.get(),
         B, S, H, D, scale, ctx.stream());
     if (rc != 0) {
         GGML_ABORT("flashrt: FA4 vision attention failed (B=%d S=%d H=%d rc=%d)", B, S, H, rc);
+    }
+#endif // GGML_CUDA_FLASHRT_FA4
+}
+
+// Variant absorbing the {VIEW (head de-pad), CONT} pair after the FA node:
+// the FA4 output converts directly into the CONT's packed destination.
+bool ggml_cuda_flashrt_should_fuse_vit_fa4_depad(const ggml_tensor * fa, const ggml_tensor * view,
+                                                 const ggml_tensor * cont, ggml_backend_cuda_context & ctx) {
+#ifndef GGML_CUDA_FLASHRT_FA4
+    GGML_UNUSED(fa); GGML_UNUSED(view); GGML_UNUSED(cont); GGML_UNUSED(ctx);
+    return false;
+#else
+    if (!ggml_cuda_flashrt_should_fuse_vit_fa4(fa, ctx)) {
+        return false;
+    }
+    const int64_t D = fa->ne[0];
+    const int64_t H = fa->ne[1];
+    const int64_t S = fa->ne[2];
+    const int64_t B = fa->ne[3];
+    // view: leading d2 <= D slice of the FA output, no offset
+    if (view->src[0] != fa || view->type != GGML_TYPE_F32 ||
+        view->data != fa->data ||
+        view->ne[0] > D || view->ne[1] != H || view->ne[2] != S || view->ne[3] != B) {
+        return false;
+    }
+    const int64_t D2 = view->ne[0];
+    // cont: packed [(H*D2), S, B] contiguous f32
+    if (cont->src[0] != view || cont->type != GGML_TYPE_F32 ||
+        cont->ne[0] != H * D2 || cont->ne[1] != S || cont->ne[2] != B || cont->ne[3] != 1 ||
+        !ggml_is_contiguous(cont)) {
+        return false;
+    }
+    return true;
+#endif // GGML_CUDA_FLASHRT_FA4
+}
+
+void ggml_cuda_flashrt_vit_fa4_depad(ggml_backend_cuda_context & ctx, ggml_tensor * fa,
+                                     const ggml_tensor * view, ggml_tensor * cont) {
+#ifndef GGML_CUDA_FLASHRT_FA4
+    GGML_UNUSED(ctx); GGML_UNUSED(fa); GGML_UNUSED(view); GGML_UNUSED(cont);
+    GGML_ABORT("flashrt: FA4 vision attention not built");
+#else
+    const ggml_tensor * q = fa->src[0];
+    const int B = (int) q->ne[3];
+    const int S = (int) q->ne[1];
+    const int H = (int) q->ne[2];
+    const int D = (int) q->ne[0];
+    const int D2 = (int) view->ne[0];
+    float scale;
+    memcpy(&scale, (const float *) fa->op_params + 0, sizeof(float));
+
+    const int64_t n = (int64_t) B * S * H * D;
+    ggml_cuda_pool_alloc<uint8_t> q16(ctx.pool(), n * sizeof(uint16_t));
+    ggml_cuda_pool_alloc<uint8_t> o16(ctx.pool(), n * sizeof(uint16_t));
+
+    const int rc = ggml_cuda_flashrt::fa4_vit_attention(
+        (const float *) q->data, fa->src[1]->data, fa->src[2]->data,
+        (float *) cont->data, D2, q16.get(), o16.get(),
+        B, S, H, D, scale, ctx.stream());
+    if (rc != 0) {
+        GGML_ABORT("flashrt: FA4 vision attention (depad) failed (B=%d S=%d H=%d rc=%d)", B, S, H, rc);
     }
 #endif // GGML_CUDA_FLASHRT_FA4
 }

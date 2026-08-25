@@ -161,8 +161,10 @@ int vec_add_f32(const float * a, const float * b, float * out, int n, cudaStream
 // capture: fall back). attention runs f32->f16 Q convert + FA4 + f16->f32
 // output convert; all tensors dense (B,S,H,D) as one linear buffer.
 int fa4_vit_ensure_loaded(cudaStream_t stream);
+// d_out == D: dst is the dense padded layout; d_out < D: the head padding
+// is dropped and dst is the packed [(H*d_out), S, B] contiguous tensor.
 int fa4_vit_attention(const float * q_f32, const void * k16, const void * v16,
-                      float * dst_f32, void * q16_ws, void * o16_ws,
+                      float * dst_f32, int d_out, void * q16_ws, void * o16_ws,
                       int B, int S, int H, int D, float scale,
                       cudaStream_t stream);
 
