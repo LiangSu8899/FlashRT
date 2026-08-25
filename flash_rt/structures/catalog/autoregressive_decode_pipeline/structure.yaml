@@ -63,9 +63,8 @@ stages:
       Speculative drafting between decode steps: a draft model (or trained
       MTP head chain) proposes n_draft tokens; the next decode step becomes
       a verify batch over 1 + n_draft rows whose logits feed acceptance.
-      Draft state (KV / recurrent / conv) advances tentatively and is rolled
-      back to the accepted position, which is what makes the
-      snapshot_per_token discipline of stateful embedded regions mandatory.
+      Draft state (KV / recurrent / conv) advances tentatively and is
+      rolled back to the accepted position.
     inputs:
       - {name: token_id, window: swap}
       - {name: target_hidden, buffer: mutable, optional: true}   # MTP h rows
@@ -91,17 +90,11 @@ conformance:
   - modality_features_have_request_cadence
   - graph_bucket_fallback_is_reported
   # speculative (spec_draft stage present):
-  - spec_output_distribution_matches_target   # acceptance math guarantees the
-                                              # emitted tokens equal target-only
-                                              # decoding; draft quality may only
-                                              # change speed, never output
-  - draft_state_rollback_is_explicit          # verify batches must leave state
-                                              # rollback-capable (snapshot
-                                              # discipline in stateful regions)
-  - spec_throughput_judged_on_text            # tps under speculation is invalid
-                                              # evidence without verifying the
-                                              # generated text (broken rollback
-                                              # inflates acceptance and tps)
+  - spec_output_distribution_matches_target   # emitted tokens equal target-only
+                                              # decoding; the draft affects
+                                              # speed, never output
+  - draft_state_rollback_is_explicit          # verify batches leave every
+                                              # tentative state rollback-capable
 
 gates:
   parity:

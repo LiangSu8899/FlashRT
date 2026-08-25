@@ -70,7 +70,7 @@ coverage:
     - name: lm_head
       stage: decode
       classification: structure
-      seam: "full tier: NVFP4 W4A4 head (M<=4 one pass, weights from the BF16-checkpoint pack); safe tier: stock Q6_K mmvq (~91% BW, left alone)"
+      seam: "full tier: NVFP4 W4A4 head (M<=4 one pass, weights from the BF16-checkpoint pack); safe tier: stock Q6_K mmvq"
       structures: [linear_proj]
     - name: spec_draft_serving
       stage: spec_draft
