@@ -86,18 +86,31 @@ cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 \
   -DCMAKE_CUDA_FLAGS="-I<cutlass>/include -gencode=arch=compute_120a,code=sm_120a"
 ```
 
-The target's windows are opt-in per mechanism (historic `FRT_*` switches;
-unset = off). Safe-tier set: `FRT_INPROJ_SWAP=1 FRT_ATTNQKV_SWAP=1
-FRT_GDN_SWAP=1 FRT_MOEGLUE_SWAP=1 FRT_MOEFUSE_SWAP=1 FRT_MOEFUSE_SHEXP=1
-FRT_OUTNATIVE_SWAP=1 FRT_REGIONS_PACK=<pack>`; full tier adds
-`FRT_HEAD_SWAP=1 FRT_HEAD_PACK=<pack>`. Speculative serving adds
-`FRT_HEAD_DRAFT=1` (safe tier: FP4-serve only the draft's head copy) and the
-host-side `LLAMA_GRAPH_SLOTS=6` + `--backend-sampling`.
+The safe tier is the zero-configuration default: a compiled-in build runs
+every quality-neutral window (fused packs, GDN span, MoE span, out-proj,
+draft-head serving, in-process repack) with no environment at all —
+`./llama-server -m <stock gguf> [-md <draft gguf> -bs]` is the whole story.
+Switch semantics, most specific wins:
 
-FP4 region weights repack **in-process** with `FRT_ONLINE_REPACK=1` (leave
-`FRT_REGIONS_PACK` unset): the pre-capture hook dequantizes the GGUF members
-on device and rebuilds the wire format byte-identically to the offline packer
-(validated by `FRT_REPACK_CHECK=1` with `FRT_REGIONS_PACK_REF=<file>`). The
+| layer | variable |
+|---|---|
+| whole layer off (stock llama.cpp) | `GGML_CUDA_FLASHRT_DISABLE=1` |
+| per-window disable | `GGML_FLASHRT_NO_{INPROJ,ATTNQKV,GDN,MOEGLUE,MOEFUSE,SHEXP_FOLD,OUTNATIVE,HEAD_DRAFT,ONLINE_REPACK}=1` |
+| per-window A/B override | historic `FRT_<X>_SWAP=0/1` |
+
+Opt-in extras: `FRT_HEAD_SWAP=1 FRT_HEAD_PACK=<pack>` (full tier — the FP4
+lm-head trades a measured perplexity increment for speed, so it never
+defaults on); `FRT_DRAFT_REGIONS=1` (also FP4-serve the draft model's own
+qkv projections; judged flat, off by default); archive windows
+(`FRT_SHEXP_SWAP`, `FRT_OUTPROJ_SWAP`, `FRT_MOE_SWAP`, `FRT_ATTNGATE_SWAP`,
+`FRT_GDN_NORMFOLD`) stay opt-in. Recommended host-side flags for
+speculative decode: `LLAMA_GRAPH_SLOTS=6` + `--backend-sampling`.
+
+FP4 region weights repack **in-process by default** (set `FRT_REGIONS_PACK`
+to use an offline pack instead): the pre-capture hook dequantizes the GGUF
+members on device and rebuilds the wire format byte-identically to the
+offline packer (validated by `FRT_REPACK_CHECK=1` with
+`FRT_REGIONS_PACK_REF=<file>`). The
 lm-head is the exception: the shipped head pack is quantized from the BF16
 checkpoint (the GGUF only holds Q6_K), and the BF16-sourced pack drafts and
 scores measurably better than an online Q6_K-sourced rebuild — keep

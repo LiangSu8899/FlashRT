@@ -33,6 +33,37 @@
 // the header with tools/gen_binding_header.py after editing the binding.
 #include "fr_binding_qwen36_35b_sm120.h"
 
+// ---- switch semantics -----------------------------------------------------
+// Compiled-in windows default ON. Three layers of control, most specific wins:
+//   FRT_<X>_SWAP=0/1              per-window A/B override (historic names)
+//   GGML_FLASHRT_NO_<X>=1         per-window disable
+//   GGML_CUDA_FLASHRT_DISABLE=1   whole layer off (stock llama.cpp)
+// Archive windows (judged off on this target) stay opt-in via their FRT_*
+// switches only. The full-tier head swap changes output quality, so it too
+// stays opt-in (FRT_HEAD_SWAP=1).
+static bool frt_layer_enabled(void) {
+    static int on = -1;
+    if (on < 0) { const char * s = getenv("GGML_CUDA_FLASHRT_DISABLE"); on = (s && s[0] == '1') ? 0 : 1; }
+    return on == 1;
+}
+static bool frt_window_on(const char * frt_env, const char * no_env) {
+    if (!frt_layer_enabled()) return false;
+    const char * f = getenv(frt_env);
+    if (f) return f[0] == '1';
+    const char * n = getenv(no_env);
+    return !(n && n[0] == '1');
+}
+// The spec draft model's MTP layer reuses the target's tensor-name scheme at
+// layer indices >= n_layer, and its attn q/k/v happen to match the kind-1
+// pack shapes. Serving the draft's projections from FP4 only moves
+// acceptance, never output — but it is a separate judgment call, so it is
+// gated off by default until judged (FRT_DRAFT_REGIONS=1 to enable).
+static bool frt_layer_in_scope(int layer) {
+    static int draft_on = -1;
+    if (draft_on < 0) { const char * e = getenv("FRT_DRAFT_REGIONS"); draft_on = (e && e[0] == '1') ? 1 : 0; }
+    return layer < frt_binding::n_layer || draft_on == 1;
+}
+
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_fp4.h>
@@ -310,14 +341,12 @@ static bool frt_online_on(void);   // defined with the in-process repack section
 static bool frt_regions_load(void) {
     if (g_reg.tried) return g_reg.ok;
     g_reg.tried = true;
-    const char * a = getenv("FRT_INPROJ_SWAP");
-    const char * b = getenv("FRT_ATTNQKV_SWAP");
     const char * c = getenv("FRT_SHEXP_SWAP");
     const char * d = getenv("FRT_OUTPROJ_SWAP");
-    g_reg.inproj_on = a && a[0] == '1';
-    g_reg.attn_on   = b && b[0] == '1';
-    g_reg.shexp_on  = c && c[0] == '1';
-    g_reg.outproj_on = d && d[0] == '1';
+    g_reg.inproj_on = frt_window_on("FRT_INPROJ_SWAP", "GGML_FLASHRT_NO_INPROJ");
+    g_reg.attn_on   = frt_window_on("FRT_ATTNQKV_SWAP", "GGML_FLASHRT_NO_ATTNQKV");
+    g_reg.shexp_on  = frt_layer_enabled() && c && c[0] == '1';    // archive: opt-in
+    g_reg.outproj_on = frt_layer_enabled() && d && d[0] == '1';   // archive: opt-in
     if (!g_reg.inproj_on && !g_reg.attn_on && !g_reg.shexp_on && !g_reg.outproj_on) return false;
     const char * path = getenv("FRT_REGIONS_PACK");
     if (!path && frt_online_on()) {
@@ -422,6 +451,7 @@ static bool frt_regions_mul_mat(ggml_backend_cuda_context & ctx,
     if (!frt_regions_load()) return false;
     int layer = -1; char rest[64] = {0};
     if (sscanf(src0->name, "blk.%d.%63s", &layer, rest) != 2 || layer < 0 || layer >= frt_binding::layer_scan_max) return false;
+    if (!frt_layer_in_scope(layer)) return false;
     for (int kind = 0; kind < frt_binding::n_region_kinds; ++kind) {
         if (kind == 0 && !g_reg.inproj_on) continue;
         if (kind == 1 && !g_reg.attn_on) continue;
@@ -467,9 +497,8 @@ static bool frt_head_load(void) {
     // storage; the target head stays Q6_K/stock) — draft logits only steer
     // acceptance, never the verified output, so this is quality-free.
     const char * sw = getenv("FRT_HEAD_SWAP");
-    const char * dr = getenv("FRT_HEAD_DRAFT");
-    const bool sw_on = sw && sw[0] == '1';
-    const bool dr_on = dr && dr[0] == '1';
+    const bool sw_on = frt_layer_enabled() && sw && sw[0] == '1';   // full tier: opt-in (quality)
+    const bool dr_on = frt_window_on("FRT_HEAD_DRAFT", "GGML_FLASHRT_NO_HEAD_DRAFT");
     if (!sw_on && !dr_on) return false;
     g_head.draft_only = !sw_on;
     const char * path = getenv("FRT_HEAD_PACK");
@@ -634,7 +663,7 @@ __global__ void frt_w_pass2_bf16(const __nv_bfloat16 * __restrict__ w, const flo
 
 static bool frt_online_on(void) {
     static int on = -1;
-    if (on < 0) { const char * s = getenv("FRT_ONLINE_REPACK"); on = (s && s[0] == '1') ? 1 : 0; }
+    if (on < 0) on = frt_window_on("FRT_ONLINE_REPACK", "GGML_FLASHRT_NO_ONLINE_REPACK") ? 1 : 0;
     return on == 1;
 }
 
@@ -745,8 +774,36 @@ static void frt_repack_check_region(int kind, int layer, const frt_region & r) {
 static void frt_online_prepare(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph) {
     if (!frt_online_on()) return;
     static bool all_done = false;
+    static int evals_seen = 0;
     if (all_done) return;
-    if (!frt_regions_load() && !getenv("FRT_HEAD_SWAP") && !getenv("FRT_HEAD_DRAFT")) { all_done = true; return; }
+    ++evals_seen;
+    const char * hsw = getenv("FRT_HEAD_SWAP");
+    const bool head_full = frt_layer_enabled() && hsw && hsw[0] == '1';
+    const bool head_draft = frt_window_on("FRT_HEAD_DRAFT", "GGML_FLASHRT_NO_HEAD_DRAFT");
+    if (!frt_regions_load() && !head_full && !head_draft) { all_done = true; return; }
+
+    // once everything structural is built and only a draft-model head sighting
+    // is outstanding, drop to a light scan (name check only) — the full member
+    // scan on every eval costs measurable host time.
+    static bool structural_done = false;
+    static bool saw_draft_head = false;   // a loaded spec draft's Q8_0 head copy
+    if (structural_done) {
+        // the draft model's graphs are small (single MTP layer); skip the walk
+        // on full-size target graphs entirely.
+        if (!saw_draft_head && cgraph->n_nodes < 512) {
+            for (int i = 0; i < cgraph->n_nodes; ++i) {
+                const ggml_tensor * n = cgraph->nodes[i];
+                if (n->op == GGML_OP_MUL_MAT && n->src[0] && n->src[0]->type == GGML_TYPE_Q8_0 &&
+                    n->src[0]->ne[0] == frt_binding::d_model && strcmp(n->src[0]->name, frt_binding::head_name) == 0) {
+                    saw_draft_head = true;
+                    break;
+                }
+            }
+        }
+        if (!saw_draft_head && evals_seen < 4096) return;  // cheap: small graphs only
+        if (!saw_draft_head) { all_done = true; return; }  // no draft model; give up
+        // fall through: full scan once, to locate the pack source and build
+    }
 
     using namespace frt_binding;
     const ggml_tensor * mem[n_region_kinds][64][region_max_members] = {};
@@ -755,12 +812,14 @@ static void frt_online_prepare(ggml_backend_cuda_context & ctx, const ggml_cgrap
         const ggml_tensor * n = cgraph->nodes[i];
         if (n->op != GGML_OP_MUL_MAT || !n->src[0]) continue;
         const ggml_tensor * w = n->src[0];
-        if (strcmp(w->name, head_name) == 0 && w->type != GGML_TYPE_Q8_0 && w->ne[0] == d_model) {
-            head_w = w;
+        if (strcmp(w->name, head_name) == 0 && w->ne[0] == d_model) {
+            if (w->type != GGML_TYPE_Q8_0) head_w = w;
+            else saw_draft_head = true;
             continue;
         }
         int layer = -1; char rest[64] = {0};
         if (sscanf(w->name, "blk.%d.%63s", &layer, rest) != 2 || layer < 0 || layer >= layer_scan_max) continue;
+        if (!frt_layer_in_scope(layer)) continue;
         for (int kind = 0; kind < n_region_kinds; ++kind)
             for (int m = 0; m < region_n_members[kind]; ++m)
                 if (strcmp(rest, region_members[kind][m].name) == 0 && w->ne[1] == region_members[kind][m].rows)
@@ -799,7 +858,10 @@ static void frt_online_prepare(ggml_backend_cuda_context & ctx, const ggml_cgrap
         }
     }
 
-    if (head_w && !g_head.ok && (getenv("FRT_HEAD_SWAP") || getenv("FRT_HEAD_DRAFT"))) {
+    // draft-only serving builds lazily: only once a draft model is actually
+    // loaded (its Q8_0 head copy shows up in a graph), so plain runs never
+    // spend VRAM on a head pack that would never serve.
+    if (head_w && !g_head.ok && (head_full || (head_draft && saw_draft_head))) {
         const int64_t N = head_w->ne[1], K = head_w->ne[0];
         const size_t pkb = (size_t) N * K / 2;
         const size_t sfb = (size_t) ((N + 127) / 128) * ((K + 63) / 64) * 512;
@@ -823,16 +885,20 @@ static void frt_online_prepare(ggml_backend_cuda_context & ctx, const ggml_cgrap
         }
     }
 
-    const bool head_pending = (getenv("FRT_HEAD_SWAP") || getenv("FRT_HEAD_DRAFT")) && !g_head.ok;
+    const bool head_pending = (head_full || (head_draft && saw_draft_head)) && !g_head.ok;
     bool region_pending = false;
     for (int kind = 0; kind < n_region_kinds; ++kind) {
         const bool on = (kind == 0 && g_reg.inproj_on) || (kind == 1 && g_reg.attn_on);
         region_pending = region_pending || (on && built[kind] < region_layers[kind]);
     }
     if (!head_pending && !region_pending) {
-        fprintf(stderr, "frt-repack: online repack complete (kind0=%d kind1=%d head=%d)\n",
-                built[0], built[1], (int) g_head.ok);
-        all_done = true;
+        structural_done = true;
+        const bool draft_wait = head_draft && !head_full && !saw_draft_head;
+        if (!draft_wait) {
+            fprintf(stderr, "frt-repack: online repack complete (kind0=%d kind1=%d head=%d)\n",
+                    built[0], built[1], (int) g_head.ok);
+            all_done = true;
+        }
     }
 }
 
@@ -1134,7 +1200,7 @@ __global__ void frt_gdn_epilogue(
 // Returns number of nodes consumed starting at i (0 = not ours).
 bool ggml_cuda_frt_gdn_try_impl(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i, int * skip_count) {
     static int mode = -1;
-    if (mode < 0) { const char * m = getenv("FRT_GDN_SWAP"); mode = (m && m[0] == '1') ? 1 : 0; }
+    if (mode < 0) mode = frt_window_on("FRT_GDN_SWAP", "GGML_FLASHRT_NO_GDN") ? 1 : 0;
     if (!mode) return false;
     if (!frt::frt_regions_load() || !frt::g_reg.inproj_on) return false;
 
@@ -1818,7 +1884,7 @@ static bool frt_router_span_try(ggml_backend_cuda_context & ctx, ggml_cgraph * c
     // (their fusion is M=1-only; the M=2 fallback is the unfused argsort chain).
     // "1" -> on for all M; "0" -> off entirely.
     static int mode = -1;
-    if (mode < 0) { const char * m = getenv("FRT_ROUTER_SWAP"); mode = m ? ((m[0] == '1') ? 2 : 0) : 1; }
+    if (mode < 0) { const char * m = getenv("FRT_ROUTER_SWAP"); mode = !frt_layer_enabled() ? 0 : (m ? ((m[0] == '1') ? 2 : 0) : 1); }
     if (!mode) return false;
     ggml_tensor * n0 = cgraph->nodes[i];
     if (n0->op != GGML_OP_MUL_MAT || !n0->src[0] ||
@@ -1880,7 +1946,7 @@ static bool frt_router_span_try(ggml_backend_cuda_context & ctx, ggml_cgraph * c
 // fused MoE expert segment: anchor = MUL_MAT_ID on ffn_gate_exps.weight.
 static bool frt_moefuse_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i, int * skip_count) {
     static int mode = -1;
-    if (mode < 0) { const char * m = getenv("FRT_MOEFUSE_SWAP"); mode = (m && m[0] == '1') ? 1 : 0; }
+    if (mode < 0) mode = frt_window_on("FRT_MOEFUSE_SWAP", "GGML_FLASHRT_NO_MOEFUSE") ? 1 : 0;
     if (!mode) return false;
     ggml_tensor * gate_id = cgraph->nodes[i];
     if (gate_id->op != GGML_OP_MUL_MAT_ID || !gate_id->src[0] ||
@@ -1919,7 +1985,7 @@ static bool frt_moefuse_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgrap
     if (ids->ne[1] != M) return false;
 
     static int sh_mode = -1;
-    if (sh_mode < 0) { const char * m = getenv("FRT_MOEFUSE_SHEXP"); sh_mode = (m && m[0] == '1') ? 1 : 0; }
+    if (sh_mode < 0) sh_mode = frt_window_on("FRT_MOEFUSE_SHEXP", "GGML_FLASHRT_NO_SHEXP_FOLD") ? 1 : 0;
     const ggml_tensor * up_id = nullptr, * glu = nullptr, * down_id = nullptr;
     const ggml_tensor * wmul = nullptr;
     const ggml_tensor * shg = nullptr, * shu = nullptr, * shd = nullptr, * ginp = nullptr;
@@ -2150,7 +2216,7 @@ static bool frt_moefuse_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgrap
 // (their path: quantize_q8_1 + mmvq + add = 3 launches) -> quant + gemv/add = 2.
 static bool frt_outproj_native_try(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i, int * skip_count) {
     static int mode = -1;
-    if (mode < 0) { const char * m = getenv("FRT_OUTNATIVE_SWAP"); mode = (m && m[0] == '1') ? 1 : 0; }
+    if (mode < 0) mode = frt_window_on("FRT_OUTNATIVE_SWAP", "GGML_FLASHRT_NO_OUTNATIVE") ? 1 : 0;
     if (!mode) return false;
     ggml_tensor * n0 = cgraph->nodes[i];
     if (n0->op != GGML_OP_MUL_MAT || !n0->src[0]) return false;
@@ -2299,7 +2365,7 @@ bool ggml_cuda_frt_moeglue_try_impl(ggml_backend_cuda_context & ctx, ggml_cgraph
     if (frt_outproj_native_try(ctx, cgraph, i, skip_count)) return true;
     if (frt_shexp_span_try(ctx, cgraph, i, skip_count)) return true;
     static int mode = -1;
-    if (mode < 0) { const char * m = getenv("FRT_MOEGLUE_SWAP"); mode = (m && m[0] == '1') ? 1 : 0; }
+    if (mode < 0) mode = frt_window_on("FRT_MOEGLUE_SWAP", "GGML_FLASHRT_NO_MOEGLUE") ? 1 : 0;
     if (!mode) return false;
     ggml_tensor * n0 = cgraph->nodes[i];
 
