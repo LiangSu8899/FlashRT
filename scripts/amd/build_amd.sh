@@ -42,7 +42,9 @@ else
     ${PYBIND_INCLUDES} \
     -I"${ROOT}/csrc/amd" \
     -x hip "${ROOT}/csrc/amd/bindings.cpp" \
-    "${ROOT}/csrc/amd/kernels/norm.hip" \
+    "${ROOT}/csrc/amd/kernels/"*.hip \
+    "${ROOT}/csrc/amd/gemm/"*.hip \
+    -L"${ROCM_PATH}/lib" -lhipblaslt \
     -o "${OUT}"
   echo "built via hipcc: ${OUT}"
 fi

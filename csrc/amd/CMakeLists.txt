@@ -43,6 +43,7 @@ set(CMAKE_HIP_ARCHITECTURES "${GPU_ARCH}")
 set(CMAKE_HIP_STANDARD 17)
 
 find_package(hip REQUIRED)
+find_package(hipblaslt REQUIRED)
 
 # ── pybind11 (same resolution as root CMake: ask the interpreter) ──
 find_package(Python COMPONENTS Interpreter Development REQUIRED)
@@ -56,6 +57,11 @@ find_package(pybind11 CONFIG REQUIRED)
 set(FLASHRT_AMD_SOURCES
   bindings.cpp
   kernels/norm.hip
+  kernels/activation.hip
+  kernels/elementwise.hip
+  kernels/rope.hip
+  kernels/patch_embed.hip
+  gemm/hipblaslt_runner.hip
 )
 set_source_files_properties(${FLASHRT_AMD_SOURCES} PROPERTIES LANGUAGE HIP)
 
@@ -65,7 +71,7 @@ target_compile_definitions(flash_rt_amd_kernels PRIVATE
   FLASHRT_AMD_GPU_ARCH="${GPU_ARCH}")
 target_compile_options(flash_rt_amd_kernels PRIVATE
   $<$<COMPILE_LANGUAGE:HIP>:-O3 -ffp-contract=fast>)
-target_link_libraries(flash_rt_amd_kernels PRIVATE hip::host)
+target_link_libraries(flash_rt_amd_kernels PRIVATE hip::host roc::hipblaslt)
 
 set_target_properties(flash_rt_amd_kernels PROPERTIES
   LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../../flash_rt/amd")
