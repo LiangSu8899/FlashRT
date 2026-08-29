@@ -1,5 +1,6 @@
 // ================================================================
 // FlashRT AMD — decoder cross-attention, split-KV flash (CDNA wave64)
+// v2: thread-parallel dot products, zero cross-lane ops in hot loops.
 //
 // One fixed production site: tiny-M GQA cross-attention
 //     Q (Sq, Hq, D) bf16   — Sq ~ 10 query tokens, Hq query heads
@@ -7,91 +8,150 @@
 //     V (Skv, D)    bf16
 //     O (Sq, Hq, D) bf16   — bidirectional, no mask
 //
-// Why this shape needs its own kernel: total work is ~80 query
-// vectors x <1K keys x 256 dims — library FA tiles (128/256-row Q
-// blocks, MFMA pipelines) waste >90% of their lanes here and the
-// call is launch/bandwidth bound, not compute bound. MFMA is
-// deliberately NOT used: a 10-row score tile cannot feed the
-// 16x16x16 matrix pipes; packed FMA from LDS is already >10x above
-// the arithmetic demand of this site.
+// Why v1 was slow (76 us in-graph vs 49 us sdpa): v1 computed each
+// score with a wave_reduce_sum — per workgroup ~10 queries x ~26 KV
+// rows = ~260 serial 6-step shuffle trees, each a latency chain the
+// wave sits through. The site is ~34 MFLOP / ~850 KB — pure
+// structure/overhead, so shuffle latency dominated everything.
 //
-// Decomposition (mirrors the FlashRT RTX split-KV win on this site):
-//   kernel 1 (partial): grid (ATTN_NSPLIT=32, Hq) — 32*8 = 256
-//     workgroups, one per CU on a 256-CU MI350X. Workgroup (i, h)
-//     owns KV rows [i*chunk, min((i+1)*chunk, skv)) for head h,
-//     chunk = ceil(skv/32) (<= 28 rows at Skv=876). It computes a
-//     full online-softmax partial over its slice for ALL Sq queries:
-//     row max m[q], sum-of-exp l[q], and the UNNORMALIZED
-//     acc[q][d] = sum_j exp(s[q][j] - m[q]) * V[j][d],
-//     written to the caller-provided fp32 workspace.
-//   kernel 2 (reduce): grid (Sq, Hq) — 80 tiny workgroups combine
-//     the 32 partials per (q, h) with the standard flash rescale
-//     (global max, exp(m_i - gm) coefficients) and emit bf16 O.
-//   Two kernels on one stream: plain stream ordering, no atomics,
-//   no cooperative counters — trivially HIP-graph capturable.
+// v2 restructure — every hot phase is one THREAD per output value,
+// dots run serially in registers from LDS, no shuffles at all in
+// kernel 1:
+//   Phase 0 (stage):   Q (Sq x D, fp32) and this split's K tile
+//                      (chunk x D, bf16 pairs) into LDS, coalesced.
+//   Phase A (scores):  one thread per (query, kv-row) pair —
+//                      Sq*chunk pairs over 256 threads (chunk=26 at
+//                      the site -> 260 pairs, ~1 loop iteration).
+//                      Each thread runs the full D-dim dot serially
+//                      from LDS into 4 fp32 accumulators (fixed
+//                      combine order), writes one score to LDS.
+//   Phase A'(V stage): K tile is dead after A; the same LDS buffer
+//                      is refilled with the split's V tile.
+//   Phase B (softmax): one thread per query — serial ascending-j
+//                      max / exp / sum over <= chunk scores in LDS
+//                      (<= ~3*64 LDS ops on <= 16 threads; cheaper
+//                      than extra barriers + reduction round-trips).
+//   Phase C (PV):      one thread per (query, dim-pair) — Sq*D/2
+//                      units (1280 at site) over 256 threads = 5
+//                      serial rows each, accumulating over chunk V
+//                      rows from LDS, ascending j.
 //
-// K/V are read once per head (8x total through L2; K+V ~ 850 KB,
-// so ~7 MB of L2-resident traffic — well under 10 us at any
-// realistic L2/HBM bandwidth). The problem is launch bound; both
-// kernels are deliberately shallow.
+// Split-KV decomposition (unchanged from v1):
+//   kernel 1 (partial): grid (NSPLIT, Hq). Workgroup (i, h) owns KV
+//     rows [i*chunk, min((i+1)*chunk, skv)), chunk = ceil(skv/NSPLIT),
+//     and emits an online-softmax partial for ALL Sq queries: m[q],
+//     l[q], unnormalized acc[q][d] -> fp32 workspace.
+//   kernel 2 (reduce): grid (Sq, Hq) — combines the NSPLIT partials
+//     with the standard flash rescale and emits bf16 O. v2 change:
+//     the per-split m/l loads run on a full wave (lane i <-> split i)
+//     with fixed radix-2 shuffle trees, instead of v1's thread-0
+//     serial loop; the acc combine stays one thread per output dim.
+//   Two kernels on one stream: plain stream ordering, no atomics, no
+//   cooperative counters — trivially HIP-graph capturable. A fused
+//   single-kernel variant would need a last-WG-done flag (atomics —
+//   forbidden for determinism); two in-graph launches are ~2 x
+//   ~2.5 us and fit the 10 us budget.
 //
-// Sequence length modes (matches qkv_split_rope_devpos):
-//   exact mode:  seqused == nullptr, Skv host int is the length.
-//   fixed mode:  seqused != nullptr, kernel reads seqused[0] on
-//     device; host Skv is ignored. Rows >= seqused[0] are NEVER
-//     touched (loops bound by the device value), so a fixed-shape
-//     graph can run any valid prefix length and padding rows may
-//     hold garbage/NaN.
+// NSPLIT selection (compile-time template, instantiated 8/16/32):
+//   Kernel-1 latency scales with chunk (score dots per thread =
+//   ceil(Sq*chunk/256); PV inner trip = chunk), while the reduce
+//   kernel's cost in NSPLIT is a wave-parallel handful of loads —
+//   so smaller chunks win until launch/reduce overhead bites.
+//   Host heuristic keeps chunk ~<= 32:
+//       skv <= 256 -> NSPLIT 8;  skv <= 512 -> 16;  else -> 32.
+//   Capacity: skv <= NSPLIT * CHUNK_MAX(64), i.e. 512 / 1024 / 2048;
+//   the guard falls back to NSPLIT=32 when the pick can't hold Skv.
+//   Env FRT_ATTN_NSPLIT=8|16|32 overrides (read per call on the
+//   host, so a bench can sweep variants; inside a captured graph the
+//   choice is frozen at capture time — flipping the env later does
+//   NOT re-route an existing graph). In fixed/seqused mode the pick
+//   uses the host Skv (the padded capacity bound, >= seqused[0]).
 //
-// fp32 math order (deterministic, fixed for a given shape):
-//   - scores: per-lane partial over dims {lane, lane+64, lane+128,
-//     lane+192} in ascending order, then the wave64 shuffle tree of
-//     wave_reduce_sum (fixed radix-2 order). Scale applied once to
-//     the reduced fp32 score.
-//   - softmax: m = serial fmaxf over the slice in ascending j;
-//     p = __expf(s - m) (device fast exp, rel err ~2^-22 — far
-//     below bf16 input noise); l = serial sum ascending j.
-//   - acc: serial ascending j per output dim; fp32 FMA.
-//   - reduce: serial ascending split index. No atomics anywhere.
+// Occupancy (MI350X, 256 CUs = 8 XCDs x 32):
+//   kernel 1 WGs = NSPLIT x Hq(8): 256 WGs at NSPLIT=32 -> 1 WG/CU,
+//   every CU busy, per-WG serial work minimal (chunk 26 at skv 826:
+//   score = 1-2 dots x 128 packed iters/thread; PV = 5 x 26 FMAs).
+//   NSPLIT=16 -> 128 WGs on 256 CUs: half the CUs idle but each WG
+//   is still latency- not throughput-bound, so it's competitive only
+//   when skv is small enough that chunk stays ~<= 32; the heuristic
+//   encodes exactly that. NSPLIT=8 -> 64 WGs, only for tiny skv.
+//   kernel 2 = Sq x Hq = 80 tiny WGs (D threads live) — launch bound
+//   by design. LDS 54 KB/WG caps residency at 1 WG/CU on a 64 KB
+//   budget (2 on gfx950's 160 KB) — irrelevant: the grid itself is
+//   <= 1 WG/CU.
 //
-// LDS layout (kernel 1, ~20.3 KB static):
-//   q_lds  [Sq][D]  fp32 Q for this head (10x256 = 10 KB at site)
-//   s_lds  [SQ_MAX][CHUNK_MAX] scores -> exp'd probabilities
-//   m_lds  [SQ_MAX] row maxima
-//   Bank behavior: score dot reads q_lds[q*D + lane + 64*i] —
-//   consecutive lanes hit consecutive banks (conflict-free); the
-//   matching K global read is a 2 B/lane contiguous burst (128 B
-//   per quarter row per instruction, fully coalesced). Phase C
-//   reads s_lds at one address per wave (broadcast) and V rows as
-//   contiguous 2 B/lane bursts.
+// LDS layout (kernel 1, ~54 KB static) and bank reasoning
+// (CDNA banks are 4 B; row pads below keep row strides odd in
+// 4 B units, so distinct rows -> distinct banks for any power-of-2
+// bank count):
+//   kv_lds [CHUNK_MAX][D/2 + 1] bf16-pairs (4 B units), pitch 129:
+//     holds K for phase A, then V for phase C.
+//     Phase A: consecutive threads = consecutive kv rows (pair index
+//     p = q*chunk + r) reading element i -> bank (r*129 + i) % NB =
+//     (r + i) % NB: distinct rows hit distinct banks; threads from
+//     different q-groups reading the SAME row read the same address
+//     -> hardware broadcast, no serialization. Rows r and r+NB
+//     collide 2-way at chunk > NB (chunk 52 at NSPLIT=16) — accepted.
+//     Phase C: consecutive threads = consecutive dim-pairs of one
+//     query reading v[j*129 + dp] -> consecutive banks, conflict-free.
+//     The matching global K/V loads are linear 4 B/lane bursts
+//     (rows are contiguous), fully coalesced.
+//   q_lds [SQ_MAX][D + 2] fp32, pitch 258 (even, float2-aligned):
+//     Phase A reads q_lds[q*258 + 2i] as float2; lanes in the same
+//     q-group read the same address (broadcast); distinct q differ
+//     by 258*dq -> bank pair offset 2*dq % NB, distinct for q < 16.
+//   s_lds  [SQ_MAX][CHUNK_MAX + 1] fp32, pitch 65 (odd):
+//     Phase A writes one score/thread (consecutive r -> consecutive
+//     banks); phase C reads s[q*65 + j] at one address per q-group
+//     (broadcast).
 //
-// Workspace (partial_ws, caller-provided, NO allocation here):
-//   ATTN_NSPLIT * Hq * Sq * (D + 2) floats
-//   = 32 * Hq * Sq * (D + 2) * 4 bytes  (pi05 site: 32*8*10*258*4
+// fp32 math order (deterministic, fixed for a given shape + NSPLIT):
+//   - scores: single thread, serial ascending d in 4 accumulators
+//     (d%4 lanes), combined (a0+a1)+(a2+a3); scale applied once.
+//   - softmax: serial ascending j for max, exp (__expf, rel err
+//     ~2^-22, far below bf16 input noise), and sum — one thread per q.
+//   - acc: serial ascending j per (q, dim-pair), fp32 FMA.
+//   - reduce: fixed radix-2 wave trees over a fixed lane<->split map
+//     (max is order-free; the l-sum tree order is fixed), then serial
+//     ascending split index for the acc combine. No atomics anywhere.
+//
+// Workspace (partial_ws, caller-provided, NO allocation here), sized
+// for NSPLIT_MAX = 32 regardless of the runtime pick:
+//   32 * Hq * Sq * (D + 2) floats  (pi05 site: 32*8*10*258*4
 //   = 2,641,920 B ~ 2.52 MiB). Per-(split,head) block layout:
 //   [Sq*D unnormalized acc][Sq m][Sq l]. Never needs zeroing:
 //   empty tail slices mark l = 0 and the reducer skips them.
 //
-// Limits (asserted nowhere — this is a fixed-site kernel; the
-// wrapper documents them): Sq <= 16, D <= 256, D % 4 == 0,
-// skv <= ATTN_NSPLIT * ATTN_CHUNK_MAX = 2048 (in-kernel clamped),
-// single KV head (GQA Hq:1).
+// Sequence length modes (matches qkv_split_rope_devpos):
+//   exact mode:  seqused == nullptr, Skv host int is the length.
+//   fixed mode:  seqused != nullptr, kernel reads seqused[0] on
+//     device; host Skv is only the capacity bound for the NSPLIT
+//     pick. Rows >= seqused[0] are NEVER touched (all loops bound by
+//     the device value), so a fixed-shape graph can run any valid
+//     prefix length and padding rows may hold garbage/NaN.
+//
+// Limits (fixed-site kernel; wrapper documents, nothing asserts):
+//   Sq <= 16, D <= 256, D % 4 == 0, skv <= NSPLIT*64 (in-kernel
+//   clamped), single KV head (GQA Hq:1).
 // ================================================================
 
 #include "../kernels/common_hip.h"
 
 #include <cfloat>
+#include <cstdlib>
 
-#define ATTN_NSPLIT     32   // KV splits; 32 * Hq(8) = 256 WGs = 1/CU
+#define ATTN_NSPLIT_MAX 32   // workspace sizing bound (test allocates for 32)
 #define ATTN_NTHREADS   256  // 4 waves
-#define ATTN_NWAVES     (ATTN_NTHREADS / FVK_WAVE_SIZE)
-#define ATTN_SQ_MAX     16   // register/LDS sizing bound for Sq
+#define ATTN_SQ_MAX     16   // LDS sizing bound for Sq
 #define ATTN_D_MAX      256  // LDS sizing bound for D
-#define ATTN_CHUNK_MAX  64   // max KV rows per split -> skv <= 2048
-#define ATTN_KD_PER_LANE (ATTN_D_MAX / FVK_WAVE_SIZE)  // 4 dims/lane
+#define ATTN_CHUNK_MAX  64   // max KV rows per split -> skv <= NSPLIT*64
+#define ATTN_KV_PITCH   (ATTN_D_MAX / 2 + 1)   // 129 bf16-pairs: odd stride
+#define ATTN_Q_PITCH    (ATTN_D_MAX + 2)       // 258 floats: even, f2-aligned
+#define ATTN_S_PITCH    (ATTN_CHUNK_MAX + 1)   // 65 floats: odd stride
 
 // ── Kernel 1: per-slice flash partials ──
-// grid (ATTN_NSPLIT, Hq), block ATTN_NTHREADS.
+// grid (NSPLIT, Hq), block ATTN_NTHREADS.
+template <int NSPLIT>
 __global__ __launch_bounds__(ATTN_NTHREADS)
 void attention_decoder_gqa_partial_kernel(
     const __hip_bfloat16* __restrict__ Q,
@@ -103,24 +163,24 @@ void attention_decoder_gqa_partial_kernel(
     const int split = blockIdx.x;
     const int h     = blockIdx.y;
     const int tid   = threadIdx.x;
-    const int lane  = tid & (FVK_WAVE_SIZE - 1);
-    const int wave  = tid >> 6;
 
-    __shared__ float q_lds[ATTN_SQ_MAX * ATTN_D_MAX];
-    __shared__ float s_lds[ATTN_SQ_MAX * ATTN_CHUNK_MAX];
-    __shared__ float m_lds[ATTN_SQ_MAX];
+    // K tile for phase A, then (reused) V tile for phase C.
+    alignas(16) __shared__ __hip_bfloat162 kv_lds[ATTN_CHUNK_MAX * ATTN_KV_PITCH];
+    alignas(16) __shared__ float q_lds[ATTN_SQ_MAX * ATTN_Q_PITCH];
+    alignas(16) __shared__ float s_lds[ATTN_SQ_MAX * ATTN_S_PITCH];
 
     // Effective sequence length: device seqused[0] wins (fixed-shape
     // graph mode); otherwise the host int (exact mode).
     int skv_eff = (seqused != nullptr) ? seqused[0] : Skv;
-    if (skv_eff > ATTN_NSPLIT * ATTN_CHUNK_MAX)
-        skv_eff = ATTN_NSPLIT * ATTN_CHUNK_MAX;  // documented hard cap
+    if (skv_eff > NSPLIT * ATTN_CHUNK_MAX)
+        skv_eff = NSPLIT * ATTN_CHUNK_MAX;  // documented hard cap
 
-    const int chunk = (skv_eff + ATTN_NSPLIT - 1) / ATTN_NSPLIT;
+    const int chunk = (skv_eff + NSPLIT - 1) / NSPLIT;
     const int start = split * chunk;
     int end = start + chunk;
     if (end > skv_eff) end = skv_eff;
     const int cn = end - start;  // rows in this slice (may be <= 0)
+    const int dh = D >> 1;       // bf16-pairs per row
 
     // Workspace block for (split, head): [Sq*D acc][Sq m][Sq l]
     const size_t base = (size_t)(split * Hq + h) * (size_t)Sq * (size_t)(D + 2);
@@ -135,145 +195,141 @@ void attention_decoder_gqa_partial_kernel(
         return;
     }
 
-    // Stage this head's Q into LDS as fp32 (10x256 = 10 KB at site).
+    // ── Phase 0: stage Q (fp32) and the K tile (bf16 pairs) ──
     for (int idx = tid; idx < Sq * D; idx += ATTN_NTHREADS) {
         const int q = idx / D;
         const int d = idx - q * D;
-        q_lds[q * D + d] =
+        q_lds[q * ATTN_Q_PITCH + d] =
             __bfloat162float(Q[((size_t)q * Hq + h) * D + d]);
     }
-    __syncthreads();
-
-    // ── Phase A: scores s[q][j] = scale * <Q[q], K[j]> ──
-    // Waves interleave over slice rows (wave w -> rows start+w,
-    // start+w+4, ...). Lane l owns dims {l, l+64, l+128, l+192}:
-    // conflict-free LDS reads of Q, coalesced 2 B/lane K bursts.
-    for (int j = start + wave; j < end; j += ATTN_NWAVES) {
-        const __hip_bfloat16* krow = K + (size_t)j * D;
-        float kd[ATTN_KD_PER_LANE];
-        #pragma unroll
-        for (int i = 0; i < ATTN_KD_PER_LANE; ++i) {
-            const int d = lane + i * FVK_WAVE_SIZE;
-            kd[i] = (d < D) ? __bfloat162float(krow[d]) : 0.0f;
-        }
-        float p[ATTN_SQ_MAX];
-        #pragma unroll
-        for (int q = 0; q < ATTN_SQ_MAX; ++q) {
-            float a = 0.0f;
-            if (q < Sq) {
-                #pragma unroll
-                for (int i = 0; i < ATTN_KD_PER_LANE; ++i) {
-                    const int d = lane + i * FVK_WAVE_SIZE;
-                    if (d < D) a += kd[i] * q_lds[q * D + d];
-                }
-            }
-            p[q] = a;
-        }
-        #pragma unroll
-        for (int q = 0; q < ATTN_SQ_MAX; ++q) {
-            if (q < Sq) {
-                const float r = wave_reduce_sum(p[q]);  // fixed radix-2 tree
-                if (lane == 0)
-                    s_lds[q * ATTN_CHUNK_MAX + (j - start)] = r * scale;
-            }
-        }
+    const __hip_bfloat162* K2 = reinterpret_cast<const __hip_bfloat162*>(K);
+    for (int idx = tid; idx < cn * dh; idx += ATTN_NTHREADS) {
+        const int r = idx / dh;
+        const int c = idx - r * dh;
+        kv_lds[r * ATTN_KV_PITCH + c] = K2[(size_t)(start + r) * dh + c];
     }
     __syncthreads();
 
-    // ── Phase B: per-slice online softmax over the <= CHUNK_MAX rows ──
-    // Row maxima: one thread per query row, serial ascending j
-    // (<= 64 iterations — cheaper than another reduction round-trip).
+    // ── Phase A: one thread per (query, kv-row) pair ──
+    // Full D-dim dot serially from LDS; 4 accumulators break the FMA
+    // dependency chain to ~D/4; fixed combine order (a0+a1)+(a2+a3).
+    const int npairs = Sq * cn;
+    for (int p = tid; p < npairs; p += ATTN_NTHREADS) {
+        const int q = p / cn;
+        const int r = p - q * cn;
+        const __hip_bfloat162* kr = &kv_lds[r * ATTN_KV_PITCH];
+        const float2* qr =
+            reinterpret_cast<const float2*>(&q_lds[q * ATTN_Q_PITCH]);
+        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+        #pragma unroll 4
+        for (int i = 0; i < dh; i += 2) {  // dh even (D % 4 == 0)
+            const __hip_bfloat162 k0 = kr[i];
+            const __hip_bfloat162 k1 = kr[i + 1];
+            const float2 q0 = qr[i];
+            const float2 q1 = qr[i + 1];
+            a0 = fmaf(__bfloat162float(k0.x), q0.x, a0);
+            a1 = fmaf(__bfloat162float(k0.y), q0.y, a1);
+            a2 = fmaf(__bfloat162float(k1.x), q1.x, a2);
+            a3 = fmaf(__bfloat162float(k1.y), q1.y, a3);
+        }
+        s_lds[q * ATTN_S_PITCH + r] = ((a0 + a1) + (a2 + a3)) * scale;
+    }
+    __syncthreads();  // scores done; K tile is dead from here
+
+    // ── Phase A': refill the tile with V (all threads) ──
+    const __hip_bfloat162* V2 = reinterpret_cast<const __hip_bfloat162*>(V);
+    for (int idx = tid; idx < cn * dh; idx += ATTN_NTHREADS) {
+        const int r = idx / dh;
+        const int c = idx - r * dh;
+        kv_lds[r * ATTN_KV_PITCH + c] = V2[(size_t)(start + r) * dh + c];
+    }
+
+    // ── Phase B: per-query serial softmax (interleaved with A') ──
+    // Serial ascending j: max, then exp in place + sum — fixed order,
+    // <= 3*chunk LDS ops on Sq threads; s_lds is untouched by A'.
     if (tid < Sq) {
+        float* sp = &s_lds[tid * ATTN_S_PITCH];
         float m = -FLT_MAX;
-        for (int jj = 0; jj < cn; ++jj)
-            m = fmaxf(m, s_lds[tid * ATTN_CHUNK_MAX + jj]);
-        m_lds[tid] = m;
-    }
-    __syncthreads();
-
-    // Exponentiate in place, all threads in parallel.
-    for (int idx = tid; idx < Sq * cn; idx += ATTN_NTHREADS) {
-        const int q  = idx / cn;
-        const int jj = idx - q * cn;
-        float* sp = &s_lds[q * ATTN_CHUNK_MAX + jj];
-        *sp = __expf(*sp - m_lds[q]);
-    }
-    __syncthreads();
-
-    // l[q]: serial ascending j — fixed summation order.
-    if (tid < Sq) {
+        for (int j = 0; j < cn; ++j) m = fmaxf(m, sp[j]);
         float l = 0.0f;
-        for (int jj = 0; jj < cn; ++jj)
-            l += s_lds[tid * ATTN_CHUNK_MAX + jj];
-        m_ws[tid] = m_lds[tid];
+        for (int j = 0; j < cn; ++j) {
+            const float e = __expf(sp[j] - m);
+            sp[j] = e;
+            l += e;
+        }
+        m_ws[tid] = m;
         l_ws[tid] = l;
     }
+    __syncthreads();  // V staged + probabilities final
 
-    // ── Phase C: unnormalized acc[q][d] = sum_j p[q][j] * V[j][d] ──
-    // Thread t owns output dim t for all Sq queries; V row reads are
-    // contiguous 2 B/lane, p reads are LDS broadcasts. Ascending j.
-    if (tid < D) {
-        float acc[ATTN_SQ_MAX];
-        #pragma unroll
-        for (int q = 0; q < ATTN_SQ_MAX; ++q) acc[q] = 0.0f;
-        for (int jj = 0; jj < cn; ++jj) {
-            const float v =
-                __bfloat162float(V[(size_t)(start + jj) * D + tid]);
-            #pragma unroll
-            for (int q = 0; q < ATTN_SQ_MAX; ++q)
-                if (q < Sq) acc[q] += s_lds[q * ATTN_CHUNK_MAX + jj] * v;
+    // ── Phase C: one thread per (query, dim-pair) ──
+    // acc[q][2dp..2dp+1] = sum_j p[q][j] * V[j][2dp..2dp+1], ascending j.
+    const int nunits = Sq * dh;
+    for (int u = tid; u < nunits; u += ATTN_NTHREADS) {
+        const int q  = u / dh;
+        const int dp = u - q * dh;
+        const float* sp = &s_lds[q * ATTN_S_PITCH];
+        const __hip_bfloat162* vp = &kv_lds[dp];
+        float ax = 0.0f, ay = 0.0f;
+        for (int j = 0; j < cn; ++j) {
+            const __hip_bfloat162 v = vp[j * ATTN_KV_PITCH];
+            const float pj = sp[j];
+            ax = fmaf(pj, __bfloat162float(v.x), ax);
+            ay = fmaf(pj, __bfloat162float(v.y), ay);
         }
-        #pragma unroll
-        for (int q = 0; q < ATTN_SQ_MAX; ++q)
-            if (q < Sq) acc_ws[(size_t)q * D + tid] = acc[q];
+        float* out = acc_ws + (size_t)q * D + 2 * dp;
+        out[0] = ax;   // adjacent 4 B stores; consecutive lanes are
+        out[1] = ay;   // consecutive pairs -> coalesced 8 B/lane
     }
 }
 
-// ── Kernel 2: combine the ATTN_NSPLIT partials per (q, h) ──
+// ── Kernel 2: combine the NSPLIT partials per (q, h) ──
 // grid (Sq, Hq), block ATTN_NTHREADS (thread t = output dim t).
 // Standard flash rescale: gm = max_i m_i, coeff_i = exp(m_i - gm),
 // O = (sum_i coeff_i * acc_i) / (sum_i coeff_i * l_i).
+// v2: wave 0 loads all m/l in parallel (lane i <-> split i) and
+// reduces with fixed shuffle trees; v1 looped serially on thread 0.
+template <int NSPLIT>
 __global__ __launch_bounds__(ATTN_NTHREADS)
 void attention_decoder_gqa_reduce_kernel(
     const float* __restrict__ ws,
     __hip_bfloat16* __restrict__ O,
     int Sq, int Hq, int D) {
-    const int q   = blockIdx.x;
-    const int h   = blockIdx.y;
-    const int tid = threadIdx.x;
+    const int q    = blockIdx.x;
+    const int h    = blockIdx.y;
+    const int tid  = threadIdx.x;
+    const int lane = tid & (FVK_WAVE_SIZE - 1);
+    const int wave = tid >> 6;
 
-    __shared__ float coeff[ATTN_NSPLIT];
+    __shared__ float coeff[NSPLIT];
     __shared__ float s_invL;
 
     const size_t blk = (size_t)Sq * (size_t)(D + 2);  // floats per (split,head)
     const size_t ml_off = (size_t)Sq * D;
 
-    // Serial over 32 splits on thread 0: ~64 independent fp32 loads,
-    // negligible next to launch cost; fixed ascending order.
-    if (tid == 0) {
-        float gm = -FLT_MAX;
-        for (int i = 0; i < ATTN_NSPLIT; ++i) {
-            const size_t b = (size_t)(i * Hq + h) * blk;
-            const float li = ws[b + ml_off + Sq + q];
-            const float mi = ws[b + ml_off + q];
-            if (li > 0.0f && mi > gm) gm = mi;
+    static_assert(NSPLIT <= FVK_WAVE_SIZE, "one wave covers all splits");
+    if (wave == 0) {
+        float mi = -FLT_MAX, li = 0.0f;
+        if (lane < NSPLIT) {
+            const size_t b = (size_t)(lane * Hq + h) * blk;
+            li = ws[b + ml_off + Sq + q];
+            mi = ws[b + ml_off + q];
         }
-        float L = 0.0f;
-        for (int i = 0; i < ATTN_NSPLIT; ++i) {
-            const size_t b = (size_t)(i * Hq + h) * blk;
-            const float li = ws[b + ml_off + Sq + q];
-            const float mi = ws[b + ml_off + q];
-            const float c = (li > 0.0f) ? __expf(mi - gm) : 0.0f;
-            coeff[i] = c;
-            L += c * li;
-        }
-        s_invL = (L > 0.0f) ? 1.0f / L : 0.0f;  // skv >= 1 => L > 0
+        // Global max: order-free; empty slices (li == 0) excluded.
+        float gm = wave_reduce_max((li > 0.0f) ? mi : -FLT_MAX);
+        gm = __shfl(gm, 0);  // tree result lives in lane 0 — broadcast
+        const float c = (lane < NSPLIT && li > 0.0f) ? __expf(mi - gm) : 0.0f;
+        if (lane < NSPLIT) coeff[lane] = c;
+        // L: fixed radix-2 tree over the fixed lane<->split map.
+        const float L = wave_reduce_sum(c * li);
+        if (lane == 0) s_invL = (L > 0.0f) ? 1.0f / L : 0.0f;  // skv>=1 => L>0
     }
     __syncthreads();
 
     if (tid < D) {
         float s = 0.0f;
-        for (int i = 0; i < ATTN_NSPLIT; ++i) {
+        #pragma unroll
+        for (int i = 0; i < NSPLIT; ++i) {
             const float c = coeff[i];
             // c == 0 also guards the never-written acc of empty slices.
             if (c != 0.0f) {
@@ -285,18 +341,38 @@ void attention_decoder_gqa_reduce_kernel(
     }
 }
 
+template <int NSPLIT>
+static void launch_decoder_gqa(const __hip_bfloat16* Q,
+                               const __hip_bfloat16* K,
+                               const __hip_bfloat16* V,
+                               __hip_bfloat16* O,
+                               float* partial_ws,
+                               int Sq, int Skv, int Hq, int D,
+                               const int* seqused,
+                               float softmax_scale,
+                               hipStream_t stream) {
+    dim3 grid1(NSPLIT, Hq);
+    attention_decoder_gqa_partial_kernel<NSPLIT><<<grid1, ATTN_NTHREADS, 0, stream>>>(Q, K, V, partial_ws, seqused, Sq, Skv, Hq, D, softmax_scale);
+    dim3 grid2(Sq, Hq);
+    attention_decoder_gqa_reduce_kernel<NSPLIT><<<grid2, ATTN_NTHREADS, 0, stream>>>(partial_ws, O, Sq, Hq, D);
+}
+
 // ── Host wrapper ──
 // partial_ws: caller-provided device fp32 scratch of at least
-//   ATTN_NSPLIT * Hq * Sq * (D + 2) floats
-//   (= 32 * Hq * Sq * (D + 2) * 4 bytes; pi05 decoder site
-//   32*8*10*258*4 = 2,641,920 bytes). No allocation, no memset, no
-//   host sync — safe inside HIP graph capture.
+//   ATTN_NSPLIT_MAX(32) * Hq * Sq * (D + 2) floats (pi05 decoder
+//   site: 32*8*10*258*4 = 2,641,920 bytes) — sized for the largest
+//   variant so the buffer works for any NSPLIT pick. No allocation,
+//   no memset, no host sync — safe inside HIP graph capture.
 // seqused: nullptr => exact mode (Skv host int is the length);
-//   else device int32, seqused[0] read in-kernel and Skv is ignored
-//   (fixed-shape graph mode; padding rows beyond seqused[0] are
-//   never read).
+//   else device int32, seqused[0] read in-kernel and the host Skv is
+//   only the padded capacity bound (fixed-shape graph mode; padding
+//   rows beyond seqused[0] are never read).
+// NSPLIT: heuristic on host Skv keeps chunk ~<= 32 (see header);
+//   FRT_ATTN_NSPLIT=8|16|32 overrides, re-read every call so a bench
+//   can sweep — but a captured graph keeps the capture-time choice.
 // Constraints (fixed-site kernel, not checked): 1 <= Sq <= 16,
-//   D <= 256, seq length <= 2048, single KV head (K/V are (Skv, D)).
+//   D <= 256, D % 4 == 0, seq length <= NSPLIT*64, single KV head
+//   (K/V are (Skv, D)).
 void attention_decoder_gqa(const __hip_bfloat16* Q,
                            const __hip_bfloat16* K,
                            const __hip_bfloat16* V,
@@ -306,8 +382,20 @@ void attention_decoder_gqa(const __hip_bfloat16* Q,
                            const int* seqused,
                            float softmax_scale,
                            hipStream_t stream) {
-    dim3 grid1(ATTN_NSPLIT, Hq);
-    attention_decoder_gqa_partial_kernel<<<grid1, ATTN_NTHREADS, 0, stream>>>(Q, K, V, partial_ws, seqused, Sq, Skv, Hq, D, softmax_scale);
-    dim3 grid2(Sq, Hq);
-    attention_decoder_gqa_reduce_kernel<<<grid2, ATTN_NTHREADS, 0, stream>>>(partial_ws, O, Sq, Hq, D);
+    int ns = 0;
+    if (const char* e = std::getenv("FRT_ATTN_NSPLIT")) ns = std::atoi(e);
+    if (ns != 8 && ns != 16 && ns != 32)
+        ns = (Skv <= 256) ? 8 : (Skv <= 512) ? 16 : 32;
+    if (Skv > ns * ATTN_CHUNK_MAX) ns = 32;  // capacity guard
+    switch (ns) {
+        case 8:
+            launch_decoder_gqa<8>(Q, K, V, O, partial_ws, Sq, Skv, Hq, D, seqused, softmax_scale, stream);
+            break;
+        case 16:
+            launch_decoder_gqa<16>(Q, K, V, O, partial_ws, Sq, Skv, Hq, D, seqused, softmax_scale, stream);
+            break;
+        default:
+            launch_decoder_gqa<32>(Q, K, V, O, partial_ws, Sq, Skv, Hq, D, seqused, softmax_scale, stream);
+            break;
+    }
 }

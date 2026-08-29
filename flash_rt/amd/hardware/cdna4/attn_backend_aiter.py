@@ -130,6 +130,27 @@ class Cdna4AiterAttnBackend(Cdna4AttnBackend):
         self._vis_scale = 1.0 / math.sqrt(self.vis_Q.shape[-1])   # D=72
         self._enc_scale = 1.0 / math.sqrt(self.enc_Q.shape[-1])   # D=256
 
+        # Optional hand-written decoder attention (csrc/amd/attention/
+        # decoder_flash.hip). FVK_AMD_DEC_ATTN=custom routes the decoder
+        # site to it; default "lib" keeps the aiter/sdpa library path.
+        # Workspace is pre-allocated once (pointer-stable, capture-safe);
+        # size per the kernel header: MAX_SPLIT * Hq * Sq * (D + 2) floats.
+        import os
+        self._dec_custom = (
+            os.environ.get("FVK_AMD_DEC_ATTN", "custom").strip().lower()
+            == "custom")
+        if self._dec_custom:
+            from flash_rt.amd import flash_rt_amd_kernels as _fvk
+            if not hasattr(_fvk, "attention_decoder_gqa"):
+                raise ImportError(
+                    "FVK_AMD_DEC_ATTN=custom but attention_decoder_gqa "
+                    "is not in flash_rt_amd_kernels")
+            self._fvk = _fvk
+            hq, d = self.dec_Q.shape[-2], self.dec_Q.shape[-1]
+            ws_floats = 32 * hq * chunk_size * (d + 2)
+            self._dec_attn_ws = self._torch.empty(
+                ws_floats, dtype=self._torch.float32, device="cuda")
+
     # ── aiter dispatch ──
 
     def _aiter_attn(self, q, k, v, out, scale):
@@ -180,6 +201,21 @@ class Cdna4AiterAttnBackend(Cdna4AttnBackend):
             return super().decoder_attn(layer_idx, enc_seq, dec_seq,
                                         stream=stream)
         total_kv = enc_seq + dec_seq
+        if self._dec_custom:
+            # Hand-written split-KV kernel; launches on the pipeline
+            # stream directly (raw-pointer ABI, no torch dispatch).
+            self._fvk.attention_decoder_gqa(
+                self.dec_Q.data_ptr(),
+                self.enc_K[layer_idx].data_ptr(),
+                self.enc_V[layer_idx].data_ptr(),
+                self._dec_O.data_ptr(),
+                self._dec_attn_ws.data_ptr(),
+                dec_seq, total_kv,
+                self.dec_Q.shape[-2], self.dec_Q.shape[-1],
+                0,                       # seqused: exact mode
+                self._enc_scale,
+                stream)
+            return self._dec_O.data_ptr()
         # Chunk queries cross-attend the shared [encoder + appended chunk]
         # K/V range bidirectionally — same semantics as the sdpa path.
         q = self.dec_Q[:dec_seq].unsqueeze(0)                 # (1, chunk, 8, 256)
