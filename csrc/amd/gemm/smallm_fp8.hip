@@ -39,11 +39,35 @@
 //   The naturally streaming layout: a wave owns whole output columns,
 //   lanes tile K in 16-byte chunks (64 lanes x 16B = 1KB of one B row
 //   per pass — perfectly coalesced full cache lines), and column
-//   parallelism alone (N/16 WGs at 4 columns/wave) fills the GPU with
-//   NO split-K, NO workspace, NO LDS. Each wave processes NPW=4
-//   columns per K-chunk so the A-chunk, converted once into
-//   registers, is reused across 4 columns. Prefer this path: set the
-//   frontend's fp8_layout="nk" so decoder weights are packed (N,K).
+//   parallelism alone fills the GPU with NO split-K, NO workspace, NO
+//   LDS. Prefer this path: set the frontend's fp8_layout="nk" so
+//   decoder weights are packed (N,K).
+//
+//   ILP=4 streaming (stream_probe, gfx950 — see
+//   FlashRT-amd-dev/notes/stream_craft_gfx950.md): one dwordx4 chain
+//   per lane plateaus at ~1373 GB/s @4MB / 3235 @64MB (latency-window
+//   bound, Little's law); FOUR independent dwordx4 chains per lane
+//   reach 1534-5855 GB/s (co_x4_i4 winners). The kernel therefore
+//   keeps NPW * CG == 4 independent B-row loads in flight per lane:
+//   NPW simultaneous output columns x CG consecutive K-chunks, all
+//   NPW*CG loads ISSUED before any convert/FMA consumes them.
+//   Consumption then runs in the ORIGINAL fixed order — ascending
+//   chunk, ascending column, ascending j inside the 16-byte packet —
+//   so per-column fp32 accumulation order is UNCHANGED and results
+//   stay bit-identical to the pre-ILP4 kernel (and to the fused FFN
+//   kernels, which copy this skeleton). ILP comes purely from load
+//   scheduling, never from splitting accumulators.
+//
+//   Host config pick (values are bit-identical for ANY (NPW, WAVES):
+//   a column's math never depends on which wave computes it):
+//     default: 4 waves/WG; largest NPW in {4,2,1} keeping
+//       grid = N/(4*NPW) >= 256 WGs (the measured saturation grid) —
+//       pi05 site N=1024 -> NPW=1 (256 WGs, CG=4: the whole K=4096
+//       row preloaded as 4 chains); N>=4096 -> NPW=4 (A-convert
+//       amortized 4x, grid still >= 256).
+//     alt: 8 waves/WG (w8 — probe: helps at larger footprints,
+//       neutral at small), same wave-count-preserving NPW rule
+//       against grid >= 128.
 //
 // fp8 -> f32 conversion: per-byte through __hip_fp8_e4m3's float
 // operator, which lowers to the gfx950 native V_CVT_*_FP8 ops. A
@@ -193,14 +217,21 @@ void smallm_fp8_split_reduce_kernel(const float* __restrict__ ws,
 
 // ================================================================
 // nt kernel: B stored (N, K) row-major.
-//   grid = ceil(N / (4*NPW)), block = 256; wave w owns output columns
-//   nb + w*NPW .. +NPW-1. Lanes tile K in 16B chunks (1KB per wave
-//   pass); the lane's A window is converted to registers once per
-//   chunk and reused across the wave's NPW columns. No LDS, no
-//   split-K, no workspace.
+//   grid = ceil(N / (WAVES*NPW)), block = WAVES*64; wave w owns output
+//   columns nb + w*NPW .. +NPW-1. Lanes tile K in 16B chunks (1KB per
+//   wave pass). No LDS, no split-K, no workspace.
+//
+//   ILP=4: each outer iteration covers a group of CG = 4/NPW
+//   consecutive K-chunks. All NPW*CG == 4 independent B dwordx4 loads
+//   for the group are issued FIRST (distinct destination registers ->
+//   4 loads in flight per lane, the measured gfx950 saturation
+//   lever), then consumed in the ORIGINAL fixed order: ascending
+//   chunk u, A window converted once per chunk, then ascending column
+//   p, ascending j. Per-accumulator fp32 order is bit-identical to
+//   the pre-ILP4 kernel.
 // ================================================================
-template<int M_T, int NPW>
-__global__ __launch_bounds__(SMALLM_FP8_BLOCK)
+template<int M_T, int NPW, int WAVES>
+__global__ __launch_bounds__(WAVES * 64)
 void smallm_fp8_nt_kernel(const unsigned char* __restrict__ A,
                           const unsigned char* __restrict__ B,
                           __hip_bfloat16* __restrict__ D,
@@ -209,7 +240,10 @@ void smallm_fp8_nt_kernel(const unsigned char* __restrict__ A,
                           int M, int N, int K) {
     const int wave = threadIdx.x >> 6;
     const int lane = threadIdx.x & 63;
-    const int nb   = blockIdx.x * (4 * NPW) + wave * NPW;
+    const int nb   = blockIdx.x * (WAVES * NPW) + wave * NPW;
+
+    // Chunk-group depth: NPW columns x CG chunks = 4 chains in flight.
+    constexpr int CG = (NPW >= 4) ? 1 : (4 / NPW);
 
     float acc[NPW][M_T];
     #pragma unroll
@@ -217,40 +251,59 @@ void smallm_fp8_nt_kernel(const unsigned char* __restrict__ A,
         #pragma unroll
         for (int m = 0; m < M_T; ++m) acc[p][m] = 0.0f;
 
-    // K-chunks of 64 lanes x 16B = 1024 elements; sequential chunk
-    // loop per lane keeps accumulation order fixed.
+    // K-chunks of 64 lanes x 16B = 1024 elements; the group loop and
+    // the in-group consume order are both ascending-chunk, so the
+    // accumulation order matches the plain sequential chunk loop.
     const int chunks = (K + 1023) >> 10;
-    for (int c = 0; c < chunks; ++c) {
-        const int kw = (c << 10) + (lane << 4);
-        if (kw >= K) continue;  // tail guard (K % 16 == 0 keeps loads whole)
-
-        // A window for this lane's 16 k's, all rows, converted once.
-        float a_f[M_T][16];
-        #pragma unroll
-        for (int m = 0; m < M_T; ++m) {
-            if (m < M) {
-                const uint4 av = *reinterpret_cast<const uint4*>(
-                    A + (size_t)m * K + kw);
-                smallm_fp8x16_to_f32(av, a_f[m]);
-            } else {
-                #pragma unroll
-                for (int j = 0; j < 16; ++j) a_f[m][j] = 0.0f;
-            }
-        }
-
+    for (int c0 = 0; c0 < chunks; c0 += CG) {
+        // ── issue all NPW x CG independent B loads (ILP4) ──
+        uint4 braw[NPW][CG];
+        bool  bok[NPW][CG];
         #pragma unroll
         for (int p = 0; p < NPW; ++p) {
             const int n = nb + p;
-            if (n >= N) continue;
-            const uint4 bv = *reinterpret_cast<const uint4*>(
-                B + (size_t)n * K + kw);
-            float bf[16];
-            smallm_fp8x16_to_f32(bv, bf);
+            #pragma unroll
+            for (int u = 0; u < CG; ++u) {
+                const int kw = ((c0 + u) << 10) + (lane << 4);
+                bok[p][u] = (n < N) && (kw < K);  // K % 16 == 0: whole loads
+                if (bok[p][u])
+                    braw[p][u] = *reinterpret_cast<const uint4*>(
+                        B + (size_t)n * K + kw);
+            }
+        }
+
+        // ── consume: ascending chunk, then ascending column ──
+        #pragma unroll
+        for (int u = 0; u < CG; ++u) {
+            const int kw = ((c0 + u) << 10) + (lane << 4);
+            if (kw >= K) continue;  // tail guard
+
+            // A window for this lane's 16 k's, all rows, converted
+            // once per chunk (L1/L2-hot — not the stream).
+            float a_f[M_T][16];
             #pragma unroll
             for (int m = 0; m < M_T; ++m) {
+                if (m < M) {
+                    const uint4 av = *reinterpret_cast<const uint4*>(
+                        A + (size_t)m * K + kw);
+                    smallm_fp8x16_to_f32(av, a_f[m]);
+                } else {
+                    #pragma unroll
+                    for (int j = 0; j < 16; ++j) a_f[m][j] = 0.0f;
+                }
+            }
+
+            #pragma unroll
+            for (int p = 0; p < NPW; ++p) {
+                if (!bok[p][u]) continue;
+                float bf[16];
+                smallm_fp8x16_to_f32(braw[p][u], bf);
                 #pragma unroll
-                for (int j = 0; j < 16; ++j)
-                    acc[p][m] += a_f[m][j] * bf[j];
+                for (int m = 0; m < M_T; ++m) {
+                    #pragma unroll
+                    for (int j = 0; j < 16; ++j)
+                        acc[p][m] += a_f[m][j] * bf[j];
+                }
             }
         }
     }
@@ -374,20 +427,20 @@ void smallm_fp8_nn_dev_alt(const void* A, const void* B, void* D,
                            split_ws, stream, /*target_wgs=*/512);
 }
 
-template<int NPW>
+template<int NPW, int WAVES>
 static void smallm_fp8_nt_dev_impl(const void* A, const void* B, void* D,
                                    const float* d_scale_a, const float* d_scale_b,
                                    int M, int N, int K, hipStream_t stream) {
     smallm_fp8_check("smallm_fp8_nt_dev", M, N, K, 1, 16);
-    const int cols_per_wg = 4 * NPW;
+    const int cols_per_wg = WAVES * NPW;
     const dim3 grid((unsigned)((N + cols_per_wg - 1) / cols_per_wg));
-    const dim3 block(SMALLM_FP8_BLOCK);
+    const dim3 block((unsigned)(WAVES * 64));
     const unsigned char* a8 = static_cast<const unsigned char*>(A);
     const unsigned char* b8 = static_cast<const unsigned char*>(B);
     __hip_bfloat16* d16 = static_cast<__hip_bfloat16*>(D);
 
     #define SMALLM_LAUNCH_NT(MT)                                                \
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(smallm_fp8_nt_kernel<MT, NPW>),      \
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(smallm_fp8_nt_kernel<MT, NPW, WAVES>),\
                            grid, block, 0, stream,                              \
                            a8, b8, d16, d_scale_a, d_scale_b, M, N, K)
     if      (M <= 4)  SMALLM_LAUNCH_NT(4);
@@ -397,12 +450,37 @@ static void smallm_fp8_nt_dev_impl(const void* A, const void* B, void* D,
     #undef SMALLM_LAUNCH_NT
 }
 
+// Shape-adaptive NPW: the largest NPW in {4, 2, 1} that keeps
+// grid = N/(WAVES*NPW) >= min_wgs — the measured gfx950 saturation
+// grid (stream_probe: 256 one-shot WGs of 4 waves with ILP4 saturate;
+// fewer WGs starve the latency window). Results are bit-identical for
+// every (NPW, WAVES): each output column's accumulation never depends
+// on which wave computes it, only on the fixed chunk/j order.
+template<int WAVES>
+static void smallm_fp8_nt_dispatch(const void* A, const void* B, void* D,
+                                   const float* d_scale_a, const float* d_scale_b,
+                                   int M, int N, int K, int min_wgs,
+                                   hipStream_t stream) {
+    if (N >= WAVES * 4 * min_wgs)
+        smallm_fp8_nt_dev_impl<4, WAVES>(A, B, D, d_scale_a, d_scale_b,
+                                         M, N, K, stream);
+    else if (N >= WAVES * 2 * min_wgs)
+        smallm_fp8_nt_dev_impl<2, WAVES>(A, B, D, d_scale_a, d_scale_b,
+                                         M, N, K, stream);
+    else
+        smallm_fp8_nt_dev_impl<1, WAVES>(A, B, D, d_scale_a, d_scale_b,
+                                         M, N, K, stream);
+}
+
 void smallm_fp8_nt_dev(const void* A, const void* B, void* D,
                        const float* d_scale_a, const float* d_scale_b,
                        int M, int N, int K, float* split_ws,
                        hipStream_t stream) {
     (void)split_ws;  // nt never splits K — accepted for signature symmetry
-    smallm_fp8_nt_dev_impl<4>(A, B, D, d_scale_a, d_scale_b, M, N, K, stream);
+    // Default: 4 waves/WG, grid target >= 256 WGs. pi05 site N=1024
+    // -> NPW=1 (256 WGs, CG=4); N>=2048 -> NPW=2; N>=4096 -> NPW=4.
+    smallm_fp8_nt_dispatch<4>(A, B, D, d_scale_a, d_scale_b, M, N, K,
+                              /*min_wgs=*/256, stream);
 }
 
 void smallm_fp8_nt_dev_alt(const void* A, const void* B, void* D,
@@ -410,5 +488,9 @@ void smallm_fp8_nt_dev_alt(const void* A, const void* B, void* D,
                            int M, int N, int K, float* split_ws,
                            hipStream_t stream) {
     (void)split_ws;
-    smallm_fp8_nt_dev_impl<2>(A, B, D, d_scale_a, d_scale_b, M, N, K, stream);
+    // Alt: w8 (512-thread WGs — probe: 8 waves helps at larger
+    // footprints, neutral at small), same total wave count as the
+    // default via a halved grid target.
+    smallm_fp8_nt_dispatch<8>(A, B, D, d_scale_a, d_scale_b, M, N, K,
+                              /*min_wgs=*/128, stream);
 }

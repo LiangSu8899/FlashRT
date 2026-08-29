@@ -73,8 +73,9 @@ void smallm_fp8_nt_dev(const void* A, const void* B, void* D,
                        int M, int N, int K, float* split_ws,
                        hipStream_t stream);
 
-// Alternate nt config for A/B benching: 2 output columns per wave
-// instead of 4 (2x workgroups — more parallelism, less A-convert reuse).
+// Alternate nt config for A/B benching: 8-wave (512-thread) WGs
+// instead of 4-wave, same total wave count (halved grid). Values are
+// bit-identical to smallm_fp8_nt_dev for every shape.
 void smallm_fp8_nt_dev_alt(const void* A, const void* B, void* D,
                            const float* d_scale_a, const float* d_scale_b,
                            int M, int N, int K, float* split_ws,

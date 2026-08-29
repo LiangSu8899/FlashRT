@@ -23,6 +23,8 @@
 #include "context.h"
 #include "gemm/hipblaslt_runner.h"
 #include "gemm/smallm_fp8.h"
+#include "gemm/decoder_ffn_fused.h"
+#include "kernels/stream_probe.h"
 
 namespace py = pybind11;
 
@@ -125,6 +127,12 @@ void attention_decoder_gqa(const __hip_bfloat16* Q, const __hip_bfloat16* K,
                            float* partial_ws, int Sq, int Skv, int Hq, int D,
                            const int* seqused, float softmax_scale,
                            hipStream_t stream);
+void attention_decoder_gqa_fp8out(const __hip_bfloat16* Q, const __hip_bfloat16* K,
+                                  const __hip_bfloat16* V, __hip_bfloat16* O,
+                                  __hip_fp8_e4m3* O_fp8, const float* d_scale,
+                                  float* partial_ws, int Sq, int Skv, int Hq, int D,
+                                  const int* seqused, float softmax_scale,
+                                  hipStream_t stream);
 
 PYBIND11_MODULE(flash_rt_amd_kernels, m) {
     m.doc() = "FlashRT AMD (ROCm/HIP) kernels — raw-pointer ABI";
@@ -381,6 +389,33 @@ PYBIND11_MODULE(flash_rt_amd_kernels, m) {
        py::arg("Hq"), py::arg("D"), py::arg("seqused") = 0,
        py::arg("softmax_scale") = 0.0625f, py::arg("stream") = 0);
 
+    // Same attention with a fused FP8-quantize epilogue: O_fp8 gets
+    // (Sq, Hq*D) OCP e4m3 bytes, byte-identical to quantize_fp8_static
+    // run on the bf16 O with the same device scale; O (bf16) is still
+    // written, identical to attention_decoder_gqa. d_scale = device
+    // float pointer (static per-layer scale, read in-kernel).
+    m.def("attention_decoder_gqa_fp8out", [](uintptr_t Q, uintptr_t K, uintptr_t V,
+                                             uintptr_t O, uintptr_t O_fp8,
+                                             uintptr_t d_scale, uintptr_t partial_ws,
+                                             int Sq, int Skv, int Hq, int D,
+                                             uintptr_t seqused, float softmax_scale,
+                                             uintptr_t stream) {
+        attention_decoder_gqa_fp8out(typed_ptr<__hip_bfloat16>(Q),
+                                     typed_ptr<__hip_bfloat16>(K),
+                                     typed_ptr<__hip_bfloat16>(V),
+                                     typed_ptr<__hip_bfloat16>(O),
+                                     typed_ptr<__hip_fp8_e4m3>(O_fp8),
+                                     reinterpret_cast<const float*>(d_scale),
+                                     typed_ptr<float>(partial_ws),
+                                     Sq, Skv, Hq, D,
+                                     reinterpret_cast<const int*>(seqused),
+                                     softmax_scale, to_stream(stream));
+    }, py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("O"),
+       py::arg("O_fp8"), py::arg("d_scale"), py::arg("partial_ws"),
+       py::arg("Sq"), py::arg("Skv"), py::arg("Hq"), py::arg("D"),
+       py::arg("seqused") = 0, py::arg("softmax_scale") = 0.0625f,
+       py::arg("stream") = 0);
+
     // ── Fusion ──
     m.def("gate_residual_ada_norm_fp8", [](uintptr_t residual, uintptr_t x,
                                             uintptr_t gate, uintptr_t weight,
@@ -432,6 +467,32 @@ PYBIND11_MODULE(flash_rt_amd_kernels, m) {
                         nbytes, to_stream(stream));
     }, py::arg("dst"), py::arg("src"), py::arg("nbytes"), py::arg("stream") = 0);
 
+    // ── Weight-streaming read-bandwidth probe (see kernels/stream_probe.h) ──
+    m.def("stream_probe", [](int variant_id, uintptr_t src, size_t nbytes,
+                             uintptr_t out, uintptr_t stream) {
+        stream_probe(variant_id, to_ptr(src), nbytes,
+                     typed_ptr<unsigned>(out), to_stream(stream));
+    }, py::arg("variant_id"), py::arg("src"), py::arg("nbytes"),
+       py::arg("out"), py::arg("stream") = 0);
+
+    m.def("stream_probe_variants", []() {
+        py::list variants;
+        for (int i = 0; i < stream_probe_variant_count(); ++i) {
+            const StreamProbeVariant& v = stream_probe_variant(i);
+            py::dict d;
+            d["id"] = i;
+            d["name"] = v.name;
+            d["ilp"] = v.ilp;
+            d["waves"] = v.waves;
+            d["grid"] = v.grid;
+            d["load"] = v.load;          // 0=dwordx4, 1=dwordx4 nt, 2=dwordx2
+            d["strided"] = (bool)v.strided;
+            d["persistent"] = (bool)v.persistent;
+            variants.append(d);
+        }
+        return variants;
+    });
+
     // ── Patch embedding (FP16, matching the CUDA surface) ──
     m.def("patch_im2col", [](uintptr_t input, uintptr_t output, int nv, uintptr_t stream) {
         patch_im2col(typed_ptr<__half>(input),
@@ -452,4 +513,7 @@ PYBIND11_MODULE(flash_rt_amd_kernels, m) {
 
     // ── GEMM: hand-tuned small-M FP8 (weight-streaming) ──
 #include "gemm/bindings_smallm.inc"
+
+    // ── GEMM: fused decoder-FFN pair (gate|up+geglu, down+gate*res) ──
+#include "gemm/bindings_ffn_fused.inc"
 }

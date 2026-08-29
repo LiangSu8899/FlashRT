@@ -1,6 +1,68 @@
 // ================================================================
 // FlashRT AMD — decoder cross-attention, split-KV flash (CDNA wave64)
 // v2: thread-parallel dot products, zero cross-lane ops in hot loops.
+// v3: fused single kernel — no workspace, no reduce launch (below).
+//
+// ── v3 (default path, Skv <= 2048): one kernel per (h, q) ──
+// Iteration-2 measurement (rocprof, real captured pi05 graph):
+// partial<32> 21.4us + reduce<32> 12.4us = 33.8us/call. The reduce
+// kernel spends 12us on ~0.5us of real work — fp32 workspace
+// round-trip (2.5 MiB write + read) plus an 80-WG launch tail. v3
+// deletes both: grid (Hq, Sq) = 80 WGs, 256 threads, each WG owns one
+// (head, query) row end-to-end. K/V have ONE head (GQA Hq:1), so all
+// 80 WGs stream the SAME ~850 KB — it lives in L2/LLC after the first
+// touch and every later read is a cache hit; per-XCD L2 (4 MB) holds
+// it whole. No K/V LDS staging anywhere: LDS staging buys coalescing,
+// but here the data is cache-resident, so staging would only add
+// barriers and an LDS round-trip.
+//   Phase 0: Q(h,q) row -> LDS as fp32 (D floats; every later read is
+//     a same-address wave broadcast).
+//   Phase A (scores): thread t owns KV rows j = t, t+256, ... (~4 rows
+//     at skv 876). Full D-dim dot per row, K read straight from
+//     global as 16 B packets (8 bf16) x D/8, q side read as float4
+//     pairs from LDS; 8 fp32 accumulators, fixed combine
+//     ((a0+a1)+(a2+a3))+((a4+a5)+(a6+a7)). Lanes sit on different
+//     rows -> uncoalesced by design, L2-resident so latency-tolerant
+//     (unrolled independent 16 B loads). Scores -> s_lds[j].
+//   Phase B (softmax): grid-stride local max per thread (same fixed
+//     row map), fixed radix-2 wave tree, 4 wave partials -> LDS, every
+//     thread combines the 4 serially (max is order-free). Then exp in
+//     place + local sum (ascending j per thread), wave tree, 4
+//     partials combined in fixed order (r0+r1)+(r2+r3) -> L, invL.
+//     3 barriers total, no workspace.
+//   Phase C (PV): thread t owns dim-pair dp = t % (D/2) and j-half
+//     t / (D/2) — 128 pairs x 2 halves = 256 threads at D=256. For a
+//     fixed j the wave's lanes read CONSECUTIVE dims of V[j]: a
+//     contiguous coalesced 4 B/lane burst (it is phase A, not C, that
+//     is column-strided). Each thread accumulates its half [0,skv/2)
+//     or [skv/2,skv) ascending; high half parks its partial in LDS;
+//     low half combines fixed-order (low + high), scales by invL,
+//     emits bf16. Direct-global chosen over the 64-row LDS-tile
+//     alternative: same global traffic (every WG reads V exactly
+//     once), but zero extra barriers (tile version: ~13 tiles x 2
+//     barriers + 32 KB LDS round-trip) and the coalescing a tile
+//     stage would buy is already there.
+//   Optional fused FP8 epilogue (attention_decoder_gqa_fp8out): after
+//     the bf16 store, re-expand the ROUNDED bf16 value, multiply by
+//     inv = 1/(*d_scale) (device scalar, same per-thread single
+//     division as quantize_fp8_static), clamp to +-448, convert
+//     __hip_fp8_e4m3 — bit-identical to running quantize_fp8_static
+//     on the bf16 O, so the standalone quantize launch (~180/graph)
+//     disappears. O bf16 is still written unchanged for parity
+//     tooling and bf16 consumers.
+//   Occupancy: 80 WGs on 256 CUs = 31% of CUs, 4 waves each = 1
+//     wave/SIMD on the busy CUs — latency hiding comes from ILP
+//     (unrolled independent loads), not TLP. LDS ~10.3 KB/WG.
+//   Determinism: fixed thread<->row and thread<->dim maps, fixed-order
+//     serial + radix-2 tree reductions, no atomics. Bit-stable for a
+//     given (shape, skv_eff).
+//   Wrapper: fused path when Skv <= 2048 and D % 8 == 0 (always true
+//     at the pi05 site); v2 split path otherwise, and
+//     FRT_ATTN_FORCE_SPLIT=1 forces v2 for A/B benches (read per call,
+//     frozen into a graph at capture). partial_ws is accepted and
+//     ignored by the fused path. Signatures unchanged.
+//
+// ── v2 (fallback path) — original notes below ──
 //
 // One fixed production site: tiny-M GQA cross-attention
 //     Q (Sq, Hq, D) bf16   — Sq ~ 10 query tokens, Hq query heads
@@ -19,6 +81,10 @@
 // kernel 1:
 //   Phase 0 (stage):   Q (Sq x D, fp32) and this split's K tile
 //                      (chunk x D, bf16 pairs) into LDS, coalesced.
+//                      K/V staging batches 4 independent global loads
+//                      per thread before storing (ILP=4 — measured
+//                      gfx950 streaming recipe; pure copy, bytes and
+//                      mapping unchanged: attn_stage_tile_ilp4).
 //   Phase A (scores):  one thread per (query, kv-row) pair —
 //                      Sq*chunk pairs over 256 threads (chunk=26 at
 //                      the site -> 260 pairs, ~1 loop iteration).
@@ -137,6 +203,8 @@
 
 #include "../kernels/common_hip.h"
 
+#include <hip/hip_fp8.h>
+
 #include <cfloat>
 #include <cstdlib>
 
@@ -148,6 +216,56 @@
 #define ATTN_KV_PITCH   (ATTN_D_MAX / 2 + 1)   // 129 bf16-pairs: odd stride
 #define ATTN_Q_PITCH    (ATTN_D_MAX + 2)       // 258 floats: even, f2-aligned
 #define ATTN_S_PITCH    (ATTN_CHUNK_MAX + 1)   // 65 floats: odd stride
+
+#define ATTN_FUSED_SKV_MAX 2048  // fused-path score buffer bound (8 KB LDS)
+
+// forward decl (csrc/amd/kernels/quantize_fp8.hip) — used by the
+// fp8out wrapper's v2-split fallback only.
+void quantize_fp8_static(const __hip_bfloat16* input, __hip_fp8_e4m3* output,
+                         const float* d_scale, int n, hipStream_t stream);
+
+// ── ILP=4 GLOBAL->LDS K/V tile stage (v2 split path) ──
+// stream_probe (gfx950, stream_craft_gfx950.md): one outstanding load
+// per lane is latency-window bound (~1373 GB/s @4MB footprints); four
+// INDEPENDENT loads issued before any consumer quadruple the bytes in
+// flight (co_x4_i4 winners). Here the per-thread stage loop was a
+// serial 4 B load chain — batch four grid-stride iterations so the
+// four global loads issue back-to-back before the LDS stores. Pure
+// copy: element mapping, staged bytes, and barrier placement are
+// identical to the plain loop, so kernel math is bit-unchanged.
+// src must be pre-offset to the slice (K/V base + start*dh, bf16 pairs);
+// the global side is then linear in idx; the LDS side keeps the
+// ATTN_KV_PITCH row pitch.
+__device__ __forceinline__ void attn_stage_tile_ilp4(
+    __hip_bfloat162* __restrict__ dst,          // kv_lds
+    const __hip_bfloat162* __restrict__ src,    // slice base (row `start`)
+    int cn, int dh, int tid) {
+    const int total = cn * dh;
+    int idx = tid;
+    for (; idx + 3 * ATTN_NTHREADS < total; idx += 4 * ATTN_NTHREADS) {
+        const int i0 = idx;
+        const int i1 = idx + ATTN_NTHREADS;
+        const int i2 = idx + 2 * ATTN_NTHREADS;
+        const int i3 = idx + 3 * ATTN_NTHREADS;
+        // four independent global loads, distinct destination registers
+        const __hip_bfloat162 v0 = src[i0];
+        const __hip_bfloat162 v1 = src[i1];
+        const __hip_bfloat162 v2 = src[i2];
+        const __hip_bfloat162 v3 = src[i3];
+        const int r0 = i0 / dh, e0 = i0 - r0 * dh;
+        const int r1 = i1 / dh, e1 = i1 - r1 * dh;
+        const int r2 = i2 / dh, e2 = i2 - r2 * dh;
+        const int r3 = i3 / dh, e3 = i3 - r3 * dh;
+        dst[r0 * ATTN_KV_PITCH + e0] = v0;
+        dst[r1 * ATTN_KV_PITCH + e1] = v1;
+        dst[r2 * ATTN_KV_PITCH + e2] = v2;
+        dst[r3 * ATTN_KV_PITCH + e3] = v3;
+    }
+    for (; idx < total; idx += ATTN_NTHREADS) {
+        const int r = idx / dh, e = idx - r * dh;
+        dst[r * ATTN_KV_PITCH + e] = src[idx];
+    }
+}
 
 // ── Kernel 1: per-slice flash partials ──
 // grid (NSPLIT, Hq), block ATTN_NTHREADS.
@@ -203,11 +321,7 @@ void attention_decoder_gqa_partial_kernel(
             __bfloat162float(Q[((size_t)q * Hq + h) * D + d]);
     }
     const __hip_bfloat162* K2 = reinterpret_cast<const __hip_bfloat162*>(K);
-    for (int idx = tid; idx < cn * dh; idx += ATTN_NTHREADS) {
-        const int r = idx / dh;
-        const int c = idx - r * dh;
-        kv_lds[r * ATTN_KV_PITCH + c] = K2[(size_t)(start + r) * dh + c];
-    }
+    attn_stage_tile_ilp4(kv_lds, K2 + (size_t)start * dh, cn, dh, tid);
     __syncthreads();
 
     // ── Phase A: one thread per (query, kv-row) pair ──
@@ -238,11 +352,7 @@ void attention_decoder_gqa_partial_kernel(
 
     // ── Phase A': refill the tile with V (all threads) ──
     const __hip_bfloat162* V2 = reinterpret_cast<const __hip_bfloat162*>(V);
-    for (int idx = tid; idx < cn * dh; idx += ATTN_NTHREADS) {
-        const int r = idx / dh;
-        const int c = idx - r * dh;
-        kv_lds[r * ATTN_KV_PITCH + c] = V2[(size_t)(start + r) * dh + c];
-    }
+    attn_stage_tile_ilp4(kv_lds, V2 + (size_t)start * dh, cn, dh, tid);
 
     // ── Phase B: per-query serial softmax (interleaved with A') ──
     // Serial ascending j: max, then exp in place + sum — fixed order,
@@ -357,31 +467,196 @@ static void launch_decoder_gqa(const __hip_bfloat16* Q,
     attention_decoder_gqa_reduce_kernel<NSPLIT><<<grid2, ATTN_NTHREADS, 0, stream>>>(partial_ws, O, Sq, Hq, D);
 }
 
-// ── Host wrapper ──
+// ================================================================
+// v3 fused single kernel — see the v3 section of the file header.
+// grid (Hq, Sq), block 256 (4 waves). One WG owns O(h, q, :) whole:
+// scores -> softmax -> PV, all in one launch, no workspace.
+// ================================================================
+
+// 16 B global-load packet: 8 bf16 (one dwordx4). Rows are 16 B
+// aligned whenever D % 8 == 0 and the tensor base is 16 B aligned.
+struct alignas(16) attn_bf16x8 {
+    __hip_bfloat162 p0, p1, p2, p3;
+};
+
+__global__ __launch_bounds__(ATTN_NTHREADS)
+void attention_decoder_gqa_fused_kernel(
+    const __hip_bfloat16* __restrict__ Q,
+    const __hip_bfloat16* __restrict__ K,
+    const __hip_bfloat16* __restrict__ V,
+    __hip_bfloat16* __restrict__ O,
+    __hip_fp8_e4m3* __restrict__ O_fp8,  // optional epilogue (nullptr = off)
+    const float* __restrict__ d_scale,   // device scale, read iff O_fp8
+    const int* __restrict__ seqused,
+    int Skv, int Hq, int D, float scale) {
+    static_assert(ATTN_NTHREADS == 256, "combine trees hardcode 4 waves");
+    const int h    = blockIdx.x;
+    const int q    = blockIdx.y;
+    const int tid  = threadIdx.x;
+    const int lane = tid & (FVK_WAVE_SIZE - 1);
+    const int wave = tid >> 6;
+
+    alignas(16) __shared__ float q_lds[ATTN_D_MAX];        // fp32 query row
+    alignas(16) __shared__ float s_lds[ATTN_FUSED_SKV_MAX];// scores -> probs
+    __shared__ float red_lds[8];                           // [0..3] max, [4..7] sum
+    __shared__ float c_lds[ATTN_D_MAX];                    // phase-C high-half partials
+
+    int skv = (seqused != nullptr) ? seqused[0] : Skv;
+    if (skv > ATTN_FUSED_SKV_MAX) skv = ATTN_FUSED_SKV_MAX;  // documented cap
+
+    // ── Phase 0: stage Q(h, q, :) as fp32 (later reads broadcast) ──
+    if (tid < D)
+        q_lds[tid] = __bfloat162float(Q[((size_t)q * Hq + h) * D + tid]);
+    __syncthreads();
+
+    // ── Phase A: scores — thread t owns rows j = t, t+256, ... ──
+    // K straight from global (L2-resident, shared by all 80 WGs);
+    // uncoalesced across lanes by design, hidden by unrolled
+    // independent 16 B loads. Fixed 8-acc combine order.
+    const int d8 = D >> 3;  // 16 B packets per row
+    for (int j = tid; j < skv; j += ATTN_NTHREADS) {
+        const attn_bf16x8* kr =
+            reinterpret_cast<const attn_bf16x8*>(K + (size_t)j * D);
+        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+        float a4 = 0.0f, a5 = 0.0f, a6 = 0.0f, a7 = 0.0f;
+        #pragma unroll 4
+        for (int i = 0; i < d8; ++i) {
+            const attn_bf16x8 kb = kr[i];
+            const float4* qp =
+                reinterpret_cast<const float4*>(&q_lds[i << 3]);
+            const float4 qa = qp[0];
+            const float4 qb = qp[1];
+            a0 = fmaf(__bfloat162float(kb.p0.x), qa.x, a0);
+            a1 = fmaf(__bfloat162float(kb.p0.y), qa.y, a1);
+            a2 = fmaf(__bfloat162float(kb.p1.x), qa.z, a2);
+            a3 = fmaf(__bfloat162float(kb.p1.y), qa.w, a3);
+            a4 = fmaf(__bfloat162float(kb.p2.x), qb.x, a4);
+            a5 = fmaf(__bfloat162float(kb.p2.y), qb.y, a5);
+            a6 = fmaf(__bfloat162float(kb.p3.x), qb.z, a6);
+            a7 = fmaf(__bfloat162float(kb.p3.y), qb.w, a7);
+        }
+        s_lds[j] = (((a0 + a1) + (a2 + a3)) + ((a4 + a5) + (a6 + a7))) * scale;
+    }
+    __syncthreads();
+
+    // ── Phase B1: global max (order-free) ──
+    float lm = -FLT_MAX;
+    for (int j = tid; j < skv; j += ATTN_NTHREADS) lm = fmaxf(lm, s_lds[j]);
+    lm = wave_reduce_max(lm);
+    if (lane == 0) red_lds[wave] = lm;
+    __syncthreads();
+    const float gm =
+        fmaxf(fmaxf(red_lds[0], red_lds[1]), fmaxf(red_lds[2], red_lds[3]));
+
+    // ── Phase B2: exp in place + fixed-order sum ──
+    // Per-thread serial ascending j over the fixed row map, then the
+    // fixed radix-2 wave tree, then (r0+r1)+(r2+r3) — deterministic
+    // for a given (shape, skv). Every thread computes L redundantly
+    // (identical bits) — saves a broadcast barrier.
+    float ls = 0.0f;
+    for (int j = tid; j < skv; j += ATTN_NTHREADS) {
+        const float e = __expf(s_lds[j] - gm);
+        s_lds[j] = e;   // own rows only — no race
+        ls += e;
+    }
+    ls = wave_reduce_sum(ls);
+    if (lane == 0) red_lds[4 + wave] = ls;
+    __syncthreads();  // probs final + sum partials visible
+    const float L = (red_lds[4] + red_lds[5]) + (red_lds[6] + red_lds[7]);
+    const float invL = (L > 0.0f) ? 1.0f / L : 0.0f;
+
+    // ── Phase C: PV — thread t owns dim-pair (t % dh) in j-half (t / dh) ──
+    // For fixed j the wave reads consecutive dims of V[j]: contiguous
+    // coalesced 4 B/lane. s_lds[j] is a same-address broadcast.
+    const int dh   = D >> 1;            // dim-pairs; <= 128
+    const int half = tid / dh;          // 0 = low j-half, 1 = high; >= 2 idle
+    const int dp   = tid - half * dh;
+    const int jmid = skv >> 1;
+    float ax = 0.0f, ay = 0.0f;
+    if (half < 2) {
+        const int j0 = half ? jmid : 0;
+        const int j1 = half ? skv : jmid;
+        const __hip_bfloat162* vp =
+            reinterpret_cast<const __hip_bfloat162*>(V) + dp;
+        #pragma unroll 4
+        for (int j = j0; j < j1; ++j) {
+            const __hip_bfloat162 v = vp[(size_t)j * dh];
+            const float pj = s_lds[j];
+            ax = fmaf(pj, __bfloat162float(v.x), ax);
+            ay = fmaf(pj, __bfloat162float(v.y), ay);
+        }
+    }
+    if (half == 1) {          // SoA park: consecutive lanes, consecutive banks
+        c_lds[dp] = ax;
+        c_lds[dh + dp] = ay;
+    }
+    __syncthreads();
+    if (half == 0) {
+        const float sx = (ax + c_lds[dp]) * invL;       // fixed: low + high
+        const float sy = (ay + c_lds[dh + dp]) * invL;
+        const __hip_bfloat16 bx = __float2bfloat16(sx);
+        const __hip_bfloat16 by = __float2bfloat16(sy);
+        const size_t o_off = ((size_t)q * Hq + h) * D + 2 * (size_t)dp;
+        *reinterpret_cast<__hip_bfloat162*>(O + o_off) =
+            __halves2bfloat162(bx, by);
+        if (O_fp8 != nullptr) {
+            // Bit-exact quantize_fp8_static semantics: quantize the
+            // ROUNDED bf16 value, per-thread inv = 1/(*d_scale)
+            // (single division), pre-clamp +-448, e4m3 convert.
+            const float inv = 1.0f / (*d_scale);
+            const float fx =
+                fminf(fmaxf(__bfloat162float(bx) * inv, -448.0f), 448.0f);
+            const float fy =
+                fminf(fmaxf(__bfloat162float(by) * inv, -448.0f), 448.0f);
+            O_fp8[o_off]     = __hip_fp8_e4m3(fx);
+            O_fp8[o_off + 1] = __hip_fp8_e4m3(fy);
+        }
+    }
+}
+
+// ── Host wrappers ──
 // partial_ws: caller-provided device fp32 scratch of at least
 //   ATTN_NSPLIT_MAX(32) * Hq * Sq * (D + 2) floats (pi05 decoder
 //   site: 32*8*10*258*4 = 2,641,920 bytes) — sized for the largest
-//   variant so the buffer works for any NSPLIT pick. No allocation,
-//   no memset, no host sync — safe inside HIP graph capture.
+//   split variant. The fused path accepts and IGNORES it (kept so the
+//   signature and callers are unchanged). No allocation, no memset,
+//   no host sync — safe inside HIP graph capture.
 // seqused: nullptr => exact mode (Skv host int is the length);
 //   else device int32, seqused[0] read in-kernel and the host Skv is
 //   only the padded capacity bound (fixed-shape graph mode; padding
 //   rows beyond seqused[0] are never read).
-// NSPLIT: heuristic on host Skv keeps chunk ~<= 32 (see header);
-//   FRT_ATTN_NSPLIT=8|16|32 overrides, re-read every call so a bench
-//   can sweep — but a captured graph keeps the capture-time choice.
-// Constraints (fixed-site kernel, not checked): 1 <= Sq <= 16,
-//   D <= 256, D % 4 == 0, seq length <= NSPLIT*64, single KV head
-//   (K/V are (Skv, D)).
-void attention_decoder_gqa(const __hip_bfloat16* Q,
-                           const __hip_bfloat16* K,
-                           const __hip_bfloat16* V,
-                           __hip_bfloat16* O,
-                           float* partial_ws,
-                           int Sq, int Skv, int Hq, int D,
-                           const int* seqused,
-                           float softmax_scale,
-                           hipStream_t stream) {
+// Path pick (host, per call — frozen into a graph at capture time):
+//   fused single kernel when Skv <= 2048 and D % 8 == 0 (K/V rows
+//   16 B aligned); v2 split otherwise. FRT_ATTN_FORCE_SPLIT=1 forces
+//   the v2 path for A/B benches. On the v2 path the NSPLIT heuristic
+//   and FRT_ATTN_NSPLIT=8|16|32 behave as before.
+// Constraints (fixed-site kernel, not checked): D <= 256, D % 4 == 0
+//   (fused additionally wants D % 8 == 0), seq length <= 2048, single
+//   KV head (K/V are (Skv, D)). v2 also needs Sq <= 16; the fused
+//   path has no Sq cap (one WG per query).
+
+static bool attn_use_fused(int Skv, int D) {
+    // Default is the v2 split path: measured in-graph 36.5us vs the fused
+    // single kernel's 40.6us at the pi05 site, and the fused kernel's
+    // larger per-call L2 footprint degrades neighboring GEMMs in the real
+    // captured graph (E2E +2ms). FRT_ATTN_FUSED=1 opts back in for A/B.
+    if (const char* e = std::getenv("FRT_ATTN_FUSED"))
+        if (std::atoi(e) != 0)
+            return Skv <= ATTN_FUSED_SKV_MAX && D <= ATTN_D_MAX && (D % 8) == 0;
+    if (const char* e = std::getenv("FRT_ATTN_FORCE_SPLIT"))
+        (void)e;  // legacy switch, now the default
+    return false;
+}
+
+static void launch_decoder_gqa_split(const __hip_bfloat16* Q,
+                                     const __hip_bfloat16* K,
+                                     const __hip_bfloat16* V,
+                                     __hip_bfloat16* O,
+                                     float* partial_ws,
+                                     int Sq, int Skv, int Hq, int D,
+                                     const int* seqused,
+                                     float softmax_scale,
+                                     hipStream_t stream) {
     int ns = 0;
     if (const char* e = std::getenv("FRT_ATTN_NSPLIT")) ns = std::atoi(e);
     if (ns != 8 && ns != 16 && ns != 32)
@@ -398,4 +673,52 @@ void attention_decoder_gqa(const __hip_bfloat16* Q,
             launch_decoder_gqa<32>(Q, K, V, O, partial_ws, Sq, Skv, Hq, D, seqused, softmax_scale, stream);
             break;
     }
+}
+
+void attention_decoder_gqa(const __hip_bfloat16* Q,
+                           const __hip_bfloat16* K,
+                           const __hip_bfloat16* V,
+                           __hip_bfloat16* O,
+                           float* partial_ws,
+                           int Sq, int Skv, int Hq, int D,
+                           const int* seqused,
+                           float softmax_scale,
+                           hipStream_t stream) {
+    if (attn_use_fused(Skv, D)) {
+        dim3 grid(Hq, Sq);
+        attention_decoder_gqa_fused_kernel<<<grid, ATTN_NTHREADS, 0, stream>>>(
+            Q, K, V, O, /*O_fp8=*/nullptr, /*d_scale=*/nullptr, seqused,
+            Skv, Hq, D, softmax_scale);
+        return;
+    }
+    launch_decoder_gqa_split(Q, K, V, O, partial_ws, Sq, Skv, Hq, D,
+                             seqused, softmax_scale, stream);
+}
+
+// Fused-epilogue variant: same attention, plus OCP e4m3 output
+// O_fp8 (Sq, Hq*D) row-major — byte-for-byte what quantize_fp8_static
+// would produce from the bf16 O with the same device scale. O (bf16)
+// is still written, identical to the plain path. On the (never hit at
+// the pi05 site) v2 fallback this degrades to split + a standalone
+// quantize_fp8_static launch — semantics preserved.
+void attention_decoder_gqa_fp8out(const __hip_bfloat16* Q,
+                                  const __hip_bfloat16* K,
+                                  const __hip_bfloat16* V,
+                                  __hip_bfloat16* O,
+                                  __hip_fp8_e4m3* O_fp8,
+                                  const float* d_scale,
+                                  float* partial_ws,
+                                  int Sq, int Skv, int Hq, int D,
+                                  const int* seqused,
+                                  float softmax_scale,
+                                  hipStream_t stream) {
+    if (attn_use_fused(Skv, D)) {
+        dim3 grid(Hq, Sq);
+        attention_decoder_gqa_fused_kernel<<<grid, ATTN_NTHREADS, 0, stream>>>(
+            Q, K, V, O, O_fp8, d_scale, seqused, Skv, Hq, D, softmax_scale);
+        return;
+    }
+    launch_decoder_gqa_split(Q, K, V, O, partial_ws, Sq, Skv, Hq, D,
+                             seqused, softmax_scale, stream);
+    quantize_fp8_static(O, O_fp8, d_scale, Sq * Hq * D, stream);
 }
