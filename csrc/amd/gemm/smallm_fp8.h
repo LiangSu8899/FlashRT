@@ -68,10 +68,33 @@ void smallm_fp8_nn_dev_alt(const void* A, const void* B, void* D,
 // This is the stream-friendliest layout — every output column owns a
 // contiguous K row, so no split-K and no workspace are ever needed.
 // split_ws is accepted for signature symmetry and ignored (may be nullptr).
+//
+// Default path: the double-buffered LDS pipeline (smallm_fp8_nt_lds_dev
+// below) with async staging; env overrides, read on the host at
+// launch/capture time (a captured graph keeps the capture-time choice):
+//   FRT_SMALLM_REG=1  -> legacy register-only ILP4 kernel
+//   FRT_LDS_ASYNC=0   -> LDS pipeline with sync (register-hoisted) staging
 void smallm_fp8_nt_dev(const void* A, const void* B, void* D,
                        const float* d_scale_a, const float* d_scale_b,
                        int M, int N, int K, float* split_ws,
                        hipStream_t stream);
+
+// nt LDS pipeline, explicit entry for A/B benching: double-buffered
+// global->LDS staging of the WG's weight columns (2-16KB LDS per WG,
+// w4 only), consumer fed from LDS off the load critical path. Both
+// staging variants are compiled into the binary; use_async != 0 picks
+// gfx9 LDS-DMA (__builtin_amdgcn_global_load_lds, 4B/lane per issue),
+// use_async == 0 picks the register-hoisted sync fallback with the
+// identical LDS layout. Deterministic fixed-order accumulation (NOT
+// bit-identical to the register nt kernel — different lane<->k split).
+void smallm_fp8_nt_lds_dev(const void* A, const void* B, void* D,
+                           const float* d_scale_a, const float* d_scale_b,
+                           int M, int N, int K, int use_async,
+                           hipStream_t stream);
+
+// 1 if the binary was built with the async LDS-DMA staging variant
+// (FRT_LDS_ASYNC=1, the default); 0 if use_async degenerates to sync.
+int smallm_fp8_nt_lds_async_available();
 
 // Alternate nt config for A/B benching: 8-wave (512-thread) WGs
 // instead of 4-wave, same total wave count (halved grid). Values are

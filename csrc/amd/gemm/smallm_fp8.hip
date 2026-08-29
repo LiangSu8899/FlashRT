@@ -2,6 +2,8 @@
 
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp8.h>
+#include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -82,6 +84,98 @@
 
 #define SMALLM_FP8_BLOCK 256   // threads per workgroup (4 waves)
 
+// ================================================================
+// Async global->LDS staging plumbing (gfx9 LDS-DMA).
+//
+// FRT_LDS_ASYNC (compile-time, default 1) gates the use of
+//   __builtin_amdgcn_global_load_lds(gptr_as1, lptr_as3, size, offset, aux)
+// which lowers to GLOBAL_LOAD_DWORD ... lds — the hardware reads one
+// dword per active lane from the per-lane global address and the LDS-DMA
+// path deposits lane l's dword at (wave-uniform lptr) + 4*l, WITHOUT
+// touching VGPRs. size/offset/aux must be integer constants; size=4 is
+// the portable gfx9 granularity (gfx950 also accepts 12/16 — dwordx3/x4
+// per lane, a follow-up A/B knob, see the kernel notes). One issue
+// therefore stages 256B per wave; we issue MANY per buffer.
+//
+// The builtin is a *target* builtin: visible only in the device pass
+// (__HIP_DEVICE_COMPILE__), never in the hipcc host pass nor under the
+// g++ -fsyntax-only stub harness. So:
+//   - FRT_LDS_ASYNC        : host+device agreement on whether the async
+//                            variant is real (drives *_async_available()).
+//   - FRT_ASYNC_LDS_CODEGEN: whether THIS compilation pass may emit the
+//                            builtin call. Host pass compiles the sync
+//                            body for the ASYNC instantiation — it never
+//                            runs, only the device pass' code does.
+//   - FRT_FORCE_ASYNC_LDS  : override for the g++ stub syntax check so
+//                            the builtin call sites are type-checked.
+// If ROCm lacks the builtin, fail LOUDLY (build with -DFRT_LDS_ASYNC=0
+// to get a binary whose "async" variant is the sync fallback) — never
+// silently downgrade, so the on-node A/B rows mean what they say.
+// ================================================================
+#ifndef FRT_LDS_ASYNC
+#define FRT_LDS_ASYNC 1
+#endif
+
+#if defined(FRT_FORCE_ASYNC_LDS)
+#  define FRT_ASYNC_LDS_CODEGEN FRT_FORCE_ASYNC_LDS
+#elif defined(__HIP_DEVICE_COMPILE__)
+#  if FRT_LDS_ASYNC
+#    if !defined(__has_builtin) || !__has_builtin(__builtin_amdgcn_global_load_lds)
+#      error "FRT_LDS_ASYNC=1 but __builtin_amdgcn_global_load_lds is unavailable; rebuild with -DFRT_LDS_ASYNC=0"
+#    endif
+#    define FRT_ASYNC_LDS_CODEGEN 1
+#  else
+#    define FRT_ASYNC_LDS_CODEGEN 0
+#  endif
+#else
+#  define FRT_ASYNC_LDS_CODEGEN 0
+#endif
+
+// Clang address-space qualifier (ignored elsewhere; the g++ stub path
+// then sees plain pointers, matching the stubbed builtin signature).
+#if defined(__clang__)
+#define FRT_AS(n) __attribute__((address_space(n)))
+#else
+#define FRT_AS(n)
+#endif
+
+// The helpers below are ALWAYS defined (their names appear inside
+// `if constexpr` branches, which must resolve even when discarded);
+// only their bodies are gated. The empty bodies are unreachable: the
+// kernels call them only when kAsync (== FRT_ASYNC_LDS_CODEGEN != 0)
+// is true, and only the device pass' code ever executes.
+
+// One dword per lane, global -> LDS, no VGPR round-trip. gp is the
+// per-lane global address (VGPR); lp must be WAVE-UNIFORM — the DMA
+// writes lane l at lp + 4*l. Inactive lanes (EXEC-masked) stage nothing.
+// Address-space casts follow composable_kernel's proven pattern
+// (amd_direct_load): generic->as(1)/as(3) through uintptr_t — the
+// generic LDS aperture bits live above bit 31, so the truncating cast
+// to the 32-bit as(3) pointer yields the raw LDS offset.
+__device__ __forceinline__ void smallm_async_copy_dword(
+        const unsigned char* gp, unsigned char* lp) {
+#if FRT_ASYNC_LDS_CODEGEN
+    auto* g = reinterpret_cast<const FRT_AS(1) unsigned*>(
+        reinterpret_cast<uintptr_t>(gp));
+    auto* l = reinterpret_cast<FRT_AS(3) unsigned*>(
+        reinterpret_cast<uintptr_t>(lp));
+    __builtin_amdgcn_global_load_lds(g, l, /*size=*/4, /*offset=*/0, /*aux=*/0);
+#else
+    (void)gp; (void)lp;  // unreachable stub (see note above)
+#endif
+}
+
+// s_waitcnt vmcnt(0), other counters untouched. gfx9 simm16 encoding:
+// vmcnt lo [3:0]=0, expcnt [6:4]=7 (ignore), lgkmcnt [11:8]=15 (ignore),
+// vmcnt hi [15:14]=0  ->  0x0F70. LDS-DMA completion is tracked by
+// vmcnt, and the compiler does NOT model the DMA->ds_read dependency,
+// so this wait is mandatory before reading a freshly staged buffer.
+__device__ __forceinline__ void smallm_wait_lds_dma() {
+#if FRT_ASYNC_LDS_CODEGEN
+    __builtin_amdgcn_s_waitcnt(0x0F70);
+#endif
+}
+
 // ── fp8 e4m3 byte -> f32 ──
 __device__ __forceinline__ float smallm_fp8_to_f32(unsigned char b) {
     __hip_fp8_e4m3 v;
@@ -94,6 +188,14 @@ __device__ __forceinline__ void smallm_fp8x16_to_f32(const uint4& v, float* out)
     const unsigned char* b = reinterpret_cast<const unsigned char*>(&v);
     #pragma unroll
     for (int j = 0; j < 16; ++j) out[j] = smallm_fp8_to_f32(b[j]);
+}
+
+// Unpack 8 fp8 bytes (one b64 load) to f32 — the LDS-pipeline lane
+// granularity (512B chunk / 64 lanes = 8B per lane).
+__device__ __forceinline__ void smallm_fp8x8_to_f32(const uint2& v, float* out) {
+    const unsigned char* b = reinterpret_cast<const unsigned char*>(&v);
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) out[j] = smallm_fp8_to_f32(b[j]);
 }
 
 // ================================================================
@@ -334,6 +436,233 @@ void smallm_fp8_nt_kernel(const unsigned char* __restrict__ A,
 }
 
 // ================================================================
+// nt LDS kernel: B stored (N, K) row-major, double-buffered async
+// global->LDS staging (the hipBLASLt craft, rocprof-verified: their
+// 4.9-5.8us winners run 18-50KB of LDS wide staging while our
+// register-only ILP4 kernel sits at 10.2us / ~410GB/s — the gap is the
+// CONSUMER sitting on the load critical path, not raw bandwidth;
+// stream_probe already reads 5+TB/s with ILP4 when nothing consumes).
+//
+//   Work partition (w4 ONLY — 256 threads; every w8 register variant
+//   measured priv=76-168B scratch spills, so w8 is dropped from this
+//   path entirely):
+//     grid = ceil(N / COLS), COLS = 4 waves * NPW columns per wave.
+//     Wave w owns output columns nwg + w*NPW .. +NPW-1 for the whole
+//     kernel — and stages exactly those columns itself, so the LDS
+//     buffers are per-wave-private slices (the WG barrier below is
+//     kept for safety/symmetry, not for cross-wave data exchange; a
+//     barrier-free per-wave pipeline is a documented follow-up A/B).
+//
+//   Chunking / LDS budget:
+//     KC = 512 B of K per chunk per column. Buffer = COLS * KC:
+//       NPW=4: 16 cols -> 8KB/buffer, 16KB total (2 buffers)
+//       NPW=2:  8 cols -> 4KB/buffer,  8KB total
+//       NPW=1:  4 cols -> 2KB/buffer,  4KB total
+//     All well under the 32KB budget => >=4 WGs/CU by LDS. KC=512
+//     (not 1024) so the DOMINANT pi05 shape K=1024 still has 2 chunks
+//     and a real stage/compute overlap; K=4096 gets 8 pipeline steps.
+//
+//   Pipeline (double buffer, depth 1):
+//     prol   stage S0 -> buf0 ; waitcnt vmcnt(0) ; s_barrier
+//     c=0    issue S1 -> buf1 ▶ DMA fills buf1 ║ compute C0 from buf0
+//            waitcnt vmcnt(0) ; s_barrier      (S1 landed, C0 retired)
+//     c=1    issue S2 -> buf0 ▶                ║ compute C1 from buf1
+//            waitcnt vmcnt(0) ; s_barrier
+//     ...    (compute never waits on the loads feeding it — those
+//             finished a whole compute phase ago; the FMA/convert
+//             stream is fed from LDS at LDS rate)
+//     Overwrite hazard: S(c+2) targets buf[c&1]; the barrier ending
+//     iteration c sits AFTER compute(c), so every read of buf[c&1] has
+//     retired before iteration c+1 issues S(c+2) into it.
+//
+//   Staging (per chunk): the buffer is COLS contiguous 512B column
+//   slices, lds[buf][col*KC + k]. It is filled in 256B "units" (one
+//   async issue: 64 lanes * 4B); unit u of wave w covers column
+//   w*NPW + u/2, half u&1. ASYNC=true issues UPW = 2*NPW
+//   global_load_lds dwords per lane back-to-back (8 in flight at
+//   NPW=4). ASYNC=false is the register fallback: the same UPW dwords
+//   are loaded global->VGPR with all loads hoisted BEFORE compute (ILP
+//   like the register kernel) and only deposited to LDS after compute,
+//   so the consumer stays decoupled in both variants; the two variants
+//   share identical addressing, which is what makes the on-node A/B a
+//   single-variable comparison of the LDS-DMA path itself.
+//
+//   Compute (per chunk): lane l consumes bytes [l*8, l*8+8) of each
+//   owned column slice (ds_read_b64, conflict-free: 64 lanes hit 512
+//   consecutive bytes), converts A (global, L1/L2-hot — A is tiny and
+//   stays on the existing register-convert scheme) and B (LDS) with
+//   the native fp8 converts, and FMAs into acc[NPW][M_T].
+//
+//   Accumulation order (deterministic, graph-replay bit-identical):
+//   for a given output element, lane l accumulates k = c*512 + l*8 + j
+//   in ascending chunk c, ascending j — a fixed sequential order per
+//   lane — then the fixed-shape shuffle tree folds lanes. No atomics.
+//   NOTE: the lane<->k partition differs from the register nt kernel
+//   (8B windows vs 16B), so results are NOT bit-identical to that
+//   kernel — allowed: the gate is cos vs GemmRunner on the same
+//   quantized inputs, and each variant is itself deterministic.
+//
+//   K handling: K % 16 == 0 (checked) => a lane's 8B window and every
+//   staged dword are all-in or all-out of K; out-of-range units are
+//   simply not staged and out-of-range windows not consumed, so stale
+//   LDS bytes are never read. Tail columns (N % COLS) are guarded per
+//   column in both stage and compute.
+// ================================================================
+template<int M_T, int NPW, bool ASYNC>
+__global__ __launch_bounds__(SMALLM_FP8_BLOCK)
+void smallm_fp8_nt_lds_kernel(const unsigned char* __restrict__ A,
+                              const unsigned char* __restrict__ B,
+                              __hip_bfloat16* __restrict__ D,
+                              const float* __restrict__ d_scale_a,
+                              const float* __restrict__ d_scale_b,
+                              int M, int N, int K) {
+    constexpr int COLS = 4 * NPW;   // output columns per WG (4 waves)
+    constexpr int KC   = 512;       // K-bytes per chunk per column
+    constexpr int UPW  = 2 * NPW;   // 256B stage units per wave per chunk
+    // ASYNC only becomes LDS-DMA when this pass may emit the builtin
+    // (device pass / forced stub check); elsewhere it compiles as the
+    // sync body, which is fine — that code is never executed.
+    constexpr bool kAsync = ASYNC && (FRT_ASYNC_LDS_CODEGEN != 0);
+
+    __shared__ alignas(16) unsigned char lds[2][COLS * KC];
+
+    const int tid  = (int)threadIdx.x;
+    const int wave = tid >> 6;
+    const int lane = tid & 63;
+    const int nwg  = (int)blockIdx.x * COLS;
+    const int chunks = (K + KC - 1) / KC;
+
+    float acc[NPW][M_T];
+    #pragma unroll
+    for (int p = 0; p < NPW; ++p)
+        #pragma unroll
+        for (int m = 0; m < M_T; ++m) acc[p][m] = 0.0f;
+
+    unsigned sreg[UPW];  // sync-fallback staging registers (dead if kAsync)
+
+    // ── producer: issue chunk c's loads (async: LDS-DMA; sync: ->VGPR) ──
+    auto stage_issue = [&](int c) {
+        unsigned char* dst = lds[c & 1];
+        const int kb = c * KC;
+        #pragma unroll
+        for (int i = 0; i < UPW; ++i) {
+            const int u    = wave * UPW + i;   // wave stages its OWN columns
+            const int col  = u >> 1;
+            const int off  = (u & 1) * 256 + lane * 4;   // byte in column slice
+            const int gk   = kb + off;
+            const bool ok  = (nwg + col < N) && (gk < K);  // K%4==0: whole dword
+            if constexpr (kAsync) {
+                if (ok)
+                    smallm_async_copy_dword(B + (size_t)(nwg + col) * K + gk,
+                                            dst + col * KC + (u & 1) * 256);
+            } else {
+                sreg[i] = ok ? *reinterpret_cast<const unsigned*>(
+                                   B + (size_t)(nwg + col) * K + gk)
+                             : 0u;
+            }
+        }
+    };
+
+    // ── producer: deposit chunk c to LDS (sync fallback only — placed
+    //    AFTER compute so the global loads overlap the FMA stream) ──
+    auto stage_commit = [&](int c) {
+        if constexpr (!kAsync) {
+            unsigned char* dst = lds[c & 1];
+            #pragma unroll
+            for (int i = 0; i < UPW; ++i) {
+                const int u = wave * UPW + i;
+                const int col = u >> 1;
+                const int off = (u & 1) * 256 + lane * 4;
+                *reinterpret_cast<unsigned*>(dst + col * KC + off) = sreg[i];
+            }
+        }
+    };
+
+    // ── pipeline barrier: drain this wave's LDS-DMA (vmcnt — the
+    //    compiler does not model DMA->ds_read deps), then WG barrier ──
+    auto pipe_barrier = [&]() {
+        if constexpr (kAsync) smallm_wait_lds_dma();
+        __syncthreads();
+    };
+
+    // ── consumer: chunk c from lds[c&1] ──
+    auto compute = [&](int c) {
+        const unsigned char* buf = lds[c & 1];
+        const int kb = c * KC;
+        const int ko = lane * 8;              // lane's 8B window in the chunk
+        if (kb + ko >= K) return;             // K%8==0 => all-in or all-out
+
+        // A window: 8 bytes per row, converted once per chunk (same
+        // scheme as the register kernel — A is L1/L2-hot, not the stream).
+        float a_f[M_T][8];
+        #pragma unroll
+        for (int m = 0; m < M_T; ++m) {
+            if (m < M) {
+                const uint2 av = *reinterpret_cast<const uint2*>(
+                    A + (size_t)m * K + kb + ko);
+                smallm_fp8x8_to_f32(av, a_f[m]);
+            } else {
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) a_f[m][j] = 0.0f;
+            }
+        }
+
+        #pragma unroll
+        for (int p = 0; p < NPW; ++p) {
+            const int col = wave * NPW + p;
+            if (nwg + col >= N) continue;
+            const uint2 bv = *reinterpret_cast<const uint2*>(
+                buf + col * KC + ko);
+            float bf[8];
+            smallm_fp8x8_to_f32(bv, bf);
+            #pragma unroll
+            for (int m = 0; m < M_T; ++m) {
+                #pragma unroll
+                for (int j = 0; j < 8; ++j)
+                    acc[p][m] += a_f[m][j] * bf[j];
+            }
+        }
+    };
+
+    // ── run the pipeline ──
+    stage_issue(0);
+    stage_commit(0);          // sync fallback prologue stalls once; fine
+    pipe_barrier();           // buf0 ready WG-wide
+    for (int c = 0; c < chunks; ++c) {
+        if (c + 1 < chunks) stage_issue(c + 1);
+        compute(c);
+        if (c + 1 < chunks) {
+            stage_commit(c + 1);
+            pipe_barrier();   // next buffer landed; buf[c&1] reads retired
+        }
+    }
+
+    // ── epilogue: identical to the register nt kernel ──
+    #pragma unroll
+    for (int off = 32; off > 0; off >>= 1) {
+        #pragma unroll
+        for (int p = 0; p < NPW; ++p)
+            #pragma unroll
+            for (int m = 0; m < M_T; ++m)
+                acc[p][m] += __shfl_down(acc[p][m], off);
+    }
+
+    if (lane == 0) {
+        const float sc = d_scale_a[0] * d_scale_b[0];
+        #pragma unroll
+        for (int p = 0; p < NPW; ++p) {
+            const int n = nwg + wave * NPW + p;
+            if (n < N) {
+                #pragma unroll
+                for (int m = 0; m < M_T; ++m)
+                    if (m < M)
+                        D[(size_t)m * N + n] = __float2bfloat16(acc[p][m] * sc);
+            }
+        }
+    }
+}
+
+// ================================================================
 // Host side
 // ================================================================
 
@@ -472,15 +801,92 @@ static void smallm_fp8_nt_dispatch(const void* A, const void* B, void* D,
                                          M, N, K, stream);
 }
 
+template<int NPW, bool ASYNC>
+static void smallm_fp8_nt_lds_impl(const void* A, const void* B, void* D,
+                                   const float* d_scale_a, const float* d_scale_b,
+                                   int M, int N, int K, hipStream_t stream) {
+    constexpr int cols = 4 * NPW;   // w4 only — every w8 variant spills
+    const dim3 grid((unsigned)((N + cols - 1) / cols));
+    const dim3 block(SMALLM_FP8_BLOCK);
+    const unsigned char* a8 = static_cast<const unsigned char*>(A);
+    const unsigned char* b8 = static_cast<const unsigned char*>(B);
+    __hip_bfloat16* d16 = static_cast<__hip_bfloat16*>(D);
+
+    #define SMALLM_LAUNCH_NT_LDS(MT)                                            \
+        hipLaunchKernelGGL(                                                     \
+            HIP_KERNEL_NAME(smallm_fp8_nt_lds_kernel<MT, NPW, ASYNC>),          \
+            grid, block, 0, stream, a8, b8, d16, d_scale_a, d_scale_b, M, N, K)
+    if      (M <= 4)  SMALLM_LAUNCH_NT_LDS(4);
+    else if (M <= 8)  SMALLM_LAUNCH_NT_LDS(8);
+    else if (M <= 10) SMALLM_LAUNCH_NT_LDS(10);
+    else              SMALLM_LAUNCH_NT_LDS(16);
+    #undef SMALLM_LAUNCH_NT_LDS
+}
+
+// Same shape-adaptive NPW rule as the register path (grid >= 256 WGs,
+// the measured gfx950 saturation grid): N>=4096 -> NPW=4 (16 cols/WG,
+// 16KB LDS), N>=2048 -> NPW=2 (8KB), else NPW=1 (4KB).
+template<bool ASYNC>
+static void smallm_fp8_nt_lds_dispatch(const void* A, const void* B, void* D,
+                                       const float* d_scale_a,
+                                       const float* d_scale_b,
+                                       int M, int N, int K, hipStream_t stream) {
+    if (N >= 4 * 4 * 256)
+        smallm_fp8_nt_lds_impl<4, ASYNC>(A, B, D, d_scale_a, d_scale_b,
+                                         M, N, K, stream);
+    else if (N >= 4 * 2 * 256)
+        smallm_fp8_nt_lds_impl<2, ASYNC>(A, B, D, d_scale_a, d_scale_b,
+                                         M, N, K, stream);
+    else
+        smallm_fp8_nt_lds_impl<1, ASYNC>(A, B, D, d_scale_a, d_scale_b,
+                                         M, N, K, stream);
+}
+
+int smallm_fp8_nt_lds_async_available() {
+    return FRT_LDS_ASYNC ? 1 : 0;
+}
+
+void smallm_fp8_nt_lds_dev(const void* A, const void* B, void* D,
+                           const float* d_scale_a, const float* d_scale_b,
+                           int M, int N, int K, int use_async,
+                           hipStream_t stream) {
+    smallm_fp8_check("smallm_fp8_nt_lds_dev", M, N, K, 1, 16);
+    // use_async selects between the two compiled variants at runtime so
+    // one bench process can A/B them. If the binary was built with
+    // -DFRT_LDS_ASYNC=0 the async instantiation is the sync body; route
+    // to sync explicitly so the choice is honest either way (query
+    // smallm_fp8_nt_lds_async_available() to annotate bench rows).
+    if (use_async != 0 && FRT_LDS_ASYNC)
+        smallm_fp8_nt_lds_dispatch<true>(A, B, D, d_scale_a, d_scale_b,
+                                         M, N, K, stream);
+    else
+        smallm_fp8_nt_lds_dispatch<false>(A, B, D, d_scale_a, d_scale_b,
+                                          M, N, K, stream);
+}
+
 void smallm_fp8_nt_dev(const void* A, const void* B, void* D,
                        const float* d_scale_a, const float* d_scale_b,
                        int M, int N, int K, float* split_ws,
                        hipStream_t stream) {
     (void)split_ws;  // nt never splits K — accepted for signature symmetry
-    // Default: 4 waves/WG, grid target >= 256 WGs. pi05 site N=1024
-    // -> NPW=1 (256 WGs, CG=4); N>=2048 -> NPW=2; N>=4096 -> NPW=4.
-    smallm_fp8_nt_dispatch<4>(A, B, D, d_scale_a, d_scale_b, M, N, K,
-                              /*min_wgs=*/256, stream);
+    // Default is now the LDS double-buffered pipeline (async staging
+    // unless FRT_LDS_ASYNC=0 in the env or at build time). The legacy
+    // register-only ILP4 path stays behind FRT_SMALLM_REG=1 for A/B.
+    // NOTE: env vars are read on the HOST at launch/capture time — a
+    // captured graph keeps whatever the env said at capture; flip the
+    // env BEFORE capturing, or use smallm_fp8_nt_lds_dev directly.
+    const char* reg = std::getenv("FRT_SMALLM_REG");
+    if (reg && reg[0] == '1' && reg[1] == '\0') {
+        // Legacy: 4 waves/WG, grid target >= 256 WGs. pi05 site N=1024
+        // -> NPW=1 (256 WGs, CG=4); N>=2048 -> NPW=2; N>=4096 -> NPW=4.
+        smallm_fp8_nt_dispatch<4>(A, B, D, d_scale_a, d_scale_b, M, N, K,
+                                  /*min_wgs=*/256, stream);
+        return;
+    }
+    const char* as = std::getenv("FRT_LDS_ASYNC");
+    const int use_async = (as && as[0] == '0' && as[1] == '\0') ? 0 : 1;
+    smallm_fp8_nt_lds_dev(A, B, D, d_scale_a, d_scale_b, M, N, K,
+                          use_async, stream);
 }
 
 void smallm_fp8_nt_dev_alt(const void* A, const void* B, void* D,

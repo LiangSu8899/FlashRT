@@ -259,6 +259,9 @@ class Pi05Pipeline:
         # FP8 activation scratch buffers + per-layer static scales
         self.fp8_act_scales = {}  # name -> HipBuffer(1, fp32)
         self.fp8_calibrated = False
+        # Fused decoder attn->FP8 epilogue: armed once post-calibration by
+        # _arm_decoder_attn_fp8out() (see there for the env gate).
+        self._dec_attn_fp8out_armed = False
         # Set once autotune_gemms() has benchmarked this pipeline's (fixed) GEMM
         # shapes, so repeat calls (frontend + record_infer_graph) are no-ops.
         self._gemms_autotuned = False
@@ -1099,6 +1102,12 @@ class Pi05Pipeline:
         try:
             for step in range(self.num_steps):
                 self._fp8_current_decoder_step = step
+                if self._dec_attn_fp8out_armed:
+                    # Host-side scale-row selector: the fp8out epilogue must
+                    # use the SAME per-(step, layer) o-proj static scale ptr
+                    # the quantize path uses; frozen into the graph at
+                    # capture like every other per-launch pointer.
+                    self.attn.set_decoder_fp8out_step(step)
                 self._copy_rtc_prefix(rtc_prefix_len, stream)
                 # C0: Action input projection: noise (ds, 32) → decoder_x (ds, 1024)
                 gemm.bf16_nn(
@@ -1213,11 +1222,32 @@ class Pi05Pipeline:
             stream=stream,
         )
 
-        # C4: Attn output projection
-        if self.use_fp8_decoder:
+        # C4: Attn output projection.
+        # When the fused decoder attn->FP8 epilogue is armed (see
+        # _arm_decoder_attn_fp8out), the attention kernel already emitted
+        # the o-proj activation's fp8 bytes with the SAME static scale
+        # pointer _fp8_gemm would use — consume them directly and skip the
+        # standalone quantize launch (~180/inference). Bit-equal numerics.
+        o_name = f"decoder_attn_o_w_{i}"
+        fp8out = None
+        if fused and self._dec_attn_fp8out_armed:
+            get_fp8out = getattr(self.attn, "get_decoder_fp8out_ptr", None)
+            fp8out = get_fp8out() if get_fp8out is not None else None
+        if fp8out is not None:
+            fp8_ptr, act_scale_ptr = fp8out
+            # The epilogue and the quantize path must share one scale
+            # pointer, or the fp8 bytes would differ from today's path.
+            assert act_scale_ptr == self._fp8_static_scale_ptr(o_name), (
+                f"decoder fp8out scale ptr mismatch at layer {i} step "
+                f"{self._fp8_current_decoder_step}")
+            self._fp8_gemm_fused(
+                fp8_ptr, o_name,
+                B["x_normed_buf"].ptr.value,
+                ds, DEC_D, DEC_NH * DEC_HD, act_scale_ptr, stream)
+        elif self.use_fp8_decoder:
             self._fp8_gemm(
                 dec_o_ptr, ds * DEC_NH * DEC_HD,
-                f"decoder_attn_o_w_{i}",
+                o_name,
                 B["x_normed_buf"].ptr.value,
                 ds, DEC_D, DEC_NH * DEC_HD, stream)
         else:
@@ -1358,6 +1388,62 @@ class Pi05Pipeline:
         self.fp8_calibrated = True
         logger.info("FP8 calibrated: %d activation scales collected",
                     len(self.fp8_act_scales))
+
+    def _arm_decoder_attn_fp8out(self) -> None:
+        """Arm the fused decoder attention -> FP8 epilogue (capture prep).
+
+        Post-calibration, the decoder attn-output -> o-proj site quantizes
+        the attention output with the layer's (per-step) STATIC scale
+        before the FP8 GEMM. The custom decoder attention kernel can emit
+        those exact fp8 bytes as an in-kernel epilogue instead
+        (attention_decoder_gqa_fp8out), removing ~180 standalone
+        quantize_fp8_static launches per inference with bit-equal numerics
+        (same scale pointers, same conversion math).
+
+        Called once from :meth:`record_infer_graph` after
+        ``calibrate_fp8()`` — the point where the static scales are final.
+        Arms the backend with the per-(step, layer) o-proj static-scale
+        device pointers; :meth:`transformer_decoder` selects the step row
+        (host-side) so each captured attention launch freezes the same
+        scale pointer the o-proj quantize would use.
+
+        Env gate: ``FVK_AMD_ATTN_FP8OUT=0`` disables arming entirely, in
+        which case pipeline behavior is IDENTICAL to the pre-fusion path
+        (split attention + standalone quantize). Default is ON
+        post-calibration.
+        """
+        if self._dec_attn_fp8out_armed:
+            return
+        if not (self.use_fp8 and self.use_fp8_decoder and self.fp8_calibrated):
+            return
+        if os.environ.get("FVK_AMD_ATTN_FP8OUT", "1").strip().lower() in (
+                "0", "off", "false"):
+            logger.info("Decoder attn FP8-out epilogue disabled "
+                        "(FVK_AMD_ATTN_FP8OUT=0)")
+            return
+        supported = getattr(self.attn, "decoder_fp8out_supported", None)
+        if supported is None or not supported():
+            return
+        scale_ptrs = []
+        for step in range(self.num_steps):
+            row = []
+            for i in range(DEC_L):
+                name = f"decoder_attn_o_w_{i}"
+                buf = (self.fp8_act_scales.get(f"{name}__step_{step}")
+                       or self.fp8_act_scales.get(name))
+                if buf is None:
+                    logger.warning(
+                        "Decoder attn FP8-out: scale for %s missing — "
+                        "leaving epilogue disarmed", name)
+                    return
+                row.append(buf.ptr.value)
+            scale_ptrs.append(row)
+        self.attn.set_decoder_fp8out(scale_ptrs)
+        self._dec_attn_fp8out_armed = True
+        logger.info(
+            "Decoder attn FP8-out epilogue armed: %d steps x %d layers "
+            "(standalone o-proj quantize launches eliminated)",
+            self.num_steps, DEC_L)
 
     def autotune_gemms(self) -> None:
         """Benchmark GEMM algorithms for each shape and cache the best.
@@ -1542,6 +1628,10 @@ class Pi05Pipeline:
         if self.use_fp8 and not self.fp8_calibrated:
             self.calibrate_fp8()
         self.autotune_gemms()
+        # Scales are final now — arm the fused decoder attn->FP8 epilogue
+        # so warmup and capture both take the fused route (see helper for
+        # the FVK_AMD_ATTN_FP8OUT env gate).
+        self._arm_decoder_attn_fp8out()
 
         self._graph = HipGraph()
         if external_stream_int is None:

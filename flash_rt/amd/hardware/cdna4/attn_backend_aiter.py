@@ -151,6 +151,85 @@ class Cdna4AiterAttnBackend(Cdna4AttnBackend):
             self._dec_attn_ws = self._torch.empty(
                 ws_floats, dtype=self._torch.float32, device="cuda")
 
+        # Fused FP8-out epilogue state (see set_decoder_fp8out). Disarmed
+        # until the pipeline arms it post-calibration.
+        self._dec_fp8out_scales = None   # list[list[int]] [step][layer] or None
+        self._dec_fp8out_step = 0        # host-side step selector (capture-time)
+        self._dec_fp8out_buf = None      # (chunk, Hq*D) fp8-byte tensor, reused
+        self._dec_fp8out_last = None     # (fp8_ptr, scale_ptr) of last call
+
+    # ── Fused FP8-out epilogue (decoder custom route only) ──
+    #
+    # The pipeline's decoder attn-output -> o-proj site quantizes the
+    # attention output with a per-weight STATIC scale before the FP8
+    # GEMM (~180 standalone quantize launches / inference). The custom
+    # decoder kernel can emit those exact fp8 bytes as an in-kernel
+    # epilogue instead. Protocol note: decoder_attn/run keep their
+    # signatures — arming is a separate one-shot call, and the fp8
+    # result is picked up out-of-band via get_decoder_fp8out_ptr().
+
+    def decoder_fp8out_supported(self) -> bool:
+        """Whether the decoder site can produce fused fp8-out bytes."""
+        return (self._dec_custom
+                and getattr(self, "_fvk", None) is not None
+                and hasattr(self._fvk, "attention_decoder_gqa_fp8out"))
+
+    def set_decoder_fp8out(self, layer_scale_ptrs) -> None:
+        """Arm (or disarm) the fused FP8-out decoder epilogue.
+
+        ``layer_scale_ptrs``: ``None`` disarms; a ``list[int]`` of
+        per-layer device float pointers (the o-proj static activation
+        scales) arms every step with the same per-layer scales; a
+        ``list[list[int]]`` indexed ``[step][layer]`` arms with the
+        pipeline's per-(step, layer) static scales — required for
+        bit-equality when the calibration recorded per-step scales
+        (select the step via :meth:`set_decoder_fp8out_step`).
+
+        Called ONCE by the pipeline after calibration (capture prep).
+        Allocates the single reused (chunk, Hq*D) fp8-byte output
+        tensor on first arm — pointer-stable across replays.
+        """
+        if layer_scale_ptrs is None:
+            self._dec_fp8out_scales = None
+            self._dec_fp8out_last = None
+            return
+        if not self.decoder_fp8out_supported():
+            raise RuntimeError(
+                "set_decoder_fp8out: custom decoder route with "
+                "attention_decoder_gqa_fp8out is not available "
+                "(FVK_AMD_DEC_ATTN != custom or symbol missing)")
+        first = layer_scale_ptrs[0]
+        if isinstance(first, (list, tuple)):
+            mat = [list(row) for row in layer_scale_ptrs]
+        else:
+            mat = [list(layer_scale_ptrs)]
+        self._dec_fp8out_scales = mat
+        self._dec_fp8out_step = 0
+        self._dec_fp8out_last = None
+        if self._dec_fp8out_buf is None:
+            chunk, hq, d = self.dec_Q.shape
+            self._dec_fp8out_buf = self._torch.empty(
+                chunk, hq * d, dtype=self._torch.uint8, device="cuda")
+
+    def set_decoder_fp8out_step(self, step: int) -> None:
+        """Select the denoise step whose scale row decoder_attn uses.
+
+        Host-side only (the pipeline calls it at the top of each step
+        while recording — the chosen pointers are frozen into the
+        graph at capture, exactly like the o-proj quantize's scale
+        pointer today). No-op when disarmed.
+        """
+        self._dec_fp8out_step = int(step)
+
+    def get_decoder_fp8out_ptr(self):
+        """(fp8_ptr, scale_ptr) of the LAST decoder_attn call, or None.
+
+        None when disarmed, or when the last decoder_attn did not run
+        the fused fp8-out kernel (fixed-shape delegation / lib route)
+        — the caller must then fall back to its own quantize path.
+        """
+        return self._dec_fp8out_last
+
     # ── aiter dispatch ──
 
     def _aiter_attn(self, q, k, v, out, scale):
@@ -196,6 +275,9 @@ class Cdna4AiterAttnBackend(Cdna4AttnBackend):
 
     def decoder_attn(self, layer_idx: int, enc_seq: int, dec_seq: int,
                      stream: int = 0) -> int:
+        # Reset per call: get_decoder_fp8out_ptr() must reflect THIS
+        # call only (fixed-shape delegation / lib route produce none).
+        self._dec_fp8out_last = None
         if self._fixed_shape:
             # Same delegation rationale as encoder_attn.
             return super().decoder_attn(layer_idx, enc_seq, dec_seq,
@@ -204,6 +286,30 @@ class Cdna4AiterAttnBackend(Cdna4AttnBackend):
         if self._dec_custom:
             # Hand-written split-KV kernel; launches on the pipeline
             # stream directly (raw-pointer ABI, no torch dispatch).
+            scales = self._dec_fp8out_scales
+            if scales is not None:
+                # Armed: fused FP8-out epilogue. Same attention + bf16
+                # O as the plain call, plus the o-proj activation's fp8
+                # bytes (bit-equal to quantize_fp8_static with the same
+                # scale pointer).
+                row = scales[min(self._dec_fp8out_step, len(scales) - 1)]
+                scale_ptr = row[layer_idx]
+                fp8_ptr = self._dec_fp8out_buf.data_ptr()
+                self._fvk.attention_decoder_gqa_fp8out(
+                    self.dec_Q.data_ptr(),
+                    self.enc_K[layer_idx].data_ptr(),
+                    self.enc_V[layer_idx].data_ptr(),
+                    self._dec_O.data_ptr(),
+                    fp8_ptr,
+                    scale_ptr,
+                    self._dec_attn_ws.data_ptr(),
+                    dec_seq, total_kv,
+                    self.dec_Q.shape[-2], self.dec_Q.shape[-1],
+                    0,                   # seqused: exact mode
+                    self._enc_scale,
+                    stream)
+                self._dec_fp8out_last = (fp8_ptr, scale_ptr)
+                return self._dec_O.data_ptr()
             self._fvk.attention_decoder_gqa(
                 self.dec_Q.data_ptr(),
                 self.enc_K[layer_idx].data_ptr(),

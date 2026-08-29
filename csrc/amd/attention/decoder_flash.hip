@@ -112,6 +112,15 @@
 //     the per-split m/l loads run on a full wave (lane i <-> split i)
 //     with fixed radix-2 shuffle trees, instead of v1's thread-0
 //     serial loop; the acc combine stays one thread per output dim.
+//     Optional fused FP8 epilogue (same contract as the v3 fused
+//     kernel's): when O_fp8 != nullptr, after the bf16 O store each
+//     thread re-expands its ROUNDED bf16 value, multiplies by
+//     inv = 1/(*d_scale), pre-clamps to +-448 and converts
+//     __hip_fp8_e4m3 — byte-identical to a standalone
+//     quantize_fp8_static launch on the bf16 O with the same device
+//     scale. This makes attention_decoder_gqa_fp8out fully fused on
+//     BOTH wrapper paths (the production v2 split path included),
+//     deleting the ~180 standalone quantize launches per inference.
 //   Two kernels on one stream: plain stream ordering, no atomics, no
 //   cooperative counters — trivially HIP-graph capturable. A fused
 //   single-kernel variant would need a last-WG-done flag (atomics —
@@ -218,11 +227,6 @@
 #define ATTN_S_PITCH    (ATTN_CHUNK_MAX + 1)   // 65 floats: odd stride
 
 #define ATTN_FUSED_SKV_MAX 2048  // fused-path score buffer bound (8 KB LDS)
-
-// forward decl (csrc/amd/kernels/quantize_fp8.hip) — used by the
-// fp8out wrapper's v2-split fallback only.
-void quantize_fp8_static(const __hip_bfloat16* input, __hip_fp8_e4m3* output,
-                         const float* d_scale, int n, hipStream_t stream);
 
 // ── ILP=4 GLOBAL->LDS K/V tile stage (v2 split path) ──
 // stream_probe (gfx950, stream_craft_gfx950.md): one outstanding load
@@ -399,11 +403,15 @@ void attention_decoder_gqa_partial_kernel(
 // O = (sum_i coeff_i * acc_i) / (sum_i coeff_i * l_i).
 // v2: wave 0 loads all m/l in parallel (lane i <-> split i) and
 // reduces with fixed shuffle trees; v1 looped serially on thread 0.
+// Optional FP8 epilogue: O_fp8/d_scale as in the fused kernel —
+// nullptr O_fp8 disables it (plain path, zero extra work).
 template <int NSPLIT>
 __global__ __launch_bounds__(ATTN_NTHREADS)
 void attention_decoder_gqa_reduce_kernel(
     const float* __restrict__ ws,
     __hip_bfloat16* __restrict__ O,
+    __hip_fp8_e4m3* __restrict__ O_fp8,  // optional epilogue (nullptr = off)
+    const float* __restrict__ d_scale,   // device scale, read iff O_fp8
     int Sq, int Hq, int D) {
     const int q    = blockIdx.x;
     const int h    = blockIdx.y;
@@ -447,7 +455,18 @@ void attention_decoder_gqa_reduce_kernel(
                 s += c * ws[b + (size_t)q * D + tid];
             }
         }
-        O[((size_t)q * Hq + h) * D + tid] = __float2bfloat16(s * s_invL);
+        const size_t o_off = ((size_t)q * Hq + h) * D + tid;
+        const __hip_bfloat16 b = __float2bfloat16(s * s_invL);
+        O[o_off] = b;
+        if (O_fp8 != nullptr) {
+            // Bit-exact quantize_fp8_static semantics: quantize the
+            // ROUNDED bf16 value, per-thread inv = 1/(*d_scale)
+            // (single division), pre-clamp +-448, e4m3 convert.
+            const float inv = 1.0f / (*d_scale);
+            const float f =
+                fminf(fmaxf(__bfloat162float(b) * inv, -448.0f), 448.0f);
+            O_fp8[o_off] = __hip_fp8_e4m3(f);
+        }
     }
 }
 
@@ -456,6 +475,8 @@ static void launch_decoder_gqa(const __hip_bfloat16* Q,
                                const __hip_bfloat16* K,
                                const __hip_bfloat16* V,
                                __hip_bfloat16* O,
+                               __hip_fp8_e4m3* O_fp8,
+                               const float* d_scale,
                                float* partial_ws,
                                int Sq, int Skv, int Hq, int D,
                                const int* seqused,
@@ -464,7 +485,7 @@ static void launch_decoder_gqa(const __hip_bfloat16* Q,
     dim3 grid1(NSPLIT, Hq);
     attention_decoder_gqa_partial_kernel<NSPLIT><<<grid1, ATTN_NTHREADS, 0, stream>>>(Q, K, V, partial_ws, seqused, Sq, Skv, Hq, D, softmax_scale);
     dim3 grid2(Sq, Hq);
-    attention_decoder_gqa_reduce_kernel<NSPLIT><<<grid2, ATTN_NTHREADS, 0, stream>>>(partial_ws, O, Sq, Hq, D);
+    attention_decoder_gqa_reduce_kernel<NSPLIT><<<grid2, ATTN_NTHREADS, 0, stream>>>(partial_ws, O, O_fp8, d_scale, Sq, Hq, D);
 }
 
 // ================================================================
@@ -652,6 +673,8 @@ static void launch_decoder_gqa_split(const __hip_bfloat16* Q,
                                      const __hip_bfloat16* K,
                                      const __hip_bfloat16* V,
                                      __hip_bfloat16* O,
+                                     __hip_fp8_e4m3* O_fp8,
+                                     const float* d_scale,
                                      float* partial_ws,
                                      int Sq, int Skv, int Hq, int D,
                                      const int* seqused,
@@ -664,13 +687,13 @@ static void launch_decoder_gqa_split(const __hip_bfloat16* Q,
     if (Skv > ns * ATTN_CHUNK_MAX) ns = 32;  // capacity guard
     switch (ns) {
         case 8:
-            launch_decoder_gqa<8>(Q, K, V, O, partial_ws, Sq, Skv, Hq, D, seqused, softmax_scale, stream);
+            launch_decoder_gqa<8>(Q, K, V, O, O_fp8, d_scale, partial_ws, Sq, Skv, Hq, D, seqused, softmax_scale, stream);
             break;
         case 16:
-            launch_decoder_gqa<16>(Q, K, V, O, partial_ws, Sq, Skv, Hq, D, seqused, softmax_scale, stream);
+            launch_decoder_gqa<16>(Q, K, V, O, O_fp8, d_scale, partial_ws, Sq, Skv, Hq, D, seqused, softmax_scale, stream);
             break;
         default:
-            launch_decoder_gqa<32>(Q, K, V, O, partial_ws, Sq, Skv, Hq, D, seqused, softmax_scale, stream);
+            launch_decoder_gqa<32>(Q, K, V, O, O_fp8, d_scale, partial_ws, Sq, Skv, Hq, D, seqused, softmax_scale, stream);
             break;
     }
 }
@@ -691,16 +714,18 @@ void attention_decoder_gqa(const __hip_bfloat16* Q,
             Skv, Hq, D, softmax_scale);
         return;
     }
-    launch_decoder_gqa_split(Q, K, V, O, partial_ws, Sq, Skv, Hq, D,
-                             seqused, softmax_scale, stream);
+    launch_decoder_gqa_split(Q, K, V, O, /*O_fp8=*/nullptr,
+                             /*d_scale=*/nullptr, partial_ws,
+                             Sq, Skv, Hq, D, seqused, softmax_scale, stream);
 }
 
 // Fused-epilogue variant: same attention, plus OCP e4m3 output
 // O_fp8 (Sq, Hq*D) row-major — byte-for-byte what quantize_fp8_static
 // would produce from the bf16 O with the same device scale. O (bf16)
-// is still written, identical to the plain path. On the (never hit at
-// the pi05 site) v2 fallback this degrades to split + a standalone
-// quantize_fp8_static launch — semantics preserved.
+// is still written, identical to the plain path. BOTH wrapper paths
+// are fully fused: the v3 fused kernel carries the epilogue inline,
+// and the v2 split path (the production default) carries it in the
+// reduce kernel — no standalone quantize launch anywhere.
 void attention_decoder_gqa_fp8out(const __hip_bfloat16* Q,
                                   const __hip_bfloat16* K,
                                   const __hip_bfloat16* V,
@@ -718,7 +743,6 @@ void attention_decoder_gqa_fp8out(const __hip_bfloat16* Q,
             Q, K, V, O, O_fp8, d_scale, seqused, Skv, Hq, D, softmax_scale);
         return;
     }
-    launch_decoder_gqa_split(Q, K, V, O, partial_ws, Sq, Skv, Hq, D,
-                             seqused, softmax_scale, stream);
-    quantize_fp8_static(O, O_fp8, d_scale, Sq * Hq * D, stream);
+    launch_decoder_gqa_split(Q, K, V, O, O_fp8, d_scale, partial_ws,
+                             Sq, Skv, Hq, D, seqused, softmax_scale, stream);
 }
