@@ -1,6 +1,7 @@
 // ================================================================
 // FlashRT AMD — Elementwise kernels (dtype-generic, CDNA wave64)
-// Residual add, gate multiply, bias residual, broadcast bias add.
+// Residual add, gate multiply, bias residual, broadcast bias add,
+// GPU copy (graph-compatible, explicit stream).
 // Mirrors csrc/kernels/elementwise.cu (add_bias_bf16 comes from
 // csrc/kernels/dit_bf16.cu) host-wrapper signatures exactly.
 // ================================================================
@@ -102,4 +103,14 @@ __global__ void add_bias_bf16_kernel(__hip_bfloat16* x, const __hip_bfloat16* b,
 void add_bias_bf16(__hip_bfloat16* x, const __hip_bfloat16* b,
                    int S, int D, hipStream_t stream) {
     add_bias_bf16_kernel<<<(S * D + 255) / 256, 256, 0, stream>>>(x, b, S, D);
+}
+
+// ================================================================
+// GPU memory/copy ops for HIP Graph compatibility (DiT pipeline)
+// These replace PyTorch .copy_()/.fill_()/.half() which don't
+// submit to the correct stream during graph capture.
+// ================================================================
+
+void gpu_copy_async(void* dst, const void* src, size_t nbytes, hipStream_t stream) {
+    hipMemcpyAsync(dst, src, nbytes, hipMemcpyDeviceToDevice, stream);
 }

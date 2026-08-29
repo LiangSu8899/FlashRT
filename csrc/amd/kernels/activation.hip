@@ -1,11 +1,19 @@
 // ================================================================
 // FlashRT AMD — Activation kernels (dtype-generic, CDNA wave64)
-// GeLU, GeGLU (split and merged), fused bias+GeLU (strict).
+// GeLU, GeGLU (split and merged), fused bias+GeLU (strict),
+// merged GeGLU → FP8 (gate_geglu_merged_fp8).
 // Mirrors csrc/kernels/activation.cu host-wrapper signatures exactly
 // so the pipeline layer stays portable text across platforms.
+//
+// FP8 output dtype: OCP e4m3 via <hip/hip_fp8.h> __hip_fp8_e4m3
+// (saturating RNE conversion, same as __nv_fp8_e4m3; values are
+// pre-clamped to ±448 exactly as in activation.cu). Only the generic
+// (BF16-bound) gate_geglu_merged_fp8 path is ported; the vectorized
+// FP16 encoder variant stays CUDA-only.
 // ================================================================
 
 #include "common_hip.h"
+#include <hip/hip_fp8.h>
 
 // ── Gate GELU Multiply ──
 // GELU(x) approx: x * sigmoid(1.5957691216 * x * (1 + 0.044715 * x^2))
@@ -126,4 +134,39 @@ void gate_geglu_merged(const __hip_bfloat16* merged, __hip_bfloat16* out,
     int total = seq * half_dim;
     int blocks = (total + 255) / 256;
     gate_geglu_merged_kernel<__hip_bfloat16><<<blocks, 256, 0, stream>>>(merged, out, seq, half_dim);
+}
+
+// ── Gate GELU Mul Merged → FP8 ──
+// Merged layout: merged[s, 0..H-1] = gate, merged[s, H..2H-1] = up
+template<typename T>
+__global__ void gate_geglu_merged_fp8_kernel(const T* __restrict__ merged,
+                                                 __hip_fp8_e4m3* __restrict__ out,
+                                                 int seq, int half_dim,
+                                                 const float* __restrict__ d_scale) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = seq * half_dim;
+    if (idx < total) {
+        int row = idx / half_dim;
+        int col = idx % half_dim;
+        int full_dim = half_dim * 2;
+        float g = to_f32(merged[row * full_dim + col]);
+        float u = to_f32(merged[row * full_dim + half_dim + col]);
+        float gelu = g / (1.0f + expf(-1.5957691216057308f * g * (1.0f + 0.044715f * g * g)));
+        float val = gelu * u;
+        float inv_scale = 1.0f / (*d_scale);
+        val = fminf(fmaxf(val * inv_scale, -448.0f), 448.0f);
+        out[idx] = __hip_fp8_e4m3(val);
+    }
+}
+
+template __global__ void gate_geglu_merged_fp8_kernel<__half>(const __half*, __hip_fp8_e4m3*, int, int, const float*);
+template __global__ void gate_geglu_merged_fp8_kernel<__hip_bfloat16>(const __hip_bfloat16*, __hip_fp8_e4m3*, int, int, const float*);
+
+void gate_geglu_merged_fp8(const __hip_bfloat16* merged, __hip_fp8_e4m3* out,
+                               int seq, int half_dim,
+                               const float* d_scale, hipStream_t stream) {
+    int total = seq * half_dim;
+    int blocks = (total + 255) / 256;
+    gate_geglu_merged_fp8_kernel<__hip_bfloat16><<<blocks, 256, 0, stream>>>(
+        merged, out, seq, half_dim, d_scale);
 }

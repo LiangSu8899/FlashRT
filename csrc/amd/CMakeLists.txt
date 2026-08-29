@@ -61,6 +61,8 @@ set(FLASHRT_AMD_SOURCES
   kernels/elementwise.hip
   kernels/rope.hip
   kernels/patch_embed.hip
+  kernels/fusion.hip
+  kernels/quantize_fp8.hip
   gemm/hipblaslt_runner.hip
 )
 set_source_files_properties(${FLASHRT_AMD_SOURCES} PROPERTIES LANGUAGE HIP)
