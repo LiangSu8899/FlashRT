@@ -22,6 +22,7 @@
 
 #include "context.h"
 #include "gemm/hipblaslt_runner.h"
+#include "gemm/smallm_fp8.h"
 
 namespace py = pybind11;
 
@@ -119,6 +120,11 @@ void qkv_split_rope_devpos(const __hip_bfloat16* qkv,
                            const int* devpos,
                            int seq, int q_dim, int k_dim, int v_dim,
                            int head_dim, hipStream_t stream);
+void attention_decoder_gqa(const __hip_bfloat16* Q, const __hip_bfloat16* K,
+                           const __hip_bfloat16* V, __hip_bfloat16* O,
+                           float* partial_ws, int Sq, int Skv, int Hq, int D,
+                           const int* seqused, float softmax_scale,
+                           hipStream_t stream);
 
 PYBIND11_MODULE(flash_rt_amd_kernels, m) {
     m.doc() = "FlashRT AMD (ROCm/HIP) kernels — raw-pointer ABI";
@@ -350,6 +356,31 @@ PYBIND11_MODULE(flash_rt_amd_kernels, m) {
        py::arg("seq"), py::arg("q_dim"), py::arg("k_dim"), py::arg("v_dim"),
        py::arg("head_dim"), py::arg("stream") = 0);
 
+    // ── Attention ──
+    // Split-KV flash decoder cross-attention (GQA Hq:1, bidirectional).
+    // Q/O: (Sq, Hq, D) bf16; K/V: (Skv, D) bf16 single KV head.
+    // partial_ws: caller device fp32 scratch >= 32*Hq*Sq*(D+2) floats
+    // (graph-capture-safe: no allocation inside). seqused = 0 => exact
+    // mode (Skv host int); else device int32 ptr, seqused[0] is the
+    // runtime length and Skv is ignored (fixed-shape graph mode).
+    m.def("attention_decoder_gqa", [](uintptr_t Q, uintptr_t K, uintptr_t V,
+                                      uintptr_t O, uintptr_t partial_ws,
+                                      int Sq, int Skv, int Hq, int D,
+                                      uintptr_t seqused, float softmax_scale,
+                                      uintptr_t stream) {
+        attention_decoder_gqa(typed_ptr<__hip_bfloat16>(Q),
+                              typed_ptr<__hip_bfloat16>(K),
+                              typed_ptr<__hip_bfloat16>(V),
+                              typed_ptr<__hip_bfloat16>(O),
+                              typed_ptr<float>(partial_ws),
+                              Sq, Skv, Hq, D,
+                              reinterpret_cast<const int*>(seqused),
+                              softmax_scale, to_stream(stream));
+    }, py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("O"),
+       py::arg("partial_ws"), py::arg("Sq"), py::arg("Skv"),
+       py::arg("Hq"), py::arg("D"), py::arg("seqused") = 0,
+       py::arg("softmax_scale") = 0.0625f, py::arg("stream") = 0);
+
     // ── Fusion ──
     m.def("gate_residual_ada_norm_fp8", [](uintptr_t residual, uintptr_t x,
                                             uintptr_t gate, uintptr_t weight,
@@ -418,4 +449,7 @@ PYBIND11_MODULE(flash_rt_amd_kernels, m) {
 
     // ── GEMM: FvkContext + hipBLASLt GemmRunner ──
 #include "gemm/bindings_gemm.inc"
+
+    // ── GEMM: hand-tuned small-M FP8 (weight-streaming) ──
+#include "gemm/bindings_smallm.inc"
 }

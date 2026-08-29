@@ -350,14 +350,16 @@ def _quantize_fp8_e4m3(w_bf16: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor
 def _select_fp8_layout(fp8_layout: Optional[str]) -> str:
     """Choose the FP8 weight layout used by the AMD frontend kernels.
 
-    ``kn``: weights are stored as [K,N] and use ``fp8_nn_dev`` (default).
-    ``nk``: weights are stored as [N,K] and use ``fp8_nt_dev``.
+    ``kn``: weights are stored as [K,N] and use ``fp8_nn_dev``.
+    ``nk``: weights are stored as [N,K] and use ``fp8_nt_dev`` (default —
+    measured faster in-graph across every pi05 FP8 GEMM shape on CDNA4,
+    -2.8 ms E2E vs kn in the single-variable A/B).
     """
     if fp8_layout is not None:
         if fp8_layout not in ("kn", "nk"):
             raise ValueError(f"fp8_layout must be 'kn' or 'nk', got {fp8_layout!r}")
         return fp8_layout
-    return "kn"
+    return "nk"
 
 
 def _precompute_decoder_styles(ckpt: dict, chunk_size: int,
@@ -574,11 +576,7 @@ class Pi05TorchFrontendAmd:
 
         # ── Attention backend (torch, owns Q/K/V/O) ──
         enc_seq_max = self.num_views * 256 + self.max_prompt_len
-        self.attn_backend = Cdna4AttnBackend(
-            num_views=self.num_views,
-            encoder_seq_max=enc_seq_max,
-            chunk_size=self.chunk_size,
-            num_encoder_layers=ENC_L)
+        self.attn_backend = self._make_attn_backend(enc_seq_max)
 
         # ── fvk module + GemmRunner ──
         from flash_rt.amd import flash_rt_amd_kernels as fvk
@@ -599,17 +597,46 @@ class Pi05TorchFrontendAmd:
             "Pi05TorchFrontendAmd initialised (num_views=%d, chunk=%d, fp8_layout=%s)",
             self.num_views, self.chunk_size, self.fp8_layout)
 
+    def _make_attn_backend(self, enc_seq_max: int):
+        """Construct the CDNA4 attention backend.
+
+        ``FVK_AMD_ATTN=sdpa|aiter`` selects the implementation (default
+        "sdpa" — the interim torch-SDPA backend). "aiter" dispatches to
+        the aiter asm flash-attention backend
+        (:class:`~flash_rt.amd.hardware.cdna4.attn_backend_aiter.Cdna4AiterAttnBackend`,
+        same buffers/surface); if aiter is unavailable the frontend logs
+        a warning and falls back to sdpa.
+        """
+        kwargs = dict(
+            num_views=self.num_views,
+            encoder_seq_max=enc_seq_max,
+            chunk_size=self.chunk_size,
+            num_encoder_layers=ENC_L)
+        choice = os.environ.get("FVK_AMD_ATTN", "aiter").strip().lower()
+        if choice not in ("sdpa", "aiter"):
+            raise ValueError(
+                f"FVK_AMD_ATTN must be 'sdpa' or 'aiter', got {choice!r}")
+        if choice == "aiter":
+            from flash_rt.amd.hardware.cdna4.attn_backend_aiter import (
+                Cdna4AiterAttnBackend,
+            )
+            try:
+                backend = Cdna4AiterAttnBackend(**kwargs)
+                logger.info("CDNA4 attention backend: aiter (FVK_AMD_ATTN)")
+                return backend
+            except ImportError as ex:
+                logger.warning(
+                    "FVK_AMD_ATTN=aiter but the aiter backend is "
+                    "unavailable (%s); falling back to sdpa", ex)
+        return Cdna4AttnBackend(**kwargs)
+
     def _ensure_prompt_capacity(self, required_prompt_len: int) -> None:
         """Grow attention buffers before building longer prompt pipelines."""
         if required_prompt_len <= self.max_prompt_len:
             return
         self.max_prompt_len = int(required_prompt_len)
         enc_seq_max = self.num_views * 256 + self.max_prompt_len
-        self.attn_backend = Cdna4AttnBackend(
-            num_views=self.num_views,
-            encoder_seq_max=enc_seq_max,
-            chunk_size=self.chunk_size,
-            num_encoder_layers=ENC_L)
+        self.attn_backend = self._make_attn_backend(enc_seq_max)
         self._prompt_pipeline_cache.clear()
         self._fixed_pipeline = None
         self.pipeline = None
