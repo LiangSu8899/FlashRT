@@ -74,6 +74,7 @@ set(FLASHRT_AMD_SOURCES
   gemm/hipblaslt_runner.hip
   gemm/smallm_fp8.hip
   gemm/smallm_mfma.hip
+  gemm/smallm_mfma_bf16.hip
   gemm/decoder_ffn_fused.hip
 )
 set_source_files_properties(${FLASHRT_AMD_SOURCES} PROPERTIES LANGUAGE HIP)

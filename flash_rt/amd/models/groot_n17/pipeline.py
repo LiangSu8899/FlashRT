@@ -67,6 +67,8 @@ host↔device traffic; streams are raw ints).
 
 from __future__ import annotations
 
+import os
+
 
 # ─────────────────────────────────────────────────────────────────────────
 # Stage 4: VLLN — LayerNorm on backbone_features (no FP8; identical to RTX)
@@ -728,6 +730,40 @@ def dit_forward(gemm, fvk, bufs, weights, dims,
 
     layer_iter = range(32) if layers_subset is None else list(layers_subset)
 
+    # ── Small-M MFMA packed-GEMM routing (measured list, the pi05
+    # FVK_AMD_DEC_GEMM precedent) ────────────────────────────────────
+    # The gfx950 packed bf16 kernel (csrc/amd/gemm/smallm_mfma_bf16.h)
+    # wins ONLY on the square (41, 1536, 1536) projection shape
+    # (standalone gate vs autotuned hipBLASLt: bias 1.41x, bias_res
+    # 1.12x); it LOSES on ff1 (41,6144,1536) and ff2 (41,1536,6144),
+    # which stay on hipBLASLt. Routed sites: Q (32 layers), K/V (16
+    # self layers), O (32 layers) — each only when the frontend supplied
+    # an MFMA-packed copy of that weight in weights["smallm_packed"].
+    # FVK_AMD_DIT_GEMM: "smallm" (default) enables the routing,
+    # "hipblaslt" keeps every site on the library path. Env read at
+    # graph-build time only — this function never runs post-capture.
+    smallm_packed = weights.get("smallm_packed") or {}
+    if os.environ.get("FVK_AMD_DIT_GEMM", "smallm").strip().lower() \
+            != "smallm":
+        smallm_packed = {}
+
+    def _dd_proj_bias(wkey: str, li: int, out_ptr: int, s: int) -> None:
+        """(Sa, D, D) bias-epilogue projection (Q/K/V, input xn).
+
+        Variant 3 = w4_split, hardcoded per the standalone gate: the
+        measured bias-epilogue winner at (41, 1536, 1536), 1.41x vs
+        autotuned hipBLASLt (auto's heuristic would not pick it here).
+        """
+        wp = smallm_packed.get(f"{wkey}_w_{li}")
+        if wp is not None:
+            fvk.smallm_mfma_bf16_nn_bias(
+                xn_ptr, int(wp), int(weights[f"{wkey}_b"][li]), out_ptr,
+                Sa, D, D, 3, s)
+        else:
+            gemm.bf16_nn_bias(xn_ptr, int(weights[f"{wkey}_w"][li]),
+                              out_ptr, int(weights[f"{wkey}_b"][li]),
+                              Sa, D, D, s)
+
     # NVFP4 fast path: every DiT GEMM (fused QKV / cross-Q / O / FFN up /
     # FFN down) runs as a block-scaled NVFP4 GEMM with a fused bf16 bias
     # epilogue. At M=Sa=41 the DiT is weight-bandwidth-bound, so halving
@@ -895,19 +931,15 @@ def dit_forward(gemm, fvk, bufs, weights, dims,
             fvk.gpu_strided_copy_fp16(int(bufs["qkv_buf"]), V_ptr, Sa, D, 3 * D, 2 * D, int(stream))
             attn.run("dit_self", j_attn, q_seq=Sa, kv_seq=Sa, stream=int(stream))
         else:
-            # AMD FUSED: bf16_nn + add_bias_bf16 → bf16_nn_bias (Q).
-            gemm.bf16_nn_bias(xn_ptr, int(weights["q_w"][li]),
-                              Q_ptr, int(weights["q_b"][li]),
-                              Sa, D, D, int(stream))
+            # AMD FUSED: bf16_nn + add_bias_bf16 → bf16_nn_bias (Q);
+            # smallm-routed when a packed q_w copy exists (see
+            # _dd_proj_bias / FVK_AMD_DIT_GEMM above).
+            _dd_proj_bias("q", li, Q_ptr, int(stream))
             if is_self:
                 # AMD FUSED: bf16_nn + add_bias_bf16 → bf16_nn_bias (K).
-                gemm.bf16_nn_bias(xn_ptr, int(weights["k_w"][li]),
-                                  K_ptr, int(weights["k_b"][li]),
-                                  Sa, D, D, int(stream))
+                _dd_proj_bias("k", li, K_ptr, int(stream))
                 # AMD FUSED: bf16_nn + add_bias_bf16 → bf16_nn_bias (V).
-                gemm.bf16_nn_bias(xn_ptr, int(weights["v_w"][li]),
-                                  V_ptr, int(weights["v_b"][li]),
-                                  Sa, D, D, int(stream))
+                _dd_proj_bias("v", li, V_ptr, int(stream))
                 attn.run("dit_self", j_attn, q_seq=Sa, kv_seq=Sa, stream=int(stream))
             else:
                 target_text = (li % 4 == 0)
@@ -922,9 +954,19 @@ def dit_forward(gemm, fvk, bufs, weights, dims,
         # NUMERICS: the residual is added BEFORE the single bf16 round
         # (decomposed rounds the GEMM output first) — same class as the
         # bias epilogues, judged by the E2E gate.
-        gemm.bf16_nn_bias_res(O_ptr, int(weights["o_w"][li]),
-                              h_ptr, int(weights["o_b"][li]),
-                              Sa, D, D, int(stream))
+        _o_wp = smallm_packed.get(f"o_w_{li}")
+        if _o_wp is not None:
+            # smallm-routed O proj (variant 4 = w8_split, hardcoded per
+            # the standalone gate: measured bias_res winner at
+            # (41, 1536, 1536), 1.12x vs autotuned hipBLASLt). Same
+            # D += acc + bias semantics as bf16_nn_bias_res (beta=1).
+            fvk.smallm_mfma_bf16_nn_bias_res(
+                O_ptr, int(_o_wp), int(weights["o_b"][li]), h_ptr,
+                Sa, D, D, 4, int(stream))
+        else:
+            gemm.bf16_nn_bias_res(O_ptr, int(weights["o_w"][li]),
+                                  h_ptr, int(weights["o_b"][li]),
+                                  Sa, D, D, int(stream))
 
         # ── Pre-FF LayerNorm (no affine — DiT default) ───────────────
         fvk.layer_norm_no_affine_bf16(

@@ -24,6 +24,7 @@
 #include "gemm/hipblaslt_runner.h"
 #include "gemm/smallm_fp8.h"
 #include "gemm/smallm_mfma.h"
+#include "gemm/smallm_mfma_bf16.h"
 #include "gemm/decoder_ffn_fused.h"
 #include "kernels/stream_probe.h"
 #include "kernels/ew_tune.h"
@@ -688,6 +689,9 @@ PYBIND11_MODULE(flash_rt_amd_kernels, m) {
             v.append(smallm_mfma_variant_name(i));
         return v;
     });
+
+    // ── MFMA small-M BF16 packed GEMM (see gemm/smallm_mfma_bf16.h) ──
+#include "gemm/bindings_smallm_bf16.inc"
 
     // ── GEMM: fused decoder-FFN pair (gate|up+geglu, down+gate*res) ──
 #include "gemm/bindings_ffn_fused.inc"

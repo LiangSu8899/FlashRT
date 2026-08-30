@@ -338,6 +338,54 @@ class GrootN17TorchFrontendAmd(_GrootN17FP8BackboneMixin,
     # Fully-kernelized DiT graph (bf16, single combined graph)
     # ────────────────────────────────────────────────────────────────
 
+    def _pack_smallm_dit_weights(self) -> None:
+        """MFMA-pack the DiT (41, 1536, 1536) projection weights ONCE at
+        graph-build time (never per frame) for the gfx950 small-M packed
+        bf16 kernel (csrc/amd/gemm/smallm_mfma_bf16.h).
+
+        Measured routing (standalone gate vs autotuned hipBLASLt): the
+        packed kernel wins ONLY on the square D→D shape — bias 1.41x,
+        bias_res 1.12x — and loses on ff1/ff2, so only the projection
+        weights feeding those sites get packed copies: Q (all 32
+        layers), K/V (the 16 self blocks — the cross blocks' K/V
+        weights are the (2048, 1536) cross-KV projections, a different
+        shape consumed by ``_setup_cross_kv_kernel``), O (all 32).
+
+        Packed copies land in ``self._dit_smallm_packed`` keyed
+        ``{q,k,v,o}_w_{li}`` (pointer ints, matching the pipeline
+        ``weights`` lists); the tensors are kept alive in
+        ``self._dit_smallm_store``. Originals are KEPT — they serve the
+        FVK_AMD_DIT_GEMM=hipblaslt fallback and the cross-KV consumer —
+        at ~432 MB extra VRAM for the 96 packed copies.
+        FVK_AMD_DIT_GEMM=hipblaslt (read once here, setup time) skips
+        the packing entirely; the AMD ``dit_forward`` reads the same
+        env for routing.
+        """
+        if getattr(self, "_dit_smallm_packed", None) is not None:
+            return
+        self._dit_smallm_packed: dict = {}
+        self._dit_smallm_store: list = []
+        # FVK_AMD_DIT_GEMM: "smallm" (default) = pack + route the D→D
+        # projections to the MFMA packed kernel; "hipblaslt" = library path.
+        if os.environ.get("FVK_AMD_DIT_GEMM", "smallm").strip().lower() \
+                != "smallm":
+            return
+        with torch.no_grad():
+            for li in range(32):
+                sites = [("q_w", self._dit_q_w), ("o_w", self._dit_o_w)]
+                if li % 2 == 1:  # self blocks only (K/V)
+                    sites += [("k_w", self._dit_k_w),
+                              ("v_w", self._dit_v_w)]
+                for key, wl in sites:
+                    W = wl[li]  # (K, N) row-major bf16, both 1536
+                    Kd, Nd = W.shape
+                    # Per-lane consumption order — the documented
+                    # one-liner from smallm_mfma_bf16.h.
+                    wp = (W.view(Kd // 32, 4, 8, Nd // 16, 16)
+                           .permute(3, 0, 1, 4, 2).contiguous())
+                    self._dit_smallm_store.append(wp)
+                    self._dit_smallm_packed[f"{key}_{li}"] = wp.data_ptr()
+
     def _capture_kernel_dit_graphs(self, num_inference_timesteps: int = 4,
                                    action_horizon: int = 40) -> None:
         """Capture the per-frame action-head chain as ONE HIP graph.
@@ -377,6 +425,10 @@ class GrootN17TorchFrontendAmd(_GrootN17FP8BackboneMixin,
             self._allocate_infer_buffers(action_horizon)
         self._prepare_kernel_dit(num_inference_timesteps)
         self._allocate_kernel_dit_buffers(action_horizon)
+        if fused_ep:
+            # Setup-time MFMA packing for the smallm D→D projection
+            # routing in the AMD dit_forward (FVK_AMD_DIT_GEMM).
+            self._pack_smallm_dit_weights()
 
         K = self._fvk
         mg = self._mlp_gemm
@@ -406,6 +458,12 @@ class GrootN17TorchFrontendAmd(_GrootN17FP8BackboneMixin,
                               ("ff_down_w", "_dit_ff_down_w"),
                               ("ff_down_b", "_dit_ff_down_b")):
                 d[key] = [t.data_ptr() for t in getattr(self, attr)]
+            if fused_ep:
+                # MFMA-packed q/k/v/o copies for the smallm routing in
+                # the AMD dit_forward (same dict for every step —
+                # weights are step-invariant). Empty dict when
+                # FVK_AMD_DIT_GEMM=hipblaslt skipped the packing.
+                d["smallm_packed"] = self._dit_smallm_packed
             return d
 
         step_weights = [_dit_weights(s) for s in range(num_inference_timesteps)]
