@@ -143,6 +143,27 @@ class GrootN17TorchFrontendAmd(_GrootN17FP8BackboneMixin,
         embodiment_tag: str = "oxe_droid_relative_eef_relative_joint",
         device: str = "cuda:0",
     ):
+        # gfx950-only gate, FIRST: the MFMA tile shapes and FP8 paths in
+        # the extension are CDNA4-specific — refuse before touching the
+        # checkpoint unless BOTH the visible device arch (e.g.
+        # "gfx950:sramecc+:xnack-") and the extension's compile-time
+        # gpu_arch are gfx950. Anything else computes garbage, not a
+        # fallback (a forced hardware="amd_cdna4" on gfx942 fails here).
+        # This runs ahead of super().__init__, which loads weights.
+        from flash_rt.amd import flash_rt_amd_kernels as _fvk_gate
+        _dev_arch = str(_fvk_gate.device_arch())
+        _build_arch = str(dict(_fvk_gate.build_info()).get("gpu_arch",
+                                                           "unknown"))
+        if not (_dev_arch.startswith("gfx950")
+                and _build_arch.startswith("gfx950")):
+            raise RuntimeError(
+                "GrootN17TorchFrontendAmd is gfx950-only (CDNA4 / "
+                f"MI350-series): running device arch is {_dev_arch!r} and "
+                f"the extension was built for gpu_arch {_build_arch!r}. "
+                "Rebuild with scripts/amd/build_amd.sh on a gfx950 "
+                "machine; other AMD arches are not supported by this "
+                "backend.")
+
         # The strided-FMHA side-load is a CUDA-only .so (Thor ViT path);
         # the AMD ViT attention runs through the CDNA4 backend instead.
         super().__init__(
@@ -158,6 +179,7 @@ class GrootN17TorchFrontendAmd(_GrootN17FP8BackboneMixin,
         # import in the base is guarded by ``hasattr(self, "_fvk")`` /
         # ``hasattr(self, "_gemm")`` / ``hasattr(self, "_mlp_gemm")``.
         from flash_rt.amd import flash_rt_amd_kernels as fvk
+        # (gfx950 gate already ran at the top of __init__.)
         self._fvk = fvk
         self._gemm = fvk.GemmRunner()
         self._mlp_gemm = fvk.GemmRunner()
