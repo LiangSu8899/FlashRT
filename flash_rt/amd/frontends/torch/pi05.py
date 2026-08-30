@@ -566,6 +566,7 @@ class Pi05TorchFrontendAmd:
         # pure torch, but the resulting pointers would route the pipeline
         # through fp8_* fvk entries).
         self._fp8_weights: dict = {}
+        self._fp8_packed: dict = {}  # decoder weights in MFMA-packed layout
         self._fp8_store: list = []  # holds tensors alive
         if self.use_fp8 and not self._force_bf16:
             self._quantize_all_fp8()
@@ -719,6 +720,29 @@ class Pi05TorchFrontendAmd:
             quant(f"decoder_ffn_gate_up_w_{i}", gate_up)
             quant(f"decoder_ffn_down_w_{i}", W["decoder_ffn_down_w"][i])
 
+        # MFMA-packed copies of the decoder weights (nk layout only):
+        # repacked once here into the smallm_mfma_nt_packed per-lane
+        # consumption order (see csrc/amd/gemm/smallm_mfma.h) so the
+        # decoder small-M GEMMs stream weights as one linear slab per
+        # workgroup. The plain fp8 copy is kept for the hipBLASLt
+        # fallback and autotune.
+        if self.fp8_layout == "nk":
+            packed = self._fp8_packed
+            for name, (w_ptr, _) in list(fp8.items()):
+                if not name.startswith("decoder_"):
+                    continue
+                w_fp8 = next(t for t in store
+                             if t.data_ptr() == w_ptr and t.dim() == 2)
+                n_dim, k_dim = w_fp8.shape
+                if n_dim % 16 != 0 or k_dim % 1024 != 0:
+                    continue
+                wp = (w_fp8.view(torch.uint8)
+                      .view(n_dim // 16, 16, k_dim // 64, 2, 4, 8)
+                      .permute(0, 2, 4, 1, 3, 5).contiguous())
+                store.append(wp)
+                packed[name] = wp.data_ptr()
+            logger.info("MFMA-packed %d decoder GEMM weights", len(packed))
+
         logger.info("FP8 quantized %d GEMM weights (layout=%s)", len(fp8), self.fp8_layout)
 
     def _build_pipeline_weights(self) -> dict:
@@ -776,6 +800,7 @@ class Pi05TorchFrontendAmd:
 
             # FP8 quantized weights
             "fp8": self._fp8_weights,
+            "fp8_packed": self._fp8_packed,
             "fp8_layout": self.fp8_layout,
             "hardware": self.hardware,
 

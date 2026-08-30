@@ -202,6 +202,12 @@ class Pi05Pipeline:
         self.num_steps = int(num_steps)
         self.use_fp8 = bool(use_fp8)
         self.use_fp8_decoder = bool(use_fp8_decoder)
+        # Decoder small-M GEMM backend: "mfma" (default) routes the
+        # decoder GEMMs whose weights carry an MFMA-packed copy to
+        # smallm_mfma_nt_packed; "hipblaslt" keeps the library path.
+        # Read once here (env flips after capture never re-evaluate).
+        self.dec_gemm_backend = os.environ.get(
+            "FVK_AMD_DEC_GEMM", "mfma").strip().lower()
         self.vision_pool_factor = int(vision_pool_factor)
         self.vision_num_layers = int(vision_num_layers)
         if self.num_steps <= 0:
@@ -645,6 +651,20 @@ class Pi05Pipeline:
                         act_scale_ptr: int, stream: int) -> None:
         """FP8 GEMM with pre-quantized activation (from fused norm→FP8 kernel)."""
         w_fp8_ptr, w_scale_ptr = self._weight_fp8(weight_name)
+        # Measured routing (in-situ profiling, gfx950): the MFMA
+        # packed kernel wins in-situ on the K<=2048 and wide-N decoder
+        # shapes (qkv/o/gate_up ~4.7-5.0us vs hipblaslt ~6.1); the
+        # 64-workgroup K=4096 down-proj stays on hipblaslt (7.17 vs 6.2).
+        if (self.dec_gemm_backend == "mfma"
+                and M <= 16 and N % 16 == 0 and K % 1024 == 0
+                and (K <= 2048 or N >= 8192)):
+            packed = self.weights.get("fp8_packed", {})
+            wp_ptr = packed.get(weight_name)
+            if wp_ptr is not None:
+                self.fvk.smallm_mfma_nt_packed(
+                    act_fp8_ptr, wp_ptr, out_bf16_ptr,
+                    M, N, K, act_scale_ptr, w_scale_ptr, stream=stream)
+                return
         self._fp8_matmul(
             act_fp8_ptr, w_fp8_ptr, out_bf16_ptr,
             M, N, K, act_scale_ptr, w_scale_ptr, stream)

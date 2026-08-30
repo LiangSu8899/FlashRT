@@ -23,8 +23,10 @@
 #include "context.h"
 #include "gemm/hipblaslt_runner.h"
 #include "gemm/smallm_fp8.h"
+#include "gemm/smallm_mfma.h"
 #include "gemm/decoder_ffn_fused.h"
 #include "kernels/stream_probe.h"
+#include "kernels/ew_tune.h"
 
 namespace py = pybind11;
 
@@ -110,6 +112,14 @@ void gate_residual_ada_norm_fp8(__hip_bfloat16* residual, const __hip_bfloat16* 
                                 __hip_fp8_e4m3* out, __hip_bfloat16* gate_out,
                                 int seq_len, int dim, float eps,
                                 const float* d_scale, hipStream_t stream);
+void gate_residual_ada_norm_fp8_ksum(
+    __hip_bfloat16* residual, const float* partial, int splits,
+    const float* d_scale_a, const float* d_scale_b,
+    const __hip_bfloat16* gate, const __hip_bfloat16* weight,
+    const __hip_bfloat16* style,
+    __hip_fp8_e4m3* out, __hip_bfloat16* gate_out,
+    int seq_len, int dim, float eps,
+    const float* d_scale, hipStream_t stream);
 void quantize_fp8_static(const __hip_bfloat16* input, __hip_fp8_e4m3* output,
                          const float* d_scale, int n, hipStream_t stream);
 void quantize_fp8_device(const __hip_bfloat16* input, __hip_fp8_e4m3* output,
@@ -493,6 +503,63 @@ PYBIND11_MODULE(flash_rt_amd_kernels, m) {
         return variants;
     });
 
+    // ── Elementwise launch-geometry tuning probe (see kernels/ew_tune.h) ──
+    m.def("ew_tune_quant", [](int variant, uintptr_t in, uintptr_t out,
+                              uintptr_t d_scale, int n, uintptr_t stream) {
+        ew_tune_quant(variant, typed_ptr<__hip_bfloat16>(in),
+                      typed_ptr<__hip_fp8_e4m3>(out),
+                      reinterpret_cast<const float*>(d_scale), n, to_stream(stream));
+    }, py::arg("variant"), py::arg("in"), py::arg("out"),
+       py::arg("d_scale"), py::arg("n"), py::arg("stream") = 0);
+
+    m.def("ew_tune_norm", [](int variant, uintptr_t residual, uintptr_t x,
+                             uintptr_t gate, uintptr_t weight, uintptr_t style,
+                             uintptr_t out, uintptr_t gate_out,
+                             int seq_len, int dim, float eps,
+                             uintptr_t d_scale, uintptr_t stream) {
+        ew_tune_norm(variant, typed_ptr<__hip_bfloat16>(residual),
+                     typed_ptr<__hip_bfloat16>(x),
+                     typed_ptr<__hip_bfloat16>(gate),
+                     typed_ptr<__hip_bfloat16>(weight),
+                     typed_ptr<__hip_bfloat16>(style),
+                     typed_ptr<__hip_fp8_e4m3>(out),
+                     typed_ptr<__hip_bfloat16>(gate_out),
+                     seq_len, dim, eps,
+                     reinterpret_cast<const float*>(d_scale), to_stream(stream));
+    }, py::arg("variant"), py::arg("residual"), py::arg("x"), py::arg("gate"),
+       py::arg("weight"), py::arg("style"), py::arg("out"), py::arg("gate_out"),
+       py::arg("seq_len"), py::arg("dim"), py::arg("eps") = 1e-6f,
+       py::arg("d_scale") = 0, py::arg("stream") = 0);
+
+    m.def("ew_tune_rope", [](int variant, uintptr_t qkv, uintptr_t rope_weights,
+                             uintptr_t Q, uintptr_t K, uintptr_t V,
+                             int seq, int q_dim, int k_dim, int v_dim,
+                             int head_dim, uintptr_t stream) {
+        ew_tune_rope(variant, typed_ptr<__hip_bfloat16>(qkv),
+                     typed_ptr<__hip_bfloat16>(rope_weights),
+                     typed_ptr<__hip_bfloat16>(Q), typed_ptr<__hip_bfloat16>(K),
+                     typed_ptr<__hip_bfloat16>(V),
+                     seq, q_dim, k_dim, v_dim, head_dim, to_stream(stream));
+    }, py::arg("variant"), py::arg("qkv"), py::arg("rope_weights"),
+       py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("seq"),
+       py::arg("q_dim"), py::arg("k_dim"), py::arg("v_dim"),
+       py::arg("head_dim"), py::arg("stream") = 0);
+
+    m.def("ew_tune_variants", []() {
+        py::dict families;
+        py::list q, n, r;
+        for (int i = 0; i < ew_tune_quant_variant_count(); ++i)
+            q.append(ew_tune_quant_variant_name(i));
+        for (int i = 0; i < ew_tune_norm_variant_count(); ++i)
+            n.append(ew_tune_norm_variant_name(i));
+        for (int i = 0; i < ew_tune_rope_variant_count(); ++i)
+            r.append(ew_tune_rope_variant_name(i));
+        families["quant"] = q;
+        families["norm"] = n;
+        families["rope"] = r;
+        return families;
+    });
+
     // ── Patch embedding (FP16, matching the CUDA surface) ──
     m.def("patch_im2col", [](uintptr_t input, uintptr_t output, int nv, uintptr_t stream) {
         patch_im2col(typed_ptr<__half>(input),
@@ -513,6 +580,76 @@ PYBIND11_MODULE(flash_rt_amd_kernels, m) {
 
     // ── GEMM: hand-tuned small-M FP8 (weight-streaming) ──
 #include "gemm/bindings_smallm.inc"
+
+    // ── MFMA small-M FP8 GEMM (see gemm/smallm_mfma.h) ──
+    m.def("smallm_mfma_nt", [](int variant, uintptr_t A, uintptr_t W,
+                               uintptr_t D, int M, int N, int K,
+                               uintptr_t d_scale_a, uintptr_t d_scale_b,
+                               uintptr_t stream) {
+        smallm_mfma_nt(variant, to_ptr(A), to_ptr(W),
+                       typed_ptr<__hip_bfloat16>(D), M, N, K,
+                       reinterpret_cast<const float*>(d_scale_a),
+                       reinterpret_cast<const float*>(d_scale_b),
+                       to_stream(stream));
+    }, py::arg("variant"), py::arg("A"), py::arg("W"), py::arg("D"),
+       py::arg("M"), py::arg("N"), py::arg("K"),
+       py::arg("d_scale_a"), py::arg("d_scale_b"), py::arg("stream") = 0);
+
+    m.def("smallm_mfma_nt_partial", [](uintptr_t A, uintptr_t W, uintptr_t ws,
+                                       int M, int N, int K, int splits,
+                                       uintptr_t stream) {
+        smallm_mfma_nt_partial(to_ptr(A), to_ptr(W),
+                               reinterpret_cast<float*>(ws),
+                               M, N, K, splits, to_stream(stream));
+    }, py::arg("A"), py::arg("W"), py::arg("ws"),
+       py::arg("M"), py::arg("N"), py::arg("K"), py::arg("splits"),
+       py::arg("stream") = 0);
+
+    m.def("gate_residual_ada_norm_fp8_ksum",
+          [](uintptr_t residual, uintptr_t partial, int splits,
+             uintptr_t d_scale_a, uintptr_t d_scale_b,
+             uintptr_t gate, uintptr_t weight, uintptr_t style,
+             uintptr_t out, uintptr_t gate_out,
+             int seq_len, int dim, float eps,
+             uintptr_t d_scale, uintptr_t stream) {
+        gate_residual_ada_norm_fp8_ksum(
+            typed_ptr<__hip_bfloat16>(residual),
+            reinterpret_cast<const float*>(partial), splits,
+            reinterpret_cast<const float*>(d_scale_a),
+            reinterpret_cast<const float*>(d_scale_b),
+            typed_ptr<__hip_bfloat16>(gate),
+            typed_ptr<__hip_bfloat16>(weight),
+            typed_ptr<__hip_bfloat16>(style),
+            typed_ptr<__hip_fp8_e4m3>(out),
+            typed_ptr<__hip_bfloat16>(gate_out),
+            seq_len, dim, eps,
+            reinterpret_cast<const float*>(d_scale), to_stream(stream));
+    }, py::arg("residual"), py::arg("partial"), py::arg("splits"),
+       py::arg("d_scale_a"), py::arg("d_scale_b"),
+       py::arg("gate"), py::arg("weight"), py::arg("style"),
+       py::arg("out"), py::arg("gate_out"),
+       py::arg("seq_len"), py::arg("dim"), py::arg("eps") = 1e-6f,
+       py::arg("d_scale") = 0, py::arg("stream") = 0);
+
+    m.def("smallm_mfma_nt_packed", [](uintptr_t A, uintptr_t Wp, uintptr_t D,
+                                      int M, int N, int K,
+                                      uintptr_t d_scale_a, uintptr_t d_scale_b,
+                                      uintptr_t stream) {
+        smallm_mfma_nt_packed(to_ptr(A), to_ptr(Wp),
+                              typed_ptr<__hip_bfloat16>(D), M, N, K,
+                              reinterpret_cast<const float*>(d_scale_a),
+                              reinterpret_cast<const float*>(d_scale_b),
+                              to_stream(stream));
+    }, py::arg("A"), py::arg("Wp"), py::arg("D"),
+       py::arg("M"), py::arg("N"), py::arg("K"),
+       py::arg("d_scale_a"), py::arg("d_scale_b"), py::arg("stream") = 0);
+
+    m.def("smallm_mfma_variants", []() {
+        py::list v;
+        for (int i = 0; i < smallm_mfma_variant_count(); ++i)
+            v.append(smallm_mfma_variant_name(i));
+        return v;
+    });
 
     // ── GEMM: fused decoder-FFN pair (gate|up+geglu, down+gate*res) ──
 #include "gemm/bindings_ffn_fused.inc"

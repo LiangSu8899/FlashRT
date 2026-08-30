@@ -64,9 +64,11 @@ set(FLASHRT_AMD_SOURCES
   kernels/fusion.hip
   kernels/quantize_fp8.hip
   kernels/stream_probe.hip
+  kernels/ew_tune.hip
   attention/decoder_flash.hip
   gemm/hipblaslt_runner.hip
   gemm/smallm_fp8.hip
+  gemm/smallm_mfma.hip
   gemm/decoder_ffn_fused.hip
 )
 set_source_files_properties(${FLASHRT_AMD_SOURCES} PROPERTIES LANGUAGE HIP)

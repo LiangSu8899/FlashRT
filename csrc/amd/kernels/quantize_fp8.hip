@@ -91,9 +91,41 @@ void fp8_accumulate_scale_max(const float* src_scale, float* dst_scale,
     fp8_accumulate_scale_max_kernel<<<1, 1, 0, stream>>>(src_scale, dst_scale);
 }
 
+// ── Wide variant (CDNA retune): dwordx4 load (8 bf16), packed 8-byte
+// FP8 store. Same per-element math as quantize_fp8_kernel_generic —
+// bit-exact (verified by the ew_tune probe).
+struct alignas(16) qz_bf16x8 { __hip_bfloat162 p[4]; };
+struct alignas(8) qz_fp8x8 { unsigned char b[8]; };
+
+__global__ void quantize_fp8_kernel_wide8(const qz_bf16x8* __restrict__ in,
+                                          qz_fp8x8* __restrict__ out,
+                                          const float* __restrict__ scale,
+                                          int nchunks) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= nchunks) return;
+    qz_bf16x8 v = in[idx];
+    float inv_s = 1.0f / (*scale);
+    qz_fp8x8 o;
+    #pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        float v0 = __bfloat162float(v.p[k].x) * inv_s;
+        float v1 = __bfloat162float(v.p[k].y) * inv_s;
+        o.b[2*k]   = __hip_fp8_e4m3(fminf(fmaxf(v0, -448.0f), 448.0f)).__x;
+        o.b[2*k+1] = __hip_fp8_e4m3(fminf(fmaxf(v1, -448.0f), 448.0f)).__x;
+    }
+    out[idx] = o;
+}
+
 // Static FP8 quantize: uses pre-computed scale on device (no absmax, no reduction)
 void quantize_fp8_static(const __hip_bfloat16* input, __hip_fp8_e4m3* output,
                           const float* d_scale, int n, hipStream_t stream) {
+    if (n % 8 == 0 && ((uintptr_t)input & 15) == 0 && ((uintptr_t)output & 7) == 0) {
+        int nchunks = n >> 3;
+        quantize_fp8_kernel_wide8<<<(nchunks + 255) / 256, 256, 0, stream>>>(
+            reinterpret_cast<const qz_bf16x8*>(input),
+            reinterpret_cast<qz_fp8x8*>(output), d_scale, nchunks);
+        return;
+    }
     int n2 = n >> 1;
     int threads = 256;
     int blocks = (n2 + threads - 1) / threads;
