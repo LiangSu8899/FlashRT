@@ -21,7 +21,14 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-_hip = ctypes.CDLL("libamdhip64.so")
+try:
+    _hip = ctypes.CDLL("libamdhip64.so")
+except OSError as exc:  # no ROCm runtime on this machine
+    # Same contract as hip_buffer: report an unavailable optional
+    # backend as ImportError, not a platform-specific OSError.
+    raise ImportError(
+        "the AMD backend requires the ROCm runtime (libamdhip64.so), "
+        f"which could not be loaded: {exc}") from exc
 
 
 def _configure_signatures() -> None:
