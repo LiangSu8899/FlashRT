@@ -35,8 +35,12 @@ def main() -> None:
     ap.add_argument("--checkpoint", required=True,
                     help="Pi0.5 PyTorch checkpoint dir (model.safetensors)")
     ap.add_argument("--prompt", default="pick up the object")
-    ap.add_argument("--num-views", type=int, default=2)
+    ap.add_argument("--num-views", type=int, default=2, choices=[2, 3],
+                    help="camera views: 2 = base + wrist (LIBERO), "
+                         "3 = + right wrist")
     ap.add_argument("--iters", type=int, default=50)
+    ap.add_argument("--warmup", type=int, default=20,
+                    help="replays before the timed loop")
     ap.add_argument("--bf16", action="store_true",
                     help="disable FP8 (BF16 baseline)")
     ap.add_argument("--state-prompt-mode", default="exact",
@@ -58,16 +62,25 @@ def main() -> None:
     fe = model.pipeline   # Pi05TorchFrontendAmd
 
     rng = np.random.default_rng(0)
+    # Synthetic observation with one image per configured view, using the
+    # frontend's per-view key names (2 views: image + wrist_image;
+    # 3 views adds wrist_image_right).
+    view_keys = ("image", "wrist_image", "wrist_image_right")
     obs = {
-        "image": rng.integers(0, 255, (224, 224, 3), dtype=np.uint8),
-        "wrist_image": rng.integers(0, 255, (224, 224, 3), dtype=np.uint8),
+        key: rng.integers(0, 255, (224, 224, 3), dtype=np.uint8)
+        for key in view_keys[:args.num_views]
     }
     state = rng.standard_normal(8).astype(np.float32)
 
     fe.set_prompt(args.prompt, state=state)   # builds + captures the HIP graph
+    # Pi0.5 renders the robot state into the prompt, so the token count --
+    # and with it the encoder sequence length and the latency -- depends on
+    # both the prompt text and the state values.
+    print(f"prompt+state tokens: {fe.current_prompt_len}  "
+          f"encoder seq: {fe.pipeline.encoder_seq_len}")
     fe.calibrate(obs)                         # real-data FP8 calibration
-    for _ in range(5):
-        fe.infer(obs)                         # warmup replays
+    for _ in range(args.warmup):
+        fe.infer(obs)                     # warmup replays
 
     lat = []
     for _ in range(args.iters):

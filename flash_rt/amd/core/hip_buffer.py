@@ -99,7 +99,7 @@ class HipBuffer:
     def zeros(cls, count: int, dtype, managed: bool = True) -> 'HipBuffer':
         nbytes = count * np.dtype(dtype).itemsize
         buf = cls(nbytes, managed=managed)
-        _hip.hipMemset(buf._ptr, 0, nbytes)
+        _check(_hip.hipMemset(buf._ptr, 0, nbytes), "hipMemset")
         return buf
 
     @classmethod
@@ -127,7 +127,7 @@ class HipBuffer:
     def download(self, arr: np.ndarray):
         """Download buffer → numpy."""
         assert arr.nbytes <= self._nbytes
-        _hip.hipDeviceSynchronize()
+        _check(_hip.hipDeviceSynchronize(), "hipDeviceSynchronize")
         if self._managed:
             ctypes.memmove(arr.ctypes.data, self._ptr, arr.nbytes)
         else:
@@ -142,15 +142,20 @@ class HipBuffer:
 
     def zero_(self, stream=None):
         if stream is not None:
-            _hip.hipMemsetAsync(self._ptr, 0, self._nbytes, stream)
+            _check(_hip.hipMemsetAsync(self._ptr, 0, self._nbytes, stream),
+                   "hipMemsetAsync")
         else:
-            _hip.hipMemset(self._ptr, 0, self._nbytes)
+            _check(_hip.hipMemset(self._ptr, 0, self._nbytes), "hipMemset")
 
     def __del__(self):
         try:
             if _hip is not None and hasattr(self, '_ptr') and self._ptr.value:
-                _hip.hipFree(self._ptr)
+                ret = _hip.hipFree(self._ptr)
                 self._ptr = ctypes.c_void_p()
+                if ret != 0:
+                    # Raising in __del__ is unraisable; a failed free cannot
+                    # corrupt results, so log instead of _check here.
+                    logger.warning("hipFree failed with HIP error %d", ret)
         except Exception:
             pass
 
@@ -160,4 +165,4 @@ class HipBuffer:
 
 
 def sync():
-    _hip.hipDeviceSynchronize()
+    _check(_hip.hipDeviceSynchronize(), "hipDeviceSynchronize")
