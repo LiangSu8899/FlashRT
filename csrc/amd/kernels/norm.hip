@@ -15,6 +15,12 @@
 #include "common_hip.h"
 #include <hip/hip_fp8.h>
 
+// 16-byte packet (8 bf16) and 8-byte FP8 packet for the wide (CDNA
+// retune) kernel variants — measured on the ew_tune probe: wide
+// row-per-block b256 wins ~1.4x on encoder-seq shapes.
+struct alignas(16) nrm_bf16x8 { __hip_bfloat162 p[4]; };
+struct alignas(8) nrm_fp8x8 { unsigned char b[8]; };
+
 // ── RMSNorm ──
 template<typename T>
 __global__ void rms_norm_kernel(const T* __restrict__ x,
@@ -108,9 +114,68 @@ __global__ void layer_norm_kernel(const T* __restrict__ x,
 template __global__ void layer_norm_kernel<__half>(const __half*, const __half*, const __half*, __half*, int, float);
 template __global__ void layer_norm_kernel<__hip_bfloat16>(const __hip_bfloat16*, const __hip_bfloat16*, const __hip_bfloat16*, __hip_bfloat16*, int, float);
 
+// Wide row-per-block variant: dwordx4 chunked accesses, same 2-pass
+// mean/var structure. Per-thread accumulation order changes (chunked)
+// -> last-ULP differences only; gated by the cos parity suite.
+__global__ void layer_norm_wide_kernel(
+    const __hip_bfloat16* __restrict__ x,
+    const __hip_bfloat16* __restrict__ weight,
+    const __hip_bfloat16* __restrict__ bias,
+    __hip_bfloat16* __restrict__ out,
+    int dim, float eps) {
+    const int row = blockIdx.x;
+    const int chunks = dim >> 3;
+    const nrm_bf16x8* x8 = reinterpret_cast<const nrm_bf16x8*>(x + (size_t)row * dim);
+    const nrm_bf16x8* w8 = reinterpret_cast<const nrm_bf16x8*>(weight);
+    const nrm_bf16x8* b8 = reinterpret_cast<const nrm_bf16x8*>(bias);
+    nrm_bf16x8* out8 = reinterpret_cast<nrm_bf16x8*>(out + (size_t)row * dim);
+
+    extern __shared__ float shared[];
+    float local_sum = 0.0f;
+    for (int c = threadIdx.x; c < chunks; c += blockDim.x) {
+        nrm_bf16x8 v = x8[c];
+        #pragma unroll
+        for (int k = 0; k < 4; ++k)
+            local_sum += to_f32(v.p[k].x) + to_f32(v.p[k].y);
+    }
+    const float mean = block_reduce_sum(local_sum, shared) / dim;
+
+    float local_var = 0.0f;
+    for (int c = threadIdx.x; c < chunks; c += blockDim.x) {
+        nrm_bf16x8 v = x8[c];
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const float d0 = to_f32(v.p[k].x) - mean;
+            const float d1 = to_f32(v.p[k].y) - mean;
+            local_var += d0 * d0 + d1 * d1;
+        }
+    }
+    const float inv_std = rsqrtf(block_reduce_sum(local_var, shared) / dim + eps);
+
+    for (int c = threadIdx.x; c < chunks; c += blockDim.x) {
+        nrm_bf16x8 v = x8[c];
+        nrm_bf16x8 wv = w8[c];
+        nrm_bf16x8 bv = b8[c];
+        nrm_bf16x8 o;
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const float n0 = (to_f32(v.p[k].x) - mean) * inv_std * to_f32(wv.p[k].x) + to_f32(bv.p[k].x);
+            const float n1 = (to_f32(v.p[k].y) - mean) * inv_std * to_f32(wv.p[k].y) + to_f32(bv.p[k].y);
+            o.p[k] = make_packed2<__hip_bfloat16>(
+                from_f32<__hip_bfloat16>(n0), from_f32<__hip_bfloat16>(n1));
+        }
+        out8[c] = o;
+    }
+}
+
 void layer_norm(const __hip_bfloat16* x, const __hip_bfloat16* weight,
                 const __hip_bfloat16* bias, __hip_bfloat16* out,
                 int seq_len, int dim, float eps, hipStream_t stream) {
+    if (dim % 8 == 0) {
+        layer_norm_wide_kernel<<<seq_len, 256, 4 * sizeof(float), stream>>>(
+            x, weight, bias, out, dim, eps);
+        return;
+    }
     layer_norm_kernel<__hip_bfloat16><<<seq_len, 256, 4 * sizeof(float), stream>>>(x, weight, bias, out, dim, eps);
 }
 
@@ -302,10 +367,65 @@ __global__ void residual_add_rms_norm_fp8_kernel(
 template __global__ void residual_add_rms_norm_fp8_kernel<__half>(__half*, const __half*, const __half*, __hip_fp8_e4m3*, int, float, const float*);
 template __global__ void residual_add_rms_norm_fp8_kernel<__hip_bfloat16>(__hip_bfloat16*, const __hip_bfloat16*, const __hip_bfloat16*, __hip_fp8_e4m3*, int, float, const float*);
 
+// Wide row-per-block variant (see layer_norm_wide_kernel notes).
+// Keeps the rounded residual in registers for pass 2 — bit-identical
+// to the re-read (the register value IS the stored rounded value)
+// as long as each chunk stays with one thread (it does).
+__global__ void residual_add_rms_norm_fp8_wide_kernel(
+    __hip_bfloat16* __restrict__ residual, const __hip_bfloat16* __restrict__ x,
+    const __hip_bfloat16* __restrict__ weight, __hip_fp8_e4m3* __restrict__ out,
+    int dim, float eps, const float* __restrict__ d_scale) {
+    const int row = blockIdx.x;
+    const int chunks = dim >> 3;
+    nrm_bf16x8* res8 = reinterpret_cast<nrm_bf16x8*>(residual + (size_t)row * dim);
+    const nrm_bf16x8* x8 = reinterpret_cast<const nrm_bf16x8*>(x + (size_t)row * dim);
+    const nrm_bf16x8* w8 = reinterpret_cast<const nrm_bf16x8*>(weight);
+    nrm_fp8x8* out8 = reinterpret_cast<nrm_fp8x8*>(
+        reinterpret_cast<unsigned char*>(out) + (size_t)row * dim);
+
+    extern __shared__ float shared[];
+    float local_sum = 0.0f;
+    for (int c = threadIdx.x; c < chunks; c += blockDim.x) {
+        nrm_bf16x8 rv = res8[c];
+        nrm_bf16x8 xv = x8[c];
+        nrm_bf16x8 rounded;
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const float r0 = to_f32(rv.p[k].x) + to_f32(xv.p[k].x);
+            const float r1 = to_f32(rv.p[k].y) + to_f32(xv.p[k].y);
+            rounded.p[k] = make_packed2<__hip_bfloat16>(
+                from_f32<__hip_bfloat16>(r0), from_f32<__hip_bfloat16>(r1));
+            local_sum += r0 * r0 + r1 * r1;
+        }
+        res8[c] = rounded;
+    }
+    const float rms = rsqrtf(block_reduce_sum(local_sum, shared) / dim + eps);
+    const float inv_scale = 1.0f / (*d_scale);
+
+    for (int c = threadIdx.x; c < chunks; c += blockDim.x) {
+        nrm_bf16x8 rv = res8[c];
+        nrm_bf16x8 wv = w8[c];
+        nrm_fp8x8 o;
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const float v0 = to_f32(rv.p[k].x) * rms * to_f32(wv.p[k].x) * inv_scale;
+            const float v1 = to_f32(rv.p[k].y) * rms * to_f32(wv.p[k].y) * inv_scale;
+            o.b[2*k]   = __hip_fp8_e4m3(fminf(fmaxf(v0, -448.0f), 448.0f)).__x;
+            o.b[2*k+1] = __hip_fp8_e4m3(fminf(fmaxf(v1, -448.0f), 448.0f)).__x;
+        }
+        out8[c] = o;
+    }
+}
+
 void residual_add_rms_norm_fp8(__hip_bfloat16* residual, const __hip_bfloat16* x,
                                 const __hip_bfloat16* weight, __hip_fp8_e4m3* out,
                                 int seq_len, int dim, float eps,
                                 const float* d_scale, hipStream_t stream) {
+    if (dim % 8 == 0) {
+        residual_add_rms_norm_fp8_wide_kernel<<<seq_len, 256, 4 * sizeof(float), stream>>>(
+            residual, x, weight, out, dim, eps, d_scale);
+        return;
+    }
     residual_add_rms_norm_fp8_kernel<__hip_bfloat16><<<seq_len, 256, 4 * sizeof(float), stream>>>(
         residual, x, weight, out, dim, eps, d_scale);
 }

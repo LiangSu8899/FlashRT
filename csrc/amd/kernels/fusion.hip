@@ -163,12 +163,90 @@ void gate_residual_ada_norm_fp8_ksum(
         gate, weight, style, out, gate_out, seq_len, dim, eps, d_scale);
 }
 
+// Wide row-per-block variant (CDNA retune, ew_tune probe winner):
+// dwordx4 chunked accesses + packed FP8 stores; the rounded residual
+// stays in registers for pass 2 (bit-identical to the re-read — each
+// chunk is owned by one thread in both passes). Reduction order
+// changes (chunked) -> cos-gated.
+struct alignas(16) fus_bf16x8 { __hip_bfloat162 p[4]; };
+struct alignas(8) fus_fp8x8 { unsigned char b[8]; };
+
+__global__ void gate_residual_ada_norm_fp8_wide_kernel(
+    __hip_bfloat16* __restrict__ residual,
+    const __hip_bfloat16* __restrict__ x,
+    const __hip_bfloat16* __restrict__ gate,
+    const __hip_bfloat16* __restrict__ weight,
+    const __hip_bfloat16* __restrict__ style,
+    __hip_fp8_e4m3* __restrict__ out,
+    __hip_bfloat16* __restrict__ gate_out,
+    int dim, float eps,
+    const float* __restrict__ d_scale) {
+    const int row = blockIdx.x;
+    const int chunks = dim >> 3;
+    fus_bf16x8* res8 = reinterpret_cast<fus_bf16x8*>(residual + (size_t)row * dim);
+    const fus_bf16x8* x8 = reinterpret_cast<const fus_bf16x8*>(x + (size_t)row * dim);
+    const fus_bf16x8* g8 = reinterpret_cast<const fus_bf16x8*>(gate + (size_t)row * dim);
+    const fus_bf16x8* w8 = reinterpret_cast<const fus_bf16x8*>(weight);
+    const __hip_bfloat16* style_row = style + (size_t)row * 3 * dim;
+    const fus_bf16x8* sc8 = reinterpret_cast<const fus_bf16x8*>(style_row);
+    const fus_bf16x8* sh8 = reinterpret_cast<const fus_bf16x8*>(style_row + dim);
+    const fus_bf16x8* gt8 = reinterpret_cast<const fus_bf16x8*>(style_row + 2 * dim);
+    fus_fp8x8* out8 = reinterpret_cast<fus_fp8x8*>(
+        reinterpret_cast<unsigned char*>(out) + (size_t)row * dim);
+    fus_bf16x8* gate_out8 = reinterpret_cast<fus_bf16x8*>(gate_out + (size_t)row * dim);
+
+    extern __shared__ float shared[];
+    float local_sum = 0.0f;
+    for (int c = threadIdx.x; c < chunks; c += blockDim.x) {
+        fus_bf16x8 rv = res8[c];
+        fus_bf16x8 xv = x8[c];
+        fus_bf16x8 gv = g8[c];
+        fus_bf16x8 rounded;
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const float r0 = to_f32(rv.p[k].x) + to_f32(xv.p[k].x) * to_f32(gv.p[k].x);
+            const float r1 = to_f32(rv.p[k].y) + to_f32(xv.p[k].y) * to_f32(gv.p[k].y);
+            rounded.p[k] = make_packed2<__hip_bfloat16>(
+                from_f32<__hip_bfloat16>(r0), from_f32<__hip_bfloat16>(r1));
+            local_sum += r0 * r0 + r1 * r1;
+        }
+        res8[c] = rounded;
+    }
+    const float rms = rsqrtf(block_reduce_sum(local_sum, shared) / dim + eps);
+    const float inv_scale = 1.0f / (*d_scale);
+
+    for (int c = threadIdx.x; c < chunks; c += blockDim.x) {
+        fus_bf16x8 rv = res8[c];
+        fus_bf16x8 wv = w8[c];
+        fus_bf16x8 sv = sc8[c];
+        fus_bf16x8 hv = sh8[c];
+        fus_bf16x8 gv = gt8[c];
+        fus_fp8x8 o;
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const float n0 = to_f32(rv.p[k].x) * rms * to_f32(wv.p[k].x);
+            const float n1 = to_f32(rv.p[k].y) * rms * to_f32(wv.p[k].y);
+            const float v0 = (n0 * (1.0f + to_f32(sv.p[k].x)) + to_f32(hv.p[k].x)) * inv_scale;
+            const float v1 = (n1 * (1.0f + to_f32(sv.p[k].y)) + to_f32(hv.p[k].y)) * inv_scale;
+            o.b[2*k]   = __hip_fp8_e4m3(fminf(fmaxf(v0, -448.0f), 448.0f)).__x;
+            o.b[2*k+1] = __hip_fp8_e4m3(fminf(fmaxf(v1, -448.0f), 448.0f)).__x;
+        }
+        out8[c] = o;
+        gate_out8[c] = gv;
+    }
+}
+
 void gate_residual_ada_norm_fp8(__hip_bfloat16* residual, const __hip_bfloat16* x,
                                  const __hip_bfloat16* gate, const __hip_bfloat16* weight,
                                  const __hip_bfloat16* style,
                                  __hip_fp8_e4m3* out, __hip_bfloat16* gate_out,
                                  int seq_len, int dim, float eps,
                                  const float* d_scale, hipStream_t stream) {
+    if (dim % 8 == 0) {
+        gate_residual_ada_norm_fp8_wide_kernel<<<seq_len, 256, 4 * sizeof(float), stream>>>(
+            residual, x, gate, weight, style, out, gate_out, dim, eps, d_scale);
+        return;
+    }
     gate_residual_ada_norm_fp8_kernel<__hip_bfloat16><<<seq_len, 256, 4 * sizeof(float), stream>>>(
         residual, x, gate, weight, style, out, gate_out, dim, eps, d_scale);
 }

@@ -59,9 +59,45 @@ __global__ void bias_res_kernel(T* __restrict__ residual,
 template __global__ void bias_res_kernel<__half>(__half*, const __half*, const __half*, int);
 template __global__ void bias_res_kernel<__hip_bfloat16>(__hip_bfloat16*, const __hip_bfloat16*, const __hip_bfloat16*, int);
 
+// Wide 2D variant (CDNA retune): dwordx4 accesses, one 8-element
+// chunk per thread, blockIdx.y = row. Same per-element math —
+// bit-exact vs the row-per-block loop.
+struct alignas(16) ewi_bf16x8 { __hip_bfloat162 p[4]; };
+
+__global__ void bias_res_wide_kernel(__hip_bfloat16* __restrict__ residual,
+                                     const __hip_bfloat16* __restrict__ x,
+                                     const __hip_bfloat16* __restrict__ bias,
+                                     int dim) {
+    const int row = blockIdx.y;
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    const int chunks = dim >> 3;
+    if (c >= chunks) return;
+    ewi_bf16x8* res8 = reinterpret_cast<ewi_bf16x8*>(residual + (size_t)row * dim);
+    const ewi_bf16x8* x8 = reinterpret_cast<const ewi_bf16x8*>(x + (size_t)row * dim);
+    const ewi_bf16x8* b8 = reinterpret_cast<const ewi_bf16x8*>(bias);
+    ewi_bf16x8 rv = res8[c];
+    ewi_bf16x8 xv = x8[c];
+    ewi_bf16x8 bv = b8[c];
+    ewi_bf16x8 o;
+    #pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        float r0 = to_f32(rv.p[k].x) + to_f32(xv.p[k].x) + to_f32(bv.p[k].x);
+        float r1 = to_f32(rv.p[k].y) + to_f32(xv.p[k].y) + to_f32(bv.p[k].y);
+        o.p[k] = make_packed2<__hip_bfloat16>(
+            from_f32<__hip_bfloat16>(r0), from_f32<__hip_bfloat16>(r1));
+    }
+    res8[c] = o;
+}
+
 void bias_residual(__hip_bfloat16* residual, const __hip_bfloat16* x,
                    const __hip_bfloat16* bias, int seq_len, int dim,
                    hipStream_t stream) {
+    if (dim % 8 == 0) {
+        int chunks = dim >> 3;
+        dim3 grid((chunks + 255) / 256, seq_len);
+        bias_res_wide_kernel<<<grid, 256, 0, stream>>>(residual, x, bias, dim);
+        return;
+    }
     bias_res_kernel<__hip_bfloat16><<<seq_len, 256, 0, stream>>>(residual, x, bias, dim);
 }
 
