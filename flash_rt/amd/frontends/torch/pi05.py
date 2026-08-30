@@ -1226,6 +1226,41 @@ class Pi05TorchFrontendAmd:
         }
 
     # -----------------------------------------------------------------
+    # Not-yet-ported RTX extensions (explicit failure, no silent fallback)
+    # -----------------------------------------------------------------
+    # The single-stream production surface (set_prompt / calibrate /
+    # infer, both state_prompt_mode graphs, FP8 + BF16) is aligned with
+    # Pi05TorchFrontendRtx. The RL-conditioned and CFG-batched modes
+    # below are RTX-only so far; they raise instead of degrading.
+
+    _NOT_PORTED = (
+        "is not ported to the AMD backend yet — supported surface: "
+        "set_prompt / warm_state_prompt_buckets / calibrate / "
+        "calibrate_with_real_data / infer / precision_spec / "
+        "get_latency_stats (state_prompt_mode 'exact' and 'fixed'). "
+        "See docs/deployment_amd.md for the support matrix.")
+
+    def set_rl_mode(self, *args, **kwargs) -> None:
+        raise NotImplementedError(
+            f"Pi05TorchFrontendAmd.set_rl_mode {self._NOT_PORTED}")
+
+    def set_batched_mode(self, *args, **kwargs) -> None:
+        raise NotImplementedError(
+            f"Pi05TorchFrontendAmd.set_batched_mode {self._NOT_PORTED}")
+
+    def set_prompt_batch(self, *args, **kwargs) -> None:
+        raise NotImplementedError(
+            f"Pi05TorchFrontendAmd.set_prompt_batch {self._NOT_PORTED}")
+
+    def calibrate_batch(self, *args, **kwargs) -> None:
+        raise NotImplementedError(
+            f"Pi05TorchFrontendAmd.calibrate_batch {self._NOT_PORTED}")
+
+    def infer_batch(self, *args, **kwargs) -> list:
+        raise NotImplementedError(
+            f"Pi05TorchFrontendAmd.infer_batch {self._NOT_PORTED}")
+
+    # -----------------------------------------------------------------
     # Internals
     # -----------------------------------------------------------------
 
