@@ -67,6 +67,7 @@ set(FLASHRT_AMD_SOURCES
   kernels/ew_tune.hip
   attention/decoder_flash.hip
   attention/attn_probe.hip
+  attention/encoder_flash.hip
   gemm/hipblaslt_runner.hip
   gemm/smallm_fp8.hip
   gemm/smallm_mfma.hip

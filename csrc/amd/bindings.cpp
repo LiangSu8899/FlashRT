@@ -503,6 +503,22 @@ PYBIND11_MODULE(flash_rt_amd_kernels, m) {
         return variants;
     });
 
+    // ── Encoder MFMA flash attention (see attention/encoder_flash.hip) ──
+    m.def("encoder_attention_flash", [](uintptr_t Q, uintptr_t K, uintptr_t V,
+                                        uintptr_t O, int S, int Hq, int D,
+                                        float scale, uintptr_t stream, int mask) {
+        extern void encoder_attention_flash(const __hip_bfloat16*, const __hip_bfloat16*,
+                                            const __hip_bfloat16*, __hip_bfloat16*,
+                                            int, int, int, float, hipStream_t, int);
+        encoder_attention_flash(typed_ptr<__hip_bfloat16>(Q),
+                                typed_ptr<__hip_bfloat16>(K),
+                                typed_ptr<__hip_bfloat16>(V),
+                                typed_ptr<__hip_bfloat16>(O),
+                                S, Hq, D, scale, to_stream(stream), mask);
+    }, py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("O"),
+       py::arg("S"), py::arg("Hq"), py::arg("D"),
+       py::arg("scale") = 0.0625f, py::arg("stream") = 0, py::arg("mask") = 31);
+
     // ── Decoder-attention phase-ablation probe (see attention/attn_probe.hip) ──
     m.def("attn_partial_probe", [](uintptr_t Q, uintptr_t K, uintptr_t V,
                                    uintptr_t ws, int Sq, int Skv, int Hq,
