@@ -63,6 +63,9 @@ set(FLASHRT_AMD_SOURCES
   kernels/patch_embed.hip
   kernels/fusion.hip
   kernels/quantize_fp8.hip
+  kernels/elementwise_fp16.hip
+  kernels/norm_fp16.hip
+  kernels/adaln_layer_norm.hip
   kernels/stream_probe.hip
   kernels/ew_tune.hip
   attention/decoder_flash.hip

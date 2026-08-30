@@ -27,6 +27,7 @@
 #include "gemm/decoder_ffn_fused.h"
 #include "kernels/stream_probe.h"
 #include "kernels/ew_tune.h"
+#include "kernels/fp16_ops.h"
 
 namespace py = pybind11;
 
@@ -690,4 +691,8 @@ PYBIND11_MODULE(flash_rt_amd_kernels, m) {
 
     // ── GEMM: fused decoder-FFN pair (gate|up+geglu, down+gate*res) ──
 #include "gemm/bindings_ffn_fused.inc"
+
+    // ── FP16 backbone port: elementwise/norm/rope/quantize + AdaLN
+    //    (see kernels/{elementwise_fp16,norm_fp16,adaln_layer_norm}.hip) ──
+#include "kernels/bindings_fp16_port.inc"
 }
