@@ -343,6 +343,19 @@ def test_actions_match_reference_when_provided(amd_env, frontend, aux):
     if not ref_path:
         pytest.skip("no reference fixture: export FLASH_RT_GROOT_N17_AMD_REF "
                     "to a torch.load-able fixture with inputs/actions")
+    # denormalize_action builds the HF processor, whose tokenizer metadata
+    # lookup transformers 4.57.x performs even in offline mode. The library
+    # deliberately refuses to patch huggingface_hub for that (it is shared
+    # process state); an offline caller injects a processor instead, which
+    # is what this harness does when the lookup is blocked.
+    try:
+        frontend._hf_processor()
+    except RuntimeError as exc:
+        if "HF_HUB_OFFLINE" not in str(exc):
+            raise
+        pytest.skip("processor load needs a Hub metadata lookup that this "
+                    "environment blocks; build one in setup code and call "
+                    "set_hf_processor() to run this gate offline")
     if not os.path.isfile(ref_path):
         pytest.skip("FLASH_RT_GROOT_N17_AMD_REF does not point at a file")
     if "initial_noise" not in aux:

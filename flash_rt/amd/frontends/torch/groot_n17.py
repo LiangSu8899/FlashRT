@@ -59,7 +59,6 @@ The FP8 / FP4 DiT quantization tiers of the base are NOT ported;
 
 from __future__ import annotations
 
-import contextlib
 import os
 
 import torch
@@ -84,47 +83,6 @@ def _fused_epilogue_enabled() -> bool:
     """
     return os.environ.get("FVK_AMD_FUSED_EPILOGUE", "1").strip().lower() \
         not in ("0", "off", "false", "no")
-
-
-@contextlib.contextmanager
-def _offline_tolerant_model_info():
-    """Scope a workaround for a transformers offline-mode bug.
-
-    Tokenizer loading in transformers 4.57.x calls
-    ``huggingface_hub.model_info`` without catching
-    ``OfflineModeIsEnabled``, so ``HF_HUB_OFFLINE=1`` breaks
-    ``AutoProcessor.from_pretrained`` even when every file is already in
-    the local cache. The caller only reads ``.tags``, so within this
-    context an offline lookup degrades to a ``tags=None`` stub.
-
-    The substitution is installed for the duration of one processor load
-    and restored in ``finally`` — it never outlives the call, so other
-    code in the process keeps the real ``model_info`` (and keeps seeing
-    genuine offline errors). Any exception other than
-    ``OfflineModeIsEnabled`` still propagates.
-    """
-    try:
-        import huggingface_hub as hh
-        from huggingface_hub.errors import OfflineModeIsEnabled
-    except ImportError:
-        yield
-        return
-
-    original = hh.model_info
-
-    def _tolerant(*args, **kwargs):
-        try:
-            return original(*args, **kwargs)
-        except OfflineModeIsEnabled:
-            class _Stub:
-                tags = None
-            return _Stub()
-
-    hh.model_info = _tolerant
-    try:
-        yield
-    finally:
-        hh.model_info = original
 
 
 class GrootN17TorchFrontendAmd(_GrootN17FP8BackboneMixin,
@@ -210,19 +168,51 @@ class GrootN17TorchFrontendAmd(_GrootN17FP8BackboneMixin,
     # Attention backend (single instance, all 5 sites)
     # ────────────────────────────────────────────────────────────────
 
-    def _hf_processor(self):
-        """Build the HF processor with the offline lookup scoped.
+    def set_hf_processor(self, processor) -> None:
+        """Supply the HF processor instead of letting it be loaded.
 
-        Identical to the base implementation apart from the surrounding
-        context manager, which contains the transformers offline-mode
-        workaround to this one call (see
-        :func:`_offline_tolerant_model_info`) instead of mutating
-        ``huggingface_hub`` for the whole process.
+        ``denormalize_action`` needs the processor for the
+        relative-to-absolute action decode. It is normally built on
+        demand from the checkpoint, which reaches the Hub for the
+        tokenizer's metadata. Callers that must avoid that lookup —
+        offline deployments, or environments hitting the transformers
+        4.57.x bug described in :meth:`_hf_processor` — can build the
+        processor themselves and inject it here before inference.
+        """
+        self._hf_proc_cached = processor
+
+    def _hf_processor(self):
+        """Build the HF processor, with an actionable offline error.
+
+        Loading the processor resolves its tokenizer by Hub repository
+        id, and transformers 4.57.x looks that repository's metadata up
+        through ``huggingface_hub.model_info`` without catching
+        ``OfflineModeIsEnabled``. With ``HF_HUB_OFFLINE=1`` the load then
+        fails even when every file is already cached locally.
+
+        The library does not work around this: the only interception
+        point is ``huggingface_hub``'s module-level function, and
+        swapping that out — even temporarily — mutates state shared with
+        every other thread in the process. Instead the failure is
+        reported with the two remedies that do not.
         """
         if hasattr(self, "_hf_proc_cached"):
             return self._hf_proc_cached
-        with _offline_tolerant_model_info():
+        try:
             return super()._hf_processor()
+        except Exception as exc:
+            if type(exc).__name__ != "OfflineModeIsEnabled":
+                raise
+            raise RuntimeError(
+                "loading the GROOT processor requires a Hub metadata "
+                "lookup that offline mode blocks. This is a transformers "
+                "4.57.x issue (the tokenizer loader calls "
+                "huggingface_hub.model_info without handling offline "
+                "mode), not a missing file. Either allow that one "
+                "lookup by clearing HF_HUB_OFFLINE for the load, or "
+                "build the processor in your own setup code and pass it "
+                "to set_hf_processor() before inference."
+            ) from exc
 
     def _dit_kv_split(self) -> tuple:
         """(num_text_tokens, num_image_tokens) from the prompt's mask."""
