@@ -14,7 +14,10 @@ GPU_ARCH="${1:-gfx950}"
 # building for anything else produces a module that can never pass the
 # frontend's device gate. Set FLASHRT_AMD_ALLOW_ARCH=1 to bypass this
 # check when bringing up a port to a future arch.
-if [[ ! "${GPU_ARCH}" =~ ^gfx950 && "${FLASHRT_AMD_ALLOW_ARCH:-0}" != "1" ]]; then
+# Compare the base target only ("gfx950" from "gfx950:xnack-"); a
+# prefix match would also accept a future "gfx9500".
+GPU_ARCH_BASE="${GPU_ARCH%%:*}"
+if [[ "${GPU_ARCH_BASE}" != "gfx950" && "${FLASHRT_AMD_ALLOW_ARCH:-0}" != "1" ]]; then
   echo "error: GPU_ARCH='${GPU_ARCH}' is not gfx950 — this backend is gfx950-only." >&2
   echo "       Pass gfx950, or set FLASHRT_AMD_ALLOW_ARCH=1 to override for a port." >&2
   exit 1
