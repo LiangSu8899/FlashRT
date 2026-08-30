@@ -25,6 +25,9 @@
 //     bf16_nn, bf16_nn_bias, bf16_nn_bias_gelu, fp8_nn_dev,
 //     fp8_nt_dev, autotune_bf16_nn, autotune_fp8_nn_dev,
 //     autotune_fp8_nt_dev.
+//   - AMD-only additions (no CUDA counterpart): mxfp4_nt_dev and
+//     autotune_mxfp4_nt_dev (gfx950 native MXFP4 a4w4 via hipBLASLt
+//     VEC32_UE8M0 block scales).
 //   - bf16_run exists on the CUDA C++ class but is not exposed by the
 //     CUDA bindings; it is exposed here (same name/signature as the
 //     C++ method) because the AMD line needs a Python-reachable
@@ -92,6 +95,18 @@
         }, py::arg("A"), py::arg("B"), py::arg("D"),
            py::arg("M"), py::arg("N"), py::arg("K"),
            py::arg("d_scale_a"), py::arg("d_scale_b"), py::arg("stream") = 0)
+        // MXFP4 a4w4 (E2M1 packed 2-per-byte + per-1x32-block ue8m0 uint8
+        // scale tensors; see hipblaslt_runner.h for the exact layouts)
+        .def("mxfp4_nt_dev", [](GemmRunner& self,
+                                 uintptr_t A, uintptr_t A_scales,
+                                 uintptr_t B, uintptr_t B_scales, uintptr_t D,
+                                 int M, int N, int K, uintptr_t stream) {
+            self.mxfp4_nt_dev(to_ptr(A), to_ptr(A_scales),
+                               to_ptr(B), to_ptr(B_scales), to_ptr(D),
+                               M, N, K, to_stream(stream));
+        }, py::arg("A"), py::arg("A_scales"),
+           py::arg("B"), py::arg("B_scales"), py::arg("D"),
+           py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0)
         // Autotune
         .def("autotune_bf16_nn", [](GemmRunner& self,
                                      uintptr_t A, uintptr_t B, uintptr_t D,
@@ -121,4 +136,14 @@
         }, py::arg("A"), py::arg("B"), py::arg("D"),
            py::arg("M"), py::arg("N"), py::arg("K"),
            py::arg("d_scale_a"), py::arg("d_scale_b"), py::arg("num_algos") = 16)
+        .def("autotune_mxfp4_nt_dev", [](GemmRunner& self,
+                                          uintptr_t A, uintptr_t A_scales,
+                                          uintptr_t B, uintptr_t B_scales, uintptr_t D,
+                                          int M, int N, int K, int num_algos) {
+            self.autotune_mxfp4_nt_dev(to_ptr(A), to_ptr(A_scales),
+                                        to_ptr(B), to_ptr(B_scales), to_ptr(D),
+                                        M, N, K, num_algos);
+        }, py::arg("A"), py::arg("A_scales"),
+           py::arg("B"), py::arg("B_scales"), py::arg("D"),
+           py::arg("M"), py::arg("N"), py::arg("K"), py::arg("num_algos") = 16)
     ;

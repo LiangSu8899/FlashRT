@@ -99,6 +99,30 @@ GemmRunner::CachedGemm& GemmRunner::get_or_create_cached(GemmType type, int M, i
         HIPBLASLT_CHECK(hipblasLtMatrixLayoutCreate(&entry.op0_desc, HIP_R_8F_E4M3, K, N, K));
         HIPBLASLT_CHECK(hipblasLtMatrixLayoutCreate(&entry.op1_desc, HIP_R_8F_E4M3, K, M, K));
         HIPBLASLT_CHECK(hipblasLtMatrixLayoutCreate(&entry.D_desc, HIP_R_16BF, N, M, N));
+    } else if (type == MXFP4_NT_DEV) {
+        // MXFP4 a4w4: same NT col-major swap as FP8_NT_DEV, which lands on
+        // library-TN (TRANSA=T, TRANSB=N) — the canonical (and, per the
+        // hipBLASLt MX samples, only exercised) layout for fp4 GEMM.
+        // Element type HIP_R_4F_E2M1_EXT (hipblaslt-types.h): rows/cols/ld
+        // stay in ELEMENTS; the 2-per-byte packing along the innermost
+        // (stride-1) dimension is implied by the datatype.
+        // K % 32 == 0 enforced by the public entry points.
+        hipDataType fp4_type = static_cast<hipDataType>(HIP_R_4F_E2M1_EXT);
+        HIPBLASLT_CHECK(hipblasLtMatmulDescCreate(&entry.matmul_desc, HIPBLAS_COMPUTE_32F, HIP_R_32F));
+        HIPBLASLT_CHECK(hipblasLtMatmulDescSetAttribute(entry.matmul_desc, HIPBLASLT_MATMUL_DESC_TRANSA, &op_T, sizeof(op_T)));
+        HIPBLASLT_CHECK(hipblasLtMatmulDescSetAttribute(entry.matmul_desc, HIPBLASLT_MATMUL_DESC_TRANSB, &op_N, sizeof(op_N)));
+        // Block-scale mode MUST be on the descriptor before the heuristic
+        // query so hipBLASLt only proposes MX-capable solutions. VEC32_UE8M0
+        // = one uint8 e8m0 scale per 32-element block in the innermost
+        // dimension of the corresponding data tensor (hipblaslt.h:172).
+        // Both operands' innermost dim here is K (see layout note below),
+        // matching the per-1x32-along-K quantization.
+        hipblasLtMatmulMatrixScale_t scale_mode = HIPBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0;
+        HIPBLASLT_CHECK(hipblasLtMatmulDescSetAttribute(entry.matmul_desc, HIPBLASLT_MATMUL_DESC_A_SCALE_MODE, &scale_mode, sizeof(scale_mode)));
+        HIPBLASLT_CHECK(hipblasLtMatmulDescSetAttribute(entry.matmul_desc, HIPBLASLT_MATMUL_DESC_B_SCALE_MODE, &scale_mode, sizeof(scale_mode)));
+        HIPBLASLT_CHECK(hipblasLtMatrixLayoutCreate(&entry.op0_desc, fp4_type, K, N, K));
+        HIPBLASLT_CHECK(hipblasLtMatrixLayoutCreate(&entry.op1_desc, fp4_type, K, M, K));
+        HIPBLASLT_CHECK(hipblasLtMatrixLayoutCreate(&entry.D_desc, HIP_R_16BF, N, M, N));
     } else {
         // BF16_NN
         HIPBLASLT_CHECK(hipblasLtMatmulDescCreate(&entry.matmul_desc, HIPBLAS_COMPUTE_32F, HIP_R_32F));
@@ -236,6 +260,25 @@ void GemmRunner::autotune_fp8_nt_dev(void* A, void* B, void* D,
                                       int num_algos) {
     auto& entry = get_or_create_cached(FP8_NT_DEV, M, N, K);
     autotune_cached(entry, B, A, D, 1.0f, 0.0f, num_algos, d_scale_b, d_scale_a);
+}
+
+void GemmRunner::autotune_mxfp4_nt_dev(void* A, void* A_scales,
+                                        void* B, void* B_scales, void* D,
+                                        int M, int N, int K,
+                                        int num_algos) {
+    if (K % 32 != 0) {
+        throw std::runtime_error("mxfp4_nt_dev: K must be a multiple of 32 (MX block size)");
+    }
+    auto& entry = get_or_create_cached(MXFP4_NT_DEV, M, N, K);
+    // Operand swap: library A = FlashRT B (gets B_scales), library B =
+    // FlashRT A (gets A_scales). autotune_cached only forwards the scale
+    // pointers into the A/B_SCALE_POINTER attributes (opaque void* writes),
+    // so the uint8 ue8m0 tensors ride through its float* parameters
+    // unchanged — the SCALE_MODE already on the descriptor tells hipBLASLt
+    // how to interpret them.
+    autotune_cached(entry, B, A, D, 1.0f, 0.0f, num_algos,
+                    reinterpret_cast<float*>(B_scales),
+                    reinterpret_cast<float*>(A_scales));
 }
 
 // ================================================================
@@ -469,6 +512,57 @@ void GemmRunner::fp8_nt_dev(void* A, void* B, void* D,
         HIPBLASLT_MATMUL_DESC_A_SCALE_POINTER, &d_scale_b, sizeof(d_scale_b)));
     HIPBLASLT_CHECK(hipblasLtMatmulDescSetAttribute(entry.matmul_desc,
         HIPBLASLT_MATMUL_DESC_B_SCALE_POINTER, &d_scale_a, sizeof(d_scale_a)));
+
+    float alpha = 1.0f, beta = 0.0f;
+    HIPBLASLT_CHECK(hipblasLtMatmul(handle_, entry.matmul_desc,
+        &alpha, B, entry.op0_desc, A, entry.op1_desc,
+        &beta, D, entry.D_desc, D, entry.D_desc,
+        &entry.algo, workspace_, workspace_size_, stream));
+}
+
+// ================================================================
+//  MXFP4 a4w4 transpose-B path: D_bf16 = A_fp4(M,K) @ B_fp4(N,K)^T
+//  (OCP MX: E2M1 elements + per-1x32-block UE8M0 scales, gfx950)
+//
+//  How the col-major swap maps the SCALE tensors:
+//    op0 (library "A") = FlashRT B, stored (N, K) row-major = B_col(K, N)
+//        ld=K, TRANSA=T. Its innermost (stride-1) dim is K, so
+//        VEC32_UE8M0 wants one e8m0 byte per 32 elements along K —
+//        i.e. a scale tensor shaped col-major (K/32, N). That is
+//        byte-identical to the row-major (N, K/32) tensor produced by
+//        quantizing B per 1x32 blocks along K. Zero reshuffling.
+//    op1 (library "B") = FlashRT A, stored (M, K) row-major = A_col(K, M)
+//        ld=K, TRANSB=N. Innermost dim is again K → scale tensor
+//        col-major (K/32, M) == row-major (M, K/32). Zero reshuffling.
+//  So under the swap: library A_SCALE_POINTER ← FlashRT B_scales and
+//  library B_SCALE_POINTER ← FlashRT A_scales, exactly mirroring the
+//  data-operand swap. Dequant semantics: value = e2m1 * 2^(byte - 127),
+//  applied by hipBLASLt inside the FP32 accumulation.
+//
+//  Packing: HIP_R_4F_E2M1_EXT layouts keep rows/cols/ld in ELEMENTS;
+//  two elements share a byte along the innermost dim (element 2i in the
+//  low nibble, 2i+1 in the high nibble — hip_fp4 convention). K % 32
+//  == 0 covers both the packing and the block-scale granularity.
+//
+//  Layout support note: this NT entry point lands on library-TN, the
+//  canonical fp4 layout in the hipBLASLt MX samples. If a future need
+//  arises for other trans combos, probe support with the heuristic
+//  query first — TN is the only one exercised here.
+// ================================================================
+void GemmRunner::mxfp4_nt_dev(void* A, void* A_scales,
+                               void* B, void* B_scales, void* D,
+                               int M, int N, int K,
+                               hipStream_t stream) {
+    if (K % 32 != 0) {
+        throw std::runtime_error("mxfp4_nt_dev: K must be a multiple of 32 (MX block size)");
+    }
+    auto& entry = get_or_create_cached(MXFP4_NT_DEV, M, N, K);
+    // Update scale-tensor pointers per call (different layers, different
+    // scale buffers). Operand swap: library A = FlashRT B → B_scales.
+    HIPBLASLT_CHECK(hipblasLtMatmulDescSetAttribute(entry.matmul_desc,
+        HIPBLASLT_MATMUL_DESC_A_SCALE_POINTER, &B_scales, sizeof(B_scales)));
+    HIPBLASLT_CHECK(hipblasLtMatmulDescSetAttribute(entry.matmul_desc,
+        HIPBLASLT_MATMUL_DESC_B_SCALE_POINTER, &A_scales, sizeof(A_scales)));
 
     float alpha = 1.0f, beta = 0.0f;
     HIPBLASLT_CHECK(hipblasLtMatmul(handle_, entry.matmul_desc,

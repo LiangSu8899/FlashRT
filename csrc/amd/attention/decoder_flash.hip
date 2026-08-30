@@ -111,7 +111,13 @@
 //     with the standard flash rescale and emits bf16 O. v2 change:
 //     the per-split m/l loads run on a full wave (lane i <-> split i)
 //     with fixed radix-2 shuffle trees, instead of v1's thread-0
-//     serial loop; the acc combine stays one thread per output dim.
+//     serial loop; the acc combine stays one thread per output dim,
+//     with the NSPLIT split loads batched 4-wide (ILP4) ahead of the
+//     ascending-split accumulate (sum order unchanged — see the
+//     in-kernel comment). Env FRT_ATTN_REDUCE_ALT=1 swaps in a
+//     512-thread alternate (2 (q,h) pairs per WG, grid halved to
+//     ceil(Sq*Hq/2)) with bit-identical outputs — read per call on
+//     the host, frozen into a graph at capture time.
 //     Optional fused FP8 epilogue (same contract as the v3 fused
 //     kernel's): when O_fp8 != nullptr, after the bf16 O store each
 //     thread re-expands its ROUNDED bf16 value, multiplies by
@@ -445,15 +451,35 @@ void attention_decoder_gqa_reduce_kernel(
     __syncthreads();
 
     if (tid < D) {
+        // ILP4 acc combine (stream_probe: one outstanding 4 B load per
+        // lane is latency-window bound; four INDEPENDENT loads issued
+        // before any consumer quadruple the bytes in flight). The old
+        // loop's guarded load-then-FMA compiled as one serial chain of
+        // NSPLIT latency windows per thread. Batch FOUR split loads
+        // into registers first, then accumulate — the ADDS stay in
+        // ascending split order, so the fixed deterministic fp32 sum
+        // order documented in the header is preserved; only the LOADS
+        // are hoisted. Loads are now unconditional: the workspace is
+        // allocated for all NSPLIT splits (never-written empty-tail acc
+        // may hold garbage/NaN), and the c == 0 SELECT on the
+        // accumulate still excludes them — select, not multiply, since
+        // 0 * NaN would poison the sum.
+        static_assert(NSPLIT % 4 == 0, "ILP4 combine assumes 4 | NSPLIT");
+        const size_t sstride = (size_t)Hq * blk;  // floats, split i -> i+1
+        const float* ap = ws + (size_t)h * blk + (size_t)q * D + tid;
         float s = 0.0f;
         #pragma unroll
-        for (int i = 0; i < NSPLIT; ++i) {
-            const float c = coeff[i];
-            // c == 0 also guards the never-written acc of empty slices.
-            if (c != 0.0f) {
-                const size_t b = (size_t)(i * Hq + h) * blk;
-                s += c * ws[b + (size_t)q * D + tid];
-            }
+        for (int i = 0; i < NSPLIT; i += 4) {
+            const float v0 = ap[(i + 0) * sstride];
+            const float v1 = ap[(i + 1) * sstride];
+            const float v2 = ap[(i + 2) * sstride];
+            const float v3 = ap[(i + 3) * sstride];
+            const float c0 = coeff[i + 0], c1 = coeff[i + 1];
+            const float c2 = coeff[i + 2], c3 = coeff[i + 3];
+            s = (c0 != 0.0f) ? fmaf(c0, v0, s) : s;
+            s = (c1 != 0.0f) ? fmaf(c1, v1, s) : s;
+            s = (c2 != 0.0f) ? fmaf(c2, v2, s) : s;
+            s = (c3 != 0.0f) ? fmaf(c3, v3, s) : s;
         }
         const size_t o_off = ((size_t)q * Hq + h) * D + tid;
         const __hip_bfloat16 b = __float2bfloat16(s * s_invL);
@@ -462,6 +488,89 @@ void attention_decoder_gqa_reduce_kernel(
             // Bit-exact quantize_fp8_static semantics: quantize the
             // ROUNDED bf16 value, per-thread inv = 1/(*d_scale)
             // (single division), pre-clamp +-448, e4m3 convert.
+            const float inv = 1.0f / (*d_scale);
+            const float f =
+                fminf(fmaxf(__bfloat162float(b) * inv, -448.0f), 448.0f);
+            O_fp8[o_off] = __hip_fp8_e4m3(f);
+        }
+    }
+}
+
+// ── Optional reduce alternate (env FRT_ATTN_REDUCE_ALT=1) ──
+// Same per-(q, h) math as attention_decoder_gqa_reduce_kernel, but 512
+// threads per WG covering TWO (q, h) pairs (half 0 = waves 0-3, half 1
+// = waves 4-7), so the grid halves from Sq*Hq tiny WGs to
+// ceil(Sq*Hq/2) — amortizing launch/WG setup, the dominant cost of a
+// kernel whose real work is ~0.5 us. Register pressure is tiny here
+// (unlike the partial kernel's w8 spill precedent), so doubling the
+// block is free. Pair p = q*Hq + h maps halves to ADJACENT output
+// D-blocks -> one WG stores 2*D contiguous bf16. The load/accumulate
+// code per pair is identical to the default kernel (same ILP4 batching,
+// same ascending-split fixed-order sum, same fp8 epilogue), so outputs
+// are bit-identical. Guarded per-phase for odd Sq*Hq (idle half still
+// reaches __syncthreads).
+template <int NSPLIT>
+__global__ __launch_bounds__(2 * ATTN_NTHREADS)
+void attention_decoder_gqa_reduce_alt_kernel(
+    const float* __restrict__ ws,
+    __hip_bfloat16* __restrict__ O,
+    __hip_fp8_e4m3* __restrict__ O_fp8,  // optional epilogue (nullptr = off)
+    const float* __restrict__ d_scale,   // device scale, read iff O_fp8
+    int Sq, int Hq, int D) {
+    const int hf   = (int)(threadIdx.x >> 8);            // half 0 / 1
+    const int tid  = (int)(threadIdx.x & (ATTN_NTHREADS - 1));
+    const int lane = tid & (FVK_WAVE_SIZE - 1);
+    const int wave = tid >> 6;                           // wave within half
+    const int np   = Sq * Hq;
+    const int p    = (int)blockIdx.x * 2 + hf;           // pair = q*Hq + h
+    const int q    = p / Hq;
+    const int h    = p - q * Hq;
+
+    __shared__ float coeff[2][NSPLIT];
+    __shared__ float s_invL[2];
+
+    const size_t blk = (size_t)Sq * (size_t)(D + 2);  // floats per (split,head)
+    const size_t ml_off = (size_t)Sq * D;
+
+    static_assert(NSPLIT <= FVK_WAVE_SIZE, "one wave covers all splits");
+    if (wave == 0 && p < np) {  // wave 0 of each half owns its pair's m/l
+        float mi = -FLT_MAX, li = 0.0f;
+        if (lane < NSPLIT) {
+            const size_t b = (size_t)(lane * Hq + h) * blk;
+            li = ws[b + ml_off + Sq + q];
+            mi = ws[b + ml_off + q];
+        }
+        float gm = wave_reduce_max((li > 0.0f) ? mi : -FLT_MAX);
+        gm = __shfl(gm, 0);
+        const float c = (lane < NSPLIT && li > 0.0f) ? __expf(mi - gm) : 0.0f;
+        if (lane < NSPLIT) coeff[hf][lane] = c;
+        const float L = wave_reduce_sum(c * li);
+        if (lane == 0) s_invL[hf] = (L > 0.0f) ? 1.0f / L : 0.0f;
+    }
+    __syncthreads();
+
+    if (tid < D && p < np) {
+        static_assert(NSPLIT % 4 == 0, "ILP4 combine assumes 4 | NSPLIT");
+        const size_t sstride = (size_t)Hq * blk;  // floats, split i -> i+1
+        const float* ap = ws + (size_t)h * blk + (size_t)q * D + tid;
+        float s = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < NSPLIT; i += 4) {
+            const float v0 = ap[(i + 0) * sstride];
+            const float v1 = ap[(i + 1) * sstride];
+            const float v2 = ap[(i + 2) * sstride];
+            const float v3 = ap[(i + 3) * sstride];
+            const float c0 = coeff[hf][i + 0], c1 = coeff[hf][i + 1];
+            const float c2 = coeff[hf][i + 2], c3 = coeff[hf][i + 3];
+            s = (c0 != 0.0f) ? fmaf(c0, v0, s) : s;
+            s = (c1 != 0.0f) ? fmaf(c1, v1, s) : s;
+            s = (c2 != 0.0f) ? fmaf(c2, v2, s) : s;
+            s = (c3 != 0.0f) ? fmaf(c3, v3, s) : s;
+        }
+        const size_t o_off = ((size_t)q * Hq + h) * D + tid;
+        const __hip_bfloat16 b = __float2bfloat16(s * s_invL[hf]);
+        O[o_off] = b;
+        if (O_fp8 != nullptr) {
             const float inv = 1.0f / (*d_scale);
             const float f =
                 fminf(fmaxf(__bfloat162float(b) * inv, -448.0f), 448.0f);
@@ -484,8 +593,19 @@ static void launch_decoder_gqa(const __hip_bfloat16* Q,
                                hipStream_t stream) {
     dim3 grid1(NSPLIT, Hq);
     attention_decoder_gqa_partial_kernel<NSPLIT><<<grid1, ATTN_NTHREADS, 0, stream>>>(Q, K, V, partial_ws, seqused, Sq, Skv, Hq, D, softmax_scale);
-    dim3 grid2(Sq, Hq);
-    attention_decoder_gqa_reduce_kernel<NSPLIT><<<grid2, ATTN_NTHREADS, 0, stream>>>(partial_ws, O, O_fp8, d_scale, Sq, Hq, D);
+    // FRT_ATTN_REDUCE_ALT=1 -> w8 alternate (2 pairs/WG, half the
+    // grid). Read per call on the host, like FRT_ATTN_NSPLIT: frozen
+    // into a captured graph at capture time, env flips later do NOT
+    // re-route an existing graph.
+    bool alt = false;
+    if (const char* e = std::getenv("FRT_ATTN_REDUCE_ALT")) alt = std::atoi(e) != 0;
+    if (alt) {
+        dim3 grid2((Sq * Hq + 1) / 2);
+        attention_decoder_gqa_reduce_alt_kernel<NSPLIT><<<grid2, 2 * ATTN_NTHREADS, 0, stream>>>(partial_ws, O, O_fp8, d_scale, Sq, Hq, D);
+    } else {
+        dim3 grid2(Sq, Hq);
+        attention_decoder_gqa_reduce_kernel<NSPLIT><<<grid2, ATTN_NTHREADS, 0, stream>>>(partial_ws, O, O_fp8, d_scale, Sq, Hq, D);
+    }
 }
 
 // ================================================================

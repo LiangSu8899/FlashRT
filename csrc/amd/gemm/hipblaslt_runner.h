@@ -90,6 +90,31 @@ public:
                     float* d_scale_a, float* d_scale_b,
                     hipStream_t stream = 0);
 
+    // MXFP4 a4w4 transpose-B path (OCP MX: E2M1 elements + per-1x32-block
+    // UE8M0 scales): D_bf16 = A_fp4(M,K) @ B_fp4(N,K)^T
+    //
+    //   A        : E2M1 packed 2-per-byte along K → (M, K/2) bytes row-major.
+    //              Element 2i in the low nibble, 2i+1 in the high nibble.
+    //   A_scales : uint8 UE8M0 (biased-127 exponent), one per 1x32 block
+    //              along K → (M, K/32) bytes row-major.
+    //   B        : E2M1 packed 2-per-byte along K → (N, K/2) bytes row-major.
+    //   B_scales : uint8 UE8M0 → (N, K/32) bytes row-major.
+    //   D        : BF16 (M, N) row-major.
+    //
+    // hipBLASLt contract (see hipblaslt.h): the block-scale tensors are
+    // installed via A/B_SCALE_POINTER with A/B_SCALE_MODE =
+    // HIPBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0 — "an 8-bit R_8F_UE8M0
+    // value for each 32-element block in the innermost dimension of the
+    // corresponding data tensor". Under the col-major swap used by this
+    // class the innermost (stride-1) dimension of BOTH operands is K, so
+    // the row-major (rows, K/32) scale tensors above map to the library's
+    // expectation with no reshuffling (full derivation in the .hip file).
+    // K must be a multiple of 32 (throws otherwise).
+    void mxfp4_nt_dev(void* A, void* A_scales,
+                      void* B, void* B_scales, void* D,
+                      int M, int N, int K,
+                      hipStream_t stream = 0);
+
     // ── Autotune: benchmark top-N algorithms and cache the best ──
     // Call before HIP Graph capture. Uses dummy data at the provided pointers.
     // Matters on gfx950: hipBLASLt FP8 heuristics have known gaps, so the
@@ -104,6 +129,10 @@ public:
                              int M, int N, int K,
                              float* d_scale_a, float* d_scale_b,
                              int num_algos = 16);
+    void autotune_mxfp4_nt_dev(void* A, void* A_scales,
+                               void* B, void* B_scales, void* D,
+                               int M, int N, int K,
+                               int num_algos = 16);
 
 private:
     hipblasLtHandle_t handle_;
@@ -112,7 +141,9 @@ private:
 
     // ── GEMM descriptor + algorithm cache ──
     // Enum values match the CUDA class for the ported subset.
-    enum GemmType { BF16_NN = 0, FP8_NN_DEV = 2, FP8_NT_DEV = 5 };
+    // MXFP4_NT_DEV is AMD-only (gfx950 native MX support, no CUDA
+    // counterpart in the ported class) and uses the next free value.
+    enum GemmType { BF16_NN = 0, FP8_NN_DEV = 2, FP8_NT_DEV = 5, MXFP4_NT_DEV = 6 };
 
     struct GemmKey {
         int type, M, N, K;
