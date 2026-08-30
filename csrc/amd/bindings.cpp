@@ -503,6 +503,23 @@ PYBIND11_MODULE(flash_rt_amd_kernels, m) {
         return variants;
     });
 
+    // ── Decoder-attention phase-ablation probe (see attention/attn_probe.hip) ──
+    m.def("attn_partial_probe", [](uintptr_t Q, uintptr_t K, uintptr_t V,
+                                   uintptr_t ws, int Sq, int Skv, int Hq,
+                                   int D, float scale, int nsplit, int mask,
+                                   uintptr_t stream) {
+        extern void attn_partial_probe(const __hip_bfloat16*, const __hip_bfloat16*,
+                                       const __hip_bfloat16*, float*,
+                                       int, int, int, int, float, int, int,
+                                       hipStream_t);
+        attn_partial_probe(typed_ptr<__hip_bfloat16>(Q), typed_ptr<__hip_bfloat16>(K),
+                           typed_ptr<__hip_bfloat16>(V), typed_ptr<float>(ws),
+                           Sq, Skv, Hq, D, scale, nsplit, mask, to_stream(stream));
+    }, py::arg("Q"), py::arg("K"), py::arg("V"), py::arg("ws"),
+       py::arg("Sq"), py::arg("Skv"), py::arg("Hq"), py::arg("D"),
+       py::arg("scale") = 0.0625f, py::arg("nsplit") = 32, py::arg("mask") = 63,
+       py::arg("stream") = 0);
+
     // ── Elementwise launch-geometry tuning probe (see kernels/ew_tune.h) ──
     m.def("ew_tune_quant", [](int variant, uintptr_t in, uintptr_t out,
                               uintptr_t d_scale, int n, uintptr_t stream) {

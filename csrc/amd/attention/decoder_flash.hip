@@ -345,16 +345,35 @@ void attention_decoder_gqa_partial_kernel(
         const float2* qr =
             reinterpret_cast<const float2*>(&q_lds[q * ATTN_Q_PITCH]);
         float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
-        #pragma unroll 4
-        for (int i = 0; i < dh; i += 2) {  // dh even (D % 4 == 0)
-            const __hip_bfloat162 k0 = kr[i];
-            const __hip_bfloat162 k1 = kr[i + 1];
-            const float2 q0 = qr[i];
-            const float2 q1 = qr[i + 1];
-            a0 = fmaf(__bfloat162float(k0.x), q0.x, a0);
-            a1 = fmaf(__bfloat162float(k0.y), q0.y, a1);
-            a2 = fmaf(__bfloat162float(k1.x), q1.x, a2);
-            a3 = fmaf(__bfloat162float(k1.y), q1.y, a3);
+        if ((dh & 7) == 0) {
+            // 8-deep explicit load batching (LDS latency hiding at the
+            // kernel's 1-wave/SIMD occupancy). Per-chain accumulation
+            // order matches the plain loop — bit-exact.
+            for (int i = 0; i < dh; i += 8) {
+                __hip_bfloat162 kk[8];
+                float2 qq[8];
+                #pragma unroll
+                for (int t = 0; t < 8; ++t) { kk[t] = kr[i + t]; qq[t] = qr[i + t]; }
+                #pragma unroll
+                for (int t = 0; t < 8; t += 2) {
+                    a0 = fmaf(__bfloat162float(kk[t].x),     qq[t].x,     a0);
+                    a1 = fmaf(__bfloat162float(kk[t].y),     qq[t].y,     a1);
+                    a2 = fmaf(__bfloat162float(kk[t + 1].x), qq[t + 1].x, a2);
+                    a3 = fmaf(__bfloat162float(kk[t + 1].y), qq[t + 1].y, a3);
+                }
+            }
+        } else {
+            #pragma unroll 4
+            for (int i = 0; i < dh; i += 2) {  // dh even (D % 4 == 0)
+                const __hip_bfloat162 k0 = kr[i];
+                const __hip_bfloat162 k1 = kr[i + 1];
+                const float2 q0 = qr[i];
+                const float2 q1 = qr[i + 1];
+                a0 = fmaf(__bfloat162float(k0.x), q0.x, a0);
+                a1 = fmaf(__bfloat162float(k0.y), q0.y, a1);
+                a2 = fmaf(__bfloat162float(k1.x), q1.x, a2);
+                a3 = fmaf(__bfloat162float(k1.y), q1.y, a3);
+            }
         }
         s_lds[q * ATTN_S_PITCH + r] = ((a0 + a1) + (a2 + a3)) * scale;
     }
@@ -367,36 +386,78 @@ void attention_decoder_gqa_partial_kernel(
     // ── Phase B: per-query serial softmax (interleaved with A') ──
     // Serial ascending j: max, then exp in place + sum — fixed order,
     // <= 3*chunk LDS ops on Sq threads; s_lds is untouched by A'.
+    // ILP4 softmax: 4 independent chains hide the serial LDS latency
+    // (only Sq threads are active here). max is order-free; the exp
+    // sum combines its chains in fixed order (l0+l1)+(l2+l3).
     if (tid < Sq) {
         float* sp = &s_lds[tid * ATTN_S_PITCH];
-        float m = -FLT_MAX;
-        for (int j = 0; j < cn; ++j) m = fmaxf(m, sp[j]);
-        float l = 0.0f;
-        for (int j = 0; j < cn; ++j) {
+        float m0 = -FLT_MAX, m1 = -FLT_MAX, m2 = -FLT_MAX, m3 = -FLT_MAX;
+        int j = 0;
+        for (; j + 3 < cn; j += 4) {
+            m0 = fmaxf(m0, sp[j]);
+            m1 = fmaxf(m1, sp[j + 1]);
+            m2 = fmaxf(m2, sp[j + 2]);
+            m3 = fmaxf(m3, sp[j + 3]);
+        }
+        for (; j < cn; ++j) m0 = fmaxf(m0, sp[j]);
+        const float m = fmaxf(fmaxf(m0, m1), fmaxf(m2, m3));
+        float l0 = 0.0f, l1 = 0.0f, l2 = 0.0f, l3 = 0.0f;
+        j = 0;
+        for (; j + 3 < cn; j += 4) {
+            const float e0 = __expf(sp[j] - m);
+            const float e1 = __expf(sp[j + 1] - m);
+            const float e2 = __expf(sp[j + 2] - m);
+            const float e3 = __expf(sp[j + 3] - m);
+            sp[j] = e0; sp[j + 1] = e1; sp[j + 2] = e2; sp[j + 3] = e3;
+            l0 += e0; l1 += e1; l2 += e2; l3 += e3;
+        }
+        for (; j < cn; ++j) {
             const float e = __expf(sp[j] - m);
             sp[j] = e;
-            l += e;
+            l0 += e;
         }
         m_ws[tid] = m;
-        l_ws[tid] = l;
+        l_ws[tid] = (l0 + l1) + (l2 + l3);
     }
     __syncthreads();  // V staged + probabilities final
 
     // ── Phase C: one thread per (query, dim-pair) ──
     // acc[q][2dp..2dp+1] = sum_j p[q][j] * V[j][2dp..2dp+1], ascending j.
+    // ILP4 PV: 4 independent accumulator chains hide the serial LDS
+    // latency; chains combine in fixed order (a0+a1)+(a2+a3).
     const int nunits = Sq * dh;
     for (int u = tid; u < nunits; u += ATTN_NTHREADS) {
         const int q  = u / dh;
         const int dp = u - q * dh;
         const float* sp = &s_lds[q * ATTN_S_PITCH];
         const __hip_bfloat162* vp = &kv_lds[dp];
-        float ax = 0.0f, ay = 0.0f;
-        for (int j = 0; j < cn; ++j) {
+        float ax0 = 0.0f, ay0 = 0.0f, ax1 = 0.0f, ay1 = 0.0f;
+        float ax2 = 0.0f, ay2 = 0.0f, ax3 = 0.0f, ay3 = 0.0f;
+        int j = 0;
+        for (; j + 3 < cn; j += 4) {
+            const __hip_bfloat162 v0 = vp[(j)     * ATTN_KV_PITCH];
+            const __hip_bfloat162 v1 = vp[(j + 1) * ATTN_KV_PITCH];
+            const __hip_bfloat162 v2 = vp[(j + 2) * ATTN_KV_PITCH];
+            const __hip_bfloat162 v3 = vp[(j + 3) * ATTN_KV_PITCH];
+            const float p0 = sp[j], p1 = sp[j + 1];
+            const float p2 = sp[j + 2], p3 = sp[j + 3];
+            ax0 = fmaf(p0, __bfloat162float(v0.x), ax0);
+            ay0 = fmaf(p0, __bfloat162float(v0.y), ay0);
+            ax1 = fmaf(p1, __bfloat162float(v1.x), ax1);
+            ay1 = fmaf(p1, __bfloat162float(v1.y), ay1);
+            ax2 = fmaf(p2, __bfloat162float(v2.x), ax2);
+            ay2 = fmaf(p2, __bfloat162float(v2.y), ay2);
+            ax3 = fmaf(p3, __bfloat162float(v3.x), ax3);
+            ay3 = fmaf(p3, __bfloat162float(v3.y), ay3);
+        }
+        for (; j < cn; ++j) {
             const __hip_bfloat162 v = vp[j * ATTN_KV_PITCH];
             const float pj = sp[j];
-            ax = fmaf(pj, __bfloat162float(v.x), ax);
-            ay = fmaf(pj, __bfloat162float(v.y), ay);
+            ax0 = fmaf(pj, __bfloat162float(v.x), ax0);
+            ay0 = fmaf(pj, __bfloat162float(v.y), ay0);
         }
+        const float ax = (ax0 + ax1) + (ax2 + ax3);
+        const float ay = (ay0 + ay1) + (ay2 + ay3);
         float* out = acc_ws + (size_t)q * D + 2 * dp;
         out[0] = ax;   // adjacent 4 B stores; consecutive lanes are
         out[1] = ay;   // consecutive pairs -> coalesced 8 B/lane
