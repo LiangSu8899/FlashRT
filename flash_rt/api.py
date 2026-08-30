@@ -731,12 +731,14 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             ("groot_n17", "torch", "thor"),
             ("groot_n17", "torch", "rtx_sm120"),
             ("groot_n17", "torch", "rtx_sm89"),
+            ("groot_n17", "torch", "amd_cdna4"),
         }:
             raise ValueError(
                 "use_fp16=True is currently experimental and only supports "
                 "('pi05', 'torch', 'thor'/'rtx_sm120'/'rtx_sm89'), "
                 "('groot', 'torch', 'thor'/'rtx_sm120'), and "
-                "('groot_n17', 'torch', 'thor'/'rtx_sm120'/'rtx_sm89')")
+                "('groot_n17', 'torch', "
+                "'thor'/'rtx_sm120'/'rtx_sm89'/'amd_cdna4')")
 
     # FA4 is an attention-backend choice, not part of the NVFP4 tier: both
     # the FP8 Pi0.5 Thor frontend and its NVFP4 subclass accept use_fa4, and
@@ -781,6 +783,19 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                 GrootN17TorchFrontendRtxFP8,
             )
             pipe_cls = GrootN17TorchFrontendRtxFP8
+
+    # GROOT N1.7 on AMD CDNA4 defaults to the FP8-backbone frontend
+    # (bf16 DiT), mirroring the RTX FP8 production tier; _PIPELINE_MAP
+    # already resolves amd_cdna4 to GrootN17TorchFrontendAmd. There is
+    # no BF16-only fallback, and the full-FP16 reference is not yet
+    # ported (use_fp16=True raises NotImplementedError below).
+    if config == "groot_n17" and framework == "torch" \
+            and arch == "amd_cdna4" and not use_fp16 and not use_fp8:
+        raise ValueError(
+            "GROOT N1.7 on AMD CDNA4 defaults to FP8; there is no "
+            "separate BF16-only fallback. The non-quantized full-FP16 "
+            "reference (use_fp16=True, use_fp8=False) is not yet ported "
+            "to CDNA4.")
 
     # GROOT N1.7 on Thor (SM110) runs the FP8 backbone (+ bf16 DiT) by
     # default. There is no BF16-only fallback; the non-quantized reference is
@@ -835,6 +850,11 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                 )
                 pipe_cls = GrootTorchFrontendRtxFP16
             else:  # config == "groot_n17"
+                if arch == "amd_cdna4":
+                    raise NotImplementedError(
+                        "the GROOT N1.7 full-FP16 reference is not yet "
+                        "ported to AMD CDNA4; use the default FP8 tier "
+                        "(use_fp8=True, use_fp16=False)")
                 if arch == "rtx_sm89":
                     from flash_rt.frontends.torch.groot_n17_rtx_sm89_fp16 import (
                         GrootN17TorchFrontendRtxSm89FP16,
