@@ -22,7 +22,8 @@
 //
 // Notes vs the CUDA bindings:
 //   - Only the ported subset is exposed: FvkContext, bf16_run,
-//     bf16_nn, bf16_nn_bias, bf16_nn_bias_gelu, fp8_nn_dev,
+//     bf16_nn, bf16_nn_res, bf16_nn_bias, bf16_nn_bias_gelu,
+//     bf16_nn_bias_res, fp8_nn_dev,
 //     fp8_nt_dev, autotune_bf16_nn, autotune_fp8_nn_dev,
 //     autotune_fp8_nt_dev.
 //   - AMD-only additions (no CUDA counterpart): mxfp4_nt_dev and
@@ -59,6 +60,12 @@
             self.bf16_nn(to_ptr(A), to_ptr(B), to_ptr(D), M, N, K, to_stream(stream));
         }, py::arg("A"), py::arg("B"), py::arg("D"),
            py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0)
+        .def("bf16_nn_res", [](GemmRunner& self,
+                                uintptr_t A, uintptr_t B, uintptr_t D,
+                                int M, int N, int K, uintptr_t stream) {
+            self.bf16_nn_res(to_ptr(A), to_ptr(B), to_ptr(D), M, N, K, to_stream(stream));
+        }, py::arg("A"), py::arg("B"), py::arg("D"),
+           py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0)
         .def("bf16_nn_bias", [](GemmRunner& self,
                                  uintptr_t A, uintptr_t B, uintptr_t D, uintptr_t bias,
                                  int M, int N, int K, uintptr_t stream) {
@@ -71,6 +78,13 @@
                                       int M, int N, int K, uintptr_t stream) {
             self.bf16_nn_bias_gelu(to_ptr(A), to_ptr(B), to_ptr(D), to_ptr(bias),
                                     M, N, K, to_stream(stream));
+        }, py::arg("A"), py::arg("B"), py::arg("D"), py::arg("bias"),
+           py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0)
+        .def("bf16_nn_bias_res", [](GemmRunner& self,
+                                     uintptr_t A, uintptr_t B, uintptr_t D, uintptr_t bias,
+                                     int M, int N, int K, uintptr_t stream) {
+            self.bf16_nn_bias_res(to_ptr(A), to_ptr(B), to_ptr(D), to_ptr(bias),
+                                   M, N, K, to_stream(stream));
         }, py::arg("A"), py::arg("B"), py::arg("D"), py::arg("bias"),
            py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0)
         .def("fp8_nn_dev", [](GemmRunner& self,

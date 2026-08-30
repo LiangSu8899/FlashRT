@@ -26,7 +26,19 @@ the ``alphas`` dict (key names parallel to ``scales_dev``; required when
 ``fused_epilogue=True``). Numerics: the fused epilogue adds the bias on
 the FP32 accumulator BEFORE the fp16 round, whereas the decomposed form
 adds it AFTER rounding — slightly different, judged by the E2E gate, not
-bit-parity. The llm stage is biasless (Qwen3) and keeps descale GEMMs.
+bit-parity. The llm stage is biasless (Qwen3) and keeps descale GEMMs;
+its ``fused_epilogue`` flag instead fuses the norm/residual elementwise
+chains (see its docstring).
+
+The fused tier additionally collapses the norm→quantize front-ends into
+single kernels (same FVK_AMD_FUSED_EPILOGUE gate): every
+``layer_norm_fp16 → quantize_fp8_static_fp16`` pair whose fp16 normed
+output feeds ONLY the quantize runs as ``layer_norm_fp8_static_fp16_vec``
+(bit-matching — fp16 round-through before the quantize; falls back to
+the pair when the vec preconditions return rc != 0), and the llm's
+RMSNorm chains run as ``rms_norm_fp8_fp16`` /
+``residual_add_rms_norm_fp8_fp16`` (last-ULP deltas, see the llm
+docstring).
 
 Attention stays FP16 (the descale GEMM emits FP16 Q/K/V) and delegates
 to :class:`flash_rt.amd.hardware.cdna4.attn_backend_groot_n17.Cdna4GrootN17AttnBackend`.
@@ -146,13 +158,31 @@ def qwen3vl_vit_forward(gemm, fvk, bufs, weights, dims,
         a_fc1 = int(scales_dev["act_fc1"][li])
         a_fc2 = int(scales_dev["act_fc2"][li])
 
-        # ── Pre-attn LayerNorm ──
-        fvk.layer_norm_fp16(
-            h_ptr, int(weights["norm1_w"][li]), int(weights["norm1_b"][li]),
-            xn_ptr, S, D, 1e-6, int(stream))
+        # ── Pre-attn LayerNorm (+ quantize for Q/K/V) ──
+        if fused_epilogue:
+            # AMD FUSED: LayerNorm + static FP8 quantize in ONE kernel.
+            # The kernel rounds the norm output through fp16 BEFORE the
+            # fp8 quantize, bit-matching the decomposed pair; the normed
+            # fp16 buffer (xn) is consumed only by the quantize here, so
+            # its write is dropped entirely. rc != 0 (dim%8 / alignment)
+            # falls back to the decomposed pair.
+            rc = fvk.layer_norm_fp8_static_fp16_vec(
+                h_ptr, int(weights["norm1_w"][li]), int(weights["norm1_b"][li]),
+                xn_fp8_ptr, a_qkv, S, D, 1e-6, int(stream))
+            if rc != 0:
+                fvk.layer_norm_fp16(
+                    h_ptr, int(weights["norm1_w"][li]), int(weights["norm1_b"][li]),
+                    xn_ptr, S, D, 1e-6, int(stream))
+                fvk.quantize_fp8_static_fp16(xn_ptr, xn_fp8_ptr, a_qkv,
+                                             S * D, int(stream))
+        else:
+            fvk.layer_norm_fp16(
+                h_ptr, int(weights["norm1_w"][li]), int(weights["norm1_b"][li]),
+                xn_ptr, S, D, 1e-6, int(stream))
+            # ── Quantize xn once for Q/K/V ──
+            fvk.quantize_fp8_static_fp16(xn_ptr, xn_fp8_ptr, a_qkv, S * D, int(stream))
 
-        # ── Quantize xn once for Q/K/V; 3 split FP8 GEMMs + bias ──
-        fvk.quantize_fp8_static_fp16(xn_ptr, xn_fp8_ptr, a_qkv, S * D, int(stream))
+        # ── 3 split FP8 GEMMs + bias ──
         if fused_epilogue:
             # FUSED: bias in the hipBLASLt epilogue, host alpha = act·w scale.
             al_qkv = float(alphas["act_qkv"][li])
@@ -193,13 +223,24 @@ def qwen3vl_vit_forward(gemm, fvk, bufs, weights, dims,
             fvk.add_bias_fp16(o_proj_out, int(weights["o_b"][li]), S, D, int(stream))
         fvk.residual_add_fp16(h_ptr, o_proj_out, S * D, int(stream))
 
-        # ── Pre-FF LayerNorm ──
-        fvk.layer_norm_fp16(
-            h_ptr, int(weights["norm2_w"][li]), int(weights["norm2_b"][li]),
-            xn_ptr, S, D, 1e-6, int(stream))
-
-        # ── FF: D → FF (GELU) → D ──
-        fvk.quantize_fp8_static_fp16(xn_ptr, xn_fp8_ptr, a_fc1, S * D, int(stream))
+        # ── Pre-FF LayerNorm (+ quantize) then FF: D → FF (GELU) → D ──
+        if fused_epilogue:
+            # AMD FUSED: LayerNorm + static FP8 quantize in ONE kernel
+            # (bit-matching; xn write dropped; rc != 0 falls back).
+            rc = fvk.layer_norm_fp8_static_fp16_vec(
+                h_ptr, int(weights["norm2_w"][li]), int(weights["norm2_b"][li]),
+                xn_fp8_ptr, a_fc1, S, D, 1e-6, int(stream))
+            if rc != 0:
+                fvk.layer_norm_fp16(
+                    h_ptr, int(weights["norm2_w"][li]), int(weights["norm2_b"][li]),
+                    xn_ptr, S, D, 1e-6, int(stream))
+                fvk.quantize_fp8_static_fp16(xn_ptr, xn_fp8_ptr, a_fc1,
+                                             S * D, int(stream))
+        else:
+            fvk.layer_norm_fp16(
+                h_ptr, int(weights["norm2_w"][li]), int(weights["norm2_b"][li]),
+                xn_ptr, S, D, 1e-6, int(stream))
+            fvk.quantize_fp8_static_fp16(xn_ptr, xn_fp8_ptr, a_fc1, S * D, int(stream))
         if fused_epilogue:
             # FUSED: fc1 bias+GELU in epilogue; fc2 bias in epilogue.
             gemm.fp8_nn_gelu_bias(xn_fp8_ptr, int(weights["fc1_w"][li]),
@@ -271,11 +312,25 @@ def deepstack_merge_forward(gemm, fvk, bufs, weights, dims,
         a_fc1 = int(scales_dev["act_fc1"][j])
         a_fc2 = int(scales_dev["act_fc2"][j])
 
-        fvk.layer_norm_fp16(
-            in_ptr, int(weights["norm_w"][j]), int(weights["norm_b"][j]),
-            ln_out, Nout, Dmid, 1e-6, int(stream))
-
-        fvk.quantize_fp8_static_fp16(ln_out, fp8_scratch, a_fc1, Nout * Dmid, int(stream))
+        if fused_epilogue:
+            # AMD FUSED: LayerNorm + static FP8 quantize in ONE kernel.
+            # Bit-matches the decomposed pair (fp16 round-through before
+            # the quantize); ln_out is consumed only by the quantize, so
+            # its write is dropped. rc != 0 falls back to the pair.
+            rc = fvk.layer_norm_fp8_static_fp16_vec(
+                in_ptr, int(weights["norm_w"][j]), int(weights["norm_b"][j]),
+                fp8_scratch, a_fc1, Nout, Dmid, 1e-6, int(stream))
+            if rc != 0:
+                fvk.layer_norm_fp16(
+                    in_ptr, int(weights["norm_w"][j]), int(weights["norm_b"][j]),
+                    ln_out, Nout, Dmid, 1e-6, int(stream))
+                fvk.quantize_fp8_static_fp16(ln_out, fp8_scratch, a_fc1,
+                                             Nout * Dmid, int(stream))
+        else:
+            fvk.layer_norm_fp16(
+                in_ptr, int(weights["norm_w"][j]), int(weights["norm_b"][j]),
+                ln_out, Nout, Dmid, 1e-6, int(stream))
+            fvk.quantize_fp8_static_fp16(ln_out, fp8_scratch, a_fc1, Nout * Dmid, int(stream))
         if fused_epilogue:
             # FUSED: fc1 bias+GELU in epilogue; fc2 bias in epilogue.
             gemm.fp8_nn_gelu_bias(fp8_scratch, int(weights["fc1_w"][j]), fc1_out,
@@ -305,7 +360,8 @@ def deepstack_merge_forward(gemm, fvk, bufs, weights, dims,
 
 def qwen3vl_llm_forward(gemm, fvk, bufs, weights, dims,
                         scales_dev, *, attn, stream: int = 0,
-                        layers_subset=None) -> None:
+                        layers_subset=None,
+                        fused_epilogue: bool = False) -> None:
     """16 truncated Qwen3-VL LLM decoder layers, FP8 GEMMs via decomposed descale.
 
     Per layer: RMSNorm → quantize → 3 split FP8 Q/K/V descale GEMMs (no bias) →
@@ -331,6 +387,25 @@ def qwen3vl_llm_forward(gemm, fvk, bufs, weights, dims,
                 cos, sin; deepstack_inject (list[16], 0 = none)
     scales_dev: act_qkv, act_o, act_gateup, act_down
     dims:       S, D, NHQ, NHKV, HD, FF
+
+    fused_epilogue: the llm stage is biasless (Qwen3) so the GEMMs always
+        stay on descale form — here the flag instead fuses the elementwise
+        chains around them (same FVK_AMD_FUSED_EPILOGUE gate as the other
+        forwards; no ``alphas`` needed):
+          * pre-attn  ``rms_norm_fp16 + quantize`` → ``rms_norm_fp8_fp16``
+          * o-proj    ``residual_add_fp16 + rms_norm_fp16 + quantize`` →
+            ``residual_add_rms_norm_fp8_fp16`` (h updated in place exactly
+            as the decomposed chain: the fp16-rounded residual is written
+            back before the norm output is quantized)
+        NUMERICS (last-ULP class, judged by the E2E gate like the GEMM
+        epilogues): the fused kernels quantize the fp32 normed value
+        directly (no fp16 round-through of xn) and use 1/scale without the
+        quantize kernel's 1e-12 guard; the residual variant additionally
+        accumulates the sum-of-squares from the UNROUNDED fp32 residual
+        sums (the decomposed rms_norm re-reads the fp16-rounded residual).
+        The per-head q/k norms and the FFN-tail residual (which crosses
+        the layer boundary into the next layer's pre-attn norm and may be
+        followed by a DeepStack inject) are NOT substituted.
     """
     S    = int(dims["S"])
     D    = int(dims["D"])
@@ -366,9 +441,18 @@ def qwen3vl_llm_forward(gemm, fvk, bufs, weights, dims,
         a_dn  = int(scales_dev["act_down"][li])
 
         # ── Pre-attn RMSNorm + quantize ──
-        fvk.rms_norm_fp16(h_ptr, int(weights["in_ln_w"][li]), xn_ptr,
-                          S, D, 1e-6, int(stream))
-        fvk.quantize_fp8_static_fp16(xn_ptr, xn_fp8_ptr, a_qkv, S * D, int(stream))
+        if fused_epilogue:
+            # AMD FUSED: RMSNorm + static FP8 quantize in ONE kernel; xn
+            # is consumed only by the quantize here, so its write is
+            # dropped. Numeric deltas vs the decomposed pair (no fp16
+            # round-through, no 1e-12 scale guard) are last-ULP — see the
+            # docstring; judged by the E2E gate.
+            fvk.rms_norm_fp8_fp16(h_ptr, int(weights["in_ln_w"][li]),
+                                  xn_fp8_ptr, S, D, 1e-6, a_qkv, int(stream))
+        else:
+            fvk.rms_norm_fp16(h_ptr, int(weights["in_ln_w"][li]), xn_ptr,
+                              S, D, 1e-6, int(stream))
+            fvk.quantize_fp8_static_fp16(xn_ptr, xn_fp8_ptr, a_qkv, S * D, int(stream))
 
         # ── 3 split FP8 descale GEMMs (no bias — Qwen3 QKV) ──
         gemm.fp8_descale_fp16(xn_fp8_ptr, int(weights["q_w"][li]), Q_ptr,
@@ -399,12 +483,23 @@ def qwen3vl_llm_forward(gemm, fvk, bufs, weights, dims,
                                      S * NHQ * HD, int(stream))
         gemm.fp8_descale_fp16(xn_fp8_ptr, int(weights["o_w"][li]), o_out_ptr,
                               S, D, NHQ * HD, a_o, int(weights["o_ws"][li]), int(stream))
-        fvk.residual_add_fp16(h_ptr, o_out_ptr, S * D, int(stream))
 
-        # ── Pre-FFN RMSNorm + quantize ──
-        fvk.rms_norm_fp16(h_ptr, int(weights["post_ln_w"][li]), xn_ptr,
-                          S, D, 1e-6, int(stream))
-        fvk.quantize_fp8_static_fp16(xn_ptr, xn_fp8_ptr, a_gu, S * D, int(stream))
+        # ── o-proj residual + Pre-FFN RMSNorm + quantize ──
+        if fused_epilogue:
+            # AMD FUSED: residual += o_proj, RMSNorm(residual), FP8
+            # quantize in ONE kernel. Same op sequence as the decomposed
+            # chain: h is updated in place (fp16-rounded residual written
+            # back) and o_out is not read again. Numeric deltas (unrounded
+            # sum-of-squares, no fp16 round-through, no 1e-12 guard) are
+            # last-ULP — see the docstring; judged by the E2E gate.
+            fvk.residual_add_rms_norm_fp8_fp16(
+                h_ptr, o_out_ptr, int(weights["post_ln_w"][li]), xn_fp8_ptr,
+                S, D, 1e-6, a_gu, int(stream))
+        else:
+            fvk.residual_add_fp16(h_ptr, o_out_ptr, S * D, int(stream))
+            fvk.rms_norm_fp16(h_ptr, int(weights["post_ln_w"][li]), xn_ptr,
+                              S, D, 1e-6, int(stream))
+            fvk.quantize_fp8_static_fp16(xn_ptr, xn_fp8_ptr, a_gu, S * D, int(stream))
 
         # ── gate / up FP8 GEMMs → fp16 ──
         gemm.fp8_descale_fp16(xn_fp8_ptr, int(weights["gate_w"][li]), gate_ptr,
@@ -487,10 +582,24 @@ def vl_self_attn_forward(gemm, fvk, bufs, weights, dims,
         a_fc2 = int(scales_dev["act_fc2"][li])
 
         # ── Pre-attn LayerNorm + quantize ──
-        fvk.layer_norm_fp16(
-            h_ptr, int(weights["norm1_w"][li]), int(weights["norm1_b"][li]),
-            xn_ptr, T, D, 1e-5, int(stream))
-        fvk.quantize_fp8_static_fp16(xn_ptr, xn_fp8_ptr, a_qkv, T * D, int(stream))
+        if fused_epilogue:
+            # AMD FUSED: LayerNorm + static FP8 quantize in ONE kernel
+            # (bit-matching fp16 round-through; xn consumed only by the
+            # quantize, its write dropped; rc != 0 falls back).
+            rc = fvk.layer_norm_fp8_static_fp16_vec(
+                h_ptr, int(weights["norm1_w"][li]), int(weights["norm1_b"][li]),
+                xn_fp8_ptr, a_qkv, T, D, 1e-5, int(stream))
+            if rc != 0:
+                fvk.layer_norm_fp16(
+                    h_ptr, int(weights["norm1_w"][li]), int(weights["norm1_b"][li]),
+                    xn_ptr, T, D, 1e-5, int(stream))
+                fvk.quantize_fp8_static_fp16(xn_ptr, xn_fp8_ptr, a_qkv,
+                                             T * D, int(stream))
+        else:
+            fvk.layer_norm_fp16(
+                h_ptr, int(weights["norm1_w"][li]), int(weights["norm1_b"][li]),
+                xn_ptr, T, D, 1e-5, int(stream))
+            fvk.quantize_fp8_static_fp16(xn_ptr, xn_fp8_ptr, a_qkv, T * D, int(stream))
 
         # ── Q / K / V FP8 GEMMs + bias (separate weight scales) ──
         if fused_epilogue:
@@ -533,10 +642,23 @@ def vl_self_attn_forward(gemm, fvk, bufs, weights, dims,
         fvk.residual_add_fp16(h_ptr, o_proj_out, T * D, int(stream))
 
         # ── Pre-FF LayerNorm + FF (GELU) ──
-        fvk.layer_norm_fp16(
-            h_ptr, int(weights["norm3_w"][li]), int(weights["norm3_b"][li]),
-            xn_ptr, T, D, 1e-5, int(stream))
-        fvk.quantize_fp8_static_fp16(xn_ptr, xn_fp8_ptr, a_fc1, T * D, int(stream))
+        if fused_epilogue:
+            # AMD FUSED: LayerNorm + static FP8 quantize in ONE kernel
+            # (bit-matching; xn write dropped; rc != 0 falls back).
+            rc = fvk.layer_norm_fp8_static_fp16_vec(
+                h_ptr, int(weights["norm3_w"][li]), int(weights["norm3_b"][li]),
+                xn_fp8_ptr, a_fc1, T, D, 1e-5, int(stream))
+            if rc != 0:
+                fvk.layer_norm_fp16(
+                    h_ptr, int(weights["norm3_w"][li]), int(weights["norm3_b"][li]),
+                    xn_ptr, T, D, 1e-5, int(stream))
+                fvk.quantize_fp8_static_fp16(xn_ptr, xn_fp8_ptr, a_fc1,
+                                             T * D, int(stream))
+        else:
+            fvk.layer_norm_fp16(
+                h_ptr, int(weights["norm3_w"][li]), int(weights["norm3_b"][li]),
+                xn_ptr, T, D, 1e-5, int(stream))
+            fvk.quantize_fp8_static_fp16(xn_ptr, xn_fp8_ptr, a_fc1, T * D, int(stream))
         if fused_epilogue:
             # FUSED: fc1 bias+GELU in epilogue; fc2 bias in epilogue.
             gemm.fp8_nn_gelu_bias(xn_fp8_ptr, int(weights["fc1_w"][li]),
@@ -571,17 +693,27 @@ def dit_forward(gemm, fvk, bufs, weights, dims,
     """AMD copy of :func:`flash_rt.models.groot_n17.pipeline_thor.dit_forward`
     with the bf16 GEMM+bias pairs fused into hipBLASLt epilogues.
 
-    Same signature, same buffers, same order. The ONLY change: every
-    ``gemm.bf16_nn`` followed by ``fvk.add_bias_bf16`` on the SAME output
-    becomes one ``gemm.bf16_nn_bias`` (and ``bf16_nn_bias_gelu`` where the
-    pair is followed by ``gelu_inplace`` on that output) — 6 sites per
-    bf16 layer: Q, K, V (self), O, FFN up (+GELU), FFN down. Each is
-    marked ``# AMD FUSED``. NUMERICS: the epilogue adds bias on the FP32
-    accumulator BEFORE the bf16 round (the decomposed pair adds it after)
-    — judged by the E2E gate, not bit-parity. The FP8/FP4 branches are
-    kept byte-identical for fidelity (dead on AMD: ``_DIT_USE_FP8=False``
-    and no fp4 weights are supplied). See the pipeline_thor docstring for
-    the full per-layer contract.
+    Same signature, same buffers, same order. Two changes vs the Thor
+    source, both marked ``# AMD FUSED``:
+
+      * every ``gemm.bf16_nn`` followed by ``fvk.add_bias_bf16`` on the
+        SAME output becomes one ``gemm.bf16_nn_bias`` (and
+        ``bf16_nn_bias_gelu`` where the pair is followed by
+        ``gelu_inplace`` on that output) — Q, K, V (self), FFN up (+GELU);
+      * where that biased GEMM's output is then only ``residual_add``-ed
+        into ``h`` (O proj, FFN down), the pair collapses further into
+        ``gemm.bf16_nn_bias_res`` writing straight into ``h`` (hipBLASLt
+        beta=1 residual accumulate; the ``o_proj_out`` intermediate write
+        and the res_add launch are dropped).
+
+    NUMERICS: the epilogue adds bias — and, for the ``_res`` sites, the
+    residual — on the FP32 accumulator BEFORE the bf16 round (the
+    decomposed forms round first) — judged by the E2E gate, not
+    bit-parity. The FP8/FP4 branch bodies are kept byte-identical for
+    fidelity (dead on AMD: ``_DIT_USE_FP8=False`` and no fp4 weights are
+    supplied); their shared trailing FFN ``residual_add`` remains as a
+    separate launch reachable only from those branches. See the
+    pipeline_thor docstring for the full per-layer contract.
     """
     Sa = int(dims["Sa"])
     D = int(dims["D"])
@@ -783,11 +915,16 @@ def dit_forward(gemm, fvk, bufs, weights, dims,
                 attn.run("dit_cross", j_attn, q_seq=Sa, kv_seq=kv_seq,
                          stream=int(stream))
 
-        # AMD FUSED: bf16_nn + add_bias_bf16 → bf16_nn_bias (O proj).
-        gemm.bf16_nn_bias(O_ptr, int(weights["o_w"][li]),
-                          o_out_ptr, int(weights["o_b"][li]),
-                          Sa, D, D, int(stream))
-        fvk.residual_add(h_ptr, o_out_ptr, Sa * D, int(stream))
+        # AMD FUSED: bf16_nn_bias + residual_add → bf16_nn_bias_res writing
+        # straight into h (beta=1 residual on the FP32 accumulator; the
+        # o_proj_out intermediate write and the res_add launch are both
+        # dropped — o_proj_out was consumed only by the res_add here).
+        # NUMERICS: the residual is added BEFORE the single bf16 round
+        # (decomposed rounds the GEMM output first) — same class as the
+        # bias epilogues, judged by the E2E gate.
+        gemm.bf16_nn_bias_res(O_ptr, int(weights["o_w"][li]),
+                              h_ptr, int(weights["o_b"][li]),
+                              Sa, D, D, int(stream))
 
         # ── Pre-FF LayerNorm (no affine — DiT default) ───────────────
         fvk.layer_norm_no_affine_bf16(
@@ -865,8 +1002,15 @@ def dit_forward(gemm, fvk, bufs, weights, dims,
             gemm.bf16_nn_bias_gelu(xn_ptr, int(weights["ff_proj_w"][li]),
                                    ff_out_ptr, int(weights["ff_proj_b"][li]),
                                    Sa, FF, D, int(stream))
-            # AMD FUSED: bf16_nn + add_bias_bf16 → bf16_nn_bias (FFN down).
-            gemm.bf16_nn_bias(ff_out_ptr, int(weights["ff_down_w"][li]),
-                              o_out_ptr, int(weights["ff_down_b"][li]),
-                              Sa, D, FF, int(stream))
+            # AMD FUSED: bf16_nn_bias + residual_add → bf16_nn_bias_res
+            # writing straight into h (FFN down; o_proj_out intermediate
+            # and the res_add launch dropped, residual added on the FP32
+            # accumulator — judged by the E2E gate).
+            gemm.bf16_nn_bias_res(ff_out_ptr, int(weights["ff_down_w"][li]),
+                                  h_ptr, int(weights["ff_down_b"][li]),
+                                  Sa, D, FF, int(stream))
+            continue
+        # FP8 FFN branches (dead on AMD, kept for fidelity): the down
+        # projection still lands in o_out_ptr, so the residual runs as
+        # the original separate launch.
         fvk.residual_add(h_ptr, o_out_ptr, Sa * D, int(stream))

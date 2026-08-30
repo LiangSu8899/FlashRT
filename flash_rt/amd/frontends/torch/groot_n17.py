@@ -619,7 +619,10 @@ class GrootN17TorchFrontendAmd(_GrootN17FP8BackboneMixin,
         # _bake_calibration (already run via _ensure_act_scales) composes
         # them as python floats: alpha = act_scale × w_scale per site per
         # layer. Key names parallel the scales_dev dicts. The llm stage is
-        # biasless (Qwen3) and always stays on descale GEMMs.
+        # biasless (Qwen3) and always stays on descale GEMMs; its
+        # fused_epilogue flag fuses the norm/residual+quantize chains
+        # instead (rms_norm_fp8_fp16 / residual_add_rms_norm_fp8_fp16 —
+        # no alphas needed).
         fused = _fused_epilogue_enabled()
         if fused:
             vit_alphas = {
@@ -821,7 +824,8 @@ class GrootN17TorchFrontendAmd(_GrootN17FP8BackboneMixin,
                     "HD": 128, "FF": 6144}
         P.qwen3vl_llm_forward(
             gemm=gemm, fvk=fvkm, bufs=llm_bufs, weights=lw,
-            scales_dev=llm_scales, dims=llm_dims, attn=attn)
+            scales_dev=llm_scales, dims=llm_dims, attn=attn,
+            fused_epilogue=fused)
 
         # ═══ vlln + VL self-attn (4L) ═══
         vlsa_h = buf(Se, 2048)
@@ -898,7 +902,7 @@ class GrootN17TorchFrontendAmd(_GrootN17FP8BackboneMixin,
             P.qwen3vl_llm_forward(
                 gemm=gemm, fvk=fvkm, bufs=llm_bufs, weights=lw,
                 scales_dev=llm_scales, dims=llm_dims, attn=attn,
-                stream=stream)
+                stream=stream, fused_epilogue=fused)
             P.vlln_forward(
                 gemm=gemm, fvk=fvkm, bufs=vlln_bufs,
                 weights=vlln_weights, dims=vlln_dims, stream=stream)

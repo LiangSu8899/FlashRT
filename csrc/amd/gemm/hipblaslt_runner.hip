@@ -140,7 +140,9 @@ GemmRunner::CachedGemm& GemmRunner::get_or_create_cached(GemmType type, int M, i
         HIPBLASLT_CHECK(hipblasLtMatrixLayoutCreate(&entry.op1_desc, HIP_R_8F_E4M3, K, M, K));
         HIPBLASLT_CHECK(hipblasLtMatrixLayoutCreate(&entry.D_desc, HIP_R_16F, N, M, N));
     } else {
-        // BF16_NN
+        // BF16_NN or BF16_NN_RES (identical descriptors — only the
+        // runtime beta differs; separate cache slots keep the tuned
+        // algos independent)
         HIPBLASLT_CHECK(hipblasLtMatmulDescCreate(&entry.matmul_desc, HIPBLAS_COMPUTE_32F, HIP_R_32F));
         HIPBLASLT_CHECK(hipblasLtMatmulDescSetAttribute(entry.matmul_desc, HIPBLASLT_MATMUL_DESC_TRANSA, &op_N, sizeof(op_N)));
         HIPBLASLT_CHECK(hipblasLtMatmulDescSetAttribute(entry.matmul_desc, HIPBLASLT_MATMUL_DESC_TRANSB, &op_N, sizeof(op_N)));
@@ -370,6 +372,29 @@ void GemmRunner::bf16_nn(void* A, void* B, void* D,
 }
 
 // ================================================================
+//  BF16 no-transpose with fused residual: D(M,N) += A(M,K) @ B(K,N)
+//  beta=1.0 accumulates the matmul into D on the FP32 accumulator,
+//  avoiding the BF16 round-trip of separate matmul + residual_add.
+//  Mirrors gemm_runner.cu:755-763 (cached BF16_NN_RES descriptor).
+//  Lazy autotune runs with beta=1.0 so the timed pick reflects the
+//  production epilogue; NOTE the timed loop's repeated D += A@B
+//  accumulates garbage into D — acceptable because first-shape calls
+//  happen only during pre-capture warmup whose outputs are discarded
+//  (see the header note).
+// ================================================================
+void GemmRunner::bf16_nn_res(void* A, void* B, void* D,
+                             int M, int N, int K, hipStream_t stream) {
+    auto& entry = get_or_create_cached(BF16_NN_RES, M, N, K);
+    if (lazy_autotune_ && !entry.tuned)
+        autotune_cached(entry, B, A, D, 1.0f, 1.0f, lazy_pool_);
+    float alpha = 1.0f, beta = 1.0f;
+    HIPBLASLT_CHECK(hipblasLtMatmul(handle_, entry.matmul_desc,
+        &alpha, B, entry.op0_desc, A, entry.op1_desc,
+        &beta, D, entry.D_desc, D, entry.D_desc,
+        &entry.algo, workspace_, workspace_size_, stream));
+}
+
+// ================================================================
 //  BF16 no-transpose with BIAS epilogue: D(M,N) = A(M,K) @ B(K,N) + bias(N)
 //  Uses EPILOGUE_BIAS to fuse bias addition into the GEMM.
 //  With the col-major swap, D_col is (N,M), so the epilogue bias vector
@@ -480,6 +505,67 @@ void GemmRunner::bf16_nn_bias_gelu(void* A, void* B, void* D, void* bias,
     }
 
     float alpha = 1.0f, beta = 0.0f;
+    HIPBLASLT_CHECK(hipblasLtMatmul(handle_, matmul_desc,
+        &alpha, B, op0_desc, A, op1_desc, &beta, D, D_desc, D, D_desc,
+        &heuristic.algo, workspace_, workspace_size_, stream));
+
+    hipblasLtMatmulPreferenceDestroy(preference);
+    hipblasLtMatrixLayoutDestroy(op0_desc);
+    hipblasLtMatrixLayoutDestroy(op1_desc);
+    hipblasLtMatrixLayoutDestroy(D_desc);
+    hipblasLtMatmulDescDestroy(matmul_desc);
+}
+
+// ================================================================
+//  BF16 GEMM + BIAS + residual: D(M,N) += A(M,K) @ B(K,N) + bias(N)
+//  EPILOGUE_BIAS combined with beta=1.0 — bias and the residual read
+//  of D both land on the FP32 accumulator before the single bf16
+//  round. Mirrors gemm_runner.cu:893-949 (per-call descriptors +
+//  heuristic top-1, same style as bf16_nn_bias above).
+// ================================================================
+void GemmRunner::bf16_nn_bias_res(void* A, void* B, void* D, void* bias,
+                                   int M, int N, int K, hipStream_t stream) {
+    hipblasLtMatmulDesc_t matmul_desc;
+    hipblasLtMatrixLayout_t op0_desc, op1_desc, D_desc;
+
+    HIPBLASLT_CHECK(hipblasLtMatmulDescCreate(&matmul_desc, HIPBLAS_COMPUTE_32F, HIP_R_32F));
+
+    hipblasOperation_t op_N = HIPBLAS_OP_N;
+
+    HIPBLASLT_CHECK(hipblasLtMatmulDescSetAttribute(matmul_desc, HIPBLASLT_MATMUL_DESC_TRANSA, &op_N, sizeof(op_N)));
+    HIPBLASLT_CHECK(hipblasLtMatmulDescSetAttribute(matmul_desc, HIPBLASLT_MATMUL_DESC_TRANSB, &op_N, sizeof(op_N)));
+
+    // Set BIAS epilogue with beta=1 for residual
+    hipblasLtEpilogue_t epilogue = HIPBLASLT_EPILOGUE_BIAS;
+    HIPBLASLT_CHECK(hipblasLtMatmulDescSetAttribute(matmul_desc, HIPBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue)));
+    HIPBLASLT_CHECK(hipblasLtMatmulDescSetAttribute(matmul_desc, HIPBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias)));
+    hipDataType bias_type = HIP_R_16BF;
+    HIPBLASLT_CHECK(hipblasLtMatmulDescSetAttribute(matmul_desc, HIPBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, &bias_type, sizeof(bias_type)));
+
+    HIPBLASLT_CHECK(hipblasLtMatrixLayoutCreate(&op0_desc, HIP_R_16BF, N, K, N));
+    HIPBLASLT_CHECK(hipblasLtMatrixLayoutCreate(&op1_desc, HIP_R_16BF, K, M, K));
+    HIPBLASLT_CHECK(hipblasLtMatrixLayoutCreate(&D_desc, HIP_R_16BF, N, M, N));
+
+    hipblasLtMatmulPreference_t preference;
+    HIPBLASLT_CHECK(hipblasLtMatmulPreferenceCreate(&preference));
+    HIPBLASLT_CHECK(hipblasLtMatmulPreferenceSetAttribute(preference,
+        HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace_size_, sizeof(workspace_size_)));
+
+    int returned_results = 0;
+    hipblasLtMatmulHeuristicResult_t heuristic;
+    HIPBLASLT_CHECK(hipblasLtMatmulAlgoGetHeuristic(handle_, matmul_desc,
+        op0_desc, op1_desc, D_desc, D_desc, preference, 1, &heuristic, &returned_results));
+
+    if (returned_results == 0) {
+        hipblasLtMatmulPreferenceDestroy(preference);
+        hipblasLtMatrixLayoutDestroy(op0_desc);
+        hipblasLtMatrixLayoutDestroy(op1_desc);
+        hipblasLtMatrixLayoutDestroy(D_desc);
+        hipblasLtMatmulDescDestroy(matmul_desc);
+        throw std::runtime_error("hipBLASLt bf16_nn_bias_res: no algorithm found");
+    }
+
+    float alpha = 1.0f, beta = 1.0f;
     HIPBLASLT_CHECK(hipblasLtMatmul(handle_, matmul_desc,
         &alpha, B, op0_desc, A, op1_desc, &beta, D, D_desc, D, D_desc,
         &heuristic.algo, workspace_, workspace_size_, stream));

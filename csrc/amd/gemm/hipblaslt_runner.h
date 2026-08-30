@@ -63,6 +63,20 @@ public:
                  int M, int N, int K,
                  hipStream_t stream = 0);
 
+    // BF16 with residual: D += A(M,K) @ B(K,N)  (row-major, no transpose)
+    // Fuses residual add into GEMM accumulator (FP32) via beta=1.0,
+    // avoiding the BF16 round-trip of a separate matmul + residual_add.
+    // Mirrors the CUDA class exactly (gemm_runner.h:85). Own cache slot
+    // (BF16_NN_RES) so lazy autotune times it with beta=1; NOTE the
+    // timed selection loop then repeatedly accumulates A@B into D — D
+    // holds garbage right after a lazy tune, which is fine for
+    // warmup/scratch passes (all first-shape calls happen pre-capture
+    // during warmup whose outputs are discarded) but means a lazy-tuned
+    // first call must not be trusted for numerics.
+    void bf16_nn_res(void* A, void* B, void* D,
+                     int M, int N, int K,
+                     hipStream_t stream = 0);
+
     // BF16 + BIAS epilogue: D = A(M,K) @ B(K,N) + bias(N)
     void bf16_nn_bias(void* A, void* B, void* D, void* bias,
                        int M, int N, int K,
@@ -72,6 +86,15 @@ public:
     void bf16_nn_bias_gelu(void* A, void* B, void* D, void* bias,
                             int M, int N, int K,
                             hipStream_t stream = 0);
+
+    // BF16 + BIAS + residual: D += A(M,K) @ B(K,N) + bias(N)
+    // hipBLASLt EPILOGUE_BIAS combined with beta=1.0 (bias and residual
+    // both land on the FP32 accumulator before the single bf16 round).
+    // Mirrors the CUDA class exactly (gemm_runner.h:100): per-call
+    // descriptors + heuristic top-1, same style as bf16_nn_bias above.
+    void bf16_nn_bias_res(void* A, void* B, void* D, void* bias,
+                           int M, int N, int K,
+                           hipStream_t stream = 0);
 
     // FP8 no-transpose: D_bf16 = A_fp8(M,K) @ B_fp8(K,N) with device scale pointers
     // Matches bf16_nn layout — B stored as (K,N), no transpose.
@@ -189,12 +212,16 @@ private:
 
     // ── GEMM descriptor + algorithm cache ──
     // Enum values match the CUDA class for the ported subset.
+    // BF16_NN_RES = 1 matches the CUDA enum (same descriptors as
+    // BF16_NN — only beta differs — but its own slot so lazy autotune
+    // times the beta=1 form separately).
     // MXFP4_NT_DEV is AMD-only (gfx950 native MX support, no CUDA
     // counterpart in the ported class) and uses the next free value.
     // FP16_NN = 4 matches the CUDA class; the CUDA fp8-with-fp16-out
     // cached type (FP8_NN_DEV_FP16) is 6 there, but 6 was already taken
     // by the AMD-only MXFP4_NT_DEV, so it takes the next free value 7.
-    enum GemmType { BF16_NN = 0, FP8_NN_DEV = 2, FP16_NN = 4,
+    enum GemmType { BF16_NN = 0, BF16_NN_RES = 1, FP8_NN_DEV = 2,
+                    FP16_NN = 4,
                     FP8_NT_DEV = 5, MXFP4_NT_DEV = 6, FP8_NN_DEV_FP16 = 7 };
 
     struct GemmKey {
