@@ -478,11 +478,14 @@ class Pi05TorchFrontendAmd:
         # gpu_arch are gfx950. Anything else computes garbage, not a
         # fallback (a forced hardware="amd_cdna4" on gfx942 fails here).
         from flash_rt.amd import flash_rt_amd_kernels as _fvk_gate
+        # Compare the base target only ("gfx950" from
+        # "gfx950:sramecc+:xnack-"); a prefix test would also accept a
+        # future "gfx9500".
         _dev_arch = str(_fvk_gate.device_arch())
         _build_arch = str(dict(_fvk_gate.build_info()).get("gpu_arch",
                                                            "unknown"))
-        if not (_dev_arch.startswith("gfx950")
-                and _build_arch.startswith("gfx950")):
+        if not (_dev_arch.split(":", 1)[0] == "gfx950"
+                and _build_arch.split(":", 1)[0] == "gfx950"):
             raise RuntimeError(
                 "Pi05TorchFrontendAmd is gfx950-only (CDNA4 / MI350-series): "
                 f"running device arch is {_dev_arch!r} and the extension "
