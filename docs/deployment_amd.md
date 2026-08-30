@@ -120,8 +120,10 @@ Both RTX strategies are supported, same semantics:
   ceiling, and a prompt exceeding the capacity raises instead of
   recapturing). The decoder runs the same custom split-KV kernel as
   exact mode (seqused pointer, FP8-out epilogue included); the encoder
-  attention falls back from aiter to masked sdpa in this mode.
-  Accuracy holds (cos vs the FP32 reference 0.9996, on par with exact).
+  runs the seqused variant of the MFMA flash kernel (masked sdpa stays
+  available via `FVK_AMD_FIXED_ENC_ATTN=sdpa`). At a right-sized
+  capacity the premium over exact mode is well under 1 ms, and accuracy
+  holds (cos vs the FP32 reference 0.9993, on par with exact).
 
 ### Environment knobs
 
@@ -130,11 +132,14 @@ Both RTX strategies are supported, same semantics:
 | `FVK_AMD_ATTN` | `aiter` | vision/encoder attention backend: `aiter` (CK-tile) or `sdpa` (torch fallback) |
 | `FVK_AMD_DEC_ATTN` | `custom` | decoder cross-attention: `custom` (hand-written split-KV flash, fastest) or backend default |
 | `FVK_AMD_ATTN_FP8OUT` | `1` | fuse the decoder attention output's FP8 quantize into the attention epilogue (bit-identical to the standalone quantize) |
+| `FVK_AMD_FIXED_ENC_ATTN` | `flash` | fixed-mode encoder attention: `flash` (MFMA flash kernel, seqused pointer) or `sdpa` (masked torch fallback) |
+| `FVK_AMD_CALIB_DET_ATTN` | `flash` | route the encoder site through the deterministic MFMA flash kernel during FP8 calibration so the collected scales are run-to-run stable; `off` calibrates on the library path |
 | `FVK_AMD_DEC_GEMM` | `mfma` | decoder small-M GEMMs: `mfma` (packed-weight MFMA kernels where measured faster) or `hipblaslt` |
 | `FLASHRT_FP8_NT_AUTOTUNE` | `auto` | timed hipBLASLt algorithm selection for the FP8 GEMMs at setup |
 | `FLASHRT_FP8_ALGO_POOL` | `16` | heuristic pool depth for the timed selection; deeper pools (64/128) find faster encoder algos but widen run-to-run pick variance |
 | `FVK_PI05_AMD_FORCE_BF16` | `0` | force the BF16 baseline regardless of `use_fp8` |
 | `FLASHRT_PI05_STATE_PROMPT_MODE` | — | overrides the `state_prompt_mode` constructor arg |
+| `FLASHRT_PI05_STATE_PROMPT_FIXED_MAX_LEN` | `200` | fixed-mode padded capacity in tokens; overrides `state_prompt_fixed_max_len` |
 
 `FRT_ATTN_NSPLIT` / `FRT_ATTN_FUSED` / `FRT_ATTN_REDUCE_ALT` are
 attention micro-bench knobs (A/B sweeps); leave them unset in production.
@@ -163,6 +168,13 @@ attention micro-bench knobs (A/B sweeps); leave them unset in production.
 
 Cross-run medians move ±0.2-0.35 ms with hipBLASLt's timed autotune
 picks; compare arms inside one process where possible.
+
+When judging output cosine against a saved reference, pin the denoise
+noise via `infer(obs, noise=...)` to the exact array the reference was
+generated with — a fresh random draw shifts cos by ~1e-3, which swamps
+real numerics differences. With pinned noise the FP8 band is
+0.9992-0.9994 across processes (residual: library-attention
+nondeterminism and autotune algorithm picks).
 
 ## HIP-vs-CUDA notes
 

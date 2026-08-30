@@ -1387,6 +1387,13 @@ class Pi05Pipeline:
         instead of fresh language tokens.
         """
         self._copy_lang_embeds_to_encoder_x(stream=stream)
+        # Every pre-calibration FP8 forward IS a calibration pass (dynamic
+        # quant writes the amax scales as a side effect), so the
+        # deterministic-attention window tracks exactly that predicate:
+        # nondeterministic library attention (aiter) would otherwise turn
+        # into permanent run-to-run scale jitter. Post-calibration forwards
+        # (warmup, capture) run the fast library path with frozen scales.
+        self.attn.set_calibrating(self.use_fp8 and not self.fp8_calibrated)
         self.vision_encoder(stream)
         self.transformer_encoder(stream)
         self.transformer_decoder(stream)

@@ -1184,12 +1184,21 @@ class Pi05TorchFrontendAmd:
         """:class:`ModelPrecisionSpec` captured at calibration time."""
         return getattr(self, "_precision_spec", None)
 
-    def infer(self, observation: dict, debug: bool = False) -> dict:
+    def infer(self, observation: dict, debug: bool = False,
+              noise: Optional[np.ndarray] = None) -> dict:
         """Run inference on a single observation.
 
         All GPU work happens on ``self._graph_torch_stream`` — the same
         stream the graph was captured on — so replay + pre/post D2D copies
         are serialized correctly.
+
+        ``noise``: optional ``(chunk_size, 32)`` array used as the denoise
+        starting point instead of a fresh random draw — the same contract
+        as openpi's ``policy.infer(example, noise=...)``. Serving wants the
+        default fresh draw (action diversity); parity/repro judging MUST
+        pin the noise, since the flow integration is conditioned on it and
+        a random draw adds ~1e-3-level cos-vs-reference lottery that is
+        indistinguishable from a real numerics regression.
         """
         if self.pipeline is None:
             raise RuntimeError("set_prompt must be called before infer")
@@ -1207,7 +1216,11 @@ class Pi05TorchFrontendAmd:
         with torch.cuda.stream(self._graph_torch_stream):
             stream_int = self._graph_torch_stream.cuda_stream
 
-            self._noise_buf.normal_()
+            if noise is not None:
+                self._noise_buf.copy_(torch.as_tensor(
+                    np.asarray(noise)).reshape(self._noise_buf.shape))
+            else:
+                self._noise_buf.normal_()
             self._copy_tensor_to_pipeline_buf_stream(
                 self._noise_buf, self.pipeline.input_noise_buf, stream_int)
 

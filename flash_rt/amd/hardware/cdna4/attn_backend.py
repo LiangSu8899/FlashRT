@@ -125,6 +125,7 @@ class Cdna4AttnBackend:
         #     to append the chunk K/V right after the valid prefix.
         # batch=1, so each is a single int32.
         self._fixed_shape = False
+        self._calibrating = False
         self.enc_seqused = torch.zeros(1, dtype=torch.int32, device=d)  # vis_enc+plen
         self.dec_seqused = torch.zeros(1, dtype=torch.int32, device=d)  # +chunk
         self.dec_devpos = torch.zeros(1, dtype=torch.int32, device=d)   # = enc_seqused
@@ -186,6 +187,19 @@ class Cdna4AttnBackend:
         each time it changes.
         """
         self._fixed_shape = bool(enabled)
+
+    def set_calibrating(self, enabled: bool) -> None:
+        """Mark the FP8-calibration window (deterministic-attention hint).
+
+        Quantization scales are derived from activation amax during the
+        calibration pass, so any run-to-run nondeterminism in an attention
+        site becomes permanent scale jitter. Backends whose attention
+        library is nondeterministic across processes (e.g. aiter) override
+        their site dispatch to a deterministic kernel while this flag is
+        set. The sdpa math here is already deterministic, so the base
+        implementation only records the flag.
+        """
+        self._calibrating = bool(enabled)
 
     def set_fixed_valid_len(self, valid_prefix_len: int) -> None:
         """Update the fixed-shape valid prefix length (host->device).

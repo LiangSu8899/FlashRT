@@ -77,6 +77,19 @@ without recapture), so each site needs a pointer-read mechanism:
 
 Exact-shape mode (one graph per prompt length) runs fully on
 aiter + the custom decoder kernel.
+
+CALIBRATION DETERMINISM
+-----------------------
+aiter's asm attention is nondeterministic ACROSS PROCESSES (graph
+replay within a process stays bit-stable). FP8 amax scales collected
+while it runs therefore jitter run-to-run — observed as an exact-mode
+cos-vs-reference band of ~0.997-0.999 versus ~0.9994+ on fully
+deterministic arms. During the calibration window (``set_calibrating``,
+driven by the pipeline's pre-calibration forwards) the ENCODER site
+routes to the deterministic MFMA flash kernel; vision stays on aiter
+(cleared as a jitter source by the deterministic fixed-mode arms) and
+the custom decoder kernel is deterministic already. Escape hatch:
+``FVK_AMD_CALIB_DET_ATTN=off``.
 """
 
 from __future__ import annotations
@@ -162,11 +175,27 @@ class Cdna4AiterAttnBackend(Cdna4AttnBackend):
         # FVK_AMD_FIXED_ENC_ATTN=sdpa keeps the masked-sdpa base path.
         from flash_rt.amd import flash_rt_amd_kernels as _fvk_ef
         self._fvk_ef = _fvk_ef
+        self._enc_flash_ok = (hasattr(_fvk_ef, "encoder_attention_flash")
+                              and self.enc_Q.shape[-1] == 256)
         self._fixed_enc_flash = (
             os.environ.get("FVK_AMD_FIXED_ENC_ATTN", "flash").strip().lower()
-            == "flash"
-            and hasattr(_fvk_ef, "encoder_attention_flash")
-            and self.enc_Q.shape[-1] == 256)
+            == "flash" and self._enc_flash_ok)
+
+        # Calibration-window determinism: aiter's asm attention is
+        # nondeterministic ACROSS PROCESSES (replay within a process is
+        # bit-stable), so encoder activations — and therefore the FP8
+        # amax scales collected during calibration — jitter from run to
+        # run. While set_calibrating(True) is active, the encoder site
+        # routes to the deterministic MFMA flash kernel instead, pinning
+        # the scales; capture/replay then run the fast aiter path with
+        # frozen scales. FVK_AMD_CALIB_DET_ATTN=off restores the old
+        # behaviour (calibrate on aiter). The vision site stays on aiter
+        # in both windows: the deterministic fixed-mode arms measured a
+        # tight cos band with aiter vision, clearing it as a jitter
+        # source; the custom decoder kernel is already deterministic.
+        self._calib_det = (
+            os.environ.get("FVK_AMD_CALIB_DET_ATTN", "flash").strip().lower()
+            != "off" and self._enc_flash_ok)
 
         # Fused FP8-out epilogue state (see set_decoder_fp8out). Disarmed
         # until the pipeline arms it post-calibration.
@@ -295,6 +324,19 @@ class Cdna4AiterAttnBackend(Cdna4AttnBackend):
                     31, self.enc_seqused.data_ptr())
                 return self._enc_O.data_ptr()
             return super().encoder_attn(layer_idx, seq, stream=stream)
+        if self._calibrating and self._calib_det:
+            # FP8-calibration window: deterministic MFMA flash kernel so
+            # the collected amax scales are run-to-run stable (seqused=0
+            # -> the full seq is valid; math identical to the fixed-mode
+            # route above). Never taken inside the captured graph.
+            self._fvk_ef.encoder_attention_flash(
+                self.enc_Q.data_ptr(),
+                self.enc_K[layer_idx].data_ptr(),
+                self.enc_V[layer_idx].data_ptr(),
+                self._enc_O.data_ptr(),
+                seq, self.enc_Q.shape[-2], self.enc_Q.shape[-1],
+                self._enc_scale, stream, 31, 0)
+            return self._enc_O.data_ptr()
         # (1, seq, 8, 256) vs (1, seq, 1, 256): native GQA, no expand.
         q = self.enc_Q[:seq].unsqueeze(0)
         k = self.enc_K[layer_idx, :seq].unsqueeze(0)
