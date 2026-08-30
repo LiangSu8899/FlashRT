@@ -2,9 +2,13 @@
 
 Production tier mirror of :class:`GrootN17TorchFrontendRtxFP8`: the whole
 VLM backbone (ViT / DeepStack / LLM / VL self-attn) runs through the AMD
-FP8 kernel surface via the decomposed descale form in
-:mod:`flash_rt.amd.models.groot_n17.pipeline`, and the DiT action head
-stays bf16 (``_DIT_USE_FP8 = False``) driven by the hardware-independent
+FP8 kernel surface via :mod:`flash_rt.amd.models.groot_n17.pipeline`
+(FUSED-EPILOGUE tier by default — bias / bias+GELU in the hipBLASLt FP8
+epilogue with host alphas; ``FVK_AMD_FUSED_EPILOGUE=0`` falls back to the
+decomposed descale form), and the DiT action head stays bf16
+(``_DIT_USE_FP8 = False``). The same env picks the DiT driver: fused on →
+the AMD-local ``dit_forward`` (``bf16_nn_bias`` / ``bf16_nn_bias_gelu``);
+off → the hardware-independent
 :func:`flash_rt.models.groot_n17.pipeline_thor.dit_forward` with the AMD
 kernel module passed in — every binding name the bf16 DiT path touches
 (``bf16_nn`` / ``add_bias_bf16`` / ``ada_layer_norm_bf16`` /
@@ -55,6 +59,8 @@ The FP8 / FP4 DiT quantization tiers of the base are NOT ported;
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from flash_rt.frontends.torch.groot_n17_thor import GrootN17TorchFrontendThor
@@ -62,6 +68,21 @@ from flash_rt.frontends.torch.groot_n17_rtx_fp8 import _GrootN17FP8BackboneMixin
 
 _FP16 = torch.float16
 _U8 = torch.uint8
+
+
+def _fused_epilogue_enabled() -> bool:
+    """FVK_AMD_FUSED_EPILOGUE gate (default ON) for BOTH fusions.
+
+    When on: the FP8 backbone forwards run with ``fused_epilogue=True``
+    (bias / bias+GELU in the hipBLASLt FP8 epilogue, host alphas) and the
+    DiT runs the AMD-local fused ``dit_forward`` (``bf16_nn_bias`` /
+    ``bf16_nn_bias_gelu``). One env flips both for the A/B against the
+    decomposed form. Read at setup time (set_prompt / graph build), never
+    on the hot path — flipping the env after graphs are built has no
+    effect on the built graphs.
+    """
+    return os.environ.get("FVK_AMD_FUSED_EPILOGUE", "1").strip().lower() \
+        not in ("0", "off", "false", "no")
 
 
 def _patch_hf_offline_model_info() -> None:
@@ -318,6 +339,17 @@ class GrootN17TorchFrontendAmd(_GrootN17FP8BackboneMixin,
         """
         from flash_rt.models.groot_n17 import pipeline_thor
 
+        # FVK_AMD_FUSED_EPILOGUE flips BOTH fusions (backbone + DiT) for
+        # the A/B: on → the AMD-local dit_forward (bf16_nn_bias /
+        # bf16_nn_bias_gelu fused epilogues); off → the byte-identical
+        # decomposed pipeline_thor.dit_forward. Only dit_forward is
+        # AMD-local; embodiment_* stages keep coming from pipeline_thor.
+        if _fused_epilogue_enabled():
+            from flash_rt.amd.models.groot_n17 import pipeline as _amd_pipeline
+            dit_forward = _amd_pipeline.dit_forward
+        else:
+            dit_forward = pipeline_thor.dit_forward
+
         if getattr(self, "_DIT_USE_FP8", False) or \
                 getattr(self, "_DIT_QUANT", "fp8") == "fp4":
             raise NotImplementedError(
@@ -434,7 +466,7 @@ class GrootN17TorchFrontendAmd(_GrootN17FP8BackboneMixin,
 
         def _step_fwd(step, s):
             _ae_fwd(step, s)
-            pipeline_thor.dit_forward(
+            dit_forward(
                 gemm=self._gemm, fvk=K, bufs=bp, weights=step_weights[step],
                 dims=dims, attn=self._dit_attn, stream=s)
             _post_fwd(step, s)
@@ -517,6 +549,38 @@ class GrootN17TorchFrontendAmd(_GrootN17FP8BackboneMixin,
             """Device act-scale scalar tensors → list of int ptrs."""
             return [t.data_ptr() for t in dev_list]
 
+        # ── FUSED-EPILOGUE tier (FVK_AMD_FUSED_EPILOGUE, default on) ──
+        # Host alphas for the fused fp8_nn_bias / fp8_nn_gelu_bias calls.
+        # _bake_calibration (already run via _ensure_act_scales) composes
+        # them as python floats: alpha = act_scale × w_scale per site per
+        # layer. Key names parallel the scales_dev dicts. The llm stage is
+        # biasless (Qwen3) and always stays on descale GEMMs.
+        fused = _fused_epilogue_enabled()
+        if fused:
+            vit_alphas = {
+                "act_qkv": [float(a) for a in self._vit_alpha_q],
+                "act_o":   [float(a) for a in self._vit_alpha_o],
+                "act_fc1": [float(a) for a in self._vit_alpha_fc1],
+                "act_fc2": [float(a) for a in self._vit_alpha_fc2],
+            }
+            ds_alphas = {
+                "act_fc1": [float(a) for a in self._dsm_alpha_fc1],
+                "act_fc2": [float(a) for a in self._dsm_alpha_fc2],
+            }
+            # vlsa Q/K/V have separate weight scales → per-layer 3-tuples.
+            vlsa_alphas = {
+                "act_qkv": [
+                    (float(q), float(k), float(v))
+                    for q, k, v in zip(self._vlsa_alpha_q,
+                                       self._vlsa_alpha_k,
+                                       self._vlsa_alpha_v)],
+                "act_o":   [float(a) for a in self._vlsa_alpha_o],
+                "act_fc1": [float(a) for a in self._vlsa_alpha_fc1],
+                "act_fc2": [float(a) for a in self._vlsa_alpha_fc2],
+            }
+        else:
+            vit_alphas = ds_alphas = vlsa_alphas = None
+
         # One backend for the whole model: backbone sites now, DiT sites
         # at first infer (reused by _build_dit_attn when Sa matches).
         n_text, n_image = self._dit_kv_split()
@@ -595,7 +659,8 @@ class GrootN17TorchFrontendAmd(_GrootN17FP8BackboneMixin,
             scales_dev=vit_scales,
             dims={"S": Sv, "D": 1024, "NH": 16, "HD": 64,
                   "ff_inner": 4096, "Sper_view": Sv // nv},
-            attn=attn, deepstack_taps=tap_layers, deepstack_capture=dcap)
+            attn=attn, deepstack_taps=tap_layers, deepstack_capture=dcap,
+            fused_epilogue=fused, alphas=vit_alphas)
 
         # ═══ DeepStack (3 mergers) ═══
         Nout = Sv // 4
@@ -622,7 +687,8 @@ class GrootN17TorchFrontendAmd(_GrootN17FP8BackboneMixin,
                    "Dmid": 4096, "Dout": 2048}
         P.deepstack_merge_forward(
             gemm=gemm, fvk=fvkm, bufs=ds_bufs,
-            weights=dsw, scales_dev=ds_scales, dims=ds_dims)
+            weights=dsw, scales_dev=ds_scales, dims=ds_dims,
+            fused_epilogue=fused, alphas=ds_alphas)
 
         # DeepStack inject buffers (S, D) — zero except visual positions.
         mask = self._visual_pos_masks
@@ -742,7 +808,8 @@ class GrootN17TorchFrontendAmd(_GrootN17FP8BackboneMixin,
                      "ff_inner": 8192}
         P.vl_self_attn_forward(
             gemm=gemm, fvk=fvkm, bufs=vlsa_bufs,
-            weights=vsw, scales_dev=vlsa_scales, dims=vlsa_dims, attn=attn)
+            weights=vsw, scales_dev=vlsa_scales, dims=vlsa_dims, attn=attn,
+            fused_epilogue=fused, alphas=vlsa_alphas)
         torch.cuda.synchronize()
 
         vit_dims = {"S": Sv, "D": 1024, "NH": 16, "HD": 64,
@@ -755,10 +822,11 @@ class GrootN17TorchFrontendAmd(_GrootN17FP8BackboneMixin,
                 gemm=gemm, fvk=fvkm, bufs=vit_bufs, weights=vw,
                 scales_dev=vit_scales, dims=vit_dims, attn=attn,
                 deepstack_taps=tap_layers, deepstack_capture=dcap,
-                stream=stream)
+                stream=stream, fused_epilogue=fused, alphas=vit_alphas)
             P.deepstack_merge_forward(
                 gemm=gemm, fvk=fvkm, bufs=ds_bufs, weights=dsw,
-                scales_dev=ds_scales, dims=ds_dims, stream=stream)
+                scales_dev=ds_scales, dims=ds_dims, stream=stream,
+                fused_epilogue=fused, alphas=ds_alphas)
             for j in range(3):
                 injb[j].zero_()
                 injb[j].index_copy_(0, vis_idx, ds_out[j])
@@ -772,7 +840,7 @@ class GrootN17TorchFrontendAmd(_GrootN17FP8BackboneMixin,
             P.vl_self_attn_forward(
                 gemm=gemm, fvk=fvkm, bufs=vlsa_bufs, weights=vsw,
                 scales_dev=vlsa_scales, dims=vlsa_dims, attn=attn,
-                stream=stream)
+                stream=stream, fused_epilogue=fused, alphas=vlsa_alphas)
             return vlsa_h
 
         self._kbb_forward = _kbb_forward

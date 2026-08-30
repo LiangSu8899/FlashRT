@@ -12,9 +12,21 @@ numerics-identical to the RTX production path:
     fvk.gelu_inplace_fp16(out, ...)                           # separate activation
 
 hipBLASLt does support fused fp8 bias/gelu epilogues (``fp8_nn_bias`` /
-``fp8_nn_gelu_bias``), but flipping to them is a LATER single-variable
-A/B — this pass keeps the descale + separate-epilogue form so the AMD
-numbers are directly comparable to the RTX-validated production path.
+``fp8_nn_gelu_bias``), and the biased forwards (vit / deepstack /
+vl_self_attn) now carry a FUSED-EPILOGUE tier behind the keyword-only
+``fused_epilogue`` switch (default False — the decomposed form stays the
+directly-RTX-comparable baseline). Fused form per biased GEMM site:
+
+    quantize_fp8_static_fp16(x, x_fp8, act_scale_devptr)          # unchanged
+    gemm.fp8_nn_bias(x_fp8, w_fp8, out, bias, M, N, K, alpha)     # bias in epilogue
+    gemm.fp8_nn_gelu_bias(...)                                    # bias+GELU sites
+
+with HOST ``alpha = act_scale * w_scale`` (python float) supplied through
+the ``alphas`` dict (key names parallel to ``scales_dev``; required when
+``fused_epilogue=True``). Numerics: the fused epilogue adds the bias on
+the FP32 accumulator BEFORE the fp16 round, whereas the decomposed form
+adds it AFTER rounding — slightly different, judged by the E2E gate, not
+bit-parity. The llm stage is biasless (Qwen3) and keeps descale GEMMs.
 
 Attention stays FP16 (the descale GEMM emits FP16 Q/K/V) and delegates
 to :class:`flash_rt.amd.hardware.cdna4.attn_backend_groot_n17.Cdna4GrootN17AttnBackend`.
@@ -73,7 +85,9 @@ def qwen3vl_vit_forward(gemm, fvk, bufs, weights, dims,
                         scales_dev, *, attn, stream: int = 0,
                         layers_subset=None,
                         deepstack_taps=(5, 11, 17),
-                        deepstack_capture=None) -> None:
+                        deepstack_capture=None,
+                        fused_epilogue: bool = False,
+                        alphas=None) -> None:
     """24-layer Qwen3-VL ViT, FP8 GEMMs via decomposed descale.
 
     Per layer (in-place residual on ``h``): LayerNorm → quantize → 3 split FP8
@@ -90,7 +104,22 @@ def qwen3vl_vit_forward(gemm, fvk, bufs, weights, dims,
                  (weight-scale dev ptrs); cos, sin (fp16 dev S×HD)
     scales_dev:  act_qkv, act_o, act_fc1, act_fc2 (lists of fp32 dev ptrs)
     dims:        S, D, NH, HD, ff_inner, Sper_view
+
+    fused_epilogue: replace every descale-GEMM + add_bias (+gelu) pair with
+        a single hipBLASLt fused-epilogue GEMM — ``fp8_nn_bias`` for the
+        Q/K/V/o/fc2 sites, ``fp8_nn_gelu_bias`` for fc1. Same buffers, no
+        extra scratch; the quantize front-end is unchanged. NUMERICS: the
+        epilogue adds bias on the FP32 accumulator BEFORE the fp16 round
+        (decomposed adds it after) — judged by the E2E gate, not bit-parity.
+    alphas: required iff ``fused_epilogue`` — per-site per-layer HOST float
+        lists, keys parallel to ``scales_dev``: act_qkv (one alpha for
+        q/k/v — shared fused-qkv weight scale), act_o, act_fc1, act_fc2;
+        each alpha = act_scale × w_scale.
     """
+    if fused_epilogue and alphas is None:
+        raise ValueError(
+            "qwen3vl_vit_forward: fused_epilogue=True requires host `alphas` "
+            "(act_qkv/act_o/act_fc1/act_fc2 per-layer float lists)")
     S  = int(dims["S"])
     D  = int(dims["D"])
     NH = int(dims["NH"])
@@ -122,17 +151,27 @@ def qwen3vl_vit_forward(gemm, fvk, bufs, weights, dims,
             h_ptr, int(weights["norm1_w"][li]), int(weights["norm1_b"][li]),
             xn_ptr, S, D, 1e-6, int(stream))
 
-        # ── Quantize xn once for Q/K/V; 3 split FP8 descale GEMMs + bias ──
+        # ── Quantize xn once for Q/K/V; 3 split FP8 GEMMs + bias ──
         fvk.quantize_fp8_static_fp16(xn_ptr, xn_fp8_ptr, a_qkv, S * D, int(stream))
-        gemm.fp8_descale_fp16(xn_fp8_ptr, int(weights["q_w"][li]), Q_ptr,
-                              S, D, D, a_qkv, int(weights["q_ws"][li]), int(stream))
-        fvk.add_bias_fp16(Q_ptr, int(weights["q_b"][li]), S, D, int(stream))
-        gemm.fp8_descale_fp16(xn_fp8_ptr, int(weights["k_w"][li]), K_ptr,
-                              S, D, D, a_qkv, int(weights["k_ws"][li]), int(stream))
-        fvk.add_bias_fp16(K_ptr, int(weights["k_b"][li]), S, D, int(stream))
-        gemm.fp8_descale_fp16(xn_fp8_ptr, int(weights["v_w"][li]), V_ptr,
-                              S, D, D, a_qkv, int(weights["v_ws"][li]), int(stream))
-        fvk.add_bias_fp16(V_ptr, int(weights["v_b"][li]), S, D, int(stream))
+        if fused_epilogue:
+            # FUSED: bias in the hipBLASLt epilogue, host alpha = act·w scale.
+            al_qkv = float(alphas["act_qkv"][li])
+            gemm.fp8_nn_bias(xn_fp8_ptr, int(weights["q_w"][li]), Q_ptr,
+                             int(weights["q_b"][li]), S, D, D, al_qkv, int(stream))
+            gemm.fp8_nn_bias(xn_fp8_ptr, int(weights["k_w"][li]), K_ptr,
+                             int(weights["k_b"][li]), S, D, D, al_qkv, int(stream))
+            gemm.fp8_nn_bias(xn_fp8_ptr, int(weights["v_w"][li]), V_ptr,
+                             int(weights["v_b"][li]), S, D, D, al_qkv, int(stream))
+        else:
+            gemm.fp8_descale_fp16(xn_fp8_ptr, int(weights["q_w"][li]), Q_ptr,
+                                  S, D, D, a_qkv, int(weights["q_ws"][li]), int(stream))
+            fvk.add_bias_fp16(Q_ptr, int(weights["q_b"][li]), S, D, int(stream))
+            gemm.fp8_descale_fp16(xn_fp8_ptr, int(weights["k_w"][li]), K_ptr,
+                                  S, D, D, a_qkv, int(weights["k_ws"][li]), int(stream))
+            fvk.add_bias_fp16(K_ptr, int(weights["k_b"][li]), S, D, int(stream))
+            gemm.fp8_descale_fp16(xn_fp8_ptr, int(weights["v_w"][li]), V_ptr,
+                                  S, D, D, a_qkv, int(weights["v_ws"][li]), int(stream))
+            fvk.add_bias_fp16(V_ptr, int(weights["v_b"][li]), S, D, int(stream))
 
         # ── Split-half RoPE on Q and K ──
         fvk.rope_rotate_half_fp16(Q_ptr, cos_ptr, sin_ptr, S, NH, HD, int(stream))
@@ -143,9 +182,15 @@ def qwen3vl_vit_forward(gemm, fvk, bufs, weights, dims,
 
         # ── O projection (FP8) ──
         fvk.quantize_fp8_static_fp16(O_ptr, xn_fp8_ptr, a_o, S * D, int(stream))
-        gemm.fp8_descale_fp16(xn_fp8_ptr, int(weights["o_w"][li]), o_proj_out,
-                              S, D, D, a_o, int(weights["o_ws"][li]), int(stream))
-        fvk.add_bias_fp16(o_proj_out, int(weights["o_b"][li]), S, D, int(stream))
+        if fused_epilogue:
+            # FUSED: o-proj bias in epilogue.
+            gemm.fp8_nn_bias(xn_fp8_ptr, int(weights["o_w"][li]), o_proj_out,
+                             int(weights["o_b"][li]), S, D, D,
+                             float(alphas["act_o"][li]), int(stream))
+        else:
+            gemm.fp8_descale_fp16(xn_fp8_ptr, int(weights["o_w"][li]), o_proj_out,
+                                  S, D, D, a_o, int(weights["o_ws"][li]), int(stream))
+            fvk.add_bias_fp16(o_proj_out, int(weights["o_b"][li]), S, D, int(stream))
         fvk.residual_add_fp16(h_ptr, o_proj_out, S * D, int(stream))
 
         # ── Pre-FF LayerNorm ──
@@ -155,14 +200,26 @@ def qwen3vl_vit_forward(gemm, fvk, bufs, weights, dims,
 
         # ── FF: D → FF (GELU) → D ──
         fvk.quantize_fp8_static_fp16(xn_ptr, xn_fp8_ptr, a_fc1, S * D, int(stream))
-        gemm.fp8_descale_fp16(xn_fp8_ptr, int(weights["fc1_w"][li]), fc1_out_ptr,
-                              S, FF, D, a_fc1, int(weights["fc1_ws"][li]), int(stream))
-        fvk.add_bias_fp16(fc1_out_ptr, int(weights["fc1_b"][li]), S, FF, int(stream))
-        fvk.gelu_inplace_fp16(fc1_out_ptr, S * FF, int(stream))
-        fvk.quantize_fp8_static_fp16(fc1_out_ptr, fc1_fp8_ptr, a_fc2, S * FF, int(stream))
-        gemm.fp8_descale_fp16(fc1_fp8_ptr, int(weights["fc2_w"][li]), o_proj_out,
-                              S, D, FF, a_fc2, int(weights["fc2_ws"][li]), int(stream))
-        fvk.add_bias_fp16(o_proj_out, int(weights["fc2_b"][li]), S, D, int(stream))
+        if fused_epilogue:
+            # FUSED: fc1 bias+GELU in epilogue; fc2 bias in epilogue.
+            gemm.fp8_nn_gelu_bias(xn_fp8_ptr, int(weights["fc1_w"][li]),
+                                  fc1_out_ptr, int(weights["fc1_b"][li]),
+                                  S, FF, D, float(alphas["act_fc1"][li]),
+                                  int(stream))
+            fvk.quantize_fp8_static_fp16(fc1_out_ptr, fc1_fp8_ptr, a_fc2,
+                                         S * FF, int(stream))
+            gemm.fp8_nn_bias(fc1_fp8_ptr, int(weights["fc2_w"][li]), o_proj_out,
+                             int(weights["fc2_b"][li]), S, D, FF,
+                             float(alphas["act_fc2"][li]), int(stream))
+        else:
+            gemm.fp8_descale_fp16(xn_fp8_ptr, int(weights["fc1_w"][li]), fc1_out_ptr,
+                                  S, FF, D, a_fc1, int(weights["fc1_ws"][li]), int(stream))
+            fvk.add_bias_fp16(fc1_out_ptr, int(weights["fc1_b"][li]), S, FF, int(stream))
+            fvk.gelu_inplace_fp16(fc1_out_ptr, S * FF, int(stream))
+            fvk.quantize_fp8_static_fp16(fc1_out_ptr, fc1_fp8_ptr, a_fc2, S * FF, int(stream))
+            gemm.fp8_descale_fp16(fc1_fp8_ptr, int(weights["fc2_w"][li]), o_proj_out,
+                                  S, D, FF, a_fc2, int(weights["fc2_ws"][li]), int(stream))
+            fvk.add_bias_fp16(o_proj_out, int(weights["fc2_b"][li]), S, D, int(stream))
         fvk.residual_add_fp16(h_ptr, o_proj_out, S * D, int(stream))
 
         # ── DeepStack tap callback ──
@@ -176,7 +233,9 @@ def qwen3vl_vit_forward(gemm, fvk, bufs, weights, dims,
 
 
 def deepstack_merge_forward(gemm, fvk, bufs, weights, dims,
-                            scales_dev, *, attn=None, stream: int = 0) -> None:
+                            scales_dev, *, attn=None, stream: int = 0,
+                            fused_epilogue: bool = False,
+                            alphas=None) -> None:
     """3 DeepStack mergers (taps ViT [5, 11, 17]) → 3 features for LLM [0,1,2].
 
     Per merger j: LayerNorm(4096) → quantize → FP8 fc1 (+bias, +GELU tanh) →
@@ -186,7 +245,18 @@ def deepstack_merge_forward(gemm, fvk, bufs, weights, dims,
     weights:    norm_w/b[j]; fc1/fc2_w[j] (fp8) + fc1/fc2_b[j]; fc1/fc2_ws[j]
     scales_dev: act_fc1[j], act_fc2[j]
     dims:       Nin, Din, Nout, Dmid, Dout
+
+    fused_epilogue: fold bias(+GELU) into the hipBLASLt epilogue —
+        ``fp8_nn_gelu_bias`` for fc1, ``fp8_nn_bias`` for fc2. Same buffers.
+        NUMERICS: bias is added on the FP32 accumulator BEFORE the fp16
+        round (decomposed adds it after) — judged by the E2E gate.
+    alphas: required iff ``fused_epilogue`` — HOST float lists keyed
+        act_fc1 / act_fc2 (per merger; alpha = act_scale × w_scale).
     """
+    if fused_epilogue and alphas is None:
+        raise ValueError(
+            "deepstack_merge_forward: fused_epilogue=True requires host "
+            "`alphas` (act_fc1/act_fc2 per-merger float lists)")
     Nout = int(dims["Nout"])
     Dmid = int(dims["Dmid"])
     Dout = int(dims["Dout"])
@@ -206,15 +276,26 @@ def deepstack_merge_forward(gemm, fvk, bufs, weights, dims,
             ln_out, Nout, Dmid, 1e-6, int(stream))
 
         fvk.quantize_fp8_static_fp16(ln_out, fp8_scratch, a_fc1, Nout * Dmid, int(stream))
-        gemm.fp8_descale_fp16(fp8_scratch, int(weights["fc1_w"][j]), fc1_out,
-                              Nout, Dmid, Dmid, a_fc1, int(weights["fc1_ws"][j]), int(stream))
-        fvk.add_bias_fp16(fc1_out, int(weights["fc1_b"][j]), Nout, Dmid, int(stream))
-        fvk.gelu_inplace_fp16(fc1_out, Nout * Dmid, int(stream))
+        if fused_epilogue:
+            # FUSED: fc1 bias+GELU in epilogue; fc2 bias in epilogue.
+            gemm.fp8_nn_gelu_bias(fp8_scratch, int(weights["fc1_w"][j]), fc1_out,
+                                  int(weights["fc1_b"][j]), Nout, Dmid, Dmid,
+                                  float(alphas["act_fc1"][j]), int(stream))
+            fvk.quantize_fp8_static_fp16(fc1_out, fp8_scratch, a_fc2,
+                                         Nout * Dmid, int(stream))
+            gemm.fp8_nn_bias(fp8_scratch, int(weights["fc2_w"][j]), out_ptr,
+                             int(weights["fc2_b"][j]), Nout, Dout, Dmid,
+                             float(alphas["act_fc2"][j]), int(stream))
+        else:
+            gemm.fp8_descale_fp16(fp8_scratch, int(weights["fc1_w"][j]), fc1_out,
+                                  Nout, Dmid, Dmid, a_fc1, int(weights["fc1_ws"][j]), int(stream))
+            fvk.add_bias_fp16(fc1_out, int(weights["fc1_b"][j]), Nout, Dmid, int(stream))
+            fvk.gelu_inplace_fp16(fc1_out, Nout * Dmid, int(stream))
 
-        fvk.quantize_fp8_static_fp16(fc1_out, fp8_scratch, a_fc2, Nout * Dmid, int(stream))
-        gemm.fp8_descale_fp16(fp8_scratch, int(weights["fc2_w"][j]), out_ptr,
-                              Nout, Dout, Dmid, a_fc2, int(weights["fc2_ws"][j]), int(stream))
-        fvk.add_bias_fp16(out_ptr, int(weights["fc2_b"][j]), Nout, Dout, int(stream))
+            fvk.quantize_fp8_static_fp16(fc1_out, fp8_scratch, a_fc2, Nout * Dmid, int(stream))
+            gemm.fp8_descale_fp16(fp8_scratch, int(weights["fc2_w"][j]), out_ptr,
+                                  Nout, Dout, Dmid, a_fc2, int(weights["fc2_ws"][j]), int(stream))
+            fvk.add_bias_fp16(out_ptr, int(weights["fc2_b"][j]), Nout, Dout, int(stream))
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -351,7 +432,9 @@ def qwen3vl_llm_forward(gemm, fvk, bufs, weights, dims,
 
 def vl_self_attn_forward(gemm, fvk, bufs, weights, dims,
                          scales_dev, *, attn, stream: int = 0,
-                         layers_subset=None) -> None:
+                         layers_subset=None,
+                         fused_epilogue: bool = False,
+                         alphas=None) -> None:
     """4-layer SelfAttentionTransformer, FP8 GEMMs via decomposed descale.
 
     Per layer: LayerNorm → quantize → FP8 Q/K/V (+bias, separate weight scales)
@@ -366,7 +449,22 @@ def vl_self_attn_forward(gemm, fvk, bufs, weights, dims,
                 q/k/v/o_ws, fc1/fc2_ws (weight-scale dev ptrs)
     scales_dev: act_qkv, act_o, act_fc1, act_fc2
     dims:       T, D, NH, HD, ff_inner
+
+    fused_epilogue: fold bias(+GELU for fc1) into the hipBLASLt epilogue —
+        ``fp8_nn_bias`` for Q/K/V/o/fc2, ``fp8_nn_gelu_bias`` for fc1. Same
+        buffers, no extra scratch. NUMERICS: bias added on the FP32
+        accumulator BEFORE the fp16 round (decomposed adds it after) —
+        judged by the E2E gate, not bit-parity.
+    alphas: required iff ``fused_epilogue`` — HOST floats, keys parallel to
+        ``scales_dev``: act_qkv is a per-layer list of ``(a_q, a_k, a_v)``
+        3-tuples (Q/K/V have SEPARATE weight scales here, so one shared
+        float cannot cover them); act_o / act_fc1 / act_fc2 are per-layer
+        float lists. Each alpha = act_scale × w_scale.
     """
+    if fused_epilogue and alphas is None:
+        raise ValueError(
+            "vl_self_attn_forward: fused_epilogue=True requires host `alphas` "
+            "(act_qkv 3-tuples + act_o/act_fc1/act_fc2 per-layer float lists)")
     T  = int(dims["T"])
     D  = int(dims["D"])
     FF = int(dims["ff_inner"])
@@ -394,25 +492,44 @@ def vl_self_attn_forward(gemm, fvk, bufs, weights, dims,
             xn_ptr, T, D, 1e-5, int(stream))
         fvk.quantize_fp8_static_fp16(xn_ptr, xn_fp8_ptr, a_qkv, T * D, int(stream))
 
-        # ── Q / K / V FP8 descale GEMMs + bias (separate weight scales) ──
-        gemm.fp8_descale_fp16(xn_fp8_ptr, int(weights["q_w"][li]), Q_ptr,
-                              T, D, D, a_qkv, int(weights["q_ws"][li]), int(stream))
-        fvk.add_bias_fp16(Q_ptr, int(weights["q_b"][li]), T, D, int(stream))
-        gemm.fp8_descale_fp16(xn_fp8_ptr, int(weights["k_w"][li]), K_ptr,
-                              T, D, D, a_qkv, int(weights["k_ws"][li]), int(stream))
-        fvk.add_bias_fp16(K_ptr, int(weights["k_b"][li]), T, D, int(stream))
-        gemm.fp8_descale_fp16(xn_fp8_ptr, int(weights["v_w"][li]), V_ptr,
-                              T, D, D, a_qkv, int(weights["v_ws"][li]), int(stream))
-        fvk.add_bias_fp16(V_ptr, int(weights["v_b"][li]), T, D, int(stream))
+        # ── Q / K / V FP8 GEMMs + bias (separate weight scales) ──
+        if fused_epilogue:
+            # FUSED: per-projection alphas (separate weight scales).
+            al_q, al_k, al_v = alphas["act_qkv"][li]
+            gemm.fp8_nn_bias(xn_fp8_ptr, int(weights["q_w"][li]), Q_ptr,
+                             int(weights["q_b"][li]), T, D, D,
+                             float(al_q), int(stream))
+            gemm.fp8_nn_bias(xn_fp8_ptr, int(weights["k_w"][li]), K_ptr,
+                             int(weights["k_b"][li]), T, D, D,
+                             float(al_k), int(stream))
+            gemm.fp8_nn_bias(xn_fp8_ptr, int(weights["v_w"][li]), V_ptr,
+                             int(weights["v_b"][li]), T, D, D,
+                             float(al_v), int(stream))
+        else:
+            gemm.fp8_descale_fp16(xn_fp8_ptr, int(weights["q_w"][li]), Q_ptr,
+                                  T, D, D, a_qkv, int(weights["q_ws"][li]), int(stream))
+            fvk.add_bias_fp16(Q_ptr, int(weights["q_b"][li]), T, D, int(stream))
+            gemm.fp8_descale_fp16(xn_fp8_ptr, int(weights["k_w"][li]), K_ptr,
+                                  T, D, D, a_qkv, int(weights["k_ws"][li]), int(stream))
+            fvk.add_bias_fp16(K_ptr, int(weights["k_b"][li]), T, D, int(stream))
+            gemm.fp8_descale_fp16(xn_fp8_ptr, int(weights["v_w"][li]), V_ptr,
+                                  T, D, D, a_qkv, int(weights["v_ws"][li]), int(stream))
+            fvk.add_bias_fp16(V_ptr, int(weights["v_b"][li]), T, D, int(stream))
 
         # ── MHA ──
         attn.run("vl_self_attn", li, q_seq=T, kv_seq=T, stream=int(stream))
 
         # ── O projection (FP8) ──
         fvk.quantize_fp8_static_fp16(O_ptr, xn_fp8_ptr, a_o, T * D, int(stream))
-        gemm.fp8_descale_fp16(xn_fp8_ptr, int(weights["o_w"][li]), o_proj_out,
-                              T, D, D, a_o, int(weights["o_ws"][li]), int(stream))
-        fvk.add_bias_fp16(o_proj_out, int(weights["o_b"][li]), T, D, int(stream))
+        if fused_epilogue:
+            # FUSED: o-proj bias in epilogue (vlsa).
+            gemm.fp8_nn_bias(xn_fp8_ptr, int(weights["o_w"][li]), o_proj_out,
+                             int(weights["o_b"][li]), T, D, D,
+                             float(alphas["act_o"][li]), int(stream))
+        else:
+            gemm.fp8_descale_fp16(xn_fp8_ptr, int(weights["o_w"][li]), o_proj_out,
+                                  T, D, D, a_o, int(weights["o_ws"][li]), int(stream))
+            fvk.add_bias_fp16(o_proj_out, int(weights["o_b"][li]), T, D, int(stream))
         fvk.residual_add_fp16(h_ptr, o_proj_out, T * D, int(stream))
 
         # ── Pre-FF LayerNorm + FF (GELU) ──
@@ -420,12 +537,336 @@ def vl_self_attn_forward(gemm, fvk, bufs, weights, dims,
             h_ptr, int(weights["norm3_w"][li]), int(weights["norm3_b"][li]),
             xn_ptr, T, D, 1e-5, int(stream))
         fvk.quantize_fp8_static_fp16(xn_ptr, xn_fp8_ptr, a_fc1, T * D, int(stream))
-        gemm.fp8_descale_fp16(xn_fp8_ptr, int(weights["fc1_w"][li]), fc1_out_ptr,
-                              T, FF, D, a_fc1, int(weights["fc1_ws"][li]), int(stream))
-        fvk.add_bias_fp16(fc1_out_ptr, int(weights["fc1_b"][li]), T, FF, int(stream))
-        fvk.gelu_inplace_fp16(fc1_out_ptr, T * FF, int(stream))
-        fvk.quantize_fp8_static_fp16(fc1_out_ptr, fc1_fp8_ptr, a_fc2, T * FF, int(stream))
-        gemm.fp8_descale_fp16(fc1_fp8_ptr, int(weights["fc2_w"][li]), o_proj_out,
-                              T, D, FF, a_fc2, int(weights["fc2_ws"][li]), int(stream))
-        fvk.add_bias_fp16(o_proj_out, int(weights["fc2_b"][li]), T, D, int(stream))
+        if fused_epilogue:
+            # FUSED: fc1 bias+GELU in epilogue; fc2 bias in epilogue.
+            gemm.fp8_nn_gelu_bias(xn_fp8_ptr, int(weights["fc1_w"][li]),
+                                  fc1_out_ptr, int(weights["fc1_b"][li]),
+                                  T, FF, D, float(alphas["act_fc1"][li]),
+                                  int(stream))
+            fvk.quantize_fp8_static_fp16(fc1_out_ptr, fc1_fp8_ptr, a_fc2,
+                                         T * FF, int(stream))
+            gemm.fp8_nn_bias(fc1_fp8_ptr, int(weights["fc2_w"][li]), o_proj_out,
+                             int(weights["fc2_b"][li]), T, D, FF,
+                             float(alphas["act_fc2"][li]), int(stream))
+        else:
+            gemm.fp8_descale_fp16(xn_fp8_ptr, int(weights["fc1_w"][li]), fc1_out_ptr,
+                                  T, FF, D, a_fc1, int(weights["fc1_ws"][li]), int(stream))
+            fvk.add_bias_fp16(fc1_out_ptr, int(weights["fc1_b"][li]), T, FF, int(stream))
+            fvk.gelu_inplace_fp16(fc1_out_ptr, T * FF, int(stream))
+            fvk.quantize_fp8_static_fp16(fc1_out_ptr, fc1_fp8_ptr, a_fc2, T * FF, int(stream))
+            gemm.fp8_descale_fp16(fc1_fp8_ptr, int(weights["fc2_w"][li]), o_proj_out,
+                                  T, D, FF, a_fc2, int(weights["fc2_ws"][li]), int(stream))
+            fvk.add_bias_fp16(o_proj_out, int(weights["fc2_b"][li]), T, D, int(stream))
         fvk.residual_add_fp16(h_ptr, o_proj_out, T * D, int(stream))
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# DiT (bf16) — AMD FUSED-EPILOGUE variant of pipeline_thor.dit_forward
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def dit_forward(gemm, fvk, bufs, weights, dims,
+                *, attn, stream: int = 0, layers_subset=None,
+                fvk_fp4=None) -> None:
+    """AMD copy of :func:`flash_rt.models.groot_n17.pipeline_thor.dit_forward`
+    with the bf16 GEMM+bias pairs fused into hipBLASLt epilogues.
+
+    Same signature, same buffers, same order. The ONLY change: every
+    ``gemm.bf16_nn`` followed by ``fvk.add_bias_bf16`` on the SAME output
+    becomes one ``gemm.bf16_nn_bias`` (and ``bf16_nn_bias_gelu`` where the
+    pair is followed by ``gelu_inplace`` on that output) — 6 sites per
+    bf16 layer: Q, K, V (self), O, FFN up (+GELU), FFN down. Each is
+    marked ``# AMD FUSED``. NUMERICS: the epilogue adds bias on the FP32
+    accumulator BEFORE the bf16 round (the decomposed pair adds it after)
+    — judged by the E2E gate, not bit-parity. The FP8/FP4 branches are
+    kept byte-identical for fidelity (dead on AMD: ``_DIT_USE_FP8=False``
+    and no fp4 weights are supplied). See the pipeline_thor docstring for
+    the full per-layer contract.
+    """
+    Sa = int(dims["Sa"])
+    D = int(dims["D"])
+    FF = int(dims["FF"])
+    Skv_text = int(dims.get("Skv_text", 0))
+    Skv_image = int(dims.get("Skv_image", 0))
+
+    h_ptr      = int(bufs["h"])
+    xn_ptr     = int(bufs["xn"])
+    o_out_ptr  = int(bufs["o_proj_out"])
+    ff_out_ptr = int(bufs["ff_proj_out"])
+
+    layer_iter = range(32) if layers_subset is None else list(layers_subset)
+
+    # NVFP4 fast path: every DiT GEMM (fused QKV / cross-Q / O / FFN up /
+    # FFN down) runs as a block-scaled NVFP4 GEMM with a fused bf16 bias
+    # epilogue. At M=Sa=41 the DiT is weight-bandwidth-bound, so halving
+    # the weight bytes is the dominant win; the fused epilogues (bias,
+    # bias+residual, bias+GELU+fp4out) and the fused norm->fp4 front-ends
+    # additionally remove most of the per-layer elementwise launches.
+    use_fp4 = fvk_fp4 is not None and "ff_proj_w_fp4" in weights
+
+    def _ck(rc, what, li):
+        if rc != 0:
+            raise RuntimeError(
+                f"N1.7 DiT FP4 {what} layer {li} failed rc={rc}")
+
+    for li in layer_iter:
+        is_self = (li % 2 == 1)
+        # Backend's ``dit_self`` and ``dit_cross`` sites are indexed
+        # cross-only / self-only (16 entries each, NOT the full 0..31
+        # layer index). Map here.
+        j_attn = (li - 1) // 2 if is_self else li // 2
+
+        if use_fp4:
+            xn_fp4, xn_sfa = int(bufs["xn_fp4"]), int(bufs["xn_sfa"])
+            slots = attn.get_slot_ptrs("dit_self" if is_self else "dit_cross",
+                                       j_attn)
+            Q_ptr, K_ptr, V_ptr, O_ptr = (slots["Q"], slots["K"], slots["V"],
+                                          slots["O"])
+            # AdaLN-modulated norm1 -> fp4 + SFA (one fused kernel).
+            rc = fvk_fp4.ada_layer_norm_fp4_sfa_bf16(
+                h_ptr, int(weights["scale_msa"][li]),
+                int(weights["shift_msa"][li]),
+                xn_fp4, xn_sfa, Sa, D, 1e-5, int(stream))
+            _ck(rc, "adaln", li)
+            if is_self:
+                j = (li - 1) // 2
+                rc = fvk_fp4.cutlass_fp4_gemm_bias_bf16(
+                    xn_fp4, xn_sfa,
+                    int(weights["qkv_w_fp4"][j]), int(weights["qkv_sfb"][j]),
+                    int(weights["qkv_b_fp4"][j]), int(bufs["qkv_buf"]),
+                    Sa, 3 * D, D, int(stream))
+                _ck(rc, "qkv", li)
+                if not bufs.get("qkv_strided"):
+                    # The self-attn slots normally alias the fused QKV
+                    # output (token stride 3D); split into packed per-slot
+                    # buffers only when they do not.
+                    fvk.gpu_strided_copy_fp16(int(bufs["qkv_buf"]), Q_ptr, Sa, D, 3 * D, 0, int(stream))
+                    fvk.gpu_strided_copy_fp16(int(bufs["qkv_buf"]), K_ptr, Sa, D, 3 * D, D, int(stream))
+                    fvk.gpu_strided_copy_fp16(int(bufs["qkv_buf"]), V_ptr, Sa, D, 3 * D, 2 * D, int(stream))
+                attn.run("dit_self", j_attn, q_seq=Sa, kv_seq=Sa,
+                         stream=int(stream))
+            else:
+                rc = fvk_fp4.cutlass_fp4_gemm_bias_bf16(
+                    xn_fp4, xn_sfa,
+                    int(weights["q_w_fp4"][j_attn]),
+                    int(weights["q_sfb"][j_attn]),
+                    int(weights["q_b"][li]), Q_ptr,
+                    Sa, D, D, int(stream))
+                _ck(rc, "q", li)
+                target_text = (li % 4 == 0)
+                kv_seq = Skv_text if target_text else Skv_image
+                attn.run("dit_cross", j_attn, q_seq=Sa, kv_seq=kv_seq,
+                         stream=int(stream))
+            # O projection: quantize the attention output, then fused
+            # bias + residual straight into h.
+            rc = fvk_fp4.quantize_fp4_dynamic_sfa_bf16_vec(
+                O_ptr, int(bufs["octx_fp4"]), int(bufs["octx_sfa"]),
+                Sa, D, False, int(stream))
+            _ck(rc, "o-quant", li)
+            rc = fvk_fp4.cutlass_fp4_gemm_bias_res_bf16(
+                int(bufs["octx_fp4"]), int(bufs["octx_sfa"]),
+                int(weights["o_w_fp4"][li]), int(weights["o_sfb"][li]),
+                int(weights["o_b"][li]), h_ptr, h_ptr,
+                Sa, D, D, int(stream))
+            _ck(rc, "o", li)
+            # FFN: LN -> fp4, up GEMM with fused bias+GELU+fp4out, down
+            # GEMM with fused bias+residual into h.
+            rc = fvk_fp4.layer_norm_no_affine_fp4_sfa_bf16(
+                h_ptr, xn_fp4, xn_sfa, Sa, D, 1e-5, int(stream))
+            _ck(rc, "ffn-ln", li)
+            rc = fvk_fp4.cutlass_fp4_gemm_bias_gelu_fp4out_bf16(
+                xn_fp4, xn_sfa,
+                int(weights["ff_proj_w_fp4"][li]),
+                int(weights["ff_proj_sfb"][li]),
+                int(weights["ff_proj_b"][li]),
+                int(bufs["hid_fp4"]), int(bufs["hid_sfa"]),
+                Sa, FF, D, int(stream))
+            _ck(rc, "ffn-up", li)
+            rc = fvk_fp4.cutlass_fp4_gemm_bias_res_bf16(
+                int(bufs["hid_fp4"]), int(bufs["hid_sfa"]),
+                int(weights["ff_down_w_fp4"][li]),
+                int(weights["ff_down_sfb"][li]),
+                int(weights["ff_down_b"][li]), h_ptr, h_ptr,
+                Sa, D, FF, int(stream))
+            _ck(rc, "ffn-down", li)
+            continue
+
+        # ── AdaLN modulated norm1 ─────────────────────────────────────
+        # For self-attn FP8 QKV, fuse the AdaLN and the FP8 quantize into one
+        # kernel — the AdaLN output feeds only the QKV projection, so it can
+        # be emitted directly as fp8 (one kernel instead of AdaLN + quantize).
+        # Cross-attn and the bf16 fallback keep the bf16 AdaLN.
+        is_self_fp8_sm120 = is_self and "qkv_w_fp8_nt" in weights
+        is_self_fp8 = is_self and ("qkv_w_fp8" in weights or is_self_fp8_sm120)
+        j_self = (li - 1) // 2
+        if is_self_fp8:
+            fvk.ada_layer_norm_fp8(
+                h_ptr, int(weights["scale_msa"][li]), int(weights["shift_msa"][li]),
+                int(bufs["qkv_xn_fp8"]), int(weights["act_qkv_scale"][j_self]),
+                Sa, D, 1e-5, int(stream),
+            )
+        else:
+            fvk.ada_layer_norm_bf16(
+                h_ptr,
+                int(weights["scale_msa"][li]), int(weights["shift_msa"][li]),
+                xn_ptr, Sa, D, 1e-5, int(stream),
+            )
+
+        # ── attention projections ─────────────────────────────────────
+        if is_self:
+            slots = attn.get_slot_ptrs("dit_self", j_attn)
+        else:
+            slots = attn.get_slot_ptrs("dit_cross", j_attn)
+        Q_ptr, K_ptr, V_ptr, O_ptr = slots["Q"], slots["K"], slots["V"], slots["O"]
+
+        # AMD delta vs pipeline_thor: hipBLASLt on gfx950 supports the bias
+        # (and bias+GELU) epilogue at M=Sa=41 — parity-validated GemmRunner
+        # entry points — so the bf16_nn + add_bias_bf16 pairs below run as
+        # single fused-epilogue GEMMs (the cuBLASLt M-alignment limitation
+        # that forced the decomposed form on Thor does not apply here).
+        if is_self_fp8_sm120:
+            gemm.fp8_nt_dev(
+                int(bufs["qkv_xn_fp8"]), int(weights["qkv_w_fp8_nt"][j_self]),
+                int(bufs["qkv_buf"]), Sa, 3 * D, D,
+                int(weights["act_qkv_scale"][j_self]),
+                int(weights["qkv_weight_scale"][j_self]), int(stream))
+            fvk.add_bias_bf16(
+                int(bufs["qkv_buf"]), int(weights["qkv_b"][j_self]),
+                Sa, 3 * D, int(stream))
+            fvk.gpu_strided_copy_fp16(int(bufs["qkv_buf"]), Q_ptr, Sa, D, 3 * D, 0, int(stream))
+            fvk.gpu_strided_copy_fp16(int(bufs["qkv_buf"]), K_ptr, Sa, D, 3 * D, D, int(stream))
+            fvk.gpu_strided_copy_fp16(int(bufs["qkv_buf"]), V_ptr, Sa, D, 3 * D, 2 * D, int(stream))
+            attn.run("dit_self", j_attn, q_seq=Sa, kv_seq=Sa, stream=int(stream))
+        elif is_self_fp8:
+            # Fused FP8 QKV (self-attn): q/k/v share the post-AdaLN input,
+            # so one [D, 3D] GEMM (compute-bound, unlike 3 launch-bound D→D
+            # GEMMs) + a strided split into the Q/K/V slots. Cross-attn keeps
+            # a single Q GEMM (K/V come from the backbone-projected cross-KV).
+            qkv_fp8_layout = str(weights.get("qkv_fp8_layout", "kn"))
+            if qkv_fp8_layout == "nk":
+                gemm.fp8_nt_dev(
+                    int(bufs["qkv_xn_fp8"]), int(weights["qkv_w_fp8"][j_self]),
+                    int(bufs["qkv_buf"]), Sa, 3 * D, D,
+                    int(weights["act_qkv_scale"][j_self]),
+                    int(weights["w_qkv_scale"][j_self]), int(stream))
+            else:
+                gemm.fp8_nn_dev(
+                    int(bufs["qkv_xn_fp8"]), int(weights["qkv_w_fp8"][j_self]),
+                    int(bufs["qkv_buf"]), Sa, 3 * D, D,
+                    int(weights["act_qkv_scale"][j_self]),
+                    int(weights["w_qkv_scale"][j_self]), int(stream))
+            fvk.add_bias_bf16(
+                int(bufs["qkv_buf"]), int(weights["qkv_b"][j_self]),
+                Sa, 3 * D, int(stream))
+            fvk.gpu_strided_copy_fp16(int(bufs["qkv_buf"]), Q_ptr, Sa, D, 3 * D, 0, int(stream))
+            fvk.gpu_strided_copy_fp16(int(bufs["qkv_buf"]), K_ptr, Sa, D, 3 * D, D, int(stream))
+            fvk.gpu_strided_copy_fp16(int(bufs["qkv_buf"]), V_ptr, Sa, D, 3 * D, 2 * D, int(stream))
+            attn.run("dit_self", j_attn, q_seq=Sa, kv_seq=Sa, stream=int(stream))
+        else:
+            # AMD FUSED: bf16_nn + add_bias_bf16 → bf16_nn_bias (Q).
+            gemm.bf16_nn_bias(xn_ptr, int(weights["q_w"][li]),
+                              Q_ptr, int(weights["q_b"][li]),
+                              Sa, D, D, int(stream))
+            if is_self:
+                # AMD FUSED: bf16_nn + add_bias_bf16 → bf16_nn_bias (K).
+                gemm.bf16_nn_bias(xn_ptr, int(weights["k_w"][li]),
+                                  K_ptr, int(weights["k_b"][li]),
+                                  Sa, D, D, int(stream))
+                # AMD FUSED: bf16_nn + add_bias_bf16 → bf16_nn_bias (V).
+                gemm.bf16_nn_bias(xn_ptr, int(weights["v_w"][li]),
+                                  V_ptr, int(weights["v_b"][li]),
+                                  Sa, D, D, int(stream))
+                attn.run("dit_self", j_attn, q_seq=Sa, kv_seq=Sa, stream=int(stream))
+            else:
+                target_text = (li % 4 == 0)
+                kv_seq = Skv_text if target_text else Skv_image
+                attn.run("dit_cross", j_attn, q_seq=Sa, kv_seq=kv_seq,
+                         stream=int(stream))
+
+        # AMD FUSED: bf16_nn + add_bias_bf16 → bf16_nn_bias (O proj).
+        gemm.bf16_nn_bias(O_ptr, int(weights["o_w"][li]),
+                          o_out_ptr, int(weights["o_b"][li]),
+                          Sa, D, D, int(stream))
+        fvk.residual_add(h_ptr, o_out_ptr, Sa * D, int(stream))
+
+        # ── Pre-FF LayerNorm (no affine — DiT default) ───────────────
+        fvk.layer_norm_no_affine_bf16(
+            h_ptr, xn_ptr, Sa, D, 1e-5, int(stream),
+        )
+
+        # ── FFN: GELU(tanh-approx) ────────────────────────────────────
+        # The FFN GEMMs are the compute-bound part of the (M=41) DiT, so an
+        # FP8 path here is a real win (≈1.8× on the up-projection) and fuses
+        # the bias+GELU into the GEMM epilogue. Activated when calibrated FP8
+        # FFN weights/scales are supplied; otherwise the bf16 path runs. The
+        # attention GEMMs stay bf16 — at M=41 they are launch-bound, so FP8
+        # gives no speedup there.
+        if "ff_proj_w_fp8_sm120" in weights:
+            fvk.quantize_fp8_static(
+                xn_ptr, int(bufs["xn_fp8"]),
+                int(weights["act_fc1_scale"][li]), Sa * D, int(stream))
+            gemm.fp8_descale_fp16(
+                int(bufs["xn_fp8"]), int(weights["ff_proj_w_fp8_sm120"][li]),
+                int(bufs["ff_fp16"]), Sa, FF, D,
+                int(weights["act_fc1_scale"][li]),
+                int(weights["ff_proj_weight_scale"][li]), int(stream))
+            fvk.add_bias_fp16(
+                int(bufs["ff_fp16"]), int(weights["ff_proj_b"][li]),
+                Sa, FF, int(stream))
+            fvk.gelu_inplace_fp16(int(bufs["ff_fp16"]), Sa * FF, int(stream))
+            fvk.quantize_fp8_static_fp16(
+                int(bufs["ff_fp16"]), int(bufs["ff_fp8"]),
+                int(weights["act_fc2_scale"][li]), Sa * FF, int(stream))
+            gemm.fp8_nt_dev(
+                int(bufs["ff_fp8"]), int(weights["ff_down_w_fp8_nt"][li]),
+                o_out_ptr, Sa, D, FF,
+                int(weights["act_fc2_scale"][li]),
+                int(weights["ff_down_weight_scale"][li]), int(stream))
+            fvk.add_bias_bf16(o_out_ptr, int(weights["ff_down_b"][li]),
+                              Sa, D, int(stream))
+        elif "ff_proj_w_fp8" in weights:
+            ff_fp8_layout = str(weights.get("ff_fp8_layout", "kn"))
+            fvk.quantize_fp8_static(
+                xn_ptr, int(bufs["xn_fp8"]),
+                int(weights["act_fc1_scale"][li]), Sa * D, int(stream))
+            if ff_fp8_layout == "nk":
+                gemm.fp8_nt_dev(
+                    int(bufs["xn_fp8"]), int(weights["ff_proj_w_fp8"][li]),
+                    ff_out_ptr, Sa, FF, D,
+                    int(weights["act_fc1_scale"][li]),
+                    int(weights["w_fc1_scale"][li]), int(stream))
+            else:
+                gemm.fp8_nn_dev(
+                    int(bufs["xn_fp8"]), int(weights["ff_proj_w_fp8"][li]),
+                    ff_out_ptr, Sa, FF, D,
+                    int(weights["act_fc1_scale"][li]),
+                    int(weights["w_fc1_scale"][li]), int(stream))
+            fvk.bias_gelu_quantize_fp8_static_bf16(
+                ff_out_ptr, int(weights["ff_proj_b"][li]),
+                int(bufs["ff_fp8"]), int(weights["act_fc2_scale"][li]),
+                Sa, FF, int(stream))
+            if ff_fp8_layout == "nk":
+                gemm.fp8_nt_dev(
+                    int(bufs["ff_fp8"]), int(weights["ff_down_w_fp8"][li]),
+                    o_out_ptr, Sa, D, FF,
+                    int(weights["act_fc2_scale"][li]),
+                    int(weights["w_fc2_scale"][li]), int(stream))
+            else:
+                gemm.fp8_nn_dev(
+                    int(bufs["ff_fp8"]), int(weights["ff_down_w_fp8"][li]),
+                    o_out_ptr, Sa, D, FF,
+                    int(weights["act_fc2_scale"][li]),
+                    int(weights["w_fc2_scale"][li]), int(stream))
+            fvk.add_bias_bf16(o_out_ptr, int(weights["ff_down_b"][li]),
+                              Sa, D, int(stream))
+        else:
+            # AMD FUSED: bf16_nn + add_bias_bf16 + gelu_inplace →
+            # bf16_nn_bias_gelu (FFN up).
+            gemm.bf16_nn_bias_gelu(xn_ptr, int(weights["ff_proj_w"][li]),
+                                   ff_out_ptr, int(weights["ff_proj_b"][li]),
+                                   Sa, FF, D, int(stream))
+            # AMD FUSED: bf16_nn + add_bias_bf16 → bf16_nn_bias (FFN down).
+            gemm.bf16_nn_bias(ff_out_ptr, int(weights["ff_down_w"][li]),
+                              o_out_ptr, int(weights["ff_down_b"][li]),
+                              Sa, D, FF, int(stream))
+        fvk.residual_add(h_ptr, o_out_ptr, Sa * D, int(stream))
