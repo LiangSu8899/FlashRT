@@ -54,8 +54,12 @@ Omitting `aux` from `infer` reuses the backbone features computed at
 
 ## Precision
 
-The production tier is an **FP8 backbone with a bf16 DiT action head**,
-mirroring the validated RTX tier:
+The tier here is an **FP8 backbone with an unquantized bf16 DiT action
+head**. Note this is deliberately *less* quantized than the Thor and RTX
+FP8 frontends, which additionally run the DiT FFN and fused
+self-attention QKV in FP8 (`_DIT_USE_FP8 = True`); that DiT calibration
+path is not ported to CDNA4 yet, so it remains available headroom rather
+than a shipped capability.
 
 - ViT, DeepStack mergers, the truncated LLM and the VL self-attention
   adapter run FP8 GEMMs with per-tensor activation scales.

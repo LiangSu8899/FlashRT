@@ -1,6 +1,6 @@
 """FlashRT AMD -- GROOT N1.7 FP8 torch frontend for CDNA4 (MI350X, gfx950).
 
-Production tier mirror of :class:`GrootN17TorchFrontendRtxFP8`: the whole
+FP8 kernel backbone with an unquantized bf16 action head. The whole
 VLM backbone (ViT / DeepStack / LLM / VL self-attn) runs through the AMD
 FP8 kernel surface via :mod:`flash_rt.amd.models.groot_n17.pipeline`
 (FUSED-EPILOGUE tier by default — bias / bias+GELU in the hipBLASLt FP8
@@ -59,6 +59,7 @@ The FP8 / FP4 DiT quantization tiers of the base are NOT ported;
 
 from __future__ import annotations
 
+import contextlib
 import os
 
 import torch
@@ -85,49 +86,55 @@ def _fused_epilogue_enabled() -> bool:
         not in ("0", "off", "false", "no")
 
 
-def _patch_hf_offline_model_info() -> None:
-    """Tolerate huggingface_hub offline mode in transformers 4.57.3.
+@contextlib.contextmanager
+def _offline_tolerant_model_info():
+    """Scope a workaround for a transformers offline-mode bug.
 
-    Tokenizer loading in transformers 4.57.3 calls
+    Tokenizer loading in transformers 4.57.x calls
     ``huggingface_hub.model_info`` without catching
     ``OfflineModeIsEnabled``, so ``HF_HUB_OFFLINE=1`` breaks
-    ``AutoProcessor.from_pretrained`` even when every file is local.
-    The caller only reads ``.tags``, so degrade to a ``tags=None`` stub
-    when offline. This frontend triggers processor loading through the
-    inherited ``denormalize_action`` → ``_hf_processor`` path, hence the
-    patch lives here. Idempotent (guarded by a marker attribute).
+    ``AutoProcessor.from_pretrained`` even when every file is already in
+    the local cache. The caller only reads ``.tags``, so within this
+    context an offline lookup degrades to a ``tags=None`` stub.
+
+    The substitution is installed for the duration of one processor load
+    and restored in ``finally`` — it never outlives the call, so other
+    code in the process keeps the real ``model_info`` (and keeps seeing
+    genuine offline errors). Any exception other than
+    ``OfflineModeIsEnabled`` still propagates.
     """
     try:
         import huggingface_hub as hh
         from huggingface_hub.errors import OfflineModeIsEnabled
     except ImportError:
+        yield
         return
-    if getattr(hh.model_info, "_flashrt_offline_tolerant", False):
-        return
-    orig_model_info = hh.model_info
 
-    def _tolerant_model_info(*args, **kwargs):
+    original = hh.model_info
+
+    def _tolerant(*args, **kwargs):
         try:
-            return orig_model_info(*args, **kwargs)
+            return original(*args, **kwargs)
         except OfflineModeIsEnabled:
             class _Stub:
                 tags = None
             return _Stub()
 
-    _tolerant_model_info._flashrt_offline_tolerant = True
-    hh.model_info = _tolerant_model_info
-
-
-_patch_hf_offline_model_info()
+    hh.model_info = _tolerant
+    try:
+        yield
+    finally:
+        hh.model_info = original
 
 
 class GrootN17TorchFrontendAmd(_GrootN17FP8BackboneMixin,
                                GrootN17TorchFrontendThor):
     """N1.7 CDNA4 frontend: FP8 kernel backbone + bf16 DiT action head."""
 
-    # The DiT stays bf16 on AMD — the production tier is FP8 backbone +
-    # bf16 DiT, mirroring GrootN17TorchFrontendRtxFP8's dtype split. The
-    # FP8-FFN/QKV DiT calibration path of the Thor base is not ported.
+    # The DiT runs unquantized bf16 on AMD. NOTE this is a weaker tier
+    # than the Thor/RTX FP8 frontends, which inherit _DIT_USE_FP8 = True
+    # and quantize the DiT FFN and fused self-attention QKV as well; that
+    # calibration path is not ported to CDNA4 yet.
     _DIT_USE_FP8 = False
 
     # Default DiT token count (1 state + 40 action tokens) used to size
@@ -151,11 +158,14 @@ class GrootN17TorchFrontendAmd(_GrootN17FP8BackboneMixin,
         # fallback (a forced hardware="amd_cdna4" on gfx942 fails here).
         # This runs ahead of super().__init__, which loads weights.
         from flash_rt.amd import flash_rt_amd_kernels as _fvk_gate
+        # Compare the base target only ("gfx950" from
+        # "gfx950:sramecc+:xnack-"); a prefix test would also accept a
+        # future "gfx9500".
         _dev_arch = str(_fvk_gate.device_arch())
         _build_arch = str(dict(_fvk_gate.build_info()).get("gpu_arch",
                                                            "unknown"))
-        if not (_dev_arch.startswith("gfx950")
-                and _build_arch.startswith("gfx950")):
+        if not (_dev_arch.split(":", 1)[0] == "gfx950"
+                and _build_arch.split(":", 1)[0] == "gfx950"):
             raise RuntimeError(
                 "GrootN17TorchFrontendAmd is gfx950-only (CDNA4 / "
                 f"MI350-series): running device arch is {_dev_arch!r} and "
@@ -199,6 +209,20 @@ class GrootN17TorchFrontendAmd(_GrootN17FP8BackboneMixin,
     # ────────────────────────────────────────────────────────────────
     # Attention backend (single instance, all 5 sites)
     # ────────────────────────────────────────────────────────────────
+
+    def _hf_processor(self):
+        """Build the HF processor with the offline lookup scoped.
+
+        Identical to the base implementation apart from the surrounding
+        context manager, which contains the transformers offline-mode
+        workaround to this one call (see
+        :func:`_offline_tolerant_model_info`) instead of mutating
+        ``huggingface_hub`` for the whole process.
+        """
+        if hasattr(self, "_hf_proc_cached"):
+            return self._hf_proc_cached
+        with _offline_tolerant_model_info():
+            return super()._hf_processor()
 
     def _dit_kv_split(self) -> tuple:
         """(num_text_tokens, num_image_tokens) from the prompt's mask."""
