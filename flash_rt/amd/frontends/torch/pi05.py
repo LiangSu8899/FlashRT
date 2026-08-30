@@ -469,7 +469,8 @@ class Pi05TorchFrontendAmd:
                  use_fp8: bool = True,
                  hardware: Optional[str] = None,
                  fp8_layout: Optional[str] = None,
-                 state_prompt_mode: str = "exact"):
+                 state_prompt_mode: str = "exact",
+                 state_prompt_fixed_max_len: Optional[int] = None):
         checkpoint_dir = pathlib.Path(checkpoint_dir)
         # State-in-prompt graph strategy (Pi0.5 renders robot state into the
         # prompt, so its token length drifts with the state values):
@@ -486,6 +487,25 @@ class Pi05TorchFrontendAmd:
             raise ValueError(
                 f"state_prompt_mode must be 'fixed' or 'exact', got {_spm!r}")
         self._state_prompt_mode = _spm
+        # Fixed-mode padded prompt capacity. The one-graph strategy pays
+        # per padded token through the whole encoder, so right-sizing
+        # this to the deployment's real prompt+state length (instead of
+        # the PI05_STATE_PROMPT_MAX_LEN=200 ceiling) is the main
+        # fixed-mode latency lever. Same semantics as the Thor frontend;
+        # env override FLASHRT_PI05_STATE_PROMPT_FIXED_MAX_LEN.
+        _fixed_cap = PI05_STATE_PROMPT_MAX_LEN
+        if _spm == "fixed":
+            _fixed_cap = os.environ.get(
+                "FLASHRT_PI05_STATE_PROMPT_FIXED_MAX_LEN",
+                state_prompt_fixed_max_len)
+            if _fixed_cap is None:
+                _fixed_cap = PI05_STATE_PROMPT_MAX_LEN
+            _fixed_cap = int(_fixed_cap)
+            if _fixed_cap <= 0:
+                raise ValueError(
+                    "state_prompt_fixed_max_len must be a positive integer, "
+                    f"got {_fixed_cap}")
+        self._state_prompt_fixed_max_len = _fixed_cap
         self.num_views = int(num_views)
         self.chunk_size = int(chunk_size)
         self.max_prompt_len = int(max_prompt_len)
@@ -815,8 +835,12 @@ class Pi05TorchFrontendAmd:
 
     def set_prompt(self, prompt_text: str, state=None) -> None:
         """Tokenise prompt + (re)build the pipeline for the exact prompt length."""
-        max_len = (PI05_STATE_PROMPT_MAX_LEN if state is not None
-                   else MAX_PROMPT_LEN_DEFAULT)
+        if state is not None:
+            max_len = (self._state_prompt_fixed_max_len
+                       if self._state_prompt_mode == "fixed"
+                       else PI05_STATE_PROMPT_MAX_LEN)
+        else:
+            max_len = MAX_PROMPT_LEN_DEFAULT
         embeds, prompt_len = _embed_prompt(
             prompt_text, self.embedding_weight, max_len=max_len, state=state)
 
@@ -853,16 +877,24 @@ class Pi05TorchFrontendAmd:
         backend the per-length pipeline has since touched and would also
         perturb numerics via autotune variance.
         """
-        self._ensure_prompt_capacity(PI05_STATE_PROMPT_MAX_LEN)
+        cap = self._state_prompt_fixed_max_len
+        if prompt_len > cap:
+            raise ValueError(
+                f"fixed-mode prompt+state is {prompt_len} tokens but the "
+                f"padded graph capacity is {cap}; raise "
+                "state_prompt_fixed_max_len (or the "
+                "FLASHRT_PI05_STATE_PROMPT_FIXED_MAX_LEN env) — the graph "
+                "is captured once at this capacity and cannot grow.")
+        self._ensure_prompt_capacity(cap)
         if self._fixed_pipeline is None:
             logger.info("Building fixed-shape Pi05Pipeline (max_prompt_len=%d)...",
-                        PI05_STATE_PROMPT_MAX_LEN)
+                        cap)
             pipeline_weights = self._build_pipeline_weights()
             self._fixed_pipeline = Pi05Pipeline(
                 gemm=self.gemm, fvk=self.fvk, attn_backend=self.attn_backend,
                 weights=pipeline_weights,
                 num_views=self.num_views,
-                max_prompt_len=PI05_STATE_PROMPT_MAX_LEN,
+                max_prompt_len=cap,
                 chunk_size=self.chunk_size,
                 num_steps=self._num_steps,
                 vision_pool_factor=self._vision_pool_factor,

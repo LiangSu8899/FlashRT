@@ -73,7 +73,17 @@ void encoder_attention_flash_kernel(
     const __hip_bfloat16* __restrict__ K,
     const __hip_bfloat16* __restrict__ V,
     __hip_bfloat16* __restrict__ O,
-    int S, int Hq, float scale, int mask) {
+    int S, int Hq, float scale, int mask,
+    const int* __restrict__ seqused) {
+    // Runtime valid length (FA2 seqused contract): S stays the padded
+    // capacity that sized the grid; the device value masks compute.
+    // Uniform across the workgroup, so the derived loop bounds and
+    // barriers stay convergent.
+    const int Scap = S;   // padded capacity (grid/store bound)
+    if (seqused != nullptr) {
+        const int se = seqused[0];
+        if (se > 0 && se < S) S = se;
+    }
     extern __shared__ unsigned char lds_raw[];
     EfaLds& lds = *reinterpret_cast<EfaLds*>(lds_raw);
 
@@ -268,22 +278,26 @@ void encoder_attention_flash_kernel(
         }
     }
 
-    // ── Epilogue: O = acc / l, store valid q rows ──
+    // ── Epilogue: O = acc / l for valid q rows; pad rows in
+    // [S, Scap) are ZEROED (never skipped) so downstream consumers of
+    // the padded buffer — including FP8 calibration's absmax — see
+    // well-defined finite values instead of stale/NaN memory. ──
     #pragma unroll
     for (int i = 0; i < 4; ++i) {
         const int m = 4 * kgrp + i;
         const int qrow = q0 + m;
-        if (qrow >= S) continue;
+        if (qrow >= Scap) continue;
         float lt = l_run[i];
         #pragma unroll
         for (int off = 8; off > 0; off >>= 1)
             lt += __shfl_xor(lt, off);
-        const float inv_l = (lt > 0.0f) ? 1.0f / lt : 0.0f;
+        const float inv_l =
+            (qrow < S && lt > 0.0f) ? 1.0f / lt : 0.0f;
         #pragma unroll
         for (int t = 0; t < EFA_D / 16; ++t) {
             const int d = 16 * t + fcol;
             O[((size_t)qrow * Hq + h) * EFA_D + d] =
-                __float2bfloat16(oacc[t][i] * inv_l);
+                __float2bfloat16(qrow < S ? oacc[t][i] * inv_l : 0.0f);
         }
     }
 }
@@ -293,7 +307,8 @@ void encoder_attention_flash_kernel(
 void encoder_attention_flash(const __hip_bfloat16* Q, const __hip_bfloat16* K,
                              const __hip_bfloat16* V, __hip_bfloat16* O,
                              int S, int Hq, int D, float scale,
-                             hipStream_t stream, int mask) {
+                             hipStream_t stream, int mask,
+                             const int* seqused) {
     if (D != EFA_D)
         throw std::runtime_error("encoder_attention_flash: D must be 256");
     if (S < 1 || S > 4096 || Hq < 1 || Hq > 16)
@@ -307,5 +322,5 @@ void encoder_attention_flash(const __hip_bfloat16* Q, const __hip_bfloat16* K,
     }
     dim3 grid((S + 63) / 64, Hq);
     encoder_attention_flash_kernel<<<grid, EFA_NTHREADS, sizeof(EfaLds), stream>>>(
-        Q, K, V, O, S, Hq, scale, mask);
+        Q, K, V, O, S, Hq, scale, mask, seqused);
 }

@@ -112,10 +112,16 @@ Both RTX strategies are supported, same semantics:
 - `state_prompt_mode="exact"` (default): one captured graph per exact
   prompt length, cached; pair with `warm_state_prompt_buckets(...)`.
 - `state_prompt_mode="fixed"`: ONE padded graph serves every length
-  (masked prefix + runtime `devpos` K/V append) — no mid-loop captures.
-  Latency follows the padded `max_prompt_len` (measured ~29 ms at the
-  defaults vs ~16.5 ms exact-mode); accuracy holds (cos vs the FP32
-  reference 0.9996, on par with exact mode).
+  (masked prefix + runtime `devpos`/`seqused` K/V append) — no mid-loop
+  captures. Latency follows the PADDED length, so right-size the
+  capacity to your deployment's real prompt+state length with
+  `state_prompt_fixed_max_len=<tokens>` (env
+  `FLASHRT_PI05_STATE_PROMPT_FIXED_MAX_LEN`; default is the 200-token
+  ceiling, and a prompt exceeding the capacity raises instead of
+  recapturing). The decoder runs the same custom split-KV kernel as
+  exact mode (seqused pointer, FP8-out epilogue included); the encoder
+  attention falls back from aiter to masked sdpa in this mode.
+  Accuracy holds (cos vs the FP32 reference 0.9996, on par with exact).
 
 ### Environment knobs
 
@@ -126,6 +132,7 @@ Both RTX strategies are supported, same semantics:
 | `FVK_AMD_ATTN_FP8OUT` | `1` | fuse the decoder attention output's FP8 quantize into the attention epilogue (bit-identical to the standalone quantize) |
 | `FVK_AMD_DEC_GEMM` | `mfma` | decoder small-M GEMMs: `mfma` (packed-weight MFMA kernels where measured faster) or `hipblaslt` |
 | `FLASHRT_FP8_NT_AUTOTUNE` | `auto` | timed hipBLASLt algorithm selection for the FP8 GEMMs at setup |
+| `FLASHRT_FP8_ALGO_POOL` | `16` | heuristic pool depth for the timed selection; deeper pools (64/128) find faster encoder algos but widen run-to-run pick variance |
 | `FVK_PI05_AMD_FORCE_BF16` | `0` | force the BF16 baseline regardless of `use_fp8` |
 | `FLASHRT_PI05_STATE_PROMPT_MODE` | — | overrides the `state_prompt_mode` constructor arg |
 

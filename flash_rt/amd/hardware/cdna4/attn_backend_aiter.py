@@ -62,15 +62,21 @@ frontend wraps calibration + capture + replay in
 
 FIXED-SHAPE MODE
 ----------------
-aiter exposes varlen/``cu_seqlens`` entry points that could express the
-runtime-valid-length contract, but v2 keeps it simple: when
-``set_fixed_shape(True)`` is active, the encoder/decoder sites delegate
-to the sdpa base-class implementation, whose boolean key masks (driven
-by :meth:`set_fixed_valid_len`) are read by pointer at replay — masking
-by slicing is NOT an option in-graph because the valid length changes
-without recapture. The vision site has no mask in either mode and stays
-on aiter. Exact-shape mode (one graph per prompt length) runs fully on
-aiter.
+Masking by slicing is NOT an option in-graph (the valid length changes
+without recapture), so each site needs a pointer-read mechanism:
+
+- decoder: the hand-written split-KV kernel takes the FA2-style
+  ``seqused`` DEVICE pointer natively (``dec_seqused``, maintained by
+  :meth:`set_fixed_valid_len`), so the custom route — including the
+  fused FP8-out epilogue — serves fixed mode directly at full speed.
+- encoder: aiter's dense ``mha_fwd`` has no runtime mask input
+  (varlen/``cu_seqlens`` would need device-read offsets), so this site
+  delegates to the sdpa base class, whose boolean key mask is read by
+  pointer at replay. This is the remaining fixed-mode overhead.
+- vision: no mask in either mode; always aiter.
+
+Exact-shape mode (one graph per prompt length) runs fully on
+aiter + the custom decoder kernel.
 """
 
 from __future__ import annotations
@@ -150,6 +156,17 @@ class Cdna4AiterAttnBackend(Cdna4AttnBackend):
             ws_floats = 32 * hq * chunk_size * (d + 2)
             self._dec_attn_ws = self._torch.empty(
                 ws_floats, dtype=self._torch.float32, device="cuda")
+
+        # Fixed-mode encoder attention: the MFMA flash kernel with the
+        # seqused device pointer (default when available and D == 256);
+        # FVK_AMD_FIXED_ENC_ATTN=sdpa keeps the masked-sdpa base path.
+        from flash_rt.amd import flash_rt_amd_kernels as _fvk_ef
+        self._fvk_ef = _fvk_ef
+        self._fixed_enc_flash = (
+            os.environ.get("FVK_AMD_FIXED_ENC_ATTN", "flash").strip().lower()
+            == "flash"
+            and hasattr(_fvk_ef, "encoder_attention_flash")
+            and self.enc_Q.shape[-1] == 256)
 
         # Fused FP8-out epilogue state (see set_decoder_fp8out). Disarmed
         # until the pipeline arms it post-calibration.
@@ -261,9 +278,22 @@ class Cdna4AiterAttnBackend(Cdna4AttnBackend):
 
     def encoder_attn(self, layer_idx: int, seq: int, stream: int = 0) -> int:
         if self._fixed_shape:
-            # Fixed-shape masking needs the pointer-read boolean key mask
-            # (valid length changes without recapture) — delegate to the
-            # sdpa base implementation. See module docstring.
+            # aiter's dense mha_fwd has no runtime-mask input. The MFMA
+            # flash kernel takes the FA2-style seqused device pointer
+            # (enc_seqused) and only computes the runtime-valid rows, so
+            # it serves fixed mode; masked sdpa remains the env escape
+            # (FVK_AMD_FIXED_ENC_ATTN=sdpa) and the non-256-headdim
+            # fallback. See module docstring.
+            if self._fixed_enc_flash:
+                self._fvk_ef.encoder_attention_flash(
+                    self.enc_Q.data_ptr(),
+                    self.enc_K[layer_idx].data_ptr(),
+                    self.enc_V[layer_idx].data_ptr(),
+                    self._enc_O.data_ptr(),
+                    seq, self.enc_Q.shape[-2], self.enc_Q.shape[-1],
+                    self._enc_scale, stream,
+                    31, self.enc_seqused.data_ptr())
+                return self._enc_O.data_ptr()
             return super().encoder_attn(layer_idx, seq, stream=stream)
         # (1, seq, 8, 256) vs (1, seq, 1, 256): native GQA, no expand.
         q = self.enc_Q[:seq].unsqueeze(0)
@@ -278,11 +308,17 @@ class Cdna4AiterAttnBackend(Cdna4AttnBackend):
         # Reset per call: get_decoder_fp8out_ptr() must reflect THIS
         # call only (fixed-shape delegation / lib route produce none).
         self._dec_fp8out_last = None
-        if self._fixed_shape:
-            # Same delegation rationale as encoder_attn.
+        if self._fixed_shape and not self._dec_custom:
+            # Only the aiter lib route lacks runtime masking — delegate
+            # to the sdpa base. The hand-written split-KV kernel takes
+            # the FA2-style seqused device pointer directly (validated
+            # by the seqused-mode gates in its kernel suite), so the
+            # custom route below serves fixed mode natively: enc_seq is
+            # the padded capacity, dec_seqused[0] wins at replay.
             return super().decoder_attn(layer_idx, enc_seq, dec_seq,
                                         stream=stream)
         total_kv = enc_seq + dec_seq
+        seqused_ptr = self.dec_seqused.data_ptr() if self._fixed_shape else 0
         if self._dec_custom:
             # Hand-written split-KV kernel; launches on the pipeline
             # stream directly (raw-pointer ABI, no torch dispatch).
@@ -305,7 +341,7 @@ class Cdna4AiterAttnBackend(Cdna4AttnBackend):
                     self._dec_attn_ws.data_ptr(),
                     dec_seq, total_kv,
                     self.dec_Q.shape[-2], self.dec_Q.shape[-1],
-                    0,                   # seqused: exact mode
+                    seqused_ptr,         # 0 = exact; device int in fixed mode
                     self._enc_scale,
                     stream)
                 self._dec_fp8out_last = (fp8_ptr, scale_ptr)
@@ -318,7 +354,7 @@ class Cdna4AiterAttnBackend(Cdna4AttnBackend):
                 self._dec_attn_ws.data_ptr(),
                 dec_seq, total_kv,
                 self.dec_Q.shape[-2], self.dec_Q.shape[-1],
-                0,                       # seqused: exact mode
+                seqused_ptr,             # 0 = exact; device int in fixed mode
                 self._enc_scale,
                 stream)
             return self._dec_O.data_ptr()

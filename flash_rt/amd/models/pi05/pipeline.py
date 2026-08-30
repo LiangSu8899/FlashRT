@@ -491,19 +491,24 @@ class Pi05Pipeline:
                              out_bf16_ptr: int, M: int, N: int, K: int,
                              act_scale_ptr: int, weight_scale_ptr: int) -> None:
         """Autotune the FP8 GEMM for the selected weight layout."""
-        # num_algos=128: the default 16-deep heuristic pool leaves
-        # measured time on the encoder shapes (gate_up 40.6 -> 34.1us
-        # at pool 64+); the deeper sweep only costs setup seconds.
+        # Heuristic pool depth for the timed selection. Deeper pools
+        # find faster encoder algos (gate_up 40.6 -> 34.1us at 64+) but
+        # widen run-to-run variance: with 128 candidates a mis-timed
+        # trial occasionally wins and ships a slow/odd-numerics pick
+        # (observed: one 128-pool process at +10 ms E2E). Default stays
+        # the long-validated 16; opt into a deeper pool via
+        # FLASHRT_FP8_ALGO_POOL when setup-time re-runs can vet it.
+        pool = int(os.environ.get("FLASHRT_FP8_ALGO_POOL", "16"))
         if self.fp8_layout == "nk":
             if not getattr(self, "_autotune_fp8_nt", True):
                 return
             self.gemm.autotune_fp8_nt_dev(
                 act_fp8_ptr, weight_fp8_ptr, out_bf16_ptr,
-                M, N, K, act_scale_ptr, weight_scale_ptr, 128)
+                M, N, K, act_scale_ptr, weight_scale_ptr, pool)
         else:
             self.gemm.autotune_fp8_nn_dev(
                 act_fp8_ptr, weight_fp8_ptr, out_bf16_ptr,
-                M, N, K, act_scale_ptr, weight_scale_ptr, 128)
+                M, N, K, act_scale_ptr, weight_scale_ptr, pool)
 
     def _upload_precomputed_styles(self) -> None:
         """Upload frontend-precomputed decoder style/time buffers.
