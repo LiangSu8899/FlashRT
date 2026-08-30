@@ -491,16 +491,19 @@ class Pi05Pipeline:
                              out_bf16_ptr: int, M: int, N: int, K: int,
                              act_scale_ptr: int, weight_scale_ptr: int) -> None:
         """Autotune the FP8 GEMM for the selected weight layout."""
+        # num_algos=128: the default 16-deep heuristic pool leaves
+        # measured time on the encoder shapes (gate_up 40.6 -> 34.1us
+        # at pool 64+); the deeper sweep only costs setup seconds.
         if self.fp8_layout == "nk":
             if not getattr(self, "_autotune_fp8_nt", True):
                 return
             self.gemm.autotune_fp8_nt_dev(
                 act_fp8_ptr, weight_fp8_ptr, out_bf16_ptr,
-                M, N, K, act_scale_ptr, weight_scale_ptr)
+                M, N, K, act_scale_ptr, weight_scale_ptr, 128)
         else:
             self.gemm.autotune_fp8_nn_dev(
                 act_fp8_ptr, weight_fp8_ptr, out_bf16_ptr,
-                M, N, K, act_scale_ptr, weight_scale_ptr)
+                M, N, K, act_scale_ptr, weight_scale_ptr, 128)
 
     def _upload_precomputed_styles(self) -> None:
         """Upload frontend-precomputed decoder style/time buffers.
