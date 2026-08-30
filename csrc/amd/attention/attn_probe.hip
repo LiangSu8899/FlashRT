@@ -204,7 +204,31 @@ void attn_partial_probe_kernel(
             const float* sp = &s_lds[q * APROBE_S_PITCH];
             const __hip_bfloat162* vp = &kv_lds[dp];
             float ax, ay;
-            if (mask & 128) {
+            if (mask & 512) {
+                // ILP8 PV: 8 independent chains.
+                float axs[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+                float ays[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+                int j = 0;
+                for (; j + 7 < cn; j += 8) {
+                    #pragma unroll
+                    for (int t = 0; t < 8; ++t) {
+                        const __hip_bfloat162 v = vp[(j + t) * APROBE_KV_PITCH];
+                        const float pj = sp[j + t];
+                        axs[t] = fmaf(pj, __bfloat162float(v.x), axs[t]);
+                        ays[t] = fmaf(pj, __bfloat162float(v.y), ays[t]);
+                    }
+                }
+                for (; j < cn; ++j) {
+                    const __hip_bfloat162 v = vp[j * APROBE_KV_PITCH];
+                    const float pj = sp[j];
+                    axs[0] = fmaf(pj, __bfloat162float(v.x), axs[0]);
+                    ays[0] = fmaf(pj, __bfloat162float(v.y), ays[0]);
+                }
+                ax = ((axs[0] + axs[1]) + (axs[2] + axs[3]))
+                   + ((axs[4] + axs[5]) + (axs[6] + axs[7]));
+                ay = ((ays[0] + ays[1]) + (ays[2] + ays[3]))
+                   + ((ays[4] + ays[5]) + (ays[6] + ays[7]));
+            } else if (mask & 128) {
                 // ILP4 PV: 4 independent accumulator chains, fixed
                 // combine order.
                 float ax0 = 0.0f, ay0 = 0.0f, ax1 = 0.0f, ay1 = 0.0f;

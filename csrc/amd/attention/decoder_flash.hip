@@ -423,41 +423,36 @@ void attention_decoder_gqa_partial_kernel(
 
     // ── Phase C: one thread per (query, dim-pair) ──
     // acc[q][2dp..2dp+1] = sum_j p[q][j] * V[j][2dp..2dp+1], ascending j.
-    // ILP4 PV: 4 independent accumulator chains hide the serial LDS
-    // latency; chains combine in fixed order (a0+a1)+(a2+a3).
+    // ILP8 PV: 8 independent accumulator chains hide the serial LDS
+    // latency; chains combine in a fixed pairwise order.
     const int nunits = Sq * dh;
     for (int u = tid; u < nunits; u += ATTN_NTHREADS) {
         const int q  = u / dh;
         const int dp = u - q * dh;
         const float* sp = &s_lds[q * ATTN_S_PITCH];
         const __hip_bfloat162* vp = &kv_lds[dp];
-        float ax0 = 0.0f, ay0 = 0.0f, ax1 = 0.0f, ay1 = 0.0f;
-        float ax2 = 0.0f, ay2 = 0.0f, ax3 = 0.0f, ay3 = 0.0f;
+        float axs[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        float ays[8] = {0, 0, 0, 0, 0, 0, 0, 0};
         int j = 0;
-        for (; j + 3 < cn; j += 4) {
-            const __hip_bfloat162 v0 = vp[(j)     * ATTN_KV_PITCH];
-            const __hip_bfloat162 v1 = vp[(j + 1) * ATTN_KV_PITCH];
-            const __hip_bfloat162 v2 = vp[(j + 2) * ATTN_KV_PITCH];
-            const __hip_bfloat162 v3 = vp[(j + 3) * ATTN_KV_PITCH];
-            const float p0 = sp[j], p1 = sp[j + 1];
-            const float p2 = sp[j + 2], p3 = sp[j + 3];
-            ax0 = fmaf(p0, __bfloat162float(v0.x), ax0);
-            ay0 = fmaf(p0, __bfloat162float(v0.y), ay0);
-            ax1 = fmaf(p1, __bfloat162float(v1.x), ax1);
-            ay1 = fmaf(p1, __bfloat162float(v1.y), ay1);
-            ax2 = fmaf(p2, __bfloat162float(v2.x), ax2);
-            ay2 = fmaf(p2, __bfloat162float(v2.y), ay2);
-            ax3 = fmaf(p3, __bfloat162float(v3.x), ax3);
-            ay3 = fmaf(p3, __bfloat162float(v3.y), ay3);
+        for (; j + 7 < cn; j += 8) {
+            #pragma unroll
+            for (int t = 0; t < 8; ++t) {
+                const __hip_bfloat162 v = vp[(j + t) * ATTN_KV_PITCH];
+                const float pj = sp[j + t];
+                axs[t] = fmaf(pj, __bfloat162float(v.x), axs[t]);
+                ays[t] = fmaf(pj, __bfloat162float(v.y), ays[t]);
+            }
         }
         for (; j < cn; ++j) {
             const __hip_bfloat162 v = vp[j * ATTN_KV_PITCH];
             const float pj = sp[j];
-            ax0 = fmaf(pj, __bfloat162float(v.x), ax0);
-            ay0 = fmaf(pj, __bfloat162float(v.y), ay0);
+            axs[0] = fmaf(pj, __bfloat162float(v.x), axs[0]);
+            ays[0] = fmaf(pj, __bfloat162float(v.y), ays[0]);
         }
-        const float ax = (ax0 + ax1) + (ax2 + ax3);
-        const float ay = (ay0 + ay1) + (ay2 + ay3);
+        const float ax = ((axs[0] + axs[1]) + (axs[2] + axs[3]))
+                       + ((axs[4] + axs[5]) + (axs[6] + axs[7]));
+        const float ay = ((ays[0] + ays[1]) + (ays[2] + ays[3]))
+                       + ((ays[4] + ays[5]) + (ays[6] + ays[7]));
         float* out = acc_ws + (size_t)q * D + 2 * dp;
         out[0] = ax;   // adjacent 4 B stores; consecutive lanes are
         out[1] = ay;   // consecutive pairs -> coalesced 8 B/lane
@@ -528,19 +523,19 @@ void attention_decoder_gqa_reduce_kernel(
         static_assert(NSPLIT % 4 == 0, "ILP4 combine assumes 4 | NSPLIT");
         const size_t sstride = (size_t)Hq * blk;  // floats, split i -> i+1
         const float* ap = ws + (size_t)h * blk + (size_t)q * D + tid;
+        // Full-depth prefetch: all NSPLIT split loads issue before any
+        // consumer (NSPLIT <= 32 registers; occupancy is not the
+        // constraint here). The accumulate keeps the ascending-split
+        // fixed order — bit-identical to the 4-batch version.
+        float vv[NSPLIT];
+        #pragma unroll
+        for (int i = 0; i < NSPLIT; ++i)
+            vv[i] = ap[(size_t)i * sstride];
         float s = 0.0f;
         #pragma unroll
-        for (int i = 0; i < NSPLIT; i += 4) {
-            const float v0 = ap[(i + 0) * sstride];
-            const float v1 = ap[(i + 1) * sstride];
-            const float v2 = ap[(i + 2) * sstride];
-            const float v3 = ap[(i + 3) * sstride];
-            const float c0 = coeff[i + 0], c1 = coeff[i + 1];
-            const float c2 = coeff[i + 2], c3 = coeff[i + 3];
-            s = (c0 != 0.0f) ? fmaf(c0, v0, s) : s;
-            s = (c1 != 0.0f) ? fmaf(c1, v1, s) : s;
-            s = (c2 != 0.0f) ? fmaf(c2, v2, s) : s;
-            s = (c3 != 0.0f) ? fmaf(c3, v3, s) : s;
+        for (int i = 0; i < NSPLIT; ++i) {
+            const float c = coeff[i];
+            s = (c != 0.0f) ? fmaf(c, vv[i], s) : s;
         }
         const size_t o_off = ((size_t)q * Hq + h) * D + tid;
         const __hip_bfloat16 b = __float2bfloat16(s * s_invL);
