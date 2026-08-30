@@ -471,6 +471,25 @@ class Pi05TorchFrontendAmd:
                  fp8_layout: Optional[str] = None,
                  state_prompt_mode: str = "exact",
                  state_prompt_fixed_max_len: Optional[int] = None):
+        # gfx950-only gate, FIRST: the MFMA tile shapes and FP8 paths in
+        # the extension are CDNA4-specific — refuse before touching the
+        # checkpoint unless BOTH the visible device arch (e.g.
+        # "gfx950:sramecc+:xnack-") and the extension's compile-time
+        # gpu_arch are gfx950. Anything else computes garbage, not a
+        # fallback (a forced hardware="amd_cdna4" on gfx942 fails here).
+        from flash_rt.amd import flash_rt_amd_kernels as _fvk_gate
+        _dev_arch = str(_fvk_gate.device_arch())
+        _build_arch = str(dict(_fvk_gate.build_info()).get("gpu_arch",
+                                                           "unknown"))
+        if not (_dev_arch.startswith("gfx950")
+                and _build_arch.startswith("gfx950")):
+            raise RuntimeError(
+                "Pi05TorchFrontendAmd is gfx950-only (CDNA4 / MI350-series): "
+                f"running device arch is {_dev_arch!r} and the extension "
+                f"was built for gpu_arch {_build_arch!r}. Rebuild with "
+                "scripts/amd/build_amd.sh on a gfx950 machine; other AMD "
+                "arches are not supported by this backend.")
+
         checkpoint_dir = pathlib.Path(checkpoint_dir)
         # State-in-prompt graph strategy (Pi0.5 renders robot state into the
         # prompt, so its token length drifts with the state values):
@@ -507,6 +526,14 @@ class Pi05TorchFrontendAmd:
                     f"got {_fixed_cap}")
         self._state_prompt_fixed_max_len = _fixed_cap
         self.num_views = int(num_views)
+        # Observation contract: 2 views (base + wrist camera — the LIBERO
+        # deployment) or 3 (+ right wrist camera). All input buffers and
+        # the encoder sequence are sized to num_views, and the observation
+        # keys accepted by _gather_view_images() only express 2 or 3.
+        if self.num_views not in (2, 3):
+            raise ValueError(
+                "num_views must be 2 (base + wrist camera) or 3 "
+                f"(+ right wrist camera); got {self.num_views}")
         self.chunk_size = int(chunk_size)
         self.max_prompt_len = int(max_prompt_len)
         self._num_steps = int(num_steps)
@@ -602,6 +629,7 @@ class Pi05TorchFrontendAmd:
         # ── fvk module + GemmRunner ──
         from flash_rt.amd import flash_rt_amd_kernels as fvk
         self.fvk = fvk
+        # (gfx950 gate already ran at the top of __init__.)
         self.gemm = fvk.GemmRunner()
 
         # ── Reusable pre-allocated input buffers (match Thor style) ──
@@ -611,8 +639,13 @@ class Pi05TorchFrontendAmd:
             self.chunk_size, ACTION_DIM, dtype=bf16, device="cuda")
         self._noise_out = torch.empty(
             self.chunk_size, ACTION_DIM, dtype=bf16, device="cuda")
-        from flash_rt.amd.core.hip_buffer import _hip
+        from flash_rt.amd.core.hip_buffer import _check, _hip
         self._hip = _hip
+        # Shared HIP return-code checker (single int compare on success;
+        # raises RuntimeError with the error code + operation on failure).
+        # Every raw self._hip.* call MUST route its return through this so
+        # a failed copy/sync can never surface stale buffer contents.
+        self._hip_check = _check
 
         logger.info(
             "Pi05TorchFrontendAmd initialised (num_views=%d, chunk=%d, fp8_layout=%s)",
@@ -1053,8 +1086,8 @@ class Pi05TorchFrontendAmd:
 
             self.pipeline.run_pipeline(stream=stream_int)
 
-            self._hip.hipStreamSynchronize(
-                ctypes.c_void_p(stream_int))
+            self._hip_check(self._hip.hipStreamSynchronize(
+                ctypes.c_void_p(stream_int)), "hipStreamSynchronize")
 
             # FP8 calibration (no-op for BF16 pipelines).
             self.pipeline.calibrate_fp8()
@@ -1099,8 +1132,8 @@ class Pi05TorchFrontendAmd:
                     noise, self.pipeline.input_noise_buf, stream_int)
                 self._zero_pipeline_scales()
                 self.pipeline.run_pipeline(stream=stream_int)
-                self._hip.hipStreamSynchronize(
-                    ctypes.c_void_p(stream_int))
+                self._hip_check(self._hip.hipStreamSynchronize(
+                    ctypes.c_void_p(stream_int)), "hipStreamSynchronize")
 
                 if names is None:
                     names = list(self.pipeline.fp8_act_scales.keys())
@@ -1233,14 +1266,19 @@ class Pi05TorchFrontendAmd:
                 # Decode-only: skip vision+encoder, reuse cached K/V
                 out_ptr = self.pipeline.forward_decode_only()
 
-            # D2D download → staging torch tensor
-            self._hip.hipMemcpyAsync(
+            # D2D download → staging torch tensor. Both the copy and the
+            # sync below are checked: if the graph replay, this D2D copy
+            # or the sync fails, we must raise rather than read stale
+            # _noise_out contents back as actions.
+            self._hip_check(self._hip.hipMemcpyAsync(
                 ctypes.c_void_p(self._noise_out.data_ptr()),
                 ctypes.c_void_p(out_ptr),
-                self._noise_out.numel() * 2, 3, stream_int)
+                self._noise_out.numel() * 2, 3, stream_int),
+                "hipMemcpyAsync D2D")
 
-        self._hip.hipStreamSynchronize(
-            ctypes.c_void_p(self._graph_torch_stream.cuda_stream))
+        self._hip_check(self._hip.hipStreamSynchronize(
+            ctypes.c_void_p(self._graph_torch_stream.cuda_stream)),
+            "hipStreamSynchronize")
 
         latency_ms = (time.perf_counter() - t0) * 1000
         self.latency_records.append(latency_ms)
@@ -1309,29 +1347,65 @@ class Pi05TorchFrontendAmd:
     # Internals
     # -----------------------------------------------------------------
 
+    # Named per-view observation keys, in buffer order (same naming as the
+    # RTX frontend). Alternatively the observation may carry an "images"
+    # list with exactly num_views entries in this order.
+    _VIEW_KEYS = ("image", "wrist_image", "wrist_image_right")
+
+    def _gather_view_images(self, observation: dict) -> list:
+        """Return exactly ``num_views`` validated (224, 224, 3) images.
+
+        Strict by design: a missing or misshaped view raises ValueError
+        instead of silently leaving stale ``_img_buf`` rows (which the
+        captured graph would then consume as a real camera view).
+        """
+        expected_keys = self._VIEW_KEYS[:self.num_views]
+        if "images" in observation:
+            img_list = list(observation["images"])
+            if len(img_list) != self.num_views:
+                raise ValueError(
+                    f"observation['images'] has {len(img_list)} entries; "
+                    f"this frontend was built with num_views={self.num_views}")
+            labels = [f"images[{i}]" for i in range(len(img_list))]
+        else:
+            missing = [k for k in expected_keys if k not in observation]
+            if missing:
+                raise ValueError(
+                    f"observation is missing image key(s) {missing} — "
+                    f"num_views={self.num_views} requires "
+                    f"{list(expected_keys)} (or an 'images' list)")
+            if self.num_views < 3 and "wrist_image_right" in observation:
+                raise ValueError(
+                    "observation provides 'wrist_image_right' but this "
+                    f"frontend was built with num_views={self.num_views}; "
+                    "construct it with num_views=3 to use a third view")
+            img_list = [observation[k] for k in expected_keys]
+            labels = list(expected_keys)
+        for label, im in zip(labels, img_list):
+            if not isinstance(im, np.ndarray) or im.dtype != np.uint8:
+                raise ValueError(
+                    f"observation image {label!r} must be a uint8 numpy "
+                    f"array, got {type(im).__name__}"
+                    f"{'/' + str(im.dtype) if isinstance(im, np.ndarray) else ''}")
+            if im.shape != (IMG_HW, IMG_HW, 3):
+                raise ValueError(
+                    f"observation image {label!r} has shape {im.shape}; "
+                    f"expected ({IMG_HW}, {IMG_HW}, 3)")
+        return img_list
+
     def _stack_images(self, observation: dict) -> torch.Tensor:
         """Stack and normalize observation images into a new bf16 tensor."""
-        if "images" in observation:
-            img_list = observation["images"]
-        else:
-            img_list = [observation["image"], observation["wrist_image"]]
-            if self.num_views >= 3 and "wrist_image_right" in observation:
-                img_list.append(observation["wrist_image_right"])
+        img_list = self._gather_view_images(observation)
         tensors = []
-        for im in img_list[:self.num_views]:
+        for im in img_list:
             tensors.append(
                 torch.from_numpy(im.astype(np.float32) / 127.5 - 1.0).to("cuda", bf16))
         return torch.stack(tensors)
 
     def _fill_img_buf(self, observation: dict) -> None:
         """Fill ``self._img_buf`` in place without allocating new tensors."""
-        if "images" in observation:
-            img_list = observation["images"]
-        else:
-            img_list = [observation["image"], observation["wrist_image"]]
-            if self.num_views >= 3 and "wrist_image_right" in observation:
-                img_list.append(observation["wrist_image_right"])
-        for v, im in enumerate(img_list[:self.num_views]):
+        img_list = self._gather_view_images(observation)
+        for v, im in enumerate(img_list):
             norm = torch.from_numpy(im.astype(np.float32) / 127.5 - 1.0)
             self._img_buf[v].copy_(norm.to(bf16))
 
@@ -1349,5 +1423,6 @@ class Pi05TorchFrontendAmd:
         nbytes = src.numel() * src.element_size()
         assert nbytes == dst_buf.nbytes, \
             f"size mismatch: src {nbytes} vs dst {dst_buf.nbytes}"
-        self._hip.hipMemcpyAsync(
-            dst_buf.ptr, ctypes.c_void_p(src.data_ptr()), nbytes, 3, stream_int)
+        self._hip_check(self._hip.hipMemcpyAsync(
+            dst_buf.ptr, ctypes.c_void_p(src.data_ptr()), nbytes, 3,
+            stream_int), "hipMemcpyAsync D2D")

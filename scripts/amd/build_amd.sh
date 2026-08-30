@@ -8,6 +8,18 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 GPU_ARCH="${1:-gfx950}"
+
+# This backend is gfx950-only (CDNA4 / MI350-series): the kernels use
+# gfx950 MFMA shapes and the runtime refuses to load on other arches, so
+# building for anything else produces a module that can never pass the
+# frontend's device gate. Set FLASHRT_AMD_ALLOW_ARCH=1 to bypass this
+# check when bringing up a port to a future arch.
+if [[ ! "${GPU_ARCH}" =~ ^gfx950 && "${FLASHRT_AMD_ALLOW_ARCH:-0}" != "1" ]]; then
+  echo "error: GPU_ARCH='${GPU_ARCH}' is not gfx950 — this backend is gfx950-only." >&2
+  echo "       Pass gfx950, or set FLASHRT_AMD_ALLOW_ARCH=1 to override for a port." >&2
+  exit 1
+fi
+
 PYTHON_BIN="${PYTHON:-python3}"
 JOBS="${SLURM_CPUS_PER_TASK:-8}"
 ROCM_PATH="${ROCM_PATH:-/opt/rocm}"

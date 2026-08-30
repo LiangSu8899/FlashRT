@@ -283,8 +283,11 @@ class Pi05Pipeline:
         self._graph = None
         self._decoder_only_graph = None  # for temporal K/V caching
         self._graph_stream = None  # ctypes.c_void_p
-        from flash_rt.amd.core.hip_buffer import _hip
+        from flash_rt.amd.core.hip_buffer import _check, _hip
         self._hip = _hip
+        # Shared HIP return-code checker: every raw self._hip.* call must
+        # route its return through this (raises RuntimeError on failure).
+        self._hip_check = _check
 
         # Pre-expand vision position embedding across num_views (see
         # ``vision_encoder``'s patch embed path). We replicate the
@@ -454,11 +457,12 @@ class Pi05Pipeline:
         dst_buf = self.bufs["vision_pos_embed_expanded"]
         assert dst_buf.nbytes == self.num_views * per_view_nbytes
         for v in range(self.num_views):
-            self._hip.hipMemcpy(
+            self._hip_check(self._hip.hipMemcpy(
                 ctypes.c_void_p(dst_buf.ptr.value + v * per_view_nbytes),
                 ctypes.c_void_p(pos_src_ptr),
-                per_view_nbytes, 3)  # D2D
-        self._hip.hipDeviceSynchronize()
+                per_view_nbytes, 3), "hipMemcpy D2D")
+        self._hip_check(self._hip.hipDeviceSynchronize(),
+                        "hipDeviceSynchronize")
 
     # ══════════════════════════════════════════════════════════════════
     #   Helpers
@@ -1419,7 +1423,8 @@ class Pi05Pipeline:
         # side effect of _fp8_gemm's non-calibrated code path).
         self.fp8_calibrated = False
         self.run_pipeline(stream=0)
-        self._hip.hipDeviceSynchronize()
+        self._hip_check(self._hip.hipDeviceSynchronize(),
+                        "hipDeviceSynchronize")
         self.fp8_calibrated = True
         logger.info("FP8 calibrated: %d activation scales collected",
                     len(self.fp8_act_scales))
@@ -1633,7 +1638,8 @@ class Pi05Pipeline:
                     B[out_key].ptr.value,
                     M_val, N_val, K_val)
 
-        self._hip.hipDeviceSynchronize()
+        self._hip_check(self._hip.hipDeviceSynchronize(),
+                        "hipDeviceSynchronize")
         self._gemms_autotuned = True
         logger.info("Autotune complete")
 
@@ -1681,13 +1687,15 @@ class Pi05Pipeline:
         # Warmup on the capture stream to stabilize allocations
         for _ in range(3):
             self.run_pipeline(stream=stream_int)
-        self._hip.hipStreamSynchronize(stream_handle)
+        self._hip_check(self._hip.hipStreamSynchronize(stream_handle),
+                        "hipStreamSynchronize")
 
         # Capture full pipeline
         self._graph.begin_capture(stream_handle)
         self.run_pipeline(stream=stream_int)
         self._graph.end_capture(stream_handle)
-        self._hip.hipStreamSynchronize(stream_handle)
+        self._hip_check(self._hip.hipStreamSynchronize(stream_handle),
+                        "hipStreamSynchronize")
         logger.info("HIP Graph captured for Pi05Pipeline")
 
         # Also capture a decoder-only graph for temporal K/V caching.
@@ -1697,11 +1705,13 @@ class Pi05Pipeline:
         self._decoder_only_graph = HipGraph()
         for _ in range(3):
             self.transformer_decoder(stream=stream_int)
-        self._hip.hipStreamSynchronize(stream_handle)
+        self._hip_check(self._hip.hipStreamSynchronize(stream_handle),
+                        "hipStreamSynchronize")
         self._decoder_only_graph.begin_capture(stream_handle)
         self.transformer_decoder(stream=stream_int)
         self._decoder_only_graph.end_capture(stream_handle)
-        self._hip.hipStreamSynchronize(stream_handle)
+        self._hip_check(self._hip.hipStreamSynchronize(stream_handle),
+                        "hipStreamSynchronize")
         logger.info("HIP Graph captured for Pi05Pipeline (decoder-only)")
 
     # ══════════════════════════════════════════════════════════════════
@@ -1800,10 +1810,10 @@ class Pi05Pipeline:
             return  # set_language_embeds not called yet (first build)
         start_byte = self.vision_seq_enc * ENC_D * 2  # language embeds follow pooled vision tokens
         dst_ptr = self.bufs["encoder_x"].ptr.value + start_byte
-        self._hip.hipMemcpyAsync(
+        self._hip_check(self._hip.hipMemcpyAsync(
             ctypes.c_void_p(dst_ptr),
             self._lang_embeds_buf.ptr,
-            self._lang_embeds_buf.nbytes, 3, stream)  # D2D
+            self._lang_embeds_buf.nbytes, 3, stream), "hipMemcpyAsync D2D")
 
     def forward(self) -> int:
         """Replay the captured graph (or fall back to ``run_pipeline``).
@@ -1816,12 +1826,17 @@ class Pi05Pipeline:
         After this returns, ``input_noise_buf`` contains the final actions.
         Returns the device pointer of that buffer for the frontend to read.
         """
+        # replay() checks the hipGraphLaunch return; the sync below is
+        # checked too so a failed replay can never let the caller read a
+        # stale diffusion_noise buffer as real actions.
         if self._graph is not None:
             self._graph.replay(self._graph_stream)
-            self._hip.hipStreamSynchronize(self._graph_stream)
+            self._hip_check(self._hip.hipStreamSynchronize(self._graph_stream),
+                            "hipStreamSynchronize")
         else:
             self.run_pipeline(stream=0)
-            self._hip.hipDeviceSynchronize()
+            self._hip_check(self._hip.hipDeviceSynchronize(),
+                            "hipDeviceSynchronize")
         return self.bufs["diffusion_noise"].ptr.value
 
     def forward_decode_only(self) -> int:
@@ -1836,8 +1851,10 @@ class Pi05Pipeline:
         """
         if hasattr(self, "_decoder_only_graph") and self._decoder_only_graph is not None:
             self._decoder_only_graph.replay(self._graph_stream)
-            self._hip.hipStreamSynchronize(self._graph_stream)
+            self._hip_check(self._hip.hipStreamSynchronize(self._graph_stream),
+                            "hipStreamSynchronize")
         else:
             self.transformer_decoder(stream=0)
-            self._hip.hipDeviceSynchronize()
+            self._hip_check(self._hip.hipDeviceSynchronize(),
+                            "hipDeviceSynchronize")
         return self.bufs["diffusion_noise"].ptr.value
