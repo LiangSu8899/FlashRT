@@ -297,6 +297,7 @@ class GrootN17TorchFrontendAmd(_GrootN17FP8BackboneMixin,
         mg = self._mlp_gemm
         S = self.Se
         nt, ni = self._ck_nt, self._ck_ni
+        fused = _fused_epilogue_enabled()
         K.cast_fp16_to_bf16(
             self._ck_bb_src.data_ptr(), self._ck_bb.data_ptr(),
             S * 2048, int(s))
@@ -315,12 +316,23 @@ class GrootN17TorchFrontendAmd(_GrootN17FP8BackboneMixin,
             k_b = self._dit_k_b[li]
             v_w = self._dit_v_w[li]
             v_b = self._dit_v_b[li]
-            mg.bf16_nn(src.data_ptr(), k_w.data_ptr(), k_dst.data_ptr(),
-                       N, 1536, 2048, int(s))
-            K.add_bias_bf16(k_dst.data_ptr(), k_b.data_ptr(), N, 1536, int(s))
-            mg.bf16_nn(src.data_ptr(), v_w.data_ptr(), v_dst.data_ptr(),
-                       N, 1536, 2048, int(s))
-            K.add_bias_bf16(v_dst.data_ptr(), v_b.data_ptr(), N, 1536, int(s))
+            if fused:
+                # AMD FUSED: bf16_nn + add_bias_bf16 → bf16_nn_bias (cross K/V).
+                mg.bf16_nn_bias(src.data_ptr(), k_w.data_ptr(),
+                                k_dst.data_ptr(), k_b.data_ptr(),
+                                N, 1536, 2048, int(s))
+                mg.bf16_nn_bias(src.data_ptr(), v_w.data_ptr(),
+                                v_dst.data_ptr(), v_b.data_ptr(),
+                                N, 1536, 2048, int(s))
+            else:
+                mg.bf16_nn(src.data_ptr(), k_w.data_ptr(), k_dst.data_ptr(),
+                           N, 1536, 2048, int(s))
+                K.add_bias_bf16(k_dst.data_ptr(), k_b.data_ptr(), N, 1536,
+                                int(s))
+                mg.bf16_nn(src.data_ptr(), v_w.data_ptr(), v_dst.data_ptr(),
+                           N, 1536, 2048, int(s))
+                K.add_bias_bf16(v_dst.data_ptr(), v_b.data_ptr(), N, 1536,
+                                int(s))
 
     # ────────────────────────────────────────────────────────────────
     # Fully-kernelized DiT graph (bf16, single combined graph)
@@ -344,7 +356,8 @@ class GrootN17TorchFrontendAmd(_GrootN17FP8BackboneMixin,
         # bf16_nn_bias_gelu fused epilogues); off → the byte-identical
         # decomposed pipeline_thor.dit_forward. Only dit_forward is
         # AMD-local; embodiment_* stages keep coming from pipeline_thor.
-        if _fused_epilogue_enabled():
+        fused_ep = _fused_epilogue_enabled()
+        if fused_ep:
             from flash_rt.amd.models.groot_n17 import pipeline as _amd_pipeline
             dit_forward = _amd_pipeline.dit_forward
         else:
@@ -398,40 +411,75 @@ class GrootN17TorchFrontendAmd(_GrootN17FP8BackboneMixin,
         step_weights = [_dit_weights(s) for s in range(num_inference_timesteps)]
 
         def _state_fwd(s):
-            mg.bf16_nn(self._k_state_in.data_ptr(), w["st_l1"].data_ptr(),
-                       self._k_st_h1.data_ptr(), 1, 1024, 132, s)
-            K.add_bias_bf16(self._k_st_h1.data_ptr(), w["st_l1b"].data_ptr(),
-                            1, 1024, s)
+            if fused_ep:
+                # AMD FUSED: bf16_nn + add_bias_bf16 → bf16_nn_bias (state l1).
+                mg.bf16_nn_bias(self._k_state_in.data_ptr(),
+                                w["st_l1"].data_ptr(),
+                                self._k_st_h1.data_ptr(),
+                                w["st_l1b"].data_ptr(), 1, 1024, 132, s)
+            else:
+                mg.bf16_nn(self._k_state_in.data_ptr(), w["st_l1"].data_ptr(),
+                           self._k_st_h1.data_ptr(), 1, 1024, 132, s)
+                K.add_bias_bf16(self._k_st_h1.data_ptr(),
+                                w["st_l1b"].data_ptr(), 1, 1024, s)
             K.relu_inplace_bf16(self._k_st_h1.data_ptr(), 1024, s)
-            mg.bf16_nn(self._k_st_h1.data_ptr(), w["st_l2"].data_ptr(),
-                       self._k_state_feat.data_ptr(), 1, 1536, 1024, s)
-            K.add_bias_bf16(self._k_state_feat.data_ptr(),
-                            w["st_l2b"].data_ptr(), 1, 1536, s)
+            if fused_ep:
+                # AMD FUSED: bf16_nn + add_bias_bf16 → bf16_nn_bias (state l2).
+                mg.bf16_nn_bias(self._k_st_h1.data_ptr(),
+                                w["st_l2"].data_ptr(),
+                                self._k_state_feat.data_ptr(),
+                                w["st_l2b"].data_ptr(), 1, 1536, 1024, s)
+            else:
+                mg.bf16_nn(self._k_st_h1.data_ptr(), w["st_l2"].data_ptr(),
+                           self._k_state_feat.data_ptr(), 1, 1536, 1024, s)
+                K.add_bias_bf16(self._k_state_feat.data_ptr(),
+                                w["st_l2b"].data_ptr(), 1, 1536, s)
 
         def _ae_fwd(step, s):
             # action_encode: W1 (no act) → cat[a_emb, tau] → W2 → SiLU → W3,
             # add pos, then fill dit_h ([0]=state, [1:]=action features).
             T = action_horizon
-            mg.bf16_nn(self._k_actions.data_ptr(), w["ae_W1"].data_ptr(),
-                       self._k_ae_aemb.data_ptr(), T, 1536, 132, s)
-            K.add_bias_bf16(self._k_ae_aemb.data_ptr(), w["ae_b1"].data_ptr(),
-                            T, 1536, s)
+            if fused_ep:
+                # AMD FUSED: bf16_nn + add_bias_bf16 → bf16_nn_bias (ae W1).
+                mg.bf16_nn_bias(self._k_actions.data_ptr(),
+                                w["ae_W1"].data_ptr(),
+                                self._k_ae_aemb.data_ptr(),
+                                w["ae_b1"].data_ptr(), T, 1536, 132, s)
+            else:
+                mg.bf16_nn(self._k_actions.data_ptr(), w["ae_W1"].data_ptr(),
+                           self._k_ae_aemb.data_ptr(), T, 1536, 132, s)
+                K.add_bias_bf16(self._k_ae_aemb.data_ptr(),
+                                w["ae_b1"].data_ptr(), T, 1536, s)
             K.concat2_bf16(self._k_ae_aemb.data_ptr(),
                            self._k_tau[step].data_ptr(),
                            self._k_ae_concat.data_ptr(), T, 1536, 1536, s)
-            mg.bf16_nn(self._k_ae_concat.data_ptr(), w["ae_W2"].data_ptr(),
-                       self._k_ae_i2.data_ptr(), T, 1536, 3072, s)
-            K.add_bias_bf16(self._k_ae_i2.data_ptr(), w["ae_b2"].data_ptr(),
-                            T, 1536, s)
+            if fused_ep:
+                # AMD FUSED: bf16_nn + add_bias_bf16 → bf16_nn_bias (ae W2).
+                mg.bf16_nn_bias(self._k_ae_concat.data_ptr(),
+                                w["ae_W2"].data_ptr(),
+                                self._k_ae_i2.data_ptr(),
+                                w["ae_b2"].data_ptr(), T, 1536, 3072, s)
+            else:
+                mg.bf16_nn(self._k_ae_concat.data_ptr(), w["ae_W2"].data_ptr(),
+                           self._k_ae_i2.data_ptr(), T, 1536, 3072, s)
+                K.add_bias_bf16(self._k_ae_i2.data_ptr(),
+                                w["ae_b2"].data_ptr(), T, 1536, s)
             K.cast_bf16_to_fp16(self._k_ae_i2.data_ptr(),
                                 self._k_ae_i2f.data_ptr(), T * 1536, s)
             K.silu_inplace_fp16(self._k_ae_i2f.data_ptr(), T * 1536, s)
             K.cast_fp16_to_bf16(self._k_ae_i2f.data_ptr(),
                                 self._k_ae_i2.data_ptr(), T * 1536, s)
-            mg.bf16_nn(self._k_ae_i2.data_ptr(), w["ae_W3"].data_ptr(),
-                       self._k_ae_out.data_ptr(), T, 1536, 1536, s)
-            K.add_bias_bf16(self._k_ae_out.data_ptr(), w["ae_b3"].data_ptr(),
-                            T, 1536, s)
+            if fused_ep:
+                # AMD FUSED: bf16_nn + add_bias_bf16 → bf16_nn_bias (ae W3).
+                mg.bf16_nn_bias(self._k_ae_i2.data_ptr(),
+                                w["ae_W3"].data_ptr(),
+                                self._k_ae_out.data_ptr(),
+                                w["ae_b3"].data_ptr(), T, 1536, 1536, s)
+            else:
+                mg.bf16_nn(self._k_ae_i2.data_ptr(), w["ae_W3"].data_ptr(),
+                           self._k_ae_out.data_ptr(), T, 1536, 1536, s)
+                K.add_bias_bf16(self._k_ae_out.data_ptr(),
+                                w["ae_b3"].data_ptr(), T, 1536, s)
             K.residual_add(self._k_ae_out.data_ptr(), self._k_pos.data_ptr(),
                            T * 1536, s)
             K.gpu_copy(dit_h, self._k_state_feat.data_ptr(), 1536 * 2, s)
@@ -444,19 +492,36 @@ class GrootN17TorchFrontendAmd(_GrootN17FP8BackboneMixin,
             K.ada_layer_norm_bf16(dit_h, self._k_oproj_scale[step].data_ptr(),
                                   self._k_oproj_shift[step].data_ptr(),
                                   self._k_hmod.data_ptr(), Sa, 1536, 1e-5, s)
-            mg.bf16_nn(self._k_hmod.data_ptr(), w["po2"].data_ptr(),
-                       self._k_hout.data_ptr(), Sa, 1024, 1536, s)
-            K.add_bias_bf16(self._k_hout.data_ptr(), w["po2b"].data_ptr(),
-                            Sa, 1024, s)
-            mg.bf16_nn(hout_dec, w["dec_l1"].data_ptr(),
-                       self._k_dec_h.data_ptr(), T, 1024, 1024, s)
-            K.add_bias_bf16(self._k_dec_h.data_ptr(), w["dec_l1b"].data_ptr(),
-                            T, 1024, s)
+            if fused_ep:
+                # AMD FUSED: bf16_nn + add_bias_bf16 → bf16_nn_bias (po2).
+                mg.bf16_nn_bias(self._k_hmod.data_ptr(), w["po2"].data_ptr(),
+                                self._k_hout.data_ptr(),
+                                w["po2b"].data_ptr(), Sa, 1024, 1536, s)
+                # AMD FUSED: bf16_nn + add_bias_bf16 → bf16_nn_bias (dec l1).
+                mg.bf16_nn_bias(hout_dec, w["dec_l1"].data_ptr(),
+                                self._k_dec_h.data_ptr(),
+                                w["dec_l1b"].data_ptr(), T, 1024, 1024, s)
+            else:
+                mg.bf16_nn(self._k_hmod.data_ptr(), w["po2"].data_ptr(),
+                           self._k_hout.data_ptr(), Sa, 1024, 1536, s)
+                K.add_bias_bf16(self._k_hout.data_ptr(), w["po2b"].data_ptr(),
+                                Sa, 1024, s)
+                mg.bf16_nn(hout_dec, w["dec_l1"].data_ptr(),
+                           self._k_dec_h.data_ptr(), T, 1024, 1024, s)
+                K.add_bias_bf16(self._k_dec_h.data_ptr(),
+                                w["dec_l1b"].data_ptr(), T, 1024, s)
             K.relu_inplace_bf16(self._k_dec_h.data_ptr(), T * 1024, s)
-            mg.bf16_nn(self._k_dec_h.data_ptr(), w["dec_l2"].data_ptr(),
-                       self._k_vel.data_ptr(), T, 132, 1024, s)
-            K.add_bias_bf16(self._k_vel.data_ptr(), w["dec_l2b"].data_ptr(),
-                            T, 132, s)
+            if fused_ep:
+                # AMD FUSED: bf16_nn + add_bias_bf16 → bf16_nn_bias (dec l2).
+                mg.bf16_nn_bias(self._k_dec_h.data_ptr(),
+                                w["dec_l2"].data_ptr(),
+                                self._k_vel.data_ptr(),
+                                w["dec_l2b"].data_ptr(), T, 132, 1024, s)
+            else:
+                mg.bf16_nn(self._k_dec_h.data_ptr(), w["dec_l2"].data_ptr(),
+                           self._k_vel.data_ptr(), T, 132, 1024, s)
+                K.add_bias_bf16(self._k_vel.data_ptr(),
+                                w["dec_l2b"].data_ptr(), T, 132, s)
             # Euler update: actions += dt * velocity, in place on the
             # persistent buffers. The AMD module has no euler_step
             # binding; an in-place torch add is capture-safe (fixed
