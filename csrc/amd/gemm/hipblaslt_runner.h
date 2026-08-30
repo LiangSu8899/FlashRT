@@ -115,6 +115,37 @@ public:
                       int M, int N, int K,
                       hipStream_t stream = 0);
 
+    // ── GROOT N1.7 surface: FP16 GEMM + FP8 epilogue variants ──
+    // Signatures mirror the CUDA class exactly (gemm_runner.h) so the
+    // pipeline text stays portable.
+
+    // FP16: D = A(M,K) @ B(K,N)  (row-major, no transpose, fp16 in/out)
+    void fp16_nn(void* A, void* B, void* D,
+                 int M, int N, int K,
+                 hipStream_t stream = 0);
+
+    // FP8 with host alpha + BIAS epilogue: D_fp16 = alpha * A_fp8 @ B_fp8 + bias_fp16
+    // Unlike sm_120 cuBLASLt (which rejects fp8 fused-bias epilogues,
+    // code=15), hipBLASLt supports the fused form on gfx950 — verified
+    // by the standalone gate before any pipeline use.
+    void fp8_nn_bias(void* A, void* B, void* D, void* bias,
+                     int M, int N, int K, float alpha,
+                     hipStream_t stream = 0);
+
+    // FP8 with host alpha + GELU + BIAS epilogue:
+    // D_fp16 = GELU(alpha * A_fp8 @ B_fp8 + bias_fp16)
+    void fp8_nn_gelu_bias(void* A, void* B, void* D, void* bias,
+                          int M, int N, int K, float alpha,
+                          hipStream_t stream = 0);
+
+    // FP8 with device descale pointers → FP16 output.
+    // Same scale semantics as fp8_nn_dev (per-tensor FP32 multipliers on
+    // the FP32 accumulator); only the output dtype differs.
+    void fp8_descale_fp16(void* A, void* B, void* D,
+                          int M, int N, int K,
+                          float* act_descale, float* w_descale,
+                          hipStream_t stream = 0);
+
     // ── Autotune: benchmark top-N algorithms and cache the best ──
     // Call before HIP Graph capture. Uses dummy data at the provided pointers.
     // Matters on gfx950: hipBLASLt FP8 heuristics have known gaps, so the
@@ -133,6 +164,12 @@ public:
                                void* B, void* B_scales, void* D,
                                int M, int N, int K,
                                int num_algos = 16);
+    void autotune_fp16_nn(void* A, void* B, void* D,
+                          int M, int N, int K, int num_algos = 16);
+    void autotune_fp8_descale_fp16(void* A, void* B, void* D,
+                                   int M, int N, int K,
+                                   float* act_descale, float* w_descale,
+                                   int num_algos = 16);
 
 private:
     hipblasLtHandle_t handle_;
@@ -143,7 +180,11 @@ private:
     // Enum values match the CUDA class for the ported subset.
     // MXFP4_NT_DEV is AMD-only (gfx950 native MX support, no CUDA
     // counterpart in the ported class) and uses the next free value.
-    enum GemmType { BF16_NN = 0, FP8_NN_DEV = 2, FP8_NT_DEV = 5, MXFP4_NT_DEV = 6 };
+    // FP16_NN = 4 matches the CUDA class; the CUDA fp8-with-fp16-out
+    // cached type (FP8_NN_DEV_FP16) is 6 there, but 6 was already taken
+    // by the AMD-only MXFP4_NT_DEV, so it takes the next free value 7.
+    enum GemmType { BF16_NN = 0, FP8_NN_DEV = 2, FP16_NN = 4,
+                    FP8_NT_DEV = 5, MXFP4_NT_DEV = 6, FP8_NN_DEV_FP16 = 7 };
 
     struct GemmKey {
         int type, M, N, K;
