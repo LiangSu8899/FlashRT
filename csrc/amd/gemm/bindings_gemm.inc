@@ -142,6 +142,11 @@
         }, py::arg("A"), py::arg("B"), py::arg("D"),
            py::arg("M"), py::arg("N"), py::arg("K"),
            py::arg("act_descale"), py::arg("w_descale"), py::arg("stream") = 0)
+        // Lazy autotune: timed selection on first use of each shape
+        // (pre-capture eager calls only; see hipblaslt_runner.h note)
+        .def("enable_lazy_autotune", [](GemmRunner& self, int num_algos) {
+            self.enable_lazy_autotune(num_algos);
+        }, py::arg("num_algos") = 16)
         // Autotune
         .def("autotune_bf16_nn", [](GemmRunner& self,
                                      uintptr_t A, uintptr_t B, uintptr_t D,

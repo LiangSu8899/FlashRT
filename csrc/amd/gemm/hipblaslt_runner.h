@@ -171,10 +171,21 @@ public:
                                    float* act_descale, float* w_descale,
                                    int num_algos = 16);
 
+    // ── Lazy autotune: timed algorithm selection on the FIRST call of
+    // each cached (type, M, N, K), using that call's real pointers.
+    // First calls happen during eager setup/warmup (pre-capture), so
+    // the device-wide sync inside the timed selection is safe; a shape
+    // first seen INSIDE a graph capture would fail loudly (sync is
+    // illegal in capture) — warm every shape before capturing.
+    // Off by default: the pi05 pipeline manages autotune explicitly.
+    void enable_lazy_autotune(int num_algos = 16);
+
 private:
     hipblasLtHandle_t handle_;
     void* workspace_;
     size_t workspace_size_;
+    bool lazy_autotune_ = false;
+    int lazy_pool_ = 16;
 
     // ── GEMM descriptor + algorithm cache ──
     // Enum values match the CUDA class for the ported subset.
@@ -210,6 +221,7 @@ private:
         hipblasLtMatmulDesc_t matmul_desc;
         hipblasLtMatrixLayout_t op0_desc, op1_desc, D_desc;
         hipblasLtMatmulAlgo_t algo;
+        bool tuned = false;   // timed selection ran (explicit or lazy)
     };
 
     std::unordered_map<GemmKey, CachedGemm, GemmKeyHash> gemm_cache_;

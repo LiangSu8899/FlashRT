@@ -140,6 +140,18 @@ class GrootN17TorchFrontendAmd(_GrootN17FP8BackboneMixin,
         self._fvk = fvk
         self._gemm = fvk.GemmRunner()
         self._mlp_gemm = fvk.GemmRunner()
+        # Timed hipBLASLt algorithm selection on the first eager call of
+        # each GEMM shape (all first calls happen pre-capture: shadow
+        # calibration / set_prompt backbone / graph warmup). gfx950
+        # heuristics have known gaps; pi05 measured meaningful wins from
+        # timed picks. FLASHRT_FP8_NT_AUTOTUNE=off disables;
+        # FLASHRT_FP8_ALGO_POOL sets the candidate pool (default 16 —
+        # deeper pools widen run-to-run pick variance).
+        import os as _os
+        if _os.environ.get("FLASHRT_FP8_NT_AUTOTUNE", "auto").lower() != "off":
+            pool = int(_os.environ.get("FLASHRT_FP8_ALGO_POOL", "16"))
+            self._gemm.enable_lazy_autotune(pool)
+            self._mlp_gemm.enable_lazy_autotune(pool)
 
     # ────────────────────────────────────────────────────────────────
     # Attention backend (single instance, all 5 sites)

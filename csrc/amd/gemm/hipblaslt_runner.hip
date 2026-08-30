@@ -251,6 +251,7 @@ void GemmRunner::autotune_cached(CachedGemm& entry, void* op0, void* op1, void* 
     HIP_CHECK(hipEventDestroy(stop));
 
     entry.algo = heuristics[best_idx].algo;
+    entry.tuned = true;
     std::cout << "  autotune: tested " << returned_results << " algos, best="
               << best_idx << " (" << best_ms * 1000.0f << " us)" << std::endl;
 }
@@ -359,6 +360,8 @@ void GemmRunner::bf16_run(void* A, void* B, void* D,
 void GemmRunner::bf16_nn(void* A, void* B, void* D,
                          int M, int N, int K, hipStream_t stream) {
     auto& entry = get_or_create_cached(BF16_NN, M, N, K);
+    if (lazy_autotune_ && !entry.tuned)
+        autotune_cached(entry, B, A, D, 1.0f, 0.0f, lazy_pool_);
     float alpha = 1.0f, beta = 0.0f;
     HIPBLASLT_CHECK(hipblasLtMatmul(handle_, entry.matmul_desc,
         &alpha, B, entry.op0_desc, A, entry.op1_desc,
@@ -500,6 +503,9 @@ void GemmRunner::fp8_nn_dev(void* A, void* B, void* D,
                              float* d_scale_a, float* d_scale_b,
                              hipStream_t stream) {
     auto& entry = get_or_create_cached(FP8_NN_DEV, M, N, K);
+    if (lazy_autotune_ && !entry.tuned)
+        autotune_cached(entry, B, A, D, 1.0f, 0.0f, lazy_pool_,
+                        d_scale_b, d_scale_a);
     // Update scale pointers per-call (different layers have different scales).
     // Operand swap: hipBLASLt operand A = FlashRT B → gets d_scale_b.
     HIPBLASLT_CHECK(hipblasLtMatmulDescSetAttribute(entry.matmul_desc,
@@ -524,6 +530,9 @@ void GemmRunner::fp8_nt_dev(void* A, void* B, void* D,
                              float* d_scale_a, float* d_scale_b,
                              hipStream_t stream) {
     auto& entry = get_or_create_cached(FP8_NT_DEV, M, N, K);
+    if (lazy_autotune_ && !entry.tuned)
+        autotune_cached(entry, B, A, D, 1.0f, 0.0f, lazy_pool_,
+                        d_scale_b, d_scale_a);
     HIPBLASLT_CHECK(hipblasLtMatmulDescSetAttribute(entry.matmul_desc,
         HIPBLASLT_MATMUL_DESC_A_SCALE_POINTER, &d_scale_b, sizeof(d_scale_b)));
     HIPBLASLT_CHECK(hipblasLtMatmulDescSetAttribute(entry.matmul_desc,
@@ -595,6 +604,8 @@ void GemmRunner::mxfp4_nt_dev(void* A, void* A_scales,
 void GemmRunner::fp16_nn(void* A, void* B, void* D,
                          int M, int N, int K, hipStream_t stream) {
     auto& entry = get_or_create_cached(FP16_NN, M, N, K);
+    if (lazy_autotune_ && !entry.tuned)
+        autotune_cached(entry, B, A, D, 1.0f, 0.0f, lazy_pool_);
     float alpha = 1.0f, beta = 0.0f;
     HIPBLASLT_CHECK(hipblasLtMatmul(handle_, entry.matmul_desc,
         &alpha, B, entry.op0_desc, A, entry.op1_desc,
@@ -607,6 +618,9 @@ void GemmRunner::fp8_descale_fp16(void* A, void* B, void* D,
                                   float* act_descale, float* w_descale,
                                   hipStream_t stream) {
     auto& entry = get_or_create_cached(FP8_NN_DEV_FP16, M, N, K);
+    if (lazy_autotune_ && !entry.tuned)
+        autotune_cached(entry, B, A, D, 1.0f, 0.0f, lazy_pool_,
+                        w_descale, act_descale);
     // Operand swap: hipBLASLt operand A = FlashRT B (weights) → w_descale.
     HIPBLASLT_CHECK(hipblasLtMatmulDescSetAttribute(entry.matmul_desc,
         HIPBLASLT_MATMUL_DESC_A_SCALE_POINTER, &w_descale, sizeof(w_descale)));
@@ -706,4 +720,10 @@ void GemmRunner::autotune_fp8_descale_fp16(void* A, void* B, void* D,
                                            int num_algos) {
     auto& entry = get_or_create_cached(FP8_NN_DEV_FP16, M, N, K);
     autotune_cached(entry, B, A, D, 1.0f, 0.0f, num_algos, w_descale, act_descale);
+}
+
+
+void GemmRunner::enable_lazy_autotune(int num_algos) {
+    lazy_autotune_ = true;
+    lazy_pool_ = num_algos;
 }
