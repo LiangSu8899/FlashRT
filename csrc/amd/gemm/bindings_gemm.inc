@@ -22,7 +22,8 @@
 //
 // Notes vs the CUDA bindings:
 //   - Only the ported subset is exposed: FvkContext, bf16_run,
-//     bf16_nn, bf16_nn_bias, bf16_nn_bias_gelu, fp8_nn_dev,
+//     bf16_nn, bf16_nn_res, bf16_nn_bias, bf16_nn_bias_gelu,
+//     bf16_nn_bias_res, fp8_nn_dev,
 //     fp8_nt_dev, autotune_bf16_nn, autotune_fp8_nn_dev,
 //     autotune_fp8_nt_dev.
 //   - AMD-only additions (no CUDA counterpart): mxfp4_nt_dev and
@@ -59,6 +60,12 @@
             self.bf16_nn(to_ptr(A), to_ptr(B), to_ptr(D), M, N, K, to_stream(stream));
         }, py::arg("A"), py::arg("B"), py::arg("D"),
            py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0)
+        .def("bf16_nn_res", [](GemmRunner& self,
+                                uintptr_t A, uintptr_t B, uintptr_t D,
+                                int M, int N, int K, uintptr_t stream) {
+            self.bf16_nn_res(to_ptr(A), to_ptr(B), to_ptr(D), M, N, K, to_stream(stream));
+        }, py::arg("A"), py::arg("B"), py::arg("D"),
+           py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0)
         .def("bf16_nn_bias", [](GemmRunner& self,
                                  uintptr_t A, uintptr_t B, uintptr_t D, uintptr_t bias,
                                  int M, int N, int K, uintptr_t stream) {
@@ -71,6 +78,13 @@
                                       int M, int N, int K, uintptr_t stream) {
             self.bf16_nn_bias_gelu(to_ptr(A), to_ptr(B), to_ptr(D), to_ptr(bias),
                                     M, N, K, to_stream(stream));
+        }, py::arg("A"), py::arg("B"), py::arg("D"), py::arg("bias"),
+           py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0)
+        .def("bf16_nn_bias_res", [](GemmRunner& self,
+                                     uintptr_t A, uintptr_t B, uintptr_t D, uintptr_t bias,
+                                     int M, int N, int K, uintptr_t stream) {
+            self.bf16_nn_bias_res(to_ptr(A), to_ptr(B), to_ptr(D), to_ptr(bias),
+                                   M, N, K, to_stream(stream));
         }, py::arg("A"), py::arg("B"), py::arg("D"), py::arg("bias"),
            py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0)
         .def("fp8_nn_dev", [](GemmRunner& self,
@@ -107,6 +121,46 @@
         }, py::arg("A"), py::arg("A_scales"),
            py::arg("B"), py::arg("B_scales"), py::arg("D"),
            py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0)
+        // ── GROOT N1.7 surface: FP16 GEMM + FP8 epilogue variants ──
+        // (same names/args as the CUDA bindings)
+        .def("fp16_nn", [](GemmRunner& self,
+                            uintptr_t A, uintptr_t B, uintptr_t D,
+                            int M, int N, int K, uintptr_t stream) {
+            self.fp16_nn(to_ptr(A), to_ptr(B), to_ptr(D), M, N, K, to_stream(stream));
+        }, py::arg("A"), py::arg("B"), py::arg("D"),
+           py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0)
+        .def("fp8_nn_bias", [](GemmRunner& self,
+                                uintptr_t A, uintptr_t B, uintptr_t D, uintptr_t bias,
+                                int M, int N, int K, float alpha, uintptr_t stream) {
+            self.fp8_nn_bias(to_ptr(A), to_ptr(B), to_ptr(D), to_ptr(bias),
+                              M, N, K, alpha, to_stream(stream));
+        }, py::arg("A"), py::arg("B"), py::arg("D"), py::arg("bias"),
+           py::arg("M"), py::arg("N"), py::arg("K"), py::arg("alpha"),
+           py::arg("stream") = 0)
+        .def("fp8_nn_gelu_bias", [](GemmRunner& self,
+                                     uintptr_t A, uintptr_t B, uintptr_t D, uintptr_t bias,
+                                     int M, int N, int K, float alpha, uintptr_t stream) {
+            self.fp8_nn_gelu_bias(to_ptr(A), to_ptr(B), to_ptr(D), to_ptr(bias),
+                                   M, N, K, alpha, to_stream(stream));
+        }, py::arg("A"), py::arg("B"), py::arg("D"), py::arg("bias"),
+           py::arg("M"), py::arg("N"), py::arg("K"), py::arg("alpha"),
+           py::arg("stream") = 0)
+        .def("fp8_descale_fp16", [](GemmRunner& self,
+                                     uintptr_t A, uintptr_t B, uintptr_t D,
+                                     int M, int N, int K,
+                                     uintptr_t act_descale, uintptr_t w_descale,
+                                     uintptr_t stream) {
+            self.fp8_descale_fp16(to_ptr(A), to_ptr(B), to_ptr(D), M, N, K,
+                                   typed_ptr<float>(act_descale),
+                                   typed_ptr<float>(w_descale), to_stream(stream));
+        }, py::arg("A"), py::arg("B"), py::arg("D"),
+           py::arg("M"), py::arg("N"), py::arg("K"),
+           py::arg("act_descale"), py::arg("w_descale"), py::arg("stream") = 0)
+        // Lazy autotune: timed selection on first use of each shape
+        // (pre-capture eager calls only; see hipblaslt_runner.h note)
+        .def("enable_lazy_autotune", [](GemmRunner& self, int num_algos) {
+            self.enable_lazy_autotune(num_algos);
+        }, py::arg("num_algos") = 16)
         // Autotune
         .def("autotune_bf16_nn", [](GemmRunner& self,
                                      uintptr_t A, uintptr_t B, uintptr_t D,
@@ -146,4 +200,21 @@
         }, py::arg("A"), py::arg("A_scales"),
            py::arg("B"), py::arg("B_scales"), py::arg("D"),
            py::arg("M"), py::arg("N"), py::arg("K"), py::arg("num_algos") = 16)
+        .def("autotune_fp16_nn", [](GemmRunner& self,
+                                     uintptr_t A, uintptr_t B, uintptr_t D,
+                                     int M, int N, int K, int num_algos) {
+            self.autotune_fp16_nn(to_ptr(A), to_ptr(B), to_ptr(D), M, N, K, num_algos);
+        }, py::arg("A"), py::arg("B"), py::arg("D"),
+           py::arg("M"), py::arg("N"), py::arg("K"), py::arg("num_algos") = 16)
+        .def("autotune_fp8_descale_fp16", [](GemmRunner& self,
+                                              uintptr_t A, uintptr_t B, uintptr_t D,
+                                              int M, int N, int K,
+                                              uintptr_t act_descale, uintptr_t w_descale,
+                                              int num_algos) {
+            self.autotune_fp8_descale_fp16(to_ptr(A), to_ptr(B), to_ptr(D), M, N, K,
+                                            typed_ptr<float>(act_descale),
+                                            typed_ptr<float>(w_descale), num_algos);
+        }, py::arg("A"), py::arg("B"), py::arg("D"),
+           py::arg("M"), py::arg("N"), py::arg("K"),
+           py::arg("act_descale"), py::arg("w_descale"), py::arg("num_algos") = 16)
     ;
