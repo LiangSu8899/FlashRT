@@ -123,8 +123,26 @@ GemmRunner::CachedGemm& GemmRunner::get_or_create_cached(GemmType type, int M, i
         HIPBLASLT_CHECK(hipblasLtMatrixLayoutCreate(&entry.op0_desc, fp4_type, K, N, K));
         HIPBLASLT_CHECK(hipblasLtMatrixLayoutCreate(&entry.op1_desc, fp4_type, K, M, K));
         HIPBLASLT_CHECK(hipblasLtMatrixLayoutCreate(&entry.D_desc, HIP_R_16BF, N, M, N));
+    } else if (type == FP16_NN) {
+        // FP16 in/out, same NN col-major swap as BF16_NN.
+        HIPBLASLT_CHECK(hipblasLtMatmulDescCreate(&entry.matmul_desc, HIPBLAS_COMPUTE_32F, HIP_R_32F));
+        HIPBLASLT_CHECK(hipblasLtMatmulDescSetAttribute(entry.matmul_desc, HIPBLASLT_MATMUL_DESC_TRANSA, &op_N, sizeof(op_N)));
+        HIPBLASLT_CHECK(hipblasLtMatmulDescSetAttribute(entry.matmul_desc, HIPBLASLT_MATMUL_DESC_TRANSB, &op_N, sizeof(op_N)));
+        HIPBLASLT_CHECK(hipblasLtMatrixLayoutCreate(&entry.op0_desc, HIP_R_16F, N, K, N));
+        HIPBLASLT_CHECK(hipblasLtMatrixLayoutCreate(&entry.op1_desc, HIP_R_16F, K, M, K));
+        HIPBLASLT_CHECK(hipblasLtMatrixLayoutCreate(&entry.D_desc, HIP_R_16F, N, M, N));
+    } else if (type == FP8_NN_DEV_FP16) {
+        // FP8 inputs with device descale, FP16 output (fp8_descale_fp16).
+        HIPBLASLT_CHECK(hipblasLtMatmulDescCreate(&entry.matmul_desc, HIPBLAS_COMPUTE_32F, HIP_R_32F));
+        HIPBLASLT_CHECK(hipblasLtMatmulDescSetAttribute(entry.matmul_desc, HIPBLASLT_MATMUL_DESC_TRANSA, &op_N, sizeof(op_N)));
+        HIPBLASLT_CHECK(hipblasLtMatmulDescSetAttribute(entry.matmul_desc, HIPBLASLT_MATMUL_DESC_TRANSB, &op_N, sizeof(op_N)));
+        HIPBLASLT_CHECK(hipblasLtMatrixLayoutCreate(&entry.op0_desc, HIP_R_8F_E4M3, N, K, N));
+        HIPBLASLT_CHECK(hipblasLtMatrixLayoutCreate(&entry.op1_desc, HIP_R_8F_E4M3, K, M, K));
+        HIPBLASLT_CHECK(hipblasLtMatrixLayoutCreate(&entry.D_desc, HIP_R_16F, N, M, N));
     } else {
-        // BF16_NN
+        // BF16_NN or BF16_NN_RES (identical descriptors — only the
+        // runtime beta differs; separate cache slots keep the tuned
+        // algos independent)
         HIPBLASLT_CHECK(hipblasLtMatmulDescCreate(&entry.matmul_desc, HIPBLAS_COMPUTE_32F, HIP_R_32F));
         HIPBLASLT_CHECK(hipblasLtMatmulDescSetAttribute(entry.matmul_desc, HIPBLASLT_MATMUL_DESC_TRANSA, &op_N, sizeof(op_N)));
         HIPBLASLT_CHECK(hipblasLtMatmulDescSetAttribute(entry.matmul_desc, HIPBLASLT_MATMUL_DESC_TRANSB, &op_N, sizeof(op_N)));
@@ -235,6 +253,7 @@ void GemmRunner::autotune_cached(CachedGemm& entry, void* op0, void* op1, void* 
     HIP_CHECK(hipEventDestroy(stop));
 
     entry.algo = heuristics[best_idx].algo;
+    entry.tuned = true;
     std::cout << "  autotune: tested " << returned_results << " algos, best="
               << best_idx << " (" << best_ms * 1000.0f << " us)" << std::endl;
 }
@@ -343,7 +362,32 @@ void GemmRunner::bf16_run(void* A, void* B, void* D,
 void GemmRunner::bf16_nn(void* A, void* B, void* D,
                          int M, int N, int K, hipStream_t stream) {
     auto& entry = get_or_create_cached(BF16_NN, M, N, K);
+    if (lazy_autotune_ && !entry.tuned)
+        autotune_cached(entry, B, A, D, 1.0f, 0.0f, lazy_pool_);
     float alpha = 1.0f, beta = 0.0f;
+    HIPBLASLT_CHECK(hipblasLtMatmul(handle_, entry.matmul_desc,
+        &alpha, B, entry.op0_desc, A, entry.op1_desc,
+        &beta, D, entry.D_desc, D, entry.D_desc,
+        &entry.algo, workspace_, workspace_size_, stream));
+}
+
+// ================================================================
+//  BF16 no-transpose with fused residual: D(M,N) += A(M,K) @ B(K,N)
+//  beta=1.0 accumulates the matmul into D on the FP32 accumulator,
+//  avoiding the BF16 round-trip of separate matmul + residual_add.
+//  Mirrors gemm_runner.cu:755-763 (cached BF16_NN_RES descriptor).
+//  Lazy autotune runs with beta=1.0 so the timed pick reflects the
+//  production epilogue; NOTE the timed loop's repeated D += A@B
+//  accumulates garbage into D — acceptable because first-shape calls
+//  happen only during pre-capture warmup whose outputs are discarded
+//  (see the header note).
+// ================================================================
+void GemmRunner::bf16_nn_res(void* A, void* B, void* D,
+                             int M, int N, int K, hipStream_t stream) {
+    auto& entry = get_or_create_cached(BF16_NN_RES, M, N, K);
+    if (lazy_autotune_ && !entry.tuned)
+        autotune_cached(entry, B, A, D, 1.0f, 1.0f, lazy_pool_);
+    float alpha = 1.0f, beta = 1.0f;
     HIPBLASLT_CHECK(hipblasLtMatmul(handle_, entry.matmul_desc,
         &alpha, B, entry.op0_desc, A, entry.op1_desc,
         &beta, D, entry.D_desc, D, entry.D_desc,
@@ -473,6 +517,67 @@ void GemmRunner::bf16_nn_bias_gelu(void* A, void* B, void* D, void* bias,
 }
 
 // ================================================================
+//  BF16 GEMM + BIAS + residual: D(M,N) += A(M,K) @ B(K,N) + bias(N)
+//  EPILOGUE_BIAS combined with beta=1.0 — bias and the residual read
+//  of D both land on the FP32 accumulator before the single bf16
+//  round. Mirrors gemm_runner.cu:893-949 (per-call descriptors +
+//  heuristic top-1, same style as bf16_nn_bias above).
+// ================================================================
+void GemmRunner::bf16_nn_bias_res(void* A, void* B, void* D, void* bias,
+                                   int M, int N, int K, hipStream_t stream) {
+    hipblasLtMatmulDesc_t matmul_desc;
+    hipblasLtMatrixLayout_t op0_desc, op1_desc, D_desc;
+
+    HIPBLASLT_CHECK(hipblasLtMatmulDescCreate(&matmul_desc, HIPBLAS_COMPUTE_32F, HIP_R_32F));
+
+    hipblasOperation_t op_N = HIPBLAS_OP_N;
+
+    HIPBLASLT_CHECK(hipblasLtMatmulDescSetAttribute(matmul_desc, HIPBLASLT_MATMUL_DESC_TRANSA, &op_N, sizeof(op_N)));
+    HIPBLASLT_CHECK(hipblasLtMatmulDescSetAttribute(matmul_desc, HIPBLASLT_MATMUL_DESC_TRANSB, &op_N, sizeof(op_N)));
+
+    // Set BIAS epilogue with beta=1 for residual
+    hipblasLtEpilogue_t epilogue = HIPBLASLT_EPILOGUE_BIAS;
+    HIPBLASLT_CHECK(hipblasLtMatmulDescSetAttribute(matmul_desc, HIPBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue)));
+    HIPBLASLT_CHECK(hipblasLtMatmulDescSetAttribute(matmul_desc, HIPBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias)));
+    hipDataType bias_type = HIP_R_16BF;
+    HIPBLASLT_CHECK(hipblasLtMatmulDescSetAttribute(matmul_desc, HIPBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, &bias_type, sizeof(bias_type)));
+
+    HIPBLASLT_CHECK(hipblasLtMatrixLayoutCreate(&op0_desc, HIP_R_16BF, N, K, N));
+    HIPBLASLT_CHECK(hipblasLtMatrixLayoutCreate(&op1_desc, HIP_R_16BF, K, M, K));
+    HIPBLASLT_CHECK(hipblasLtMatrixLayoutCreate(&D_desc, HIP_R_16BF, N, M, N));
+
+    hipblasLtMatmulPreference_t preference;
+    HIPBLASLT_CHECK(hipblasLtMatmulPreferenceCreate(&preference));
+    HIPBLASLT_CHECK(hipblasLtMatmulPreferenceSetAttribute(preference,
+        HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace_size_, sizeof(workspace_size_)));
+
+    int returned_results = 0;
+    hipblasLtMatmulHeuristicResult_t heuristic;
+    HIPBLASLT_CHECK(hipblasLtMatmulAlgoGetHeuristic(handle_, matmul_desc,
+        op0_desc, op1_desc, D_desc, D_desc, preference, 1, &heuristic, &returned_results));
+
+    if (returned_results == 0) {
+        hipblasLtMatmulPreferenceDestroy(preference);
+        hipblasLtMatrixLayoutDestroy(op0_desc);
+        hipblasLtMatrixLayoutDestroy(op1_desc);
+        hipblasLtMatrixLayoutDestroy(D_desc);
+        hipblasLtMatmulDescDestroy(matmul_desc);
+        throw std::runtime_error("hipBLASLt bf16_nn_bias_res: no algorithm found");
+    }
+
+    float alpha = 1.0f, beta = 1.0f;
+    HIPBLASLT_CHECK(hipblasLtMatmul(handle_, matmul_desc,
+        &alpha, B, op0_desc, A, op1_desc, &beta, D, D_desc, D, D_desc,
+        &heuristic.algo, workspace_, workspace_size_, stream));
+
+    hipblasLtMatmulPreferenceDestroy(preference);
+    hipblasLtMatrixLayoutDestroy(op0_desc);
+    hipblasLtMatrixLayoutDestroy(op1_desc);
+    hipblasLtMatrixLayoutDestroy(D_desc);
+    hipblasLtMatmulDescDestroy(matmul_desc);
+}
+
+// ================================================================
 //  FP8 no-transpose: D_bf16 = A_fp8(M,K) @ B_fp8(K,N)
 //  with device scale pointers (HIP Graph compatible).
 //  Matches bf16_nn layout — B stored as (K,N) row-major, no transpose.
@@ -484,6 +589,9 @@ void GemmRunner::fp8_nn_dev(void* A, void* B, void* D,
                              float* d_scale_a, float* d_scale_b,
                              hipStream_t stream) {
     auto& entry = get_or_create_cached(FP8_NN_DEV, M, N, K);
+    if (lazy_autotune_ && !entry.tuned)
+        autotune_cached(entry, B, A, D, 1.0f, 0.0f, lazy_pool_,
+                        d_scale_b, d_scale_a);
     // Update scale pointers per-call (different layers have different scales).
     // Operand swap: hipBLASLt operand A = FlashRT B → gets d_scale_b.
     HIPBLASLT_CHECK(hipblasLtMatmulDescSetAttribute(entry.matmul_desc,
@@ -508,6 +616,9 @@ void GemmRunner::fp8_nt_dev(void* A, void* B, void* D,
                              float* d_scale_a, float* d_scale_b,
                              hipStream_t stream) {
     auto& entry = get_or_create_cached(FP8_NT_DEV, M, N, K);
+    if (lazy_autotune_ && !entry.tuned)
+        autotune_cached(entry, B, A, D, 1.0f, 0.0f, lazy_pool_,
+                        d_scale_b, d_scale_a);
     HIPBLASLT_CHECK(hipblasLtMatmulDescSetAttribute(entry.matmul_desc,
         HIPBLASLT_MATMUL_DESC_A_SCALE_POINTER, &d_scale_b, sizeof(d_scale_b)));
     HIPBLASLT_CHECK(hipblasLtMatmulDescSetAttribute(entry.matmul_desc,
@@ -569,4 +680,136 @@ void GemmRunner::mxfp4_nt_dev(void* A, void* A_scales,
         &alpha, B, entry.op0_desc, A, entry.op1_desc,
         &beta, D, entry.D_desc, D, entry.D_desc,
         &entry.algo, workspace_, workspace_size_, stream));
+}
+
+// ================================================================
+// GROOT N1.7 surface: FP16 GEMM + FP8 epilogue variants
+// (signature-identical to the CUDA class; see header note)
+// ================================================================
+
+void GemmRunner::fp16_nn(void* A, void* B, void* D,
+                         int M, int N, int K, hipStream_t stream) {
+    auto& entry = get_or_create_cached(FP16_NN, M, N, K);
+    if (lazy_autotune_ && !entry.tuned)
+        autotune_cached(entry, B, A, D, 1.0f, 0.0f, lazy_pool_);
+    float alpha = 1.0f, beta = 0.0f;
+    HIPBLASLT_CHECK(hipblasLtMatmul(handle_, entry.matmul_desc,
+        &alpha, B, entry.op0_desc, A, entry.op1_desc,
+        &beta, D, entry.D_desc, D, entry.D_desc,
+        &entry.algo, workspace_, workspace_size_, stream));
+}
+
+void GemmRunner::fp8_descale_fp16(void* A, void* B, void* D,
+                                  int M, int N, int K,
+                                  float* act_descale, float* w_descale,
+                                  hipStream_t stream) {
+    auto& entry = get_or_create_cached(FP8_NN_DEV_FP16, M, N, K);
+    if (lazy_autotune_ && !entry.tuned)
+        autotune_cached(entry, B, A, D, 1.0f, 0.0f, lazy_pool_,
+                        w_descale, act_descale);
+    // Operand swap: hipBLASLt operand A = FlashRT B (weights) → w_descale.
+    HIPBLASLT_CHECK(hipblasLtMatmulDescSetAttribute(entry.matmul_desc,
+        HIPBLASLT_MATMUL_DESC_A_SCALE_POINTER, &w_descale, sizeof(w_descale)));
+    HIPBLASLT_CHECK(hipblasLtMatmulDescSetAttribute(entry.matmul_desc,
+        HIPBLASLT_MATMUL_DESC_B_SCALE_POINTER, &act_descale, sizeof(act_descale)));
+
+    float alpha = 1.0f, beta = 0.0f;
+    HIPBLASLT_CHECK(hipblasLtMatmul(handle_, entry.matmul_desc,
+        &alpha, B, entry.op0_desc, A, entry.op1_desc,
+        &beta, D, entry.D_desc, D, entry.D_desc,
+        &entry.algo, workspace_, workspace_size_, stream));
+}
+
+// Shared body for the two fp8 host-alpha epilogue entry points.
+// Per-call descriptors (bias pointer + alpha are baked per call, same
+// style as bf16_nn_bias above); D/bias are FP16.
+static void fp8_epilogue_nn(hipblasLtHandle_t handle,
+                            void* workspace, size_t workspace_size,
+                            void* A, void* B, void* D, void* bias,
+                            int M, int N, int K, float alpha,
+                            hipblasLtEpilogue_t epilogue_kind,
+                            const char* what, hipStream_t stream) {
+    hipblasLtMatmulDesc_t matmul_desc;
+    hipblasLtMatrixLayout_t op0_desc, op1_desc, D_desc;
+
+    HIPBLASLT_CHECK(hipblasLtMatmulDescCreate(&matmul_desc, HIPBLAS_COMPUTE_32F, HIP_R_32F));
+    hipblasOperation_t op_N = HIPBLAS_OP_N;
+    HIPBLASLT_CHECK(hipblasLtMatmulDescSetAttribute(matmul_desc, HIPBLASLT_MATMUL_DESC_TRANSA, &op_N, sizeof(op_N)));
+    HIPBLASLT_CHECK(hipblasLtMatmulDescSetAttribute(matmul_desc, HIPBLASLT_MATMUL_DESC_TRANSB, &op_N, sizeof(op_N)));
+
+    HIPBLASLT_CHECK(hipblasLtMatmulDescSetAttribute(matmul_desc, HIPBLASLT_MATMUL_DESC_EPILOGUE, &epilogue_kind, sizeof(epilogue_kind)));
+    HIPBLASLT_CHECK(hipblasLtMatmulDescSetAttribute(matmul_desc, HIPBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias)));
+    hipDataType bias_type = HIP_R_16F;
+    HIPBLASLT_CHECK(hipblasLtMatmulDescSetAttribute(matmul_desc, HIPBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, &bias_type, sizeof(bias_type)));
+
+    HIPBLASLT_CHECK(hipblasLtMatrixLayoutCreate(&op0_desc, HIP_R_8F_E4M3, N, K, N));
+    HIPBLASLT_CHECK(hipblasLtMatrixLayoutCreate(&op1_desc, HIP_R_8F_E4M3, K, M, K));
+    HIPBLASLT_CHECK(hipblasLtMatrixLayoutCreate(&D_desc, HIP_R_16F, N, M, N));
+
+    hipblasLtMatmulPreference_t preference;
+    HIPBLASLT_CHECK(hipblasLtMatmulPreferenceCreate(&preference));
+    size_t ws = workspace_size;
+    HIPBLASLT_CHECK(hipblasLtMatmulPreferenceSetAttribute(preference,
+        HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws, sizeof(ws)));
+
+    int returned_results = 0;
+    hipblasLtMatmulHeuristicResult_t heuristic;
+    HIPBLASLT_CHECK(hipblasLtMatmulAlgoGetHeuristic(handle, matmul_desc,
+        op0_desc, op1_desc, D_desc, D_desc, preference, 1, &heuristic, &returned_results));
+
+    if (returned_results == 0) {
+        hipblasLtMatmulPreferenceDestroy(preference);
+        hipblasLtMatrixLayoutDestroy(op0_desc);
+        hipblasLtMatrixLayoutDestroy(op1_desc);
+        hipblasLtMatrixLayoutDestroy(D_desc);
+        hipblasLtMatmulDescDestroy(matmul_desc);
+        throw std::runtime_error(std::string("hipBLASLt ") + what + ": no algorithm found");
+    }
+
+    float beta = 0.0f;
+    HIPBLASLT_CHECK(hipblasLtMatmul(handle, matmul_desc,
+        &alpha, B, op0_desc, A, op1_desc, &beta, D, D_desc, D, D_desc,
+        &heuristic.algo, workspace, workspace_size, stream));
+
+    hipblasLtMatmulPreferenceDestroy(preference);
+    hipblasLtMatrixLayoutDestroy(op0_desc);
+    hipblasLtMatrixLayoutDestroy(op1_desc);
+    hipblasLtMatrixLayoutDestroy(D_desc);
+    hipblasLtMatmulDescDestroy(matmul_desc);
+}
+
+void GemmRunner::fp8_nn_bias(void* A, void* B, void* D, void* bias,
+                             int M, int N, int K, float alpha,
+                             hipStream_t stream) {
+    fp8_epilogue_nn(handle_, workspace_, workspace_size_, A, B, D, bias,
+                    M, N, K, alpha, HIPBLASLT_EPILOGUE_BIAS,
+                    "fp8_nn_bias", stream);
+}
+
+void GemmRunner::fp8_nn_gelu_bias(void* A, void* B, void* D, void* bias,
+                                  int M, int N, int K, float alpha,
+                                  hipStream_t stream) {
+    fp8_epilogue_nn(handle_, workspace_, workspace_size_, A, B, D, bias,
+                    M, N, K, alpha, HIPBLASLT_EPILOGUE_GELU_BIAS,
+                    "fp8_nn_gelu_bias", stream);
+}
+
+void GemmRunner::autotune_fp16_nn(void* A, void* B, void* D,
+                                  int M, int N, int K, int num_algos) {
+    auto& entry = get_or_create_cached(FP16_NN, M, N, K);
+    autotune_cached(entry, B, A, D, 1.0f, 0.0f, num_algos);
+}
+
+void GemmRunner::autotune_fp8_descale_fp16(void* A, void* B, void* D,
+                                           int M, int N, int K,
+                                           float* act_descale, float* w_descale,
+                                           int num_algos) {
+    auto& entry = get_or_create_cached(FP8_NN_DEV_FP16, M, N, K);
+    autotune_cached(entry, B, A, D, 1.0f, 0.0f, num_algos, w_descale, act_descale);
+}
+
+
+void GemmRunner::enable_lazy_autotune(int num_algos) {
+    lazy_autotune_ = true;
+    lazy_pool_ = num_algos;
 }

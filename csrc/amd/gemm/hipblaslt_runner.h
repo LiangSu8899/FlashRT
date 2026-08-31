@@ -63,6 +63,20 @@ public:
                  int M, int N, int K,
                  hipStream_t stream = 0);
 
+    // BF16 with residual: D += A(M,K) @ B(K,N)  (row-major, no transpose)
+    // Fuses residual add into GEMM accumulator (FP32) via beta=1.0,
+    // avoiding the BF16 round-trip of a separate matmul + residual_add.
+    // Mirrors the CUDA class exactly (gemm_runner.h:85). Own cache slot
+    // (BF16_NN_RES) so lazy autotune times it with beta=1; NOTE the
+    // timed selection loop then repeatedly accumulates A@B into D — D
+    // holds garbage right after a lazy tune, which is fine for
+    // warmup/scratch passes (all first-shape calls happen pre-capture
+    // during warmup whose outputs are discarded) but means a lazy-tuned
+    // first call must not be trusted for numerics.
+    void bf16_nn_res(void* A, void* B, void* D,
+                     int M, int N, int K,
+                     hipStream_t stream = 0);
+
     // BF16 + BIAS epilogue: D = A(M,K) @ B(K,N) + bias(N)
     void bf16_nn_bias(void* A, void* B, void* D, void* bias,
                        int M, int N, int K,
@@ -72,6 +86,15 @@ public:
     void bf16_nn_bias_gelu(void* A, void* B, void* D, void* bias,
                             int M, int N, int K,
                             hipStream_t stream = 0);
+
+    // BF16 + BIAS + residual: D += A(M,K) @ B(K,N) + bias(N)
+    // hipBLASLt EPILOGUE_BIAS combined with beta=1.0 (bias and residual
+    // both land on the FP32 accumulator before the single bf16 round).
+    // Mirrors the CUDA class exactly (gemm_runner.h:100): per-call
+    // descriptors + heuristic top-1, same style as bf16_nn_bias above.
+    void bf16_nn_bias_res(void* A, void* B, void* D, void* bias,
+                           int M, int N, int K,
+                           hipStream_t stream = 0);
 
     // FP8 no-transpose: D_bf16 = A_fp8(M,K) @ B_fp8(K,N) with device scale pointers
     // Matches bf16_nn layout — B stored as (K,N), no transpose.
@@ -115,6 +138,37 @@ public:
                       int M, int N, int K,
                       hipStream_t stream = 0);
 
+    // ── GROOT N1.7 surface: FP16 GEMM + FP8 epilogue variants ──
+    // Signatures mirror the CUDA class exactly (gemm_runner.h) so the
+    // pipeline text stays portable.
+
+    // FP16: D = A(M,K) @ B(K,N)  (row-major, no transpose, fp16 in/out)
+    void fp16_nn(void* A, void* B, void* D,
+                 int M, int N, int K,
+                 hipStream_t stream = 0);
+
+    // FP8 with host alpha + BIAS epilogue: D_fp16 = alpha * A_fp8 @ B_fp8 + bias_fp16
+    // Unlike sm_120 cuBLASLt (which rejects fp8 fused-bias epilogues,
+    // code=15), hipBLASLt supports the fused form on gfx950 — verified
+    // by the standalone gate before any pipeline use.
+    void fp8_nn_bias(void* A, void* B, void* D, void* bias,
+                     int M, int N, int K, float alpha,
+                     hipStream_t stream = 0);
+
+    // FP8 with host alpha + GELU + BIAS epilogue:
+    // D_fp16 = GELU(alpha * A_fp8 @ B_fp8 + bias_fp16)
+    void fp8_nn_gelu_bias(void* A, void* B, void* D, void* bias,
+                          int M, int N, int K, float alpha,
+                          hipStream_t stream = 0);
+
+    // FP8 with device descale pointers → FP16 output.
+    // Same scale semantics as fp8_nn_dev (per-tensor FP32 multipliers on
+    // the FP32 accumulator); only the output dtype differs.
+    void fp8_descale_fp16(void* A, void* B, void* D,
+                          int M, int N, int K,
+                          float* act_descale, float* w_descale,
+                          hipStream_t stream = 0);
+
     // ── Autotune: benchmark top-N algorithms and cache the best ──
     // Call before HIP Graph capture. Uses dummy data at the provided pointers.
     // Matters on gfx950: hipBLASLt FP8 heuristics have known gaps, so the
@@ -133,17 +187,42 @@ public:
                                void* B, void* B_scales, void* D,
                                int M, int N, int K,
                                int num_algos = 16);
+    void autotune_fp16_nn(void* A, void* B, void* D,
+                          int M, int N, int K, int num_algos = 16);
+    void autotune_fp8_descale_fp16(void* A, void* B, void* D,
+                                   int M, int N, int K,
+                                   float* act_descale, float* w_descale,
+                                   int num_algos = 16);
+
+    // ── Lazy autotune: timed algorithm selection on the FIRST call of
+    // each cached (type, M, N, K), using that call's real pointers.
+    // First calls happen during eager setup/warmup (pre-capture), so
+    // the device-wide sync inside the timed selection is safe; a shape
+    // first seen INSIDE a graph capture would fail loudly (sync is
+    // illegal in capture) — warm every shape before capturing.
+    // Off by default: the pi05 pipeline manages autotune explicitly.
+    void enable_lazy_autotune(int num_algos = 16);
 
 private:
     hipblasLtHandle_t handle_;
     void* workspace_;
     size_t workspace_size_;
+    bool lazy_autotune_ = false;
+    int lazy_pool_ = 16;
 
     // ── GEMM descriptor + algorithm cache ──
     // Enum values match the CUDA class for the ported subset.
+    // BF16_NN_RES = 1 matches the CUDA enum (same descriptors as
+    // BF16_NN — only beta differs — but its own slot so lazy autotune
+    // times the beta=1 form separately).
     // MXFP4_NT_DEV is AMD-only (gfx950 native MX support, no CUDA
     // counterpart in the ported class) and uses the next free value.
-    enum GemmType { BF16_NN = 0, FP8_NN_DEV = 2, FP8_NT_DEV = 5, MXFP4_NT_DEV = 6 };
+    // FP16_NN = 4 matches the CUDA class; the CUDA fp8-with-fp16-out
+    // cached type (FP8_NN_DEV_FP16) is 6 there, but 6 was already taken
+    // by the AMD-only MXFP4_NT_DEV, so it takes the next free value 7.
+    enum GemmType { BF16_NN = 0, BF16_NN_RES = 1, FP8_NN_DEV = 2,
+                    FP16_NN = 4,
+                    FP8_NT_DEV = 5, MXFP4_NT_DEV = 6, FP8_NN_DEV_FP16 = 7 };
 
     struct GemmKey {
         int type, M, N, K;
@@ -169,6 +248,7 @@ private:
         hipblasLtMatmulDesc_t matmul_desc;
         hipblasLtMatrixLayout_t op0_desc, op1_desc, D_desc;
         hipblasLtMatmulAlgo_t algo;
+        bool tuned = false;   // timed selection ran (explicit or lazy)
     };
 
     std::unordered_map<GemmKey, CachedGemm, GemmKeyHash> gemm_cache_;

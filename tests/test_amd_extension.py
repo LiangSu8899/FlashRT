@@ -137,10 +137,15 @@ _REQUIRED_CLASSES = ["FvkContext", "GemmRunner"]
 
 # GemmRunner methods the pi05 pipeline dispatches on by name.
 _REQUIRED_GEMM_METHODS = [
-    "bf16_run", "bf16_nn", "bf16_nn_bias", "bf16_nn_bias_gelu",
+    "bf16_run", "bf16_nn", "bf16_nn_res", "bf16_nn_bias",
+    "bf16_nn_bias_gelu", "bf16_nn_bias_res",
     "fp8_nn_dev", "fp8_nt_dev", "mxfp4_nt_dev",
+    # GROOT N1.7 surface: FP16 GEMM + FP8 epilogue variants
+    "fp16_nn", "fp8_nn_bias", "fp8_nn_gelu_bias", "fp8_descale_fp16",
+    "enable_lazy_autotune",
     "autotune_bf16_nn", "autotune_fp8_nn_dev", "autotune_fp8_nt_dev",
-    "autotune_mxfp4_nt_dev",
+    "autotune_mxfp4_nt_dev", "autotune_fp16_nn",
+    "autotune_fp8_descale_fp16",
 ]
 
 

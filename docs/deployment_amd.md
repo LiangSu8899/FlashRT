@@ -9,7 +9,7 @@ Per-model deployment guides:
 | Model | Guide | Status |
 |---|---|---|
 | Pi0.5 | [deployment_amd_pi05.md](deployment_amd_pi05.md) | FP8 default, BF16 available |
-| GROOT N1.7 | `deployment_amd_groot_n17.md` | on the GROOT integration branch |
+| GROOT N1.7 | [deployment_amd_groot_n17.md](deployment_amd_groot_n17.md) | FP8 backbone + bf16 DiT |
 
 ## Supported hardware
 
@@ -141,6 +141,8 @@ python -m pytest tests/test_amd_routing.py tests/test_amd_extension.py \
 | `test_amd_hip_graph.py` | buffer round-trips with pattern data, capture → instantiate → replay, byte-identical repeat replays | no ROCm device or extension |
 | `test_amd_kernel_parity.py` | numerical parity of the kernel surface against torch references on real-distribution inputs, including FP8 byte-exactness and the seqused fixed-shape attention path | no ROCm device or extension |
 | `test_amd_pi05_model.py` | end-to-end model load, graph capture, pinned-noise determinism, exact/fixed prompt modes, FP8 and BF16 | no checkpoint (see the per-model guide for the environment variables) |
+| `test_amd_groot_routing.py` | GROOT N1.7 pipeline-map entry, precision-tier contracts, attention-backend site/layer validation | extension-dependent cases skip without the `.so` |
+| `test_amd_groot_model.py` | GROOT N1.7 end-to-end: kernel backbone, finite actions, pinned-noise determinism, optional reference cosine | no checkpoint |
 
 Everything skips cleanly with a stated reason on machines without ROCm,
 so the suite is safe to run in a CUDA-only CI.
