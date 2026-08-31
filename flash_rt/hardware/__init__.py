@@ -37,6 +37,7 @@ def detect_arch() -> str:
         ``"rtx_sm120"`` — RTX 5090 / DGX Spark GB10 Blackwell, SM120/SM121
         ``"rtx_sm89"``  — RTX 4090 / Ada, SM89 (cc 8.9)
         ``"rtx_sm87"``  — Jetson Orin via RTX consumer backend, SM87 (cc 8.7)
+        ``"amd_cdna4"`` — AMD Instinct MI350 series, ROCm (gfx950)
 
     Raises RuntimeError if CUDA is unavailable or the card has an
     unsupported SM level. Deliberately strict: silently falling back to
@@ -49,8 +50,17 @@ def detect_arch() -> str:
             "FlashRT requires PyTorch for GPU detection") from e
     if not torch.cuda.is_available():
         raise RuntimeError(
-            "FlashRT requires a CUDA-capable GPU "
+            "FlashRT requires a CUDA- or ROCm-capable GPU "
             "(torch.cuda.is_available()==False)")
+    if getattr(torch.version, "hip", None):
+        # ROCm build: route by the gfx architecture name, not the CUDA
+        # cc tuple (which ROCm fills with unrelated values).
+        gcn = torch.cuda.get_device_properties(0).gcnArchName
+        if gcn.split(":")[0] == "gfx950":
+            return "amd_cdna4"
+        raise RuntimeError(
+            f"FlashRT: unsupported ROCm GPU arch {gcn!r}. "
+            "Supported: gfx950 (MI350 series / CDNA4).")
     major, minor = torch.cuda.get_device_capability()
     if (major, minor) == (11, 0):
         return "thor"
@@ -79,6 +89,8 @@ _PIPELINE_MAP: dict[tuple[str, str, str], tuple[str, str]] = {
         ("flash_rt.frontends.torch.pi05_rtx", "Pi05TorchFrontendRtx"),
     ("pi05", "torch", "rtx_sm87"):
         ("flash_rt.frontends.torch.pi05_rtx", "Pi05TorchFrontendRtx"),
+    ("pi05", "torch", "amd_cdna4"):
+        ("flash_rt.amd.frontends.torch.pi05", "Pi05TorchFrontendAmd"),
     ("pi05", "torch", "rtx_sm89"):
         ("flash_rt.frontends.torch.pi05_rtx", "Pi05TorchFrontendRtx"),
     ("pi05", "jax", "thor"):

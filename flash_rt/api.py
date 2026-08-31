@@ -675,15 +675,29 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             "Qwen36MoeTextFrontend\n"
             "See docs/qwen36_moe_usage.md.")
 
+    from flash_rt.hardware import detect_arch, resolve_pipeline_class
+    arch = detect_arch() if hardware == "auto" else hardware
+
     # Refuse before the frontend import: a frontend that imports the
     # extension at module scope would otherwise fail as a bare
     # ModuleNotFoundError, which reads as a broken install rather than as
-    # a build the user still has to run.
-    from flash_rt import _extensions
-    _extensions.require(config=config)
-
-    from flash_rt.hardware import detect_arch, resolve_pipeline_class
-    arch = detect_arch() if hardware == "auto" else hardware
+    # a build the user still has to run. The AMD backend has its own
+    # self-contained module (the CUDA extensions are neither needed nor
+    # expected on a ROCm box).
+    if arch == "amd_cdna4":
+        try:
+            import flash_rt.amd.flash_rt_amd_kernels  # noqa: F401
+        except ImportError as exc:
+            raise ImportError(
+                "flash_rt.amd.flash_rt_amd_kernels is not built (the "
+                "AMD/ROCm backend's core kernels). Build it with:\n"
+                "    bash scripts/amd/build_amd.sh gfx950\n"
+                "or: cmake -B build-amd -S csrc/amd -DGPU_ARCH=gfx950 && "
+                "cmake --build build-amd -j\n"
+                "See docs/deployment_amd.md.") from exc
+    else:
+        from flash_rt import _extensions
+        _extensions.require(config=config)
 
     if recalibrate:
         from flash_rt.core.quant.calibrator import clear_calibration
