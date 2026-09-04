@@ -211,7 +211,7 @@ void GemmRunner::autotune_cached(CachedGemm& entry, void* A, void* B, void* D,
     CUDA_CHECK(cudaEventDestroy(stop));
 
     entry.algo = heuristics[best_idx].algo;
-    std::cout << "  autotune: tested " << returned_results << " algos, best="
+    std::cerr << "  autotune: tested " << returned_results << " algos, best="
               << best_idx << " (" << best_ms * 1000.0f << " us)" << std::endl;
 }
 
