@@ -473,7 +473,8 @@ class Pi05TorchFrontendRtx:
                  use_fp8: bool = True,
                  hardware: Optional[str] = None,
                  fp8_layout: Optional[str] = None,
-                 state_prompt_mode: str = "exact"):
+                 state_prompt_mode: str = "exact",
+                 use_cuda_graph: bool = True):
         checkpoint_dir = pathlib.Path(checkpoint_dir)
         # State-in-prompt graph strategy (Pi0.5 renders robot state into the
         # prompt, so its token length drifts with the state values):
@@ -517,6 +518,7 @@ class Pi05TorchFrontendRtx:
                 f"got {self._vision_num_layers}")
         # _use_int8_vision_static is set after _force_int8_decoder below
         self.use_fp8 = bool(use_fp8)
+        self.use_cuda_graph = bool(use_cuda_graph)
         self.hardware = _resolve_effective_hardware(hardware)
         self.fp8_layout = select_fp8_layout(hardware, fp8_layout)
 
@@ -1382,12 +1384,13 @@ class Pi05TorchFrontendRtx:
                     "(~0.96 vs dynamic 0.991 on test sequence). Set "
                     "FVK_PI05_RTX_INT8_ENCODER_STATIC=0 to disable.")
             self.pipeline.autotune_gemms()
-            from flash_rt.subgraphs.capture import apply_frontend_capture_hooks
-            apply_frontend_capture_hooks(self)
-            self.pipeline.record_infer_graph(external_stream_int=stream_int)
+            if self.use_cuda_graph:
+                from flash_rt.subgraphs.capture import apply_frontend_capture_hooks
+                apply_frontend_capture_hooks(self)
+                self.pipeline.record_infer_graph(external_stream_int=stream_int)
 
         self.calibrated = True
-        self.graph_recorded = True
+        self.graph_recorded = self.use_cuda_graph
         self._precision_spec = self._snapshot_precision_spec(
             method="single_frame", n=1, percentile=None)
         self._warn_if_scale_ceiling_exceeded()
@@ -1449,12 +1452,13 @@ class Pi05TorchFrontendRtx:
 
             self.pipeline.fp8_calibrated = True
             self.pipeline.autotune_gemms()
-            from flash_rt.subgraphs.capture import apply_frontend_capture_hooks
-            apply_frontend_capture_hooks(self)
-            self.pipeline.record_infer_graph(external_stream_int=stream_int)
+            if self.use_cuda_graph:
+                from flash_rt.subgraphs.capture import apply_frontend_capture_hooks
+                apply_frontend_capture_hooks(self)
+                self.pipeline.record_infer_graph(external_stream_int=stream_int)
 
         self.calibrated = True
-        self.graph_recorded = True
+        self.graph_recorded = self.use_cuda_graph
         self._precision_spec = self._snapshot_precision_spec(
             method="percentile", n=n, percentile=percentile)
         self._warn_if_scale_ceiling_exceeded(label=f"pi05_rtx_N{n}")
@@ -1586,10 +1590,10 @@ class Pi05TorchFrontendRtx:
                 self._fill_img_buf(observation)
                 self._copy_tensor_to_pipeline_buf_stream(
                     self._img_buf, self.pipeline.input_images_buf, stream_int)
-                out_ptr = self.pipeline.forward()
+                out_ptr = self.pipeline.forward(stream=stream_int)
             else:
                 # Decode-only: skip vision+encoder, reuse cached K/V
-                out_ptr = self.pipeline.forward_decode_only()
+                out_ptr = self.pipeline.forward_decode_only(stream=stream_int)
 
             # D2D download → staging torch tensor
             self._cudart.cudaMemcpyAsync(
@@ -1640,7 +1644,7 @@ class Pi05TorchFrontendRtx:
                 self._noise_buf_b2, self.pipeline.input_noise_buf_b2, stream_int)
 
             # Graph replay returns the cond slot's noise pointer.
-            out_ptr = self.pipeline.forward()
+            out_ptr = self.pipeline.forward(stream=stream_int)
 
             # D2D download of just the cond slot (chunk * ACTION_DIM bf16)
             self._cudart.cudaMemcpyAsync(
@@ -1817,11 +1821,12 @@ class Pi05TorchFrontendRtx:
                 noise, self.pipeline.input_noise_buf, stream_int)
             self.pipeline.calibrate_fp8()
             self.pipeline.autotune_gemms()
-            from flash_rt.subgraphs.capture import apply_frontend_capture_hooks
-            apply_frontend_capture_hooks(self)
-            self.pipeline.record_infer_graph(external_stream_int=stream_int)
+            if self.use_cuda_graph:
+                from flash_rt.subgraphs.capture import apply_frontend_capture_hooks
+                apply_frontend_capture_hooks(self)
+                self.pipeline.record_infer_graph(external_stream_int=stream_int)
         self.calibrated = True
-        self.graph_recorded = True
+        self.graph_recorded = self.use_cuda_graph
 
     def infer_batch(self, observations: list) -> list:
         """Run B=2 inference on two independent observations.
@@ -1854,7 +1859,7 @@ class Pi05TorchFrontendRtx:
             self._copy_tensor_to_pipeline_buf_stream(
                 self._noise_buf_b2, self.pipeline.input_noise_buf_b2, stream_int)
 
-            out_ptr = self.pipeline.forward()
+            out_ptr = self.pipeline.forward(stream=stream_int)
 
             self._cudart.cudaMemcpyAsync(
                 ctypes.c_void_p(self._noise_out_b2.data_ptr()),
