@@ -1384,17 +1384,16 @@ class Pi05TorchFrontendRtx:
                     "(~0.96 vs dynamic 0.991 on test sequence). Set "
                     "FVK_PI05_RTX_INT8_ENCODER_STATIC=0 to disable.")
             self.pipeline.autotune_gemms()
-            if self.use_cuda_graph:
-                from flash_rt.subgraphs.capture import apply_frontend_capture_hooks
-                apply_frontend_capture_hooks(self)
-                self.pipeline.record_infer_graph(external_stream_int=stream_int)
+            self._record_infer_graph_if_enabled(stream_int)
 
         self.calibrated = True
         self.graph_recorded = self.use_cuda_graph
         self._precision_spec = self._snapshot_precision_spec(
             method="single_frame", n=1, percentile=None)
         self._warn_if_scale_ceiling_exceeded()
-        logger.info("Calibration + graph capture complete")
+        logger.info(
+            "Calibration%s complete",
+            " + graph capture" if self.use_cuda_graph else "")
 
     def _calibrate_multi_frame(
         self, obs_list, *, percentile: float, verbose: bool,
@@ -1452,10 +1451,7 @@ class Pi05TorchFrontendRtx:
 
             self.pipeline.fp8_calibrated = True
             self.pipeline.autotune_gemms()
-            if self.use_cuda_graph:
-                from flash_rt.subgraphs.capture import apply_frontend_capture_hooks
-                apply_frontend_capture_hooks(self)
-                self.pipeline.record_infer_graph(external_stream_int=stream_int)
+            self._record_infer_graph_if_enabled(stream_int)
 
         self.calibrated = True
         self.graph_recorded = self.use_cuda_graph
@@ -1463,14 +1459,24 @@ class Pi05TorchFrontendRtx:
             method="percentile", n=n, percentile=percentile)
         self._warn_if_scale_ceiling_exceeded(label=f"pi05_rtx_N{n}")
         logger.info(
-            "Pi0.5 multi-frame calibration + graph capture complete "
-            "(N=%d, percentile=%.2f)", n, percentile)
+            "Pi0.5 multi-frame calibration%s complete "
+            "(N=%d, percentile=%.2f)",
+            " + graph capture" if self.use_cuda_graph else "",
+            n, percentile)
 
     def _zero_pipeline_scales(self) -> None:
         for buf in self.pipeline.fp8_act_scales.values():
             buf.zero_()
         for buf in getattr(self.pipeline, "int8_act_scales", {}).values():
             buf.zero_()
+
+    def _record_infer_graph_if_enabled(self, stream_int: int) -> None:
+        """Apply capture hooks and record graphs when graph mode is enabled."""
+        if not self.use_cuda_graph:
+            return
+        from flash_rt.subgraphs.capture import apply_frontend_capture_hooks
+        apply_frontend_capture_hooks(self)
+        self.pipeline.record_infer_graph(external_stream_int=stream_int)
 
     def _warn_if_scale_ceiling_exceeded(self, label: str = "pi05_rtx") -> None:
         """Diagnostic warning if any FP8 scale exceeds the sanity ceiling."""
@@ -1575,9 +1581,7 @@ class Pi05TorchFrontendRtx:
         # pipeline (vision + encoder + decoder); intermediate frames skip
         # vision and encoder and replay only the decoder with fresh noise,
         # reusing the encoder K/V cache from the last full forward.
-        self._frame_count += 1
-        use_full = (self._cache_frames <= 1 or
-                    self._frame_count % self._cache_frames == 1)
+        use_full = self._use_full_pipeline_for_next_frame()
 
         with torch.cuda.stream(self._graph_torch_stream):
             stream_int = self._graph_torch_stream.cuda_stream
@@ -1616,6 +1620,12 @@ class Pi05TorchFrontendRtx:
             logger.info("Latency: %.1f ms", latency_ms)
 
         return {"actions": robot_actions}
+
+    def _use_full_pipeline_for_next_frame(self) -> bool:
+        """Advance the frame counter and select full vs decode-only work."""
+        self._frame_count += 1
+        return (self._cache_frames <= 1 or
+                self._frame_count % self._cache_frames == 1)
 
     def _infer_cfg_batched(self, observation: dict,
                            debug: bool = False) -> dict:
@@ -1821,10 +1831,7 @@ class Pi05TorchFrontendRtx:
                 noise, self.pipeline.input_noise_buf, stream_int)
             self.pipeline.calibrate_fp8()
             self.pipeline.autotune_gemms()
-            if self.use_cuda_graph:
-                from flash_rt.subgraphs.capture import apply_frontend_capture_hooks
-                apply_frontend_capture_hooks(self)
-                self.pipeline.record_infer_graph(external_stream_int=stream_int)
+            self._record_infer_graph_if_enabled(stream_int)
         self.calibrated = True
         self.graph_recorded = self.use_cuda_graph
 
